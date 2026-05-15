@@ -1,6 +1,6 @@
 // Package frontend wires up the frontend tool described by a profile.
 //
-// Two kinds are supported today:
+// Three kinds are supported:
 //
 //   - external: vibe writes a sidecar config file (e.g. an opencode.json)
 //     and surfaces env-var advisories; the user launches the frontend
@@ -9,6 +9,10 @@
 //     user-supplied compose file as part of profile activation, polls any
 //     configured wait_for endpoints, and runs `docker compose down` on
 //     deactivation.
+//   - managed: vibe execs a native binary directly (same args/env/workdir
+//     model as systemd) and stops it on profile deactivation with the
+//     same SIGINT-then-SIGKILL lifecycle the backend supervisor uses for
+//     llama-server.
 package frontend
 
 import (
@@ -55,6 +59,8 @@ func ActivateWithContext(reqCtx context.Context, p *profile.Profile, ctx profile
 		return activateExternal(p, ctx)
 	case profile.FrontendDockerCompose:
 		return defaultCompose().Activate(reqCtx, p, ctx)
+	case profile.FrontendManaged:
+		return defaultManaged().Activate(reqCtx, p, ctx)
 	default:
 		return nil, fmt.Errorf("frontend.kind %q is not supported yet", p.Frontend.Kind)
 	}

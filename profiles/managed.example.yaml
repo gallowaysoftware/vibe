@@ -1,0 +1,72 @@
+# Example profile: a native binary (Open-WebUI-style) supervised by vibe
+# directly. Same lifecycle coupling as the docker-compose kind — vibe
+# starts the binary as part of `vibe start <profile>` and shuts it down
+# on `vibe stop` — but without the container dependency.
+#
+# Copy this to ~/.config/vibe/profiles/openwebui.yaml, point `binary` at
+# your real Open-WebUI launcher, and `vibe start openwebui`.
+#
+# On start, vibe execs:
+#   <binary> <args...>
+# with the configured env and workdir, then polls each wait_for URL
+# until it 2xxs (or the timeout elapses, in which case vibe stops the
+# child and aborts activation). On stop, vibe sends SIGINT and waits up
+# to 10s for the child to exit, then falls back to SIGKILL — the same
+# graceful-shutdown contract used by the backend supervisor for
+# llama-server.
+
+name: openwebui
+description: Qwen3 + Open-WebUI under vibe supervision
+
+backend:
+  llama_server:
+    path: ~/models/qwen3-30b-q6_k.gguf
+    alias: qwen3-30b
+    context: 32768
+    parallel: 1
+    gpu_layers: 999
+    flash_attn: true
+    jinja: true
+
+frontend:
+  kind: managed
+
+  # Informational. Surfaces in `vibe status` so it's obvious which tool
+  # is running.
+  app: open-webui
+
+  # Required. Tilde-expanded at load time. Must exist and be executable
+  # at validation time; vibe will not chmod +x it for you.
+  binary: ~/.local/share/open-webui/run-server.sh
+
+  # Optional. Passed positionally to the binary. Vibe does no shell
+  # expansion or quoting — each entry becomes one argv element.
+  args:
+    - "--listen"
+    - "127.0.0.1"
+    - "--port"
+    - "8080"
+
+  # Optional. Tilde-expanded at load time. When unset, the child
+  # inherits vibe's working directory.
+  workdir: ~/.local/share/open-webui
+
+  # Optional. Pairs are layered on top of vibe's environment (and the
+  # daemon's environment in turn) when the child is exec'd. Values
+  # support the same ${VAR} expansion as the other frontend kinds —
+  # ${VIBE_API} resolves to vibe's proxy URL, ${MODEL_ALIAS} /
+  # ${MODEL_CONTEXT} to the active model.
+  env:
+    OPEN_WEBUI_DATA: ~/.local/share/open-webui/data
+    OLLAMA_API_URL: ${VIBE_API}
+
+  # Optional. Each entry is polled after the binary starts. Polling
+  # continues until the URL returns a 2xx response or `timeout`
+  # (default 60s) elapses. Activation fails if any URL never goes
+  # ready, and vibe will SIGINT/SIGKILL the child on failure so you're
+  # not left with a half-started process.
+  wait_for:
+    - url: http://127.0.0.1:8080/
+      timeout: 30s
+
+estimated_vram_gb: 20

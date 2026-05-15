@@ -78,10 +78,13 @@ func TestActivate_External_WritesExpandedJSON(t *testing.T) {
 	}
 }
 
-func TestActivate_UnsupportedKind(t *testing.T) {
-	p := &profile.Profile{Frontend: profile.Frontend{Kind: profile.FrontendManaged}}
+func TestActivate_UnknownKind(t *testing.T) {
+	// Pass a literal kind the dispatch doesn't know about. (Validation
+	// would reject this at Load() time; we exercise the Activate dispatch
+	// here directly.)
+	p := &profile.Profile{Frontend: profile.Frontend{Kind: "weird"}}
 	if _, err := Activate(p, profile.ExpandContext{}); err == nil {
-		t.Fatal("expected error for unsupported kind")
+		t.Fatal("expected error for unknown kind")
 	}
 }
 
