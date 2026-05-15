@@ -1,6 +1,7 @@
 // Package daemon is the long-running supervisor process. It owns the
 // llama-server supervisor and the reverse proxy, and exposes a JSON-over-HTTP
-// control plane on a unix socket for the CLI.
+// control plane on both a unix socket (for the local CLI) and a TCP listener
+// on 127.0.0.1 (for vibeclient/vamp).
 package daemon
 
 import (
@@ -30,16 +31,20 @@ import (
 	"github.com/gallowaysoftware/vibe/internal/vibe/supervisor"
 )
 
-const defaultProxyPort = 9000
+const (
+	defaultProxyPort = 9000
+	defaultHTTPAddr  = "127.0.0.1:9001"
+)
 
 type Config struct {
 	ProxyPort   int    `yaml:"proxy_port,omitempty"`
+	HTTPAddr    string `yaml:"http_addr,omitempty"`    // empty → "127.0.0.1:9001"
 	LlamaBinary string `yaml:"llama_binary,omitempty"` // empty → "llama-server" from $PATH
 }
 
 // LoadConfig reads the global vibe config; missing file is not an error.
 func LoadConfig() (Config, error) {
-	c := Config{ProxyPort: defaultProxyPort}
+	c := Config{ProxyPort: defaultProxyPort, HTTPAddr: defaultHTTPAddr}
 	data, err := os.ReadFile(paths.ConfigFile())
 	if errors.Is(err, os.ErrNotExist) {
 		return c, nil
@@ -52,6 +57,9 @@ func LoadConfig() (Config, error) {
 	}
 	if c.ProxyPort == 0 {
 		c.ProxyPort = defaultProxyPort
+	}
+	if c.HTTPAddr == "" {
+		c.HTTPAddr = defaultHTTPAddr
 	}
 	return c, nil
 }
@@ -94,13 +102,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	sockPath := paths.Socket()
 	_ = os.Remove(sockPath) // stale socket from a hard kill
-	ln, err := net.Listen("unix", sockPath)
+	unixLn, err := net.Listen("unix", sockPath)
 	if err != nil {
 		return fmt.Errorf("listen unix %s: %w", sockPath, err)
 	}
 	defer os.Remove(sockPath)
 	if err := os.Chmod(sockPath, 0o600); err != nil {
 		return err
+	}
+
+	httpLn, err := net.Listen("tcp", d.cfg.HTTPAddr)
+	if err != nil {
+		unixLn.Close()
+		return fmt.Errorf("listen tcp %s: %w", d.cfg.HTTPAddr, err)
 	}
 
 	if err := writePIDFile(); err != nil {
@@ -113,15 +127,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer d.prx.Stop(context.Background())
 
-	srv := &http.Server{Handler: d.handler()}
-	errCh := make(chan error, 1)
-	go func() {
-		err := srv.Serve(ln)
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+	handler := d.handler()
+	unixSrv := &http.Server{Handler: handler}
+	httpSrv := &http.Server{Handler: handler}
+	errCh := make(chan error, 2)
+	serve := func(srv *http.Server, ln net.Listener) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
-		close(errCh)
-	}()
+	}
+	go serve(unixSrv, unixLn)
+	go serve(httpSrv, httpLn)
 
 	select {
 	case <-ctx.Done():
@@ -135,7 +151,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// child process exists and SIGINT will unblock waitReady on the other side.
 	_ = d.sup.Stop(shCtx)
 	d.prx.SetBackend(nil)
-	_ = srv.Shutdown(shCtx)
+	_ = unixSrv.Shutdown(shCtx)
+	_ = httpSrv.Shutdown(shCtx)
 	return nil
 }
 
