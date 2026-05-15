@@ -37,18 +37,20 @@ Today running local AI looks like:
 
 - **Profile**: the unit of configuration. A YAML file bundling a model spec, a frontend integration, and template variables that wire them together.
 - **MCP definitions**: one YAML file per Model Context Protocol server, dropped into `~/.config/vibe/mcp/` (e.g. `datadog.yaml`, `jira.yaml`). Profiles compose them by listing names: `frontend.mcps: [datadog, jira]`. Vibe injects a top-level `mcp` map into the rendered frontend config. Secrets stay in env vars (the frontend resolves `${env:...}` references); profiles never name them inline.
-- **Daemon**: supervises `llama-server` (and, later, docker-compose stacks). Exposes a control plane over a Unix socket.
+- **Daemon**: supervises `llama-server` and the active frontend. Exposes a control plane over a Unix socket.
+- **Frontend kinds**:
+  - `external` — vibe renders a sidecar config file (e.g. an `opencode.json`) and surfaces the env vars to set when launching the tool. No process lifecycle.
+  - `docker-compose` — vibe runs `docker compose up -d` against a user-supplied compose file on `vibe start`, polls any `wait_for` health endpoints, and runs `docker compose down` on `vibe stop`. Good fit for heavy stacks like Perplexica or Open WebUI that benefit from being lifecycle-coupled to a profile. See [`profiles/docker-compose.example.yaml`](profiles/docker-compose.example.yaml).
 - **Proxy**: reverse-proxies frontends to the active llama-server so swapping models doesn't require reconfiguring the frontend.
 - **CLI**: `start`, `stop`, `ps`, `logs`, `list`.
 
 ## Status
 
-Phase 1 in progress: profile schema, llama-server supervision, proxy, CLI, opencode integration. Single-host, local-only.
+Phase 1 in progress: profile schema, llama-server supervision, proxy, CLI, opencode integration, docker-compose frontends. Single-host, local-only.
 
 Not yet:
 
-- docker-compose frontends (Perplexica, Open WebUI)
-- managed-binary frontends
+- managed-binary frontends (native processes supervised by vibe)
 - TUI dashboard
 - VRAM enforcement
 - Remote (LAN) access from a laptop

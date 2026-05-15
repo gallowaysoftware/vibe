@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -57,6 +58,47 @@ type Frontend struct {
 	Template        map[string]any    `yaml:"template,omitempty"`
 	Env             map[string]string `yaml:"env,omitempty"`
 	MCPs            []string          `yaml:"mcps,omitempty"`
+
+	// docker-compose kind fields.
+	ComposeFile string       `yaml:"compose_file,omitempty"`
+	ProjectName string       `yaml:"project_name,omitempty"`
+	Services    []string     `yaml:"services,omitempty"`
+	WaitFor     []WaitForURL `yaml:"wait_for,omitempty"`
+}
+
+// WaitForURL describes a health-check endpoint the docker-compose driver
+// polls after `docker compose up -d`.
+type WaitForURL struct {
+	URL     string        `yaml:"url"`
+	Timeout time.Duration `yaml:"-"`
+}
+
+// waitForURLYAML is the on-disk shape; Timeout arrives as a duration string
+// (e.g. "60s") which we parse in UnmarshalYAML.
+type waitForURLYAML struct {
+	URL     string `yaml:"url"`
+	Timeout string `yaml:"timeout"`
+}
+
+// UnmarshalYAML parses the wait_for entry, including its duration-shaped
+// Timeout field.
+func (w *WaitForURL) UnmarshalYAML(value *yaml.Node) error {
+	var raw waitForURLYAML
+	raw.URL = ""
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	w.URL = raw.URL
+	if raw.Timeout == "" {
+		w.Timeout = 0
+		return nil
+	}
+	d, err := time.ParseDuration(raw.Timeout)
+	if err != nil {
+		return fmt.Errorf("wait_for.timeout %q: %w", raw.Timeout, err)
+	}
+	w.Timeout = d
+	return nil
 }
 
 // Load reads, parses, and validates a profile YAML file. Unknown fields are
@@ -127,8 +169,48 @@ func (p *Profile) Validate() error {
 		if len(p.Frontend.Template) == 0 {
 			return errors.New("frontend.template is required for kind=external")
 		}
-	case FrontendDockerCompose, FrontendManaged:
-		return fmt.Errorf("frontend.kind %q not supported yet (Phase 1: external only)", p.Frontend.Kind)
+		if p.Frontend.ComposeFile != "" {
+			return errors.New("frontend.compose_file is only valid for kind=docker-compose")
+		}
+		if p.Frontend.ProjectName != "" {
+			return errors.New("frontend.project_name is only valid for kind=docker-compose")
+		}
+		if len(p.Frontend.Services) > 0 {
+			return errors.New("frontend.services is only valid for kind=docker-compose")
+		}
+		if len(p.Frontend.WaitFor) > 0 {
+			return errors.New("frontend.wait_for is only valid for kind=docker-compose")
+		}
+	case FrontendDockerCompose:
+		if p.Frontend.ComposeFile == "" {
+			return errors.New("frontend.compose_file is required for kind=docker-compose")
+		}
+		if p.Frontend.WriteFile != "" {
+			return errors.New("frontend.write_file is only valid for kind=external")
+		}
+		if len(p.Frontend.Template) > 0 {
+			return errors.New("frontend.template is only valid for kind=external")
+		}
+		if len(p.Frontend.MCPs) > 0 {
+			return errors.New("frontend.mcps is only valid for kind=external")
+		}
+		seenSvc := make(map[string]struct{}, len(p.Frontend.Services))
+		for _, s := range p.Frontend.Services {
+			if s == "" {
+				return errors.New("frontend.services contains empty entry")
+			}
+			if _, dup := seenSvc[s]; dup {
+				return fmt.Errorf("frontend.services contains duplicate %q", s)
+			}
+			seenSvc[s] = struct{}{}
+		}
+		for i, w := range p.Frontend.WaitFor {
+			if w.URL == "" {
+				return fmt.Errorf("frontend.wait_for[%d].url is required", i)
+			}
+		}
+	case FrontendManaged:
+		return fmt.Errorf("frontend.kind %q not supported yet (Phase 1: external + docker-compose)", p.Frontend.Kind)
 	case "":
 		return errors.New("frontend.kind is required")
 	default:

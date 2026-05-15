@@ -168,6 +168,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	slog.Info("daemon shutting down", "reason", shutReason)
 	shCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	// Tear down the active frontend (if any) first; otherwise a
+	// docker-compose stack outlives the daemon and keeps serving stale
+	// requests at the (now-dead) proxy.
+	d.mu.Lock()
+	fr := d.frontend
+	d.mu.Unlock()
+	if fr != nil {
+		if err := frontend.Deactivate(shCtx, fr); err != nil {
+			slog.Warn("frontend deactivate on shutdown failed", "err", err)
+		}
+	}
 	// Stop the supervisor unconditionally; if a start is mid-flight the
 	// child exists and SIGINT will unblock waitReady.
 	_ = d.sup.Stop(shCtx)
@@ -246,7 +257,7 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 	d.prx.SetBackend(backendURL)
 
 	vibeAPI := fmt.Sprintf("http://127.0.0.1:%d/v1", d.cfg.ProxyPort)
-	fr, err := frontend.Activate(p, profile.ExpandContext{
+	fr, err := frontend.ActivateWithContext(startCtx, p, profile.ExpandContext{
 		VibeAPI:      vibeAPI,
 		ModelAlias:   p.Model.Alias,
 		ModelContext: p.Model.Context,
@@ -371,11 +382,24 @@ func (d *Daemon) Pull(ctx context.Context, req *connect.Request[vibev1.PullReque
 func (d *Daemon) stopActive(ctx context.Context) error {
 	d.mu.Lock()
 	active := d.active
+	fr := d.frontend
 	d.mu.Unlock()
 	if active == nil {
 		return nil
 	}
 	slog.Info("stopping profile", "profile", active.Name)
+	// Tear down the frontend first. For docker-compose this issues
+	// `docker compose down`, which may make requests against the proxy on
+	// its way out — better to fail those requests cleanly than to surface
+	// 502s from a half-stopped proxy/supervisor.
+	if fr != nil {
+		if err := frontend.Deactivate(ctx, fr); err != nil {
+			// Log and continue: leaving a stack up is bad, but failing to
+			// stop the supervisor is worse. The user can still `docker
+			// compose down` by hand if needed.
+			slog.Warn("frontend deactivate failed", "profile", active.Name, "err", err)
+		}
+	}
 	if err := d.sup.Stop(ctx); err != nil {
 		return err
 	}

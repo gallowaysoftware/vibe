@@ -1,0 +1,65 @@
+# Example profile: research stack (Perplexica + SearXNG) brought up as a
+# docker-compose project by vibe.
+#
+# Drop a compose file at
+# $XDG_STATE_HOME/vibe/frontend/perplexica/docker-compose.yaml (vibe will
+# never write to this path itself; it just shells out to docker), then
+# copy this profile to ~/.config/vibe/profiles/research.yaml and
+# `vibe start research`.
+#
+# On start, vibe runs:
+#   docker compose -f <compose_file> -p vibe-perplexica up -d searxng perplexica
+# then polls each wait_for URL until it 2xxs. On stop, vibe runs:
+#   docker compose -f <compose_file> -p vibe-perplexica down
+# (no per-service filter — the whole project comes down so networks and
+# anonymous volumes get cleaned up).
+
+name: research
+description: Research with Qwen3 + Perplexica/SearXNG
+
+model:
+  path: ~/models/qwen3-30b-q6_k.gguf
+  alias: qwen3-30b
+  context: 32768
+  parallel: 1
+  gpu_layers: 999
+  flash_attn: true
+  jinja: true
+
+frontend:
+  kind: docker-compose
+  app: perplexica
+
+  # Required. ${VIBE_STATE_DIR} expands to $XDG_STATE_HOME/vibe.
+  compose_file: ${VIBE_STATE_DIR}/frontend/perplexica/docker-compose.yaml
+
+  # Optional. Defaults to "vibe-<profile-name>" (here: "vibe-research").
+  # Pin it explicitly when you want a name that survives renaming the
+  # profile.
+  project_name: vibe-perplexica
+
+  # Optional. When set, vibe only `up -d`s these services. When unset,
+  # the entire compose project comes up.
+  services:
+    - searxng
+    - perplexica
+
+  # Optional. Each entry is polled after `up -d` succeeds. Polling
+  # continues until the URL returns a 2xx response or `timeout` (default
+  # 60s) elapses. Activation fails if any URL never goes ready; vibe will
+  # `compose down` the stack on failure so you're not left with half of
+  # it running.
+  wait_for:
+    - url: http://127.0.0.1:3001/
+      timeout: 90s
+    - url: http://127.0.0.1:8080/
+
+  # Optional. Pairs are exported into the environment passed to `docker
+  # compose up`, so the compose file can reference them via ${VAR}.
+  # Values support the same ${VAR} expansion as kind=external profiles —
+  # ${VIBE_API} resolves to vibe's proxy URL.
+  env:
+    OLLAMA_API_URL: ${VIBE_API}
+    SEARXNG_PORT: "8080"
+
+estimated_vram_gb: 20
