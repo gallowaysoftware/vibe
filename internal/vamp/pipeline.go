@@ -71,6 +71,24 @@ type Stage struct {
 	// the user-supplied args so users don't manage the destination path
 	// themselves. Binary (shared with audio) defaults to "ffmpeg" on $PATH.
 	FFmpegArgs []string `yaml:"ffmpeg_args,omitempty"`
+
+	// YouTube-stage fields. Video is a template path to the MP4 to upload
+	// (typically the output of an upstream ffmpeg stage). Title/Description
+	// are template-rendered metadata. Tags is a fixed string list (optional).
+	// Privacy is one of "private" (default), "unlisted", "public".
+	// CategoryID is YouTube's numeric category id (default "22", People &
+	// Blogs). Thumbnail is an optional template path to an image uploaded
+	// after the video. CredentialsFile is an OAuth refresh-token JSON;
+	// defaults to ~/.config/vamp/youtube-credentials.json. The executor
+	// records the resulting watch URL as the stage output.
+	Video           string   `yaml:"video,omitempty"`
+	Title           string   `yaml:"title,omitempty"`
+	Description     string   `yaml:"description,omitempty"`
+	Tags            []string `yaml:"tags,omitempty"`
+	Privacy         string   `yaml:"privacy,omitempty"`
+	CategoryID      string   `yaml:"category_id,omitempty"`
+	Thumbnail       string   `yaml:"thumbnail,omitempty"`
+	CredentialsFile string   `yaml:"credentials_file,omitempty"`
 }
 
 // ForeachSpec is the structured fan-out descriptor for a stage. The previous
@@ -187,9 +205,10 @@ func (p *Pipeline) Validate() error {
 			stageType = StageTypeText
 		}
 		// Capability is required for every stage type except the
-		// subprocess-only ones (audio, ffmpeg), which run as local
-		// binaries and never activate a vibe profile.
-		if stageType != StageTypeAudio && stageType != StageTypeFFmpeg && s.Capability == "" {
+		// subprocess-only ones (audio, ffmpeg) and the network-only youtube
+		// stage, which talk to a third-party API and never activate a vibe
+		// profile.
+		if stageType != StageTypeAudio && stageType != StageTypeFFmpeg && stageType != StageTypeYouTube && s.Capability == "" {
 			return fmt.Errorf("%s: capability is required", ctx)
 		}
 		switch stageType {
@@ -208,6 +227,9 @@ func (p *Pipeline) Validate() error {
 			}
 			if len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
+			}
+			if err := rejectYouTubeFields(ctx, s); err != nil {
+				return err
 			}
 		case StageTypeAudio:
 			if s.Voice == "" {
@@ -239,6 +261,9 @@ func (p *Pipeline) Validate() error {
 			}
 			if len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
+			}
+			if err := rejectYouTubeFields(ctx, s); err != nil {
+				return err
 			}
 		case StageTypeFFmpeg:
 			// ffmpeg stages drive a local subprocess to assemble media
@@ -273,6 +298,9 @@ func (p *Pipeline) Validate() error {
 			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" {
 				return fmt.Errorf("%s: voice/text/voices_dir are only valid on type: audio stages", ctx)
 			}
+			if err := rejectYouTubeFields(ctx, s); err != nil {
+				return err
+			}
 		case StageTypeComfyUI:
 			if s.Workflow == "" {
 				return fmt.Errorf("%s: workflow is required for type: comfyui stages", ctx)
@@ -303,8 +331,51 @@ func (p *Pipeline) Validate() error {
 			if len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
 			}
+			if err := rejectYouTubeFields(ctx, s); err != nil {
+				return err
+			}
+		case StageTypeYouTube:
+			if s.Video == "" {
+				return fmt.Errorf("%s: video is required for type: youtube stages", ctx)
+			}
+			if s.Title == "" {
+				return fmt.Errorf("%s: title is required for type: youtube stages", ctx)
+			}
+			if s.Description == "" {
+				return fmt.Errorf("%s: description is required for type: youtube stages", ctx)
+			}
+			if s.Privacy != "" && s.Privacy != "private" && s.Privacy != "unlisted" && s.Privacy != "public" {
+				return fmt.Errorf("%s: privacy %q is not supported (allowed: private, unlisted, public)", ctx, s.Privacy)
+			}
+			if s.Capability != "" {
+				return fmt.Errorf("%s: capability is only valid on stage types that activate a vibe profile (youtube talks to the YouTube Data API as a network client)", ctx)
+			}
+			if s.Prompt != "" {
+				return fmt.Errorf("%s: prompt is only valid on type: text stages", ctx)
+			}
+			if s.PromptFile != "" {
+				return fmt.Errorf("%s: prompt_file is only valid on type: text stages", ctx)
+			}
+			if len(s.Params) > 0 {
+				return fmt.Errorf("%s: params is only valid on type: text stages", ctx)
+			}
+			if s.OutputFormat != "" {
+				return fmt.Errorf("%s: output_format is only valid on type: text stages", ctx)
+			}
+			if s.Workflow != "" {
+				return fmt.Errorf("%s: workflow is only valid on type: comfyui stages", ctx)
+			}
+			if len(s.Parameters) > 0 {
+				return fmt.Errorf("%s: parameters is only valid on type: comfyui stages", ctx)
+			}
+			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" {
+				return fmt.Errorf("%s: voice/text/voices_dir are only valid on type: audio stages", ctx)
+			}
+			if len(s.FFmpegArgs) > 0 {
+				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
+			}
 		default:
-			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio, ffmpeg)", ctx, s.Type)
+			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio, ffmpeg, youtube)", ctx, s.Type)
 		}
 		if s.OutputFormat != "" && s.OutputFormat != "json" {
 			return fmt.Errorf("%s: output_format %q is not supported (allowed: \"\", json)", ctx, s.OutputFormat)
@@ -379,6 +450,32 @@ func (p *Pipeline) Validate() error {
 	// topological sort cannot consume every stage.
 	if cycle := findCycle(p.Stages); cycle != nil {
 		return fmt.Errorf("dependency cycle detected: %s", strings.Join(cycle, " -> "))
+	}
+	return nil
+}
+
+// rejectYouTubeFields returns an error if any youtube-only field is set on a
+// non-youtube stage. Kept as a small helper so each non-youtube case in
+// Validate's type switch can cheaply enforce the same rejection without
+// repeating six checks. Tags is intentionally NOT a youtube-only field — its
+// name is generic enough that future stage types may reasonably reuse it; the
+// other fields (video, privacy, category_id, thumbnail, credentials_file) are
+// specific to the youtube upload path.
+func rejectYouTubeFields(ctx string, s Stage) error {
+	if s.Video != "" {
+		return fmt.Errorf("%s: video is only valid on type: youtube stages", ctx)
+	}
+	if s.Privacy != "" {
+		return fmt.Errorf("%s: privacy is only valid on type: youtube stages", ctx)
+	}
+	if s.CategoryID != "" {
+		return fmt.Errorf("%s: category_id is only valid on type: youtube stages", ctx)
+	}
+	if s.Thumbnail != "" {
+		return fmt.Errorf("%s: thumbnail is only valid on type: youtube stages", ctx)
+	}
+	if s.CredentialsFile != "" {
+		return fmt.Errorf("%s: credentials_file is only valid on type: youtube stages", ctx)
 	}
 	return nil
 }

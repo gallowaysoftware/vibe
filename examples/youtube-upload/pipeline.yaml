@@ -1,0 +1,94 @@
+name: youtube_upload_smoke
+description: |
+  Five-stage end-to-end pipeline that drafts a short narration, synthesizes a
+  voiceover, renders a cover image, muxes everything into final.mp4, and
+  uploads the result to YouTube as an unlisted video. The publish stage is
+  the only new piece on top of the existing video-pipeline example.
+
+inputs:
+  topic:
+    type: string
+    required: true
+  title:
+    type: string
+    required: true
+
+stages:
+  # 1. Draft a short narration for the topic. Capability "reasoning" maps to
+  # any llama-server profile in capabilities.yaml.
+  - id: script
+    type: text
+    capability: reasoning
+    prompt: |
+      Write a 2-sentence narration about {{.inputs.topic}}.
+      Plain text only, no markdown, no preamble.
+    output: script.txt
+    params:
+      max_tokens: 1024
+      temperature: 0.5
+
+  # 2. TTS the narration to .wav. Audio stages run as a subprocess and do
+  # not activate a vibe profile.
+  - id: voiceover
+    type: audio
+    voice: en_US-lessac-medium
+    text: "{{.stages.script.output}}"
+    inputs: [script]
+    output: voiceover.wav
+
+  # 3. Render a single illustrative image. The "image_gen" capability swaps
+  # the active vibe profile to a ComfyUI backend.
+  - id: render
+    type: comfyui
+    capability: image_gen
+    inputs: [script]
+    workflow: ../video-pipeline/workflows/sdxl_turbo.json
+    parameters:
+      "4.text": "cinematic still illustrating: {{.inputs.topic}}"
+      "7.seed": "42"
+    output: cover.png
+
+  # 4. Mux audio + still image into final.mp4.
+  - id: assemble
+    type: ffmpeg
+    inputs: [voiceover, render]
+    ffmpeg_args:
+      - "-loop"
+      - "1"
+      - "-i"
+      - "{{ .stages.render.output }}"
+      - "-i"
+      - "{{ .stages.voiceover.output }}"
+      - "-c:v"
+      - "libx264"
+      - "-pix_fmt"
+      - "yuv420p"
+      - "-tune"
+      - "stillimage"
+      - "-c:a"
+      - "aac"
+      - "-b:a"
+      - "192k"
+      - "-shortest"
+    output: final.mp4
+
+  # 5. Upload the resulting MP4 to YouTube. Unlisted by default so a misfire
+  # doesn't publish to the world; flip to "public" once the pipeline is wired
+  # up the way you want. The credentials_file path can be overridden (or you
+  # can use the VAMP_YOUTUBE_* env vars described in this directory's README)
+  # — the default location is ~/.config/vamp/youtube-credentials.json.
+  - id: publish
+    type: youtube
+    inputs: [assemble, script, render]
+    video: "{{ .stages.assemble.output }}"
+    title: "{{ .inputs.title }}"
+    description: |
+      Auto-generated narration about {{ .inputs.topic }}.
+
+      Script:
+      {{ .stages.script.output }}
+    tags: ["ai", "vamp", "demo"]
+    privacy: unlisted
+    category_id: "22"
+    thumbnail: "{{ .stages.render.output }}"
+    output: youtube_url.txt
