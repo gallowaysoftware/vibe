@@ -24,15 +24,13 @@ part of profile activation and tears it down on `vibe stop`. See
 `profiles/docker-compose.example.yaml` and the Architecture section of
 the README.
 
-## Managed (native-binary) frontends
+## ~~Managed (native-binary) frontends~~ (done)
 
-Still pending. Vibe currently supports two frontend kinds: `external`
-(write a sidecar config, user launches the tool) and `docker-compose`
-(vibe runs `docker compose up -d`/`down`). The third planned kind,
-`managed`, would supervise a native binary directly — same lifecycle
-coupling as docker-compose but without the container dependency. Useful
-for tools that ship as a single executable and want to be started/stopped
-with the model.
+Implemented: `frontend.kind: managed` execs a native binary directly,
+captures its PID, polls any configured `wait_for` URLs, and stops it on
+`vibe stop` with the same SIGINT-then-SIGKILL contract the backend
+supervisor uses for llama-server. See `profiles/managed.example.yaml`
+and `internal/vibe/frontend/managed.go`.
 
 ## ~~`vibe doctor --install comfyui`~~ (done)
 

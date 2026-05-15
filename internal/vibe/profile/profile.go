@@ -94,6 +94,13 @@ type Frontend struct {
 	ProjectName string       `yaml:"project_name,omitempty"`
 	Services    []string     `yaml:"services,omitempty"`
 	WaitFor     []WaitForURL `yaml:"wait_for,omitempty"`
+
+	// managed kind fields. Binary is the executable to launch; Args/Workdir
+	// are optional. Env, WaitFor, RestartRequired, and App are reused from
+	// the existing shape above.
+	Binary  string   `yaml:"binary,omitempty"`
+	Args    []string `yaml:"args,omitempty"`
+	Workdir string   `yaml:"workdir,omitempty"`
 }
 
 // WaitForURL describes a health-check endpoint the docker-compose driver
@@ -172,6 +179,8 @@ func Load(path string) (*Profile, error) {
 		p.Backend.ComfyUI.Python = expandTilde(p.Backend.ComfyUI.Python)
 	}
 	p.Frontend.WriteFile = expandTilde(p.Frontend.WriteFile)
+	p.Frontend.Binary = expandTilde(p.Frontend.Binary)
+	p.Frontend.Workdir = expandTilde(p.Frontend.Workdir)
 
 	if err := p.Validate(); err != nil {
 		return nil, fmt.Errorf("validate profile %s: %w", path, err)
@@ -286,6 +295,15 @@ func (p *Profile) validateFrontend() error {
 		if len(p.Frontend.WaitFor) > 0 {
 			return errors.New("frontend.wait_for is only valid for kind=docker-compose")
 		}
+		if p.Frontend.Binary != "" {
+			return errors.New("frontend.binary is only valid for kind=managed")
+		}
+		if len(p.Frontend.Args) > 0 {
+			return errors.New("frontend.args is only valid for kind=managed")
+		}
+		if p.Frontend.Workdir != "" {
+			return errors.New("frontend.workdir is only valid for kind=managed")
+		}
 	case FrontendDockerCompose:
 		if p.Frontend.ComposeFile == "" {
 			return errors.New("frontend.compose_file is required for kind=docker-compose")
@@ -298,6 +316,15 @@ func (p *Profile) validateFrontend() error {
 		}
 		if len(p.Frontend.MCPs) > 0 {
 			return errors.New("frontend.mcps is only valid for kind=external")
+		}
+		if p.Frontend.Binary != "" {
+			return errors.New("frontend.binary is only valid for kind=managed")
+		}
+		if len(p.Frontend.Args) > 0 {
+			return errors.New("frontend.args is only valid for kind=managed")
+		}
+		if p.Frontend.Workdir != "" {
+			return errors.New("frontend.workdir is only valid for kind=managed")
 		}
 		seenSvc := make(map[string]struct{}, len(p.Frontend.Services))
 		for _, s := range p.Frontend.Services {
@@ -315,7 +342,45 @@ func (p *Profile) validateFrontend() error {
 			}
 		}
 	case FrontendManaged:
-		return fmt.Errorf("frontend.kind %q not supported yet (Phase 1: external + docker-compose)", p.Frontend.Kind)
+		if p.Frontend.Binary == "" {
+			return errors.New("frontend.binary is required for kind=managed")
+		}
+		if p.Frontend.WriteFile != "" {
+			return errors.New("frontend.write_file is only valid for kind=external")
+		}
+		if len(p.Frontend.Template) > 0 {
+			return errors.New("frontend.template is only valid for kind=external")
+		}
+		if len(p.Frontend.MCPs) > 0 {
+			return errors.New("frontend.mcps is only valid for kind=external")
+		}
+		if p.Frontend.ComposeFile != "" {
+			return errors.New("frontend.compose_file is only valid for kind=docker-compose")
+		}
+		if p.Frontend.ProjectName != "" {
+			return errors.New("frontend.project_name is only valid for kind=docker-compose")
+		}
+		if len(p.Frontend.Services) > 0 {
+			return errors.New("frontend.services is only valid for kind=docker-compose")
+		}
+		info, err := os.Stat(p.Frontend.Binary)
+		if err != nil {
+			return fmt.Errorf("frontend.binary %s: %w", p.Frontend.Binary, err)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("frontend.binary %s: is a directory", p.Frontend.Binary)
+		}
+		// Require any executable bit (owner, group, or other) to be set so we
+		// fail validation rather than failing at exec time with a confusing
+		// "permission denied".
+		if info.Mode().Perm()&0o111 == 0 {
+			return fmt.Errorf("frontend.binary %s: not executable (mode %v)", p.Frontend.Binary, info.Mode().Perm())
+		}
+		for i, w := range p.Frontend.WaitFor {
+			if w.URL == "" {
+				return fmt.Errorf("frontend.wait_for[%d].url is required", i)
+			}
+		}
 	case "":
 		return errors.New("frontend.kind is required")
 	default:
@@ -351,7 +416,10 @@ func (f Frontend) IsZero() bool {
 		f.ComposeFile == "" &&
 		f.ProjectName == "" &&
 		len(f.Services) == 0 &&
-		len(f.WaitFor) == 0
+		len(f.WaitFor) == 0 &&
+		f.Binary == "" &&
+		len(f.Args) == 0 &&
+		f.Workdir == ""
 }
 
 func expandTilde(p string) string {

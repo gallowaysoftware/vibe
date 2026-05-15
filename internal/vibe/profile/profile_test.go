@@ -39,6 +39,28 @@ func stubComfyDir(t *testing.T) string {
 	return dir
 }
 
+// stubManagedBinary writes an executable shell script so
+// frontend.binary validation passes. Returns its absolute path.
+func stubManagedBinary(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "run-server.sh")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// stubManagedBinaryNotExec writes a regular file *without* the executable
+// bit set. Used to assert validation rejects non-executable binaries.
+func stubManagedBinaryNotExec(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "run-server.sh")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexec sleep 60\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func TestLoad_Valid(t *testing.T) {
 	model := stubModelFile(t)
 	yaml := `
@@ -356,13 +378,204 @@ frontend: {kind: external, app: opencode, write_file: /tmp/x}
 			wantErr: "template is required",
 		},
 		{
-			name: "managed not yet supported",
+			name: "managed missing binary",
 			yaml: `
 name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend: {kind: managed, app: x}
 `,
-			wantErr: "not supported yet",
+			wantErr: "binary is required",
+		},
+		{
+			name: "managed binary missing on disk",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend: {kind: managed, app: x, binary: /nonexistent/run-server.sh}
+`,
+			wantErr: "frontend.binary",
+		},
+		{
+			name: "managed binary not executable",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend: {kind: managed, app: x, binary: ` + stubManagedBinaryNotExec(t) + `}
+`,
+			wantErr: "not executable",
+		},
+		{
+			name: "managed rejects write_file",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: managed
+  app: x
+  binary: ` + stubManagedBinary(t) + `
+  write_file: /tmp/x.json
+`,
+			wantErr: "write_file is only valid for kind=external",
+		},
+		{
+			name: "managed rejects template",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: managed
+  app: x
+  binary: ` + stubManagedBinary(t) + `
+  template: {a: 1}
+`,
+			wantErr: "template is only valid for kind=external",
+		},
+		{
+			name: "managed rejects mcps",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: managed
+  app: x
+  binary: ` + stubManagedBinary(t) + `
+  mcps: [datadog]
+`,
+			wantErr: "mcps is only valid for kind=external",
+		},
+		{
+			name: "managed rejects compose_file",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: managed
+  app: x
+  binary: ` + stubManagedBinary(t) + `
+  compose_file: /tmp/dc.yaml
+`,
+			wantErr: "compose_file is only valid for kind=docker-compose",
+		},
+		{
+			name: "managed rejects project_name",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: managed
+  app: x
+  binary: ` + stubManagedBinary(t) + `
+  project_name: vibe-x
+`,
+			wantErr: "project_name is only valid for kind=docker-compose",
+		},
+		{
+			name: "managed rejects services",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: managed
+  app: x
+  binary: ` + stubManagedBinary(t) + `
+  services: [web]
+`,
+			wantErr: "services is only valid for kind=docker-compose",
+		},
+		{
+			name: "managed wait_for missing url",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: managed
+  app: x
+  binary: ` + stubManagedBinary(t) + `
+  wait_for:
+    - timeout: 5s
+`,
+			wantErr: "wait_for[0].url is required",
+		},
+		{
+			name: "external rejects binary",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: external
+  app: opencode
+  write_file: /tmp/x
+  template: {a: 1}
+  binary: /usr/local/bin/foo
+`,
+			wantErr: "binary is only valid for kind=managed",
+		},
+		{
+			name: "external rejects args",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: external
+  app: opencode
+  write_file: /tmp/x
+  template: {a: 1}
+  args: [--foo]
+`,
+			wantErr: "args is only valid for kind=managed",
+		},
+		{
+			name: "external rejects workdir",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: external
+  app: opencode
+  write_file: /tmp/x
+  template: {a: 1}
+  workdir: /tmp
+`,
+			wantErr: "workdir is only valid for kind=managed",
+		},
+		{
+			name: "docker-compose rejects binary",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: docker-compose
+  app: x
+  compose_file: /tmp/dc.yaml
+  binary: /usr/local/bin/foo
+`,
+			wantErr: "binary is only valid for kind=managed",
+		},
+		{
+			name: "docker-compose rejects args",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: docker-compose
+  app: x
+  compose_file: /tmp/dc.yaml
+  args: [--foo]
+`,
+			wantErr: "args is only valid for kind=managed",
+		},
+		{
+			name: "docker-compose rejects workdir",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: docker-compose
+  app: x
+  compose_file: /tmp/dc.yaml
+  workdir: /tmp
+`,
+			wantErr: "workdir is only valid for kind=managed",
 		},
 		{
 			name: "docker-compose missing compose_file",
@@ -545,6 +758,70 @@ frontend:
 	}
 	if p.Frontend.Env["OLLAMA_API_URL"] != "${VIBE_API}" {
 		t.Errorf("env OLLAMA_API_URL = %q (should be the literal placeholder pre-expansion)", p.Frontend.Env["OLLAMA_API_URL"])
+	}
+}
+
+func TestLoad_Managed_Valid(t *testing.T) {
+	model := stubModelFile(t)
+	bin := stubManagedBinary(t)
+	workdir := filepath.Dir(bin)
+	yaml := `
+name: openwebui
+description: open-webui under vibe supervision
+backend:
+  llama_server:
+    path: ` + model + `
+    alias: m
+    context: 1024
+frontend:
+  kind: managed
+  app: open-webui
+  binary: ` + bin + `
+  args:
+    - "--listen"
+    - "127.0.0.1"
+    - "--port"
+    - "8080"
+  workdir: ` + workdir + `
+  env:
+    OPEN_WEBUI_DATA: /var/lib/open-webui
+  wait_for:
+    - url: http://127.0.0.1:8080/
+      timeout: 30s
+`
+	p, err := Load(writeProfile(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Frontend.Kind != FrontendManaged {
+		t.Errorf("kind = %q", p.Frontend.Kind)
+	}
+	if p.Frontend.Binary != bin {
+		t.Errorf("binary = %q, want %q", p.Frontend.Binary, bin)
+	}
+	wantArgs := []string{"--listen", "127.0.0.1", "--port", "8080"}
+	if len(p.Frontend.Args) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", p.Frontend.Args, wantArgs)
+	}
+	for i, a := range wantArgs {
+		if p.Frontend.Args[i] != a {
+			t.Errorf("args[%d] = %q, want %q", i, p.Frontend.Args[i], a)
+		}
+	}
+	if p.Frontend.Workdir != workdir {
+		t.Errorf("workdir = %q, want %q", p.Frontend.Workdir, workdir)
+	}
+	if p.Frontend.Env["OPEN_WEBUI_DATA"] != "/var/lib/open-webui" {
+		t.Errorf("env OPEN_WEBUI_DATA = %q", p.Frontend.Env["OPEN_WEBUI_DATA"])
+	}
+	if len(p.Frontend.WaitFor) != 1 {
+		t.Fatalf("wait_for = %v", p.Frontend.WaitFor)
+	}
+	if p.Frontend.WaitFor[0].URL != "http://127.0.0.1:8080/" {
+		t.Errorf("wait_for[0].url = %q", p.Frontend.WaitFor[0].URL)
+	}
+	if p.Frontend.WaitFor[0].Timeout != 30*time.Second {
+		t.Errorf("wait_for[0].timeout = %v, want 30s", p.Frontend.WaitFor[0].Timeout)
 	}
 }
 

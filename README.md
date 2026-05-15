@@ -67,16 +67,16 @@ Today running local AI looks like:
 - **Frontend kinds** (only applicable to `backend.llama_server` profiles):
   - `external` — vibe renders a sidecar config file (e.g. an `opencode.json`) and surfaces the env vars to set when launching the tool. No process lifecycle.
   - `docker-compose` — vibe runs `docker compose up -d` against a user-supplied compose file on `vibe start`, polls any `wait_for` health endpoints, and runs `docker compose down` on `vibe stop`. Good fit for heavy stacks like Perplexica or Open WebUI that benefit from being lifecycle-coupled to a profile. See [`profiles/docker-compose.example.yaml`](profiles/docker-compose.example.yaml).
+  - `managed` — vibe execs a native binary directly with the configured args/env/workdir, polls any `wait_for` URLs, and stops it on `vibe stop` with a SIGINT (10s graceful) → SIGKILL contract. Good fit for tools that ship as a single executable (e.g. an Open-WebUI launcher script) and want to be lifecycle-coupled without a container dependency. See [`profiles/managed.example.yaml`](profiles/managed.example.yaml).
 - **Proxy**: reverse-proxies frontends to the active llama-server so swapping models doesn't require reconfiguring the frontend.
 - **CLI**: `start`, `stop`, `ps`, `logs`, `list`.
 
 ## Status
 
-Phase 1 in progress: profile schema, llama-server supervision, proxy, CLI, opencode integration, docker-compose frontends. Single-host, local-only.
+Phase 1 in progress: profile schema, llama-server supervision, proxy, CLI, opencode integration, docker-compose frontends, managed-binary frontends. Single-host, local-only.
 
 Not yet:
 
-- managed-binary frontends (native processes supervised by vibe)
 - VRAM enforcement
 - Remote (LAN) access from a laptop
 
