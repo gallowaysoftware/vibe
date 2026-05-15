@@ -275,12 +275,16 @@ type HistoryStatus struct {
 	StatusStr string    `json:"status_str,omitempty"`
 }
 
-// NodeOutputs is a node's outputs map. Most fields are typed; unknown
-// per-output kinds (gifs, animated, etc.) are accepted by the decoder but
-// only Images is surfaced for Phase 2. Add fields here as later phases need
-// them.
+// NodeOutputs is a node's outputs map. ComfyUI buckets outputs by media kind
+// — SaveImage emits "images", the modern SaveVideo (and recent
+// VHS_VideoCombine builds) emit "videos", and older SaveAnimatedWEBP /
+// legacy VHS variants emit "gifs". Add fields here as we encounter new
+// kinds (audio, latents, etc.). The executor flattens all populated buckets
+// into a single deterministically-ordered file list.
 type NodeOutputs struct {
 	Images []OutputFile `json:"images,omitempty"`
+	Videos []OutputFile `json:"videos,omitempty"`
+	Gifs   []OutputFile `json:"gifs,omitempty"`
 }
 
 // OutputFile names a single file produced by a workflow node. Filename and
