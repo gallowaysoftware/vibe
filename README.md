@@ -1,5 +1,7 @@
 # vibe
 
+![CI](https://github.com/gallowaysoftware/vibe/actions/workflows/ci.yml/badge.svg)
+
 A task-oriented launcher for local AI inference. Think `docker compose` for local AI workflows: define a profile that bundles a model configuration with a frontend, and one command brings up everything for a task.
 
 ```
