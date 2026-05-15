@@ -23,6 +23,7 @@ func rootCmd() *cobra.Command {
 		listCmd(),
 		logsCmd(),
 		daemonCmd(),
+		shutdownCmd(),
 	)
 	return root
 }

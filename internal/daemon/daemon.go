@@ -33,7 +33,8 @@ import (
 const defaultProxyPort = 9000
 
 type Config struct {
-	ProxyPort int `yaml:"proxy_port,omitempty"`
+	ProxyPort   int    `yaml:"proxy_port,omitempty"`
+	LlamaBinary string `yaml:"llama_binary,omitempty"` // empty → "llama-server" from $PATH
 }
 
 // LoadConfig reads the global vibe config; missing file is not an error.
@@ -67,13 +68,17 @@ type Daemon struct {
 	active    *profile.Profile
 	startTime time.Time
 	frontend  *frontend.Result
+
+	shutdown     chan struct{}
+	shutdownOnce sync.Once
 }
 
 func New(cfg Config) *Daemon {
 	return &Daemon{
-		cfg: cfg,
-		sup: supervisor.New(""),
-		prx: proxy.New(fmt.Sprintf("127.0.0.1:%d", cfg.ProxyPort)),
+		cfg:      cfg,
+		sup:      supervisor.New(cfg.LlamaBinary),
+		prx:      proxy.New(fmt.Sprintf("127.0.0.1:%d", cfg.ProxyPort)),
+		shutdown: make(chan struct{}),
 	}
 }
 
@@ -120,24 +125,38 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
-		shCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		_ = d.stopActive(shCtx)
-		_ = srv.Shutdown(shCtx)
-		return nil
+	case <-d.shutdown:
 	case err := <-errCh:
 		return err
 	}
+	shCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	// Stop the supervisor unconditionally; if a start is mid-flight the
+	// child process exists and SIGINT will unblock waitReady on the other side.
+	_ = d.sup.Stop(shCtx)
+	d.prx.SetBackend(nil)
+	_ = srv.Shutdown(shCtx)
+	return nil
 }
 
 func (d *Daemon) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /start", d.handleStart)
 	mux.HandleFunc("POST /stop", d.handleStop)
+	mux.HandleFunc("POST /shutdown", d.handleShutdown)
 	mux.HandleFunc("GET /status", d.handleStatus)
 	mux.HandleFunc("GET /list", d.handleList)
 	mux.HandleFunc("GET /logs", d.handleLogs)
 	return mux
+}
+
+func (d *Daemon) handleShutdown(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "shutting down"})
+	// Trigger after the response flushes so the client doesn't see EOF.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		d.shutdownOnce.Do(func() { close(d.shutdown) })
+	}()
 }
 
 func (d *Daemon) handleStart(w http.ResponseWriter, r *http.Request) {
