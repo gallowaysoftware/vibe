@@ -1,0 +1,26 @@
+name: voiceover_smoke
+description: Text stage drafts a short narration; audio stage shells out to Piper TTS to synthesize it as WAV.
+
+inputs:
+  topic:
+    type: string
+    required: true
+
+stages:
+  - id: script
+    type: text
+    capability: reasoning
+    prompt: |
+      Write a short 2-sentence narration about {{.inputs.topic}}.
+      No markdown, just plain narration text. Output exactly the narration with no preamble.
+    output: script.txt
+    params:
+      max_tokens: 1024
+      temperature: 0.5
+
+  - id: voiceover
+    type: audio
+    voice: en_US-lessac-medium
+    text: "{{.stages.script.output}}"
+    inputs: [script]
+    output: voiceover.wav
