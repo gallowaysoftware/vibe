@@ -33,6 +33,11 @@ frontend:
   # relaunching opencode is required to pick up the new endpoint.
   restart_required: true
   write_file: ${VIBE_STATE_DIR}/frontend/code/opencode.json
+  # MCP servers to wire into this profile. Each name resolves to
+  # $XDG_CONFIG_HOME/vibe/mcp/<name>.yaml (see profiles/mcp.example.yaml for
+  # the format). Vibe injects a top-level `mcp` map into the rendered config.
+  # Uncomment after dropping in matching definitions:
+  # mcps: [datadog]
   env:
     # Vibe surfaces this back to the user via `vibe start` output; you should
     # set it (or eval `vibe env code`) before launching opencode.

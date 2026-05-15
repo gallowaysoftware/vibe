@@ -56,6 +56,7 @@ type Frontend struct {
 	WriteFile       string            `yaml:"write_file,omitempty"`
 	Template        map[string]any    `yaml:"template,omitempty"`
 	Env             map[string]string `yaml:"env,omitempty"`
+	MCPs            []string          `yaml:"mcps,omitempty"`
 }
 
 // Load reads, parses, and validates a profile YAML file. Unknown fields are
@@ -132,6 +133,19 @@ func (p *Profile) Validate() error {
 		return errors.New("frontend.kind is required")
 	default:
 		return fmt.Errorf("frontend.kind %q is unknown (expected: external, docker-compose, managed)", p.Frontend.Kind)
+	}
+
+	if len(p.Frontend.MCPs) > 0 {
+		if p.Frontend.Kind != FrontendExternal {
+			return fmt.Errorf("frontend.mcps requires frontend.kind=external (got %q)", p.Frontend.Kind)
+		}
+		seen := make(map[string]struct{}, len(p.Frontend.MCPs))
+		for _, name := range p.Frontend.MCPs {
+			if _, dup := seen[name]; dup {
+				return fmt.Errorf("frontend.mcps contains duplicate %q", name)
+			}
+			seen[name] = struct{}{}
+		}
 	}
 
 	return nil

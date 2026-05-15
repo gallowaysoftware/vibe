@@ -23,6 +23,7 @@ Today running local AI looks like:
 ## Architecture
 
 - **Profile**: the unit of configuration. A YAML file bundling a model spec, a frontend integration, and template variables that wire them together.
+- **MCP definitions**: one YAML file per Model Context Protocol server, dropped into `~/.config/vibe/mcp/` (e.g. `datadog.yaml`, `jira.yaml`). Profiles compose them by listing names: `frontend.mcps: [datadog, jira]`. Vibe injects a top-level `mcp` map into the rendered frontend config. Secrets stay in env vars (the frontend resolves `${env:...}` references); profiles never name them inline.
 - **Daemon**: supervises `llama-server` (and, later, docker-compose stacks). Exposes a control plane over a Unix socket.
 - **Proxy**: reverse-proxies frontends to the active llama-server so swapping models doesn't require reconfiguring the frontend.
 - **CLI**: `start`, `stop`, `ps`, `logs`, `list`.
