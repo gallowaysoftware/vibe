@@ -1,0 +1,39 @@
+name: multi-profile-demo
+description: |
+  Two-stage demo that exercises two distinct vibe profiles in a single run.
+  Stage 1 uses the small "fast" profile for cheap drafting; stage 2 swaps to
+  the larger "code" profile for careful expansion. The executor must
+  unload one model and load the other between stages.
+
+inputs:
+  topic:
+    type: string
+    required: true
+
+stages:
+  - id: outline
+    capability: fast_drafting
+    prompt: |
+      You are a technical writer drafting a short outline. Given the
+      topic below, produce a numbered list of 3 to 5 bullet points that
+      a longer article would expand on. Keep each bullet to a single
+      short sentence.
+
+      Topic: {{.inputs.topic}}
+
+      Output only the numbered list, no preamble or commentary.
+    output: outline.md
+    params:
+      max_tokens: 512
+      temperature: 0.3
+
+  - id: expand
+    capability: careful_reasoning
+    prompt_file: prompts/expand.tmpl
+    inputs: [outline]
+    output: article.md
+    params:
+      # The larger profile here is a thinking model; budget for both the
+      # reasoning trace and the final article.
+      max_tokens: 4096
+      temperature: 0.2
