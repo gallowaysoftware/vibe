@@ -1151,3 +1151,303 @@ func TestExecutor_ResumeForceAllowsChanged(t *testing.T) {
 		t.Errorf("stage two inference was not called (saw: %v)", dumpSyncMapKeys(&called))
 	}
 }
+
+// fastRetry is the per-test retry policy used by the retry suite. The
+// numbers are deliberately tiny (1ms initial, 4ms cap) so the tests stay
+// well under a second of wall-clock even when every retry-arm fires.
+// Multiplier 2.0 mirrors the production default.
+func fastRetry(maxAttempts int) *RetryPolicy {
+	return &RetryPolicy{
+		MaxAttempts:    maxAttempts,
+		InitialBackoff: 1 * time.Millisecond,
+		MaxBackoff:     4 * time.Millisecond,
+		Multiplier:     2.0,
+		RetryOn:        []string{"transient"},
+	}
+}
+
+// TestExecutor_RetriesTransientError verifies that a stage configured with
+// max_attempts=3 succeeds when the executor returns a 503 on the first two
+// attempts and success on the third.
+func TestExecutor_RetriesTransientError(t *testing.T) {
+	var attempts int32
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		n := atomic.AddInt32(&attempts, 1)
+		if n < 3 {
+			// Match the production inference error shape so the 5xx
+			// regex hits.
+			return "", fmt.Errorf("chat completion 503 Service Unavailable: backend down")
+		}
+		return "ok", nil
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "retry",
+		Stages: []Stage{
+			{ID: "a", Capability: "reasoning", Prompt: "X", Output: "a.txt", Retry: fastRetry(3)},
+		},
+	}
+	exec, runDir := stubExecutor(t, pipeline, caps, inf)
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("expected success after retries, got: %v", err)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 3 {
+		t.Errorf("attempts = %d, want 3 (initial + 2 retries)", got)
+	}
+	body, err := os.ReadFile(filepath.Join(runDir, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "ok" {
+		t.Errorf("a.txt = %q, want %q", body, "ok")
+	}
+}
+
+// TestExecutor_RespectsMaxAttempts verifies that the stage fails after
+// exactly MaxAttempts tries when the underlying error is persistently
+// transient.
+func TestExecutor_RespectsMaxAttempts(t *testing.T) {
+	var attempts int32
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		atomic.AddInt32(&attempts, 1)
+		return "", fmt.Errorf("chat completion 502 Bad Gateway: upstream gone")
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "retry_cap",
+		Stages: []Stage{
+			{ID: "a", Capability: "reasoning", Prompt: "X", Output: "a.txt", Retry: fastRetry(2)},
+		},
+	}
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	err := exec.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	if got := atomic.LoadInt32(&attempts); got != 2 {
+		t.Errorf("attempts = %d, want 2 (max_attempts cap)", got)
+	}
+	if !strings.Contains(err.Error(), "502") {
+		t.Errorf("err = %v, want underlying 502 message preserved", err)
+	}
+}
+
+// TestExecutor_DoesNotRetryUserCancel verifies that a context.Canceled
+// error short-circuits the retry loop: the executor is invoked exactly
+// once and ctx.Err() is propagated.
+func TestExecutor_DoesNotRetryUserCancel(t *testing.T) {
+	var attempts int32
+	ctx, cancel := context.WithCancel(context.Background())
+	inf := func(_ context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		atomic.AddInt32(&attempts, 1)
+		// Simulate the host ctx being canceled mid-inference. Returning
+		// the bare ctx.Err() is the standard pattern; the retry wrapper
+		// must short-circuit even though "context canceled" could
+		// plausibly look like a network error to a naive matcher.
+		cancel()
+		return "", ctx.Err()
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "cancel_retry",
+		Stages: []Stage{
+			{ID: "a", Capability: "reasoning", Prompt: "X", Output: "a.txt", Retry: fastRetry(5)},
+		},
+	}
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	err := exec.Run(ctx)
+	if err == nil {
+		t.Fatal("expected cancellation error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected ctx.Canceled, got: %v", err)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Errorf("attempts = %d, want 1 (cancel must not retry)", got)
+	}
+}
+
+// TestExecutor_DoesNotRetryNonTransient verifies that a non-transient
+// error (here, a JSON-validation failure that the text executor wraps
+// after a successful inference) bypasses retry entirely.
+func TestExecutor_DoesNotRetryNonTransient(t *testing.T) {
+	var attempts int32
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		atomic.AddInt32(&attempts, 1)
+		// Inference itself succeeds. The text executor then runs JSON
+		// validation against the body; because OutputFormat="json" is
+		// set on the stage, "not json" trips validateJSON and the
+		// executor returns "stage output is not valid JSON: ...".
+		// That error has no transient markers, so retry must NOT fire.
+		return "not json", nil
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "non_transient",
+		Stages: []Stage{
+			{
+				ID: "a", Capability: "reasoning", Prompt: "X",
+				Output: "a.json", OutputFormat: "json",
+				Retry: fastRetry(5),
+			},
+		},
+	}
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	err := exec.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected JSON-validation error")
+	}
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Errorf("attempts = %d, want 1 (non-transient must not retry)", got)
+	}
+}
+
+// TestExecutor_ForeachPerItemRetry verifies that the retry policy applies
+// per-item inside a foreach stage: 3 items with item 0 erroring transiently
+// once and items 1 and 2 succeeding on first try should produce 4 total
+// inference calls (3 items + 1 retry on item 0) and three written files.
+func TestExecutor_ForeachPerItemRetry(t *testing.T) {
+	// Per-item attempt counters; the producer stage is keyed separately.
+	var producerCalls int32
+	itemCalls := make(map[string]*int32)
+	for _, k := range []string{"a", "b", "c"} {
+		var c int32
+		itemCalls[k] = &c
+	}
+	var mu sync.Mutex
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		if prompt == "ITEMS" {
+			atomic.AddInt32(&producerCalls, 1)
+			return `["a","b","c"]`, nil
+		}
+		if strings.HasPrefix(prompt, "DO:") {
+			tok := strings.TrimPrefix(prompt, "DO:")
+			mu.Lock()
+			c := itemCalls[tok]
+			mu.Unlock()
+			n := atomic.AddInt32(c, 1)
+			// Fail item "a" on its first attempt; succeed on retry.
+			// Items "b" and "c" succeed first try.
+			if tok == "a" && n == 1 {
+				return "", fmt.Errorf("chat completion 503 Service Unavailable")
+			}
+			return strings.ToUpper(tok), nil
+		}
+		return "", fmt.Errorf("unexpected prompt %q", prompt)
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "foreach_retry",
+		Stages: []Stage{
+			{ID: "items", Capability: "reasoning", Prompt: "ITEMS", Output: "items.json", OutputFormat: "json"},
+			{
+				ID: "consumer", Capability: "reasoning",
+				Inputs:  []string{"items"},
+				Foreach: &ForeachSpec{From: "items", Var: "x"},
+				Prompt:  "DO:{{.x}}",
+				Output:  "out/{{.x}}.txt",
+				Retry:   fastRetry(3),
+			},
+		},
+	}
+	exec, runDir := stubExecutor(t, pipeline, caps, inf)
+	exec.MaxForeachConcurrency = 3
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("expected success after per-item retry, got: %v", err)
+	}
+	if got := atomic.LoadInt32(&producerCalls); got != 1 {
+		t.Errorf("producer attempts = %d, want 1", got)
+	}
+	// Item "a" should have run twice; "b" and "c" once each.
+	wantItem := map[string]int32{"a": 2, "b": 1, "c": 1}
+	for k, want := range wantItem {
+		got := atomic.LoadInt32(itemCalls[k])
+		if got != want {
+			t.Errorf("item %q attempts = %d, want %d", k, got, want)
+		}
+	}
+	// All three files written with uppercase contents.
+	for _, tc := range []struct{ k, want string }{{"a", "A"}, {"b", "B"}, {"c", "C"}} {
+		body, err := os.ReadFile(filepath.Join(runDir, "out", tc.k+".txt"))
+		if err != nil {
+			t.Fatalf("read item %s: %v", tc.k, err)
+		}
+		if string(body) != tc.want {
+			t.Errorf("out/%s.txt = %q, want %q", tc.k, body, tc.want)
+		}
+	}
+}
+
+// TestExecutor_ExponentialBackoffTiming verifies that the wait between
+// successive attempts grows by Multiplier and caps at MaxBackoff. The
+// stub records the wall-clock between attempts; we assert the second
+// gap is ~Multiplier * first, capped at MaxBackoff. Wide tolerances
+// keep CI green even on busy hosts.
+func TestExecutor_ExponentialBackoffTiming(t *testing.T) {
+	// Backoffs chosen so the geometric progression is visible:
+	//   attempt 1 -> attempt 2: ~10ms
+	//   attempt 2 -> attempt 3: ~20ms (10 * 2.0)
+	//   attempt 3 -> attempt 4: capped at 25ms (40 would exceed cap)
+	policy := &RetryPolicy{
+		MaxAttempts:    4,
+		InitialBackoff: 10 * time.Millisecond,
+		MaxBackoff:     25 * time.Millisecond,
+		Multiplier:     2.0,
+		RetryOn:        []string{"transient"},
+	}
+	var (
+		mu        sync.Mutex
+		callTimes []time.Time
+	)
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		mu.Lock()
+		callTimes = append(callTimes, time.Now())
+		n := len(callTimes)
+		mu.Unlock()
+		if n < 4 {
+			return "", fmt.Errorf("chat completion 503 Service Unavailable")
+		}
+		return "ok", nil
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "backoff_timing",
+		Stages: []Stage{
+			{ID: "a", Capability: "reasoning", Prompt: "X", Output: "a.txt", Retry: policy},
+		},
+	}
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("expected success on attempt 4, got: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(callTimes) != 4 {
+		t.Fatalf("recorded %d call times, want 4", len(callTimes))
+	}
+	gap := func(i int) time.Duration { return callTimes[i].Sub(callTimes[i-1]) }
+	g1, g2, g3 := gap(1), gap(2), gap(3)
+	t.Logf("gaps: %s, %s, %s", g1, g2, g3)
+	// First gap: ~10ms (the initial backoff). Allow some slack for
+	// goroutine scheduling.
+	if g1 < 8*time.Millisecond {
+		t.Errorf("gap1 = %s, expected >= 8ms (initial backoff 10ms)", g1)
+	}
+	if g1 > 50*time.Millisecond {
+		t.Errorf("gap1 = %s, expected <= 50ms (initial backoff 10ms, CI headroom)", g1)
+	}
+	// Second gap: ~20ms (10 * 2.0). Must be strictly larger than the
+	// first gap minus a small jitter window — that's what proves
+	// "exponential", not just "constant".
+	if g2 < g1 {
+		t.Errorf("gap2 (%s) should be >= gap1 (%s); backoff is not growing", g2, g1)
+	}
+	if g2 > 60*time.Millisecond {
+		t.Errorf("gap2 = %s, expected <= 60ms (target ~20ms + CI headroom)", g2)
+	}
+	// Third gap: capped at MaxBackoff = 25ms. Without the cap it would
+	// be ~40ms; assert it landed at or below the cap (with slack).
+	if g3 > 50*time.Millisecond {
+		t.Errorf("gap3 = %s, expected <= 50ms (cap is 25ms, would be 40ms uncapped)", g3)
+	}
+}

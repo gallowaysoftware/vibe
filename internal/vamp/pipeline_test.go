@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writePipeline(t *testing.T, content string) string {
@@ -14,6 +15,85 @@ func writePipeline(t *testing.T, content string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// TestLoadPipeline_RetryValid parses a stage with an explicit retry block and
+// verifies the field values land on Stage.Retry verbatim. The fast path for
+// pipelines that omit retry (no Retry field at all) is covered by every
+// other LoadPipeline test in this file.
+func TestLoadPipeline_RetryValid(t *testing.T) {
+	yaml := `
+name: r
+stages:
+  - id: a
+    capability: reasoning
+    prompt: hi
+    output: a.md
+    retry:
+      max_attempts: 5
+      initial_backoff: 250ms
+      max_backoff: 10s
+      multiplier: 3.0
+      retry_on: [transient, timeout]
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := p.Stages[0].Retry
+	if r == nil {
+		t.Fatal("expected Retry to be set")
+	}
+	if r.MaxAttempts != 5 {
+		t.Errorf("MaxAttempts = %d, want 5", r.MaxAttempts)
+	}
+	if r.InitialBackoff != 250*time.Millisecond {
+		t.Errorf("InitialBackoff = %s, want 250ms", r.InitialBackoff)
+	}
+	if r.MaxBackoff != 10*time.Second {
+		t.Errorf("MaxBackoff = %s, want 10s", r.MaxBackoff)
+	}
+	if r.Multiplier != 3.0 {
+		t.Errorf("Multiplier = %g, want 3.0", r.Multiplier)
+	}
+	if len(r.RetryOn) != 2 || r.RetryOn[0] != "transient" || r.RetryOn[1] != "timeout" {
+		t.Errorf("RetryOn = %v, want [transient timeout]", r.RetryOn)
+	}
+}
+
+// TestLoadPipeline_RetryDefaults verifies that omitting fields inside a
+// present retry block fills in the documented defaults via Normalize.
+func TestLoadPipeline_RetryDefaults(t *testing.T) {
+	yaml := `
+name: r
+stages:
+  - id: a
+    capability: reasoning
+    prompt: hi
+    output: a.md
+    retry:
+      max_attempts: 3
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := p.Stages[0].Retry
+	if r == nil {
+		t.Fatal("expected Retry to be set")
+	}
+	if r.InitialBackoff != time.Second {
+		t.Errorf("InitialBackoff default = %s, want 1s", r.InitialBackoff)
+	}
+	if r.MaxBackoff != 30*time.Second {
+		t.Errorf("MaxBackoff default = %s, want 30s", r.MaxBackoff)
+	}
+	if r.Multiplier != 2.0 {
+		t.Errorf("Multiplier default = %g, want 2.0", r.Multiplier)
+	}
+	if len(r.RetryOn) != 1 || r.RetryOn[0] != "transient" {
+		t.Errorf("RetryOn default = %v, want [transient]", r.RetryOn)
+	}
 }
 
 func TestLoadPipeline_Valid(t *testing.T) {
@@ -1242,6 +1322,42 @@ stages:
   output: a.mp4
   thumbnail: cover.png`,
 			wantErr: "thumbnail is only valid on type: youtube",
+		},
+		{
+			name: "retry with negative max_attempts",
+			yaml: `name: x
+stages:
+- id: a
+  capability: r
+  prompt: hi
+  output: a.md
+  retry:
+    max_attempts: -1`,
+			wantErr: "retry.max_attempts must be >= 1",
+		},
+		{
+			name: "retry with multiplier < 1.0",
+			yaml: `name: x
+stages:
+- id: a
+  capability: r
+  prompt: hi
+  output: a.md
+  retry:
+    multiplier: 0.5`,
+			wantErr: "retry.multiplier must be >= 1.0",
+		},
+		{
+			name: "retry with unknown retry_on entry",
+			yaml: `name: x
+stages:
+- id: a
+  capability: r
+  prompt: hi
+  output: a.md
+  retry:
+    retry_on: [bogus]`,
+			wantErr: "retry.retry_on entry \"bogus\"",
 		},
 	}
 	for _, tc := range cases {
