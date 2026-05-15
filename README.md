@@ -3,11 +3,24 @@
 A task-oriented launcher for local AI inference. Think `docker compose` for local AI workflows: define a profile that bundles a model configuration with a frontend, and one command brings up everything for a task.
 
 ```
+vibe doctor            # verify the machine is set up to run vibe
 vibe start code        # llama-server + opencode wired up for coding
 vibe start research    # different model, different context, different frontend
 vibe ps                # what's running
 vibe stop              # tear it all down
 ```
+
+## First run
+
+`vibe doctor` is the one-shot diagnostic. It checks for `llama-server` and
+the HuggingFace `hf` CLI on `$PATH`, ensures the XDG config/state/runtime
+directories exist and are writable, probes the control-plane (`:9001`) and
+proxy (`:9000`) ports, validates every profile under
+`~/.config/vibe/profiles/`, counts MCP definitions, and — best-effort —
+reports `nvidia-smi` output. Each line is tagged `[ OK ]`, `[WARN]`,
+`[FAIL]`, or `[INFO]`; the command exits non-zero only when something
+fails. Run it before your first `vibe start` and again whenever
+something behaves unexpectedly.
 
 ## Why
 

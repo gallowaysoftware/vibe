@@ -1,16 +1,15 @@
 # TODO
 
-## Installation path
+## ~~Installation path~~ (done)
 
-Need a single command that gets a new user from "nothing" to "vibe start
-works" without manual diagnostic. Likely covers:
+`vibe doctor` is the entry point. It verifies binaries (`llama-server`,
+`hf`), HuggingFace auth state, XDG dirs, ports `:9000` / `:9001`, profile
+validity, MCP definitions, daemon reachability, and GPU presence. Each
+check prints OK / WARN / FAIL; the command exits non-zero only on FAIL.
 
-- Binary install (script or `go install`)
-- `hf` (huggingface_hub) presence check; instructions when missing
-- `hf auth login` advisory for gated repos
-- llama-server binary presence/version check
-- First-time XDG dir creation + example profile drop-in
-- Maybe a `vibe doctor` subcommand that runs all the above as diagnostics
+Still open from the original list: a one-shot binary install script
+(`curl ... | sh` or `go install`) and a first-run "drop an example
+profile in `~/.config/vibe/profiles/`" affordance.
 
 ## ~~MCP composition for profiles~~ (done)
 
