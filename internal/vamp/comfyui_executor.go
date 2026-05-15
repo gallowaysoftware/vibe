@@ -86,7 +86,7 @@ func (e *comfyuiExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 		return nil, fmt.Errorf("stage %s: wait for completion: %w", st.ID, err)
 	}
 
-	files := collectOutputs(history)
+	files, counts := collectOutputs(history)
 	if len(files) == 0 {
 		return nil, fmt.Errorf("stage %s: workflow %s produced no output files", st.ID, promptID)
 	}
@@ -94,7 +94,13 @@ func (e *comfyuiExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 		// TODO(multi-output): support an `outputs:` plural in the stage schema
 		// that maps each file to a templated path. For Phase 2 we fail clearly
 		// rather than guess how to fan out multiple files into a single
-		// `output:` template.
+		// `output:` template. When the files span more than one kind (e.g. an
+		// image + a video), say so explicitly so users know to drop one of the
+		// save nodes; otherwise nudge them at batch_size like the
+		// single-kind multi-file case.
+		if mixedKindCount(counts) > 1 {
+			return nil, fmt.Errorf("stage %s: workflow produced multiple output kinds: %s; vamp currently supports one output per stage (drop the extra save node, or split into multiple stages)", st.ID, formatOutputCounts(counts))
+		}
 		return nil, fmt.Errorf("stage %s: workflow produced %d output files; vamp currently supports one output per stage (set batch_size: 1 in your workflow, or split into multiple stages)", st.ID, len(files))
 	}
 
@@ -235,14 +241,26 @@ func hasDigit(s string) bool {
 	return false
 }
 
-// collectOutputs flattens every node's image outputs into a single slice in
-// node-id order so a workflow with multiple SaveImage nodes produces a
-// deterministic file ordering. (Phase 2 errors on len>1; a future
-// `outputs:` schema will need this stable order to map files to template
-// names.)
-func collectOutputs(h *comfyui.History) []comfyui.OutputFile {
+// outputCounts is a per-kind tally of files seen across every node in a
+// completed workflow's history. Used by the executor's multi-output guard
+// to render a precise error message ("got 1 image + 1 video", etc.).
+type outputCounts struct {
+	Images int
+	Videos int
+	Gifs   int
+}
+
+// collectOutputs flattens every node's outputs into a single slice in
+// node-id order, and within each node iterates Images, then Videos, then
+// Gifs. That ordering is deterministic so a workflow with multiple save
+// nodes produces a stable file list; the per-kind counts are returned
+// alongside so the multi-output guard can phrase its error usefully.
+// (Phase 2 still errors on len>1; a future `outputs:` schema will need
+// this stable order to map files to template names.)
+func collectOutputs(h *comfyui.History) ([]comfyui.OutputFile, outputCounts) {
+	var counts outputCounts
 	if h == nil {
-		return nil
+		return nil, counts
 	}
 	ids := make([]string, 0, len(h.Outputs))
 	for id := range h.Outputs {
@@ -251,7 +269,48 @@ func collectOutputs(h *comfyui.History) []comfyui.OutputFile {
 	sort.Strings(ids)
 	var files []comfyui.OutputFile
 	for _, id := range ids {
-		files = append(files, h.Outputs[id].Images...)
+		out := h.Outputs[id]
+		files = append(files, out.Images...)
+		files = append(files, out.Videos...)
+		files = append(files, out.Gifs...)
+		counts.Images += len(out.Images)
+		counts.Videos += len(out.Videos)
+		counts.Gifs += len(out.Gifs)
 	}
-	return files
+	return files, counts
+}
+
+// mixedKindCount returns how many distinct output kinds had at least one
+// file. Used to phrase the multi-output guard differently when a workflow
+// saves, e.g., both an image and a video.
+func mixedKindCount(c outputCounts) int {
+	n := 0
+	if c.Images > 0 {
+		n++
+	}
+	if c.Videos > 0 {
+		n++
+	}
+	if c.Gifs > 0 {
+		n++
+	}
+	return n
+}
+
+// formatOutputCounts renders a per-kind tally as a human-readable list, e.g.
+// "1 image + 2 video". Only kinds with a non-zero count appear, in the same
+// order as collectOutputs concatenates them so the message matches the
+// flatten order.
+func formatOutputCounts(c outputCounts) string {
+	var parts []string
+	if c.Images > 0 {
+		parts = append(parts, fmt.Sprintf("%d image", c.Images))
+	}
+	if c.Videos > 0 {
+		parts = append(parts, fmt.Sprintf("%d video", c.Videos))
+	}
+	if c.Gifs > 0 {
+		parts = append(parts, fmt.Sprintf("%d gif", c.Gifs))
+	}
+	return strings.Join(parts, " + ")
 }

@@ -26,13 +26,23 @@ import (
 // for executor tests. It records the submitted workflow, completes the
 // returned prompt_id with the configured outputs, and serves view/<filename>
 // requests with the configured payload.
+//
+// outputs is the default "images" bucket. videos / gifs let a test exercise
+// the non-image code paths without altering the default behaviour for the
+// existing image-only tests.
 type fakeComfyServer struct {
 	t           *testing.T
 	mu          sync.Mutex
 	submitted   []map[string]any // every workflow body posted to /prompt
 	outputs     []comfyui.OutputFile
+	videos      []comfyui.OutputFile
+	gifs        []comfyui.OutputFile
 	viewPayload []byte
-	promptID    string
+	// viewPayloads maps a fetched filename to a per-file payload, used when a
+	// test needs to verify that two different output files produce the right
+	// bytes at their destinations. When nil or missing, viewPayload is served.
+	viewPayloads map[string][]byte
+	promptID     string
 }
 
 func newFakeComfyServer(t *testing.T, promptID string, outputs []comfyui.OutputFile, viewPayload []byte) (*fakeComfyServer, *httptest.Server) {
@@ -72,22 +82,43 @@ func newFakeComfyServer(t *testing.T, promptID string, outputs []comfyui.OutputF
 			return
 		}
 		fcs.mu.Lock()
-		outs := fcs.outputs
+		imgs := fcs.outputs
+		vids := fcs.videos
+		gifs := fcs.gifs
 		fcs.mu.Unlock()
+		node9 := map[string]any{}
+		// Only attach buckets that actually have entries — ComfyUI omits empty
+		// buckets in real responses, and emitting empty arrays would defeat the
+		// `omitempty` round-trip the decoder relies on.
+		if len(imgs) > 0 {
+			node9["images"] = imgs
+		}
+		if len(vids) > 0 {
+			node9["videos"] = vids
+		}
+		if len(gifs) > 0 {
+			node9["gifs"] = gifs
+		}
 		resp := map[string]any{
 			id: map[string]any{
-				"status": map[string]any{"completed": true},
-				"outputs": map[string]any{
-					"9": map[string]any{
-						"images": outs,
-					},
-				},
+				"status":  map[string]any{"completed": true},
+				"outputs": map[string]any{"9": node9},
 			},
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 	mux.HandleFunc("GET /view", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(fcs.viewPayload)
+		fcs.mu.Lock()
+		payloads := fcs.viewPayloads
+		def := fcs.viewPayload
+		fcs.mu.Unlock()
+		if payloads != nil {
+			if p, ok := payloads[r.URL.Query().Get("filename")]; ok {
+				_, _ = w.Write(p)
+				return
+			}
+		}
+		_, _ = w.Write(def)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -380,6 +411,165 @@ func TestComfyUIExecutor_RejectsMultipleOutputs(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "batch_size") {
 		t.Errorf("expected batch_size hint in error, got: %v", err)
+	}
+}
+
+// TestComfyUIExecutor_CopiesVideoOutput verifies a workflow whose history
+// surfaces an output under the `videos` bucket (modern SaveVideo /
+// VHS_VideoCombine) is copied to the rendered output path with the served
+// bytes preserved. The image bucket stays empty.
+func TestComfyUIExecutor_CopiesVideoOutput(t *testing.T) {
+	workflow := `{"6":{"class_type":"CLIPTextEncode","inputs":{"text":""}}}`
+	pipeline := &Pipeline{
+		Name: "vid",
+		Stages: []Stage{{
+			ID: "render", Type: StageTypeComfyUI, Capability: "image",
+			Output:     "assets/{{.inputs.slug}}.mp4",
+			Parameters: map[string]string{"6.text": "hello"},
+		}},
+	}
+	exec, runDir, _, fcs := stubComfyRuntime(t, pipeline, workflow)
+	exec.Inputs = map[string]string{"slug": "clip"}
+	// Reconfigure: drop the default image, surface a video instead.
+	fcs.mu.Lock()
+	fcs.outputs = nil
+	fcs.videos = []comfyui.OutputFile{{Filename: "out.mp4", Type: "output"}}
+	fcs.viewPayload = []byte("MP4DATA42")
+	fcs.mu.Unlock()
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(runDir, "assets", "clip.mp4"))
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	if string(got) != "MP4DATA42" {
+		t.Errorf("output bytes = %q, want %q", got, "MP4DATA42")
+	}
+}
+
+// TestComfyUIExecutor_CopiesGifOutput verifies the same plumbing for the
+// legacy `gifs` bucket (SaveAnimatedWEBP / older VHS variants).
+func TestComfyUIExecutor_CopiesGifOutput(t *testing.T) {
+	workflow := `{"6":{"class_type":"CLIPTextEncode","inputs":{"text":""}}}`
+	pipeline := &Pipeline{
+		Name: "gif",
+		Stages: []Stage{{
+			ID: "render", Type: StageTypeComfyUI, Capability: "image",
+			Output:     "assets/{{.inputs.slug}}.webp",
+			Parameters: map[string]string{"6.text": "hello"},
+		}},
+	}
+	exec, runDir, _, fcs := stubComfyRuntime(t, pipeline, workflow)
+	exec.Inputs = map[string]string{"slug": "anim"}
+	fcs.mu.Lock()
+	fcs.outputs = nil
+	fcs.gifs = []comfyui.OutputFile{{Filename: "out.webp", Type: "output"}}
+	fcs.viewPayload = []byte("WEBPDATA7")
+	fcs.mu.Unlock()
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(runDir, "assets", "anim.webp"))
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	if string(got) != "WEBPDATA7" {
+		t.Errorf("output bytes = %q, want %q", got, "WEBPDATA7")
+	}
+}
+
+// TestComfyUIExecutor_RejectsMultipleVideos verifies the existing
+// "exactly 1 output" guard fires for a video workflow that emits two files.
+// The error message points the user at batch_size since both files are
+// the same kind.
+func TestComfyUIExecutor_RejectsMultipleVideos(t *testing.T) {
+	workflow := `{"6":{"class_type":"X","inputs":{"text":""}}}`
+	pipeline := &Pipeline{
+		Name: "vid",
+		Stages: []Stage{{
+			ID: "render", Type: StageTypeComfyUI, Capability: "image",
+			Output:     "out.mp4",
+			Parameters: map[string]string{"6.text": "x"},
+		}},
+	}
+	exec, _, _, fcs := stubComfyRuntime(t, pipeline, workflow)
+	fcs.mu.Lock()
+	fcs.outputs = nil
+	fcs.videos = []comfyui.OutputFile{
+		{Filename: "a.mp4", Type: "output"},
+		{Filename: "b.mp4", Type: "output"},
+	}
+	fcs.mu.Unlock()
+	err := exec.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected error for multi-video workflow")
+	}
+	if !strings.Contains(err.Error(), "batch_size") {
+		t.Errorf("expected batch_size hint in error, got: %v", err)
+	}
+}
+
+// TestComfyUIExecutor_RejectsMixedKinds verifies a workflow that saves
+// outputs of more than one kind (e.g. image + video) hits the guard with
+// the per-kind tally in the message so the user knows which save node to
+// drop.
+func TestComfyUIExecutor_RejectsMixedKinds(t *testing.T) {
+	workflow := `{"6":{"class_type":"X","inputs":{"text":""}}}`
+	pipeline := &Pipeline{
+		Name: "mix",
+		Stages: []Stage{{
+			ID: "render", Type: StageTypeComfyUI, Capability: "image",
+			Output:     "out.mp4",
+			Parameters: map[string]string{"6.text": "x"},
+		}},
+	}
+	exec, _, _, fcs := stubComfyRuntime(t, pipeline, workflow)
+	fcs.mu.Lock()
+	fcs.outputs = []comfyui.OutputFile{{Filename: "a.png", Type: "output"}}
+	fcs.videos = []comfyui.OutputFile{{Filename: "b.mp4", Type: "output"}}
+	fcs.mu.Unlock()
+	err := exec.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected error for mixed-kind workflow")
+	}
+	if !strings.Contains(err.Error(), "1 image") || !strings.Contains(err.Error(), "1 video") {
+		t.Errorf("expected per-kind tally in error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "multiple output kinds") {
+		t.Errorf("expected mixed-kinds prose in error, got: %v", err)
+	}
+}
+
+// TestCollectOutputs_DeterministicOrdering pins down the ordering contract
+// collectOutputs offers callers: by node id ascending, and within a node
+// images-then-videos-then-gifs. The multi-output guard will eventually rely
+// on this when we expose plural `outputs:`.
+func TestCollectOutputs_DeterministicOrdering(t *testing.T) {
+	h := &comfyui.History{
+		Outputs: map[string]comfyui.NodeOutputs{
+			"20": {
+				Images: []comfyui.OutputFile{{Filename: "img-20.png"}},
+				Videos: []comfyui.OutputFile{{Filename: "vid-20.mp4"}},
+				Gifs:   []comfyui.OutputFile{{Filename: "gif-20.webp"}},
+			},
+			"10": {
+				Videos: []comfyui.OutputFile{{Filename: "vid-10.mp4"}},
+			},
+		},
+	}
+	files, counts := collectOutputs(h)
+	wantNames := []string{"vid-10.mp4", "img-20.png", "vid-20.mp4", "gif-20.webp"}
+	if len(files) != len(wantNames) {
+		t.Fatalf("collectOutputs returned %d files, want %d (%+v)", len(files), len(wantNames), files)
+	}
+	for i, want := range wantNames {
+		if files[i].Filename != want {
+			t.Errorf("files[%d] = %q, want %q", i, files[i].Filename, want)
+		}
+	}
+	if counts.Images != 1 || counts.Videos != 2 || counts.Gifs != 1 {
+		t.Errorf("counts = %+v, want {Images:1 Videos:2 Gifs:1}", counts)
 	}
 }
 

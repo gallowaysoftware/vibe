@@ -48,3 +48,15 @@ Same shape for llama.cpp itself (current install assumes
 `internal/vibe/cli/cmd_doctor.go` (`runInstall`) is structured so a new
 installer plugs in next to `comfyui` without touching the diagnostic
 path.
+
+## ComfyUI video smoke
+
+The ComfyUI client and the vamp executor now collect non-image outputs
+(`videos`, `gifs`) from a workflow's `/history` response, and an example
+sits at `examples/comfyui-video/`. The plumbing is covered by unit tests
+against a fake ComfyUI server, but we haven't yet run the pipeline against
+a real video model (LTX-Video, HunyuanVideo, Wan2.2, etc.). Open follow-up:
+download a public video checkpoint, run the example end-to-end, and
+confirm the MP4 lands at `<run-dir>/assets/video.mp4` with sensible
+contents. May also need to add a `VHS_VideoCombine`-flavoured variant if
+that turns out to be the more common community node in practice.

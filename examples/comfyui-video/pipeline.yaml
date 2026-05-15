@@ -1,0 +1,24 @@
+name: video_basic_smoke
+description: |
+  Minimal ComfyUI video pipeline. Demonstrates the plumbing that lets vamp
+  collect non-image outputs (SaveVideo / VHS_VideoCombine) from a workflow
+  and copy them into the run dir. This file is not a runnable smoke against
+  a real model unless you separately install LTX-Video — see README.md.
+
+inputs:
+  scene:
+    type: string
+    required: true
+  seed:
+    type: integer
+    default: 42
+
+stages:
+  - id: render
+    type: comfyui
+    capability: image_gen
+    workflow: workflows/video_basic.json
+    parameters:
+      "2.text": "{{.inputs.scene}}"
+      "5.seed": "{{.inputs.seed}}"
+    output: assets/video.mp4

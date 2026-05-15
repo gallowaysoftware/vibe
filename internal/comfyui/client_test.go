@@ -177,6 +177,52 @@ func TestClient_GetHistory_Completed(t *testing.T) {
 	}
 }
 
+// TestClient_GetHistory_VideoAndGifOutputs verifies the History decoder
+// recognises the non-image output buckets ComfyUI emits for video / animated
+// workflows: `videos` (modern SaveVideo, recent VHS_VideoCombine) and `gifs`
+// (SaveAnimatedWEBP, older VHS variants). Same OutputFile shape; only the
+// containing key differs.
+func TestClient_GetHistory_VideoAndGifOutputs(t *testing.T) {
+	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"abc":{"status":{"completed":true},"outputs":{
+			"10":{"videos":[{"filename":"out.mp4","subfolder":"","type":"output"}]},
+			"11":{"gifs":[{"filename":"out.webp","subfolder":"sub","type":"output"}]}
+		}}}`))
+	})
+
+	h, err := c.GetHistory(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("GetHistory: %v", err)
+	}
+	if h == nil {
+		t.Fatal("history nil")
+	}
+	v, ok := h.Outputs["10"]
+	if !ok {
+		t.Fatalf("Outputs missing key 10: %+v", h.Outputs)
+	}
+	if len(v.Videos) != 1 {
+		t.Fatalf("Videos = %+v, want one entry", v.Videos)
+	}
+	if v.Videos[0].Filename != "out.mp4" || v.Videos[0].Type != "output" {
+		t.Errorf("Video[0] = %+v", v.Videos[0])
+	}
+	if len(v.Images) != 0 || len(v.Gifs) != 0 {
+		t.Errorf("unexpected sibling buckets on node 10: %+v", v)
+	}
+	g, ok := h.Outputs["11"]
+	if !ok {
+		t.Fatalf("Outputs missing key 11: %+v", h.Outputs)
+	}
+	if len(g.Gifs) != 1 {
+		t.Fatalf("Gifs = %+v, want one entry", g.Gifs)
+	}
+	if g.Gifs[0].Filename != "out.webp" || g.Gifs[0].Subfolder != "sub" {
+		t.Errorf("Gif[0] = %+v", g.Gifs[0])
+	}
+}
+
 func TestClient_GetHistory_NotFound(t *testing.T) {
 	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
