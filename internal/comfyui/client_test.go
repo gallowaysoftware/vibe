@@ -253,6 +253,14 @@ func TestClient_GetHistory_NotFoundOn404(t *testing.T) {
 func TestClient_WaitForCompletion(t *testing.T) {
 	var n int32
 	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		// WaitForCompletion now prefers a WS subscription and falls back to
+		// polling on handshake failure. Reject the /ws upgrade attempt with
+		// a 404 (without touching the polling counter) so this test
+		// continues to exercise the polling path.
+		if r.URL.Path == "/ws" {
+			http.NotFound(w, r)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		switch atomic.AddInt32(&n, 1) {
 		case 1:
@@ -284,6 +292,12 @@ func TestClient_WaitForCompletion(t *testing.T) {
 
 func TestClient_WaitForCompletion_ContextCanceled(t *testing.T) {
 	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		// Reject the WS subscription so WaitForCompletion falls back to
+		// polling — that's the timing path this test cares about.
+		if r.URL.Path == "/ws" {
+			http.NotFound(w, r)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		// Always pending.
 		_, _ = w.Write([]byte(`{}`))

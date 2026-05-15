@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -668,6 +669,244 @@ func TestExecutor_ForeachOutputCollision(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "collision") {
 		t.Errorf("expected collision in error, got: %v", err)
+	}
+}
+
+// TestExecutor_ParallelForeach_RunsInParallel verifies that a foreach stage
+// runs items concurrently when MaxForeachConcurrency >= n. Wall-clock for 4
+// items each sleeping 200ms should land near 200ms (parallel) and well under
+// the 800ms sequential baseline.
+func TestExecutor_ParallelForeach_RunsInParallel(t *testing.T) {
+	const itemLatency = 200 * time.Millisecond
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		switch {
+		case prompt == "ITEMS":
+			return `["a","b","c","d"]`, nil
+		case strings.HasPrefix(prompt, "ITEM:"):
+			select {
+			case <-time.After(itemLatency):
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+			return strings.TrimPrefix(prompt, "ITEM:"), nil
+		}
+		return "", fmt.Errorf("unexpected prompt %q", prompt)
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "par",
+		Stages: []Stage{
+			{ID: "items", Capability: "reasoning", Prompt: "ITEMS", Output: "items.json", OutputFormat: "json"},
+			{
+				ID: "consumer", Capability: "reasoning",
+				Inputs:  []string{"items"},
+				Foreach: &ForeachSpec{From: "items", Var: "x"},
+				Prompt:  "ITEM:{{.x}}",
+				Output:  "out/{{.x}}.txt",
+			},
+		},
+	}
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	exec.MaxForeachConcurrency = 4
+	start := time.Now()
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	// Sequential lower bound = 4*200ms = 800ms. With concurrency 4 the foreach
+	// itself should be ~200ms; add the producer stage's near-zero latency.
+	// 400ms gives plenty of CI headroom while still failing on a sequential
+	// regression.
+	if elapsed >= 400*time.Millisecond {
+		t.Errorf("parallel foreach took %s, expected < 400ms (sequential baseline ~800ms)", elapsed)
+	}
+	t.Logf("parallel-foreach wall-clock: %s", elapsed)
+}
+
+// TestExecutor_ParallelForeach_RespectsCap verifies that MaxForeachConcurrency
+// actually caps in-flight items. 8 items at 200ms each with cap=2 should run
+// in 4 batches of 2, landing near 800ms (not the 200ms a cap of 8 would
+// produce, and not the 1.6s a cap of 1 would).
+func TestExecutor_ParallelForeach_RespectsCap(t *testing.T) {
+	const itemLatency = 200 * time.Millisecond
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		switch {
+		case prompt == "ITEMS":
+			return `["a","b","c","d","e","f","g","h"]`, nil
+		case strings.HasPrefix(prompt, "ITEM:"):
+			select {
+			case <-time.After(itemLatency):
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+			return strings.TrimPrefix(prompt, "ITEM:"), nil
+		}
+		return "", fmt.Errorf("unexpected prompt %q", prompt)
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "cap",
+		Stages: []Stage{
+			{ID: "items", Capability: "reasoning", Prompt: "ITEMS", Output: "items.json", OutputFormat: "json"},
+			{
+				ID: "consumer", Capability: "reasoning",
+				Inputs:  []string{"items"},
+				Foreach: &ForeachSpec{From: "items", Var: "x"},
+				Prompt:  "ITEM:{{.x}}",
+				Output:  "out/{{.x}}.txt",
+			},
+		},
+	}
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	exec.MaxForeachConcurrency = 2
+	start := time.Now()
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	// 8 items / 2 in flight = 4 batches * 200ms = 800ms nominal. Allow > 700ms
+	// to prove the cap actually serializes (cap=8 would finish in ~200ms) and
+	// < 1000ms to prove the cap doesn't degrade to fully sequential.
+	if elapsed <= 700*time.Millisecond {
+		t.Errorf("cap=2 finished in %s, expected > 700ms (would imply cap not enforced)", elapsed)
+	}
+	if elapsed >= 1000*time.Millisecond {
+		t.Errorf("cap=2 finished in %s, expected < 1000ms (would imply too-tight serialization)", elapsed)
+	}
+	t.Logf("cap=2 wall-clock for 8 items: %s", elapsed)
+}
+
+// TestExecutor_ParallelForeach_CancelsSiblings verifies that an erroring item
+// cancels its siblings via the per-stage context. Sibling items observe
+// ctx.Done() and return promptly instead of sleeping out their full latency.
+func TestExecutor_ParallelForeach_CancelsSiblings(t *testing.T) {
+	const longLatency = 800 * time.Millisecond
+	var aborted int32
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		switch {
+		case prompt == "ITEMS":
+			return `["fail","slow1","slow2","slow3"]`, nil
+		case prompt == "ITEM:fail":
+			// Sleep just long enough for siblings to be in flight before we
+			// poison the context.
+			select {
+			case <-time.After(100 * time.Millisecond):
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+			return "", fmt.Errorf("intentional failure")
+		case strings.HasPrefix(prompt, "ITEM:"):
+			select {
+			case <-time.After(longLatency):
+				return strings.TrimPrefix(prompt, "ITEM:"), nil
+			case <-ctx.Done():
+				atomic.AddInt32(&aborted, 1)
+				return "", ctx.Err()
+			}
+		}
+		return "", fmt.Errorf("unexpected prompt %q", prompt)
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "cancel",
+		Stages: []Stage{
+			{ID: "items", Capability: "reasoning", Prompt: "ITEMS", Output: "items.json", OutputFormat: "json"},
+			{
+				ID: "consumer", Capability: "reasoning",
+				Inputs:  []string{"items"},
+				Foreach: &ForeachSpec{From: "items", Var: "x"},
+				Prompt:  "ITEM:{{.x}}",
+				Output:  "out/{{.x}}.txt",
+			},
+		},
+	}
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	exec.MaxForeachConcurrency = 4
+	start := time.Now()
+	err := exec.Run(context.Background())
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	// The failing item's error is wrapped and joined; verify both the failure
+	// surfaces and the joined error mentions item 0 (or the relevant items
+	// indices) and the underlying error.
+	if !strings.Contains(err.Error(), "intentional failure") {
+		t.Errorf("expected 'intentional failure' in aggregated error, got: %v", err)
+	}
+	// At least one sibling must have observed cancellation rather than
+	// running to completion.
+	if got := atomic.LoadInt32(&aborted); got < 1 {
+		t.Errorf("expected >= 1 sibling to observe ctx cancellation, got %d", got)
+	}
+	// And the whole stage must have finished WELL before the slow items'
+	// nominal 800ms latency — that's the whole point of cooperative cancel.
+	if elapsed >= 600*time.Millisecond {
+		t.Errorf("cancel propagation took %s, expected < 600ms (slow items did not honor ctx)", elapsed)
+	}
+	t.Logf("cancel propagation wall-clock: %s (aborted siblings: %d)", elapsed, atomic.LoadInt32(&aborted))
+}
+
+// TestExecutor_ParallelForeach_OutputsInDeclaredOrder verifies that even when
+// items finish in reverse arrival order, stageResult.Outputs (and the
+// templated `.outputs` slice it powers) is keyed by input-array index, not by
+// finish time.
+func TestExecutor_ParallelForeach_OutputsInDeclaredOrder(t *testing.T) {
+	// Latencies arranged so item 0 finishes LAST and item 3 finishes FIRST.
+	latencies := []time.Duration{300 * time.Millisecond, 200 * time.Millisecond, 100 * time.Millisecond, 50 * time.Millisecond}
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		switch {
+		case prompt == "ITEMS":
+			return `["0","1","2","3"]`, nil
+		case strings.HasPrefix(prompt, "ITEM:"):
+			tok := strings.TrimPrefix(prompt, "ITEM:")
+			idx, err := strconv.Atoi(tok)
+			if err != nil {
+				return "", err
+			}
+			select {
+			case <-time.After(latencies[idx]):
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+			return "out-" + tok, nil
+		case strings.HasPrefix(prompt, "JOIN:"):
+			return strings.TrimPrefix(prompt, "JOIN:"), nil
+		}
+		return "", fmt.Errorf("unexpected prompt %q", prompt)
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "order",
+		Stages: []Stage{
+			{ID: "items", Capability: "reasoning", Prompt: "ITEMS", Output: "items.json", OutputFormat: "json"},
+			{
+				ID: "consumer", Capability: "reasoning",
+				Inputs:  []string{"items"},
+				Foreach: &ForeachSpec{From: "items", Var: "x"},
+				Prompt:  "ITEM:{{.x}}",
+				Output:  "out/{{.x}}.txt",
+			},
+			{
+				ID: "joiner", Capability: "reasoning",
+				Inputs: []string{"consumer"},
+				Prompt: "JOIN:{{range $i, $o := .stages.consumer.outputs}}{{if $i}}|{{end}}{{$o}}{{end}}",
+				Output: "joined.txt",
+			},
+		},
+	}
+	exec, runDir := stubExecutor(t, pipeline, caps, inf)
+	exec.MaxForeachConcurrency = 4
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(runDir, "joined.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "out-0|out-1|out-2|out-3"
+	if string(got) != want {
+		t.Errorf(".stages.consumer.outputs = %q, want %q (must be input-array order, not finish order)", got, want)
 	}
 }
 

@@ -104,6 +104,12 @@ type stageResult struct {
 	Outputs []string
 }
 
+// defaultMaxForeachConcurrency caps in-flight items inside a single foreach
+// stage when the caller doesn't set Executor.MaxForeachConcurrency. Four is a
+// pragmatic default: large enough to overlap latency-bound work (e.g. ComfyUI
+// renders against the same loaded model) without flooding the backend.
+const defaultMaxForeachConcurrency = 4
+
 // Executor runs a Pipeline end-to-end against vibe.
 type Executor struct {
 	Pipeline     *Pipeline
@@ -114,6 +120,13 @@ type Executor struct {
 	RunDir       string
 	Inference    InferenceFunc // defaults to a real chat-completion client
 	Log          io.Writer
+
+	// MaxForeachConcurrency bounds the number of foreach items that may be
+	// running concurrently inside a single stage. Zero or negative uses
+	// defaultMaxForeachConcurrency. This is independent of the DAG
+	// scheduler's per-wave/per-capability concurrency above; it only governs
+	// fan-out *within* one Stage.Foreach invocation.
+	MaxForeachConcurrency int
 
 	// in-memory state populated during Run
 	mu                 sync.Mutex // guards stageOutputs and the model cache
@@ -450,11 +463,39 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 	// this foreach stage is nested inside a parallel multi-stage group).
 	// Concurrent per-item flushes would otherwise race on the same buffer.
 	var sinkMu sync.Mutex
+	// Bound in-flight items with a buffered-channel semaphore. The cap is
+	// Executor.MaxForeachConcurrency (defaulted), independent of any
+	// per-wave concurrency the DAG scheduler enforces above us. Items still
+	// own their index-keyed slot in outputs/errs, so completion order does
+	// not affect the final `stageResult.Outputs` ordering.
+	maxConc := e.MaxForeachConcurrency
+	if maxConc <= 0 {
+		maxConc = defaultMaxForeachConcurrency
+	}
+	if maxConc > len(items) {
+		maxConc = len(items)
+	}
+	sem := make(chan struct{}, maxConc)
 	for i := range items {
 		i := i
+		// Acquire BEFORE goroutine launch so we don't spawn N goroutines for
+		// a 1000-item foreach with cap=4. Honor cancellation while waiting
+		// for a slot: if a sibling has already errored and called cancel(),
+		// we want to bail out of the wait promptly. Treat acquisition
+		// failure as a recorded cancellation error so errors.Join still
+		// surfaces the original sibling failure (errs[i] for siblings that
+		// did run) and downstream callers see the partial-cancel via
+		// errors.Is(err, context.Canceled).
+		select {
+		case sem <- struct{}{}:
+		case <-groupCtx.Done():
+			errs[i] = fmt.Errorf("item %d: %w", i, groupCtx.Err())
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() { <-sem }()
 			var itemSink io.Writer
 			var buf *bytes.Buffer
 			switch {
@@ -484,6 +525,10 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 			}
 			if runErr != nil {
 				errs[i] = fmt.Errorf("item %d: %w", i, runErr)
+				// Cancel siblings so in-flight items observe ctx.Done()
+				// promptly and pending acquirers above bail out of the
+				// semaphore wait. We do NOT cancel the outer ctx — the DAG
+				// scheduler owns whether other stages keep running.
 				cancel()
 				return
 			}

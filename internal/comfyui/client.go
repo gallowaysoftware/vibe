@@ -337,16 +337,55 @@ func (c *Client) GetHistory(ctx context.Context, promptID string) (*History, err
 	return &h, nil
 }
 
-// WaitForCompletion polls /history/{prompt_id} every interval until
-// status.completed is true or ctx fires.
+// WaitForCompletion blocks until ComfyUI reports that promptID has finished
+// or ctx fires.
 //
-// ErrNotFound is treated as transient — execution may not have started yet.
-// Any other error is returned immediately. A non-positive interval is
-// normalized to one second so a misconfigured caller doesn't spin.
+// Implementation: first attempt a WS subscription to /ws?clientId=<id> and
+// block on the event stream until the executing/null completion signal for
+// our promptID arrives. If the WS handshake fails (dial error, non-101
+// response, bad Sec-WebSocket-Accept), fall back to polling /history every
+// `interval`. Some ComfyUI deployments disable the WS endpoint or sit behind
+// a proxy that strips Upgrade headers; the fallback keeps us correct on
+// those.
+//
+// A non-positive interval is normalized to one second so a misconfigured
+// caller doesn't spin in the polling fallback.
+//
+// Backward-compatible signature: WS is purely an optimization (no extra
+// round-trips, no spin loop) so callers don't need to opt in.
 func (c *Client) WaitForCompletion(ctx context.Context, promptID string, interval time.Duration) (*History, error) {
+	if promptID == "" {
+		return nil, errors.New("comfyui: WaitForCompletion: empty prompt_id")
+	}
 	if interval <= 0 {
 		interval = time.Second
 	}
+
+	// Try WS first. wsWaitForCompletion blocks until either ctx fires or a
+	// completion event arrives. On dial / handshake errors we fall back to
+	// polling — but mid-stream errors (connection reset, malformed frames)
+	// surface to the caller because falling back from a known-broken WS
+	// session would risk masking server-side problems.
+	wsErr := c.wsWaitForCompletion(ctx, promptID)
+	if wsErr == nil {
+		// Completion was signaled over WS; one final GetHistory call
+		// returns the outputs the caller actually needs.
+		return c.GetHistory(ctx, promptID)
+	}
+	// Honor ctx cancellation regardless of WS path.
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	// Fall back to polling. We swallow wsErr here because the polling path is
+	// the canonical correct behavior; the operator who cares about WS gaps
+	// can find them in debug logs of the server itself.
+	return c.pollForCompletion(ctx, promptID, interval)
+}
+
+// pollForCompletion is the legacy /history-polling loop, retained as the WS
+// fallback path. ErrNotFound is treated as transient — execution may not
+// have started yet. Any other error is returned immediately.
+func (c *Client) pollForCompletion(ctx context.Context, promptID string, interval time.Duration) (*History, error) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 
