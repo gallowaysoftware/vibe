@@ -13,21 +13,22 @@
 name: fast
 description: Fast drafting with Qwen2.5-Coder-7B Q4_K_M
 
-model:
-  path: ~/models/qwen2.5-coder-7b/qwen2.5-coder-7b-instruct-q4_k_m.gguf
-  # Public GGUF — no HuggingFace auth required.
-  huggingface:
-    repo: Qwen/Qwen2.5-Coder-7B-Instruct-GGUF
-    file: qwen2.5-coder-7b-instruct-q4_k_m.gguf
-  # Must match the model id that llama-server advertises at /v1/models.
-  alias: qwen2.5-coder-7b
-  context: 32768
-  parallel: 1
-  gpu_layers: 999
-  flash_attn: true
-  cache_type_k: q8_0
-  cache_type_v: q8_0
-  jinja: true
+backend:
+  llama_server:
+    path: ~/models/qwen2.5-coder-7b/qwen2.5-coder-7b-instruct-q4_k_m.gguf
+    # Public GGUF — no HuggingFace auth required.
+    huggingface:
+      repo: Qwen/Qwen2.5-Coder-7B-Instruct-GGUF
+      file: qwen2.5-coder-7b-instruct-q4_k_m.gguf
+    # Must match the model id that llama-server advertises at /v1/models.
+    alias: qwen2.5-coder-7b
+    context: 32768
+    parallel: 1
+    gpu_layers: 999
+    flash_attn: true
+    cache_type_k: q8_0
+    cache_type_v: q8_0
+    jinja: true
 
 frontend:
   kind: external

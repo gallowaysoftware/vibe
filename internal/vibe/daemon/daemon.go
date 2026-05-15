@@ -91,7 +91,7 @@ var _ vibev1connect.ControlServiceHandler = (*Daemon)(nil)
 func New(cfg Config) *Daemon {
 	return &Daemon{
 		cfg:      cfg,
-		sup:      supervisor.New(cfg.LlamaBinary),
+		sup:      supervisor.New(),
 		prx:      proxy.New(fmt.Sprintf("127.0.0.1:%d", cfg.ProxyPort)),
 		shutdown: make(chan struct{}),
 	}
@@ -240,33 +240,80 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 		return nil, connect.NewError(connect.CodeNotFound, err)
 	}
 
-	slog.Info("starting profile", "profile", p.Name, "alias", p.Model.Alias, "context", p.Model.Context)
 	startCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	if err := d.sup.Start(startCtx, p); err != nil {
+
+	// Dispatch by backend kind. Each branch fully populates `spec` and the
+	// chosen `port`, then the shared tail starts the supervisor.
+	var (
+		spec supervisor.LaunchSpec
+		port int
+	)
+	switch {
+	case p.Backend.LlamaServer != nil:
+		port, err = supervisor.PickFreePort()
+		if err != nil {
+			return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("pick port: %w", err))
+		}
+		spec, err = profile.LlamaServerSpec(p, d.cfg.LlamaBinary, port)
+		if err != nil {
+			return nil, connect.NewError(connect.CodeInternal, err)
+		}
+		slog.Info("starting profile (llama_server)",
+			"profile", p.Name, "alias", p.Backend.LlamaServer.Alias,
+			"context", p.Backend.LlamaServer.Context, "port", port)
+	case p.Backend.ComfyUI != nil:
+		port = p.Backend.ComfyUI.Port
+		if port == 0 {
+			port, err = supervisor.PickFreePort()
+			if err != nil {
+				return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("pick port: %w", err))
+			}
+		}
+		spec, err = profile.ComfyUISpec(p, port)
+		if err != nil {
+			return nil, connect.NewError(connect.CodeInternal, err)
+		}
+		slog.Info("starting profile (comfyui)",
+			"profile", p.Name, "dir", p.Backend.ComfyUI.Dir, "port", port)
+	default:
+		return nil, connect.NewError(connect.CodeFailedPrecondition,
+			errors.New("profile has no backend (set backend.llama_server or backend.comfyui)"))
+	}
+
+	if err := d.sup.Start(startCtx, spec, port); err != nil {
 		slog.Error("supervisor start failed", "profile", p.Name, "err", err)
-		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("start llama-server: %w", err))
+		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("start backend: %w", err))
 	}
 
 	st := d.sup.Status()
-	backendURL, err := url.Parse(st.Addr)
-	if err != nil {
-		_ = d.sup.Stop(context.Background())
-		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("parse backend url: %w", err))
-	}
-	d.prx.SetBackend(backendURL)
 
-	vibeAPI := fmt.Sprintf("http://127.0.0.1:%d/v1", d.cfg.ProxyPort)
-	fr, err := frontend.ActivateWithContext(startCtx, p, profile.ExpandContext{
-		VibeAPI:      vibeAPI,
-		ModelAlias:   p.Model.Alias,
-		ModelContext: p.Model.Context,
-		VibeStateDir: paths.StateHome(),
-	})
-	if err != nil {
-		_ = d.sup.Stop(context.Background())
-		d.prx.SetBackend(nil)
-		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("activate frontend: %w", err))
+	// Wire the proxy and frontend only for llama-server. ComfyUI is reached
+	// directly via Status.BackendAddr by vamp / external tools, and ComfyUI
+	// already ships its own UI so there's no frontend to activate.
+	var fr *frontend.Result
+	if p.Backend.LlamaServer != nil {
+		backendURL, err := url.Parse(st.Addr)
+		if err != nil {
+			_ = d.sup.Stop(context.Background())
+			return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("parse backend url: %w", err))
+		}
+		d.prx.SetBackend(backendURL)
+
+		if p.Frontend.Kind != "" {
+			vibeAPI := fmt.Sprintf("http://127.0.0.1:%d/v1", d.cfg.ProxyPort)
+			fr, err = frontend.ActivateWithContext(startCtx, p, profile.ExpandContext{
+				VibeAPI:      vibeAPI,
+				ModelAlias:   p.Backend.LlamaServer.Alias,
+				ModelContext: p.Backend.LlamaServer.Context,
+				VibeStateDir: paths.StateHome(),
+			})
+			if err != nil {
+				_ = d.sup.Stop(context.Background())
+				d.prx.SetBackend(nil)
+				return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("activate frontend: %w", err))
+			}
+		}
 	}
 
 	d.mu.Lock()
@@ -275,16 +322,19 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 	d.frontend = fr
 	d.mu.Unlock()
 
-	slog.Info("profile started", "profile", p.Name, "backend", st.Addr, "wrote", fr.WroteFile)
-	return connect.NewResponse(&vibev1.StartResponse{
-		Status: d.protoStatus(),
-		Frontend: &vibev1.FrontendInfo{
+	resp := &vibev1.StartResponse{Status: d.protoStatus()}
+	if fr != nil {
+		slog.Info("profile started", "profile", p.Name, "backend", st.Addr, "wrote", fr.WroteFile)
+		resp.Frontend = &vibev1.FrontendInfo{
 			App:             p.Frontend.App,
 			WroteFile:       fr.WroteFile,
 			RestartRequired: fr.RestartRequired,
 			EnvVars:         fr.Env,
-		},
-	}), nil
+		}
+	} else {
+		slog.Info("profile started", "profile", p.Name, "backend", st.Addr)
+	}
+	return connect.NewResponse(resp), nil
 }
 
 func (d *Daemon) Stop(ctx context.Context, _ *connect.Request[vibev1.StopRequest]) (*connect.Response[vibev1.StopResponse], error) {
@@ -325,7 +375,21 @@ func (d *Daemon) Pull(ctx context.Context, req *connect.Request[vibev1.PullReque
 	if err != nil {
 		return connect.NewError(connect.CodeNotFound, err)
 	}
-	if p.Model.Huggingface == nil {
+	// ComfyUI manages its own model assets (ComfyUI-Manager + manual placement
+	// under models/); vibe has nothing to pull. Surface a clear DONE so the
+	// CLI doesn't spin forever waiting for download phase messages.
+	if p.Backend.ComfyUI != nil {
+		return stream.Send(&vibev1.PullProgress{
+			Phase:   vibev1.PullProgress_PHASE_DONE,
+			Message: "no model file to pull (ComfyUI manages its own model assets)",
+		})
+	}
+	if p.Backend.LlamaServer == nil {
+		return connect.NewError(connect.CodeFailedPrecondition,
+			errors.New("profile has no backend"))
+	}
+	m := p.Backend.LlamaServer
+	if m.Huggingface == nil {
 		return stream.Send(&vibev1.PullProgress{
 			Phase:   vibev1.PullProgress_PHASE_DONE,
 			Message: "no huggingface block; nothing to pull",
@@ -333,9 +397,9 @@ func (d *Daemon) Pull(ctx context.Context, req *connect.Request[vibev1.PullReque
 	}
 
 	spec := hfdownload.Spec{
-		Repo:     p.Model.Huggingface.Repo,
-		File:     p.Model.Huggingface.File,
-		Revision: p.Model.Huggingface.Revision,
+		Repo:     m.Huggingface.Repo,
+		File:     m.Huggingface.File,
+		Revision: m.Huggingface.Revision,
 	}
 	if err := stream.Send(&vibev1.PullProgress{Phase: vibev1.PullProgress_PHASE_RESOLVING}); err != nil {
 		return err
@@ -353,21 +417,21 @@ func (d *Daemon) Pull(ctx context.Context, req *connect.Request[vibev1.PullReque
 			TotalBytes:      total,
 		})
 	}
-	if err := hfdownload.Download(ctx, spec, p.Model.Path, progress); err != nil {
+	if err := hfdownload.Download(ctx, spec, m.Path, progress); err != nil {
 		slog.Error("download failed", "profile", p.Name, "err", err)
 		return connect.NewError(connect.CodeInternal, fmt.Errorf("download: %w", err))
 	}
 
 	var finalSize int64
-	if info, err := os.Stat(p.Model.Path); err == nil {
+	if info, err := os.Stat(m.Path); err == nil {
 		finalSize = info.Size()
 	}
 	msg := "complete"
 	if !bytesFlowed {
 		msg = "already cached"
-		slog.Info("model already cached", "profile", p.Name, "path", p.Model.Path, "size", finalSize)
+		slog.Info("model already cached", "profile", p.Name, "path", m.Path, "size", finalSize)
 	} else {
-		slog.Info("download complete", "profile", p.Name, "path", p.Model.Path, "size", finalSize)
+		slog.Info("download complete", "profile", p.Name, "path", m.Path, "size", finalSize)
 	}
 	return stream.Send(&vibev1.PullProgress{
 		Phase:           vibev1.PullProgress_PHASE_DONE,

@@ -11,20 +11,23 @@
 name: code
 description: Coding with Qwen3 Coder 30B + opencode
 
-model:
-  path: ~/models/qwen3-coder-30b-q6_k.gguf
-  # Must match the model id that llama-server advertises at /v1/models;
-  # opencode uses this string to route requests.
-  alias: qwen3-coder-30b
-  context: 190000
-  parallel: 1
-  gpu_layers: 999
-  flash_attn: true
-  cache_type_k: q8_0
-  cache_type_v: q8_0
-  jinja: true
-  extra_args:
-    - --no-mmap
+backend:
+  # `llama_server` is one of two supported backend kinds (the other is
+  # `comfyui`). Exactly one block under `backend:` must be set.
+  llama_server:
+    path: ~/models/qwen3-coder-30b-q6_k.gguf
+    # Must match the model id that llama-server advertises at /v1/models;
+    # opencode uses this string to route requests.
+    alias: qwen3-coder-30b
+    context: 190000
+    parallel: 1
+    gpu_layers: 999
+    flash_attn: true
+    cache_type_k: q8_0
+    cache_type_v: q8_0
+    jinja: true
+    extra_args:
+      - --no-mmap
 
 frontend:
   kind: external

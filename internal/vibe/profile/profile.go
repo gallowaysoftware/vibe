@@ -13,15 +13,34 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Profile is the top-level YAML shape on disk.
+//
+// Backend is a discriminated union: exactly one of its typed sub-blocks
+// (LlamaServer, ComfyUI) must be set. The presence of the sub-block is the
+// discriminator — no separate `kind` field is needed.
+//
+// Frontend is optional: ComfyUI ships its own UI, so ComfyUI-backed profiles
+// leave it unset. LlamaServer-backed profiles still require a frontend block
+// (external or docker-compose).
 type Profile struct {
 	Name            string   `yaml:"name"`
 	Description     string   `yaml:"description,omitempty"`
-	Model           Model    `yaml:"model"`
-	Frontend        Frontend `yaml:"frontend"`
+	Backend         Backend  `yaml:"backend"`
+	Frontend        Frontend `yaml:"frontend,omitempty"`
 	EstimatedVRAMGB float64  `yaml:"estimated_vram_gb,omitempty"`
 }
 
-type Model struct {
+// Backend is a discriminated union of supported local-AI backends. Exactly
+// one sub-block must be non-nil; loaders reject zero-or-both.
+type Backend struct {
+	LlamaServer *LlamaServerBackend `yaml:"llama_server,omitempty"`
+	ComfyUI     *ComfyUIBackend     `yaml:"comfyui,omitempty"`
+}
+
+// LlamaServerBackend supervises a llama-server child process exposing an
+// OpenAI-compatible API. This was the only backend in Phase 1 and used to
+// live under the top-level `model:` key.
+type LlamaServerBackend struct {
 	Path        string       `yaml:"path"`
 	Huggingface *Huggingface `yaml:"huggingface,omitempty"`
 	Alias       string       `yaml:"alias"`
@@ -35,9 +54,20 @@ type Model struct {
 	ExtraArgs   []string     `yaml:"extra_args,omitempty"`
 }
 
+// ComfyUIBackend supervises a ComfyUI python entrypoint. ComfyUI manages its
+// own model assets (we don't pull weights for it) and serves its own UI, so
+// no frontend block is allowed.
+type ComfyUIBackend struct {
+	Dir       string   `yaml:"dir"`              // ComfyUI checkout path; supports ~/  expansion
+	Python    string   `yaml:"python,omitempty"` // python binary; default "python3"
+	Listen    string   `yaml:"listen,omitempty"` // default "127.0.0.1"
+	Port      int      `yaml:"port,omitempty"`   // default 8188; 0 picks random
+	ExtraArgs []string `yaml:"extra_args,omitempty"`
+}
+
 // Huggingface points at a model file on huggingface.co. When set, vibe
-// downloads the file to Model.Path on demand (via `vibe pull` or implicitly
-// at the start of `vibe start`).
+// downloads the file to LlamaServerBackend.Path on demand (via `vibe pull` or
+// implicitly at the start of `vibe start`).
 type Huggingface struct {
 	Repo     string `yaml:"repo"`
 	File     string `yaml:"file"`
@@ -101,6 +131,11 @@ func (w *WaitForURL) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
+// migrationHint is appended to parse errors whenever the YAML appears to be
+// in the old `model:` shape. We detect this by looking for the keyword in the
+// raw error message produced by yaml.v3's KnownFields(true) decoder.
+const migrationHint = `: profile schema changed — the top-level 'model:' block moved under 'backend.llama_server:'. See profiles/code.example.yaml`
+
 // Load reads, parses, and validates a profile YAML file. Unknown fields are
 // rejected; ~/-prefixed paths are expanded relative to the user's home.
 func Load(path string) (*Profile, error) {
@@ -115,13 +150,26 @@ func Load(path string) (*Profile, error) {
 
 	var p Profile
 	if err := dec.Decode(&p); err != nil {
+		// yaml.v3's KnownFields(true) reports unknown top-level keys with a
+		// substring like `field model not found in type profile.Profile`.
+		// Wrap that with a migration pointer so users who upgrade vibe but
+		// not their profiles get a clear path forward.
+		msg := err.Error()
+		if strings.Contains(msg, "field model not found") || strings.Contains(msg, "\"model\"") {
+			return nil, fmt.Errorf("parse profile %s%s: %w", path, migrationHint, err)
+		}
 		return nil, fmt.Errorf("parse profile %s: %w", path, err)
 	}
 
-	if p.Model.Parallel == 0 {
-		p.Model.Parallel = 1
+	if p.Backend.LlamaServer != nil {
+		if p.Backend.LlamaServer.Parallel == 0 {
+			p.Backend.LlamaServer.Parallel = 1
+		}
+		p.Backend.LlamaServer.Path = expandTilde(p.Backend.LlamaServer.Path)
 	}
-	p.Model.Path = expandTilde(p.Model.Path)
+	if p.Backend.ComfyUI != nil {
+		p.Backend.ComfyUI.Dir = expandTilde(p.Backend.ComfyUI.Dir)
+	}
 	p.Frontend.WriteFile = expandTilde(p.Frontend.WriteFile)
 
 	if err := p.Validate(); err != nil {
@@ -140,27 +188,83 @@ func (p *Profile) Validate() error {
 		return fmt.Errorf("name %q must match [a-zA-Z0-9_-]+", p.Name)
 	}
 
-	if p.Model.Path == "" {
-		return errors.New("model.path is required")
+	if err := p.validateBackend(); err != nil {
+		return err
 	}
-	if p.Model.Huggingface != nil {
-		if p.Model.Huggingface.Repo == "" {
-			return errors.New("model.huggingface.repo is required when huggingface is set")
+	return p.validateFrontend()
+}
+
+func (p *Profile) validateBackend() error {
+	llama := p.Backend.LlamaServer
+	comfy := p.Backend.ComfyUI
+	switch {
+	case llama == nil && comfy == nil:
+		return errors.New("backend is required: set exactly one of backend.llama_server or backend.comfyui")
+	case llama != nil && comfy != nil:
+		return errors.New("backend: only one of backend.llama_server or backend.comfyui may be set")
+	case llama != nil:
+		return validateLlamaServer(llama)
+	case comfy != nil:
+		return validateComfyUI(comfy)
+	}
+	return nil
+}
+
+func validateLlamaServer(m *LlamaServerBackend) error {
+	if m.Path == "" {
+		return errors.New("backend.llama_server.path is required")
+	}
+	if m.Huggingface != nil {
+		if m.Huggingface.Repo == "" {
+			return errors.New("backend.llama_server.huggingface.repo is required when huggingface is set")
 		}
-		if p.Model.Huggingface.File == "" {
-			return errors.New("model.huggingface.file is required when huggingface is set")
+		if m.Huggingface.File == "" {
+			return errors.New("backend.llama_server.huggingface.file is required when huggingface is set")
 		}
-		// model.path doesn't need to exist; `vibe pull` will create it.
-	} else if _, err := os.Stat(p.Model.Path); err != nil {
-		return fmt.Errorf("model.path %s: %w", p.Model.Path, err)
+		// path doesn't need to exist; `vibe pull` will create it.
+	} else if _, err := os.Stat(m.Path); err != nil {
+		return fmt.Errorf("backend.llama_server.path %s: %w", m.Path, err)
 	}
-	if p.Model.Alias == "" {
-		return errors.New("model.alias is required (must match /v1/models id)")
+	if m.Alias == "" {
+		return errors.New("backend.llama_server.alias is required (must match /v1/models id)")
 	}
-	if p.Model.Context <= 0 {
-		return errors.New("model.context must be > 0")
+	if m.Context <= 0 {
+		return errors.New("backend.llama_server.context must be > 0")
+	}
+	return nil
+}
+
+func validateComfyUI(c *ComfyUIBackend) error {
+	if c.Dir == "" {
+		return errors.New("backend.comfyui.dir is required")
+	}
+	info, err := os.Stat(c.Dir)
+	if err != nil {
+		return fmt.Errorf("backend.comfyui.dir %s: %w", c.Dir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("backend.comfyui.dir %s: not a directory", c.Dir)
+	}
+	mainPy := filepath.Join(c.Dir, "main.py")
+	if _, err := os.Stat(mainPy); err != nil {
+		return fmt.Errorf("backend.comfyui.dir %s missing main.py: %w", c.Dir, err)
+	}
+	if c.Port < 0 {
+		return fmt.Errorf("backend.comfyui.port %d must be >= 0", c.Port)
+	}
+	return nil
+}
+
+func (p *Profile) validateFrontend() error {
+	// ComfyUI ships its own UI; reject any frontend config on those profiles.
+	if p.Backend.ComfyUI != nil {
+		if !p.Frontend.IsZero() {
+			return errors.New("frontend is not supported for comfyui backends (ComfyUI ships its own UI)")
+		}
+		return nil
 	}
 
+	// Llama-server profiles still require a frontend block (Phase 1 behavior).
 	switch p.Frontend.Kind {
 	case FrontendExternal:
 		if p.Frontend.WriteFile == "" {
@@ -231,6 +335,22 @@ func (p *Profile) Validate() error {
 	}
 
 	return nil
+}
+
+// IsZero reports whether the Frontend was left unset. Used to allow ComfyUI
+// profiles to omit `frontend:` entirely without tripping the kind validator.
+func (f Frontend) IsZero() bool {
+	return f.Kind == "" &&
+		f.App == "" &&
+		!f.RestartRequired &&
+		f.WriteFile == "" &&
+		len(f.Template) == 0 &&
+		len(f.Env) == 0 &&
+		len(f.MCPs) == 0 &&
+		f.ComposeFile == "" &&
+		f.ProjectName == "" &&
+		len(f.Services) == 0 &&
+		len(f.WaitFor) == 0
 }
 
 func expandTilde(p string) string {

@@ -276,10 +276,11 @@ func TestCheckProfilesAt_ValidAndInvalid(t *testing.T) {
 		t.Fatal(err)
 	}
 	good := fmt.Sprintf(`name: testprof
-model:
-  path: %s
-  alias: testalias
-  context: 4096
+backend:
+  llama_server:
+    path: %s
+    alias: testalias
+    context: 4096
 frontend:
   kind: external
   app: opencode
