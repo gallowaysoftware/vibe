@@ -28,14 +28,25 @@ type InputSpec struct {
 // Stage is a single step in the pipeline.
 type Stage struct {
 	ID           string         `yaml:"id"`
-	Type         StageType      `yaml:"type,omitempty"` // "" | "text" | "comfyui"; empty defaults to "text"
-	Capability   string         `yaml:"capability"`
+	Type         StageType      `yaml:"type,omitempty"` // "" | "text" | "comfyui" | "audio"; empty defaults to "text"
+	Capability   string         `yaml:"capability,omitempty"`
 	Prompt       string         `yaml:"prompt,omitempty"`
 	PromptFile   string         `yaml:"prompt_file,omitempty"`
 	Inputs       []string       `yaml:"inputs,omitempty"` // ids of prior stages to depend on
 	Output       string         `yaml:"output"`
 	OutputFormat string         `yaml:"output_format,omitempty"` // "" | "json"
 	Params       map[string]any `yaml:"params,omitempty"`        // merged into the chat-completion body (text stages only)
+
+	// Audio-stage fields. Audio stages shell out to a Piper TTS binary to
+	// synthesize speech from a rendered text template. Voice names the voice
+	// model (resolved to <VoicesDir>/<Voice>.onnx). Text is the template
+	// rendered and fed to piper on stdin. VoicesDir defaults to
+	// ~/.local/share/piper-voices and supports tilde expansion. Binary
+	// defaults to "piper" on $PATH.
+	Voice     string `yaml:"voice,omitempty"`
+	Text      string `yaml:"text,omitempty"`
+	VoicesDir string `yaml:"voices_dir,omitempty"`
+	Binary    string `yaml:"binary,omitempty"`
 	// Foreach, when non-nil, makes this a fan-out stage. The upstream stage
 	// referenced by From must produce output_format: json and its output must
 	// parse as a JSON array (or {"items":[...]} convenience wrap). The stage
@@ -158,9 +169,6 @@ func (p *Pipeline) Validate() error {
 		}
 		seenStages[s.ID] = true
 		ctx := fmt.Sprintf("stage %s", s.ID)
-		if s.Capability == "" {
-			return fmt.Errorf("%s: capability is required", ctx)
-		}
 		if s.Output == "" {
 			return fmt.Errorf("%s: output is required", ctx)
 		}
@@ -169,6 +177,11 @@ func (p *Pipeline) Validate() error {
 		stageType := s.Type
 		if stageType == "" {
 			stageType = StageTypeText
+		}
+		// Capability is required for every stage type except audio, which
+		// runs as a local subprocess and never activates a vibe profile.
+		if stageType != StageTypeAudio && s.Capability == "" {
+			return fmt.Errorf("%s: capability is required", ctx)
 		}
 		switch stageType {
 		case StageTypeText:
@@ -180,6 +193,37 @@ func (p *Pipeline) Validate() error {
 			}
 			if len(s.Parameters) > 0 {
 				return fmt.Errorf("%s: parameters is only valid on type: comfyui stages (text stages use params)", ctx)
+			}
+			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" {
+				return fmt.Errorf("%s: voice/text/voices_dir/binary are only valid on type: audio stages", ctx)
+			}
+		case StageTypeAudio:
+			if s.Voice == "" {
+				return fmt.Errorf("%s: voice is required for type: audio stages", ctx)
+			}
+			if s.Text == "" {
+				return fmt.Errorf("%s: text is required for type: audio stages", ctx)
+			}
+			if !strings.HasSuffix(s.Output, ".wav") {
+				return fmt.Errorf("%s: output %q must end in .wav for type: audio stages", ctx, s.Output)
+			}
+			if s.Prompt != "" {
+				return fmt.Errorf("%s: prompt is only valid on type: text stages", ctx)
+			}
+			if s.PromptFile != "" {
+				return fmt.Errorf("%s: prompt_file is only valid on type: text stages", ctx)
+			}
+			if len(s.Params) > 0 {
+				return fmt.Errorf("%s: params is only valid on type: text stages", ctx)
+			}
+			if s.OutputFormat != "" {
+				return fmt.Errorf("%s: output_format is only valid on type: text stages", ctx)
+			}
+			if s.Workflow != "" {
+				return fmt.Errorf("%s: workflow is only valid on type: comfyui stages", ctx)
+			}
+			if len(s.Parameters) > 0 {
+				return fmt.Errorf("%s: parameters is only valid on type: comfyui stages", ctx)
 			}
 		case StageTypeComfyUI:
 			if s.Workflow == "" {
@@ -205,8 +249,11 @@ func (p *Pipeline) Validate() error {
 			if s.OutputFormat != "" {
 				return fmt.Errorf("%s: output_format is only valid on type: text stages", ctx)
 			}
+			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" {
+				return fmt.Errorf("%s: voice/text/voices_dir/binary are only valid on type: audio stages", ctx)
+			}
 		default:
-			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui)", ctx, s.Type)
+			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio)", ctx, s.Type)
 		}
 		if s.OutputFormat != "" && s.OutputFormat != "json" {
 			return fmt.Errorf("%s: output_format %q is not supported (allowed: \"\", json)", ctx, s.OutputFormat)

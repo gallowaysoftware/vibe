@@ -39,6 +39,11 @@ const (
 	// workflow to a vibe-managed ComfyUI backend and copies the rendered
 	// file(s) into the run dir.
 	StageTypeComfyUI StageType = "comfyui"
+	// StageTypeAudio synthesizes speech by shelling out to a Piper TTS
+	// binary. The stage does not talk to vibe and does not activate a
+	// profile; the runner short-circuits profile activation for audio
+	// groups since the underlying binary is a local subprocess.
+	StageTypeAudio StageType = "audio"
 )
 
 // StageExecutor implements the run of a single stage instance. The receiver
@@ -152,6 +157,7 @@ func (e *Executor) Run(ctx context.Context) error {
 	e.registry = map[StageType]StageExecutor{
 		StageTypeText:    &textExecutor{inference: e.Inference},
 		StageTypeComfyUI: &comfyuiExecutor{pollInterval: time.Second},
+		StageTypeAudio:   &audioExecutor{},
 	}
 
 	// Stage lookup and dependency counts for wave-based scheduling.
@@ -233,6 +239,49 @@ func (e *Executor) Run(ctx context.Context) error {
 // buffer per-stage tokens and emit them contiguously after each stage
 // completes to keep concurrent output readable.
 func (e *Executor) runGroup(ctx context.Context, capability string, group []*Stage) error {
+	// Audio stages are local subprocesses; they don't talk to a vibe-managed
+	// backend, don't need a profile activation, and may legitimately ship
+	// with an empty capability. Short-circuit profile resolution when every
+	// stage in the group is audio so the scheduler doesn't demand a
+	// capability mapping for a stage type that doesn't use one.
+	allAudio := true
+	for _, st := range group {
+		if stageTypeOrDefault(st) != StageTypeAudio {
+			allAudio = false
+			break
+		}
+	}
+	if allAudio {
+		e.logf("  -> audio group (%d stage(s)): no profile activation", len(group))
+		if len(group) == 1 {
+			st := group[0]
+			if err := e.executeStage(ctx, st, "", "", "", nil); err != nil {
+				return fmt.Errorf("stage %s: %w", st.ID, err)
+			}
+			return nil
+		}
+		groupCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		var wg sync.WaitGroup
+		errs := make([]error, len(group))
+		for i, st := range group {
+			i, st := i, st
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				buf := &bytes.Buffer{}
+				err := e.executeStage(groupCtx, st, "", "", "", buf)
+				e.flushStageLog(st.ID, buf.Bytes())
+				if err != nil {
+					errs[i] = fmt.Errorf("stage %s: %w", st.ID, err)
+					cancel()
+				}
+			}()
+		}
+		wg.Wait()
+		return errors.Join(errs...)
+	}
+
 	profile, err := e.Capabilities.Profile(capability)
 	if err != nil {
 		return err

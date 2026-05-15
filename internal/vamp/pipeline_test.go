@@ -79,6 +79,87 @@ stages:
 	}
 }
 
+// TestLoadPipeline_AudioValid sanity-checks a minimal valid audio stage and
+// confirms the optional fields land on the parsed Stage.
+func TestLoadPipeline_AudioValid(t *testing.T) {
+	yaml := `
+name: voiceover
+stages:
+  - id: script
+    capability: reasoning
+    prompt: "say hi"
+    output: script.txt
+  - id: voiceover
+    type: audio
+    voice: en_US-lessac-medium
+    text: "{{.stages.script.output}}"
+    voices_dir: ~/.local/share/piper-voices
+    binary: piper
+    inputs: [script]
+    output: voiceover.wav
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Stages[1].Type != StageTypeAudio {
+		t.Errorf("type = %q, want %q", p.Stages[1].Type, StageTypeAudio)
+	}
+	if p.Stages[1].Voice != "en_US-lessac-medium" {
+		t.Errorf("voice = %q", p.Stages[1].Voice)
+	}
+	if p.Stages[1].Text != "{{.stages.script.output}}" {
+		t.Errorf("text = %q", p.Stages[1].Text)
+	}
+	if p.Stages[1].VoicesDir != "~/.local/share/piper-voices" {
+		t.Errorf("voices_dir = %q", p.Stages[1].VoicesDir)
+	}
+	if p.Stages[1].Binary != "piper" {
+		t.Errorf("binary = %q", p.Stages[1].Binary)
+	}
+}
+
+// TestLoadPipeline_AudioExampleFile parses the shipped example
+// pipeline.yaml so a CI failure flags any drift between the example and the
+// validator. (Pipeline files are committed alongside the code; a parse
+// failure here means the example doc is out of step.)
+func TestLoadPipeline_AudioExampleFile(t *testing.T) {
+	// Locate the example relative to this test file's package directory.
+	// `go test` runs with the package dir as CWD, so a relative path up
+	// two levels lands at the repo root.
+	p, err := LoadPipeline(filepath.Join("..", "..", "examples", "voiceover-pipeline", "pipeline.yaml"))
+	if err != nil {
+		t.Fatalf("load example: %v", err)
+	}
+	if p.Name != "voiceover_smoke" {
+		t.Errorf("name = %q, want voiceover_smoke", p.Name)
+	}
+	if len(p.Stages) != 2 {
+		t.Fatalf("stages = %d, want 2", len(p.Stages))
+	}
+	if p.Stages[1].Type != StageTypeAudio {
+		t.Errorf("stage 1 type = %q, want %q", p.Stages[1].Type, StageTypeAudio)
+	}
+}
+
+// TestLoadPipeline_AudioCapabilityOptional verifies an audio stage parses
+// successfully without a `capability:` field — audio stages run as local
+// subprocesses and don't activate a vibe profile.
+func TestLoadPipeline_AudioCapabilityOptional(t *testing.T) {
+	yaml := `
+name: voiceover
+stages:
+  - id: voiceover
+    type: audio
+    voice: en_US-lessac-medium
+    text: "hi"
+    output: voiceover.wav
+`
+	if _, err := LoadPipeline(writePipeline(t, yaml)); err != nil {
+		t.Fatalf("expected audio stage with no capability to validate, got: %v", err)
+	}
+}
+
 // TestLoadPipeline_ComfyUIValid sanity-checks a minimal valid comfyui stage.
 func TestLoadPipeline_ComfyUIValid(t *testing.T) {
 	yaml := `
@@ -566,6 +647,122 @@ stages:
   capability: r
   output: a.md`,
 			wantErr: "type \"nope\"",
+		},
+		{
+			name: "audio without voice",
+			yaml: `name: x
+stages:
+- id: a
+  type: audio
+  text: "hi"
+  output: a.wav`,
+			wantErr: "voice is required",
+		},
+		{
+			name: "audio without text",
+			yaml: `name: x
+stages:
+- id: a
+  type: audio
+  voice: en_US-lessac-medium
+  output: a.wav`,
+			wantErr: "text is required",
+		},
+		{
+			name: "audio output not .wav",
+			yaml: `name: x
+stages:
+- id: a
+  type: audio
+  voice: en_US-lessac-medium
+  text: "hi"
+  output: a.mp3`,
+			wantErr: "must end in .wav",
+		},
+		{
+			name: "audio with prompt (text-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: audio
+  voice: en_US-lessac-medium
+  text: "hi"
+  prompt: "nope"
+  output: a.wav`,
+			wantErr: "prompt is only valid on type: text",
+		},
+		{
+			name: "audio with prompt_file (text-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: audio
+  voice: en_US-lessac-medium
+  text: "hi"
+  prompt_file: nope.tmpl
+  output: a.wav`,
+			wantErr: "prompt_file is only valid on type: text",
+		},
+		{
+			name: "audio with params (text-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: audio
+  voice: en_US-lessac-medium
+  text: "hi"
+  output: a.wav
+  params:
+    temperature: 0.8`,
+			wantErr: "params is only valid on type: text",
+		},
+		{
+			name: "audio with workflow (comfyui-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: audio
+  voice: en_US-lessac-medium
+  text: "hi"
+  output: a.wav
+  workflow: wf.json`,
+			wantErr: "workflow is only valid on type: comfyui",
+		},
+		{
+			name: "text stage with voice (audio-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  capability: r
+  prompt: hi
+  output: a.md
+  voice: en_US-lessac-medium`,
+			wantErr: "voice/text/voices_dir/binary are only valid on type: audio",
+		},
+		{
+			name: "text stage with text field (audio-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  capability: r
+  prompt: hi
+  output: a.md
+  text: "nope"`,
+			wantErr: "voice/text/voices_dir/binary are only valid on type: audio",
+		},
+		{
+			name: "comfyui with voice (audio-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: comfyui
+  capability: image
+  workflow: wf.json
+  output: a.png
+  parameters:
+    "6.text": hi
+  voice: nope`,
+			wantErr: "voice/text/voices_dir/binary are only valid on type: audio",
 		},
 	}
 	for _, tc := range cases {
