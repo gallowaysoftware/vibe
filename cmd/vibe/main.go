@@ -1,12 +1,15 @@
-// vibe is a task-oriented launcher for local AI inference.
-//
-// This entry point is intentionally minimal during Phase 1 development; the
-// CLI surface is wired up in internal/cli once enough of the daemon and
-// supervisor are in place to do useful work.
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+
+	"github.com/gallowaysoftware/vibe/internal/cli"
+)
 
 func main() {
-	fmt.Println("vibe (Phase 1, in development — see github.com/gallowaysoftware/vibe)")
+	if err := cli.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, "vibe:", err)
+		os.Exit(1)
+	}
 }
