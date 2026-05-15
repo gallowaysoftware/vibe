@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -460,7 +462,7 @@ func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID
 	}
 
 	in := e.makeStageInput(st, baseURL, modelID, backendAddr, tokenSink, nil, 0)
-	out, err := exec.Execute(ctx, in)
+	out, err := e.runWithRetry(ctx, st, exec, in)
 	if err != nil {
 		return err
 	}
@@ -591,7 +593,11 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 				itemSink = buf
 			}
 			in := e.makeStageInput(st, baseURL, modelID, backendAddr, itemSink, items[i], i)
-			out, runErr := exec.Execute(groupCtx, in)
+			// Retry policy applies PER ITEM: a single transient failure on
+			// item N does not re-run items 0..N-1. The wrapper respects
+			// groupCtx so an erroring sibling that calls cancel() aborts
+			// any in-progress backoff sleeps immediately.
+			out, runErr := e.runWithRetry(groupCtx, st, exec, in)
 			if buf != nil {
 				if tokenSink != nil {
 					sinkMu.Lock()
@@ -643,6 +649,179 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 	e.mu.Unlock()
 	return nil
 }
+
+// runWithRetry invokes exec.Execute under the stage's RetryPolicy. When the
+// policy is nil or has MaxAttempts <= 1 the call is forwarded verbatim and
+// the executor's first error is returned (matching pre-retry behaviour).
+//
+// On a retryable error we sleep for the current backoff (honoring ctx) and
+// loop; the backoff grows by policy.Multiplier, capped at policy.MaxBackoff,
+// for each attempt. Non-retryable errors (validation failures, user cancel,
+// errors whose classification does not match a configured retry_on mode) are
+// returned immediately.
+//
+// The "current attempt" counter is bumped AFTER each Execute call so the
+// final-attempt log message and the early-return path both see the correct
+// value. itemTag, when non-empty, is appended to log lines so the foreach
+// per-item retry loop produces a unique header.
+func (e *Executor) runWithRetry(ctx context.Context, st *Stage, exec StageExecutor, in StageInput) (*StageOutput, error) {
+	policy := st.Retry
+	// Fast path: no policy (nil) or single-attempt policy means "no retry".
+	// Skip the loop entirely so the existing call graph is unchanged for
+	// pipelines that don't opt in.
+	if policy == nil || policy.MaxAttempts <= 1 {
+		return exec.Execute(ctx, in)
+	}
+	attempt := 0
+	backoff := policy.InitialBackoff
+	itemTag := ""
+	if st.Foreach != nil {
+		itemTag = fmt.Sprintf("[%d]", in.ItemIdx)
+	}
+	for {
+		out, err := exec.Execute(ctx, in)
+		if err == nil {
+			if attempt > 0 {
+				e.logf("  -> stage %q%s recovered after %d retry(ies)", st.ID, itemTag, attempt)
+			}
+			return out, nil
+		}
+		attempt++
+		// Always honor explicit ctx cancellation before deciding to retry.
+		// A user-initiated ctrl-C must never trigger another attempt even
+		// if the underlying error otherwise looks transient (e.g. an
+		// HTTP request aborted with "context canceled" reads as a network
+		// error to some libraries).
+		if errors.Is(err, context.Canceled) {
+			return nil, err
+		}
+		if attempt >= policy.MaxAttempts {
+			return nil, err
+		}
+		if !isRetryable(err, policy) {
+			return nil, err
+		}
+		e.logf("  -> stage %q%s attempt %d failed; retrying in %s: %v", st.ID, itemTag, attempt, backoff, err)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		// Grow backoff with the configured multiplier, capped at MaxBackoff.
+		// time.Duration is int64 nanoseconds; multiplying by a float is
+		// fine here because MaxBackoff is on the order of seconds.
+		next := time.Duration(float64(backoff) * policy.Multiplier)
+		if next > policy.MaxBackoff || next <= 0 {
+			next = policy.MaxBackoff
+		}
+		backoff = next
+	}
+}
+
+// isRetryable reports whether err matches at least one of the retry modes in
+// policy.RetryOn. The classification is intentionally permissive because the
+// stage executors return free-form errors (string-wrapped HTTP statuses, raw
+// net errors, etc.) — in Phase 1 we don't want to require every executor to
+// surface a typed error.
+//
+// Classification:
+//   - context.Canceled: never retryable (user cancel; caller handles this
+//     explicitly above for early-out, but we also gate here defensively).
+//   - context.DeadlineExceeded or *net.OpError with Timeout(): retryable
+//     under both "timeout" and "transient" modes.
+//   - HTTP 5xx errors (matched by substring in the error string — see
+//     transientHTTPMatchers below) and common network-layer failures
+//     ("connection refused", "connection reset", "i/o timeout", "EOF",
+//     "no such host", "network is unreachable") are retryable under
+//     "transient" only.
+//
+// The HTTP 5xx substring match exists because no executor wraps its errors
+// in a typed HTTPError; we'd have to thread one through ChatCompletion,
+// the ComfyUI executor, and any future Phase 2 backends. For Phase 1 we
+// pattern-match the standard "<code> <reason>" form (e.g. "503 Service
+// Unavailable") that net/http's resp.Status and most clients embed in
+// error strings. If a future executor wraps differently, this list is the
+// single place to extend.
+func isRetryable(err error, policy *RetryPolicy) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	hasTimeoutMode := false
+	hasTransientMode := false
+	for _, mode := range policy.RetryOn {
+		switch mode {
+		case retryOnTimeout:
+			hasTimeoutMode = true
+		case retryOnTransient:
+			hasTransientMode = true
+		}
+	}
+	// Timeout detection: works for both "timeout" and "transient" modes
+	// because every timeout is also a transient by definition.
+	isTimeout := errors.Is(err, context.DeadlineExceeded)
+	if !isTimeout {
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			isTimeout = true
+		}
+	}
+	if isTimeout && (hasTimeoutMode || hasTransientMode) {
+		return true
+	}
+	if !hasTransientMode {
+		// Only "timeout" was requested and the error isn't a timeout.
+		return false
+	}
+	// Transient-mode classification by substring + 5xx-status regex.
+	// Lower-case the haystack once so each substring matcher can be
+	// ASCII-lowercase; the 5xx regex is digit-only so case doesn't matter.
+	msg := strings.ToLower(err.Error())
+	if http5xxRE.MatchString(msg) {
+		return true
+	}
+	for _, m := range transientErrorMatchers {
+		if strings.Contains(msg, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// transientErrorMatchers is the substring set used to classify "transient"
+// errors when no typed error is available. Each entry is matched against the
+// lower-cased err.Error(); ordering doesn't affect correctness but
+// frequently-hit cases come first for cheap short-circuit. Centralized so
+// future executors can extend transient-detection in one place.
+//
+// Entries:
+//   - "i/o timeout", "connection refused", "connection reset": Go's
+//     standard network-layer error strings.
+//   - "no such host", "network is unreachable": DNS / routing failures
+//     that are usually transient on flaky networks (and on CI).
+//   - "unexpected eof": premature server hang-ups during keepalive reuse
+//     or mid-stream SSE drops.
+//
+// HTTP 5xx codes are NOT in this list; they're matched separately by
+// http5xxRE so we can anchor against word boundaries (digit groups
+// preceded/followed by non-digits) and avoid matching "5039" in a
+// numeric stage ID or a user prompt that happens to contain "503".
+var transientErrorMatchers = []string{
+	"i/o timeout",
+	"connection refused",
+	"connection reset",
+	"no such host",
+	"network is unreachable",
+	"unexpected eof",
+}
+
+// http5xxRE matches an HTTP 5xx status code embedded in an error string.
+// The non-digit anchors on both sides prevent the regex from matching
+// numeric substrings like "5039" or "1503ms" that are not status codes.
+// Compiled once at init so the per-error check is O(len(msg)).
+var http5xxRE = regexp.MustCompile(`(?:^|\D)5[0-9]{2}(?:\D|$)`)
 
 // makeStageInput assembles a StageInput for one invocation. tokenSink is the
 // caller-provided buffer for token streaming, or nil to stream directly to

@@ -6,6 +6,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -71,6 +72,115 @@ type Stage struct {
 	// the user-supplied args so users don't manage the destination path
 	// themselves. Binary (shared with audio) defaults to "ffmpeg" on $PATH.
 	FFmpegArgs []string `yaml:"ffmpeg_args,omitempty"`
+
+	// Retry, when non-nil, enables per-stage retry-with-exponential-backoff
+	// for transient failures. The runner wraps each executor.Execute call
+	// (per-item for foreach stages) in a retry loop governed by this
+	// policy. Absent / nil means "no retry" — the executor's first error
+	// is returned verbatim, matching pre-retry behaviour.
+	Retry *RetryPolicy `yaml:"retry,omitempty"`
+}
+
+// RetryPolicy controls per-stage retry behaviour for transient executor
+// failures. All fields have defaults; the zero value of *RetryPolicy
+// (nil) means "no retry" (max_attempts effectively 1). When a non-nil
+// policy omits a field, the defaults below are applied by Normalize so
+// the executor never has to special-case zero values.
+//
+// Semantics:
+//   - MaxAttempts is the total attempt count (NOT additional retries after
+//     the first). 1 means "no retry"; 3 means "one initial attempt plus up
+//     to two retries". Default 1.
+//   - InitialBackoff is the wait before attempt 2. Default 1s.
+//   - MaxBackoff caps the exponential growth. Default 30s.
+//   - Multiplier is the per-attempt growth factor. Default 2.0.
+//   - RetryOn names the error-classification modes that count as
+//     retryable. Default ["transient"] when the block is present. User
+//     cancellation (context.Canceled) is NEVER retryable regardless of
+//     mode.
+type RetryPolicy struct {
+	MaxAttempts    int           `yaml:"max_attempts,omitempty"`
+	InitialBackoff time.Duration `yaml:"initial_backoff,omitempty"`
+	MaxBackoff     time.Duration `yaml:"max_backoff,omitempty"`
+	Multiplier     float64       `yaml:"multiplier,omitempty"`
+	RetryOn        []string      `yaml:"retry_on,omitempty"`
+}
+
+// Retry-policy defaults applied by Normalize when the YAML omits a field.
+// Exposed so tests and callers can refer to them by name instead of
+// hard-coding constants in two places.
+const (
+	defaultRetryMaxAttempts    = 1
+	defaultRetryInitialBackoff = time.Second
+	defaultRetryMaxBackoff     = 30 * time.Second
+	defaultRetryMultiplier     = 2.0
+)
+
+// retryOnTransient and retryOnTimeout are the two valid RetryOn entries.
+// "transient" subsumes "timeout" plus 5xx/network-style errors; "timeout"
+// is the narrower form callers can pick when they only want deadline
+// failures retried.
+const (
+	retryOnTransient = "transient"
+	retryOnTimeout   = "timeout"
+)
+
+// Normalize fills in defaults on a RetryPolicy. Called by Pipeline.Validate
+// so the executor sees a fully-populated policy at run time. Returns the
+// policy unchanged when the receiver is nil (no retry).
+func (r *RetryPolicy) Normalize() {
+	if r == nil {
+		return
+	}
+	if r.MaxAttempts == 0 {
+		r.MaxAttempts = defaultRetryMaxAttempts
+	}
+	if r.InitialBackoff == 0 {
+		r.InitialBackoff = defaultRetryInitialBackoff
+	}
+	if r.MaxBackoff == 0 {
+		r.MaxBackoff = defaultRetryMaxBackoff
+	}
+	if r.Multiplier == 0 {
+		r.Multiplier = defaultRetryMultiplier
+	}
+	if len(r.RetryOn) == 0 {
+		r.RetryOn = []string{retryOnTransient}
+	}
+}
+
+// Validate checks shape constraints on a retry block. Called from
+// Pipeline.Validate; the input is the user-supplied form (pre-Normalize)
+// so we can distinguish "omitted" (zero) from "explicit 0" only for
+// fields where that matters — currently none, since zero-valued
+// durations are indistinguishable from missing in YAML and we want
+// missing to mean "use the default".
+func (r *RetryPolicy) Validate(ctx string) error {
+	if r == nil {
+		return nil
+	}
+	if r.MaxAttempts < 0 {
+		return fmt.Errorf("%s: retry.max_attempts must be >= 1 (got %d)", ctx, r.MaxAttempts)
+	}
+	// MaxAttempts == 0 is treated as "default to 1" by Normalize, so it's
+	// permitted here; only negative values are user-facing errors.
+	if r.InitialBackoff < 0 {
+		return fmt.Errorf("%s: retry.initial_backoff must be > 0 (got %s)", ctx, r.InitialBackoff)
+	}
+	if r.MaxBackoff < 0 {
+		return fmt.Errorf("%s: retry.max_backoff must be > 0 (got %s)", ctx, r.MaxBackoff)
+	}
+	if r.Multiplier != 0 && r.Multiplier < 1.0 {
+		return fmt.Errorf("%s: retry.multiplier must be >= 1.0 (got %g)", ctx, r.Multiplier)
+	}
+	for _, mode := range r.RetryOn {
+		switch mode {
+		case retryOnTransient, retryOnTimeout:
+		default:
+			return fmt.Errorf("%s: retry.retry_on entry %q is not supported (allowed: %q, %q)", ctx, mode, retryOnTransient, retryOnTimeout)
+		}
+	}
+	return nil
 }
 
 // ForeachSpec is the structured fan-out descriptor for a stage. The previous
@@ -309,6 +419,16 @@ func (p *Pipeline) Validate() error {
 		if s.OutputFormat != "" && s.OutputFormat != "json" {
 			return fmt.Errorf("%s: output_format %q is not supported (allowed: \"\", json)", ctx, s.OutputFormat)
 		}
+		// Retry policy: validate user-supplied fields, then normalize so
+		// the executor sees defaults filled in. Validation runs against
+		// the pristine values (so negative ones are rejected); Normalize
+		// mutates the policy in place via the slice element pointer so
+		// the per-stage executor.Execute wrapper can read filled-in
+		// defaults without recomputing them.
+		if err := s.Retry.Validate(ctx); err != nil {
+			return err
+		}
+		p.Stages[i].Retry.Normalize()
 		if s.Foreach != nil {
 			if s.Foreach.From == "" {
 				return fmt.Errorf("%s: foreach.from is required", ctx)
