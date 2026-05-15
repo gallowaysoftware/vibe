@@ -20,6 +20,11 @@ func startCmd() *cobra.Command {
 			if err := ensureDaemon(ctx); err != nil {
 				return err
 			}
+			// Idempotent: PHASE_DONE immediately if the profile has no HF block
+			// or the model is already cached at the right size.
+			if err := pullProfile(ctx, args[0]); err != nil {
+				return err
+			}
 			r, err := newClient().Start(ctx, args[0])
 			if err != nil {
 				return err

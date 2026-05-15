@@ -76,6 +76,10 @@ func (f *fakeControl) Logs(_ context.Context, _ *connect.Request[vibev1.LogsRequ
 	f.record("Logs")
 	return connect.NewResponse(&vibev1.LogsResponse{Lines: []string{"line1", "line2"}}), nil
 }
+func (f *fakeControl) Pull(_ context.Context, _ *connect.Request[vibev1.PullRequest], stream *connect.ServerStream[vibev1.PullProgress]) error {
+	f.record("Pull")
+	return stream.Send(&vibev1.PullProgress{Phase: vibev1.PullProgress_PHASE_DONE})
+}
 
 func newFakeServer(t *testing.T, svc vibev1connect.ControlServiceHandler) (*httptest.Server, *Client) {
 	t.Helper()

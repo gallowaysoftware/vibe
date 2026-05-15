@@ -21,16 +21,26 @@ type Profile struct {
 }
 
 type Model struct {
-	Path       string   `yaml:"path"`
-	Alias      string   `yaml:"alias"`
-	Context    int      `yaml:"context"`
-	Parallel   int      `yaml:"parallel,omitempty"`
-	GPULayers  int      `yaml:"gpu_layers,omitempty"`
-	FlashAttn  bool     `yaml:"flash_attn,omitempty"`
-	CacheTypeK string   `yaml:"cache_type_k,omitempty"`
-	CacheTypeV string   `yaml:"cache_type_v,omitempty"`
-	Jinja      bool     `yaml:"jinja,omitempty"`
-	ExtraArgs  []string `yaml:"extra_args,omitempty"`
+	Path        string       `yaml:"path"`
+	Huggingface *Huggingface `yaml:"huggingface,omitempty"`
+	Alias       string       `yaml:"alias"`
+	Context     int          `yaml:"context"`
+	Parallel    int          `yaml:"parallel,omitempty"`
+	GPULayers   int          `yaml:"gpu_layers,omitempty"`
+	FlashAttn   bool         `yaml:"flash_attn,omitempty"`
+	CacheTypeK  string       `yaml:"cache_type_k,omitempty"`
+	CacheTypeV  string       `yaml:"cache_type_v,omitempty"`
+	Jinja       bool         `yaml:"jinja,omitempty"`
+	ExtraArgs   []string     `yaml:"extra_args,omitempty"`
+}
+
+// Huggingface points at a model file on huggingface.co. When set, vibe
+// downloads the file to Model.Path on demand (via `vibe pull` or implicitly
+// at the start of `vibe start`).
+type Huggingface struct {
+	Repo     string `yaml:"repo"`
+	File     string `yaml:"file"`
+	Revision string `yaml:"revision,omitempty"` // default "main"
 }
 
 const (
@@ -90,7 +100,15 @@ func (p *Profile) Validate() error {
 	if p.Model.Path == "" {
 		return errors.New("model.path is required")
 	}
-	if _, err := os.Stat(p.Model.Path); err != nil {
+	if p.Model.Huggingface != nil {
+		if p.Model.Huggingface.Repo == "" {
+			return errors.New("model.huggingface.repo is required when huggingface is set")
+		}
+		if p.Model.Huggingface.File == "" {
+			return errors.New("model.huggingface.file is required when huggingface is set")
+		}
+		// model.path doesn't need to exist; `vibe pull` will create it.
+	} else if _, err := os.Stat(p.Model.Path); err != nil {
 		return fmt.Errorf("model.path %s: %w", p.Model.Path, err)
 	}
 	if p.Model.Alias == "" {

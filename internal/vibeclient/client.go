@@ -90,6 +90,26 @@ func (c *Client) Logs(ctx context.Context) ([]string, error) {
 	return resp.Msg.Lines, nil
 }
 
+// PullStream is a forward-iterator over PullProgress messages.
+type PullStream struct {
+	s *connect.ServerStreamForClient[vibev1.PullProgress]
+}
+
+func (s *PullStream) Receive() bool              { return s.s.Receive() }
+func (s *PullStream) Msg() *vibev1.PullProgress  { return s.s.Msg() }
+func (s *PullStream) Err() error                 { return s.s.Err() }
+func (s *PullStream) Close() error               { return s.s.Close() }
+
+// Pull starts a server-streaming Pull RPC. The caller iterates with Receive()
+// and reads each message via Msg().
+func (c *Client) Pull(ctx context.Context, profile string) (*PullStream, error) {
+	stream, err := c.rpc.Pull(ctx, connect.NewRequest(&vibev1.PullRequest{Profile: profile}))
+	if err != nil {
+		return nil, err
+	}
+	return &PullStream{s: stream}, nil
+}
+
 // EnsureActive returns immediately if `profile` is already the active, ready
 // profile. Otherwise it stops any active profile and starts `profile`.
 func (c *Client) EnsureActive(ctx context.Context, profile string) (*vibev1.Status, error) {

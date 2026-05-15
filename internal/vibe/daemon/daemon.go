@@ -26,6 +26,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/frontend"
+	"github.com/gallowaysoftware/vibe/internal/vibe/hfdownload"
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 	"github.com/gallowaysoftware/vibe/internal/vibe/proxy"
@@ -297,6 +298,76 @@ func (d *Daemon) Shutdown(_ context.Context, _ *connect.Request[vibev1.ShutdownR
 
 func (d *Daemon) Logs(_ context.Context, _ *connect.Request[vibev1.LogsRequest]) (*connect.Response[vibev1.LogsResponse], error) {
 	return connect.NewResponse(&vibev1.LogsResponse{Lines: d.sup.Logs()}), nil
+}
+
+func (d *Daemon) Pull(ctx context.Context, req *connect.Request[vibev1.PullRequest], stream *connect.ServerStream[vibev1.PullProgress]) error {
+	if !d.startMu.TryLock() {
+		return connect.NewError(connect.CodeAborted, errors.New("another start/stop/pull is in progress"))
+	}
+	defer d.startMu.Unlock()
+
+	name := strings.TrimSpace(req.Msg.Profile)
+	if name == "" {
+		return connect.NewError(connect.CodeInvalidArgument, errors.New("profile name required"))
+	}
+	p, err := loadProfileByName(name)
+	if err != nil {
+		return connect.NewError(connect.CodeNotFound, err)
+	}
+	if p.Model.Huggingface == nil {
+		return stream.Send(&vibev1.PullProgress{
+			Phase:   vibev1.PullProgress_PHASE_DONE,
+			Message: "no huggingface block; nothing to pull",
+		})
+	}
+
+	spec := hfdownload.Spec{
+		Repo:     p.Model.Huggingface.Repo,
+		File:     p.Model.Huggingface.File,
+		Revision: p.Model.Huggingface.Revision,
+	}
+	if err := stream.Send(&vibev1.PullProgress{Phase: vibev1.PullProgress_PHASE_RESOLVING}); err != nil {
+		return err
+	}
+	total, err := hfdownload.HeadSize(ctx, spec)
+	if err != nil {
+		return connect.NewError(connect.CodeUnavailable, fmt.Errorf("head huggingface: %w", err))
+	}
+	if info, statErr := os.Stat(p.Model.Path); statErr == nil && total > 0 && info.Size() == total {
+		slog.Info("model already cached", "profile", p.Name, "path", p.Model.Path, "size", total)
+		return stream.Send(&vibev1.PullProgress{
+			Phase:           vibev1.PullProgress_PHASE_DONE,
+			DownloadedBytes: total,
+			TotalBytes:      total,
+			Message:         "model already cached",
+		})
+	}
+	slog.Info("downloading model", "profile", p.Name, "url", spec.URL(), "expected_size", total)
+
+	if err := stream.Send(&vibev1.PullProgress{
+		Phase:      vibev1.PullProgress_PHASE_DOWNLOADING,
+		TotalBytes: total,
+	}); err != nil {
+		return err
+	}
+	progress := func(downloaded, t int64) {
+		_ = stream.Send(&vibev1.PullProgress{
+			Phase:           vibev1.PullProgress_PHASE_DOWNLOADING,
+			DownloadedBytes: downloaded,
+			TotalBytes:      t,
+		})
+	}
+	if err := hfdownload.Download(ctx, spec, p.Model.Path, progress); err != nil {
+		slog.Error("download failed", "profile", p.Name, "err", err)
+		return connect.NewError(connect.CodeInternal, fmt.Errorf("download: %w", err))
+	}
+	slog.Info("download complete", "profile", p.Name, "path", p.Model.Path)
+	return stream.Send(&vibev1.PullProgress{
+		Phase:           vibev1.PullProgress_PHASE_DONE,
+		DownloadedBytes: total,
+		TotalBytes:      total,
+		Message:         "complete",
+	})
 }
 
 // ─── Internals ──────────────────────────────────────────────────────────────

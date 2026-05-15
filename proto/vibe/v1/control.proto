@@ -28,6 +28,12 @@ service ControlService {
   // Logs returns the most recent llama-server log lines. Streaming follow is
   // a future RPC.
   rpc Logs(LogsRequest) returns (LogsResponse) {}
+
+  // Pull downloads the profile's model from HuggingFace if it isn't already
+  // present locally. Returns a single PHASE_DONE message if the model is
+  // already cached at the expected size, or a stream of PHASE_DOWNLOADING
+  // updates while bytes flow in.
+  rpc Pull(PullRequest) returns (stream PullProgress) {}
 }
 
 message Status {
@@ -87,4 +93,23 @@ message ShutdownResponse {}
 message LogsRequest {}
 message LogsResponse {
   repeated string lines = 1;
+}
+
+message PullRequest {
+  string profile = 1;
+}
+
+message PullProgress {
+  enum Phase {
+    PHASE_UNSPECIFIED = 0;
+    PHASE_RESOLVING = 1;   // HEAD request to HuggingFace to fetch metadata
+    PHASE_DOWNLOADING = 2; // bytes flowing in
+    PHASE_VERIFYING = 3;   // post-download size check
+    PHASE_DONE = 4;        // final state
+  }
+  Phase phase = 1;
+  int64 downloaded_bytes = 2;
+  int64 total_bytes = 3;
+  // human-readable message, e.g. "resuming from byte 1234567"
+  string message = 4;
 }

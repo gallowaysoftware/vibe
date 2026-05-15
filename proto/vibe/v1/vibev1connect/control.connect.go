@@ -46,6 +46,8 @@ const (
 	ControlServiceShutdownProcedure = "/vibe.v1.ControlService/Shutdown"
 	// ControlServiceLogsProcedure is the fully-qualified name of the ControlService's Logs RPC.
 	ControlServiceLogsProcedure = "/vibe.v1.ControlService/Logs"
+	// ControlServicePullProcedure is the fully-qualified name of the ControlService's Pull RPC.
+	ControlServicePullProcedure = "/vibe.v1.ControlService/Pull"
 )
 
 // ControlServiceClient is a client for the vibe.v1.ControlService service.
@@ -63,6 +65,11 @@ type ControlServiceClient interface {
 	// Logs returns the most recent llama-server log lines. Streaming follow is
 	// a future RPC.
 	Logs(context.Context, *connect.Request[v1.LogsRequest]) (*connect.Response[v1.LogsResponse], error)
+	// Pull downloads the profile's model from HuggingFace if it isn't already
+	// present locally. Returns a single PHASE_DONE message if the model is
+	// already cached at the expected size, or a stream of PHASE_DOWNLOADING
+	// updates while bytes flow in.
+	Pull(context.Context, *connect.Request[v1.PullRequest]) (*connect.ServerStreamForClient[v1.PullProgress], error)
 }
 
 // NewControlServiceClient constructs a client for the vibe.v1.ControlService service. By default,
@@ -112,6 +119,12 @@ func NewControlServiceClient(httpClient connect.HTTPClient, baseURL string, opts
 			connect.WithSchema(controlServiceMethods.ByName("Logs")),
 			connect.WithClientOptions(opts...),
 		),
+		pull: connect.NewClient[v1.PullRequest, v1.PullProgress](
+			httpClient,
+			baseURL+ControlServicePullProcedure,
+			connect.WithSchema(controlServiceMethods.ByName("Pull")),
+			connect.WithClientOptions(opts...),
+		),
 	}
 }
 
@@ -123,6 +136,7 @@ type controlServiceClient struct {
 	stop         *connect.Client[v1.StopRequest, v1.StopResponse]
 	shutdown     *connect.Client[v1.ShutdownRequest, v1.ShutdownResponse]
 	logs         *connect.Client[v1.LogsRequest, v1.LogsResponse]
+	pull         *connect.Client[v1.PullRequest, v1.PullProgress]
 }
 
 // Status calls vibe.v1.ControlService.Status.
@@ -155,6 +169,11 @@ func (c *controlServiceClient) Logs(ctx context.Context, req *connect.Request[v1
 	return c.logs.CallUnary(ctx, req)
 }
 
+// Pull calls vibe.v1.ControlService.Pull.
+func (c *controlServiceClient) Pull(ctx context.Context, req *connect.Request[v1.PullRequest]) (*connect.ServerStreamForClient[v1.PullProgress], error) {
+	return c.pull.CallServerStream(ctx, req)
+}
+
 // ControlServiceHandler is an implementation of the vibe.v1.ControlService service.
 type ControlServiceHandler interface {
 	// Status returns the daemon's current state.
@@ -170,6 +189,11 @@ type ControlServiceHandler interface {
 	// Logs returns the most recent llama-server log lines. Streaming follow is
 	// a future RPC.
 	Logs(context.Context, *connect.Request[v1.LogsRequest]) (*connect.Response[v1.LogsResponse], error)
+	// Pull downloads the profile's model from HuggingFace if it isn't already
+	// present locally. Returns a single PHASE_DONE message if the model is
+	// already cached at the expected size, or a stream of PHASE_DOWNLOADING
+	// updates while bytes flow in.
+	Pull(context.Context, *connect.Request[v1.PullRequest], *connect.ServerStream[v1.PullProgress]) error
 }
 
 // NewControlServiceHandler builds an HTTP handler from the service implementation. It returns the
@@ -215,6 +239,12 @@ func NewControlServiceHandler(svc ControlServiceHandler, opts ...connect.Handler
 		connect.WithSchema(controlServiceMethods.ByName("Logs")),
 		connect.WithHandlerOptions(opts...),
 	)
+	controlServicePullHandler := connect.NewServerStreamHandler(
+		ControlServicePullProcedure,
+		svc.Pull,
+		connect.WithSchema(controlServiceMethods.ByName("Pull")),
+		connect.WithHandlerOptions(opts...),
+	)
 	return "/vibe.v1.ControlService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case ControlServiceStatusProcedure:
@@ -229,6 +259,8 @@ func NewControlServiceHandler(svc ControlServiceHandler, opts ...connect.Handler
 			controlServiceShutdownHandler.ServeHTTP(w, r)
 		case ControlServiceLogsProcedure:
 			controlServiceLogsHandler.ServeHTTP(w, r)
+		case ControlServicePullProcedure:
+			controlServicePullHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -260,4 +292,8 @@ func (UnimplementedControlServiceHandler) Shutdown(context.Context, *connect.Req
 
 func (UnimplementedControlServiceHandler) Logs(context.Context, *connect.Request[v1.LogsRequest]) (*connect.Response[v1.LogsResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("vibe.v1.ControlService.Logs is not implemented"))
+}
+
+func (UnimplementedControlServiceHandler) Pull(context.Context, *connect.Request[v1.PullRequest], *connect.ServerStream[v1.PullProgress]) error {
+	return connect.NewError(connect.CodeUnimplemented, errors.New("vibe.v1.ControlService.Pull is not implemented"))
 }

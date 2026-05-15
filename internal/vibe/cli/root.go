@@ -25,6 +25,7 @@ func rootCmd() *cobra.Command {
 		daemonCmd(),
 		shutdownCmd(),
 		envCmd(),
+		pullCmd(),
 	)
 	return root
 }

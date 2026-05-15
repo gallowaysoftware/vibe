@@ -22,6 +22,61 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type PullProgress_Phase int32
+
+const (
+	PullProgress_PHASE_UNSPECIFIED PullProgress_Phase = 0
+	PullProgress_PHASE_RESOLVING   PullProgress_Phase = 1 // HEAD request to HuggingFace to fetch metadata
+	PullProgress_PHASE_DOWNLOADING PullProgress_Phase = 2 // bytes flowing in
+	PullProgress_PHASE_VERIFYING   PullProgress_Phase = 3 // post-download size check
+	PullProgress_PHASE_DONE        PullProgress_Phase = 4 // final state
+)
+
+// Enum value maps for PullProgress_Phase.
+var (
+	PullProgress_Phase_name = map[int32]string{
+		0: "PHASE_UNSPECIFIED",
+		1: "PHASE_RESOLVING",
+		2: "PHASE_DOWNLOADING",
+		3: "PHASE_VERIFYING",
+		4: "PHASE_DONE",
+	}
+	PullProgress_Phase_value = map[string]int32{
+		"PHASE_UNSPECIFIED": 0,
+		"PHASE_RESOLVING":   1,
+		"PHASE_DOWNLOADING": 2,
+		"PHASE_VERIFYING":   3,
+		"PHASE_DONE":        4,
+	}
+)
+
+func (x PullProgress_Phase) Enum() *PullProgress_Phase {
+	p := new(PullProgress_Phase)
+	*p = x
+	return p
+}
+
+func (x PullProgress_Phase) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (PullProgress_Phase) Descriptor() protoreflect.EnumDescriptor {
+	return file_vibe_v1_control_proto_enumTypes[0].Descriptor()
+}
+
+func (PullProgress_Phase) Type() protoreflect.EnumType {
+	return &file_vibe_v1_control_proto_enumTypes[0]
+}
+
+func (x PullProgress_Phase) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use PullProgress_Phase.Descriptor instead.
+func (PullProgress_Phase) EnumDescriptor() ([]byte, []int) {
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{16, 0}
+}
+
 type Status struct {
 	state       protoimpl.MessageState `protogen:"open.v1"`
 	Running     bool                   `protobuf:"varint,1,opt,name=running,proto3" json:"running,omitempty"`
@@ -742,6 +797,119 @@ func (x *LogsResponse) GetLines() []string {
 	return nil
 }
 
+type PullRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Profile       string                 `protobuf:"bytes,1,opt,name=profile,proto3" json:"profile,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PullRequest) Reset() {
+	*x = PullRequest{}
+	mi := &file_vibe_v1_control_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PullRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PullRequest) ProtoMessage() {}
+
+func (x *PullRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_vibe_v1_control_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PullRequest.ProtoReflect.Descriptor instead.
+func (*PullRequest) Descriptor() ([]byte, []int) {
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *PullRequest) GetProfile() string {
+	if x != nil {
+		return x.Profile
+	}
+	return ""
+}
+
+type PullProgress struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Phase           PullProgress_Phase     `protobuf:"varint,1,opt,name=phase,proto3,enum=vibe.v1.PullProgress_Phase" json:"phase,omitempty"`
+	DownloadedBytes int64                  `protobuf:"varint,2,opt,name=downloaded_bytes,json=downloadedBytes,proto3" json:"downloaded_bytes,omitempty"`
+	TotalBytes      int64                  `protobuf:"varint,3,opt,name=total_bytes,json=totalBytes,proto3" json:"total_bytes,omitempty"`
+	// human-readable message, e.g. "resuming from byte 1234567"
+	Message       string `protobuf:"bytes,4,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PullProgress) Reset() {
+	*x = PullProgress{}
+	mi := &file_vibe_v1_control_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PullProgress) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PullProgress) ProtoMessage() {}
+
+func (x *PullProgress) ProtoReflect() protoreflect.Message {
+	mi := &file_vibe_v1_control_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PullProgress.ProtoReflect.Descriptor instead.
+func (*PullProgress) Descriptor() ([]byte, []int) {
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *PullProgress) GetPhase() PullProgress_Phase {
+	if x != nil {
+		return x.Phase
+	}
+	return PullProgress_PHASE_UNSPECIFIED
+}
+
+func (x *PullProgress) GetDownloadedBytes() int64 {
+	if x != nil {
+		return x.DownloadedBytes
+	}
+	return 0
+}
+
+func (x *PullProgress) GetTotalBytes() int64 {
+	if x != nil {
+		return x.TotalBytes
+	}
+	return 0
+}
+
+func (x *PullProgress) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
 var File_vibe_v1_control_proto protoreflect.FileDescriptor
 
 const file_vibe_v1_control_proto_rawDesc = "" +
@@ -792,14 +960,30 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\x10ShutdownResponse\"\r\n" +
 	"\vLogsRequest\"$\n" +
 	"\fLogsResponse\x12\x14\n" +
-	"\x05lines\x18\x01 \x03(\tR\x05lines2\x87\x03\n" +
+	"\x05lines\x18\x01 \x03(\tR\x05lines\"'\n" +
+	"\vPullRequest\x12\x18\n" +
+	"\aprofile\x18\x01 \x01(\tR\aprofile\"\x98\x02\n" +
+	"\fPullProgress\x121\n" +
+	"\x05phase\x18\x01 \x01(\x0e2\x1b.vibe.v1.PullProgress.PhaseR\x05phase\x12)\n" +
+	"\x10downloaded_bytes\x18\x02 \x01(\x03R\x0fdownloadedBytes\x12\x1f\n" +
+	"\vtotal_bytes\x18\x03 \x01(\x03R\n" +
+	"totalBytes\x12\x18\n" +
+	"\amessage\x18\x04 \x01(\tR\amessage\"o\n" +
+	"\x05Phase\x12\x15\n" +
+	"\x11PHASE_UNSPECIFIED\x10\x00\x12\x13\n" +
+	"\x0fPHASE_RESOLVING\x10\x01\x12\x15\n" +
+	"\x11PHASE_DOWNLOADING\x10\x02\x12\x13\n" +
+	"\x0fPHASE_VERIFYING\x10\x03\x12\x0e\n" +
+	"\n" +
+	"PHASE_DONE\x10\x042\xc0\x03\n" +
 	"\x0eControlService\x12;\n" +
 	"\x06Status\x12\x16.vibe.v1.StatusRequest\x1a\x17.vibe.v1.StatusResponse\"\x00\x12M\n" +
 	"\fListProfiles\x12\x1c.vibe.v1.ListProfilesRequest\x1a\x1d.vibe.v1.ListProfilesResponse\"\x00\x128\n" +
 	"\x05Start\x12\x15.vibe.v1.StartRequest\x1a\x16.vibe.v1.StartResponse\"\x00\x125\n" +
 	"\x04Stop\x12\x14.vibe.v1.StopRequest\x1a\x15.vibe.v1.StopResponse\"\x00\x12A\n" +
 	"\bShutdown\x12\x18.vibe.v1.ShutdownRequest\x1a\x19.vibe.v1.ShutdownResponse\"\x00\x125\n" +
-	"\x04Logs\x12\x14.vibe.v1.LogsRequest\x1a\x15.vibe.v1.LogsResponse\"\x00B7Z5github.com/gallowaysoftware/vibe/proto/vibe/v1;vibev1b\x06proto3"
+	"\x04Logs\x12\x14.vibe.v1.LogsRequest\x1a\x15.vibe.v1.LogsResponse\"\x00\x127\n" +
+	"\x04Pull\x12\x14.vibe.v1.PullRequest\x1a\x15.vibe.v1.PullProgress\"\x000\x01B7Z5github.com/gallowaysoftware/vibe/proto/vibe/v1;vibev1b\x06proto3"
 
 var (
 	file_vibe_v1_control_proto_rawDescOnce sync.Once
@@ -813,53 +997,60 @@ func file_vibe_v1_control_proto_rawDescGZIP() []byte {
 	return file_vibe_v1_control_proto_rawDescData
 }
 
-var file_vibe_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
+var file_vibe_v1_control_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_vibe_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
 var file_vibe_v1_control_proto_goTypes = []any{
-	(*Status)(nil),                // 0: vibe.v1.Status
-	(*Profile)(nil),               // 1: vibe.v1.Profile
-	(*FrontendInfo)(nil),          // 2: vibe.v1.FrontendInfo
-	(*StatusRequest)(nil),         // 3: vibe.v1.StatusRequest
-	(*StatusResponse)(nil),        // 4: vibe.v1.StatusResponse
-	(*ListProfilesRequest)(nil),   // 5: vibe.v1.ListProfilesRequest
-	(*ListProfilesResponse)(nil),  // 6: vibe.v1.ListProfilesResponse
-	(*StartRequest)(nil),          // 7: vibe.v1.StartRequest
-	(*StartResponse)(nil),         // 8: vibe.v1.StartResponse
-	(*StopRequest)(nil),           // 9: vibe.v1.StopRequest
-	(*StopResponse)(nil),          // 10: vibe.v1.StopResponse
-	(*ShutdownRequest)(nil),       // 11: vibe.v1.ShutdownRequest
-	(*ShutdownResponse)(nil),      // 12: vibe.v1.ShutdownResponse
-	(*LogsRequest)(nil),           // 13: vibe.v1.LogsRequest
-	(*LogsResponse)(nil),          // 14: vibe.v1.LogsResponse
-	nil,                           // 15: vibe.v1.Status.FrontendEnvEntry
-	nil,                           // 16: vibe.v1.FrontendInfo.EnvVarsEntry
-	(*timestamppb.Timestamp)(nil), // 17: google.protobuf.Timestamp
+	(PullProgress_Phase)(0),       // 0: vibe.v1.PullProgress.Phase
+	(*Status)(nil),                // 1: vibe.v1.Status
+	(*Profile)(nil),               // 2: vibe.v1.Profile
+	(*FrontendInfo)(nil),          // 3: vibe.v1.FrontendInfo
+	(*StatusRequest)(nil),         // 4: vibe.v1.StatusRequest
+	(*StatusResponse)(nil),        // 5: vibe.v1.StatusResponse
+	(*ListProfilesRequest)(nil),   // 6: vibe.v1.ListProfilesRequest
+	(*ListProfilesResponse)(nil),  // 7: vibe.v1.ListProfilesResponse
+	(*StartRequest)(nil),          // 8: vibe.v1.StartRequest
+	(*StartResponse)(nil),         // 9: vibe.v1.StartResponse
+	(*StopRequest)(nil),           // 10: vibe.v1.StopRequest
+	(*StopResponse)(nil),          // 11: vibe.v1.StopResponse
+	(*ShutdownRequest)(nil),       // 12: vibe.v1.ShutdownRequest
+	(*ShutdownResponse)(nil),      // 13: vibe.v1.ShutdownResponse
+	(*LogsRequest)(nil),           // 14: vibe.v1.LogsRequest
+	(*LogsResponse)(nil),          // 15: vibe.v1.LogsResponse
+	(*PullRequest)(nil),           // 16: vibe.v1.PullRequest
+	(*PullProgress)(nil),          // 17: vibe.v1.PullProgress
+	nil,                           // 18: vibe.v1.Status.FrontendEnvEntry
+	nil,                           // 19: vibe.v1.FrontendInfo.EnvVarsEntry
+	(*timestamppb.Timestamp)(nil), // 20: google.protobuf.Timestamp
 }
 var file_vibe_v1_control_proto_depIdxs = []int32{
-	17, // 0: vibe.v1.Status.started_at:type_name -> google.protobuf.Timestamp
-	15, // 1: vibe.v1.Status.frontend_env:type_name -> vibe.v1.Status.FrontendEnvEntry
-	16, // 2: vibe.v1.FrontendInfo.env_vars:type_name -> vibe.v1.FrontendInfo.EnvVarsEntry
-	0,  // 3: vibe.v1.StatusResponse.status:type_name -> vibe.v1.Status
-	1,  // 4: vibe.v1.ListProfilesResponse.profiles:type_name -> vibe.v1.Profile
-	0,  // 5: vibe.v1.StartResponse.status:type_name -> vibe.v1.Status
-	2,  // 6: vibe.v1.StartResponse.frontend:type_name -> vibe.v1.FrontendInfo
-	0,  // 7: vibe.v1.StopResponse.status:type_name -> vibe.v1.Status
-	3,  // 8: vibe.v1.ControlService.Status:input_type -> vibe.v1.StatusRequest
-	5,  // 9: vibe.v1.ControlService.ListProfiles:input_type -> vibe.v1.ListProfilesRequest
-	7,  // 10: vibe.v1.ControlService.Start:input_type -> vibe.v1.StartRequest
-	9,  // 11: vibe.v1.ControlService.Stop:input_type -> vibe.v1.StopRequest
-	11, // 12: vibe.v1.ControlService.Shutdown:input_type -> vibe.v1.ShutdownRequest
-	13, // 13: vibe.v1.ControlService.Logs:input_type -> vibe.v1.LogsRequest
-	4,  // 14: vibe.v1.ControlService.Status:output_type -> vibe.v1.StatusResponse
-	6,  // 15: vibe.v1.ControlService.ListProfiles:output_type -> vibe.v1.ListProfilesResponse
-	8,  // 16: vibe.v1.ControlService.Start:output_type -> vibe.v1.StartResponse
-	10, // 17: vibe.v1.ControlService.Stop:output_type -> vibe.v1.StopResponse
-	12, // 18: vibe.v1.ControlService.Shutdown:output_type -> vibe.v1.ShutdownResponse
-	14, // 19: vibe.v1.ControlService.Logs:output_type -> vibe.v1.LogsResponse
-	14, // [14:20] is the sub-list for method output_type
-	8,  // [8:14] is the sub-list for method input_type
-	8,  // [8:8] is the sub-list for extension type_name
-	8,  // [8:8] is the sub-list for extension extendee
-	0,  // [0:8] is the sub-list for field type_name
+	20, // 0: vibe.v1.Status.started_at:type_name -> google.protobuf.Timestamp
+	18, // 1: vibe.v1.Status.frontend_env:type_name -> vibe.v1.Status.FrontendEnvEntry
+	19, // 2: vibe.v1.FrontendInfo.env_vars:type_name -> vibe.v1.FrontendInfo.EnvVarsEntry
+	1,  // 3: vibe.v1.StatusResponse.status:type_name -> vibe.v1.Status
+	2,  // 4: vibe.v1.ListProfilesResponse.profiles:type_name -> vibe.v1.Profile
+	1,  // 5: vibe.v1.StartResponse.status:type_name -> vibe.v1.Status
+	3,  // 6: vibe.v1.StartResponse.frontend:type_name -> vibe.v1.FrontendInfo
+	1,  // 7: vibe.v1.StopResponse.status:type_name -> vibe.v1.Status
+	0,  // 8: vibe.v1.PullProgress.phase:type_name -> vibe.v1.PullProgress.Phase
+	4,  // 9: vibe.v1.ControlService.Status:input_type -> vibe.v1.StatusRequest
+	6,  // 10: vibe.v1.ControlService.ListProfiles:input_type -> vibe.v1.ListProfilesRequest
+	8,  // 11: vibe.v1.ControlService.Start:input_type -> vibe.v1.StartRequest
+	10, // 12: vibe.v1.ControlService.Stop:input_type -> vibe.v1.StopRequest
+	12, // 13: vibe.v1.ControlService.Shutdown:input_type -> vibe.v1.ShutdownRequest
+	14, // 14: vibe.v1.ControlService.Logs:input_type -> vibe.v1.LogsRequest
+	16, // 15: vibe.v1.ControlService.Pull:input_type -> vibe.v1.PullRequest
+	5,  // 16: vibe.v1.ControlService.Status:output_type -> vibe.v1.StatusResponse
+	7,  // 17: vibe.v1.ControlService.ListProfiles:output_type -> vibe.v1.ListProfilesResponse
+	9,  // 18: vibe.v1.ControlService.Start:output_type -> vibe.v1.StartResponse
+	11, // 19: vibe.v1.ControlService.Stop:output_type -> vibe.v1.StopResponse
+	13, // 20: vibe.v1.ControlService.Shutdown:output_type -> vibe.v1.ShutdownResponse
+	15, // 21: vibe.v1.ControlService.Logs:output_type -> vibe.v1.LogsResponse
+	17, // 22: vibe.v1.ControlService.Pull:output_type -> vibe.v1.PullProgress
+	16, // [16:23] is the sub-list for method output_type
+	9,  // [9:16] is the sub-list for method input_type
+	9,  // [9:9] is the sub-list for extension type_name
+	9,  // [9:9] is the sub-list for extension extendee
+	0,  // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_vibe_v1_control_proto_init() }
@@ -872,13 +1063,14 @@ func file_vibe_v1_control_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_vibe_v1_control_proto_rawDesc), len(file_vibe_v1_control_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   17,
+			NumEnums:      1,
+			NumMessages:   19,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
 		GoTypes:           file_vibe_v1_control_proto_goTypes,
 		DependencyIndexes: file_vibe_v1_control_proto_depIdxs,
+		EnumInfos:         file_vibe_v1_control_proto_enumTypes,
 		MessageInfos:      file_vibe_v1_control_proto_msgTypes,
 	}.Build()
 	File_vibe_v1_control_proto = out.File
