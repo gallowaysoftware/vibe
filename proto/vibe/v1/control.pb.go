@@ -23,14 +23,17 @@ const (
 )
 
 type Status struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Running       bool                   `protobuf:"varint,1,opt,name=running,proto3" json:"running,omitempty"`
-	Ready         bool                   `protobuf:"varint,2,opt,name=ready,proto3" json:"ready,omitempty"`
-	Profile       string                 `protobuf:"bytes,3,opt,name=profile,proto3" json:"profile,omitempty"`
-	StartedAt     *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
-	BackendAddr   string                 `protobuf:"bytes,5,opt,name=backend_addr,json=backendAddr,proto3" json:"backend_addr,omitempty"`
-	ProxyAddr     string                 `protobuf:"bytes,6,opt,name=proxy_addr,json=proxyAddr,proto3" json:"proxy_addr,omitempty"`
-	Pid           int32                  `protobuf:"varint,7,opt,name=pid,proto3" json:"pid,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Running     bool                   `protobuf:"varint,1,opt,name=running,proto3" json:"running,omitempty"`
+	Ready       bool                   `protobuf:"varint,2,opt,name=ready,proto3" json:"ready,omitempty"`
+	Profile     string                 `protobuf:"bytes,3,opt,name=profile,proto3" json:"profile,omitempty"`
+	StartedAt   *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
+	BackendAddr string                 `protobuf:"bytes,5,opt,name=backend_addr,json=backendAddr,proto3" json:"backend_addr,omitempty"`
+	ProxyAddr   string                 `protobuf:"bytes,6,opt,name=proxy_addr,json=proxyAddr,proto3" json:"proxy_addr,omitempty"`
+	Pid         int32                  `protobuf:"varint,7,opt,name=pid,proto3" json:"pid,omitempty"`
+	// frontend_env carries the env vars the user should set when launching the
+	// external frontend, so `vibe env` can echo them after the fact.
+	FrontendEnv   map[string]string `protobuf:"bytes,8,rep,name=frontend_env,json=frontendEnv,proto3" json:"frontend_env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -114,6 +117,13 @@ func (x *Status) GetPid() int32 {
 	return 0
 }
 
+func (x *Status) GetFrontendEnv() map[string]string {
+	if x != nil {
+		return x.FrontendEnv
+	}
+	return nil
+}
+
 type Profile struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
@@ -179,8 +189,11 @@ type FrontendInfo struct {
 	App             string                 `protobuf:"bytes,1,opt,name=app,proto3" json:"app,omitempty"`
 	WroteFile       string                 `protobuf:"bytes,2,opt,name=wrote_file,json=wroteFile,proto3" json:"wrote_file,omitempty"`
 	RestartRequired bool                   `protobuf:"varint,3,opt,name=restart_required,json=restartRequired,proto3" json:"restart_required,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// env_vars the user should set when launching the external frontend.
+	// Example: {"OPENCODE_CONFIG": "/home/.../state/vibe/frontend/code/opencode.json"}.
+	EnvVars       map[string]string `protobuf:"bytes,4,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *FrontendInfo) Reset() {
@@ -232,6 +245,13 @@ func (x *FrontendInfo) GetRestartRequired() bool {
 		return x.RestartRequired
 	}
 	return false
+}
+
+func (x *FrontendInfo) GetEnvVars() map[string]string {
+	if x != nil {
+		return x.EnvVars
+	}
+	return nil
 }
 
 type StatusRequest struct {
@@ -726,7 +746,7 @@ var File_vibe_v1_control_proto protoreflect.FileDescriptor
 
 const file_vibe_v1_control_proto_rawDesc = "" +
 	"\n" +
-	"\x15vibe/v1/control.proto\x12\avibe.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xe1\x01\n" +
+	"\x15vibe/v1/control.proto\x12\avibe.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xe6\x02\n" +
 	"\x06Status\x12\x18\n" +
 	"\arunning\x18\x01 \x01(\bR\arunning\x12\x14\n" +
 	"\x05ready\x18\x02 \x01(\bR\x05ready\x12\x18\n" +
@@ -736,16 +756,24 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\fbackend_addr\x18\x05 \x01(\tR\vbackendAddr\x12\x1d\n" +
 	"\n" +
 	"proxy_addr\x18\x06 \x01(\tR\tproxyAddr\x12\x10\n" +
-	"\x03pid\x18\a \x01(\x05R\x03pid\"S\n" +
+	"\x03pid\x18\a \x01(\x05R\x03pid\x12C\n" +
+	"\ffrontend_env\x18\b \x03(\v2 .vibe.v1.Status.FrontendEnvEntryR\vfrontendEnv\x1a>\n" +
+	"\x10FrontendEnvEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"S\n" +
 	"\aProfile\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12 \n" +
 	"\vdescription\x18\x02 \x01(\tR\vdescription\x12\x12\n" +
-	"\x04path\x18\x03 \x01(\tR\x04path\"j\n" +
+	"\x04path\x18\x03 \x01(\tR\x04path\"\xe5\x01\n" +
 	"\fFrontendInfo\x12\x10\n" +
 	"\x03app\x18\x01 \x01(\tR\x03app\x12\x1d\n" +
 	"\n" +
 	"wrote_file\x18\x02 \x01(\tR\twroteFile\x12)\n" +
-	"\x10restart_required\x18\x03 \x01(\bR\x0frestartRequired\"\x0f\n" +
+	"\x10restart_required\x18\x03 \x01(\bR\x0frestartRequired\x12=\n" +
+	"\benv_vars\x18\x04 \x03(\v2\".vibe.v1.FrontendInfo.EnvVarsEntryR\aenvVars\x1a:\n" +
+	"\fEnvVarsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x0f\n" +
 	"\rStatusRequest\"9\n" +
 	"\x0eStatusResponse\x12'\n" +
 	"\x06status\x18\x01 \x01(\v2\x0f.vibe.v1.StatusR\x06status\"\x15\n" +
@@ -785,7 +813,7 @@ func file_vibe_v1_control_proto_rawDescGZIP() []byte {
 	return file_vibe_v1_control_proto_rawDescData
 }
 
-var file_vibe_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
+var file_vibe_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_vibe_v1_control_proto_goTypes = []any{
 	(*Status)(nil),                // 0: vibe.v1.Status
 	(*Profile)(nil),               // 1: vibe.v1.Profile
@@ -802,32 +830,36 @@ var file_vibe_v1_control_proto_goTypes = []any{
 	(*ShutdownResponse)(nil),      // 12: vibe.v1.ShutdownResponse
 	(*LogsRequest)(nil),           // 13: vibe.v1.LogsRequest
 	(*LogsResponse)(nil),          // 14: vibe.v1.LogsResponse
-	(*timestamppb.Timestamp)(nil), // 15: google.protobuf.Timestamp
+	nil,                           // 15: vibe.v1.Status.FrontendEnvEntry
+	nil,                           // 16: vibe.v1.FrontendInfo.EnvVarsEntry
+	(*timestamppb.Timestamp)(nil), // 17: google.protobuf.Timestamp
 }
 var file_vibe_v1_control_proto_depIdxs = []int32{
-	15, // 0: vibe.v1.Status.started_at:type_name -> google.protobuf.Timestamp
-	0,  // 1: vibe.v1.StatusResponse.status:type_name -> vibe.v1.Status
-	1,  // 2: vibe.v1.ListProfilesResponse.profiles:type_name -> vibe.v1.Profile
-	0,  // 3: vibe.v1.StartResponse.status:type_name -> vibe.v1.Status
-	2,  // 4: vibe.v1.StartResponse.frontend:type_name -> vibe.v1.FrontendInfo
-	0,  // 5: vibe.v1.StopResponse.status:type_name -> vibe.v1.Status
-	3,  // 6: vibe.v1.ControlService.Status:input_type -> vibe.v1.StatusRequest
-	5,  // 7: vibe.v1.ControlService.ListProfiles:input_type -> vibe.v1.ListProfilesRequest
-	7,  // 8: vibe.v1.ControlService.Start:input_type -> vibe.v1.StartRequest
-	9,  // 9: vibe.v1.ControlService.Stop:input_type -> vibe.v1.StopRequest
-	11, // 10: vibe.v1.ControlService.Shutdown:input_type -> vibe.v1.ShutdownRequest
-	13, // 11: vibe.v1.ControlService.Logs:input_type -> vibe.v1.LogsRequest
-	4,  // 12: vibe.v1.ControlService.Status:output_type -> vibe.v1.StatusResponse
-	6,  // 13: vibe.v1.ControlService.ListProfiles:output_type -> vibe.v1.ListProfilesResponse
-	8,  // 14: vibe.v1.ControlService.Start:output_type -> vibe.v1.StartResponse
-	10, // 15: vibe.v1.ControlService.Stop:output_type -> vibe.v1.StopResponse
-	12, // 16: vibe.v1.ControlService.Shutdown:output_type -> vibe.v1.ShutdownResponse
-	14, // 17: vibe.v1.ControlService.Logs:output_type -> vibe.v1.LogsResponse
-	12, // [12:18] is the sub-list for method output_type
-	6,  // [6:12] is the sub-list for method input_type
-	6,  // [6:6] is the sub-list for extension type_name
-	6,  // [6:6] is the sub-list for extension extendee
-	0,  // [0:6] is the sub-list for field type_name
+	17, // 0: vibe.v1.Status.started_at:type_name -> google.protobuf.Timestamp
+	15, // 1: vibe.v1.Status.frontend_env:type_name -> vibe.v1.Status.FrontendEnvEntry
+	16, // 2: vibe.v1.FrontendInfo.env_vars:type_name -> vibe.v1.FrontendInfo.EnvVarsEntry
+	0,  // 3: vibe.v1.StatusResponse.status:type_name -> vibe.v1.Status
+	1,  // 4: vibe.v1.ListProfilesResponse.profiles:type_name -> vibe.v1.Profile
+	0,  // 5: vibe.v1.StartResponse.status:type_name -> vibe.v1.Status
+	2,  // 6: vibe.v1.StartResponse.frontend:type_name -> vibe.v1.FrontendInfo
+	0,  // 7: vibe.v1.StopResponse.status:type_name -> vibe.v1.Status
+	3,  // 8: vibe.v1.ControlService.Status:input_type -> vibe.v1.StatusRequest
+	5,  // 9: vibe.v1.ControlService.ListProfiles:input_type -> vibe.v1.ListProfilesRequest
+	7,  // 10: vibe.v1.ControlService.Start:input_type -> vibe.v1.StartRequest
+	9,  // 11: vibe.v1.ControlService.Stop:input_type -> vibe.v1.StopRequest
+	11, // 12: vibe.v1.ControlService.Shutdown:input_type -> vibe.v1.ShutdownRequest
+	13, // 13: vibe.v1.ControlService.Logs:input_type -> vibe.v1.LogsRequest
+	4,  // 14: vibe.v1.ControlService.Status:output_type -> vibe.v1.StatusResponse
+	6,  // 15: vibe.v1.ControlService.ListProfiles:output_type -> vibe.v1.ListProfilesResponse
+	8,  // 16: vibe.v1.ControlService.Start:output_type -> vibe.v1.StartResponse
+	10, // 17: vibe.v1.ControlService.Stop:output_type -> vibe.v1.StopResponse
+	12, // 18: vibe.v1.ControlService.Shutdown:output_type -> vibe.v1.ShutdownResponse
+	14, // 19: vibe.v1.ControlService.Logs:output_type -> vibe.v1.LogsResponse
+	14, // [14:20] is the sub-list for method output_type
+	8,  // [8:14] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_vibe_v1_control_proto_init() }
@@ -841,7 +873,7 @@ func file_vibe_v1_control_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_vibe_v1_control_proto_rawDesc), len(file_vibe_v1_control_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   15,
+			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

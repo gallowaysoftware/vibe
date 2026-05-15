@@ -3,6 +3,10 @@
 # Copy this file to $XDG_CONFIG_HOME/vibe/profiles/code.yaml (typically
 # ~/.config/vibe/profiles/code.yaml), edit paths/aliases to match your
 # environment, then `vibe start code`.
+#
+# vibe writes a sidecar opencode config to a vibe-managed path instead of
+# overwriting ~/.config/opencode/opencode.json. After `vibe start`, the CLI
+# prints the OPENCODE_CONFIG env var you need to set when launching opencode.
 
 name: code
 description: Coding with Qwen3 Coder 30B + opencode
@@ -26,9 +30,13 @@ frontend:
   kind: external
   app: opencode
   # opencode reads its config once at startup and does not hot-reload, so
-  # switching profiles while opencode is running requires restarting opencode.
+  # relaunching opencode is required to pick up the new endpoint.
   restart_required: true
-  write_file: ~/.config/opencode/opencode.json
+  write_file: ${VIBE_STATE_DIR}/frontend/code/opencode.json
+  env:
+    # Vibe surfaces this back to the user via `vibe start` output; you should
+    # set it (or eval `vibe env code`) before launching opencode.
+    OPENCODE_CONFIG: ${WRITE_FILE}
   template:
     $schema: https://opencode.ai/config.json
     provider:

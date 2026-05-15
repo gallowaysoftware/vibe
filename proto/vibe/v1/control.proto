@@ -38,6 +38,9 @@ message Status {
   string backend_addr = 5;
   string proxy_addr = 6;
   int32 pid = 7;
+  // frontend_env carries the env vars the user should set when launching the
+  // external frontend, so `vibe env` can echo them after the fact.
+  map<string, string> frontend_env = 8;
 }
 
 message Profile {
@@ -50,6 +53,9 @@ message FrontendInfo {
   string app = 1;
   string wrote_file = 2;
   bool restart_required = 3;
+  // env_vars the user should set when launching the external frontend.
+  // Example: {"OPENCODE_CONFIG": "/home/.../state/vibe/frontend/code/opencode.json"}.
+  map<string, string> env_vars = 4;
 }
 
 message StatusRequest {}

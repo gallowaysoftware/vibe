@@ -40,11 +40,12 @@ const (
 )
 
 type Frontend struct {
-	Kind            string         `yaml:"kind"`
-	App             string         `yaml:"app"`
-	RestartRequired bool           `yaml:"restart_required,omitempty"`
-	WriteFile       string         `yaml:"write_file,omitempty"`
-	Template        map[string]any `yaml:"template,omitempty"`
+	Kind            string            `yaml:"kind"`
+	App             string            `yaml:"app"`
+	RestartRequired bool              `yaml:"restart_required,omitempty"`
+	WriteFile       string            `yaml:"write_file,omitempty"`
+	Template        map[string]any    `yaml:"template,omitempty"`
+	Env             map[string]string `yaml:"env,omitempty"`
 }
 
 // Load reads, parses, and validates a profile YAML file. Unknown fields are

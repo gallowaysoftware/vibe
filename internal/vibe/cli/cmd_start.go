@@ -30,8 +30,14 @@ func startCmd() *cobra.Command {
 			if r.Frontend != nil {
 				fmt.Printf("  frontend: %s\n", r.Frontend.App)
 				fmt.Printf("  wrote:    %s\n", r.Frontend.WroteFile)
+				if len(r.Frontend.EnvVars) > 0 {
+					fmt.Println("  to use:")
+					for k, v := range r.Frontend.EnvVars {
+						fmt.Printf("    export %s=%q\n", k, v)
+					}
+				}
 				if r.Frontend.RestartRequired {
-					fmt.Printf("  WARNING: %s does not hot-reload its config — restart it to pick up the new endpoint\n", r.Frontend.App)
+					fmt.Printf("  note: %s does not hot-reload — relaunch it (with the env above) to pick up the new endpoint\n", r.Frontend.App)
 				}
 			}
 			return nil

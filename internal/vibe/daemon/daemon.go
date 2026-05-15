@@ -249,6 +249,7 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 		VibeAPI:      vibeAPI,
 		ModelAlias:   p.Model.Alias,
 		ModelContext: p.Model.Context,
+		VibeStateDir: paths.StateHome(),
 	})
 	if err != nil {
 		_ = d.sup.Stop(context.Background())
@@ -269,6 +270,7 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 			App:             p.Frontend.App,
 			WroteFile:       fr.WroteFile,
 			RestartRequired: fr.RestartRequired,
+			EnvVars:         fr.Env,
 		},
 	}), nil
 }
@@ -332,6 +334,9 @@ func (d *Daemon) protoStatus() *vibev1.Status {
 	if d.active != nil {
 		s.Profile = d.active.Name
 		s.StartedAt = timestamppb.New(d.startTime)
+	}
+	if d.frontend != nil {
+		s.FrontendEnv = d.frontend.Env
 	}
 	return s
 }
