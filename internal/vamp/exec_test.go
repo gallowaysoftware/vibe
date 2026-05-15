@@ -1,8 +1,10 @@
 package vamp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -137,6 +139,90 @@ func TestExecutor_MissingCapabilityErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "vision") {
 		t.Errorf("err = %v", err)
+	}
+}
+
+func TestExecutor_StreamsTokensToLog(t *testing.T) {
+	stub := &stubControl{}
+	mux := http.NewServeMux()
+	path, handler := vibev1connect.NewControlServiceHandler(stub)
+	mux.Handle(path, handler)
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"data": []map[string]string{{"id": "stub"}}})
+	})
+	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if s, _ := body["stream"].(bool); !s {
+			t.Errorf("expected stream=true, got body=%v", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		flusher, _ := w.(http.Flusher)
+		writeChunk := func(content string) {
+			payload, _ := json.Marshal(map[string]any{
+				"choices": []map[string]any{{"delta": map[string]string{"content": content}}},
+			})
+			fmt.Fprintf(w, "data: %s\n\n", payload)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		// First event: role-only delta (should be skipped by the parser).
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"role":"assistant"}}]}`+"\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		writeChunk("Hello")
+		writeChunk(" world")
+		writeChunk("!")
+		// Empty-content final stop event (should be skipped).
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":""}}]}`+"\n\n")
+		// Heartbeat / keepalive (should be skipped).
+		fmt.Fprint(w, "data:\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	stub.proxyURL = srv.URL
+
+	var logBuf bytes.Buffer
+	runDir := t.TempDir()
+	exec := &Executor{
+		Pipeline: &Pipeline{
+			Name: "stream",
+			Stages: []Stage{
+				{ID: "only", Capability: "reasoning", Prompt: "hi", Output: "only.txt"},
+			},
+		},
+		Capabilities: &Capabilities{Mapping: map[string]string{"reasoning": "code"}},
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client()),
+		RunDir:       runDir,
+		Log:          &logBuf,
+	}
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, "Hello world!") {
+		t.Errorf("expected streamed tokens %q in log, got:\n%s", "Hello world!", logged)
+	}
+	// Confirm fragments were written individually (the "Hello" delta should
+	// appear before " world").
+	if i, j := strings.Index(logged, "Hello"), strings.Index(logged, " world"); i < 0 || j < 0 || i >= j {
+		t.Errorf("expected 'Hello' to appear before ' world' in log:\n%s", logged)
+	}
+
+	out, err := os.ReadFile(filepath.Join(runDir, "only.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(out); got != "Hello world!" {
+		t.Errorf("output file = %q, want %q", got, "Hello world!")
 	}
 }
 
