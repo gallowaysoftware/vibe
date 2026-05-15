@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/gallowaysoftware/vibe/internal/vibe/mcp"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 )
 
@@ -47,6 +48,22 @@ func activateExternal(p *profile.Profile, ctx profile.ExpandContext) (*Result, e
 	if err != nil {
 		return nil, fmt.Errorf("expand template: %w", err)
 	}
+
+	if len(p.Frontend.MCPs) > 0 {
+		if _, exists := expanded["mcp"]; exists {
+			return nil, fmt.Errorf("frontend.template already defines top-level %q key; cannot merge with frontend.mcps", "mcp")
+		}
+		specs, err := mcp.LoadMany(p.Frontend.MCPs)
+		if err != nil {
+			return nil, fmt.Errorf("load mcps: %w", err)
+		}
+		mcpBlock := make(map[string]any, len(specs))
+		for name, spec := range specs {
+			mcpBlock[name] = spec
+		}
+		expanded["mcp"] = mcpBlock
+	}
+
 	body, err := json.MarshalIndent(expanded, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal template: %w", err)

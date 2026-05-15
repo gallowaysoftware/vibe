@@ -38,11 +38,12 @@ func Socket() string       { return filepath.Join(RuntimeDir(), "vibe.sock") }
 func PIDFile() string      { return filepath.Join(StateHome(), "vibe.pid") }
 func LogDir() string       { return filepath.Join(StateHome(), "logs") }
 func ProfilesDir() string  { return filepath.Join(ConfigHome(), "profiles") }
+func MCPDir() string       { return filepath.Join(ConfigHome(), "mcp") }
 func ConfigFile() string   { return filepath.Join(ConfigHome(), "config.yaml") }
 
 // EnsureDirs creates the directories vibe needs at runtime.
 func EnsureDirs() error {
-	for _, d := range []string{ConfigHome(), StateHome(), RuntimeDir(), LogDir(), ProfilesDir()} {
+	for _, d := range []string{ConfigHome(), StateHome(), RuntimeDir(), LogDir(), ProfilesDir(), MCPDir()} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return err
 		}

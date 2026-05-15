@@ -1,0 +1,23 @@
+# Example MCP definition: Datadog.
+#
+# Drop this file in $XDG_CONFIG_HOME/vibe/mcp/ (typically ~/.config/vibe/mcp/).
+# The filename without the .yaml suffix is the MCP's name; reference it from
+# a profile via `frontend.mcps: [datadog]`.
+#
+# Vibe is a pass-through for MCP YAML: every field below is handed verbatim to
+# the frontend (e.g. opencode) as the value for `mcp.<name>` in the rendered
+# JSON. The schema below is what opencode expects; other frontends may differ.
+#
+# Secrets live in environment variables, not in this file. The literal string
+# ${env:DD_API_KEY} below is preserved as-is in the written config; opencode
+# resolves it natively at startup.
+
+type: local
+command:
+  - npx
+  - -y
+  - "@us-all/datadog-mcp"
+environment:
+  DD_APP_KEY: ${env:DD_APP_KEY}
+  DD_API_KEY: ${env:DD_API_KEY}
+  DD_SITE: datadoghq.com

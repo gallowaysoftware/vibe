@@ -240,6 +240,20 @@ frontend: {kind: docker-compose, app: x}
 `,
 			wantErr: "not supported yet",
 		},
+		{
+			name: "duplicate mcp names",
+			yaml: `
+name: x
+model: {path: ` + model + `, alias: x, context: 1024}
+frontend:
+  kind: external
+  app: opencode
+  write_file: /tmp/x
+  template: {a: 1}
+  mcps: [datadog, jira, datadog]
+`,
+			wantErr: `duplicate "datadog"`,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
