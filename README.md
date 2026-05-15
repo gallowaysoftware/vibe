@@ -31,6 +31,20 @@ downloads the SDXL-Turbo checkpoint (~7 GB), and drops a default
 `comfyui.yaml` profile. Each step skips when already satisfied; pass
 `--yes` to bypass the confirmation prompts (for automation).
 
+`vibe doctor --install llama-cpp` does the same for
+[llama.cpp](https://github.com/ggerganov/llama.cpp) itself, offering
+three install methods: `[d]istro` (probes the local package manager —
+`pacman` on Arch, `dnf` on Fedora — and prints the `sudo` install
+command rather than running it for you), `[r]elease tarball` (downloads
+the latest published Linux x86_64 build from GitHub, extracts to
+`~/.local/share/vibe/llama-cpp/`, and symlinks `llama-server` into
+`~/.local/bin/`), or `[s]ource build` (prints the canonical
+`cmake -B build -DGGML_CUDA=ON` commands — too operator-specific to
+run for you). Falls through automatically from the distro path to the
+tarball when the package isn't in standard repos (the Ubuntu/Debian
+case in Phase 1). Pass `--yes` to skip the menu and pick the tarball
+path; pass `--cuda` to prefer a CUDA-flavoured asset.
+
 ## Why
 
 Today running local AI looks like:
