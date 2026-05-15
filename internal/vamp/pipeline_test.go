@@ -49,6 +49,61 @@ stages:
 	}
 }
 
+func TestLoadPipeline_ForeachDefaults(t *testing.T) {
+	yaml := `
+name: fan
+stages:
+  - id: titles
+    capability: r
+    prompt: "list"
+    output: titles.json
+    output_format: json
+  - id: hooks
+    capability: r
+    inputs: [titles]
+    foreach: "{{.stages.titles.output}}"
+    prompt: "hook for {{.item}}"
+    output: "hooks/{{.item | slugify}}.md"
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hooks := p.Stages[1]
+	if hooks.Foreach == "" {
+		t.Errorf("foreach was not parsed: %+v", hooks)
+	}
+	if hooks.ForeachAs != DefaultForeachAs {
+		t.Errorf("foreach_as default = %q, want %q", hooks.ForeachAs, DefaultForeachAs)
+	}
+}
+
+func TestLoadPipeline_ForeachAsExplicit(t *testing.T) {
+	yaml := `
+name: fan
+stages:
+  - id: titles
+    capability: r
+    prompt: list
+    output: titles.json
+    output_format: json
+  - id: hooks
+    capability: r
+    inputs: [titles]
+    foreach: "{{.stages.titles.output}}"
+    foreach_as: title
+    prompt: "hook for {{.title}}"
+    output: "hooks/{{.title | slugify}}.md"
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := p.Stages[1].ForeachAs; got != "title" {
+		t.Errorf("foreach_as = %q, want title", got)
+	}
+}
+
 func TestLoadPipeline_RejectsUnknownField(t *testing.T) {
 	yaml := `
 name: x
@@ -197,6 +252,61 @@ stages:
   output: a.md
   output_format: xml`,
 			wantErr: "output_format",
+		},
+		{
+			name: "foreach_as without foreach",
+			yaml: `name: x
+stages:
+- id: a
+  capability: r
+  prompt: hi
+  output: a.md
+  foreach_as: title`,
+			wantErr: "foreach_as set without foreach",
+		},
+		{
+			name: "foreach without inputs",
+			yaml: `name: x
+stages:
+- id: a
+  capability: r
+  prompt: hi
+  output: "out/{{.item}}.md"
+  foreach: "{{.stages.b.output}}"`,
+			wantErr: "foreach stages must declare an input",
+		},
+		{
+			name: "foreach with non-json input",
+			yaml: `name: x
+stages:
+- id: src
+  capability: r
+  prompt: hi
+  output: src.md
+- id: a
+  capability: r
+  prompt: hi
+  inputs: [src]
+  output: "out/{{.item}}.md"
+  foreach: "{{.stages.src.output}}"`,
+			wantErr: "output_format: json",
+		},
+		{
+			name: "foreach with static output path",
+			yaml: `name: x
+stages:
+- id: src
+  capability: r
+  prompt: hi
+  output: src.json
+  output_format: json
+- id: a
+  capability: r
+  prompt: hi
+  inputs: [src]
+  output: out.md
+  foreach: "{{.stages.src.output}}"`,
+			wantErr: "templated output path",
 		},
 	}
 	for _, tc := range cases {

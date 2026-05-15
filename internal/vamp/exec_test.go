@@ -521,6 +521,158 @@ func TestExecutor_DAGErrorAggregation(t *testing.T) {
 	}
 }
 
+// TestExecutor_ForeachFansOut verifies a foreach consumer runs once per item
+// in its producer's JSON array, writes one file per item, and exposes the
+// per-item outputs to downstream stages via .stages.<id>.outputs.
+func TestExecutor_ForeachFansOut(t *testing.T) {
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		// Two roles: the producer prompt asks for "TITLES" and gets back a
+		// JSON array; the consumer prompts are of the shape "UP: <item>" and
+		// uppercase the embedded item; the joiner prompt embeds the slice of
+		// outputs so we can confirm `.outputs` resolves to a []string.
+		switch {
+		case prompt == "TITLES":
+			return `["a","b","c"]`, nil
+		case strings.HasPrefix(prompt, "UP:"):
+			return strings.ToUpper(strings.TrimPrefix(prompt, "UP:")), nil
+		case strings.HasPrefix(prompt, "JOIN:"):
+			return strings.TrimPrefix(prompt, "JOIN:"), nil
+		}
+		return "", fmt.Errorf("unexpected prompt %q", prompt)
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "fan",
+		Stages: []Stage{
+			{
+				ID: "titles", Capability: "reasoning",
+				Prompt: "TITLES", Output: "titles.json", OutputFormat: "json",
+			},
+			{
+				ID: "consumer", Capability: "reasoning",
+				Inputs:    []string{"titles"},
+				Foreach:   "{{.stages.titles.output}}",
+				ForeachAs: "title",
+				Prompt:    "UP:{{.title}}",
+				Output:    "items/{{.title | slugify}}.txt",
+			},
+			{
+				ID: "joiner", Capability: "reasoning",
+				Inputs: []string{"consumer"},
+				// Range over .outputs to prove it's a []string slice.
+				Prompt: "JOIN:{{range $i, $o := .stages.consumer.outputs}}{{if $i}}|{{end}}{{$o}}{{end}}",
+				Output: "joined.txt",
+			},
+		},
+	}
+	exec, runDir := stubExecutor(t, pipeline, caps, inf)
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Per-item files. The producer emits ["a","b","c"], so consumer writes
+	// items/a.txt, items/b.txt, items/c.txt with contents A,B,C.
+	for _, tc := range []struct{ path, want string }{
+		{"items/a.txt", "A"},
+		{"items/b.txt", "B"},
+		{"items/c.txt", "C"},
+	} {
+		got, err := os.ReadFile(filepath.Join(runDir, tc.path))
+		if err != nil {
+			t.Fatalf("read %s: %v", tc.path, err)
+		}
+		if string(got) != tc.want {
+			t.Errorf("%s = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+
+	// Downstream .outputs must be a 3-element slice in input order. The
+	// joiner stage receives "A|B|C" exactly.
+	joined, err := os.ReadFile(filepath.Join(runDir, "joined.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(joined) != "A|B|C" {
+		t.Errorf("joined output = %q, want %q", joined, "A|B|C")
+	}
+}
+
+// TestExecutor_ForeachParseError verifies that a foreach consumer errors
+// clearly when its producer's JSON-array template doesn't resolve to a JSON
+// array.
+func TestExecutor_ForeachParseError(t *testing.T) {
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		if prompt == "PRODUCE" {
+			// Valid JSON but not an array; the foreach resolver must reject
+			// this with a clear message rather than crashing on a type
+			// assertion.
+			return `"not an array"`, nil
+		}
+		return "", fmt.Errorf("unexpected prompt %q", prompt)
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "fail",
+		Stages: []Stage{
+			{ID: "src", Capability: "reasoning", Prompt: "PRODUCE", Output: "src.json", OutputFormat: "json"},
+			{
+				ID: "consumer", Capability: "reasoning",
+				Inputs:  []string{"src"},
+				Foreach: "{{.stages.src.output}}",
+				Prompt:  "irrelevant",
+				Output:  "out/{{.item}}.txt",
+			},
+		},
+	}
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	err := exec.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "foreach") || !strings.Contains(msg, "array") {
+		t.Errorf("expected foreach/array in error, got: %v", err)
+	}
+}
+
+// TestExecutor_ForeachOutputCollision verifies that two items whose templated
+// output paths collide cause an error before any inference runs.
+func TestExecutor_ForeachOutputCollision(t *testing.T) {
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		// Producer returns two items that slugify identically; the consumer
+		// must never be invoked because collision detection happens during
+		// per-item pre-rendering.
+		if prompt == "PRODUCE" {
+			return `["Hello, world!","hello world"]`, nil
+		}
+		t.Errorf("consumer should not run on collision, but got prompt %q", prompt)
+		return "", nil
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "collide",
+		Stages: []Stage{
+			{ID: "src", Capability: "reasoning", Prompt: "PRODUCE", Output: "src.json", OutputFormat: "json"},
+			{
+				ID: "consumer", Capability: "reasoning",
+				Inputs:    []string{"src"},
+				Foreach:   "{{.stages.src.output}}",
+				ForeachAs: "title",
+				Prompt:    "hi {{.title}}",
+				Output:    "out/{{.title | slugify}}.txt",
+			},
+		},
+	}
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	err := exec.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected collision error")
+	}
+	if !strings.Contains(err.Error(), "collision") {
+		t.Errorf("expected collision in error, got: %v", err)
+	}
+}
+
 func TestExecutor_DAGCycleDetected(t *testing.T) {
 	yaml := `name: cyc
 stages:
