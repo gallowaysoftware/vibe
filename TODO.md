@@ -7,9 +7,14 @@
 validity, MCP definitions, daemon reachability, and GPU presence. Each
 check prints OK / WARN / FAIL; the command exits non-zero only on FAIL.
 
+The "drop an example profile" affordance from the original list is now
+satisfied by `vibe profile init <kind> [--name <name>]`, which writes a
+starter YAML (with `# REPLACE: ...` markers for the fields the user must
+edit) to `$XDG_CONFIG_HOME/vibe/profiles/`. See
+`internal/vibe/cli/cmd_profile.go`.
+
 Still open from the original list: a one-shot binary install script
-(`curl ... | sh` or `go install`) and a first-run "drop an example
-profile in `~/.config/vibe/profiles/`" affordance.
+(`curl ... | sh` or `go install`).
 
 ## ~~MCP composition for profiles~~ (done)
 

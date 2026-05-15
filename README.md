@@ -3,13 +3,36 @@
 A task-oriented launcher for local AI inference. Think `docker compose` for local AI workflows: define a profile that bundles a model configuration with a frontend, and one command brings up everything for a task.
 
 ```
-vibe doctor            # verify the machine is set up to run vibe
-vibe start code        # llama-server + opencode wired up for coding
-vibe start research    # different model, different context, different frontend
-vibe ps                # what's running
-vibe tui               # real-time dashboard (start/stop, status, logs)
-vibe stop              # tear it all down
+vibe doctor                          # verify the machine is set up to run vibe
+vibe profile init llama-server --name code  # drop a starter profile to edit
+vibe start code                      # llama-server + opencode wired up for coding
+vibe start research                  # different model, different context, different frontend
+vibe ps                              # what's running
+vibe tui                             # real-time dashboard (start/stop, status, logs)
+vibe stop                            # tear it all down
 ```
+
+## Starter profiles
+
+`vibe profile init <kind> [--name <name>]` drops a starter YAML file at
+`$XDG_CONFIG_HOME/vibe/profiles/<name>.yaml` so you don't have to copy
+from this repo's `profiles/` directory. Each rendered file carries
+`# REPLACE: ...` markers on fields you must edit (model path, alias,
+ComfyUI directory, frontend app, ...) before `vibe start <name>` will
+accept it.
+
+```
+vibe profile init llama-server --name code
+vibe profile init llama-server --name code --hf Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF
+vibe profile init comfyui --name comfyui
+vibe profile init docker-compose --name perplexica
+vibe profile init managed --name open-webui    # template only; kind not wired up yet
+```
+
+The command refuses to overwrite an existing file unless `--force` is
+passed. `--hf <repo>[:<file>]` is llama-server-only and injects a
+`huggingface:` block under `backend.llama_server` so `vibe pull` can fetch
+the weights for you.
 
 ## First run
 

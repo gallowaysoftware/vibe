@@ -1,0 +1,60 @@
+# Starter profile: llama-server backend + docker-compose frontend.
+#
+# This file was dropped by `vibe profile init docker-compose`. Edit the
+# REPLACE-marked lines below, then `vibe start __PROFILE_NAME__`.
+#
+# On start, vibe runs:
+#   docker compose -f <compose_file> -p <project_name> up -d [services...]
+# then polls each wait_for URL until it 2xxs. On stop, vibe runs:
+#   docker compose -f <compose_file> -p <project_name> down
+# (no per-service filter — the whole project comes down so networks and
+# anonymous volumes get cleaned up).
+
+name: __PROFILE_NAME__
+description: __PROFILE_NAME__ (llama-server + docker-compose)
+
+backend:
+  llama_server:
+    # REPLACE: absolute or ~/-prefixed path to your GGUF model file.
+    path: ~/models/REPLACE-model.gguf
+    # REPLACE: must match the model id llama-server advertises at /v1/models.
+    alias: REPLACE-model-alias
+    context: 32768
+    parallel: 1
+    gpu_layers: 999
+    flash_attn: true
+    jinja: true
+
+frontend:
+  kind: docker-compose
+  # REPLACE: human-readable name of the frontend app (perplexica, open-webui, ...).
+  app: REPLACE-app-name
+
+  # REPLACE: path to the docker-compose.yaml that defines your stack.
+  # ${VIBE_STATE_DIR} expands to $XDG_STATE_HOME/vibe.
+  compose_file: ${VIBE_STATE_DIR}/frontend/__PROFILE_NAME__/docker-compose.yaml
+
+  # Optional. Defaults to "vibe-<profile-name>". Pin it explicitly when you
+  # want a name that survives renaming the profile.
+  project_name: vibe-__PROFILE_NAME__
+
+  # Optional. When set, vibe only `up -d`s these services. When unset, the
+  # entire compose project comes up.
+  # services:
+  #   - REPLACE-service-name
+
+  # Optional. Each entry is polled after `up -d` succeeds. Polling continues
+  # until the URL returns a 2xx response or `timeout` (default 60s) elapses.
+  wait_for:
+    # REPLACE: the URL your frontend serves on once it's ready.
+    - url: http://127.0.0.1:REPLACE-port/
+      timeout: 90s
+
+  # Optional. Pairs are exported into the environment passed to `docker
+  # compose up`, so the compose file can reference them via ${VAR}. Values
+  # support ${VAR} expansion — ${VIBE_API} resolves to vibe's proxy URL.
+  env:
+    OLLAMA_API_URL: ${VIBE_API}
+
+# REPLACE: approximate VRAM the loaded model needs.
+estimated_vram_gb: 16

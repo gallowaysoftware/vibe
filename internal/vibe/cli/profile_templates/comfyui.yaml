@@ -1,0 +1,42 @@
+# Starter profile: ComfyUI backend (image/video generation).
+#
+# This file was dropped by `vibe profile init comfyui`. Edit the
+# REPLACE-marked lines below, then `vibe start __PROFILE_NAME__`.
+#
+# Prereqs:
+#   1. A ComfyUI checkout (https://github.com/comfyanonymous/ComfyUI). The
+#      checkout path goes into backend.comfyui.dir below. `vibe doctor
+#      --install comfyui` will set this up for you.
+#   2. The Python venv has ComfyUI's deps installed.
+#   3. Models placed under <dir>/models/* per ComfyUI's conventions. vibe
+#      does NOT manage ComfyUI's model assets.
+
+name: __PROFILE_NAME__
+description: __PROFILE_NAME__ (ComfyUI)
+
+backend:
+  comfyui:
+    # REPLACE: path to your ComfyUI checkout (must contain main.py).
+    dir: ~/ComfyUI
+
+    # Optional. The Python interpreter to invoke. Defaults to "python3"
+    # resolved via $PATH. Set this to a venv's python if you keep ComfyUI's
+    # deps isolated.
+    # python: ~/ComfyUI/.venv/bin/python
+
+    # Optional. Address ComfyUI binds. Defaults to 127.0.0.1.
+    # listen: 127.0.0.1
+
+    # Optional. The port ComfyUI listens on. Defaults to 8188. Set to 0 to
+    # let vibe pick a free random port (useful for concurrent profiles).
+    port: 8188
+
+    # Optional. Extra positional flags forwarded to `python main.py`.
+    # extra_args:
+    #   - --lowvram
+
+# Note: ComfyUI ships its own browser UI; vibe does not write a `frontend:`
+# block here (the schema rejects frontend for comfyui-backed profiles).
+
+# REPLACE: approximate VRAM your ComfyUI workflow needs.
+estimated_vram_gb: 12
