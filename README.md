@@ -39,6 +39,17 @@ Not yet:
 - VRAM enforcement
 - Remote (LAN) access from a laptop
 
+## Multi-profile example
+
+`vamp` is a sibling tool in this repo that drives `vibe` to run a
+multi-stage pipeline where each stage can use a different profile (and
+therefore a different model). See
+[`examples/multi-profile-pipeline/`](examples/multi-profile-pipeline/)
+for a runnable two-stage demo: a small 7B profile drafts an outline,
+then `vibe` swaps to a larger profile to expand it. Both
+`profiles/fast.example.yaml` and `profiles/code.example.yaml` are
+referenced by that example.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

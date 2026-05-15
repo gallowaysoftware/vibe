@@ -1,0 +1,57 @@
+# Example profile: fast/small coder for quick drafts and outlines.
+#
+# Pairs well with profiles/code.example.yaml in a multi-profile vamp
+# pipeline: use this one for cheap first-pass stages (outlines,
+# brainstorming, classification) and swap to the larger coder for the
+# heavy stages.
+#
+# Copy this file to $XDG_CONFIG_HOME/vibe/profiles/fast.yaml (typically
+# ~/.config/vibe/profiles/fast.yaml), edit paths/aliases to match your
+# environment, then `vibe pull fast` (one-time download) and
+# `vibe start fast`.
+
+name: fast
+description: Fast drafting with Qwen2.5-Coder-7B Q4_K_M
+
+model:
+  path: ~/models/qwen2.5-coder-7b/qwen2.5-coder-7b-instruct-q4_k_m.gguf
+  # Public GGUF — no HuggingFace auth required.
+  huggingface:
+    repo: Qwen/Qwen2.5-Coder-7B-Instruct-GGUF
+    file: qwen2.5-coder-7b-instruct-q4_k_m.gguf
+  # Must match the model id that llama-server advertises at /v1/models.
+  alias: qwen2.5-coder-7b
+  context: 32768
+  parallel: 1
+  gpu_layers: 999
+  flash_attn: true
+  cache_type_k: q8_0
+  cache_type_v: q8_0
+  jinja: true
+
+frontend:
+  kind: external
+  app: opencode
+  # opencode reads its config once at startup and does not hot-reload,
+  # so relaunching opencode is required to pick up the new endpoint.
+  restart_required: true
+  write_file: ${VIBE_STATE_DIR}/frontend/fast/opencode.json
+  env:
+    OPENCODE_CONFIG: ${WRITE_FILE}
+  template:
+    $schema: https://opencode.ai/config.json
+    provider:
+      vibe-local:
+        npm: "@ai-sdk/openai-compatible"
+        name: vibe (llama-server)
+        options:
+          baseURL: ${VIBE_API}
+        models:
+          ${MODEL_ALIAS}:
+            name: ${MODEL_ALIAS}
+            limit:
+              context: ${MODEL_CONTEXT}
+              output: 4096
+    model: vibe-local/${MODEL_ALIAS}
+
+estimated_vram_gb: 6
