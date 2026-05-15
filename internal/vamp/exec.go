@@ -52,6 +52,11 @@ const (
 	// profile; the runner short-circuits profile activation for groups
 	// whose stages are all profile-less subprocess types.
 	StageTypeFFmpeg StageType = "ffmpeg"
+	// StageTypeYouTube uploads a video file (typically produced by an
+	// upstream ffmpeg stage) to YouTube via the YouTube Data API v3.
+	// Like the subprocess stage types it does not activate a vibe profile;
+	// it talks directly to Google's OAuth / upload endpoints over HTTPS.
+	StageTypeYouTube StageType = "youtube"
 )
 
 // StageExecutor implements the run of a single stage instance. The receiver
@@ -219,6 +224,7 @@ func (e *Executor) Run(ctx context.Context) error {
 		StageTypeComfyUI: &comfyuiExecutor{pollInterval: time.Second},
 		StageTypeAudio:   &audioExecutor{},
 		StageTypeFFmpeg:  &ffmpegExecutor{},
+		StageTypeYouTube: &youtubeExecutor{},
 	}
 
 	// Stage lookup and dependency counts for wave-based scheduling.
@@ -674,12 +680,12 @@ func stageTypeOrDefault(st *Stage) StageType {
 }
 
 // stageRequiresVibeProfile reports whether the stage's executor needs a vibe
-// profile activated before Execute. Subprocess-only types (audio, ffmpeg) run
-// against local binaries and have no backend, so the scheduler skips
-// EnsureActive for groups consisting entirely of these stages.
+// profile activated before Execute. Subprocess-only types (audio, ffmpeg) and
+// the network-only youtube type don't talk to a vibe-managed backend, so the
+// scheduler skips EnsureActive for groups consisting entirely of these stages.
 func stageRequiresVibeProfile(st *Stage) bool {
 	switch stageTypeOrDefault(st) {
-	case StageTypeAudio, StageTypeFFmpeg:
+	case StageTypeAudio, StageTypeFFmpeg, StageTypeYouTube:
 		return false
 	default:
 		return true
@@ -827,8 +833,11 @@ func (e *Executor) tryResumeStage(st *Stage) (bool, error) {
 	}
 	// Binary stages (comfyui/audio) only record the relative path in
 	// stageResult.Output; templates that reference `.stages.<id>.output`
-	// for those stages already see a path, not file contents.
-	if stageTypeOrDefault(st) != StageTypeText {
+	// for those stages already see a path, not file contents. YouTube is
+	// the exception: its "output" is the watch URL we wrote to disk, and
+	// downstream stages expect the URL string itself — same shape as text.
+	t := stageTypeOrDefault(st)
+	if t != StageTypeText && t != StageTypeYouTube {
 		e.mu.Lock()
 		e.stageOutputs[st.ID] = &stageResult{Output: outPath}
 		e.mu.Unlock()
@@ -871,7 +880,11 @@ func (e *Executor) tryResumeForeachStage(st *Stage) (bool, error) {
 		return true, nil
 	}
 	outputs := make([]string, len(items))
-	isText := stageTypeOrDefault(st) == StageTypeText
+	// YouTube records the watch URL as the file body; downstream stages see
+	// the URL string the same way they'd see a text-stage completion, so we
+	// treat youtube like text for resume purposes.
+	rt := stageTypeOrDefault(st)
+	isText := rt == StageTypeText || rt == StageTypeYouTube
 	for i, item := range items {
 		extra := map[string]any{st.Foreach.Var: item, "i": i}
 		path, err := e.renderOutputPath(st, extra)

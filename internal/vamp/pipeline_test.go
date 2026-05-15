@@ -242,6 +242,102 @@ stages:
 	}
 }
 
+// TestLoadPipeline_YouTubeValid sanity-checks a minimal valid youtube stage
+// and confirms the optional fields land on the parsed Stage. Like audio and
+// ffmpeg stages, youtube stages have no required `capability:` — they talk
+// directly to the YouTube Data API and don't activate a vibe profile.
+func TestLoadPipeline_YouTubeValid(t *testing.T) {
+	yaml := `
+name: pub
+stages:
+  - id: assemble
+    type: ffmpeg
+    ffmpeg_args: ["-i", "x"]
+    output: final.mp4
+  - id: publish
+    type: youtube
+    inputs: [assemble]
+    video: "{{ .stages.assemble.output }}"
+    title: "demo {{ .inputs.title }}"
+    description: "auto-generated"
+    tags: ["ai", "demo", "vibe"]
+    privacy: unlisted
+    category_id: "22"
+    thumbnail: cover.png
+    credentials_file: ~/.config/vamp/youtube-credentials.json
+    output: youtube_url.txt
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := p.Stages[1]
+	if st.Type != StageTypeYouTube {
+		t.Errorf("type = %q, want %q", st.Type, StageTypeYouTube)
+	}
+	if st.Video != "{{ .stages.assemble.output }}" {
+		t.Errorf("video = %q", st.Video)
+	}
+	if st.Title != "demo {{ .inputs.title }}" {
+		t.Errorf("title = %q", st.Title)
+	}
+	if st.Privacy != "unlisted" {
+		t.Errorf("privacy = %q", st.Privacy)
+	}
+	if st.CategoryID != "22" {
+		t.Errorf("category_id = %q", st.CategoryID)
+	}
+	if st.Thumbnail != "cover.png" {
+		t.Errorf("thumbnail = %q", st.Thumbnail)
+	}
+	if st.CredentialsFile != "~/.config/vamp/youtube-credentials.json" {
+		t.Errorf("credentials_file = %q", st.CredentialsFile)
+	}
+	if strings.Join(st.Tags, ",") != "ai,demo,vibe" {
+		t.Errorf("tags = %v", st.Tags)
+	}
+}
+
+// TestLoadPipeline_YouTubeCapabilityOptional verifies a youtube stage parses
+// successfully without a `capability:` field — youtube stages talk directly
+// to the YouTube Data API, not a vibe-managed backend.
+func TestLoadPipeline_YouTubeCapabilityOptional(t *testing.T) {
+	yaml := `
+name: pub
+stages:
+  - id: publish
+    type: youtube
+    video: final.mp4
+    title: T
+    description: D
+    output: url.txt
+`
+	if _, err := LoadPipeline(writePipeline(t, yaml)); err != nil {
+		t.Fatalf("expected youtube stage with no capability to validate, got: %v", err)
+	}
+}
+
+// TestLoadPipeline_YouTubeExampleFile parses the shipped example pipeline so
+// CI catches drift between the example YAML and the validator.
+func TestLoadPipeline_YouTubeExampleFile(t *testing.T) {
+	p, err := LoadPipeline(filepath.Join("..", "..", "examples", "youtube-upload", "pipeline.yaml"))
+	if err != nil {
+		t.Fatalf("load example: %v", err)
+	}
+	if p.Name != "youtube_upload_smoke" {
+		t.Errorf("name = %q, want youtube_upload_smoke", p.Name)
+	}
+	foundYT := false
+	for _, s := range p.Stages {
+		if s.Type == StageTypeYouTube {
+			foundYT = true
+		}
+	}
+	if !foundYT {
+		t.Error("example pipeline contains no youtube stage")
+	}
+}
+
 // TestLoadPipeline_ComfyUIValid sanity-checks a minimal valid comfyui stage.
 func TestLoadPipeline_ComfyUIValid(t *testing.T) {
 	yaml := `
@@ -1002,6 +1098,150 @@ stages:
     "6.text": hi
   ffmpeg_args: ["-i", "x"]`,
 			wantErr: "ffmpeg_args is only valid on type: ffmpeg",
+		},
+		{
+			name: "youtube without video",
+			yaml: `name: x
+stages:
+- id: a
+  type: youtube
+  title: T
+  description: D
+  output: url.txt`,
+			wantErr: "video is required",
+		},
+		{
+			name: "youtube without title",
+			yaml: `name: x
+stages:
+- id: a
+  type: youtube
+  video: final.mp4
+  description: D
+  output: url.txt`,
+			wantErr: "title is required",
+		},
+		{
+			name: "youtube without description",
+			yaml: `name: x
+stages:
+- id: a
+  type: youtube
+  video: final.mp4
+  title: T
+  output: url.txt`,
+			wantErr: "description is required",
+		},
+		{
+			name: "youtube invalid privacy",
+			yaml: `name: x
+stages:
+- id: a
+  type: youtube
+  video: final.mp4
+  title: T
+  description: D
+  privacy: secret
+  output: url.txt`,
+			wantErr: "privacy",
+		},
+		{
+			name: "youtube with capability (network type rejects profile binding)",
+			yaml: `name: x
+stages:
+- id: a
+  type: youtube
+  capability: upload
+  video: final.mp4
+  title: T
+  description: D
+  output: url.txt`,
+			wantErr: "capability is only valid",
+		},
+		{
+			name: "youtube with prompt (text-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: youtube
+  video: final.mp4
+  title: T
+  description: D
+  output: url.txt
+  prompt: "nope"`,
+			wantErr: "prompt is only valid on type: text",
+		},
+		{
+			name: "youtube with workflow (comfyui-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: youtube
+  video: final.mp4
+  title: T
+  description: D
+  output: url.txt
+  workflow: wf.json`,
+			wantErr: "workflow is only valid on type: comfyui",
+		},
+		{
+			name: "youtube with ffmpeg_args (ffmpeg-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: youtube
+  video: final.mp4
+  title: T
+  description: D
+  output: url.txt
+  ffmpeg_args: ["-i", "x"]`,
+			wantErr: "ffmpeg_args is only valid on type: ffmpeg",
+		},
+		{
+			name: "youtube with voice (audio-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: youtube
+  video: final.mp4
+  title: T
+  description: D
+  output: url.txt
+  voice: en_US-lessac-medium`,
+			wantErr: "voice/text/voices_dir are only valid on type: audio",
+		},
+		{
+			name: "text stage with video (youtube-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  capability: r
+  prompt: hi
+  output: a.md
+  video: final.mp4`,
+			wantErr: "video is only valid on type: youtube",
+		},
+		{
+			name: "text stage with privacy (youtube-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  capability: r
+  prompt: hi
+  output: a.md
+  privacy: unlisted`,
+			wantErr: "privacy is only valid on type: youtube",
+		},
+		{
+			name: "ffmpeg stage with thumbnail (youtube-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: ffmpeg
+  ffmpeg_args: ["-i", "x"]
+  output: a.mp4
+  thumbnail: cover.png`,
+			wantErr: "thumbnail is only valid on type: youtube",
 		},
 	}
 	for _, tc := range cases {
