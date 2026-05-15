@@ -41,13 +41,16 @@ path (git clone, venv, pip install, optional SDXL-Turbo checkpoint, drop
 default profile) idempotently — each step skips when already satisfied.
 See `internal/vibe/cli/install_comfyui.go`.
 
-## `vibe doctor --install llama-cpp`
+## ~~`vibe doctor --install llama-cpp`~~ (done)
 
-Same shape for llama.cpp itself (current install assumes
-`llama-server` already on `$PATH`). The dispatcher in
-`internal/vibe/cli/cmd_doctor.go` (`runInstall`) is structured so a new
-installer plugs in next to `comfyui` without touching the diagnostic
-path.
+Implemented: `vibe doctor --install llama-cpp [--yes] [--cuda]` offers
+three install methods (distro package metadata probe, GitHub release
+tarball, or printed source-build commands), falling through to the
+tarball path whenever a distro package isn't available. Each step is
+idempotent; the release path picks `llama-<ver>-bin-ubuntu-x64.tar.gz`
+(or a CUDA variant when one exists upstream and `--cuda` is set),
+extracts under `~/.local/share/vibe/llama-cpp/`, and symlinks into
+`~/.local/bin/`. See `internal/vibe/cli/install_llama_cpp.go`.
 
 ## ComfyUI video smoke
 

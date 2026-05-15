@@ -435,8 +435,10 @@ func TestHasLargeFile(t *testing.T) {
 // ─── dispatcher: unknown name fails ─────────────────────────────────────────
 
 func TestRunInstall_UnknownComponent(t *testing.T) {
+	// Pick a name that's not currently supported. Both `comfyui` and
+	// `llama-cpp` are valid installers; `nonesuch` is not.
 	cmd := doctorCmd()
-	cmd.SetArgs([]string{"--install", "llama-cpp"})
+	cmd.SetArgs([]string{"--install", "nonesuch"})
 	var stderr bytes.Buffer
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(&stderr)

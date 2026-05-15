@@ -118,6 +118,7 @@ func doctorCmd() *cobra.Command {
 	var (
 		installName string
 		installYes  bool
+		installCUDA bool
 	)
 	cmd := &cobra.Command{
 		Use:   "doctor",
@@ -126,10 +127,12 @@ func doctorCmd() *cobra.Command {
 			"profiles, daemon) and reports OK / WARN / FAIL for each. " +
 			"Exits non-zero if any check fails.\n\n" +
 			"With --install <name>, switches from diagnostic to install mode " +
-			"and runs the install procedure for that component (currently only " +
-			"`comfyui`). Each step is idempotent and skips when already " +
-			"satisfied; big-disk steps prompt for confirmation unless --yes " +
-			"is passed.",
+			"and runs the install procedure for that component (supported: " +
+			"`comfyui`, `llama-cpp`). Each step is idempotent and skips when " +
+			"already satisfied; big-disk steps prompt for confirmation unless " +
+			"--yes is passed. With --install llama-cpp --cuda, prefers a " +
+			"CUDA-flavoured release asset (and points at the CUDA source " +
+			"build command in the [s]ource menu).",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -137,7 +140,7 @@ func doctorCmd() *cobra.Command {
 				ctx = context.Background()
 			}
 			if installName != "" {
-				return runInstall(cmd, installName, installYes)
+				return runInstall(cmd, installName, installYes, installCUDA)
 			}
 			env := defaultDoctorEnv()
 			results := runChecks(ctx, env)
@@ -160,23 +163,27 @@ func doctorCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&installName, "install", "",
-		"install a component (supported: comfyui) instead of running diagnostics")
+		"install a component (supported: comfyui, llama-cpp) instead of running diagnostics")
 	cmd.Flags().BoolVar(&installYes, "yes", false,
 		"skip confirmation prompts when used with --install")
+	cmd.Flags().BoolVar(&installCUDA, "cuda", false,
+		"prefer CUDA-flavoured assets when used with --install llama-cpp")
 	return cmd
 }
 
-// runInstall dispatches to the named installer. New installers (e.g.
-// llama-cpp) plug in here without touching the diagnostic path.
-func runInstall(cmd *cobra.Command, name string, yes bool) error {
+// runInstall dispatches to the named installer. New installers plug in here
+// without touching the diagnostic path.
+func runInstall(cmd *cobra.Command, name string, yes, cuda bool) error {
 	out := cmd.OutOrStdout()
 	errOut := cmd.ErrOrStderr()
 	switch name {
 	case "comfyui":
 		return installComfyUI(defaultInstallerEnv(out, errOut, yes))
+	case "llama-cpp":
+		return installLlamaCpp(defaultLlamaInstallerEnv(out, errOut, yes, cuda))
 	default:
 		cmd.SilenceErrors = true
-		return fmt.Errorf("--install %q: unknown component (supported: comfyui)", name)
+		return fmt.Errorf("--install %q: unknown component (supported: comfyui, llama-cpp)", name)
 	}
 }
 
