@@ -160,6 +160,88 @@ stages:
 	}
 }
 
+// TestLoadPipeline_FFmpegValid sanity-checks a minimal valid ffmpeg stage and
+// confirms the optional fields land on the parsed Stage. ffmpeg stages have
+// no required `capability:` because they run as a local subprocess, mirroring
+// audio stages.
+func TestLoadPipeline_FFmpegValid(t *testing.T) {
+	yaml := `
+name: assemble
+stages:
+  - id: assemble
+    type: ffmpeg
+    binary: /usr/local/bin/ffmpeg
+    ffmpeg_args:
+      - "-loop"
+      - "1"
+      - "-i"
+      - "{{ .stages.render.output }}"
+      - "-c:v"
+      - "libx264"
+    output: final.mp4
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := p.Stages[0]
+	if st.Type != StageTypeFFmpeg {
+		t.Errorf("type = %q, want %q", st.Type, StageTypeFFmpeg)
+	}
+	if st.Binary != "/usr/local/bin/ffmpeg" {
+		t.Errorf("binary = %q", st.Binary)
+	}
+	if len(st.FFmpegArgs) != 6 {
+		t.Fatalf("ffmpeg_args len = %d, want 6", len(st.FFmpegArgs))
+	}
+	if st.FFmpegArgs[3] != "{{ .stages.render.output }}" {
+		t.Errorf("ffmpeg_args[3] = %q", st.FFmpegArgs[3])
+	}
+	if st.Output != "final.mp4" {
+		t.Errorf("output = %q", st.Output)
+	}
+}
+
+// TestLoadPipeline_FFmpegExampleFile parses the shipped example
+// pipeline.yaml so a CI failure flags any drift between the example and the
+// validator. (Pipeline files are committed alongside the code; a parse
+// failure here means the example doc is out of step.)
+func TestLoadPipeline_FFmpegExampleFile(t *testing.T) {
+	p, err := LoadPipeline(filepath.Join("..", "..", "examples", "video-pipeline", "pipeline.yaml"))
+	if err != nil {
+		t.Fatalf("load example: %v", err)
+	}
+	if p.Name != "video_pipeline_smoke" {
+		t.Errorf("name = %q, want video_pipeline_smoke", p.Name)
+	}
+	if len(p.Stages) != 4 {
+		t.Fatalf("stages = %d, want 4", len(p.Stages))
+	}
+	if p.Stages[3].Type != StageTypeFFmpeg {
+		t.Errorf("stage 3 type = %q, want %q", p.Stages[3].Type, StageTypeFFmpeg)
+	}
+	if len(p.Stages[3].FFmpegArgs) == 0 {
+		t.Error("stage 3 has empty ffmpeg_args")
+	}
+}
+
+// TestLoadPipeline_FFmpegCapabilityOptional verifies an ffmpeg stage parses
+// successfully without a `capability:` field — like audio stages, ffmpeg runs
+// as a local subprocess and doesn't activate a vibe profile.
+func TestLoadPipeline_FFmpegCapabilityOptional(t *testing.T) {
+	yaml := `
+name: assemble
+stages:
+  - id: assemble
+    type: ffmpeg
+    ffmpeg_args: ["-i", "in.wav"]
+    output: final.mp4
+`
+	if _, err := LoadPipeline(writePipeline(t, yaml)); err != nil {
+		t.Fatalf("expected ffmpeg stage with no capability to validate, got: %v", err)
+	}
+}
+
 // TestLoadPipeline_ComfyUIValid sanity-checks a minimal valid comfyui stage.
 func TestLoadPipeline_ComfyUIValid(t *testing.T) {
 	yaml := `
@@ -763,6 +845,163 @@ stages:
     "6.text": hi
   voice: nope`,
 			wantErr: "voice/text/voices_dir/binary are only valid on type: audio",
+		},
+		{
+			name: "ffmpeg without ffmpeg_args",
+			yaml: `name: x
+stages:
+- id: a
+  type: ffmpeg
+  output: a.mp4`,
+			wantErr: "ffmpeg_args is required",
+		},
+		{
+			name: "ffmpeg with empty ffmpeg_args list",
+			yaml: `name: x
+stages:
+- id: a
+  type: ffmpeg
+  ffmpeg_args: []
+  output: a.mp4`,
+			wantErr: "ffmpeg_args is required",
+		},
+		{
+			name: "ffmpeg with prompt (text-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: ffmpeg
+  ffmpeg_args: ["-i", "x"]
+  output: a.mp4
+  prompt: "nope"`,
+			wantErr: "prompt is only valid on type: text",
+		},
+		{
+			name: "ffmpeg with prompt_file (text-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: ffmpeg
+  ffmpeg_args: ["-i", "x"]
+  output: a.mp4
+  prompt_file: nope.tmpl`,
+			wantErr: "prompt_file is only valid on type: text",
+		},
+		{
+			name: "ffmpeg with params (text-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: ffmpeg
+  ffmpeg_args: ["-i", "x"]
+  output: a.mp4
+  params:
+    temperature: 0.8`,
+			wantErr: "params is only valid on type: text",
+		},
+		{
+			name: "ffmpeg with output_format (text-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: ffmpeg
+  ffmpeg_args: ["-i", "x"]
+  output: a.mp4
+  output_format: json`,
+			wantErr: "output_format is only valid on type: text",
+		},
+		{
+			name: "ffmpeg with workflow (comfyui-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: ffmpeg
+  ffmpeg_args: ["-i", "x"]
+  output: a.mp4
+  workflow: wf.json`,
+			wantErr: "workflow is only valid on type: comfyui",
+		},
+		{
+			name: "ffmpeg with parameters (comfyui-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: ffmpeg
+  ffmpeg_args: ["-i", "x"]
+  output: a.mp4
+  parameters:
+    "6.text": hi`,
+			wantErr: "parameters is only valid on type: comfyui",
+		},
+		{
+			name: "ffmpeg with voice (audio-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: ffmpeg
+  ffmpeg_args: ["-i", "x"]
+  output: a.mp4
+  voice: en_US-lessac-medium`,
+			wantErr: "voice/text/voices_dir are only valid on type: audio",
+		},
+		{
+			name: "ffmpeg with text (audio-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: ffmpeg
+  ffmpeg_args: ["-i", "x"]
+  output: a.mp4
+  text: "nope"`,
+			wantErr: "voice/text/voices_dir are only valid on type: audio",
+		},
+		{
+			name: "ffmpeg with capability (subprocess type rejects profile binding)",
+			yaml: `name: x
+stages:
+- id: a
+  type: ffmpeg
+  capability: video
+  ffmpeg_args: ["-i", "x"]
+  output: a.mp4`,
+			wantErr: "capability is only valid",
+		},
+		{
+			name: "text stage with ffmpeg_args (ffmpeg-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  capability: r
+  prompt: hi
+  output: a.md
+  ffmpeg_args: ["-i", "x"]`,
+			wantErr: "ffmpeg_args is only valid on type: ffmpeg",
+		},
+		{
+			name: "audio stage with ffmpeg_args (ffmpeg-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: audio
+  voice: en_US-lessac-medium
+  text: "hi"
+  output: a.wav
+  ffmpeg_args: ["-i", "x"]`,
+			wantErr: "ffmpeg_args is only valid on type: ffmpeg",
+		},
+		{
+			name: "comfyui stage with ffmpeg_args (ffmpeg-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: comfyui
+  capability: image
+  workflow: wf.json
+  output: a.png
+  parameters:
+    "6.text": hi
+  ffmpeg_args: ["-i", "x"]`,
+			wantErr: "ffmpeg_args is only valid on type: ffmpeg",
 		},
 	}
 	for _, tc := range cases {

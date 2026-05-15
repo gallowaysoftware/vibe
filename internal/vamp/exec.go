@@ -44,6 +44,12 @@ const (
 	// profile; the runner short-circuits profile activation for audio
 	// groups since the underlying binary is a local subprocess.
 	StageTypeAudio StageType = "audio"
+	// StageTypeFFmpeg invokes ffmpeg as a local subprocess to combine prior
+	// stage outputs (audio, images, video) into a final media file. Like
+	// audio stages it does not talk to vibe and does not activate a
+	// profile; the runner short-circuits profile activation for groups
+	// whose stages are all profile-less subprocess types.
+	StageTypeFFmpeg StageType = "ffmpeg"
 )
 
 // StageExecutor implements the run of a single stage instance. The receiver
@@ -171,6 +177,7 @@ func (e *Executor) Run(ctx context.Context) error {
 		StageTypeText:    &textExecutor{inference: e.Inference},
 		StageTypeComfyUI: &comfyuiExecutor{pollInterval: time.Second},
 		StageTypeAudio:   &audioExecutor{},
+		StageTypeFFmpeg:  &ffmpegExecutor{},
 	}
 
 	// Stage lookup and dependency counts for wave-based scheduling.
@@ -252,20 +259,21 @@ func (e *Executor) Run(ctx context.Context) error {
 // buffer per-stage tokens and emit them contiguously after each stage
 // completes to keep concurrent output readable.
 func (e *Executor) runGroup(ctx context.Context, capability string, group []*Stage) error {
-	// Audio stages are local subprocesses; they don't talk to a vibe-managed
-	// backend, don't need a profile activation, and may legitimately ship
-	// with an empty capability. Short-circuit profile resolution when every
-	// stage in the group is audio so the scheduler doesn't demand a
-	// capability mapping for a stage type that doesn't use one.
-	allAudio := true
+	// Some stage types (audio, ffmpeg) are local subprocesses; they don't
+	// talk to a vibe-managed backend, don't need a profile activation, and
+	// may legitimately ship with an empty capability. Short-circuit profile
+	// resolution when every stage in the group is one of these so the
+	// scheduler doesn't demand a capability mapping for a stage type that
+	// doesn't use one.
+	allProfileless := true
 	for _, st := range group {
-		if stageTypeOrDefault(st) != StageTypeAudio {
-			allAudio = false
+		if stageRequiresVibeProfile(st) {
+			allProfileless = false
 			break
 		}
 	}
-	if allAudio {
-		e.logf("  -> audio group (%d stage(s)): no profile activation", len(group))
+	if allProfileless {
+		e.logf("  -> subprocess group (%d stage(s)): no profile activation", len(group))
 		if len(group) == 1 {
 			st := group[0]
 			if err := e.executeStage(ctx, st, "", "", "", nil); err != nil {
@@ -591,6 +599,19 @@ func stageTypeOrDefault(st *Stage) StageType {
 		return StageTypeText
 	}
 	return st.Type
+}
+
+// stageRequiresVibeProfile reports whether the stage's executor needs a vibe
+// profile activated before Execute. Subprocess-only types (audio, ffmpeg) run
+// against local binaries and have no backend, so the scheduler skips
+// EnsureActive for groups consisting entirely of these stages.
+func stageRequiresVibeProfile(st *Stage) bool {
+	switch stageTypeOrDefault(st) {
+	case StageTypeAudio, StageTypeFFmpeg:
+		return false
+	default:
+		return true
+	}
 }
 
 // executorFor selects the StageExecutor for st based on its type. An unknown
