@@ -20,19 +20,34 @@ import (
 	vibev1 "github.com/gallowaysoftware/vibe/proto/vibe/v1"
 )
 
-var fakeBinary string
+var (
+	fakeBinary   string
+	fakeComfyBin string
+)
 
 func TestMain(m *testing.M) {
 	bin := filepath.Join(os.TempDir(), fmt.Sprintf("vibe-fake-llama-daemon-%d", os.Getpid()))
 	cmd := exec.Command("go", "build", "-o", bin, "../../../testdata/fake-llama-server")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "build fake:", err, string(out))
+		fmt.Fprintln(os.Stderr, "build fake-llama-server:", err, string(out))
 		os.Exit(1)
 	}
 	fakeBinary = bin
+
+	comfyBin := filepath.Join(os.TempDir(), fmt.Sprintf("vibe-fake-comfyui-daemon-%d", os.Getpid()))
+	cmd = exec.Command("go", "build", "-o", comfyBin, "../../../testdata/fake-comfyui")
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "build fake-comfyui:", err, string(out))
+		os.Remove(bin)
+		os.Exit(1)
+	}
+	fakeComfyBin = comfyBin
+
 	code := m.Run()
 	_ = os.Remove(bin)
+	_ = os.Remove(comfyBin)
 	os.Exit(code)
 }
 
@@ -90,11 +105,12 @@ func stubModel(t *testing.T) string {
 func externalProfile(name, modelPath string) string {
 	return fmt.Sprintf(`name: %s
 description: %s integration profile
-model:
-  path: %s
-  alias: fake
-  context: 1024
-  parallel: 1
+backend:
+  llama_server:
+    path: %s
+    alias: fake
+    context: 1024
+    parallel: 1
 frontend:
   kind: external
   app: stub
@@ -105,6 +121,35 @@ frontend:
     api: ${VIBE_API}
     alias: ${MODEL_ALIAS}
 `, name, name, modelPath, name)
+}
+
+// comfyUIProfile returns YAML for a ComfyUI-backed profile whose `dir`
+// points at a temp dir we've seeded with main.py. `port` may be 0 to let
+// the daemon pick a random port. `python` is set to the fake-comfyui Go
+// binary (built in TestMain) so the supervisor's health probe at
+// /system_stats actually finds a server, without depending on a real
+// python3 + ComfyUI checkout being installed on the test host.
+func comfyUIProfile(name, dir, python string, port int) string {
+	return fmt.Sprintf(`name: %s
+description: %s comfyui integration profile
+backend:
+  comfyui:
+    dir: %s
+    python: %s
+    port: %d
+`, name, name, dir, python, port)
+}
+
+// stubComfyDir creates a directory containing a main.py so the validator's
+// existence check passes. The actual server logic lives in the fake-comfyui
+// Go binary; main.py is just a marker file.
+func stubComfyDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("# fake comfyui placeholder\n"), 0o644); err != nil {
+		t.Fatalf("write main.py: %v", err)
+	}
+	return dir
 }
 
 // runHandle gives a test access to the daemon's Run() return value while
@@ -367,6 +412,103 @@ func TestDaemon_PullForLocalFile(t *testing.T) {
 	}
 	if !strings.Contains(last.Message, "no huggingface block") {
 		t.Errorf("message = %q, want \"no huggingface block; nothing to pull\"", last.Message)
+	}
+}
+
+// TestDaemon_StartComfyUI exercises the ComfyUI dispatch path: the daemon
+// must launch the configured backend, surface its addr via Status.BackendAddr
+// (used by vamp), and leave the proxy unbacked (the proxy is a llama-server
+// concern). It must also not return a Frontend payload on Start (ComfyUI
+// has its own UI).
+func TestDaemon_StartComfyUI(t *testing.T) {
+	setupXDG(t)
+	dir := stubComfyDir(t)
+	// Let the daemon pick a random port (port: 0) so we don't fight
+	// concurrent tests over 8188.
+	writeProfile(t, "imagegen", comfyUIProfile("imagegen", dir, fakeComfyBin, 0))
+
+	d := makeDaemon(t)
+	client, _ := startDaemon(t, d)
+
+	startCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	res, err := client.Start(startCtx, "imagegen")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _, _ = client.Stop(context.Background()) })
+
+	if res.Status == nil || !res.Status.Running || !res.Status.Ready {
+		t.Fatalf("status after Start = %+v; want running+ready", res.Status)
+	}
+	if res.Status.Profile != "imagegen" {
+		t.Errorf("profile = %q, want imagegen", res.Status.Profile)
+	}
+	if res.Frontend != nil {
+		t.Errorf("Frontend = %+v; want nil for ComfyUI (no frontend activation)", res.Frontend)
+	}
+
+	// BackendAddr must point at the fake comfyui's loopback addr; this is
+	// what the sibling vamp executor uses to talk to ComfyUI directly.
+	if !strings.HasPrefix(res.Status.BackendAddr, "http://127.0.0.1:") {
+		t.Errorf("BackendAddr = %q, want http://127.0.0.1:<port>", res.Status.BackendAddr)
+	}
+	// Confirm the fake server actually answered /system_stats — the
+	// supervisor only transitions to Ready after it does, so by definition
+	// it must, but assert it as a freshness check on this test.
+	resp, err := http.Get(res.Status.BackendAddr + "/system_stats")
+	if err != nil {
+		t.Fatalf("GET /system_stats: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("/system_stats status = %d, want 200", resp.StatusCode)
+	}
+
+	// Proxy must NOT be wired to this backend (ComfyUI is not OpenAI-API
+	// compatible; vamp talks to it directly). A bare GET against the proxy
+	// should fail with 502 / similar — at minimum, it should not proxy to
+	// the ComfyUI backend.
+	proxyURL := fmt.Sprintf("http://%s/system_stats", strings.TrimPrefix(res.Status.ProxyAddr, "http://"))
+	// Best-effort: a request through the unbacked proxy should not 200.
+	if pr, perr := http.Get(proxyURL); perr == nil {
+		pr.Body.Close()
+		if pr.StatusCode == 200 {
+			t.Errorf("proxy returned 200 for /system_stats; expected unbacked (proxy must not be wired to ComfyUI)")
+		}
+	}
+}
+
+// TestDaemon_PullForComfyUI confirms `vibe pull` short-circuits cleanly on a
+// ComfyUI profile (ComfyUI manages its own model assets).
+func TestDaemon_PullForComfyUI(t *testing.T) {
+	setupXDG(t)
+	dir := stubComfyDir(t)
+	writeProfile(t, "imagegen", comfyUIProfile("imagegen", dir, fakeComfyBin, 0))
+
+	d := makeDaemon(t)
+	client, _ := startDaemon(t, d)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := client.Pull(ctx, "imagegen")
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	defer stream.Close()
+
+	var last *vibev1.PullProgress
+	for stream.Receive() {
+		last = stream.Msg()
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatalf("stream err: %v", err)
+	}
+	if last == nil || last.Phase != vibev1.PullProgress_PHASE_DONE {
+		t.Fatalf("last = %+v, want DONE", last)
+	}
+	if !strings.Contains(last.Message, "ComfyUI manages its own model assets") {
+		t.Errorf("message = %q, want ComfyUI-specific short-circuit", last.Message)
 	}
 }
 

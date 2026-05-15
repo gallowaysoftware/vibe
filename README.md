@@ -35,10 +35,13 @@ Today running local AI looks like:
 
 ## Architecture
 
-- **Profile**: the unit of configuration. A YAML file bundling a model spec, a frontend integration, and template variables that wire them together.
+- **Profile**: the unit of configuration. A YAML file bundling a backend spec, an optional frontend integration, and template variables that wire them together.
+- **Backend kinds** (discriminated union under `backend:`; exactly one block must be set):
+  - `llama_server` — supervises [`llama-server`](https://github.com/ggml-org/llama.cpp) for an OpenAI-compatible chat/completion API. See [`profiles/code.example.yaml`](profiles/code.example.yaml).
+  - `comfyui` — supervises a [ComfyUI](https://github.com/comfyanonymous/ComfyUI) python process for image/video generation. ComfyUI ships its own UI, so these profiles have no `frontend:` block; vibe exposes the backend addr via `Status.BackendAddr` for tools like `vamp`. See [`profiles/comfyui.example.yaml`](profiles/comfyui.example.yaml).
 - **MCP definitions**: one YAML file per Model Context Protocol server, dropped into `~/.config/vibe/mcp/` (e.g. `datadog.yaml`, `jira.yaml`). Profiles compose them by listing names: `frontend.mcps: [datadog, jira]`. Vibe injects a top-level `mcp` map into the rendered frontend config. Secrets stay in env vars (the frontend resolves `${env:...}` references); profiles never name them inline.
-- **Daemon**: supervises `llama-server` and the active frontend. Exposes a control plane over a Unix socket.
-- **Frontend kinds**:
+- **Daemon**: supervises the active backend (llama-server or ComfyUI) and the active frontend. Exposes a control plane over a Unix socket.
+- **Frontend kinds** (only applicable to `backend.llama_server` profiles):
   - `external` — vibe renders a sidecar config file (e.g. an `opencode.json`) and surfaces the env vars to set when launching the tool. No process lifecycle.
   - `docker-compose` — vibe runs `docker compose up -d` against a user-supplied compose file on `vibe start`, polls any `wait_for` health endpoints, and runs `docker compose down` on `vibe stop`. Good fit for heavy stacks like Perplexica or Open WebUI that benefit from being lifecycle-coupled to a profile. See [`profiles/docker-compose.example.yaml`](profiles/docker-compose.example.yaml).
 - **Proxy**: reverse-proxies frontends to the active llama-server so swapping models doesn't require reconfiguring the frontend.

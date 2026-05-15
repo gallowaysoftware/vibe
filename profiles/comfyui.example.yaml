@@ -1,0 +1,55 @@
+# Example profile: ComfyUI for image (and video) generation.
+#
+# ComfyUI is a node-based stable-diffusion frontend with its own web UI; vibe
+# supervises the Python process and surfaces its address via `vibe ps`, but
+# does not act as a reverse proxy for it (unlike llama-server-backed
+# profiles). The sibling `vamp` tool can drive ComfyUI workflows through
+# vibe's Status.BackendAddr.
+#
+# Prereqs:
+#   1. A ComfyUI checkout (https://github.com/comfyanonymous/ComfyUI).
+#      Wherever you cloned it, that path goes into backend.comfyui.dir.
+#   2. Its Python venv has the required deps installed (`pip install -r
+#      requirements.txt`).
+#   3. Models placed under <dir>/models/* per ComfyUI's conventions. vibe
+#      does NOT manage ComfyUI's model assets — `vibe pull <profile>`
+#      short-circuits with a no-op for comfyui-backed profiles.
+#
+# Copy this file to ~/.config/vibe/profiles/imagegen.yaml, edit `dir` to
+# match your ComfyUI checkout, and `vibe start imagegen`.
+
+name: imagegen
+description: ComfyUI for image generation
+
+backend:
+  comfyui:
+    # Required. The ComfyUI checkout path. Supports `~/` expansion.
+    # vibe validates that main.py exists under this directory at load
+    # time, so typos fail fast.
+    dir: ~/ComfyUI
+
+    # Optional. The Python interpreter to invoke. Defaults to "python3"
+    # resolved via $PATH. Set this to a venv's python (e.g.
+    # "~/ComfyUI/.venv/bin/python") if you keep ComfyUI's deps isolated.
+    # python: ~/ComfyUI/.venv/bin/python
+
+    # Optional. Address ComfyUI binds. Defaults to 127.0.0.1. Use
+    # "0.0.0.0" to expose to LAN (not recommended; vibe is local-first).
+    # listen: 127.0.0.1
+
+    # Optional. The port ComfyUI listens on. Defaults to 8188 (ComfyUI's
+    # upstream default). Set to 0 to let vibe pick a free random port,
+    # useful when running multiple ComfyUI profiles concurrently.
+    port: 8188
+
+    # Optional. Extra positional flags forwarded to `python main.py`.
+    # See `python main.py --help` in your ComfyUI checkout for the full
+    # list (--lowvram, --disable-xformers, --preview-method, etc.).
+    # extra_args:
+    #   - --lowvram
+
+# Note: ComfyUI ships its own browser UI at http://127.0.0.1:8188 (or
+# whatever port: above resolves to). vibe does not write a `frontend:`
+# block here — the schema rejects frontend for comfyui-backed profiles.
+
+estimated_vram_gb: 12

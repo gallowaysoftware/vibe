@@ -17,14 +17,15 @@
 name: research
 description: Research with Qwen3 + Perplexica/SearXNG
 
-model:
-  path: ~/models/qwen3-30b-q6_k.gguf
-  alias: qwen3-30b
-  context: 32768
-  parallel: 1
-  gpu_layers: 999
-  flash_attn: true
-  jinja: true
+backend:
+  llama_server:
+    path: ~/models/qwen3-30b-q6_k.gguf
+    alias: qwen3-30b
+    context: 32768
+    parallel: 1
+    gpu_layers: 999
+    flash_attn: true
+    jinja: true
 
 frontend:
   kind: docker-compose

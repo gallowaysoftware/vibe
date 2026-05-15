@@ -14,12 +14,12 @@ func TestActivate_External_WritesExpandedJSON(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "nested", "opencode.json")
 	p := &profile.Profile{
 		Name: "code",
-		Model: profile.Model{
+		Backend: profile.Backend{LlamaServer: &profile.LlamaServerBackend{
 			Path:     "/m.gguf",
 			Alias:    "qwen3",
 			Context:  8192,
 			Parallel: 1,
-		},
+		}},
 		Frontend: profile.Frontend{
 			Kind:            profile.FrontendExternal,
 			App:             "opencode",
@@ -93,8 +93,8 @@ func TestValidate_DockerCompose_RejectsWriteFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := &profile.Profile{
-		Name:  "p",
-		Model: profile.Model{Path: modelPath, Alias: "x", Context: 1, Parallel: 1},
+		Name:    "p",
+		Backend: profile.Backend{LlamaServer: &profile.LlamaServerBackend{Path: modelPath, Alias: "x", Context: 1, Parallel: 1}},
 		Frontend: profile.Frontend{
 			Kind:        profile.FrontendDockerCompose,
 			App:         "x",
@@ -143,12 +143,12 @@ command: [npx, -y, "@some/jira-mcp"]
 	target := filepath.Join(t.TempDir(), "opencode.json")
 	p := &profile.Profile{
 		Name: "code",
-		Model: profile.Model{
+		Backend: profile.Backend{LlamaServer: &profile.LlamaServerBackend{
 			Path:     "/m.gguf",
 			Alias:    "qwen3",
 			Context:  8192,
 			Parallel: 1,
-		},
+		}},
 		Frontend: profile.Frontend{
 			Kind:      profile.FrontendExternal,
 			App:       "opencode",
@@ -224,8 +224,8 @@ func TestActivate_External_NoMCPs_OmitsBlock(t *testing.T) {
 
 	target := filepath.Join(t.TempDir(), "opencode.json")
 	p := &profile.Profile{
-		Name:  "code",
-		Model: profile.Model{Path: "/m.gguf", Alias: "x", Context: 1, Parallel: 1},
+		Name:    "code",
+		Backend: profile.Backend{LlamaServer: &profile.LlamaServerBackend{Path: "/m.gguf", Alias: "x", Context: 1, Parallel: 1}},
 		Frontend: profile.Frontend{
 			Kind:      profile.FrontendExternal,
 			App:       "opencode",
@@ -256,8 +256,8 @@ func TestActivate_External_MCPConflictsWithTemplateKey(t *testing.T) {
 
 	target := filepath.Join(t.TempDir(), "opencode.json")
 	p := &profile.Profile{
-		Name:  "code",
-		Model: profile.Model{Path: "/m.gguf", Alias: "x", Context: 1, Parallel: 1},
+		Name:    "code",
+		Backend: profile.Backend{LlamaServer: &profile.LlamaServerBackend{Path: "/m.gguf", Alias: "x", Context: 1, Parallel: 1}},
 		Frontend: profile.Frontend{
 			Kind:      profile.FrontendExternal,
 			App:       "opencode",
@@ -288,8 +288,8 @@ func TestActivate_External_MissingMCPDefinition(t *testing.T) {
 
 	target := filepath.Join(t.TempDir(), "opencode.json")
 	p := &profile.Profile{
-		Name:  "code",
-		Model: profile.Model{Path: "/m.gguf", Alias: "x", Context: 1, Parallel: 1},
+		Name:    "code",
+		Backend: profile.Backend{LlamaServer: &profile.LlamaServerBackend{Path: "/m.gguf", Alias: "x", Context: 1, Parallel: 1}},
 		Frontend: profile.Frontend{
 			Kind:      profile.FrontendExternal,
 			App:       "opencode",

@@ -7,11 +7,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 )
 
 var fakeBinary string
@@ -30,31 +29,49 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// stubProfile returns a Profile that points at a real (zero-byte) model file,
-// so the supervisor doesn't trip over a missing path.
-func stubProfile(t *testing.T) *profile.Profile {
+// llamaSpec builds a minimal LaunchSpec that points at the fake llama-server
+// binary built in TestMain. Extra args (e.g. --ready-after, --never-ready) can
+// be appended to drive specific behavior in individual tests.
+func llamaSpec(t *testing.T, port int, extra ...string) LaunchSpec {
 	t.Helper()
 	stub := filepath.Join(t.TempDir(), "model.gguf")
 	if err := os.WriteFile(stub, []byte("x"), 0o644); err != nil {
 		t.Fatalf("write stub model: %v", err)
 	}
-	return &profile.Profile{
-		Name: "fake",
-		Model: profile.Model{
-			Path:     stub,
-			Alias:    "fake",
-			Context:  1024,
-			Parallel: 1,
-		},
+	args := []string{
+		"--model", stub,
+		"--host", "127.0.0.1",
+		"--port", strconv.Itoa(port),
+		"--alias", "fake",
+		"--ctx-size", "1024",
+		"--parallel", "1",
+	}
+	args = append(args, extra...)
+	return LaunchSpec{
+		Binary:    fakeBinary,
+		Args:      args,
+		HealthURL: fmt.Sprintf("http://127.0.0.1:%d/health", port),
 	}
 }
 
+// freshPort allocates a localhost port for a single test. Caller passes it
+// into llamaSpec so the spec's Args and HealthURL agree on the port.
+func freshPort(t *testing.T) int {
+	t.Helper()
+	p, err := pickFreePort()
+	if err != nil {
+		t.Fatalf("pick port: %v", err)
+	}
+	return p
+}
+
 func TestSupervisor_StartReady(t *testing.T) {
-	s := New(fakeBinary)
+	s := New()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := s.Start(ctx, stubProfile(t)); err != nil {
+	port := freshPort(t)
+	if err := s.Start(ctx, llamaSpec(t, port), port); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Stop(context.Background()) })
@@ -76,15 +93,15 @@ func TestSupervisor_StartReady(t *testing.T) {
 }
 
 func TestSupervisor_StartWaitsForReady(t *testing.T) {
-	s := New(fakeBinary)
-	p := stubProfile(t)
-	p.Model.ExtraArgs = []string{"--ready-after", "1s"}
+	s := New()
+	port := freshPort(t)
+	spec := llamaSpec(t, port, "--ready-after", "1s")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	start := time.Now()
-	if err := s.Start(ctx, p); err != nil {
+	if err := s.Start(ctx, spec, port); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	elapsed := time.Since(start)
@@ -99,14 +116,14 @@ func TestSupervisor_StartWaitsForReady(t *testing.T) {
 }
 
 func TestSupervisor_StartContextTimeout(t *testing.T) {
-	s := New(fakeBinary)
-	p := stubProfile(t)
-	p.Model.ExtraArgs = []string{"--never-ready"}
+	s := New()
+	port := freshPort(t)
+	spec := llamaSpec(t, port, "--never-ready")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	err := s.Start(ctx, p)
+	err := s.Start(ctx, spec, port)
 	t.Cleanup(func() { _ = s.Stop(context.Background()) })
 
 	if err == nil {
@@ -118,15 +135,15 @@ func TestSupervisor_StartContextTimeout(t *testing.T) {
 }
 
 func TestSupervisor_PrematureExit(t *testing.T) {
-	s := New(fakeBinary)
-	p := stubProfile(t)
+	s := New()
+	port := freshPort(t)
 	// exit fast and never become ready
-	p.Model.ExtraArgs = []string{"--exit-after", "100ms", "--never-ready"}
+	spec := llamaSpec(t, port, "--exit-after", "100ms", "--never-ready")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := s.Start(ctx, p)
+	err := s.Start(ctx, spec, port)
 	if err == nil {
 		t.Fatalf("Start returned nil; expected premature-exit error")
 	}
@@ -136,11 +153,12 @@ func TestSupervisor_PrematureExit(t *testing.T) {
 }
 
 func TestSupervisor_GracefulStop(t *testing.T) {
-	s := New(fakeBinary)
+	s := New()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := s.Start(ctx, stubProfile(t)); err != nil {
+	port := freshPort(t)
+	if err := s.Start(ctx, llamaSpec(t, port), port); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -163,13 +181,13 @@ func TestSupervisor_KillFallback(t *testing.T) {
 	if testing.Short() {
 		t.Skip("slow: waits for gracefulShutdown before SIGKILL")
 	}
-	s := New(fakeBinary)
-	p := stubProfile(t)
-	p.Model.ExtraArgs = []string{"--ignore-sigint"}
+	s := New()
+	port := freshPort(t)
+	spec := llamaSpec(t, port, "--ignore-sigint")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := s.Start(ctx, p); err != nil {
+	if err := s.Start(ctx, spec, port); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -193,13 +211,13 @@ func TestSupervisor_KillFallback(t *testing.T) {
 }
 
 func TestSupervisor_LogsBuffered(t *testing.T) {
-	s := New(fakeBinary)
-	p := stubProfile(t)
-	p.Model.ExtraArgs = []string{"--log-stuff"}
+	s := New()
+	port := freshPort(t)
+	spec := llamaSpec(t, port, "--log-stuff")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := s.Start(ctx, p); err != nil {
+	if err := s.Start(ctx, spec, port); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	// Give pumpLogs a tick to drain.
@@ -213,5 +231,33 @@ func TestSupervisor_LogsBuffered(t *testing.T) {
 	joined := strings.Join(lines, "\n")
 	if !strings.Contains(joined, "fake llama-server: starting on") {
 		t.Errorf("logs missing stdout marker; got:\n%s", joined)
+	}
+}
+
+// TestSupervisor_ParameterizedHealthURL verifies the supervisor can drive a
+// non-default health URL (the ComfyUI path, /system_stats). We piggy-back on
+// the fake llama-server by serving the same handler at /system_stats via the
+// supervisor's HealthURL hook — but the fake only knows /health, so we use a
+// tiny inline stub instead.
+func TestSupervisor_NonHealthPathPolling(t *testing.T) {
+	// Sanity-check the supervisor honors LaunchSpec.HealthURL by pointing at
+	// a path the fake llama-server *does not* implement, then confirming the
+	// supervisor times out instead of returning ready. (If the supervisor
+	// were hard-coded to /health it would falsely report ready here.)
+	s := New()
+	port := freshPort(t)
+	spec := llamaSpec(t, port)
+	spec.HealthURL = fmt.Sprintf("http://127.0.0.1:%d/system_stats", port)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+	err := s.Start(ctx, spec, port)
+	t.Cleanup(func() { _ = s.Stop(context.Background()) })
+
+	if err == nil {
+		t.Fatal("Start succeeded; expected timeout because /system_stats is a 404 on the fake server")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v; want DeadlineExceeded", err)
 	}
 }

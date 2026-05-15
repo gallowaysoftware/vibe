@@ -17,7 +17,8 @@ func writeProfile(t *testing.T, content string) string {
 	return path
 }
 
-// stubModelFile creates a placeholder file so model.path existence checks pass.
+// stubModelFile creates a placeholder file so backend.llama_server.path
+// existence checks pass.
 func stubModelFile(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "model.gguf")
@@ -27,22 +28,34 @@ func stubModelFile(t *testing.T) string {
 	return path
 }
 
+// stubComfyDir creates a directory containing a main.py so backend.comfyui
+// validation passes.
+func stubComfyDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("# fake\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func TestLoad_Valid(t *testing.T) {
 	model := stubModelFile(t)
 	yaml := `
 name: code
 description: test
-model:
-  path: ` + model + `
-  alias: qwen3-coder-30b
-  context: 190000
-  parallel: 1
-  gpu_layers: 999
-  flash_attn: true
-  cache_type_k: q8_0
-  jinja: true
-  extra_args:
-    - --no-mmap
+backend:
+  llama_server:
+    path: ` + model + `
+    alias: qwen3-coder-30b
+    context: 190000
+    parallel: 1
+    gpu_layers: 999
+    flash_attn: true
+    cache_type_k: q8_0
+    jinja: true
+    extra_args:
+      - --no-mmap
 frontend:
   kind: external
   app: opencode
@@ -68,14 +81,47 @@ estimated_vram_gb: 26
 	if p.Name != "code" {
 		t.Errorf("name = %q", p.Name)
 	}
-	if p.Model.Context != 190000 {
-		t.Errorf("context = %d", p.Model.Context)
+	if p.Backend.LlamaServer == nil {
+		t.Fatalf("backend.llama_server is nil")
 	}
-	if !p.Model.FlashAttn {
+	m := p.Backend.LlamaServer
+	if m.Context != 190000 {
+		t.Errorf("context = %d", m.Context)
+	}
+	if !m.FlashAttn {
 		t.Errorf("flash_attn = false")
 	}
-	if len(p.Model.ExtraArgs) != 1 || p.Model.ExtraArgs[0] != "--no-mmap" {
-		t.Errorf("extra_args = %v", p.Model.ExtraArgs)
+	if len(m.ExtraArgs) != 1 || m.ExtraArgs[0] != "--no-mmap" {
+		t.Errorf("extra_args = %v", m.ExtraArgs)
+	}
+}
+
+func TestLoad_ComfyUI_Valid(t *testing.T) {
+	dir := stubComfyDir(t)
+	yaml := `
+name: imagegen
+description: ComfyUI for image generation
+backend:
+  comfyui:
+    dir: ` + dir + `
+    port: 8188
+estimated_vram_gb: 12
+`
+	p, err := Load(writeProfile(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Backend.ComfyUI == nil {
+		t.Fatalf("backend.comfyui is nil")
+	}
+	if p.Backend.ComfyUI.Dir != dir {
+		t.Errorf("dir = %q, want %q", p.Backend.ComfyUI.Dir, dir)
+	}
+	if p.Backend.ComfyUI.Port != 8188 {
+		t.Errorf("port = %d, want 8188", p.Backend.ComfyUI.Port)
+	}
+	if p.Backend.LlamaServer != nil {
+		t.Errorf("llama_server should be nil")
 	}
 }
 
@@ -83,11 +129,12 @@ func TestLoad_RejectsUnknownField(t *testing.T) {
 	model := stubModelFile(t)
 	yaml := `
 name: code
-model:
-  path: ` + model + `
-  alias: x
-  context: 1024
-  weird_field: nope
+backend:
+  llama_server:
+    path: ` + model + `
+    alias: x
+    context: 1024
+    weird_field: nope
 frontend:
   kind: external
   app: opencode
@@ -101,6 +148,35 @@ frontend:
 	}
 	if !strings.Contains(err.Error(), "weird_field") {
 		t.Errorf("err = %v, want mention of weird_field", err)
+	}
+}
+
+func TestLoad_RejectsOldModelShape(t *testing.T) {
+	model := stubModelFile(t)
+	yaml := `
+name: code
+model:
+  path: ` + model + `
+  alias: x
+  context: 1024
+frontend:
+  kind: external
+  app: opencode
+  write_file: /tmp/x.json
+  template: {a: 1}
+`
+	_, err := Load(writeProfile(t, yaml))
+	if err == nil {
+		t.Fatal("expected error for old `model:` shape")
+	}
+	if !strings.Contains(err.Error(), "schema changed") {
+		t.Errorf("err = %v, want schema-changed migration hint", err)
+	}
+	if !strings.Contains(err.Error(), "backend.llama_server") {
+		t.Errorf("err = %v, want pointer to backend.llama_server", err)
+	}
+	if !strings.Contains(err.Error(), "profiles/code.example.yaml") {
+		t.Errorf("err = %v, want pointer to example file", err)
 	}
 }
 
@@ -123,10 +199,11 @@ func TestLoad_TildeExpansion(t *testing.T) {
 
 	yaml := `
 name: code
-model:
-  path: ~/` + rel + `
-  alias: x
-  context: 1024
+backend:
+  llama_server:
+    path: ~/` + rel + `
+    alias: x
+    context: 1024
 frontend:
   kind: external
   app: opencode
@@ -137,8 +214,8 @@ frontend:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Model.Path != modelPath {
-		t.Errorf("model.path = %q, want %q", p.Model.Path, modelPath)
+	if p.Backend.LlamaServer.Path != modelPath {
+		t.Errorf("backend.llama_server.path = %q, want %q", p.Backend.LlamaServer.Path, modelPath)
 	}
 	if !strings.HasPrefix(p.Frontend.WriteFile, home) {
 		t.Errorf("write_file = %q, want home prefix", p.Frontend.WriteFile)
@@ -147,6 +224,8 @@ frontend:
 
 func TestValidate(t *testing.T) {
 	model := stubModelFile(t)
+	comfyDir := stubComfyDir(t)
+	emptyDir := t.TempDir() // no main.py
 	cases := []struct {
 		name    string
 		yaml    string
@@ -155,7 +234,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "missing name",
 			yaml: `
-model: {path: ` + model + `, alias: x, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
 `,
 			wantErr: "name is required",
@@ -164,43 +243,87 @@ frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
 			name: "bad name",
 			yaml: `
 name: "has spaces"
-model: {path: ` + model + `, alias: x, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
 `,
 			wantErr: "must match",
 		},
 		{
+			name: "missing backend entirely",
+			yaml: `
+name: x
+frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+`,
+			wantErr: "backend is required",
+		},
+		{
+			name: "both backends set",
+			yaml: `
+name: x
+backend:
+  llama_server: {path: ` + model + `, alias: x, context: 1024}
+  comfyui: {dir: ` + comfyDir + `}
+frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+`,
+			wantErr: "only one of",
+		},
+		{
 			name: "missing alias",
 			yaml: `
 name: x
-model: {path: ` + model + `, context: 1024}
+backend: {llama_server: {path: ` + model + `, context: 1024}}
 frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
 `,
-			wantErr: "model.alias is required",
+			wantErr: "backend.llama_server.alias is required",
 		},
 		{
 			name: "zero context",
 			yaml: `
 name: x
-model: {path: ` + model + `, alias: x, context: 0}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 0}}
 frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
 `,
-			wantErr: "model.context must be > 0",
+			wantErr: "backend.llama_server.context must be > 0",
 		},
 		{
 			name: "model file missing",
 			yaml: `
 name: x
-model: {path: /nonexistent/model.gguf, alias: x, context: 1024}
+backend: {llama_server: {path: /nonexistent/model.gguf, alias: x, context: 1024}}
 frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
 `,
-			wantErr: "model.path",
+			wantErr: "backend.llama_server.path",
+		},
+		{
+			name: "comfyui dir missing main.py",
+			yaml: `
+name: x
+backend: {comfyui: {dir: ` + emptyDir + `}}
+`,
+			wantErr: "missing main.py",
+		},
+		{
+			name: "comfyui dir does not exist",
+			yaml: `
+name: x
+backend: {comfyui: {dir: /this/path/does/not/exist/anywhere}}
+`,
+			wantErr: "backend.comfyui.dir",
+		},
+		{
+			name: "comfyui with frontend block",
+			yaml: `
+name: x
+backend: {comfyui: {dir: ` + comfyDir + `}}
+frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+`,
+			wantErr: "frontend is not supported for comfyui",
 		},
 		{
 			name: "unknown kind",
 			yaml: `
 name: x
-model: {path: ` + model + `, alias: x, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend: {kind: weird, app: x, write_file: /tmp/x, template: {a: 1}}
 `,
 			wantErr: "is unknown",
@@ -209,7 +332,7 @@ frontend: {kind: weird, app: x, write_file: /tmp/x, template: {a: 1}}
 			name: "missing kind",
 			yaml: `
 name: x
-model: {path: ` + model + `, alias: x, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend: {app: x, write_file: /tmp/x, template: {a: 1}}
 `,
 			wantErr: "frontend.kind is required",
@@ -218,7 +341,7 @@ frontend: {app: x, write_file: /tmp/x, template: {a: 1}}
 			name: "external missing write_file",
 			yaml: `
 name: x
-model: {path: ` + model + `, alias: x, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend: {kind: external, app: opencode, template: {a: 1}}
 `,
 			wantErr: "write_file is required",
@@ -227,7 +350,7 @@ frontend: {kind: external, app: opencode, template: {a: 1}}
 			name: "external missing template",
 			yaml: `
 name: x
-model: {path: ` + model + `, alias: x, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend: {kind: external, app: opencode, write_file: /tmp/x}
 `,
 			wantErr: "template is required",
@@ -236,7 +359,7 @@ frontend: {kind: external, app: opencode, write_file: /tmp/x}
 			name: "managed not yet supported",
 			yaml: `
 name: x
-model: {path: ` + model + `, alias: x, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend: {kind: managed, app: x}
 `,
 			wantErr: "not supported yet",
@@ -245,7 +368,7 @@ frontend: {kind: managed, app: x}
 			name: "docker-compose missing compose_file",
 			yaml: `
 name: x
-model: {path: ` + model + `, alias: x, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend: {kind: docker-compose, app: x}
 `,
 			wantErr: "compose_file is required",
@@ -254,7 +377,7 @@ frontend: {kind: docker-compose, app: x}
 			name: "docker-compose rejects write_file",
 			yaml: `
 name: x
-model: {path: ` + model + `, alias: x, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: docker-compose
   app: x
@@ -267,7 +390,7 @@ frontend:
 			name: "docker-compose rejects template",
 			yaml: `
 name: x
-model: {path: ` + model + `, alias: x, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: docker-compose
   app: x
@@ -280,7 +403,7 @@ frontend:
 			name: "docker-compose rejects mcps",
 			yaml: `
 name: x
-model: {path: ` + model + `, alias: x, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: docker-compose
   app: x
@@ -293,7 +416,7 @@ frontend:
 			name: "docker-compose duplicate service",
 			yaml: `
 name: x
-model: {path: ` + model + `, alias: x, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: docker-compose
   app: x
@@ -306,7 +429,7 @@ frontend:
 			name: "docker-compose wait_for missing url",
 			yaml: `
 name: x
-model: {path: ` + model + `, alias: x, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: docker-compose
   app: x
@@ -320,7 +443,7 @@ frontend:
 			name: "docker-compose bad timeout",
 			yaml: `
 name: x
-model: {path: ` + model + `, alias: x, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: docker-compose
   app: x
@@ -334,7 +457,7 @@ frontend:
 			name: "external rejects compose_file",
 			yaml: `
 name: x
-model: {path: ` + model + `, alias: x, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: external
   app: opencode
@@ -348,7 +471,7 @@ frontend:
 			name: "duplicate mcp names",
 			yaml: `
 name: x
-model: {path: ` + model + `, alias: x, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: external
   app: opencode
@@ -377,10 +500,11 @@ func TestLoad_DockerCompose_Valid(t *testing.T) {
 	yaml := `
 name: perplexica
 description: research stack
-model:
-  path: ` + model + `
-  alias: m
-  context: 1024
+backend:
+  llama_server:
+    path: ` + model + `
+    alias: m
+    context: 1024
 frontend:
   kind: docker-compose
   app: perplexica
@@ -428,7 +552,7 @@ func TestExpandTemplate_PreservesIntType(t *testing.T) {
 	model := stubModelFile(t)
 	yaml := `
 name: x
-model: {path: ` + model + `, alias: my-model, context: 8192}
+backend: {llama_server: {path: ` + model + `, alias: my-model, context: 8192}}
 frontend:
   kind: external
   app: opencode
@@ -479,7 +603,7 @@ func TestExpandTemplate_UnknownVar(t *testing.T) {
 	model := stubModelFile(t)
 	yaml := `
 name: x
-model: {path: ` + model + `, alias: x, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: external
   app: opencode
@@ -504,7 +628,7 @@ func TestExpandTemplate_SubstringStaysString(t *testing.T) {
 	model := stubModelFile(t)
 	yaml := `
 name: x
-model: {path: ` + model + `, alias: m, context: 1024}
+backend: {llama_server: {path: ` + model + `, alias: m, context: 1024}}
 frontend:
   kind: external
   app: opencode

@@ -1,6 +1,11 @@
-// Package supervisor manages a single llama-server child process: launches it
-// with the right flags, waits for its /health endpoint to report ready,
-// captures stdout/stderr into a ring buffer, and shuts it down gracefully.
+// Package supervisor manages a single local-AI child process: launches it
+// with the right argv (driven by a backend-specific LaunchSpec), waits for
+// its health URL to report ready, captures stdout/stderr into a ring buffer,
+// and shuts it down gracefully.
+//
+// The supervisor itself is backend-agnostic. Profile-driven argv and
+// health-URL derivation lives in the profile package (LlamaServerSpec,
+// ComfyUISpec); the supervisor just execs what it's told and polls.
 package supervisor
 
 import (
@@ -12,13 +17,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 )
 
 type State int
@@ -59,8 +62,6 @@ const (
 )
 
 type Supervisor struct {
-	binary string
-
 	mu      sync.Mutex
 	cmd     *exec.Cmd
 	state   State
@@ -71,30 +72,42 @@ type Supervisor struct {
 	stopped chan struct{}
 }
 
-// New returns a Supervisor that will exec the given binary (defaults to
-// "llama-server" if empty).
-func New(binary string) *Supervisor {
-	if binary == "" {
-		binary = "llama-server"
-	}
-	return &Supervisor{binary: binary, logs: newRingBuffer(logRingCapacity)}
+// New returns a fresh supervisor with no child running.
+func New() *Supervisor {
+	return &Supervisor{logs: newRingBuffer(logRingCapacity)}
 }
 
-// Start launches llama-server. Returns when /health reports 200 or ctx is
-// canceled. The supervisor picks a free localhost port for the child.
-func (s *Supervisor) Start(ctx context.Context, p *profile.Profile) error {
+// PickFreePort returns a localhost TCP port currently free, useful for
+// callers who need to allocate a port before constructing a LaunchSpec.
+func PickFreePort() (int, error) {
+	return pickFreePort()
+}
+
+// Start launches the child described by spec and blocks until the child's
+// HealthURL returns 2xx (then transitions to StateReady) or ctx is canceled.
+// `port` is recorded as the public address (the spec already encodes it in
+// its Args and HealthURL); the supervisor exposes "http://127.0.0.1:<port>"
+// via Status().Addr.
+func (s *Supervisor) Start(ctx context.Context, spec LaunchSpec, port int) error {
+	if spec.Binary == "" {
+		return errors.New("supervisor: LaunchSpec.Binary is required")
+	}
+	if spec.HealthURL == "" {
+		return errors.New("supervisor: LaunchSpec.HealthURL is required")
+	}
+
 	s.mu.Lock()
 	if s.state == StateStarting || s.state == StateReady {
 		s.mu.Unlock()
 		return errors.New("supervisor: already running")
 	}
-	port, err := pickFreePort()
-	if err != nil {
-		s.mu.Unlock()
-		return fmt.Errorf("pick port: %w", err)
+	cmd := exec.Command(spec.Binary, spec.Args...)
+	if spec.Workdir != "" {
+		cmd.Dir = spec.Workdir
 	}
-	args := BuildArgs(p, port)
-	cmd := exec.Command(s.binary, args...)
+	if len(spec.Env) > 0 {
+		cmd.Env = append(os.Environ(), spec.Env...)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		s.mu.Unlock()
@@ -107,7 +120,7 @@ func (s *Supervisor) Start(ctx context.Context, p *profile.Profile) error {
 	}
 	if err := cmd.Start(); err != nil {
 		s.mu.Unlock()
-		return fmt.Errorf("start %s: %w", s.binary, err)
+		return fmt.Errorf("start %s: %w", spec.Binary, err)
 	}
 
 	s.cmd = cmd
@@ -119,21 +132,22 @@ func (s *Supervisor) Start(ctx context.Context, p *profile.Profile) error {
 	s.logs.Reset()
 	s.mu.Unlock()
 
-	slog.Info("llama-server starting",
-		"binary", s.binary, "pid", cmd.Process.Pid, "addr", s.addr, "model", p.Model.Path)
+	slog.Info("backend starting",
+		"binary", spec.Binary, "pid", cmd.Process.Pid, "addr", s.addr,
+		"workdir", spec.Workdir, "health_url", spec.HealthURL)
 
 	go s.pumpLogs(stdout)
 	go s.pumpLogs(stderr)
 	go s.waitExit()
 
-	if err := s.waitReady(ctx, port); err != nil {
+	if err := s.waitReady(ctx, spec.HealthURL); err != nil {
 		_ = s.Stop(context.Background())
 		return err
 	}
 	s.mu.Lock()
 	s.state = StateReady
 	s.mu.Unlock()
-	slog.Info("llama-server ready",
+	slog.Info("backend ready",
 		"addr", s.addr, "elapsed", time.Since(s.started).Round(time.Millisecond))
 	return nil
 }
@@ -190,8 +204,7 @@ func (s *Supervisor) Logs() []string {
 	return s.logs.Lines()
 }
 
-func (s *Supervisor) waitReady(ctx context.Context, port int) error {
-	url := fmt.Sprintf("http://127.0.0.1:%d/health", port)
+func (s *Supervisor) waitReady(ctx context.Context, healthURL string) error {
 	client := &http.Client{Timeout: 2 * time.Second}
 	tick := time.NewTicker(healthPollInterval)
 	defer tick.Stop()
@@ -203,16 +216,16 @@ func (s *Supervisor) waitReady(ctx context.Context, port int) error {
 			s.mu.Lock()
 			exitErr := s.exitErr
 			s.mu.Unlock()
-			return fmt.Errorf("llama-server exited before becoming ready: %v", exitErr)
+			return fmt.Errorf("backend exited before becoming ready: %v", exitErr)
 		case <-tick.C:
 		}
-		resp, err := client.Get(url)
+		resp, err := client.Get(healthURL)
 		if err != nil {
 			continue
 		}
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return nil
 		}
 	}
@@ -236,9 +249,9 @@ func (s *Supervisor) waitExit() {
 	close(s.stopped)
 	s.mu.Unlock()
 	if err != nil && !wasReady {
-		slog.Error("llama-server exited before ready", "err", err)
+		slog.Error("backend exited before ready", "err", err)
 	} else {
-		slog.Info("llama-server exited", "err", err)
+		slog.Info("backend exited", "err", err)
 	}
 }
 
@@ -249,36 +262,6 @@ func pickFreePort() (int, error) {
 	}
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port, nil
-}
-
-// BuildArgs converts a profile's Model spec into llama-server CLI arguments.
-// The proxy is the public face; the child always listens on 127.0.0.1.
-func BuildArgs(p *profile.Profile, port int) []string {
-	args := []string{
-		"--model", p.Model.Path,
-		"--host", "127.0.0.1",
-		"--port", strconv.Itoa(port),
-		"--alias", p.Model.Alias,
-		"--ctx-size", strconv.Itoa(p.Model.Context),
-		"--parallel", strconv.Itoa(p.Model.Parallel),
-	}
-	if p.Model.GPULayers > 0 {
-		args = append(args, "--n-gpu-layers", strconv.Itoa(p.Model.GPULayers))
-	}
-	if p.Model.FlashAttn {
-		args = append(args, "--flash-attn", "on")
-	}
-	if p.Model.CacheTypeK != "" {
-		args = append(args, "--cache-type-k", p.Model.CacheTypeK)
-	}
-	if p.Model.CacheTypeV != "" {
-		args = append(args, "--cache-type-v", p.Model.CacheTypeV)
-	}
-	if p.Model.Jinja {
-		args = append(args, "--jinja")
-	}
-	args = append(args, p.Model.ExtraArgs...)
-	return args
 }
 
 // ringBuffer is a fixed-capacity FIFO of log lines.
