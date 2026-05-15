@@ -1,0 +1,33 @@
+name: image_batch_smoke
+description: Text stage generates prompts; ComfyUI stage renders each. Demonstrates cross-backend pipeline.
+
+inputs:
+  theme:
+    type: string
+    required: true
+
+stages:
+  - id: prompts
+    type: text
+    capability: reasoning
+    prompt: |
+      Generate exactly 2 short cinematic image prompts for the theme "{{.inputs.theme}}".
+      Return ONLY a JSON array. Each element must be {"description": "...", "seed": <integer>}.
+      Keep descriptions under 25 words. Seeds must be distinct positive integers.
+      No markdown, no commentary. Your output must start with `[` and end with `]`.
+    output: prompts.json
+    output_format: json
+    params:
+      max_tokens: 4096
+      temperature: 0.3
+
+  - id: render
+    type: comfyui
+    capability: image_gen
+    inputs: [prompts]
+    workflow: workflows/sdxl_turbo.json
+    foreach: { from: prompts, var: scene }
+    parameters:
+      "4.text": "{{.scene.description}}"
+      "7.seed": "{{.scene.seed}}"
+    output: assets/img_{{.i}}.png

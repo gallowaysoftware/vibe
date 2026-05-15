@@ -169,6 +169,7 @@ func Load(path string) (*Profile, error) {
 	}
 	if p.Backend.ComfyUI != nil {
 		p.Backend.ComfyUI.Dir = expandTilde(p.Backend.ComfyUI.Dir)
+		p.Backend.ComfyUI.Python = expandTilde(p.Backend.ComfyUI.Python)
 	}
 	p.Frontend.WriteFile = expandTilde(p.Frontend.WriteFile)
 
