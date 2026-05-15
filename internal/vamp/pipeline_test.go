@@ -150,7 +150,29 @@ stages:
 			wantErr: "exactly one",
 		},
 		{
-			name: "forward input reference",
+			name: "unknown input reference",
+			yaml: `name: x
+stages:
+- id: a
+  capability: r
+  prompt: hi
+  inputs: [b]
+  output: a.md`,
+			wantErr: `input "b"`,
+		},
+		{
+			name: "self dependency",
+			yaml: `name: x
+stages:
+- id: a
+  capability: r
+  prompt: hi
+  inputs: [a]
+  output: a.md`,
+			wantErr: "depends on itself",
+		},
+		{
+			name: "dependency cycle",
 			yaml: `name: x
 stages:
 - id: a
@@ -161,8 +183,9 @@ stages:
 - id: b
   capability: r
   prompt: hi
+  inputs: [a]
   output: b.md`,
-			wantErr: "earlier stage",
+			wantErr: "cycle",
 		},
 		{
 			name: "bad output_format",

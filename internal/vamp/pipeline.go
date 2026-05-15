@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -80,6 +81,12 @@ func (p *Pipeline) Validate() error {
 			return fmt.Errorf("inputs[%s]: type %q is not supported (only \"string\" in Phase 1)", name, spec.Type)
 		}
 	}
+	// First pass: per-stage shape validation + duplicate-id detection. We
+	// intentionally do NOT enforce the "input must reference an earlier
+	// stage" rule here anymore: the DAG executor only requires the
+	// dependency graph to be acyclic, so forward references are fine. A
+	// dedicated cycle check below produces a clearer error than the old
+	// rule, and lets pipelines declare stages in any order.
 	seenStages := make(map[string]bool)
 	for i, s := range p.Stages {
 		loc := fmt.Sprintf("stages[%d]", i)
@@ -106,9 +113,74 @@ func (p *Pipeline) Validate() error {
 		if s.OutputFormat != "" && s.OutputFormat != "json" {
 			return fmt.Errorf("%s: output_format %q is not supported (allowed: \"\", json)", ctx, s.OutputFormat)
 		}
+	}
+	// Second pass: every input must reference a declared stage, and no stage
+	// may depend on itself.
+	for _, s := range p.Stages {
+		ctx := fmt.Sprintf("stage %s", s.ID)
 		for _, dep := range s.Inputs {
+			if dep == s.ID {
+				return fmt.Errorf("%s: input %q depends on itself", ctx, dep)
+			}
 			if !seenStages[dep] {
-				return fmt.Errorf("%s: input %q must reference an earlier stage", ctx, dep)
+				return fmt.Errorf("%s: input %q does not reference any declared stage", ctx, dep)
+			}
+		}
+	}
+	// Third pass: reject dependency cycles. A cycle is detected if a
+	// topological sort cannot consume every stage.
+	if cycle := findCycle(p.Stages); cycle != nil {
+		return fmt.Errorf("dependency cycle detected: %s", strings.Join(cycle, " -> "))
+	}
+	return nil
+}
+
+// findCycle returns the participating stage ids if the dependency graph
+// contains a cycle, in the order they appear in the cycle, with the first id
+// repeated at the end (e.g. ["a","b","a"]). Returns nil when the graph is
+// acyclic.
+func findCycle(stages []Stage) []string {
+	const (
+		white = 0 // unvisited
+		gray  = 1 // on the current DFS stack
+		black = 2 // fully explored
+	)
+	deps := make(map[string][]string, len(stages))
+	for _, s := range stages {
+		deps[s.ID] = s.Inputs
+	}
+	color := make(map[string]int, len(stages))
+	var stack []string
+	var dfs func(id string) []string
+	dfs = func(id string) []string {
+		color[id] = gray
+		stack = append(stack, id)
+		for _, dep := range deps[id] {
+			switch color[dep] {
+			case gray:
+				// Found a back-edge to `dep`; build cycle slice from the
+				// first occurrence on the stack.
+				for i, n := range stack {
+					if n == dep {
+						out := append([]string{}, stack[i:]...)
+						return append(out, dep)
+					}
+				}
+				return []string{dep, dep}
+			case white:
+				if c := dfs(dep); c != nil {
+					return c
+				}
+			}
+		}
+		color[id] = black
+		stack = stack[:len(stack)-1]
+		return nil
+	}
+	for _, s := range stages {
+		if color[s.ID] == white {
+			if c := dfs(s.ID); c != nil {
+				return c
 			}
 		}
 	}
