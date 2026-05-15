@@ -22,6 +22,14 @@ reports `nvidia-smi` output. Each line is tagged `[ OK ]`, `[WARN]`,
 fails. Run it before your first `vibe start` and again whenever
 something behaves unexpectedly.
 
+`vibe doctor --install comfyui` switches doctor into install mode and
+runs the ComfyUI bring-up steps idempotently: clones
+[ComfyUI](https://github.com/comfyanonymous/ComfyUI) to `~/ComfyUI`,
+creates `.venv`, runs `pip install -r requirements.txt`, optionally
+downloads the SDXL-Turbo checkpoint (~7 GB), and drops a default
+`comfyui.yaml` profile. Each step skips when already satisfied; pass
+`--yes` to bypass the confirmation prompts (for automation).
+
 ## Why
 
 Today running local AI looks like:

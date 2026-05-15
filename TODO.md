@@ -34,25 +34,17 @@ coupling as docker-compose but without the container dependency. Useful
 for tools that ship as a single executable and want to be started/stopped
 with the model.
 
-## `vibe doctor --install` (ComfyUI etc.)
+## ~~`vibe doctor --install comfyui`~~ (done)
 
-`vibe doctor` diagnoses; it doesn't install. From hands-on bring-up of
-ComfyUI on this box, the install path is mechanical and worth codifying:
+Implemented: `vibe doctor --install comfyui [--yes]` walks the install
+path (git clone, venv, pip install, optional SDXL-Turbo checkpoint, drop
+default profile) idempotently — each step skips when already satisfied.
+See `internal/vibe/cli/install_comfyui.go`.
 
-  1. `git clone --depth 1 https://github.com/comfyanonymous/ComfyUI ~/ComfyUI`
-  2. `python3 -m venv ~/ComfyUI/.venv`
-  3. `~/ComfyUI/.venv/bin/pip install -r ~/ComfyUI/requirements.txt`
-     (pulls torch + CUDA libs; multi-GB; slow)
-  4. Download a checkpoint into `~/ComfyUI/models/checkpoints/`. For a
-     small public option:
-     `hf download stabilityai/sdxl-turbo sd_xl_turbo_1.0_fp16.safetensors --local-dir ~/ComfyUI/models/checkpoints/`
-  5. Drop a vibe profile in `~/.config/vibe/profiles/comfyui.yaml`
-     pointing at the install (see `profiles/comfyui.example.yaml`).
-
-A `vibe doctor --install comfyui` (or `vibe install comfyui`) command
-should do steps 1–4 with confirmation prompts at each big-disk step and
-pick a sensible default model. Step 5 is profile drop-in; could be a
-separate `vibe profile init <kind>`.
+## `vibe doctor --install llama-cpp`
 
 Same shape for llama.cpp itself (current install assumes
-`llama-server` already on `$PATH`).
+`llama-server` already on `$PATH`). The dispatcher in
+`internal/vibe/cli/cmd_doctor.go` (`runInstall`) is structured so a new
+installer plugs in next to `comfyui` without touching the diagnostic
+path.

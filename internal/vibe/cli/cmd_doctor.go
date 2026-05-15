@@ -115,17 +115,29 @@ func defaultDaemonStatus(ctx context.Context, addr string) (string, error) {
 }
 
 func doctorCmd() *cobra.Command {
-	return &cobra.Command{
+	var (
+		installName string
+		installYes  bool
+	)
+	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Verify this machine is ready to run vibe.",
 		Long: "Runs a series of diagnostic checks (binaries, directories, ports, " +
 			"profiles, daemon) and reports OK / WARN / FAIL for each. " +
-			"Exits non-zero if any check fails.",
+			"Exits non-zero if any check fails.\n\n" +
+			"With --install <name>, switches from diagnostic to install mode " +
+			"and runs the install procedure for that component (currently only " +
+			"`comfyui`). Each step is idempotent and skips when already " +
+			"satisfied; big-disk steps prompt for confirmation unless --yes " +
+			"is passed.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
 				ctx = context.Background()
+			}
+			if installName != "" {
+				return runInstall(cmd, installName, installYes)
 			}
 			env := defaultDoctorEnv()
 			results := runChecks(ctx, env)
@@ -146,6 +158,25 @@ func doctorCmd() *cobra.Command {
 			}
 			return nil
 		},
+	}
+	cmd.Flags().StringVar(&installName, "install", "",
+		"install a component (supported: comfyui) instead of running diagnostics")
+	cmd.Flags().BoolVar(&installYes, "yes", false,
+		"skip confirmation prompts when used with --install")
+	return cmd
+}
+
+// runInstall dispatches to the named installer. New installers (e.g.
+// llama-cpp) plug in here without touching the diagnostic path.
+func runInstall(cmd *cobra.Command, name string, yes bool) error {
+	out := cmd.OutOrStdout()
+	errOut := cmd.ErrOrStderr()
+	switch name {
+	case "comfyui":
+		return installComfyUI(defaultInstallerEnv(out, errOut, yes))
+	default:
+		cmd.SilenceErrors = true
+		return fmt.Errorf("--install %q: unknown component (supported: comfyui)", name)
 	}
 }
 
