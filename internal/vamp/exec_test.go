@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,7 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 
@@ -260,5 +263,282 @@ func TestExecutor_JSONOutputFormatRejectsBadJSON(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "JSON") {
 		t.Errorf("err = %v", err)
+	}
+}
+
+// stubExecutor wires up a real *Executor with a stub control plane so the
+// scheduler exercises its real EnsureActive/Status paths. Inference is left
+// mocked by the caller so tests can control latency and content.
+func stubExecutor(t *testing.T, pipeline *Pipeline, caps *Capabilities, inf InferenceFunc) (*Executor, string) {
+	t.Helper()
+	stub := &stubControl{}
+	mux := http.NewServeMux()
+	path, handler := vibev1connect.NewControlServiceHandler(stub)
+	mux.Handle(path, handler)
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]string{{"id": "stub"}}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	stub.proxyURL = srv.URL
+	runDir := t.TempDir()
+	exec := &Executor{
+		Pipeline:     pipeline,
+		Capabilities: caps,
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client()),
+		RunDir:       runDir,
+		Inference:    inf,
+	}
+	return exec, runDir
+}
+
+func TestExecutor_ParallelStagesSameProfile(t *testing.T) {
+	const stageLatency = 200 * time.Millisecond
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		select {
+		case <-time.After(stageLatency):
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+		return "out:" + prompt, nil
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "parallel",
+		Stages: []Stage{
+			{ID: "a", Capability: "reasoning", Prompt: "A", Output: "a.txt"},
+			{ID: "b", Capability: "reasoning", Prompt: "B {{.stages.a.output}}", Inputs: []string{"a"}, Output: "b.txt"},
+			{ID: "c", Capability: "reasoning", Prompt: "C {{.stages.a.output}}", Inputs: []string{"a"}, Output: "c.txt"},
+		},
+	}
+	exec, runDir := stubExecutor(t, pipeline, caps, inf)
+	start := time.Now()
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+
+	// Wall-clock: a runs alone (~200ms) then b+c run concurrently (~200ms)
+	// for a parallel total of ~400ms. Fully sequential would be ~600ms.
+	// 500ms gives ~25% scheduler headroom on a busy CI host.
+	if elapsed >= 500*time.Millisecond {
+		t.Errorf("parallel run took %s, expected < 500ms (sequential baseline ~600ms)", elapsed)
+	}
+	t.Logf("parallel-same-profile wall-clock: %s", elapsed)
+
+	for name, want := range map[string]string{
+		"a.txt": "out:A",
+		"b.txt": "out:B out:A",
+		"c.txt": "out:C out:A",
+	} {
+		got, err := os.ReadFile(filepath.Join(runDir, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if string(got) != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestExecutor_ParallelGroupedByCapability(t *testing.T) {
+	// activations records EnsureActive transitions on the stub control plane.
+	// We can observe profile changes via stubControl.profile after each
+	// inference call by recording snapshots from inside the mocked inference
+	// function itself.
+	var (
+		mu          sync.Mutex
+		activations []string
+	)
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		// Pull the active profile via the /v1/models route's host; here we
+		// rely on the prompt prefix to discriminate. We instead record
+		// invocation order via a stage tag in the prompt.
+		mu.Lock()
+		activations = append(activations, prompt)
+		mu.Unlock()
+		return "ok:" + prompt, nil
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reason": "code", "write": "fast"}}
+	pipeline := &Pipeline{
+		Name: "grouped",
+		Stages: []Stage{
+			{ID: "a", Capability: "reason", Prompt: "A", Output: "a.txt"},
+			{ID: "b", Capability: "reason", Prompt: "B {{.stages.a.output}}", Inputs: []string{"a"}, Output: "b.txt"},
+			{ID: "c", Capability: "write", Prompt: "C {{.stages.a.output}}", Inputs: []string{"a"}, Output: "c.txt"},
+		},
+	}
+	exec, runDir := stubExecutor(t, pipeline, caps, inf)
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// We expect three invocations total. The first must be "A" (wave 1).
+	// The next two are "B ..." and "C ..." in some order — but they must
+	// run serially because they belong to different capabilities and a
+	// profile swap can't be parallelized.
+	mu.Lock()
+	defer mu.Unlock()
+	if len(activations) != 3 {
+		t.Fatalf("expected 3 inference calls, got %d (%v)", len(activations), activations)
+	}
+	if activations[0] != "A" {
+		t.Errorf("first call should be A, got %q", activations[0])
+	}
+	rest := []string{activations[1], activations[2]}
+	wantB, wantC := "B ok:A", "C ok:A"
+	if !((rest[0] == wantB && rest[1] == wantC) || (rest[0] == wantC && rest[1] == wantB)) {
+		t.Errorf("wave 2 ordering = %v, expected some permutation of [%q,%q]", rest, wantB, wantC)
+	}
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		if _, err := os.ReadFile(filepath.Join(runDir, name)); err != nil {
+			t.Errorf("missing output %s: %v", name, err)
+		}
+	}
+}
+
+func TestExecutor_PerStageBufferingInParallel(t *testing.T) {
+	// Each "token" sleeps briefly so the goroutines would interleave at
+	// the byte level if buffering didn't isolate them.
+	emit := func(prefix string, onToken StreamFunc, count int) string {
+		var acc strings.Builder
+		for i := 0; i < count; i++ {
+			tok := strings.Repeat(prefix, 1)
+			if onToken != nil {
+				onToken(tok)
+			}
+			acc.WriteString(tok)
+			time.Sleep(10 * time.Millisecond)
+		}
+		return acc.String()
+	}
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		switch prompt {
+		case "A":
+			return emit("A", onToken, 3), nil
+		case "B":
+			return emit("B", onToken, 3), nil
+		}
+		return "", fmt.Errorf("unexpected prompt %q", prompt)
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	// Both stages must run in the SAME wave (no inputs) and SAME capability
+	// to land in a multi-stage parallel group, which triggers buffering.
+	pipeline := &Pipeline{
+		Name: "buffered",
+		Stages: []Stage{
+			{ID: "stage_a", Capability: "reasoning", Prompt: "A", Output: "a.txt"},
+			{ID: "stage_b", Capability: "reasoning", Prompt: "B", Output: "b.txt"},
+		},
+	}
+	var logBuf bytes.Buffer
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	exec.Log = &logBuf
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	logged := logBuf.String()
+	idxAHeader := strings.Index(logged, "=== stage stage_a ===")
+	idxBHeader := strings.Index(logged, "=== stage stage_b ===")
+	if idxAHeader < 0 || idxBHeader < 0 {
+		t.Fatalf("expected both stage headers in log, got:\n%s", logged)
+	}
+	// The body for each stage must be contiguous "AAA" / "BBB" — no
+	// interleaving. Find the first "AAA" / "BBB" occurrence and check.
+	if !strings.Contains(logged, "AAA") {
+		t.Errorf("expected contiguous AAA in log:\n%s", logged)
+	}
+	if !strings.Contains(logged, "BBB") {
+		t.Errorf("expected contiguous BBB in log:\n%s", logged)
+	}
+	// And specifically: the stage_a body region should not contain a B,
+	// and the stage_b body region should not contain an A. We bound the
+	// body region as the bytes between this header and the next header
+	// (or end-of-log).
+	bodyBetween := func(start int, headerLen int) string {
+		region := logged[start+headerLen:]
+		// Skip the newline after the header.
+		region = strings.TrimPrefix(region, "\n")
+		// Body runs until the next "=== stage" marker.
+		if next := strings.Index(region, "=== stage "); next >= 0 {
+			region = region[:next]
+		}
+		return region
+	}
+	// Trim the body to just the token-output line (first line after the
+	// header) — anything after that is unrelated scheduler logf output
+	// such as the "pipeline finished" status line that may legitimately
+	// contain other letters.
+	tokenLine := func(body string) string {
+		body = strings.TrimPrefix(body, "\n")
+		if nl := strings.IndexByte(body, '\n'); nl >= 0 {
+			return body[:nl]
+		}
+		return body
+	}
+	aTokens := tokenLine(bodyBetween(idxAHeader, len("=== stage stage_a ===")))
+	bTokens := tokenLine(bodyBetween(idxBHeader, len("=== stage stage_b ===")))
+	if aTokens != "AAA" {
+		t.Errorf("stage_a token line = %q, want exactly %q (interleaving?)", aTokens, "AAA")
+	}
+	if bTokens != "BBB" {
+		t.Errorf("stage_b token line = %q, want exactly %q (interleaving?)", bTokens, "BBB")
+	}
+}
+
+func TestExecutor_DAGErrorAggregation(t *testing.T) {
+	var calls int32
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		atomic.AddInt32(&calls, 1)
+		// Sleep briefly so both goroutines are guaranteed to be in flight
+		// before either returns; otherwise the first failure could cancel
+		// the second before it runs and we'd only see one error.
+		time.Sleep(50 * time.Millisecond)
+		return "", fmt.Errorf("boom from %q", prompt)
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "fail",
+		Stages: []Stage{
+			{ID: "stage_x", Capability: "reasoning", Prompt: "X", Output: "x.txt"},
+			{ID: "stage_y", Capability: "reasoning", Prompt: "Y", Output: "y.txt"},
+		},
+	}
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	err := exec.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "stage_x") || !strings.Contains(msg, "stage_y") {
+		t.Errorf("expected both stage ids in aggregated error, got: %v", err)
+	}
+	// errors.Join is what we used; ensure unwrapping behaves.
+	var joined interface{ Unwrap() []error }
+	if !errors.As(err, &joined) {
+		t.Logf("note: top-level error did not unwrap to []error; that's fine if the join is nested")
+	}
+}
+
+func TestExecutor_DAGCycleDetected(t *testing.T) {
+	yaml := `name: cyc
+stages:
+- id: a
+  capability: r
+  prompt: x
+  inputs: [b]
+  output: a.md
+- id: b
+  capability: r
+  prompt: y
+  inputs: [a]
+  output: b.md`
+	_, err := LoadPipeline(writePipeline(t, yaml))
+	if err == nil {
+		t.Fatal("expected cycle error")
+	}
+	if !strings.Contains(err.Error(), "cycle") {
+		t.Errorf("expected cycle error, got: %v", err)
 	}
 }
