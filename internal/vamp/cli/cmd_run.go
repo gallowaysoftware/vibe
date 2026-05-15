@@ -62,7 +62,7 @@ func runCmd() *cobra.Command {
 			return exec.Run(ctx)
 		},
 	}
-	cmd.Flags().StringSliceVar(&inputFlags, "input", nil, "Pipeline input as KEY=VALUE; can repeat.")
+	cmd.Flags().StringArrayVar(&inputFlags, "input", nil, "Pipeline input as KEY=VALUE; can repeat. Commas inside the value are NOT split.")
 	cmd.Flags().StringVar(&runDirFlag, "run-dir", "", "Override run directory (default: timestamped under $XDG_STATE_HOME/vamp/runs/).")
 	cmd.Flags().StringVar(&apiFlag, "api", "", "vibe control-plane URL (default: $VIBE_API or http://127.0.0.1:9001).")
 	return cmd
