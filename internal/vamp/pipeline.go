@@ -28,13 +28,14 @@ type InputSpec struct {
 // Stage is a single step in the pipeline.
 type Stage struct {
 	ID           string         `yaml:"id"`
+	Type         StageType      `yaml:"type,omitempty"` // "" | "text" | "comfyui"; empty defaults to "text"
 	Capability   string         `yaml:"capability"`
 	Prompt       string         `yaml:"prompt,omitempty"`
 	PromptFile   string         `yaml:"prompt_file,omitempty"`
 	Inputs       []string       `yaml:"inputs,omitempty"` // ids of prior stages to depend on
 	Output       string         `yaml:"output"`
 	OutputFormat string         `yaml:"output_format,omitempty"` // "" | "json"
-	Params       map[string]any `yaml:"params,omitempty"`        // merged into the chat-completion body
+	Params       map[string]any `yaml:"params,omitempty"`        // merged into the chat-completion body (text stages only)
 	// Foreach, when non-nil, makes this a fan-out stage. The upstream stage
 	// referenced by From must produce output_format: json and its output must
 	// parse as a JSON array (or {"items":[...]} convenience wrap). The stage
@@ -42,6 +43,15 @@ type Stage struct {
 	// activation. The per-item value is bound under Foreach.Var in the
 	// template namespace (defaults to "item").
 	Foreach *ForeachSpec `yaml:"foreach,omitempty"`
+
+	// ComfyUI-stage fields. Workflow is a path to a ComfyUI workflow JSON file
+	// (relative to the pipeline YAML's directory). Parameters maps
+	// "<node_id>.<input_name>" -> template string; each rendered value is
+	// type-coerced (int/float/bool/string) and substituted into the workflow's
+	// node inputs prior to submission. Capability is still required and maps
+	// to the vibe profile that supervises the ComfyUI backend.
+	Workflow   string            `yaml:"workflow,omitempty"`
+	Parameters map[string]string `yaml:"parameters,omitempty"`
 }
 
 // ForeachSpec is the structured fan-out descriptor for a stage. The previous
@@ -60,6 +70,10 @@ type ForeachSpec struct {
 var (
 	pipelineNameRE = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 	stageIDRE      = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+	// comfyParamKeyRE enforces the "<node_id>.<input_name>" shape expected for
+	// every entry in a comfyui stage's parameters map. ComfyUI workflow nodes
+	// are keyed by all-numeric string ids; input names are Go-identifier-like.
+	comfyParamKeyRE = regexp.MustCompile(`^[0-9]+\.[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
 // LoadPipeline reads, parses, and validates a pipeline YAML file. Unknown
@@ -150,8 +164,49 @@ func (p *Pipeline) Validate() error {
 		if s.Output == "" {
 			return fmt.Errorf("%s: output is required", ctx)
 		}
-		if (s.Prompt == "") == (s.PromptFile == "") {
-			return fmt.Errorf("%s: exactly one of prompt or prompt_file is required", ctx)
+		// Type discrimination: empty defaults to text. Per-type shape rules
+		// below reject fields that belong to the other type.
+		stageType := s.Type
+		if stageType == "" {
+			stageType = StageTypeText
+		}
+		switch stageType {
+		case StageTypeText:
+			if (s.Prompt == "") == (s.PromptFile == "") {
+				return fmt.Errorf("%s: exactly one of prompt or prompt_file is required", ctx)
+			}
+			if s.Workflow != "" {
+				return fmt.Errorf("%s: workflow is only valid on type: comfyui stages", ctx)
+			}
+			if len(s.Parameters) > 0 {
+				return fmt.Errorf("%s: parameters is only valid on type: comfyui stages (text stages use params)", ctx)
+			}
+		case StageTypeComfyUI:
+			if s.Workflow == "" {
+				return fmt.Errorf("%s: workflow is required for type: comfyui stages", ctx)
+			}
+			if len(s.Parameters) == 0 {
+				return fmt.Errorf("%s: parameters must have at least one entry for type: comfyui stages", ctx)
+			}
+			for key := range s.Parameters {
+				if !comfyParamKeyRE.MatchString(key) {
+					return fmt.Errorf("%s: parameters key %q must match \"<node_id>.<input_name>\" (e.g. \"6.text\")", ctx, key)
+				}
+			}
+			if s.Prompt != "" {
+				return fmt.Errorf("%s: prompt is only valid on type: text stages", ctx)
+			}
+			if s.PromptFile != "" {
+				return fmt.Errorf("%s: prompt_file is only valid on type: text stages", ctx)
+			}
+			if len(s.Params) > 0 {
+				return fmt.Errorf("%s: params is only valid on type: text stages (comfyui uses parameters)", ctx)
+			}
+			if s.OutputFormat != "" {
+				return fmt.Errorf("%s: output_format is only valid on type: text stages", ctx)
+			}
+		default:
+			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui)", ctx, s.Type)
 		}
 		if s.OutputFormat != "" && s.OutputFormat != "json" {
 			return fmt.Errorf("%s: output_format %q is not supported (allowed: \"\", json)", ctx, s.OutputFormat)

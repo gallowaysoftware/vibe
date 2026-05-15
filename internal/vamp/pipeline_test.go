@@ -49,6 +49,65 @@ stages:
 	}
 }
 
+// TestLoadPipeline_TypeDefaultsToText verifies that omitting `type:` continues
+// to behave as a text stage (Phase 1 default), and that an explicit
+// `type: text` is accepted too. This is the back-compat guard for every
+// existing pipeline.
+func TestLoadPipeline_TypeDefaultsToText(t *testing.T) {
+	yaml := `
+name: t
+stages:
+  - id: a
+    capability: r
+    prompt: hi
+    output: a.md
+  - id: b
+    type: text
+    capability: r
+    prompt: hi
+    output: b.md
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Stages[0].Type != "" {
+		t.Errorf("stage 0 type = %q, want empty (defaults to text)", p.Stages[0].Type)
+	}
+	if p.Stages[1].Type != StageTypeText {
+		t.Errorf("stage 1 type = %q, want %q", p.Stages[1].Type, StageTypeText)
+	}
+}
+
+// TestLoadPipeline_ComfyUIValid sanity-checks a minimal valid comfyui stage.
+func TestLoadPipeline_ComfyUIValid(t *testing.T) {
+	yaml := `
+name: img
+stages:
+  - id: render
+    type: comfyui
+    capability: image
+    workflow: workflow.json
+    output: out.png
+    parameters:
+      "6.text": "hello {{.inputs.topic}}"
+      "3.seed": "42"
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Stages[0].Type != StageTypeComfyUI {
+		t.Errorf("type = %q, want %q", p.Stages[0].Type, StageTypeComfyUI)
+	}
+	if p.Stages[0].Workflow != "workflow.json" {
+		t.Errorf("workflow = %q", p.Stages[0].Workflow)
+	}
+	if got := p.Stages[0].Parameters["6.text"]; got != "hello {{.inputs.topic}}" {
+		t.Errorf("parameter 6.text = %q", got)
+	}
+}
+
 func TestLoadPipeline_ForeachDefaults(t *testing.T) {
 	yaml := `
 name: fan
@@ -395,6 +454,118 @@ stages:
   foreach:
     from: src`,
 			wantErr: "templated output path",
+		},
+		{
+			name: "comfyui without workflow",
+			yaml: `name: x
+stages:
+- id: a
+  type: comfyui
+  capability: image
+  output: a.png
+  parameters:
+    "6.text": hi`,
+			wantErr: "workflow is required",
+		},
+		{
+			name: "comfyui without parameters",
+			yaml: `name: x
+stages:
+- id: a
+  type: comfyui
+  capability: image
+  workflow: wf.json
+  output: a.png`,
+			wantErr: "parameters",
+		},
+		{
+			name: "comfyui with prompt (text-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: comfyui
+  capability: image
+  workflow: wf.json
+  output: a.png
+  prompt: nope
+  parameters:
+    "6.text": hi`,
+			wantErr: "prompt is only valid on type: text",
+		},
+		{
+			name: "comfyui with prompt_file (text-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: comfyui
+  capability: image
+  workflow: wf.json
+  output: a.png
+  prompt_file: nope.tmpl
+  parameters:
+    "6.text": hi`,
+			wantErr: "prompt_file is only valid on type: text",
+		},
+		{
+			name: "comfyui with params (text-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: comfyui
+  capability: image
+  workflow: wf.json
+  output: a.png
+  parameters:
+    "6.text": hi
+  params:
+    temperature: 0.8`,
+			wantErr: "params is only valid on type: text",
+		},
+		{
+			name: "text stage with workflow (comfyui-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  capability: r
+  prompt: hi
+  output: a.md
+  workflow: nope.json`,
+			wantErr: "workflow is only valid on type: comfyui",
+		},
+		{
+			name: "text stage with parameters (comfyui-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  capability: r
+  prompt: hi
+  output: a.md
+  parameters:
+    "6.text": hi`,
+			wantErr: "parameters is only valid on type: comfyui",
+		},
+		{
+			name: "comfyui bad parameter key shape",
+			yaml: `name: x
+stages:
+- id: a
+  type: comfyui
+  capability: image
+  workflow: wf.json
+  output: a.png
+  parameters:
+    "CLIPTextEncode.text": hi`,
+			wantErr: "node_id",
+		},
+		{
+			name: "unknown stage type",
+			yaml: `name: x
+stages:
+- id: a
+  type: nope
+  capability: r
+  output: a.md`,
+			wantErr: "type \"nope\"",
 		},
 	}
 	for _, tc := range cases {

@@ -33,9 +33,12 @@ type StageType string
 
 const (
 	// StageTypeText is the LLM chat-completion stage type. Empty Stage.Type
-	// (the only kind in Phase 1) is treated as this in Run.
+	// is treated as this in Run.
 	StageTypeText StageType = "text"
-	// StageTypeComfyUI = "comfyui"  // Phase 2 follow-up; not in this PR
+	// StageTypeComfyUI is an image-generation stage that submits a ComfyUI
+	// workflow to a vibe-managed ComfyUI backend and copies the rendered
+	// file(s) into the run dir.
+	StageTypeComfyUI StageType = "comfyui"
 )
 
 // StageExecutor implements the run of a single stage instance. The receiver
@@ -67,11 +70,16 @@ type StageInput struct {
 
 	// BaseURL is the inference root for this invocation (e.g.
 	// http://127.0.0.1:9000); /v1 is NOT included. Populated by the
-	// scheduler from the currently-active vibe profile.
+	// scheduler from the currently-active vibe profile. Text stages talk
+	// here; comfyui stages talk to BackendAddr instead.
 	BaseURL string
 	// ModelID is the chat-completion model id for this invocation, resolved
-	// once per profile activation and cached.
+	// once per profile activation and cached. Only meaningful for text stages.
 	ModelID string
+	// BackendAddr is the raw backend URL the active vibe profile is running
+	// (e.g. "http://127.0.0.1:8188" for a ComfyUI backend). Stage types that
+	// talk directly to a non-OpenAI backend (today: comfyui) use this.
+	BackendAddr string
 }
 
 // StageOutput is what an executor returns for ONE invocation (one item if
@@ -138,10 +146,12 @@ func (e *Executor) Run(ctx context.Context) error {
 		return fmt.Errorf("snapshot run inputs: %w", err)
 	}
 
-	// Build the per-type executor registry. Today only text stages exist;
-	// new types (comfyui, etc.) register here in Phase 2.
+	// Build the per-type executor registry. Per-stage routing happens through
+	// Stage.Type (empty defaults to text); the executor's per-call deps travel
+	// via StageInput.
 	e.registry = map[StageType]StageExecutor{
-		StageTypeText: &textExecutor{inference: e.Inference},
+		StageTypeText:    &textExecutor{inference: e.Inference},
+		StageTypeComfyUI: &comfyuiExecutor{pollInterval: time.Second},
 	}
 
 	// Stage lookup and dependency counts for wave-based scheduling.
@@ -235,18 +245,32 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 	if !status.Ready {
 		return fmt.Errorf("profile %q is not ready", profile)
 	}
-	modelID, err := e.modelIDForCurrent(ctx, status)
-	if err != nil {
-		return fmt.Errorf("resolve model id: %w", err)
+	// Only resolve the chat-completion model id when at least one stage in
+	// this group needs it. ComfyUI backends don't speak OpenAI /v1/models, so
+	// a pure-comfyui group would fail this check unnecessarily.
+	needsModelID := false
+	for _, st := range group {
+		if stageTypeOrDefault(st) == StageTypeText {
+			needsModelID = true
+			break
+		}
+	}
+	var modelID string
+	if needsModelID {
+		modelID, err = e.modelIDForCurrent(ctx, status)
+		if err != nil {
+			return fmt.Errorf("resolve model id: %w", err)
+		}
 	}
 	baseURL := strings.TrimSuffix(status.ProxyAddr, "/v1")
+	backendAddr := status.BackendAddr
 
 	// Single-stage group: preserve the live-token UX by streaming directly
 	// to Log, exactly as the sequential path used to. (A foreach stage with
 	// more than one item still buffers per-item internally — see executeStage.)
 	if len(group) == 1 {
 		st := group[0]
-		if err := e.executeStage(ctx, st, baseURL, modelID, nil); err != nil {
+		if err := e.executeStage(ctx, st, baseURL, modelID, backendAddr, nil); err != nil {
 			return fmt.Errorf("stage %s: %w", st.ID, err)
 		}
 		return nil
@@ -264,7 +288,7 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 		go func() {
 			defer wg.Done()
 			buf := &bytes.Buffer{}
-			err := e.executeStage(groupCtx, st, baseURL, modelID, buf)
+			err := e.executeStage(groupCtx, st, baseURL, modelID, backendAddr, buf)
 			// Emit the buffered output as a contiguous block under a
 			// stage header so concurrent streams don't interleave.
 			e.flushStageLog(st.ID, buf.Bytes())
@@ -284,19 +308,31 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 // registered StageExecutor once and stores its output; for foreach stages it
 // fans out one Execute call per JSON-array item, runs them in parallel against
 // the same profile activation, and aggregates the per-item outputs.
-func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID string, tokenSink io.Writer) error {
+func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID, backendAddr string, tokenSink io.Writer) error {
 	exec, err := e.executorFor(st)
 	if err != nil {
 		return err
 	}
 	if st.Foreach != nil {
-		return e.executeForeachStage(ctx, st, exec, baseURL, modelID, tokenSink)
+		return e.executeForeachStage(ctx, st, exec, baseURL, modelID, backendAddr, tokenSink)
 	}
 
-	in := e.makeStageInput(st, baseURL, modelID, tokenSink, nil, 0)
+	in := e.makeStageInput(st, baseURL, modelID, backendAddr, tokenSink, nil, 0)
 	out, err := exec.Execute(ctx, in)
 	if err != nil {
 		return err
+	}
+
+	// ComfyUI stages own their own output-path rendering + writing because
+	// the executor copies a binary file (or files) to disk inside Execute and
+	// reports the result via out.Files. Treat out.Files (when set) as the
+	// canonical record and keep stageOutputs.Output as the joined paths so
+	// downstream `.stages.<id>.output` references still resolve.
+	if len(out.Files) > 0 {
+		e.mu.Lock()
+		e.stageOutputs[st.ID] = &stageResult{Output: strings.Join(out.Files, "\n")}
+		e.mu.Unlock()
+		return nil
 	}
 
 	outPath, err := e.renderOutputPath(st, nil)
@@ -316,7 +352,7 @@ func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID
 // non-nil Foreach. The items list is read from the upstream stage's JSON
 // output (referenced by Foreach.From). Each item runs in its own goroutine
 // through the registered executor and writes its own output file.
-func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec StageExecutor, baseURL, modelID string, tokenSink io.Writer) error {
+func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec StageExecutor, baseURL, modelID, backendAddr string, tokenSink io.Writer) error {
 	items, err := e.resolveForeachItems(st)
 	if err != nil {
 		return fmt.Errorf("resolve foreach: %w", err)
@@ -337,7 +373,9 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 	outPaths := make([]string, len(items))
 	seenPaths := make(map[string]int, len(items))
 	for i, item := range items {
-		extra := map[string]any{st.Foreach.Var: item}
+		// `.i` is the per-iteration index, also bound in the prompt template
+		// below; lets users template paths like `assets/img_{{.i}}.png`.
+		extra := map[string]any{st.Foreach.Var: item, "i": i}
 		path, err := e.renderOutputPath(st, extra)
 		if err != nil {
 			return fmt.Errorf("render output path for item %d: %w", i, err)
@@ -382,7 +420,7 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 				buf = &bytes.Buffer{}
 				itemSink = buf
 			}
-			in := e.makeStageInput(st, baseURL, modelID, itemSink, items[i], i)
+			in := e.makeStageInput(st, baseURL, modelID, backendAddr, itemSink, items[i], i)
 			out, runErr := exec.Execute(groupCtx, in)
 			if buf != nil {
 				if tokenSink != nil {
@@ -400,12 +438,21 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 				cancel()
 				return
 			}
-			if err := writeFile(filepath.Join(e.RunDir, outPaths[i]), out.Text); err != nil {
-				errs[i] = fmt.Errorf("item %d: write output: %w", i, err)
-				cancel()
-				return
+			// Binary-output stages (comfyui today) already wrote their file(s)
+			// from inside Execute and reported the paths in out.Files; the
+			// runner only needs to record per-item output for downstream
+			// `.outputs` references. Text stages return text we still need to
+			// write to the pre-rendered outPath.
+			if len(out.Files) > 0 {
+				outputs[i] = strings.Join(out.Files, "\n")
+			} else {
+				if err := writeFile(filepath.Join(e.RunDir, outPaths[i]), out.Text); err != nil {
+					errs[i] = fmt.Errorf("item %d: write output: %w", i, err)
+					cancel()
+					return
+				}
+				outputs[i] = out.Text
 			}
-			outputs[i] = out.Text
 		}()
 	}
 	wg.Wait()
@@ -426,7 +473,7 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 // makeStageInput assembles a StageInput for one invocation. tokenSink is the
 // caller-provided buffer for token streaming, or nil to stream directly to
 // e.Log under logMu. item / itemIdx are bound for foreach invocations.
-func (e *Executor) makeStageInput(st *Stage, baseURL, modelID string, tokenSink io.Writer, item any, itemIdx int) StageInput {
+func (e *Executor) makeStageInput(st *Stage, baseURL, modelID, backendAddr string, tokenSink io.Writer, item any, itemIdx int) StageInput {
 	return StageInput{
 		Stage:       st,
 		Inputs:      e.Inputs,
@@ -439,14 +486,24 @@ func (e *Executor) makeStageInput(st *Stage, baseURL, modelID string, tokenSink 
 		ItemIdx:     itemIdx,
 		BaseURL:     baseURL,
 		ModelID:     modelID,
+		BackendAddr: backendAddr,
 	}
+}
+
+// stageTypeOrDefault returns st.Type with the empty-default rule applied.
+// Centralized so the dispatcher and the runGroup pre-check stay in sync.
+func stageTypeOrDefault(st *Stage) StageType {
+	if st.Type == "" {
+		return StageTypeText
+	}
+	return st.Type
 }
 
 // executorFor selects the StageExecutor for st based on its type. An unknown
 // type produces a clear error so Phase 2 stage types that ship without a
 // matching executor fail loudly instead of silently defaulting to text.
 func (e *Executor) executorFor(st *Stage) (StageExecutor, error) {
-	t := StageTypeText // empty type defaults to text (Phase 1 only ships text)
+	t := stageTypeOrDefault(st)
 	exec, ok := e.registry[t]
 	if !ok {
 		return nil, fmt.Errorf("stage %s: no executor registered for type %q", st.ID, t)
@@ -514,7 +571,7 @@ func (t *textExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput
 	st := in.Stage
 	var extra map[string]any
 	if st.Foreach != nil {
-		extra = map[string]any{st.Foreach.Var: in.Item}
+		extra = map[string]any{st.Foreach.Var: in.Item, "i": in.ItemIdx}
 	}
 	prompt, err := renderPrompt(st, in.PipelineDir, in.Inputs, in.Prior, in.RunDir, extra)
 	if err != nil {
