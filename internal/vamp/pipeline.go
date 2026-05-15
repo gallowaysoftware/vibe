@@ -28,7 +28,7 @@ type InputSpec struct {
 // Stage is a single step in the pipeline.
 type Stage struct {
 	ID           string         `yaml:"id"`
-	Type         StageType      `yaml:"type,omitempty"` // "" | "text" | "comfyui" | "audio"; empty defaults to "text"
+	Type         StageType      `yaml:"type,omitempty"` // "" | "text" | "comfyui" | "audio" | "ffmpeg"; empty defaults to "text"
 	Capability   string         `yaml:"capability,omitempty"`
 	Prompt       string         `yaml:"prompt,omitempty"`
 	PromptFile   string         `yaml:"prompt_file,omitempty"`
@@ -63,6 +63,14 @@ type Stage struct {
 	// to the vibe profile that supervises the ComfyUI backend.
 	Workflow   string            `yaml:"workflow,omitempty"`
 	Parameters map[string]string `yaml:"parameters,omitempty"`
+
+	// FFmpeg-stage fields. FFmpegArgs is the literal argv passed to ffmpeg
+	// (in order) after the binary; each entry is rendered as a Go template
+	// against the standard binding (inputs/stages/runDir + foreach item)
+	// before invocation. The executor appends `-y <rendered output>` after
+	// the user-supplied args so users don't manage the destination path
+	// themselves. Binary (shared with audio) defaults to "ffmpeg" on $PATH.
+	FFmpegArgs []string `yaml:"ffmpeg_args,omitempty"`
 }
 
 // ForeachSpec is the structured fan-out descriptor for a stage. The previous
@@ -178,9 +186,10 @@ func (p *Pipeline) Validate() error {
 		if stageType == "" {
 			stageType = StageTypeText
 		}
-		// Capability is required for every stage type except audio, which
-		// runs as a local subprocess and never activates a vibe profile.
-		if stageType != StageTypeAudio && s.Capability == "" {
+		// Capability is required for every stage type except the
+		// subprocess-only ones (audio, ffmpeg), which run as local
+		// binaries and never activate a vibe profile.
+		if stageType != StageTypeAudio && stageType != StageTypeFFmpeg && s.Capability == "" {
 			return fmt.Errorf("%s: capability is required", ctx)
 		}
 		switch stageType {
@@ -196,6 +205,9 @@ func (p *Pipeline) Validate() error {
 			}
 			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" {
 				return fmt.Errorf("%s: voice/text/voices_dir/binary are only valid on type: audio stages", ctx)
+			}
+			if len(s.FFmpegArgs) > 0 {
+				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
 			}
 		case StageTypeAudio:
 			if s.Voice == "" {
@@ -225,6 +237,42 @@ func (p *Pipeline) Validate() error {
 			if len(s.Parameters) > 0 {
 				return fmt.Errorf("%s: parameters is only valid on type: comfyui stages", ctx)
 			}
+			if len(s.FFmpegArgs) > 0 {
+				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
+			}
+		case StageTypeFFmpeg:
+			// ffmpeg stages drive a local subprocess to assemble media
+			// from prior stage outputs. The only required schema is the
+			// rendered argv list (FFmpegArgs) and the output path; the
+			// executor appends `-y <output>` after the user args so users
+			// don't manage the destination themselves.
+			if len(s.FFmpegArgs) == 0 {
+				return fmt.Errorf("%s: ffmpeg_args is required for type: ffmpeg stages", ctx)
+			}
+			if s.Capability != "" {
+				return fmt.Errorf("%s: capability is only valid on stage types that activate a vibe profile (ffmpeg runs as a local subprocess)", ctx)
+			}
+			if s.Prompt != "" {
+				return fmt.Errorf("%s: prompt is only valid on type: text stages", ctx)
+			}
+			if s.PromptFile != "" {
+				return fmt.Errorf("%s: prompt_file is only valid on type: text stages", ctx)
+			}
+			if len(s.Params) > 0 {
+				return fmt.Errorf("%s: params is only valid on type: text stages", ctx)
+			}
+			if s.OutputFormat != "" {
+				return fmt.Errorf("%s: output_format is only valid on type: text stages", ctx)
+			}
+			if s.Workflow != "" {
+				return fmt.Errorf("%s: workflow is only valid on type: comfyui stages", ctx)
+			}
+			if len(s.Parameters) > 0 {
+				return fmt.Errorf("%s: parameters is only valid on type: comfyui stages", ctx)
+			}
+			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" {
+				return fmt.Errorf("%s: voice/text/voices_dir are only valid on type: audio stages", ctx)
+			}
 		case StageTypeComfyUI:
 			if s.Workflow == "" {
 				return fmt.Errorf("%s: workflow is required for type: comfyui stages", ctx)
@@ -252,8 +300,11 @@ func (p *Pipeline) Validate() error {
 			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" {
 				return fmt.Errorf("%s: voice/text/voices_dir/binary are only valid on type: audio stages", ctx)
 			}
+			if len(s.FFmpegArgs) > 0 {
+				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
+			}
 		default:
-			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio)", ctx, s.Type)
+			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio, ffmpeg)", ctx, s.Type)
 		}
 		if s.OutputFormat != "" && s.OutputFormat != "json" {
 			return fmt.Errorf("%s: output_format %q is not supported (allowed: \"\", json)", ctx, s.OutputFormat)
