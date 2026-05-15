@@ -130,7 +130,7 @@ func TestExecutor_MissingCapabilityErrors(t *testing.T) {
 	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
 	exec := &Executor{
 		Pipeline: &Pipeline{
-			Name: "t",
+			Name:   "t",
 			Stages: []Stage{{ID: "a", Capability: "vision", Prompt: "x", Output: "a.txt"}},
 		},
 		Capabilities: caps,
@@ -929,5 +929,225 @@ stages:
 	}
 	if !strings.Contains(err.Error(), "cycle") {
 		t.Errorf("expected cycle error, got: %v", err)
+	}
+}
+
+// resumePipelineSource is the canonical pipeline YAML used by the resume
+// suite. It's intentionally short and stable so the snapshot-hash drift test
+// has a known "different" string to compare against.
+const resumePipelineSource = `name: resume
+stages:
+- id: one
+  capability: reasoning
+  prompt: P1
+  output: one.txt
+- id: two
+  capability: reasoning
+  prompt: P2 {{.stages.one.output}}
+  inputs: [one]
+  output: two.txt
+`
+
+// resumePipeline is the parsed form of resumePipelineSource. Keep these in
+// sync: the tests rely on the snapshot bytes matching what the Executor sees.
+func resumePipeline() *Pipeline {
+	return &Pipeline{
+		Name: "resume",
+		Stages: []Stage{
+			{ID: "one", Capability: "reasoning", Prompt: "P1", Output: "one.txt"},
+			{ID: "two", Capability: "reasoning", Prompt: "P2 {{.stages.one.output}}", Inputs: []string{"one"}, Output: "two.txt"},
+		},
+	}
+}
+
+// TestExecutor_ResumeSkipsCompletedStages confirms that a pre-existing
+// stage-1 output in the run dir is reused on the second run: the inference
+// function must NOT be called for stage "one", but MUST be called for
+// stage "two" (whose output is absent).
+func TestExecutor_ResumeSkipsCompletedStages(t *testing.T) {
+	var called sync.Map
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		// Record every invocation by prompt so the assertion below is
+		// independent of stage scheduling order.
+		called.Store(prompt, true)
+		return "ran:" + prompt, nil
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+
+	// Set up a run dir that already has stage "one"'s output from a
+	// hypothetical prior run, plus the original pipeline snapshot.
+	exec, runDir := stubExecutor(t, resumePipeline(), caps, inf)
+	if err := os.WriteFile(filepath.Join(runDir, "one.txt"), []byte("prior-one-output"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "pipeline.yaml.snapshot"), []byte(resumePipelineSource), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec.PipelineSource = []byte(resumePipelineSource)
+	exec.ResumeDir = runDir
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("resume run: %v", err)
+	}
+
+	if _, ran := called.Load("P1"); ran {
+		t.Errorf("stage one inference was called despite output file existing")
+	}
+	// Stage two depends on stage one's output. The resumed contents must
+	// flow into stage two's prompt, so the recorded inference prompt is
+	// the freshly-rendered "P2 prior-one-output".
+	if _, ran := called.Load("P2 prior-one-output"); !ran {
+		t.Errorf("stage two inference was not called with the resumed upstream output (saw calls: %v)", dumpSyncMapKeys(&called))
+	}
+	got, err := os.ReadFile(filepath.Join(runDir, "two.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "ran:P2 prior-one-output" {
+		t.Errorf("two.txt = %q, want %q", got, "ran:P2 prior-one-output")
+	}
+}
+
+// dumpSyncMapKeys returns the keys of a sync.Map for use in error messages.
+func dumpSyncMapKeys(m *sync.Map) []string {
+	var out []string
+	m.Range(func(k, _ any) bool {
+		out = append(out, fmt.Sprint(k))
+		return true
+	})
+	return out
+}
+
+// TestExecutor_ResumeRunsForeachIfAnyItemMissing verifies that a foreach
+// stage's partial output forces a full rerun in Phase 1: with 3 items in the
+// upstream array and only 2 of 3 per-item files present, all 3 items must run
+// again.
+func TestExecutor_ResumeRunsForeachIfAnyItemMissing(t *testing.T) {
+	var consumerCalls sync.Map
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		if prompt == "TITLES" {
+			return `["a","b","c"]`, nil
+		}
+		if strings.HasPrefix(prompt, "UP:") {
+			tok := strings.TrimPrefix(prompt, "UP:")
+			consumerCalls.Store(tok, true)
+			return strings.ToUpper(tok), nil
+		}
+		return "", fmt.Errorf("unexpected prompt %q", prompt)
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "fan",
+		Stages: []Stage{
+			{ID: "titles", Capability: "reasoning", Prompt: "TITLES", Output: "titles.json", OutputFormat: "json"},
+			{
+				ID: "consumer", Capability: "reasoning",
+				Inputs:  []string{"titles"},
+				Foreach: &ForeachSpec{From: "titles", Var: "title"},
+				Prompt:  "UP:{{.title}}",
+				Output:  "items/{{.title | slugify}}.txt",
+			},
+		},
+	}
+	pipelineSource := "name: fan\n" // placeholder; the contents don't matter so long as resume's hash check sees the SAME bytes in snapshot and PipelineSource
+	exec, runDir := stubExecutor(t, pipeline, caps, inf)
+	// Pre-populate upstream JSON output + 2 of 3 per-item files.
+	if err := os.WriteFile(filepath.Join(runDir, "titles.json"), []byte(`["a","b","c"]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(runDir, "items"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "items", "a.txt"), []byte("A"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "items", "b.txt"), []byte("B"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// items/c.txt deliberately missing.
+	if err := os.WriteFile(filepath.Join(runDir, "pipeline.yaml.snapshot"), []byte(pipelineSource), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec.PipelineSource = []byte(pipelineSource)
+	exec.ResumeDir = runDir
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("resume run: %v", err)
+	}
+	// Every item must have been invoked because Phase 1 reruns the whole
+	// foreach when any per-item file is missing.
+	for _, tok := range []string{"a", "b", "c"} {
+		if _, ran := consumerCalls.Load(tok); !ran {
+			t.Errorf("expected foreach item %q to rerun, but it did not", tok)
+		}
+	}
+	// And the previously-missing c.txt must now exist with the right body.
+	got, err := os.ReadFile(filepath.Join(runDir, "items", "c.txt"))
+	if err != nil {
+		t.Fatalf("expected items/c.txt to be written on rerun: %v", err)
+	}
+	if string(got) != "C" {
+		t.Errorf("items/c.txt = %q, want %q", got, "C")
+	}
+}
+
+// TestExecutor_ResumePipelineChangedRejects verifies the safety check fires
+// when the pipeline file content differs from the snapshot left in the run
+// dir. The error message must mention "pipeline file changed" so the CLI
+// surface stays grep-able.
+func TestExecutor_ResumePipelineChangedRejects(t *testing.T) {
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		t.Errorf("inference should not be called when resume aborts on snapshot mismatch")
+		return "", nil
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	exec, runDir := stubExecutor(t, resumePipeline(), caps, inf)
+	// Snapshot says the run started against version V1; current pipeline
+	// source is V2 (a single extra comment line is enough to change the
+	// SHA-256).
+	if err := os.WriteFile(filepath.Join(runDir, "pipeline.yaml.snapshot"), []byte(resumePipelineSource), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec.PipelineSource = []byte(resumePipelineSource + "# extra comment\n")
+	exec.ResumeDir = runDir
+	err := exec.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected resume to reject mismatched pipeline file")
+	}
+	if !strings.Contains(err.Error(), "pipeline file changed") {
+		t.Errorf("expected 'pipeline file changed' in error, got: %v", err)
+	}
+}
+
+// TestExecutor_ResumeForceAllowsChanged verifies that --resume-force bypasses
+// the snapshot drift check: the run proceeds, and any existing outputs are
+// still reused.
+func TestExecutor_ResumeForceAllowsChanged(t *testing.T) {
+	var called sync.Map
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		called.Store(prompt, true)
+		return "ran:" + prompt, nil
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	exec, runDir := stubExecutor(t, resumePipeline(), caps, inf)
+	// Pre-stage one's output exists; snapshot bytes differ from current
+	// PipelineSource. Without --resume-force this would error.
+	if err := os.WriteFile(filepath.Join(runDir, "one.txt"), []byte("prior-one-output"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "pipeline.yaml.snapshot"), []byte(resumePipelineSource), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec.PipelineSource = []byte(resumePipelineSource + "# divergent comment\n")
+	exec.ResumeDir = runDir
+	exec.ResumeForce = true
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("resume --resume-force run failed: %v", err)
+	}
+	// Stage one was already done, so its inference must NOT have been called.
+	if _, ran := called.Load("P1"); ran {
+		t.Errorf("stage one inference was called despite --resume-force seeing the existing output")
+	}
+	// Stage two ran fresh and consumed the resumed upstream output.
+	if _, ran := called.Load("P2 prior-one-output"); !ran {
+		t.Errorf("stage two inference was not called (saw: %v)", dumpSyncMapKeys(&called))
 	}
 }

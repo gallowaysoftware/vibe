@@ -3,6 +3,8 @@ package vamp
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -127,6 +129,32 @@ type Executor struct {
 	Inference    InferenceFunc // defaults to a real chat-completion client
 	Log          io.Writer
 
+	// PipelineSource is the raw bytes of the pipeline YAML file the caller
+	// loaded. It powers two run-dir artifacts: pipeline.yaml.snapshot
+	// (written verbatim at run start so resume can detect pipeline drift)
+	// and the resume hash check itself. When nil the snapshot file is
+	// written empty and resume can't validate the pipeline hasn't changed
+	// since the original run.
+	PipelineSource []byte
+
+	// ResumeDir, when non-empty, switches Run into resume mode. The
+	// directory MUST exist and be a previous vamp run dir (i.e. it
+	// already contains pipeline.yaml.snapshot + per-stage outputs from
+	// the original run). RunDir is set from ResumeDir at Run start so
+	// every stage's output path resolves to the existing on-disk files.
+	// Resume checks each stage's rendered output path(s) for an existing
+	// non-empty file; matching stages are loaded back into stageOutputs
+	// and skipped during scheduling. Mismatching / missing files cause
+	// the stage to run normally.
+	ResumeDir string
+
+	// ResumeForce overrides the pipeline-drift safety check. When the
+	// pipeline.yaml.snapshot bytes hash differently from PipelineSource,
+	// Run normally aborts with an instruction to either pass the original
+	// pipeline file or omit --resume. Set ResumeForce to bypass that
+	// check (the user explicitly told us they know the schema diverged).
+	ResumeForce bool
+
 	// MaxForeachConcurrency bounds the number of foreach items that may be
 	// running concurrently inside a single stage. Zero or negative uses
 	// defaultMaxForeachConcurrency. This is independent of the DAG
@@ -137,6 +165,7 @@ type Executor struct {
 	// in-memory state populated during Run
 	mu                 sync.Mutex // guards stageOutputs and the model cache
 	stageOutputs       map[string]*stageResult
+	completedStages    map[string]bool // stage ids whose outputs were loaded from a prior run via Resume
 	cachedModelID      string
 	cachedModelProfile string
 	// logMu serializes writes to Log from concurrent stages so buffered
@@ -163,12 +192,24 @@ func (e *Executor) Run(ctx context.Context) error {
 	if e.Inference == nil {
 		e.Inference = defaultInference()
 	}
+	// Resume mode: the run dir already exists, snapshot drift is checked
+	// against the prior run's pipeline.yaml.snapshot, and per-stage outputs
+	// from disk seed stageOutputs so completed work is skipped. We do this
+	// before MkdirAll so the drift check sees the original snapshot bytes;
+	// MkdirAll is idempotent on an existing dir.
+	if e.ResumeDir != "" {
+		e.RunDir = e.ResumeDir
+		if err := e.checkResumeSnapshot(); err != nil {
+			return err
+		}
+	}
 	if err := os.MkdirAll(e.RunDir, 0o755); err != nil {
 		return fmt.Errorf("create run dir: %w", err)
 	}
 	if err := e.snapshot(); err != nil {
 		return fmt.Errorf("snapshot run inputs: %w", err)
 	}
+	e.completedStages = make(map[string]bool)
 
 	// Build the per-type executor registry. Per-stage routing happens through
 	// Stage.Type (empty defaults to text); the executor's per-call deps travel
@@ -259,6 +300,33 @@ func (e *Executor) Run(ctx context.Context) error {
 // buffer per-stage tokens and emit them contiguously after each stage
 // completes to keep concurrent output readable.
 func (e *Executor) runGroup(ctx context.Context, capability string, group []*Stage) error {
+	// Resume pre-pass: try to seed stageOutputs for each group stage from the
+	// run dir's existing files. Stages whose outputs are all present drop out
+	// of the working group; if the group empties entirely we skip profile
+	// activation altogether (the whole point of resume — don't even talk to
+	// vibe for work that's already done).
+	if e.ResumeDir != "" {
+		remaining := make([]*Stage, 0, len(group))
+		for _, st := range group {
+			resumed, err := e.tryResumeStage(st)
+			if err != nil {
+				return fmt.Errorf("resume stage %s: %w", st.ID, err)
+			}
+			if resumed {
+				e.logf("  -> stage %q: already completed, skipping (resume)", st.ID)
+				e.mu.Lock()
+				e.completedStages[st.ID] = true
+				e.mu.Unlock()
+				continue
+			}
+			remaining = append(remaining, st)
+		}
+		if len(remaining) == 0 {
+			e.logf("  -> capability %q: all stages already completed, skipping activation", capability)
+			return nil
+		}
+		group = remaining
+	}
 	// Some stage types (audio, ffmpeg) are local subprocesses; they don't
 	// talk to a vibe-managed backend, don't need a profile activation, and
 	// may legitimately ship with an empty capability. Short-circuit profile
@@ -378,6 +446,10 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 // registered StageExecutor once and stores its output; for foreach stages it
 // fans out one Execute call per JSON-array item, runs them in parallel against
 // the same profile activation, and aggregates the per-item outputs.
+//
+// Resume skipping happens upstream in runGroup (so an all-resumed group can
+// skip profile activation entirely); by the time we get here, every stage in
+// the group needs a real executor call.
 func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID, backendAddr string, tokenSink io.Writer) error {
 	exec, err := e.executorFor(st)
 	if err != nil {
@@ -717,6 +789,141 @@ func (t *textExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput
 	return &StageOutput{Text: out}, nil
 }
 
+// tryResumeStage attempts to load this stage's output(s) from the run dir
+// without invoking the real executor. Returns (true, nil) iff every output
+// file required by the stage exists with size > 0 (and, for json stages,
+// parses as valid JSON) — in which case stageOutputs[st.ID] is populated and
+// the scheduler can skip the stage. Returns (false, nil) for any partial /
+// missing case so the caller falls through to the normal execution path.
+// An error is only returned for unexpected I/O failures.
+//
+// Output integrity: the spec mandates "size > 0". We layer on one cheap extra
+// check — stages declared as output_format: json must contain valid JSON —
+// because a truncated/corrupted JSON output from a crashed prior run would
+// otherwise satisfy "size > 0" and poison every downstream foreach. Any
+// stronger check (checksum sidecars, stage-specific schema) is deferred to a
+// follow-up; the size-plus-JSON heuristic catches the common crash patterns
+// without persisting extra state.
+func (e *Executor) tryResumeStage(st *Stage) (bool, error) {
+	if st.Foreach != nil {
+		return e.tryResumeForeachStage(st)
+	}
+	outPath, err := e.renderOutputPath(st, nil)
+	if err != nil {
+		// Output template may reference an upstream's .output that won't
+		// be available until a prior resumed-or-run stage populated
+		// stageOutputs. If template rendering fails we can't decide
+		// resumability — bail out to normal execution rather than
+		// surfacing a confusing render error.
+		return false, nil
+	}
+	full := filepath.Join(e.RunDir, outPath)
+	body, ok, err := readNonEmpty(full)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	// Binary stages (comfyui/audio) only record the relative path in
+	// stageResult.Output; templates that reference `.stages.<id>.output`
+	// for those stages already see a path, not file contents.
+	if stageTypeOrDefault(st) != StageTypeText {
+		e.mu.Lock()
+		e.stageOutputs[st.ID] = &stageResult{Output: outPath}
+		e.mu.Unlock()
+		return true, nil
+	}
+	if st.OutputFormat == "json" {
+		if err := validateJSON(string(body)); err != nil {
+			// Treat as incomplete; downstream foreach would otherwise
+			// blow up on the corrupted JSON.
+			return false, nil
+		}
+	}
+	e.mu.Lock()
+	e.stageOutputs[st.ID] = &stageResult{Output: string(body)}
+	e.mu.Unlock()
+	return true, nil
+}
+
+// tryResumeForeachStage is the foreach analogue of tryResumeStage. Phase 1
+// per-item granularity: if ANY rendered per-item output is missing or empty,
+// the whole foreach reruns. That's intentional — partial recovery for foreach
+// is gated on us tracking per-item state across runs, which is a future
+// polish.
+func (e *Executor) tryResumeForeachStage(st *Stage) (bool, error) {
+	items, err := e.resolveForeachItems(st)
+	if err != nil {
+		// The upstream's output is missing or unparseable in this run dir;
+		// rerun the foreach so the upstream's failure (if any) surfaces
+		// naturally. Don't propagate the error — the upstream's own resume
+		// check already had its chance to bail out.
+		return false, nil
+	}
+	if len(items) == 0 {
+		// Empty foreach is trivially "complete" with no outputs. Mirror
+		// the empty-array behaviour from executeForeachStage exactly so
+		// downstream .outputs references resolve.
+		e.mu.Lock()
+		e.stageOutputs[st.ID] = &stageResult{Output: "", Outputs: nil}
+		e.mu.Unlock()
+		return true, nil
+	}
+	outputs := make([]string, len(items))
+	isText := stageTypeOrDefault(st) == StageTypeText
+	for i, item := range items {
+		extra := map[string]any{st.Foreach.Var: item, "i": i}
+		path, err := e.renderOutputPath(st, extra)
+		if err != nil {
+			return false, nil
+		}
+		full := filepath.Join(e.RunDir, path)
+		body, ok, err := readNonEmpty(full)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+		if isText {
+			if st.OutputFormat == "json" {
+				if err := validateJSON(string(body)); err != nil {
+					return false, nil
+				}
+			}
+			outputs[i] = string(body)
+		} else {
+			outputs[i] = path
+		}
+	}
+	combined := strings.Join(outputs, "\n\n")
+	e.mu.Lock()
+	e.stageOutputs[st.ID] = &stageResult{Output: combined, Outputs: outputs}
+	e.mu.Unlock()
+	return true, nil
+}
+
+// readNonEmpty reads path and reports whether the file exists with non-zero
+// size. Missing files report (nil, false, nil); other I/O errors propagate.
+func readNonEmpty(path string) ([]byte, bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if info.Size() == 0 {
+		return nil, false, nil
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false, err
+	}
+	return body, true, nil
+}
+
 // resolveForeachItems reads the upstream stage's stored JSON output (the stage
 // named by Foreach.From) and parses it as an array. Items may be strings,
 // numbers, booleans, or objects; null is rejected as inadmissible.
@@ -910,15 +1117,68 @@ func (e *Executor) modelIDForCurrent(ctx context.Context, status *vibev1.Status)
 }
 
 func (e *Executor) snapshot() error {
-	if err := os.WriteFile(filepath.Join(e.RunDir, "pipeline.yaml.snapshot"), nil, 0o644); err != nil {
-		// best-effort; don't fail the run on snapshot errors
-		slog.Warn("snapshot placeholder failed", "err", err)
+	// Write the original pipeline file bytes verbatim. Resume relies on
+	// these bytes to detect mid-run pipeline edits via a content hash
+	// compare. Best-effort: if the caller didn't populate PipelineSource
+	// (older callers, some tests), write an empty file rather than
+	// failing the run — resume just won't be able to validate drift.
+	snapPath := filepath.Join(e.RunDir, "pipeline.yaml.snapshot")
+	// In resume mode the snapshot is the original-run artifact we already
+	// validated; don't overwrite it with the current PipelineSource bytes
+	// (which may legitimately differ when --resume-force was used).
+	if e.ResumeDir == "" {
+		if err := os.WriteFile(snapPath, e.PipelineSource, 0o644); err != nil {
+			slog.Warn("snapshot write failed", "err", err)
+		}
 	}
 	data, err := json.MarshalIndent(e.Inputs, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(e.RunDir, "inputs.json"), data, 0o644)
+}
+
+// checkResumeSnapshot loads the prior run's pipeline.yaml.snapshot and
+// compares its SHA-256 to the current PipelineSource. The hashes match iff
+// the user is resuming the same pipeline file (byte-identical) — any whitespace
+// or comment edit counts as drift, since the safer default is to err on
+// "schema may have changed" rather than try to reason about semantic equality.
+// Bypass with ResumeForce.
+//
+// Returns nil on hash match (or when the user opted out via ResumeForce).
+// Returns an error mentioning "pipeline file changed" on mismatch so the CLI
+// surface stays grep-able.
+func (e *Executor) checkResumeSnapshot() error {
+	info, err := os.Stat(e.RunDir)
+	if err != nil {
+		return fmt.Errorf("resume: stat run dir %s: %w", e.RunDir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("resume: %s is not a directory", e.RunDir)
+	}
+	if e.ResumeForce {
+		// Skip drift detection entirely. We do NOT require the snapshot
+		// file to exist when force is set; that keeps the escape hatch
+		// usable on legacy run dirs that pre-date the snapshot-population
+		// fix in this PR.
+		return nil
+	}
+	snapPath := filepath.Join(e.RunDir, "pipeline.yaml.snapshot")
+	snap, err := os.ReadFile(snapPath)
+	if err != nil {
+		return fmt.Errorf("resume: read pipeline snapshot %s: %w", snapPath, err)
+	}
+	want := sha256Hex(snap)
+	got := sha256Hex(e.PipelineSource)
+	if want != got {
+		return fmt.Errorf("resume: pipeline file changed since this run started (snapshot %s != current %s); either pass the original pipeline file or start a fresh run (omit --resume), or use --resume-force to override", want[:12], got[:12])
+	}
+	return nil
+}
+
+func sha256Hex(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
 }
 
 func (e *Executor) logf(format string, args ...any) {
