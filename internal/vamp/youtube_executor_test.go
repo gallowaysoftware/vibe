@@ -162,20 +162,20 @@ func TestYouTubeExecutor_HappyPath(t *testing.T) {
 	doer := &recordingDoer{
 		responses: []doerResponse{
 			{
-				match: "POST https://oauth2.googleapis.com/token",
-				status:    200,
-				body:      []byte(`{"access_token":"AT-test","token_type":"Bearer","expires_in":3600}`),
+				match:  "POST https://oauth2.googleapis.com/token",
+				status: 200,
+				body:   []byte(`{"access_token":"AT-test","token_type":"Bearer","expires_in":3600}`),
 			},
 			{
-				match: "POST https://www.googleapis.com/upload/youtube/v3/videos",
-				status:    200,
-				header:    http.Header{"Location": []string{"https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=abc123"}},
-				body:      []byte(``),
+				match:  "POST https://www.googleapis.com/upload/youtube/v3/videos",
+				status: 200,
+				header: http.Header{"Location": []string{"https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=abc123"}},
+				body:   []byte(``),
 			},
 			{
-				match: "PUT https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=abc123",
-				status:    200,
-				body:      []byte(`{"id":"vid_xyz","kind":"youtube#video"}`),
+				match:  "PUT https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=abc123",
+				status: 200,
+				body:   []byte(`{"id":"vid_xyz","kind":"youtube#video"}`),
 			},
 		},
 	}
@@ -316,9 +316,9 @@ func TestYouTubeExecutor_TokenExchangeFails(t *testing.T) {
 	doer := &recordingDoer{
 		responses: []doerResponse{
 			{
-				match: "POST https://oauth2.googleapis.com/token",
-				status:    401,
-				body:      []byte(`{"error":"invalid_grant","error_description":"Token has been expired or revoked."}`),
+				match:  "POST https://oauth2.googleapis.com/token",
+				status: 401,
+				body:   []byte(`{"error":"invalid_grant","error_description":"Token has been expired or revoked."}`),
 			},
 		},
 	}
@@ -359,14 +359,14 @@ func TestYouTubeExecutor_UploadFails(t *testing.T) {
 	doer := &recordingDoer{
 		responses: []doerResponse{
 			{
-				match: "POST https://oauth2.googleapis.com/token",
-				status:    200,
-				body:      []byte(`{"access_token":"AT","token_type":"Bearer"}`),
+				match:  "POST https://oauth2.googleapis.com/token",
+				status: 200,
+				body:   []byte(`{"access_token":"AT","token_type":"Bearer"}`),
 			},
 			{
-				match: "POST https://www.googleapis.com/upload/youtube/v3/videos",
-				status:    500,
-				body:      []byte(`{"error":{"code":500,"message":"Internal Server Error"}}`),
+				match:  "POST https://www.googleapis.com/upload/youtube/v3/videos",
+				status: 500,
+				body:   []byte(`{"error":{"code":500,"message":"Internal Server Error"}}`),
 			},
 		},
 	}
@@ -404,24 +404,24 @@ func TestYouTubeExecutor_WithThumbnail(t *testing.T) {
 	doer := &recordingDoer{
 		responses: []doerResponse{
 			{
-				match: "POST https://oauth2.googleapis.com/token",
-				status:    200,
-				body:      []byte(`{"access_token":"AT","token_type":"Bearer"}`),
+				match:  "POST https://oauth2.googleapis.com/token",
+				status: 200,
+				body:   []byte(`{"access_token":"AT","token_type":"Bearer"}`),
 			},
 			{
-				match: "POST https://www.googleapis.com/upload/youtube/v3/videos",
-				status:    200,
-				header:    http.Header{"Location": []string{"https://example.com/upload?id=u1"}},
+				match:  "POST https://www.googleapis.com/upload/youtube/v3/videos",
+				status: 200,
+				header: http.Header{"Location": []string{"https://example.com/upload?id=u1"}},
 			},
 			{
-				match: "PUT https://example.com/upload?id=u1",
-				status:    200,
-				body:      []byte(`{"id":"vid_thumb"}`),
+				match:  "PUT https://example.com/upload?id=u1",
+				status: 200,
+				body:   []byte(`{"id":"vid_thumb"}`),
 			},
 			{
-				match: "POST https://www.googleapis.com/upload/youtube/v3/thumbnails/set",
-				status:    200,
-				body:      []byte(`{"items":[{"default":{"url":"..."}}]}`),
+				match:  "POST https://www.googleapis.com/upload/youtube/v3/thumbnails/set",
+				status: 200,
+				body:   []byte(`{"items":[{"default":{"url":"..."}}]}`),
 			},
 		},
 	}

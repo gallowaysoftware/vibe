@@ -95,10 +95,10 @@ type PullStream struct {
 	s *connect.ServerStreamForClient[vibev1.PullProgress]
 }
 
-func (s *PullStream) Receive() bool              { return s.s.Receive() }
-func (s *PullStream) Msg() *vibev1.PullProgress  { return s.s.Msg() }
-func (s *PullStream) Err() error                 { return s.s.Err() }
-func (s *PullStream) Close() error               { return s.s.Close() }
+func (s *PullStream) Receive() bool             { return s.s.Receive() }
+func (s *PullStream) Msg() *vibev1.PullProgress { return s.s.Msg() }
+func (s *PullStream) Err() error                { return s.s.Err() }
+func (s *PullStream) Close() error              { return s.s.Close() }
 
 // Pull starts a server-streaming Pull RPC. The caller iterates with Receive()
 // and reads each message via Msg().

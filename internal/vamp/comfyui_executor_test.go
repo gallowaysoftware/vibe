@@ -640,19 +640,19 @@ func TestCoerceParamValue(t *testing.T) {
 		{"", ""},
 		{"true", true},
 		{"false", false},
-		{"True", "True"},   // capitalized stays a string
-		{"1", int64(1)},     // ints aren't booled
+		{"True", "True"}, // capitalized stays a string
+		{"1", int64(1)},  // ints aren't booled
 		{"0", int64(0)},
 		{"42", int64(42)},
 		{"-7", int64(-7)},
 		{"3.14", 3.14},
 		{"-2.5", -2.5},
-		{"1e3", 1000.0},     // scientific notation parses as float
-		{"42.0", 42.0},      // explicit-decimal stays a float
-		{".", "."},          // pathological strconv input stays a string
+		{"1e3", 1000.0}, // scientific notation parses as float
+		{"42.0", 42.0},  // explicit-decimal stays a float
+		{".", "."},      // pathological strconv input stays a string
 		{"+", "+"},
 		{"-", "-"},
-		{"1.2.3", "1.2.3"},  // version-ish string stays a string
+		{"1.2.3", "1.2.3"}, // version-ish string stays a string
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
@@ -744,4 +744,3 @@ func TestComfyUIExecutor_ClientHook(t *testing.T) {
 		t.Errorf("save data = %q", body)
 	}
 }
-
