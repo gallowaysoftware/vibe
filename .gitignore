@@ -1,0 +1,21 @@
+# Build artifacts
+/vibe
+/bin/
+/dist/
+
+# Go
+*.test
+*.out
+coverage.txt
+vendor/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Local state that shouldn't be checked in
+*.sock
+*.pid
+*.log
