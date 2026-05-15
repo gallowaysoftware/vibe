@@ -31,7 +31,7 @@ func TestBuildArgs_Full(t *testing.T) {
 		"--ctx-size", "8192",
 		"--parallel", "2",
 		"--n-gpu-layers", "99",
-		"--flash-attn",
+		"--flash-attn", "on",
 		"--cache-type-k", "q8_0",
 		"--cache-type-v", "q8_0",
 		"--jinja",

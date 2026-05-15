@@ -266,7 +266,7 @@ func BuildArgs(p *profile.Profile, port int) []string {
 		args = append(args, "--n-gpu-layers", strconv.Itoa(p.Model.GPULayers))
 	}
 	if p.Model.FlashAttn {
-		args = append(args, "--flash-attn")
+		args = append(args, "--flash-attn", "on")
 	}
 	if p.Model.CacheTypeK != "" {
 		args = append(args, "--cache-type-k", p.Model.CacheTypeK)
