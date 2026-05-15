@@ -59,7 +59,12 @@ func renderPull(stream *vibeclient.PullStream) error {
 				bar.update(m.TotalBytes)
 				bar.finish()
 			}
-			if m.Message != "" && m.Message != "no huggingface block; nothing to pull" {
+			switch m.Message {
+			case "", "no huggingface block; nothing to pull":
+				// silent
+			case "already cached":
+				fmt.Printf("already cached (%s)\n", humanBytes(m.TotalBytes))
+			default:
 				fmt.Println(m.Message)
 			}
 		}

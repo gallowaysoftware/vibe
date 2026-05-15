@@ -329,44 +329,40 @@ func (d *Daemon) Pull(ctx context.Context, req *connect.Request[vibev1.PullReque
 	if err := stream.Send(&vibev1.PullProgress{Phase: vibev1.PullProgress_PHASE_RESOLVING}); err != nil {
 		return err
 	}
-	total, err := hfdownload.HeadSize(ctx, spec)
-	if err != nil {
-		return connect.NewError(connect.CodeUnavailable, fmt.Errorf("head huggingface: %w", err))
-	}
-	if info, statErr := os.Stat(p.Model.Path); statErr == nil && total > 0 && info.Size() == total {
-		slog.Info("model already cached", "profile", p.Name, "path", p.Model.Path, "size", total)
-		return stream.Send(&vibev1.PullProgress{
-			Phase:           vibev1.PullProgress_PHASE_DONE,
-			DownloadedBytes: total,
-			TotalBytes:      total,
-			Message:         "model already cached",
-		})
-	}
-	slog.Info("downloading model", "profile", p.Name, "url", spec.URL(), "expected_size", total)
+	slog.Info("pulling model", "profile", p.Name, "repo", spec.Repo, "file", spec.File)
 
-	if err := stream.Send(&vibev1.PullProgress{
-		Phase:      vibev1.PullProgress_PHASE_DOWNLOADING,
-		TotalBytes: total,
-	}); err != nil {
-		return err
-	}
-	progress := func(downloaded, t int64) {
+	// Track whether bytes actually flowed; hfdownload.Download skips the
+	// progress callback when it short-circuits (local-and-cached path).
+	var bytesFlowed bool
+	progress := func(downloaded, total int64) {
+		bytesFlowed = true
 		_ = stream.Send(&vibev1.PullProgress{
 			Phase:           vibev1.PullProgress_PHASE_DOWNLOADING,
 			DownloadedBytes: downloaded,
-			TotalBytes:      t,
+			TotalBytes:      total,
 		})
 	}
 	if err := hfdownload.Download(ctx, spec, p.Model.Path, progress); err != nil {
 		slog.Error("download failed", "profile", p.Name, "err", err)
 		return connect.NewError(connect.CodeInternal, fmt.Errorf("download: %w", err))
 	}
-	slog.Info("download complete", "profile", p.Name, "path", p.Model.Path)
+
+	var finalSize int64
+	if info, err := os.Stat(p.Model.Path); err == nil {
+		finalSize = info.Size()
+	}
+	msg := "complete"
+	if !bytesFlowed {
+		msg = "already cached"
+		slog.Info("model already cached", "profile", p.Name, "path", p.Model.Path, "size", finalSize)
+	} else {
+		slog.Info("download complete", "profile", p.Name, "path", p.Model.Path, "size", finalSize)
+	}
 	return stream.Send(&vibev1.PullProgress{
 		Phase:           vibev1.PullProgress_PHASE_DONE,
-		DownloadedBytes: total,
-		TotalBytes:      total,
-		Message:         "complete",
+		DownloadedBytes: finalSize,
+		TotalBytes:      finalSize,
+		Message:         msg,
 	})
 }
 

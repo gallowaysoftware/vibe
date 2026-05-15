@@ -77,12 +77,35 @@ func headSize(ctx context.Context, hc *http.Client, spec Spec, ep Endpoint) (int
 	return -1, nil
 }
 
-// Download fetches spec to destPath. If destPath already exists with a size
-// matching HuggingFace's Content-Length, returns immediately. If destPath
-// exists at a smaller size, attempts to resume via a Range request. Otherwise
-// downloads from scratch. The parent directory of destPath is created if
-// needed. Progress is reported periodically; the final call is guaranteed.
+// Download fetches spec to destPath. If `hf` (huggingface_hub CLI) is on
+// $PATH, vibe shells out to it so gated repos work via the user's stored
+// `hf auth login` credentials. Otherwise we fall back to a direct HF resolve
+// URL, which works for public repos and reads $HF_TOKEN for gated ones.
+//
+// In both modes: if destPath already exists at the size HuggingFace reports
+// for the file, this returns immediately. Parent directories are created.
+// Progress is reported periodically; the final call is guaranteed.
 func Download(ctx context.Context, spec Spec, destPath string, progress ProgressFunc) error {
+	// First: if the file exists locally, try to verify against HF metadata.
+	// If HEAD succeeds and sizes match, we're done. If HEAD fails (e.g.
+	// gated repo without auth), trust the local file rather than pretending
+	// we need to redownload something we can't even check. Cached paths
+	// deliberately do NOT call progress — the caller distinguishes "cached"
+	// vs "downloaded" by whether bytes flowed.
+	if info, err := os.Stat(destPath); err == nil && info.Size() > 0 {
+		total, herr := HeadSize(ctx, spec)
+		switch {
+		case herr == nil && total > 0 && info.Size() == total:
+			return nil
+		case herr != nil:
+			return nil
+		}
+		// File exists with wrong size; fall through to redownload.
+	}
+
+	if hfBin, ok := LookupHFCLI(); ok {
+		return downloadViaHFCLI(ctx, hfBin, spec, destPath, progress)
+	}
 	return download(ctx, http.DefaultClient, spec, destPath, progress, Endpoint(""))
 }
 
