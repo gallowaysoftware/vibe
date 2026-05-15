@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/gallowaysoftware/vibe/internal/cli"
+	"github.com/gallowaysoftware/vibe/internal/vibe/cli"
 )
 
 func main() {

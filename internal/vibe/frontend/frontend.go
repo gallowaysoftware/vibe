@@ -9,7 +9,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/gallowaysoftware/vibe/internal/profile"
+	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 )
 
 type Result struct {

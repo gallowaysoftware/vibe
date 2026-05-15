@@ -22,12 +22,12 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/gallowaysoftware/vibe/internal/frontend"
-	"github.com/gallowaysoftware/vibe/internal/ipc"
-	"github.com/gallowaysoftware/vibe/internal/paths"
-	"github.com/gallowaysoftware/vibe/internal/profile"
-	"github.com/gallowaysoftware/vibe/internal/proxy"
-	"github.com/gallowaysoftware/vibe/internal/supervisor"
+	"github.com/gallowaysoftware/vibe/internal/vibe/frontend"
+	"github.com/gallowaysoftware/vibe/internal/vibe/ipc"
+	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
+	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
+	"github.com/gallowaysoftware/vibe/internal/vibe/proxy"
+	"github.com/gallowaysoftware/vibe/internal/vibe/supervisor"
 )
 
 const defaultProxyPort = 9000

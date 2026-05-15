@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gallowaysoftware/vibe/internal/profile"
+	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 )
 
 type State int

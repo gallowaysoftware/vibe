@@ -5,7 +5,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/gallowaysoftware/vibe/internal/daemon"
+	"github.com/gallowaysoftware/vibe/internal/vibe/daemon"
 	"github.com/spf13/cobra"
 )
 

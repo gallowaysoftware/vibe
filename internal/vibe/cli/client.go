@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/gallowaysoftware/vibe/internal/ipc"
-	"github.com/gallowaysoftware/vibe/internal/paths"
+	"github.com/gallowaysoftware/vibe/internal/vibe/ipc"
+	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 )
 
 func newHTTPClient() *http.Client {

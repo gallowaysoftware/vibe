@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/gallowaysoftware/vibe/internal/profile"
+	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 )
 
 func TestBuildArgs_Full(t *testing.T) {

@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/gallowaysoftware/vibe/internal/profile"
+	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 )
 
 func TestActivate_External_WritesExpandedJSON(t *testing.T) {

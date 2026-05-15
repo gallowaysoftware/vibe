@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/gallowaysoftware/vibe/internal/ipc"
+	"github.com/gallowaysoftware/vibe/internal/vibe/ipc"
 	"github.com/spf13/cobra"
 )
 
