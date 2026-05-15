@@ -1,6 +1,7 @@
 package vamp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 )
 
 // ChatCompletion calls an OpenAI-compatible /v1/chat/completions endpoint
@@ -17,14 +19,26 @@ type ChatCompletion struct {
 	HTTPClient *http.Client
 }
 
-func (c *ChatCompletion) Call(ctx context.Context, baseURL, model, prompt string, params map[string]any) (string, error) {
+// StreamFunc receives incremental token deltas as they arrive from an SSE
+// chat-completion response. It is called once per non-empty content delta and
+// must not block on I/O for long; the caller is expected to write to a fast
+// sink (e.g. stdout).
+type StreamFunc func(delta string)
+
+// Call invokes the chat completion endpoint. When onToken is nil the server is
+// asked for a single non-streaming JSON response and the full content is
+// returned. When onToken is non-nil the request switches to OpenAI-compatible
+// SSE streaming: each content delta is passed to onToken, and the accumulated
+// content is returned at the end so callers can persist it.
+func (c *ChatCompletion) Call(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
 	if c.HTTPClient == nil {
 		c.HTTPClient = http.DefaultClient
 	}
+	stream := onToken != nil
 	body := map[string]any{
 		"model":    model,
 		"messages": []map[string]string{{"role": "user", "content": prompt}},
-		"stream":   false,
+		"stream":   stream,
 	}
 	for k, v := range params {
 		body[k] = v
@@ -38,6 +52,9 @@ func (c *ChatCompletion) Call(ctx context.Context, baseURL, model, prompt string
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if stream {
+		req.Header.Set("Accept", "text/event-stream")
+	}
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return "", err
@@ -47,20 +64,88 @@ func (c *ChatCompletion) Call(ctx context.Context, baseURL, model, prompt string
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return "", fmt.Errorf("chat completion %s: %s", resp.Status, string(b))
 	}
-	var r struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
+
+	if !stream {
+		var r struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+			return "", err
+		}
+		if len(r.Choices) == 0 {
+			return "", errors.New("chat completion: no choices in response")
+		}
+		return r.Choices[0].Message.Content, nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
-		return "", err
+
+	return parseSSEStream(resp.Body, onToken)
+}
+
+// parseSSEStream reads an OpenAI-compatible Server-Sent Events stream from r.
+// It accumulates content deltas, invoking onToken for each non-empty one, and
+// returns the full concatenated content once it sees the [DONE] sentinel or
+// EOF.
+func parseSSEStream(r io.Reader, onToken StreamFunc) (string, error) {
+	scanner := bufio.NewScanner(r)
+	// Reasoning models can emit large single-chunk JSON; bump well above the
+	// 64KB default so we don't choke mid-stream.
+	const maxLine = 1 << 20 // 1 MiB
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLine)
+
+	var acc strings.Builder
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			// SSE event separator; nothing to do.
+			continue
+		}
+		// We only care about data: lines. Other fields (event:, id:, retry:)
+		// and any comment lines starting with ':' are ignored.
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data:")
+		// Strip a single leading space if present ("data: foo"); a missing
+		// space ("data:foo") is also valid per the spec.
+		payload = strings.TrimPrefix(payload, " ")
+		if payload == "" {
+			// Heartbeat / keepalive.
+			continue
+		}
+		if payload == "[DONE]" {
+			return acc.String(), nil
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			return "", fmt.Errorf("decode SSE chunk: %w", err)
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		delta := chunk.Choices[0].Delta.Content
+		if delta == "" {
+			// First event (role-only) and final stop event both arrive with
+			// empty content; skip them silently.
+			continue
+		}
+		acc.WriteString(delta)
+		onToken(delta)
 	}
-	if len(r.Choices) == 0 {
-		return "", errors.New("chat completion: no choices in response")
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read SSE stream: %w", err)
 	}
-	return r.Choices[0].Message.Content, nil
+	// Stream ended without [DONE]; return what we have.
+	return acc.String(), nil
 }
 
 // ResolveModelID queries baseURL/v1/models and returns the first model id, or

@@ -19,8 +19,11 @@ import (
 )
 
 // InferenceFunc runs a single stage's chat completion against baseURL.
-// baseURL is the proxy root (e.g. http://127.0.0.1:9000) without /v1.
-type InferenceFunc func(ctx context.Context, baseURL, model, prompt string, params map[string]any) (string, error)
+// baseURL is the proxy root (e.g. http://127.0.0.1:9000) without /v1. When
+// onToken is non-nil the implementation should stream incremental content
+// deltas to it as they arrive; the returned string is still the full
+// accumulated content.
+type InferenceFunc func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error)
 
 // Executor runs a Pipeline end-to-end against vibe.
 type Executor struct {
@@ -101,9 +104,19 @@ func (e *Executor) executeStage(ctx context.Context, st *Stage) error {
 
 	baseURL := strings.TrimSuffix(status.ProxyAddr, "/v1")
 	start := time.Now()
-	out, err := e.Inference(ctx, baseURL+"/v1", modelID, prompt, st.Params)
+	var onToken StreamFunc
+	if e.Log != nil {
+		onToken = func(delta string) {
+			_, _ = e.Log.Write([]byte(delta))
+		}
+	}
+	out, err := e.Inference(ctx, baseURL+"/v1", modelID, prompt, st.Params, onToken)
 	if err != nil {
 		return fmt.Errorf("inference: %w", err)
+	}
+	if e.Log != nil {
+		// Ensure the next status line starts on a fresh line.
+		_, _ = e.Log.Write([]byte("\n"))
 	}
 	e.logf("  <- %d-char response in %s", len(out), time.Since(start).Round(time.Millisecond))
 
