@@ -26,6 +26,7 @@ func rootCmd() *cobra.Command {
 		shutdownCmd(),
 		envCmd(),
 		pullCmd(),
+		doctorCmd(),
 	)
 	return root
 }
