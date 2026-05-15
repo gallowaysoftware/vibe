@@ -7,6 +7,7 @@ vibe doctor            # verify the machine is set up to run vibe
 vibe start code        # llama-server + opencode wired up for coding
 vibe start research    # different model, different context, different frontend
 vibe ps                # what's running
+vibe tui               # real-time dashboard (start/stop, status, logs)
 vibe stop              # tear it all down
 ```
 
@@ -62,9 +63,18 @@ Phase 1 in progress: profile schema, llama-server supervision, proxy, CLI, openc
 Not yet:
 
 - managed-binary frontends (native processes supervised by vibe)
-- TUI dashboard
 - VRAM enforcement
 - Remote (LAN) access from a laptop
+
+## TUI
+
+`vibe tui` opens a Bubbletea-based dashboard that polls the daemon once a
+second for status and recent logs. Arrow keys (or `j`/`k`) navigate the
+profile list, `s` (or Enter) starts the selected profile, `x` stops the
+active one, `r` forces an immediate refresh, and `q` quits. The TUI honors
+`NO_COLOR` and is comfortable over SSH. It deliberately does not auto-spawn
+the daemon — if it isn't running, the TUI says so and points at `vibe
+daemon &` rather than springing side effects on the operator.
 
 ## Multi-profile example
 
