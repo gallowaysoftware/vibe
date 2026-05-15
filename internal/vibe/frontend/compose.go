@@ -1,0 +1,241 @@
+package frontend
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"os"
+	"os/exec"
+	"sort"
+	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
+)
+
+// composeDriver brings up (and tears down) a docker-compose stack as the
+// frontend for a profile.
+//
+// The command runner and the HTTP probe are injectable so unit tests can
+// assert the argv we'd hand to `docker compose` and the URLs we'd poll
+// without spawning docker or making real network calls.
+type composeDriver struct {
+	// runCommand executes a docker-compose command. Tests stub this out;
+	// production uses execCommand which shells out for real.
+	runCommand func(ctx context.Context, name string, args []string, env []string) error
+
+	// probeURL issues a single GET against url and returns the response
+	// status code. The default uses net/http.
+	probeURL func(ctx context.Context, url string) (int, error)
+
+	// now is wired so tests can advance time deterministically; defaults
+	// to time.Now.
+	now func() time.Time
+
+	// defaultTimeout is applied when a wait_for entry has no explicit
+	// timeout. 60s matches the spec's example.
+	defaultTimeout time.Duration
+
+	// pollInterval is the gap between wait_for polls. Small, but tests
+	// can override via withInterval if they need to spin faster.
+	pollInterval time.Duration
+}
+
+// defaultCompose returns a composeDriver configured for production: it
+// shells out to `docker` and polls URLs with net/http.
+func defaultCompose() *composeDriver {
+	return &composeDriver{
+		runCommand:     execCommand,
+		probeURL:       httpProbe,
+		now:            time.Now,
+		defaultTimeout: 60 * time.Second,
+		pollInterval:   500 * time.Millisecond,
+	}
+}
+
+// execCommand runs `name args...` with env appended to the current
+// environment and streams stdout/stderr to the daemon's standard handles.
+func execCommand(ctx context.Context, name string, args []string, env []string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// httpProbe issues a single GET to url and returns the response status code.
+// Any transport error is returned to the caller, who decides whether to
+// retry.
+func httpProbe(ctx context.Context, url string) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, err
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, nil
+}
+
+// Activate runs `docker compose up -d [services...]` and polls each
+// wait_for entry until it returns 2xx or its timeout elapses. On success it
+// returns a Result whose teardown invokes `docker compose down`.
+func (c *composeDriver) Activate(reqCtx context.Context, p *profile.Profile, ctx profile.ExpandContext) (*Result, error) {
+	composeFile, err := profile.ExpandPathString(p.Frontend.ComposeFile, ctx)
+	if err != nil {
+		return nil, fmt.Errorf("expand compose_file: %w", err)
+	}
+	if _, err := os.Stat(composeFile); err != nil {
+		return nil, fmt.Errorf("compose_file %s: %w", composeFile, err)
+	}
+
+	projectName := p.Frontend.ProjectName
+	if projectName == "" {
+		projectName = "vibe-" + p.Name
+	}
+
+	env, err := p.ExpandEnv(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("expand env: %w", err)
+	}
+	envSlice := envMapToSlice(env)
+
+	upArgs := composeUpArgs(composeFile, projectName, p.Frontend.Services)
+	if err := c.runCommand(reqCtx, "docker", upArgs, envSlice); err != nil {
+		return nil, fmt.Errorf("docker compose up: %w", err)
+	}
+
+	if err := c.waitForReady(reqCtx, p.Frontend.WaitFor); err != nil {
+		// Best-effort teardown: bring the stack back down so the caller
+		// isn't left with a half-up stack on failure.
+		downCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = c.runCommand(downCtx, "docker", composeDownArgs(composeFile, projectName), envSlice)
+		return nil, err
+	}
+
+	teardown := func(tdCtx context.Context) error {
+		return c.runCommand(tdCtx, "docker", composeDownArgs(composeFile, projectName), envSlice)
+	}
+
+	return &Result{
+		WroteFile:       composeFile,
+		RestartRequired: p.Frontend.RestartRequired,
+		Env:             env,
+		Kind:            profile.FrontendDockerCompose,
+		teardown:        teardown,
+	}, nil
+}
+
+// composeUpArgs returns the argv slice (minus the leading "docker" program
+// name) for bringing the stack up. Services, when set, are passed as
+// positional arguments after "up -d".
+func composeUpArgs(composeFile, projectName string, services []string) []string {
+	args := []string{"compose", "-f", composeFile, "-p", projectName, "up", "-d"}
+	args = append(args, services...)
+	return args
+}
+
+// composeDownArgs returns the argv slice for tearing the stack down. We
+// intentionally don't pass per-service names here — `down` should reap the
+// entire project so its networks/volumes get cleaned up.
+func composeDownArgs(composeFile, projectName string) []string {
+	return []string{"compose", "-f", composeFile, "-p", projectName, "down"}
+}
+
+// envMapToSlice flattens a string→string env map into the KEY=VAL format
+// exec.Cmd.Env expects. Keys are sorted so the result is deterministic for
+// tests and logs.
+func envMapToSlice(env map[string]string) []string {
+	if len(env) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, k+"="+env[k])
+	}
+	return out
+}
+
+// waitForReady polls each wait_for URL until it returns 2xx or its timeout
+// (or reqCtx) expires. URLs are polled sequentially: the spec is small,
+// real frontends typically expose only one or two endpoints, and
+// sequential polling keeps the error message unambiguous about which URL
+// failed.
+func (c *composeDriver) waitForReady(reqCtx context.Context, urls []profile.WaitForURL) error {
+	for _, w := range urls {
+		timeout := w.Timeout
+		if timeout <= 0 {
+			timeout = c.defaultTimeout
+		}
+		if err := c.pollURL(reqCtx, w.URL, timeout); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// pollURL hits url at c.pollInterval cadence until it answers with a 2xx
+// status, or deadline / reqCtx fires. Non-2xx responses and transport
+// errors are treated equivalently — the service may still be starting up.
+func (c *composeDriver) pollURL(reqCtx context.Context, url string, timeout time.Duration) error {
+	deadline := c.now().Add(timeout)
+	var lastStatus int
+	var lastErr error
+	for {
+		if err := reqCtx.Err(); err != nil {
+			return fmt.Errorf("wait_for %s: %w", url, err)
+		}
+		// Per-poll context with the smaller of the remaining wait_for budget
+		// and a 5s ceiling, so a stuck request can't outlast the deadline.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return composeWaitErr(url, lastStatus, lastErr)
+		}
+		probeCtx, cancel := context.WithTimeout(reqCtx, minDuration(remaining, 5*time.Second))
+		status, err := c.probeURL(probeCtx, url)
+		cancel()
+		if err == nil && status >= 200 && status < 300 {
+			return nil
+		}
+		lastStatus = status
+		lastErr = err
+		if c.now().After(deadline) {
+			return composeWaitErr(url, lastStatus, lastErr)
+		}
+		// Sleep with cancellation awareness.
+		select {
+		case <-reqCtx.Done():
+			return fmt.Errorf("wait_for %s: %w", url, reqCtx.Err())
+		case <-time.After(c.pollInterval):
+		}
+	}
+}
+
+// composeWaitErr formats a wait_for-failed error including the most recent
+// observation so logs are actionable.
+func composeWaitErr(url string, status int, lastErr error) error {
+	if lastErr != nil {
+		return fmt.Errorf("wait_for %s: timeout (last err: %v)", url, lastErr)
+	}
+	if status != 0 {
+		return fmt.Errorf("wait_for %s: timeout (last status: %d)", url, status)
+	}
+	return fmt.Errorf("wait_for %s: timeout", url)
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}

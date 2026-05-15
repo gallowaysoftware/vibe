@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeProfile(t *testing.T, content string) string {
@@ -232,13 +233,116 @@ frontend: {kind: external, app: opencode, write_file: /tmp/x}
 			wantErr: "template is required",
 		},
 		{
-			name: "docker-compose not yet supported",
+			name: "managed not yet supported",
+			yaml: `
+name: x
+model: {path: ` + model + `, alias: x, context: 1024}
+frontend: {kind: managed, app: x}
+`,
+			wantErr: "not supported yet",
+		},
+		{
+			name: "docker-compose missing compose_file",
 			yaml: `
 name: x
 model: {path: ` + model + `, alias: x, context: 1024}
 frontend: {kind: docker-compose, app: x}
 `,
-			wantErr: "not supported yet",
+			wantErr: "compose_file is required",
+		},
+		{
+			name: "docker-compose rejects write_file",
+			yaml: `
+name: x
+model: {path: ` + model + `, alias: x, context: 1024}
+frontend:
+  kind: docker-compose
+  app: x
+  compose_file: /tmp/dc.yaml
+  write_file: /tmp/x.json
+`,
+			wantErr: "write_file is only valid for kind=external",
+		},
+		{
+			name: "docker-compose rejects template",
+			yaml: `
+name: x
+model: {path: ` + model + `, alias: x, context: 1024}
+frontend:
+  kind: docker-compose
+  app: x
+  compose_file: /tmp/dc.yaml
+  template: {a: 1}
+`,
+			wantErr: "template is only valid for kind=external",
+		},
+		{
+			name: "docker-compose rejects mcps",
+			yaml: `
+name: x
+model: {path: ` + model + `, alias: x, context: 1024}
+frontend:
+  kind: docker-compose
+  app: x
+  compose_file: /tmp/dc.yaml
+  mcps: [datadog]
+`,
+			wantErr: "mcps is only valid for kind=external",
+		},
+		{
+			name: "docker-compose duplicate service",
+			yaml: `
+name: x
+model: {path: ` + model + `, alias: x, context: 1024}
+frontend:
+  kind: docker-compose
+  app: x
+  compose_file: /tmp/dc.yaml
+  services: [a, b, a]
+`,
+			wantErr: `duplicate "a"`,
+		},
+		{
+			name: "docker-compose wait_for missing url",
+			yaml: `
+name: x
+model: {path: ` + model + `, alias: x, context: 1024}
+frontend:
+  kind: docker-compose
+  app: x
+  compose_file: /tmp/dc.yaml
+  wait_for:
+    - timeout: 5s
+`,
+			wantErr: "wait_for[0].url is required",
+		},
+		{
+			name: "docker-compose bad timeout",
+			yaml: `
+name: x
+model: {path: ` + model + `, alias: x, context: 1024}
+frontend:
+  kind: docker-compose
+  app: x
+  compose_file: /tmp/dc.yaml
+  wait_for:
+    - {url: "http://x/", timeout: nope}
+`,
+			wantErr: "wait_for.timeout",
+		},
+		{
+			name: "external rejects compose_file",
+			yaml: `
+name: x
+model: {path: ` + model + `, alias: x, context: 1024}
+frontend:
+  kind: external
+  app: opencode
+  write_file: /tmp/x
+  template: {a: 1}
+  compose_file: /tmp/dc.yaml
+`,
+			wantErr: "compose_file is only valid for kind=docker-compose",
 		},
 		{
 			name: "duplicate mcp names",
@@ -265,6 +369,58 @@ frontend:
 				t.Errorf("err = %v, want substring %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestLoad_DockerCompose_Valid(t *testing.T) {
+	model := stubModelFile(t)
+	yaml := `
+name: perplexica
+description: research stack
+model:
+  path: ` + model + `
+  alias: m
+  context: 1024
+frontend:
+  kind: docker-compose
+  app: perplexica
+  compose_file: /tmp/dc.yaml
+  project_name: vibe-perplexica
+  services: [searxng, perplexica]
+  wait_for:
+    - url: http://127.0.0.1:3001/
+      timeout: 60s
+    - url: http://127.0.0.1:8080/
+  env:
+    OLLAMA_API_URL: ${VIBE_API}
+`
+	p, err := Load(writeProfile(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Frontend.Kind != FrontendDockerCompose {
+		t.Errorf("kind = %q", p.Frontend.Kind)
+	}
+	if p.Frontend.ComposeFile != "/tmp/dc.yaml" {
+		t.Errorf("compose_file = %q", p.Frontend.ComposeFile)
+	}
+	if p.Frontend.ProjectName != "vibe-perplexica" {
+		t.Errorf("project_name = %q", p.Frontend.ProjectName)
+	}
+	if len(p.Frontend.Services) != 2 || p.Frontend.Services[0] != "searxng" {
+		t.Errorf("services = %v", p.Frontend.Services)
+	}
+	if len(p.Frontend.WaitFor) != 2 {
+		t.Fatalf("wait_for = %v", p.Frontend.WaitFor)
+	}
+	if p.Frontend.WaitFor[0].Timeout != 60*time.Second {
+		t.Errorf("wait_for[0].timeout = %v, want 60s", p.Frontend.WaitFor[0].Timeout)
+	}
+	if p.Frontend.WaitFor[1].Timeout != 0 {
+		t.Errorf("wait_for[1].timeout = %v, want 0 (unset)", p.Frontend.WaitFor[1].Timeout)
+	}
+	if p.Frontend.Env["OLLAMA_API_URL"] != "${VIBE_API}" {
+		t.Errorf("env OLLAMA_API_URL = %q (should be the literal placeholder pre-expansion)", p.Frontend.Env["OLLAMA_API_URL"])
 	}
 }
 

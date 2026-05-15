@@ -1,82 +1,71 @@
-// Package frontend wires up the frontend tool described by a profile. In
-// Phase 1 only the `external` kind is supported: vibe writes a config file
-// for a tool the user launches themselves, plus an env-var advisory.
+// Package frontend wires up the frontend tool described by a profile.
+//
+// Two kinds are supported today:
+//
+//   - external: vibe writes a sidecar config file (e.g. an opencode.json)
+//     and surfaces env-var advisories; the user launches the frontend
+//     themselves. No teardown needed.
+//   - docker-compose: vibe runs `docker compose up -d` against a
+//     user-supplied compose file as part of profile activation, polls any
+//     configured wait_for endpoints, and runs `docker compose down` on
+//     deactivation.
 package frontend
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 
-	"github.com/gallowaysoftware/vibe/internal/vibe/mcp"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 )
 
+// Result describes everything the daemon needs to know after a successful
+// Activate: any file that was written (for diagnostics / `vibe status`),
+// whether the user needs to restart their frontend, the env vars to print,
+// and an optional teardown the daemon must invoke on Stop.
 type Result struct {
 	WroteFile       string
 	RestartRequired bool
 	// Env is the set of env vars the user should set when launching the
 	// external frontend, e.g. OPENCODE_CONFIG=<wrote_file>.
 	Env map[string]string
+
+	// Kind is the frontend kind that produced this Result. Used by
+	// Deactivate to pick a teardown path; not all kinds need one.
+	Kind string
+
+	// teardown, when non-nil, is invoked by Deactivate to undo whatever
+	// Activate did (e.g. `docker compose down`). It must be safe to call
+	// even when the daemon is shutting down on a cancelled context.
+	teardown func(ctx context.Context) error
 }
 
+// Activate brings up the frontend for p. For kind=external, this writes the
+// rendered config file. For kind=docker-compose, this runs `docker compose
+// up -d` and polls wait_for. Callers must call Deactivate on the returned
+// Result when the profile stops.
 func Activate(p *profile.Profile, ctx profile.ExpandContext) (*Result, error) {
+	return ActivateWithContext(context.Background(), p, ctx)
+}
+
+// ActivateWithContext is like Activate but threads a context through to any
+// underlying long-running operations (compose up + wait_for polling).
+func ActivateWithContext(reqCtx context.Context, p *profile.Profile, ctx profile.ExpandContext) (*Result, error) {
 	switch p.Frontend.Kind {
 	case profile.FrontendExternal:
 		return activateExternal(p, ctx)
+	case profile.FrontendDockerCompose:
+		return defaultCompose().Activate(reqCtx, p, ctx)
 	default:
 		return nil, fmt.Errorf("frontend.kind %q is not supported yet", p.Frontend.Kind)
 	}
 }
 
-func activateExternal(p *profile.Profile, ctx profile.ExpandContext) (*Result, error) {
-	// Resolve write_file first; it may reference ${VIBE_STATE_DIR} or other
-	// template variables.
-	resolved, err := profile.ExpandPathString(p.Frontend.WriteFile, ctx)
-	if err != nil {
-		return nil, fmt.Errorf("expand write_file: %w", err)
+// Deactivate runs the teardown attached to r (if any). It is safe to call on
+// a nil Result and on a Result whose Activate path does not need teardown
+// (e.g. external). The provided context bounds the teardown work.
+func Deactivate(ctx context.Context, r *Result) error {
+	if r == nil || r.teardown == nil {
+		return nil
 	}
-	ctx.WriteFile = resolved
-
-	env, err := p.ExpandEnv(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("expand env: %w", err)
-	}
-
-	expanded, err := p.ExpandTemplate(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("expand template: %w", err)
-	}
-
-	if len(p.Frontend.MCPs) > 0 {
-		if _, exists := expanded["mcp"]; exists {
-			return nil, fmt.Errorf("frontend.template already defines top-level %q key; cannot merge with frontend.mcps", "mcp")
-		}
-		specs, err := mcp.LoadMany(p.Frontend.MCPs)
-		if err != nil {
-			return nil, fmt.Errorf("load mcps: %w", err)
-		}
-		mcpBlock := make(map[string]any, len(specs))
-		for name, spec := range specs {
-			mcpBlock[name] = spec
-		}
-		expanded["mcp"] = mcpBlock
-	}
-
-	body, err := json.MarshalIndent(expanded, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("marshal template: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
-		return nil, fmt.Errorf("mkdir for %s: %w", resolved, err)
-	}
-	if err := os.WriteFile(resolved, append(body, '\n'), 0o644); err != nil {
-		return nil, fmt.Errorf("write %s: %w", resolved, err)
-	}
-	return &Result{
-		WroteFile:       resolved,
-		RestartRequired: p.Frontend.RestartRequired,
-		Env:             env,
-	}, nil
+	return r.teardown(ctx)
 }

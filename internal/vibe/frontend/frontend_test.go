@@ -79,9 +79,35 @@ func TestActivate_External_WritesExpandedJSON(t *testing.T) {
 }
 
 func TestActivate_UnsupportedKind(t *testing.T) {
-	p := &profile.Profile{Frontend: profile.Frontend{Kind: profile.FrontendDockerCompose}}
+	p := &profile.Profile{Frontend: profile.Frontend{Kind: profile.FrontendManaged}}
 	if _, err := Activate(p, profile.ExpandContext{}); err == nil {
 		t.Fatal("expected error for unsupported kind")
+	}
+}
+
+// docker-compose + write_file is rejected at profile.Validate() time. Confirm
+// the validation path here so a future refactor doesn't silently lose it.
+func TestValidate_DockerCompose_RejectsWriteFile(t *testing.T) {
+	modelPath := filepath.Join(t.TempDir(), "m.gguf")
+	if err := os.WriteFile(modelPath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := &profile.Profile{
+		Name:  "p",
+		Model: profile.Model{Path: modelPath, Alias: "x", Context: 1, Parallel: 1},
+		Frontend: profile.Frontend{
+			Kind:        profile.FrontendDockerCompose,
+			App:         "x",
+			ComposeFile: "/tmp/dc.yaml",
+			WriteFile:   "/tmp/x.json",
+		},
+	}
+	err := p.Validate()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "write_file") {
+		t.Errorf("err = %v, want mention of write_file", err)
 	}
 }
 
