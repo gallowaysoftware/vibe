@@ -28,6 +28,7 @@ func rootCmd() *cobra.Command {
 		pullCmd(),
 		doctorCmd(),
 		tuiCmd(),
+		profileCmd(),
 	)
 	return root
 }

@@ -1,0 +1,38 @@
+# Starter profile: llama-server backend + managed (native-binary) frontend.
+#
+# This file was dropped by `vibe profile init managed`. Edit the
+# REPLACE-marked lines below, then `vibe start __PROFILE_NAME__`.
+#
+# Note: `frontend.kind: managed` is not yet wired up in vibe — it is a
+# planned third frontend kind that supervises a native binary directly.
+# This template is here so the affordance exists; until the kind ships,
+# `vibe start __PROFILE_NAME__` will reject this profile. Track progress
+# in TODO.md (the "Managed (native-binary) frontends" entry).
+
+name: __PROFILE_NAME__
+description: __PROFILE_NAME__ (llama-server + managed binary)
+
+backend:
+  llama_server:
+    # REPLACE: absolute or ~/-prefixed path to your GGUF model file.
+    path: ~/models/REPLACE-model.gguf
+    # REPLACE: must match the model id llama-server advertises at /v1/models.
+    alias: REPLACE-model-alias
+    context: 32768
+    parallel: 1
+    gpu_layers: 999
+    flash_attn: true
+    jinja: true
+
+frontend:
+  kind: managed
+  # REPLACE: human-readable name of the frontend app (open-webui, ...).
+  app: REPLACE-app-name
+
+  # REPLACE: shape of the managed-frontend block is provisional. When the
+  # `managed` kind lands, expect fields for the binary path, working dir,
+  # environment, and readiness probe. Keep an eye on TODO.md for the final
+  # schema; until then, edit this section to match the released spec.
+
+# REPLACE: approximate VRAM the loaded model needs.
+estimated_vram_gb: 16
