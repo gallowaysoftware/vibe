@@ -21,6 +21,11 @@ func daemonCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			closer, err := daemon.SetupLogging()
+			if err != nil {
+				return err
+			}
+			defer closer.Close()
 			return daemon.New(cfg).Run(ctx)
 		},
 	}

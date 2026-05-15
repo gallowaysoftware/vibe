@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os/exec"
@@ -118,6 +119,9 @@ func (s *Supervisor) Start(ctx context.Context, p *profile.Profile) error {
 	s.logs.Reset()
 	s.mu.Unlock()
 
+	slog.Info("llama-server starting",
+		"binary", s.binary, "pid", cmd.Process.Pid, "addr", s.addr, "model", p.Model.Path)
+
 	go s.pumpLogs(stdout)
 	go s.pumpLogs(stderr)
 	go s.waitExit()
@@ -129,6 +133,8 @@ func (s *Supervisor) Start(ctx context.Context, p *profile.Profile) error {
 	s.mu.Lock()
 	s.state = StateReady
 	s.mu.Unlock()
+	slog.Info("llama-server ready",
+		"addr", s.addr, "elapsed", time.Since(s.started).Round(time.Millisecond))
 	return nil
 }
 
@@ -225,9 +231,15 @@ func (s *Supervisor) waitExit() {
 	err := s.cmd.Wait()
 	s.mu.Lock()
 	s.exitErr = err
+	wasReady := s.state == StateReady
 	s.state = StateExited
 	close(s.stopped)
 	s.mu.Unlock()
+	if err != nil && !wasReady {
+		slog.Error("llama-server exited before ready", "err", err)
+	} else {
+		slog.Info("llama-server exited", "err", err)
+	}
 }
 
 func pickFreePort() (int, error) {

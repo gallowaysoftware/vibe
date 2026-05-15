@@ -1,14 +1,14 @@
 // Package daemon is the long-running supervisor process. It owns the
-// llama-server supervisor and the reverse proxy, and exposes a JSON-over-HTTP
+// llama-server supervisor and the reverse proxy, and exposes a Connect/RPC
 // control plane on both a unix socket (for the local CLI) and a TCP listener
 // on 127.0.0.1 (for vibeclient/vamp).
 package daemon
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,14 +21,17 @@ import (
 	"syscall"
 	"time"
 
+	"connectrpc.com/connect"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"gopkg.in/yaml.v3"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/frontend"
-	"github.com/gallowaysoftware/vibe/internal/vibe/ipc"
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 	"github.com/gallowaysoftware/vibe/internal/vibe/proxy"
 	"github.com/gallowaysoftware/vibe/internal/vibe/supervisor"
+	vibev1 "github.com/gallowaysoftware/vibe/proto/vibe/v1"
+	"github.com/gallowaysoftware/vibe/proto/vibe/v1/vibev1connect"
 )
 
 const (
@@ -81,6 +84,9 @@ type Daemon struct {
 	shutdownOnce sync.Once
 }
 
+// Compile-time check: Daemon implements the Connect service.
+var _ vibev1connect.ControlServiceHandler = (*Daemon)(nil)
+
 func New(cfg Config) *Daemon {
 	return &Daemon{
 		cfg:      cfg,
@@ -90,8 +96,8 @@ func New(cfg Config) *Daemon {
 	}
 }
 
-// Run brings up the proxy and the IPC server, blocking until ctx is canceled.
-// Cleans up the socket and PID file on exit.
+// Run brings up the proxy and both control-plane listeners (unix + TCP),
+// blocking until ctx is canceled or a Shutdown RPC fires.
 func (d *Daemon) Run(ctx context.Context) error {
 	if err := paths.EnsureDirs(); err != nil {
 		return fmt.Errorf("ensure dirs: %w", err)
@@ -101,7 +107,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	sockPath := paths.Socket()
-	_ = os.Remove(sockPath) // stale socket from a hard kill
+	_ = os.Remove(sockPath)
 	unixLn, err := net.Listen("unix", sockPath)
 	if err != nil {
 		return fmt.Errorf("listen unix %s: %w", sockPath, err)
@@ -127,9 +133,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer d.prx.Stop(context.Background())
 
-	handler := d.handler()
-	unixSrv := &http.Server{Handler: handler}
-	httpSrv := &http.Server{Handler: handler}
+	mux := http.NewServeMux()
+	mountPath, connectHandler := vibev1connect.NewControlServiceHandler(d)
+	mux.Handle(mountPath, connectHandler)
+
+	unixSrv := &http.Server{Handler: mux}
+	httpSrv := &http.Server{Handler: mux}
 	errCh := make(chan error, 2)
 	serve := func(srv *http.Server, ln net.Listener) {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -139,16 +148,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go serve(unixSrv, unixLn)
 	go serve(httpSrv, httpLn)
 
+	slog.Info("daemon ready",
+		"unix_socket", sockPath,
+		"http_addr", d.cfg.HTTPAddr,
+		"proxy_addr", fmt.Sprintf("127.0.0.1:%d", d.cfg.ProxyPort),
+		"llama_binary", d.cfg.LlamaBinary)
+
+	var shutReason string
 	select {
 	case <-ctx.Done():
+		shutReason = "context canceled"
 	case <-d.shutdown:
+		shutReason = "shutdown rpc"
 	case err := <-errCh:
+		slog.Error("listener failed", "err", err)
 		return err
 	}
+	slog.Info("daemon shutting down", "reason", shutReason)
 	shCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	// Stop the supervisor unconditionally; if a start is mid-flight the
-	// child process exists and SIGINT will unblock waitReady on the other side.
+	// child exists and SIGINT will unblock waitReady.
 	_ = d.sup.Stop(shCtx)
 	d.prx.SetBackend(nil)
 	_ = unixSrv.Shutdown(shCtx)
@@ -156,72 +176,71 @@ func (d *Daemon) Run(ctx context.Context) error {
 	return nil
 }
 
-func (d *Daemon) handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /start", d.handleStart)
-	mux.HandleFunc("POST /stop", d.handleStop)
-	mux.HandleFunc("POST /shutdown", d.handleShutdown)
-	mux.HandleFunc("GET /status", d.handleStatus)
-	mux.HandleFunc("GET /list", d.handleList)
-	mux.HandleFunc("GET /logs", d.handleLogs)
-	return mux
+// ─── Connect handler methods ────────────────────────────────────────────────
+
+func (d *Daemon) Status(_ context.Context, _ *connect.Request[vibev1.StatusRequest]) (*connect.Response[vibev1.StatusResponse], error) {
+	return connect.NewResponse(&vibev1.StatusResponse{Status: d.protoStatus()}), nil
 }
 
-func (d *Daemon) handleShutdown(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "shutting down"})
-	// Trigger after the response flushes so the client doesn't see EOF.
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		d.shutdownOnce.Do(func() { close(d.shutdown) })
-	}()
+func (d *Daemon) ListProfiles(_ context.Context, _ *connect.Request[vibev1.ListProfilesRequest]) (*connect.Response[vibev1.ListProfilesResponse], error) {
+	dir := paths.ProfilesDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	var out []*vibev1.Profile
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		p, err := profile.Load(path)
+		if err != nil {
+			continue
+		}
+		out = append(out, &vibev1.Profile{Name: p.Name, Description: p.Description, Path: path})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return connect.NewResponse(&vibev1.ListProfilesResponse{Profiles: out}), nil
 }
 
-func (d *Daemon) handleStart(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartRequest]) (*connect.Response[vibev1.StartResponse], error) {
 	if !d.startMu.TryLock() {
-		writeErr(w, http.StatusConflict, errors.New("another start/stop is in progress"))
-		return
+		return nil, connect.NewError(connect.CodeAborted, errors.New("another start/stop is in progress"))
 	}
 	defer d.startMu.Unlock()
 
-	var req ipc.StartRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	if strings.TrimSpace(req.Profile) == "" {
-		writeErr(w, http.StatusBadRequest, errors.New("profile name required"))
-		return
+	profileName := strings.TrimSpace(req.Msg.Profile)
+	if profileName == "" {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("profile name required"))
 	}
 
 	d.mu.Lock()
 	if d.active != nil {
 		name := d.active.Name
 		d.mu.Unlock()
-		writeErr(w, http.StatusConflict, fmt.Errorf("profile %q is already running; stop first", name))
-		return
+		return nil, connect.NewError(connect.CodeAlreadyExists, fmt.Errorf("profile %q is already running; stop first", name))
 	}
 	d.mu.Unlock()
 
-	p, err := loadProfileByName(req.Profile)
+	p, err := loadProfileByName(profileName)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
+		return nil, connect.NewError(connect.CodeNotFound, err)
 	}
 
-	// Long timeout for model loading on first start.
+	slog.Info("starting profile", "profile", p.Name, "alias", p.Model.Alias, "context", p.Model.Context)
 	startCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	if err := d.sup.Start(startCtx, p); err != nil {
-		writeErr(w, http.StatusInternalServerError, fmt.Errorf("start llama-server: %w", err))
-		return
+		slog.Error("supervisor start failed", "profile", p.Name, "err", err)
+		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("start llama-server: %w", err))
 	}
 
 	st := d.sup.Status()
 	backendURL, err := url.Parse(st.Addr)
 	if err != nil {
 		_ = d.sup.Stop(context.Background())
-		writeErr(w, http.StatusInternalServerError, fmt.Errorf("parse backend url: %w", err))
-		return
+		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("parse backend url: %w", err))
 	}
 	d.prx.SetBackend(backendURL)
 
@@ -234,8 +253,7 @@ func (d *Daemon) handleStart(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		_ = d.sup.Stop(context.Background())
 		d.prx.SetBackend(nil)
-		writeErr(w, http.StatusInternalServerError, fmt.Errorf("activate frontend: %w", err))
-		return
+		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("activate frontend: %w", err))
 	}
 
 	d.mu.Lock()
@@ -244,28 +262,42 @@ func (d *Daemon) handleStart(w http.ResponseWriter, r *http.Request) {
 	d.frontend = fr
 	d.mu.Unlock()
 
-	writeJSON(w, http.StatusOK, ipc.StartResponse{
-		Status: d.status(),
-		Frontend: &ipc.FrontendInfo{
+	slog.Info("profile started", "profile", p.Name, "backend", st.Addr, "wrote", fr.WroteFile)
+	return connect.NewResponse(&vibev1.StartResponse{
+		Status: d.protoStatus(),
+		Frontend: &vibev1.FrontendInfo{
 			App:             p.Frontend.App,
 			WroteFile:       fr.WroteFile,
 			RestartRequired: fr.RestartRequired,
 		},
-	})
+	}), nil
 }
 
-func (d *Daemon) handleStop(w http.ResponseWriter, r *http.Request) {
+func (d *Daemon) Stop(ctx context.Context, _ *connect.Request[vibev1.StopRequest]) (*connect.Response[vibev1.StopResponse], error) {
 	if !d.startMu.TryLock() {
-		writeErr(w, http.StatusConflict, errors.New("another start/stop is in progress"))
-		return
+		return nil, connect.NewError(connect.CodeAborted, errors.New("another start/stop is in progress"))
 	}
 	defer d.startMu.Unlock()
-	if err := d.stopActive(r.Context()); err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
+	if err := d.stopActive(ctx); err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
 	}
-	writeJSON(w, http.StatusOK, ipc.StopResponse{Status: d.status()})
+	return connect.NewResponse(&vibev1.StopResponse{Status: d.protoStatus()}), nil
 }
+
+func (d *Daemon) Shutdown(_ context.Context, _ *connect.Request[vibev1.ShutdownRequest]) (*connect.Response[vibev1.ShutdownResponse], error) {
+	go func() {
+		// Trigger after the response flushes.
+		time.Sleep(50 * time.Millisecond)
+		d.shutdownOnce.Do(func() { close(d.shutdown) })
+	}()
+	return connect.NewResponse(&vibev1.ShutdownResponse{}), nil
+}
+
+func (d *Daemon) Logs(_ context.Context, _ *connect.Request[vibev1.LogsRequest]) (*connect.Response[vibev1.LogsResponse], error) {
+	return connect.NewResponse(&vibev1.LogsResponse{Lines: d.sup.Logs()}), nil
+}
+
+// ─── Internals ──────────────────────────────────────────────────────────────
 
 func (d *Daemon) stopActive(ctx context.Context) error {
 	d.mu.Lock()
@@ -274,6 +306,7 @@ func (d *Daemon) stopActive(ctx context.Context) error {
 	if active == nil {
 		return nil
 	}
+	slog.Info("stopping profile", "profile", active.Name)
 	if err := d.sup.Stop(ctx); err != nil {
 		return err
 	}
@@ -285,59 +318,22 @@ func (d *Daemon) stopActive(ctx context.Context) error {
 	return nil
 }
 
-func (d *Daemon) handleStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, d.status())
-}
-
-func (d *Daemon) status() ipc.Status {
+func (d *Daemon) protoStatus() *vibev1.Status {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	st := d.sup.Status()
-	s := ipc.Status{
+	s := &vibev1.Status{
 		Running:     d.active != nil,
 		Ready:       st.State == supervisor.StateReady,
 		BackendAddr: st.Addr,
 		ProxyAddr:   fmt.Sprintf("http://127.0.0.1:%d", d.cfg.ProxyPort),
-		PID:         st.PID,
+		Pid:         int32(st.PID),
 	}
 	if d.active != nil {
 		s.Profile = d.active.Name
-		s.StartedAt = d.startTime
+		s.StartedAt = timestamppb.New(d.startTime)
 	}
 	return s
-}
-
-func (d *Daemon) handleList(w http.ResponseWriter, r *http.Request) {
-	dir := paths.ProfilesDir()
-	entries, err := os.ReadDir(dir)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	var out []ipc.ProfileSummary
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
-			continue
-		}
-		path := filepath.Join(dir, e.Name())
-		p, err := profile.Load(path)
-		if err != nil {
-			continue
-		}
-		out = append(out, ipc.ProfileSummary{Name: p.Name, Description: p.Description, Path: path})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	writeJSON(w, http.StatusOK, ipc.ListResponse{Profiles: out})
-}
-
-func (d *Daemon) handleLogs(w http.ResponseWriter, r *http.Request) {
-	// Phase 1: dump the current log buffer; follow mode lands later.
-	lines := d.sup.Logs()
-	w.Header().Set("Content-Type", "text/plain")
-	for _, l := range lines {
-		w.Write([]byte(l))
-		w.Write([]byte("\n"))
-	}
 }
 
 func loadProfileByName(name string) (*profile.Profile, error) {
@@ -352,8 +348,6 @@ func writePIDFile() error {
 	return os.WriteFile(paths.PIDFile(), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644)
 }
 
-// ensureSingleInstance fails if another daemon is already running. A stale
-// PID file (process gone) is silently cleaned up.
 func ensureSingleInstance() error {
 	data, err := os.ReadFile(paths.PIDFile())
 	if errors.Is(err, os.ErrNotExist) {
@@ -372,14 +366,4 @@ func ensureSingleInstance() error {
 	}
 	_ = os.Remove(paths.PIDFile())
 	return nil
-}
-
-func writeJSON(w http.ResponseWriter, code int, body any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(body)
-}
-
-func writeErr(w http.ResponseWriter, code int, err error) {
-	writeJSON(w, code, ipc.ErrorResponse{Error: err.Error()})
 }

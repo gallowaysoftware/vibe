@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/gallowaysoftware/vibe/internal/vibe/ipc"
 	"github.com/spf13/cobra"
 )
 
@@ -21,15 +20,15 @@ func listCmd() *cobra.Command {
 			if err := ensureDaemon(ctx); err != nil {
 				return err
 			}
-			var resp ipc.ListResponse
-			if err := getJSON(ctx, "/list", &resp); err != nil {
+			profs, err := newClient().ListProfiles(ctx)
+			if err != nil {
 				return err
 			}
-			if len(resp.Profiles) == 0 {
+			if len(profs) == 0 {
 				fmt.Println("no profiles (drop YAML files in ~/.config/vibe/profiles/)")
 				return nil
 			}
-			for _, p := range resp.Profiles {
+			for _, p := range profs {
 				if p.Description != "" {
 					fmt.Printf("%-20s %s\n", p.Name, p.Description)
 				} else {

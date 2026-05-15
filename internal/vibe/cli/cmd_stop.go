@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/gallowaysoftware/vibe/internal/vibe/ipc"
 	"github.com/spf13/cobra"
 )
 
@@ -21,8 +20,7 @@ func stopCmd() *cobra.Command {
 			if err := ensureDaemon(ctx); err != nil {
 				return err
 			}
-			var resp ipc.StopResponse
-			if err := postJSON(ctx, "/stop", nil, &resp); err != nil {
+			if _, err := newClient().Stop(ctx); err != nil {
 				return err
 			}
 			fmt.Println("stopped")

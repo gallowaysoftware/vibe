@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+package vibe.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/gallowaysoftware/vibe/proto/vibe/v1;vibev1";
+
+// ControlService is the vibe daemon's control plane. The OpenAI-compatible
+// inference proxy is a separate REST endpoint (its contract is fixed by
+// upstream); everything here is for lifecycle management.
+service ControlService {
+  // Status returns the daemon's current state.
+  rpc Status(StatusRequest) returns (StatusResponse) {}
+
+  // ListProfiles enumerates the profiles vibe knows about.
+  rpc ListProfiles(ListProfilesRequest) returns (ListProfilesResponse) {}
+
+  // Start activates the named profile. Returns once it's ready (or errors).
+  rpc Start(StartRequest) returns (StartResponse) {}
+
+  // Stop deactivates the currently-active profile. No-op if nothing active.
+  rpc Stop(StopRequest) returns (StopResponse) {}
+
+  // Shutdown asks the daemon to exit gracefully.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse) {}
+
+  // Logs returns the most recent llama-server log lines. Streaming follow is
+  // a future RPC.
+  rpc Logs(LogsRequest) returns (LogsResponse) {}
+}
+
+message Status {
+  bool running = 1;
+  bool ready = 2;
+  string profile = 3;
+  google.protobuf.Timestamp started_at = 4;
+  string backend_addr = 5;
+  string proxy_addr = 6;
+  int32 pid = 7;
+}
+
+message Profile {
+  string name = 1;
+  string description = 2;
+  string path = 3;
+}
+
+message FrontendInfo {
+  string app = 1;
+  string wrote_file = 2;
+  bool restart_required = 3;
+}
+
+message StatusRequest {}
+message StatusResponse {
+  Status status = 1;
+}
+
+message ListProfilesRequest {}
+message ListProfilesResponse {
+  repeated Profile profiles = 1;
+}
+
+message StartRequest {
+  string profile = 1;
+}
+message StartResponse {
+  Status status = 1;
+  FrontendInfo frontend = 2;
+}
+
+message StopRequest {}
+message StopResponse {
+  Status status = 1;
+}
+
+message ShutdownRequest {}
+message ShutdownResponse {}
+
+message LogsRequest {}
+message LogsResponse {
+  repeated string lines = 1;
+}

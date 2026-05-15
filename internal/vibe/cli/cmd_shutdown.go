@@ -19,11 +19,10 @@ func shutdownCmd() *cobra.Command {
 			if ctx == nil {
 				ctx = context.Background()
 			}
-			// Don't auto-spawn just to shut down.
 			if err := pingDaemon(200 * time.Millisecond); err != nil {
 				return errors.New("daemon is not running")
 			}
-			if err := postJSON(ctx, "/shutdown", nil, nil); err != nil {
+			if err := newClient().Shutdown(ctx); err != nil {
 				return err
 			}
 			fmt.Println("daemon shutting down")

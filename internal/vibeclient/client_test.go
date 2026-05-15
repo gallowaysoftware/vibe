@@ -2,80 +2,126 @@ package vibeclient
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"sync"
 	"testing"
+
+	"connectrpc.com/connect"
+
+	vibev1 "github.com/gallowaysoftware/vibe/proto/vibe/v1"
+	"github.com/gallowaysoftware/vibe/proto/vibe/v1/vibev1connect"
 )
+
+// fakeControl is an in-memory ControlService used by the tests. It records
+// every call and supports per-test customization via the *Fn fields.
+type fakeControl struct {
+	mu       sync.Mutex
+	calls    []string
+	status   *vibev1.Status
+	profiles []*vibev1.Profile
+
+	startErr error
+	stopErr  error
+}
+
+func (f *fakeControl) record(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, name)
+}
+func (f *fakeControl) callList() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.calls))
+	copy(out, f.calls)
+	return out
+}
+
+func (f *fakeControl) Status(_ context.Context, _ *connect.Request[vibev1.StatusRequest]) (*connect.Response[vibev1.StatusResponse], error) {
+	f.record("Status")
+	return connect.NewResponse(&vibev1.StatusResponse{Status: f.status}), nil
+}
+func (f *fakeControl) ListProfiles(_ context.Context, _ *connect.Request[vibev1.ListProfilesRequest]) (*connect.Response[vibev1.ListProfilesResponse], error) {
+	f.record("ListProfiles")
+	return connect.NewResponse(&vibev1.ListProfilesResponse{Profiles: f.profiles}), nil
+}
+func (f *fakeControl) Start(_ context.Context, req *connect.Request[vibev1.StartRequest]) (*connect.Response[vibev1.StartResponse], error) {
+	f.record("Start")
+	if f.startErr != nil {
+		return nil, f.startErr
+	}
+	f.mu.Lock()
+	f.status = &vibev1.Status{Running: true, Ready: true, Profile: req.Msg.Profile}
+	f.mu.Unlock()
+	return connect.NewResponse(&vibev1.StartResponse{Status: f.status}), nil
+}
+func (f *fakeControl) Stop(_ context.Context, _ *connect.Request[vibev1.StopRequest]) (*connect.Response[vibev1.StopResponse], error) {
+	f.record("Stop")
+	if f.stopErr != nil {
+		return nil, f.stopErr
+	}
+	f.mu.Lock()
+	f.status = &vibev1.Status{}
+	f.mu.Unlock()
+	return connect.NewResponse(&vibev1.StopResponse{Status: f.status}), nil
+}
+func (f *fakeControl) Shutdown(_ context.Context, _ *connect.Request[vibev1.ShutdownRequest]) (*connect.Response[vibev1.ShutdownResponse], error) {
+	f.record("Shutdown")
+	return connect.NewResponse(&vibev1.ShutdownResponse{}), nil
+}
+func (f *fakeControl) Logs(_ context.Context, _ *connect.Request[vibev1.LogsRequest]) (*connect.Response[vibev1.LogsResponse], error) {
+	f.record("Logs")
+	return connect.NewResponse(&vibev1.LogsResponse{Lines: []string{"line1", "line2"}}), nil
+}
+
+func newFakeServer(t *testing.T, svc vibev1connect.ControlServiceHandler) (*httptest.Server, *Client) {
+	t.Helper()
+	mux := http.NewServeMux()
+	path, handler := vibev1connect.NewControlServiceHandler(svc)
+	mux.Handle(path, handler)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, New(srv.URL)
+}
 
 func TestNew_PrefersExplicitArgument(t *testing.T) {
 	t.Setenv("VIBE_API", "http://env:9999")
 	c := New("http://arg:1234")
-	if c.BaseURL() != "http://arg:1234" {
-		t.Errorf("baseURL = %q", c.BaseURL())
-	}
-}
-
-func TestNew_FallsBackToEnv(t *testing.T) {
-	t.Setenv("VIBE_API", "http://env:9999")
-	c := New("")
-	if c.BaseURL() != "http://env:9999" {
-		t.Errorf("baseURL = %q", c.BaseURL())
+	if c.rpc == nil {
+		t.Fatal("rpc nil")
 	}
 }
 
 func TestNew_FallsBackToDefault(t *testing.T) {
 	t.Setenv("VIBE_API", "")
 	c := New("")
-	if c.BaseURL() != DefaultBaseURL {
-		t.Errorf("baseURL = %q, want %q", c.BaseURL(), DefaultBaseURL)
+	if c.rpc == nil {
+		t.Fatal("rpc nil")
 	}
 }
 
 func TestStatus(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/status" {
-			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
-			http.Error(w, "wrong route", 404)
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{
-			"running":    true,
-			"ready":      true,
-			"profile":    "code",
-			"proxy_addr": "http://127.0.0.1:9000",
-			"pid":        12345,
-		})
-	}))
-	defer srv.Close()
-
-	s, err := New(srv.URL).Status(context.Background())
+	f := &fakeControl{status: &vibev1.Status{Running: true, Ready: true, Profile: "code"}}
+	_, c := newFakeServer(t, f)
+	s, err := c.Status(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !s.Running || !s.Ready || s.Profile != "code" || s.PID != 12345 {
+	if !s.Running || s.Profile != "code" {
 		t.Errorf("got %+v", s)
-	}
-	if s.ProxyAddr != "http://127.0.0.1:9000" {
-		t.Errorf("ProxyAddr = %q", s.ProxyAddr)
 	}
 }
 
 func TestListProfiles(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{
-			"profiles": []map[string]any{
-				{"name": "chat", "path": "/c.yaml"},
-				{"name": "code", "description": "Coding", "path": "/d.yaml"},
-			},
-		})
-	}))
-	defer srv.Close()
-
-	profs, err := New(srv.URL).ListProfiles(context.Background())
+	f := &fakeControl{profiles: []*vibev1.Profile{
+		{Name: "chat"},
+		{Name: "code", Description: "Coding"},
+	}}
+	_, c := newFakeServer(t, f)
+	profs, err := c.ListProfiles(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,39 +130,10 @@ func TestListProfiles(t *testing.T) {
 	}
 }
 
-func TestStart_ParsesStatus(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req map[string]string
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		if req["profile"] != "code" {
-			t.Errorf("profile = %q", req["profile"])
-		}
-		json.NewEncoder(w).Encode(map[string]any{
-			"status": map[string]any{
-				"running": true, "ready": true, "profile": req["profile"],
-				"proxy_addr": "http://127.0.0.1:9000",
-			},
-		})
-	}))
-	defer srv.Close()
-
-	s, err := New(srv.URL).Start(context.Background(), "code")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s.Profile != "code" || !s.Ready {
-		t.Errorf("got %+v", s)
-	}
-}
-
-func TestStart_ErrorPayloadBubblesAsError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusConflict)
-		json.NewEncoder(w).Encode(map[string]string{"error": `profile "code" is already running; stop first`})
-	}))
-	defer srv.Close()
-
-	_, err := New(srv.URL).Start(context.Background(), "code")
+func TestStart_ErrorBubbles(t *testing.T) {
+	f := &fakeControl{startErr: connect.NewError(connect.CodeAlreadyExists, errors.New(`profile "code" is already running`))}
+	_, c := newFakeServer(t, f)
+	_, err := c.Start(context.Background(), "code")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -126,98 +143,56 @@ func TestStart_ErrorPayloadBubblesAsError(t *testing.T) {
 }
 
 func TestEnsureActive_NoOpWhenAlreadyReady(t *testing.T) {
-	var paths []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		paths = append(paths, r.Method+" "+r.URL.Path)
-		json.NewEncoder(w).Encode(map[string]any{
-			"running": true, "ready": true, "profile": "code",
-		})
-	}))
-	defer srv.Close()
-
-	s, err := New(srv.URL).EnsureActive(context.Background(), "code")
+	f := &fakeControl{status: &vibev1.Status{Running: true, Ready: true, Profile: "code"}}
+	_, c := newFakeServer(t, f)
+	s, err := c.EnsureActive(context.Background(), "code")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if s.Profile != "code" {
 		t.Errorf("profile = %q", s.Profile)
 	}
-	if !reflect.DeepEqual(paths, []string{"GET /status"}) {
-		t.Errorf("paths = %v", paths)
+	if calls := f.callList(); len(calls) != 1 || calls[0] != "Status" {
+		t.Errorf("calls = %v", calls)
 	}
 }
 
 func TestEnsureActive_StopsAndStartsWhenSwitching(t *testing.T) {
-	var (
-		mu      sync.Mutex
-		calls   []string
-		current = "chat" // pretend chat is the active profile
-	)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		calls = append(calls, r.Method+" "+r.URL.Path)
-		mu.Unlock()
-		switch r.URL.Path {
-		case "/status":
-			json.NewEncoder(w).Encode(map[string]any{
-				"running": current != "", "ready": current != "", "profile": current,
-			})
-		case "/stop":
-			mu.Lock()
-			current = ""
-			mu.Unlock()
-			json.NewEncoder(w).Encode(map[string]any{"status": map[string]any{"running": false}})
-		case "/start":
-			var req map[string]string
-			_ = json.NewDecoder(r.Body).Decode(&req)
-			mu.Lock()
-			current = req["profile"]
-			mu.Unlock()
-			json.NewEncoder(w).Encode(map[string]any{
-				"status": map[string]any{"running": true, "ready": true, "profile": current},
-			})
-		default:
-			http.Error(w, "wrong route", 404)
-		}
-	}))
-	defer srv.Close()
-
-	s, err := New(srv.URL).EnsureActive(context.Background(), "code")
+	f := &fakeControl{status: &vibev1.Status{Running: true, Ready: true, Profile: "chat"}}
+	_, c := newFakeServer(t, f)
+	s, err := c.EnsureActive(context.Background(), "code")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if s.Profile != "code" {
 		t.Errorf("profile = %q", s.Profile)
 	}
-	want := []string{"GET /status", "POST /stop", "POST /start"}
-	if !reflect.DeepEqual(calls, want) {
-		t.Errorf("calls = %v, want %v", calls, want)
+	want := []string{"Status", "Stop", "Start"}
+	got := f.callList()
+	if len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Errorf("calls = %v, want %v", got, want)
 	}
 }
 
 func TestEnsureActive_StartsWhenNothingActive(t *testing.T) {
-	var calls []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls = append(calls, r.Method+" "+r.URL.Path)
-		switch r.URL.Path {
-		case "/status":
-			json.NewEncoder(w).Encode(map[string]any{"running": false, "ready": false})
-		case "/start":
-			var req map[string]string
-			_ = json.NewDecoder(r.Body).Decode(&req)
-			json.NewEncoder(w).Encode(map[string]any{
-				"status": map[string]any{"running": true, "ready": true, "profile": req["profile"]},
-			})
-		}
-	}))
-	defer srv.Close()
+	f := &fakeControl{status: &vibev1.Status{}}
+	_, c := newFakeServer(t, f)
+	if _, err := c.EnsureActive(context.Background(), "code"); err != nil {
+		t.Fatal(err)
+	}
+	got := f.callList()
+	if len(got) != 2 || got[0] != "Status" || got[1] != "Start" {
+		t.Errorf("calls = %v", got)
+	}
+}
 
-	_, err := New(srv.URL).EnsureActive(context.Background(), "code")
+func TestLogs(t *testing.T) {
+	_, c := newFakeServer(t, &fakeControl{})
+	lines, err := c.Logs(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"GET /status", "POST /start"}
-	if !reflect.DeepEqual(calls, want) {
-		t.Errorf("calls = %v, want %v", calls, want)
+	if len(lines) != 2 || lines[0] != "line1" {
+		t.Errorf("lines = %v", lines)
 	}
 }

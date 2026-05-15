@@ -2,9 +2,7 @@ package cli
 
 import (
 	"context"
-	"io"
-	"net/http"
-	"os"
+	"fmt"
 
 	"github.com/spf13/cobra"
 )
@@ -22,17 +20,14 @@ func logsCmd() *cobra.Command {
 			if err := ensureDaemon(ctx); err != nil {
 				return err
 			}
-			req, err := http.NewRequestWithContext(ctx, "GET", "http://unix/logs", nil)
+			lines, err := newClient().Logs(ctx)
 			if err != nil {
 				return err
 			}
-			resp, err := newHTTPClient().Do(req)
-			if err != nil {
-				return err
+			for _, l := range lines {
+				fmt.Println(l)
 			}
-			defer resp.Body.Close()
-			_, err = io.Copy(os.Stdout, resp.Body)
-			return err
+			return nil
 		},
 	}
 }

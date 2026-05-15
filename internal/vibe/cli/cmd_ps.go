@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gallowaysoftware/vibe/internal/vibe/ipc"
 	"github.com/spf13/cobra"
 )
 
@@ -22,8 +21,8 @@ func psCmd() *cobra.Command {
 			if err := ensureDaemon(ctx); err != nil {
 				return err
 			}
-			var s ipc.Status
-			if err := getJSON(ctx, "/status", &s); err != nil {
+			s, err := newClient().Status(ctx)
+			if err != nil {
 				return err
 			}
 			if !s.Running {
@@ -35,13 +34,13 @@ func psCmd() *cobra.Command {
 				ready = "ready"
 			}
 			fmt.Printf("profile:  %s (%s)\n", s.Profile, ready)
-			if !s.StartedAt.IsZero() {
-				fmt.Printf("uptime:   %s\n", time.Since(s.StartedAt).Round(time.Second))
+			if s.StartedAt != nil {
+				fmt.Printf("uptime:   %s\n", time.Since(s.StartedAt.AsTime()).Round(time.Second))
 			}
 			fmt.Printf("backend:  %s\n", s.BackendAddr)
 			fmt.Printf("proxy:    %s\n", s.ProxyAddr)
-			if s.PID != 0 {
-				fmt.Printf("pid:      %d\n", s.PID)
+			if s.Pid != 0 {
+				fmt.Printf("pid:      %d\n", s.Pid)
 			}
 			return nil
 		},

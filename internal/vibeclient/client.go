@@ -1,31 +1,34 @@
-// Package vibeclient is the typed Go SDK for vibe's HTTP control plane. It is
-// scoped to profile lifecycle (start/stop/status); inference is OpenAI-
-// compatible HTTP at Status.ProxyAddr, which callers hit directly with the
-// HTTP client of their choice.
+// Package vibeclient is the typed Go SDK for vibe's Connect/RPC control
+// plane. It is scoped to profile lifecycle (start/stop/status); inference is
+// OpenAI-compatible HTTP at Status.ProxyAddr, which callers hit directly.
 package vibeclient
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
 	"net/http"
 	"os"
-	"time"
+
+	"connectrpc.com/connect"
+
+	vibev1 "github.com/gallowaysoftware/vibe/proto/vibe/v1"
+	"github.com/gallowaysoftware/vibe/proto/vibe/v1/vibev1connect"
 )
 
 const DefaultBaseURL = "http://127.0.0.1:9001"
 
 type Client struct {
-	baseURL string
-	hc      *http.Client
+	rpc vibev1connect.ControlServiceClient
 }
 
-// New returns a client targeting vibe's HTTP control plane. baseURL is the
-// first non-empty of: the argument, $VIBE_API, DefaultBaseURL.
+// New returns a Client targeting vibe's control plane. baseURL is the first
+// non-empty of: argument, $VIBE_API, DefaultBaseURL.
 func New(baseURL string) *Client {
+	return NewWithHTTPClient(baseURL, http.DefaultClient)
+}
+
+// NewWithHTTPClient is for callers who need to control the transport — e.g.
+// the vibe CLI, which dials a unix socket instead of TCP.
+func NewWithHTTPClient(baseURL string, hc *http.Client) *Client {
 	if baseURL == "" {
 		baseURL = os.Getenv("VIBE_API")
 	}
@@ -33,123 +36,78 @@ func New(baseURL string) *Client {
 		baseURL = DefaultBaseURL
 	}
 	return &Client{
-		baseURL: baseURL,
-		hc:      &http.Client{}, // no timeout; Start can take minutes for cold model loads
+		rpc: vibev1connect.NewControlServiceClient(hc, baseURL),
 	}
 }
 
-// BaseURL returns the configured control-plane address.
-func (c *Client) BaseURL() string { return c.baseURL }
-
-// Status mirrors vibe's status payload. The fields are duplicated here (rather
-// than re-exporting internal/vibe/ipc) so external callers can depend on this
-// package alone.
-type Status struct {
-	Running     bool      `json:"running"`
-	Ready       bool      `json:"ready"`
-	Profile     string    `json:"profile,omitempty"`
-	StartedAt   time.Time `json:"started_at,omitempty"`
-	BackendAddr string    `json:"backend_addr,omitempty"`
-	ProxyAddr   string    `json:"proxy_addr,omitempty"`
-	PID         int       `json:"pid,omitempty"`
-}
-
-type Profile struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-	Path        string `json:"path"`
-}
-
-func (c *Client) Status(ctx context.Context) (*Status, error) {
-	var s Status
-	if err := c.do(ctx, http.MethodGet, "/status", nil, &s); err != nil {
+func (c *Client) Status(ctx context.Context) (*vibev1.Status, error) {
+	resp, err := c.rpc.Status(ctx, connect.NewRequest(&vibev1.StatusRequest{}))
+	if err != nil {
 		return nil, err
 	}
-	return &s, nil
+	return resp.Msg.Status, nil
 }
 
-func (c *Client) ListProfiles(ctx context.Context) ([]Profile, error) {
-	var resp struct {
-		Profiles []Profile `json:"profiles"`
-	}
-	if err := c.do(ctx, http.MethodGet, "/list", nil, &resp); err != nil {
+func (c *Client) ListProfiles(ctx context.Context) ([]*vibev1.Profile, error) {
+	resp, err := c.rpc.ListProfiles(ctx, connect.NewRequest(&vibev1.ListProfilesRequest{}))
+	if err != nil {
 		return nil, err
 	}
-	return resp.Profiles, nil
+	return resp.Msg.Profiles, nil
 }
 
-func (c *Client) Start(ctx context.Context, profile string) (*Status, error) {
-	var resp struct {
-		Status Status `json:"status"`
-	}
-	body := map[string]string{"profile": profile}
-	if err := c.do(ctx, http.MethodPost, "/start", body, &resp); err != nil {
+type StartResult struct {
+	Status   *vibev1.Status
+	Frontend *vibev1.FrontendInfo
+}
+
+func (c *Client) Start(ctx context.Context, profile string) (*StartResult, error) {
+	resp, err := c.rpc.Start(ctx, connect.NewRequest(&vibev1.StartRequest{Profile: profile}))
+	if err != nil {
 		return nil, err
 	}
-	return &resp.Status, nil
+	return &StartResult{Status: resp.Msg.Status, Frontend: resp.Msg.Frontend}, nil
 }
 
-func (c *Client) Stop(ctx context.Context) error {
-	return c.do(ctx, http.MethodPost, "/stop", nil, nil)
+func (c *Client) Stop(ctx context.Context) (*vibev1.Status, error) {
+	resp, err := c.rpc.Stop(ctx, connect.NewRequest(&vibev1.StopRequest{}))
+	if err != nil {
+		return nil, err
+	}
+	return resp.Msg.Status, nil
 }
 
 func (c *Client) Shutdown(ctx context.Context) error {
-	return c.do(ctx, http.MethodPost, "/shutdown", nil, nil)
+	_, err := c.rpc.Shutdown(ctx, connect.NewRequest(&vibev1.ShutdownRequest{}))
+	return err
+}
+
+func (c *Client) Logs(ctx context.Context) ([]string, error) {
+	resp, err := c.rpc.Logs(ctx, connect.NewRequest(&vibev1.LogsRequest{}))
+	if err != nil {
+		return nil, err
+	}
+	return resp.Msg.Lines, nil
 }
 
 // EnsureActive returns immediately if `profile` is already the active, ready
-// profile. Otherwise it stops any active profile and starts `profile`. The
-// returned Status is the post-condition.
-func (c *Client) EnsureActive(ctx context.Context, profile string) (*Status, error) {
+// profile. Otherwise it stops any active profile and starts `profile`.
+func (c *Client) EnsureActive(ctx context.Context, profile string) (*vibev1.Status, error) {
 	s, err := c.Status(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("status: %w", err)
+		return nil, err
 	}
 	if s.Running && s.Ready && s.Profile == profile {
 		return s, nil
 	}
 	if s.Running {
-		if err := c.Stop(ctx); err != nil {
-			return nil, fmt.Errorf("stop %q before switching to %q: %w", s.Profile, profile, err)
+		if _, err := c.Stop(ctx); err != nil {
+			return nil, err
 		}
 	}
-	return c.Start(ctx, profile)
-}
-
-func (c *Client) do(ctx context.Context, method, path string, in, out any) error {
-	var body io.Reader
-	if in != nil {
-		b, err := json.Marshal(in)
-		if err != nil {
-			return err
-		}
-		body = bytes.NewReader(b)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
+	r, err := c.Start(ctx, profile)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if in != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := c.hc.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		var e struct {
-			Error string `json:"error"`
-		}
-		_ = json.NewDecoder(resp.Body).Decode(&e)
-		if e.Error == "" {
-			e.Error = resp.Status
-		}
-		return errors.New(e.Error)
-	}
-	if out == nil {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return nil
-	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return r.Status, nil
 }
