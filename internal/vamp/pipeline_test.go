@@ -61,7 +61,8 @@ stages:
   - id: hooks
     capability: r
     inputs: [titles]
-    foreach: "{{.stages.titles.output}}"
+    foreach:
+      from: titles
     prompt: "hook for {{.item}}"
     output: "hooks/{{.item | slugify}}.md"
 `
@@ -70,15 +71,48 @@ stages:
 		t.Fatal(err)
 	}
 	hooks := p.Stages[1]
-	if hooks.Foreach == "" {
-		t.Errorf("foreach was not parsed: %+v", hooks)
+	if hooks.Foreach == nil {
+		t.Fatalf("foreach was not parsed: %+v", hooks)
 	}
-	if hooks.ForeachAs != DefaultForeachAs {
-		t.Errorf("foreach_as default = %q, want %q", hooks.ForeachAs, DefaultForeachAs)
+	if hooks.Foreach.From != "titles" {
+		t.Errorf("foreach.from = %q, want titles", hooks.Foreach.From)
+	}
+	if hooks.Foreach.Var != DefaultForeachVar {
+		t.Errorf("foreach.var default = %q, want %q", hooks.Foreach.Var, DefaultForeachVar)
 	}
 }
 
-func TestLoadPipeline_ForeachAsExplicit(t *testing.T) {
+func TestLoadPipeline_ForeachVarExplicit(t *testing.T) {
+	yaml := `
+name: fan
+stages:
+  - id: titles
+    capability: r
+    prompt: list
+    output: titles.json
+    output_format: json
+  - id: hooks
+    capability: r
+    inputs: [titles]
+    foreach:
+      from: titles
+      var: title
+    prompt: "hook for {{.title}}"
+    output: "hooks/{{.title | slugify}}.md"
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := p.Stages[1].Foreach.Var; got != "title" {
+		t.Errorf("foreach.var = %q, want title", got)
+	}
+}
+
+// Legacy string-form foreach must be rejected with a migration hint pointing
+// users at the new structured syntax. We check both the old templated string
+// (cannot unmarshal into ForeachSpec) and the dangling foreach_as field path.
+func TestLoadPipeline_RejectsLegacyForeachString(t *testing.T) {
 	yaml := `
 name: fan
 stages:
@@ -91,16 +125,42 @@ stages:
     capability: r
     inputs: [titles]
     foreach: "{{.stages.titles.output}}"
+    prompt: "hook for {{.item}}"
+    output: "hooks/{{.item | slugify}}.md"
+`
+	_, err := LoadPipeline(writePipeline(t, yaml))
+	if err == nil {
+		t.Fatal("expected legacy foreach-string to be rejected")
+	}
+	if !strings.Contains(err.Error(), "foreach syntax changed") &&
+		!strings.Contains(err.Error(), "foreach:\n    from:") {
+		t.Errorf("expected migration hint in error, got: %v", err)
+	}
+}
+
+func TestLoadPipeline_RejectsLegacyForeachAs(t *testing.T) {
+	yaml := `
+name: fan
+stages:
+  - id: titles
+    capability: r
+    prompt: list
+    output: titles.json
+    output_format: json
+  - id: hooks
+    capability: r
+    inputs: [titles]
     foreach_as: title
     prompt: "hook for {{.title}}"
     output: "hooks/{{.title | slugify}}.md"
 `
-	p, err := LoadPipeline(writePipeline(t, yaml))
-	if err != nil {
-		t.Fatal(err)
+	_, err := LoadPipeline(writePipeline(t, yaml))
+	if err == nil {
+		t.Fatal("expected legacy foreach_as to be rejected")
 	}
-	if got := p.Stages[1].ForeachAs; got != "title" {
-		t.Errorf("foreach_as = %q, want title", got)
+	if !strings.Contains(err.Error(), "foreach syntax changed") &&
+		!strings.Contains(err.Error(), "foreach_as") {
+		t.Errorf("expected migration hint in error, got: %v", err)
 	}
 }
 
@@ -254,29 +314,55 @@ stages:
 			wantErr: "output_format",
 		},
 		{
-			name: "foreach_as without foreach",
+			name: "foreach missing from",
+			yaml: `name: x
+stages:
+- id: src
+  capability: r
+  prompt: hi
+  output: src.json
+  output_format: json
+- id: a
+  capability: r
+  prompt: hi
+  inputs: [src]
+  output: "out/{{.item}}.md"
+  foreach:
+    var: item`,
+			wantErr: "foreach.from is required",
+		},
+		{
+			name: "foreach.from dangling reference",
 			yaml: `name: x
 stages:
 - id: a
   capability: r
   prompt: hi
-  output: a.md
-  foreach_as: title`,
-			wantErr: "foreach_as set without foreach",
+  inputs: [ghost]
+  output: "out/{{.item}}.md"
+  foreach:
+    from: ghost`,
+			wantErr: `input "ghost" does not reference`,
 		},
 		{
-			name: "foreach without inputs",
+			name: "foreach.from not in inputs",
 			yaml: `name: x
 stages:
+- id: src
+  capability: r
+  prompt: hi
+  output: src.json
+  output_format: json
 - id: a
   capability: r
   prompt: hi
   output: "out/{{.item}}.md"
-  foreach: "{{.stages.b.output}}"`,
-			wantErr: "foreach stages must declare an input",
+  foreach:
+    from: src`,
+			wantErr: "must also appear in inputs",
 		},
 		{
-			name: "foreach with non-json input",
+			name: "foreach with non-json upstream",
 			yaml: `name: x
 stages:
 - id: src
@@ -288,7 +374,8 @@ stages:
   prompt: hi
   inputs: [src]
   output: "out/{{.item}}.md"
-  foreach: "{{.stages.src.output}}"`,
+  foreach:
+    from: src`,
 			wantErr: "output_format: json",
 		},
 		{
@@ -305,7 +392,8 @@ stages:
   prompt: hi
   inputs: [src]
   output: out.md
-  foreach: "{{.stages.src.output}}"`,
+  foreach:
+    from: src`,
 			wantErr: "templated output path",
 		},
 	}
