@@ -550,11 +550,10 @@ func TestExecutor_ForeachFansOut(t *testing.T) {
 			},
 			{
 				ID: "consumer", Capability: "reasoning",
-				Inputs:    []string{"titles"},
-				Foreach:   "{{.stages.titles.output}}",
-				ForeachAs: "title",
-				Prompt:    "UP:{{.title}}",
-				Output:    "items/{{.title | slugify}}.txt",
+				Inputs:  []string{"titles"},
+				Foreach: &ForeachSpec{From: "titles", Var: "title"},
+				Prompt:  "UP:{{.title}}",
+				Output:  "items/{{.title | slugify}}.txt",
 			},
 			{
 				ID: "joiner", Capability: "reasoning",
@@ -618,7 +617,7 @@ func TestExecutor_ForeachParseError(t *testing.T) {
 			{
 				ID: "consumer", Capability: "reasoning",
 				Inputs:  []string{"src"},
-				Foreach: "{{.stages.src.output}}",
+				Foreach: &ForeachSpec{From: "src", Var: "item"},
 				Prompt:  "irrelevant",
 				Output:  "out/{{.item}}.txt",
 			},
@@ -655,11 +654,10 @@ func TestExecutor_ForeachOutputCollision(t *testing.T) {
 			{ID: "src", Capability: "reasoning", Prompt: "PRODUCE", Output: "src.json", OutputFormat: "json"},
 			{
 				ID: "consumer", Capability: "reasoning",
-				Inputs:    []string{"src"},
-				Foreach:   "{{.stages.src.output}}",
-				ForeachAs: "title",
-				Prompt:    "hi {{.title}}",
-				Output:    "out/{{.title | slugify}}.txt",
+				Inputs:  []string{"src"},
+				Foreach: &ForeachSpec{From: "src", Var: "title"},
+				Prompt:  "hi {{.title}}",
+				Output:  "out/{{.title | slugify}}.txt",
 			},
 		},
 	}

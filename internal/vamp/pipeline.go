@@ -35,16 +35,26 @@ type Stage struct {
 	Output       string         `yaml:"output"`
 	OutputFormat string         `yaml:"output_format,omitempty"` // "" | "json"
 	Params       map[string]any `yaml:"params,omitempty"`        // merged into the chat-completion body
-	// Foreach, when non-empty, makes this a fan-out stage. The template is
-	// rendered once against the executor's normal template data; the
-	// resulting string must parse as a JSON array of scalars (string/number/
-	// bool) or objects. The stage then runs once per array element, in
-	// parallel, sharing the same profile activation. Foreach requires at
-	// least one entry in Inputs whose upstream stage has output_format: json.
-	Foreach string `yaml:"foreach,omitempty"`
-	// ForeachAs is the template variable name bound to the current item
-	// while rendering Prompt/Output for a foreach stage. Defaults to "item".
-	ForeachAs string `yaml:"foreach_as,omitempty"`
+	// Foreach, when non-nil, makes this a fan-out stage. The upstream stage
+	// referenced by From must produce output_format: json and its output must
+	// parse as a JSON array (or {"items":[...]} convenience wrap). The stage
+	// then runs once per array element, in parallel, sharing the same profile
+	// activation. The per-item value is bound under Foreach.Var in the
+	// template namespace (defaults to "item").
+	Foreach *ForeachSpec `yaml:"foreach,omitempty"`
+}
+
+// ForeachSpec is the structured fan-out descriptor for a stage. The previous
+// Phase 1 form was a free-form template string plus a separate foreach_as
+// field; this form ties the iteration directly to a declared upstream stage,
+// which keeps Phase 2 (non-LLM stages) honest about its dependencies.
+type ForeachSpec struct {
+	// From is the id of the upstream stage whose JSON-array output drives the
+	// fan-out. Must appear in the consuming stage's Inputs list.
+	From string `yaml:"from"`
+	// Var is the template variable name bound to each item while rendering
+	// Prompt/Output. Defaults to "item" when empty.
+	Var string `yaml:"var,omitempty"`
 }
 
 var (
@@ -65,7 +75,7 @@ func LoadPipeline(path string) (*Pipeline, error) {
 	dec.KnownFields(true)
 	var p Pipeline
 	if err := dec.Decode(&p); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+		return nil, migrateForeachError(fmt.Errorf("parse %s: %w", path, err))
 	}
 	if err := p.Validate(); err != nil {
 		return nil, fmt.Errorf("validate %s: %w", path, err)
@@ -73,9 +83,28 @@ func LoadPipeline(path string) (*Pipeline, error) {
 	return &p, nil
 }
 
-// DefaultForeachAs is the template variable name bound to each item of a
-// foreach stage's array when ForeachAs is unset.
-const DefaultForeachAs = "item"
+// DefaultForeachVar is the template variable name bound to each item of a
+// foreach stage's array when ForeachSpec.Var is unset.
+const DefaultForeachVar = "item"
+
+// migrateForeachError annotates the YAML decode error with a migration hint
+// when the failure is most likely caused by a pipeline still using the old
+// Phase 1 foreach syntax (string template + separate foreach_as). YAML's
+// strict-field mode rejects the legacy syntax with a generic "cannot unmarshal
+// !!str into vamp.ForeachSpec" / "field foreach_as not found" message;
+// rewriting that to point at the new form saves users the dig.
+func migrateForeachError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "foreach_as") ||
+		strings.Contains(msg, "into vamp.ForeachSpec") ||
+		strings.Contains(msg, "cannot unmarshal !!str into") {
+		return fmt.Errorf("%w\n\nhint: the foreach syntax changed. Replace:\n  foreach: \"{{.stages.X.output}}\"\n  foreach_as: var\nwith:\n  foreach:\n    from: X\n    var: var", err)
+	}
+	return err
+}
 
 func (p *Pipeline) Validate() error {
 	if p.Name == "" {
@@ -127,27 +156,28 @@ func (p *Pipeline) Validate() error {
 		if s.OutputFormat != "" && s.OutputFormat != "json" {
 			return fmt.Errorf("%s: output_format %q is not supported (allowed: \"\", json)", ctx, s.OutputFormat)
 		}
-		// foreach_as without foreach is meaningless and indicates a typo.
-		if s.ForeachAs != "" && s.Foreach == "" {
-			return fmt.Errorf("%s: foreach_as set without foreach", ctx)
-		}
-		// foreach stages must use a templated output path so per-item runs
-		// don't collide on the same file. We treat the presence of "{{" as
-		// the templated marker; that's the same syntax users see in YAML.
-		if s.Foreach != "" && !strings.Contains(s.Output, "{{") {
-			return fmt.Errorf("%s: foreach stages require a templated output path (contains {{...}}) so per-item writes don't collide", ctx)
-		}
-		// Default ForeachAs to "item" so the executor can rely on the field
-		// being set whenever Foreach is. We mutate the stage in place to
-		// keep downstream code simple.
-		if s.Foreach != "" && s.ForeachAs == "" {
-			p.Stages[i].ForeachAs = DefaultForeachAs
+		if s.Foreach != nil {
+			if s.Foreach.From == "" {
+				return fmt.Errorf("%s: foreach.from is required", ctx)
+			}
+			// foreach stages must use a templated output path so per-item runs
+			// don't collide on the same file. We treat the presence of "{{" as
+			// the templated marker; that's the same syntax users see in YAML.
+			if !strings.Contains(s.Output, "{{") {
+				return fmt.Errorf("%s: foreach stages require a templated output path (contains {{...}}) so per-item writes don't collide", ctx)
+			}
+			// Default Var to "item" so the executor can rely on the field
+			// being set whenever Foreach is. We mutate the stage in place to
+			// keep downstream code simple.
+			if s.Foreach.Var == "" {
+				p.Stages[i].Foreach.Var = DefaultForeachVar
+			}
 		}
 	}
 	// Second pass: every input must reference a declared stage, and no stage
-	// may depend on itself. For foreach stages we additionally require at
-	// least one input stage with output_format: json (the source of the
-	// fan-out array).
+	// may depend on itself. For foreach stages we additionally require the
+	// upstream named in foreach.from to be declared as an input and to emit
+	// output_format: json.
 	for _, s := range p.Stages {
 		ctx := fmt.Sprintf("stage %s", s.ID)
 		for _, dep := range s.Inputs {
@@ -158,27 +188,37 @@ func (p *Pipeline) Validate() error {
 				return fmt.Errorf("%s: input %q does not reference any declared stage", ctx, dep)
 			}
 		}
-		if s.Foreach != "" {
-			if len(s.Inputs) == 0 {
-				return fmt.Errorf("%s: foreach stages must declare an input referencing the JSON-emitting upstream stage", ctx)
+		if s.Foreach != nil {
+			from := s.Foreach.From
+			if !seenStages[from] {
+				return fmt.Errorf("%s: foreach.from %q does not reference any declared stage", ctx, from)
 			}
-			// At least one input must produce JSON. We don't require all of
-			// them to be JSON (downstream might also reference plain-text
-			// stages), only that the array source is unambiguous.
-			hasJSONSource := false
+			// Require an explicit declaration in Inputs. Auto-adding would
+			// hide a real misconfiguration (e.g. typos in the inputs list,
+			// or a user forgetting that the upstream needs to complete before
+			// this stage runs); an explicit list keeps the DAG honest and the
+			// error easier to diagnose.
+			declared := false
 			for _, dep := range s.Inputs {
-				for _, other := range p.Stages {
-					if other.ID == dep && other.OutputFormat == "json" {
-						hasJSONSource = true
-						break
-					}
+				if dep == from {
+					declared = true
+					break
 				}
-				if hasJSONSource {
+			}
+			if !declared {
+				return fmt.Errorf("%s: foreach.from %q must also appear in inputs", ctx, from)
+			}
+			// The named upstream must produce JSON; otherwise the rendered
+			// foreach source can't be parsed as an array.
+			hasJSONSource := false
+			for _, other := range p.Stages {
+				if other.ID == from && other.OutputFormat == "json" {
+					hasJSONSource = true
 					break
 				}
 			}
 			if !hasJSONSource {
-				return fmt.Errorf("%s: foreach requires at least one input stage with output_format: json", ctx)
+				return fmt.Errorf("%s: foreach.from %q must reference a stage with output_format: json", ctx, from)
 			}
 		}
 	}

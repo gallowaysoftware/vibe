@@ -28,6 +28,60 @@ import (
 // accumulated content.
 type InferenceFunc func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error)
 
+// StageType selects which executor handles a stage. Empty defaults to text.
+type StageType string
+
+const (
+	// StageTypeText is the LLM chat-completion stage type. Empty Stage.Type
+	// (the only kind in Phase 1) is treated as this in Run.
+	StageTypeText StageType = "text"
+	// StageTypeComfyUI = "comfyui"  // Phase 2 follow-up; not in this PR
+)
+
+// StageExecutor implements the run of a single stage instance. The receiver
+// is shared across stages of the same type, so any per-stage state belongs
+// in StageInput, not on the executor.
+type StageExecutor interface {
+	Execute(ctx context.Context, in StageInput) (*StageOutput, error)
+}
+
+// StageInput is the per-invocation packet handed to a StageExecutor. For
+// foreach stages the runner calls Execute once per item with Item / ItemIdx
+// bound; for ordinary stages Item is nil and ItemIdx is 0.
+//
+// BaseURL and ModelID are populated by the DAG scheduler from the active
+// profile; they are only meaningful for stage types that talk to vibe's
+// inference endpoint (today, the text executor). PipelineDir is the
+// directory the pipeline YAML was loaded from, used to resolve relative
+// prompt_file paths.
+type StageInput struct {
+	Stage       *Stage
+	Inputs      map[string]string       // CLI inputs
+	Prior       map[string]*stageResult // outputs of already-completed stages
+	RunDir      string
+	PipelineDir string
+	Log         io.Writer          // for token streaming when group size == 1
+	Vibe        *vibeclient.Client // available to TextExecutor
+	Item        any                // foreach item bound here (nil when not in a foreach)
+	ItemIdx     int                // foreach index (0 when not in a foreach)
+
+	// BaseURL is the inference root for this invocation (e.g.
+	// http://127.0.0.1:9000); /v1 is NOT included. Populated by the
+	// scheduler from the currently-active vibe profile.
+	BaseURL string
+	// ModelID is the chat-completion model id for this invocation, resolved
+	// once per profile activation and cached.
+	ModelID string
+}
+
+// StageOutput is what an executor returns for ONE invocation (one item if
+// foreach). The DAG runner aggregates per-item outputs into the existing
+// stageResult{Output, Outputs} shape; executors don't need to know about that.
+type StageOutput struct {
+	Text  string   // for text stages
+	Files []string // for binary outputs (Phase 2+); paths relative to RunDir
+}
+
 // stageResult holds the output(s) of a completed stage. For ordinary stages
 // only Output is meaningful; for foreach stages Outputs holds the per-item
 // content in input-array order and Output is a deterministic newline-joined
@@ -57,6 +111,10 @@ type Executor struct {
 	// stage outputs land contiguously even when status lines from the
 	// scheduler are interleaved.
 	logMu sync.Mutex
+
+	// registry maps StageType -> executor. Built once in Run and shared by
+	// every stage; per-stage state must travel via StageInput.
+	registry map[StageType]StageExecutor
 }
 
 func defaultInference() InferenceFunc {
@@ -78,6 +136,12 @@ func (e *Executor) Run(ctx context.Context) error {
 	}
 	if err := e.snapshot(); err != nil {
 		return fmt.Errorf("snapshot run inputs: %w", err)
+	}
+
+	// Build the per-type executor registry. Today only text stages exist;
+	// new types (comfyui, etc.) register here in Phase 2.
+	e.registry = map[StageType]StageExecutor{
+		StageTypeText: &textExecutor{inference: e.Inference},
 	}
 
 	// Stage lookup and dependency counts for wave-based scheduling.
@@ -216,50 +280,43 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 	return errors.Join(errs...)
 }
 
-// executeStage runs a single stage. For ordinary stages this renders the
-// prompt, calls inference (with tokens streamed either to tokenSink, when
-// non-nil, or directly to Log when nil), validates the output, and writes it
-// to disk. For foreach stages it fans out one inference per item in the
-// resolved JSON array, runs them in parallel against the same profile, and
-// aggregates the per-item outputs.
+// executeStage runs a single stage. For ordinary stages it invokes the
+// registered StageExecutor once and stores its output; for foreach stages it
+// fans out one Execute call per JSON-array item, runs them in parallel against
+// the same profile activation, and aggregates the per-item outputs.
 func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID string, tokenSink io.Writer) error {
-	if st.Foreach != "" {
-		return e.executeForeachStage(ctx, st, baseURL, modelID, tokenSink)
-	}
-	prompt, err := e.renderPrompt(st, nil)
-	if err != nil {
-		return fmt.Errorf("render prompt: %w", err)
-	}
-	e.logf("  -> stage %q: %d-char prompt → model %s", st.ID, len(prompt), modelID)
-
-	out, err := e.runInference(ctx, st, baseURL, modelID, prompt, tokenSink)
+	exec, err := e.executorFor(st)
 	if err != nil {
 		return err
 	}
-	if st.OutputFormat == "json" {
-		if err := validateJSON(out); err != nil {
-			return fmt.Errorf("stage output is not valid JSON: %w", err)
-		}
+	if st.Foreach != nil {
+		return e.executeForeachStage(ctx, st, exec, baseURL, modelID, tokenSink)
+	}
+
+	in := e.makeStageInput(st, baseURL, modelID, tokenSink, nil, 0)
+	out, err := exec.Execute(ctx, in)
+	if err != nil {
+		return err
 	}
 
 	outPath, err := e.renderOutputPath(st, nil)
 	if err != nil {
 		return fmt.Errorf("render output path: %w", err)
 	}
-	if err := writeFile(filepath.Join(e.RunDir, outPath), out); err != nil {
+	if err := writeFile(filepath.Join(e.RunDir, outPath), out.Text); err != nil {
 		return err
 	}
 	e.mu.Lock()
-	e.stageOutputs[st.ID] = &stageResult{Output: out}
+	e.stageOutputs[st.ID] = &stageResult{Output: out.Text}
 	e.mu.Unlock()
 	return nil
 }
 
 // executeForeachStage implements the fan-out semantics for stages with a
-// non-empty Foreach. The items list is parsed from the rendered foreach
-// template, which must produce a JSON array. Each item runs in its own
-// goroutine and writes its own output file.
-func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, baseURL, modelID string, tokenSink io.Writer) error {
+// non-nil Foreach. The items list is read from the upstream stage's JSON
+// output (referenced by Foreach.From). Each item runs in its own goroutine
+// through the registered executor and writes its own output file.
+func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec StageExecutor, baseURL, modelID string, tokenSink io.Writer) error {
 	items, err := e.resolveForeachItems(st)
 	if err != nil {
 		return fmt.Errorf("resolve foreach: %w", err)
@@ -275,17 +332,12 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, baseURL, 
 	}
 	e.logf("  -> stage %q: foreach fanning out %d item(s)", st.ID, len(items))
 
-	// Pre-render each item's prompt and output path so we can detect path
-	// collisions and report errors before launching any inference work.
-	prompts := make([]string, len(items))
+	// Pre-render each item's output path so we can detect collisions before
+	// launching any executor work.
 	outPaths := make([]string, len(items))
 	seenPaths := make(map[string]int, len(items))
 	for i, item := range items {
-		extra := map[string]any{st.ForeachAs: item}
-		p, err := e.renderPrompt(st, extra)
-		if err != nil {
-			return fmt.Errorf("render prompt for item %d: %w", i, err)
-		}
+		extra := map[string]any{st.Foreach.Var: item}
 		path, err := e.renderOutputPath(st, extra)
 		if err != nil {
 			return fmt.Errorf("render output path for item %d: %w", i, err)
@@ -294,12 +346,11 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, baseURL, 
 			return fmt.Errorf("stage %s: foreach output path collision: items %d and %d both produce %q", st.ID, prev, i, path)
 		}
 		seenPaths[path] = i
-		prompts[i] = p
 		outPaths[i] = path
 	}
 
 	// Streaming policy:
-	//   - n == 1 AND tokenSink == nil (single-stage group): stream live.
+	//   - n == 1 AND tokenSink == nil (single-stage group): stream live to Log.
 	//   - otherwise: buffer per-item and flush with [index] headers so the
 	//     log stays readable when multiple items run in parallel.
 	singleLive := len(items) == 1 && tokenSink == nil
@@ -317,25 +368,22 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, baseURL, 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			var perItemSink io.Writer
+			var itemSink io.Writer
 			var buf *bytes.Buffer
 			switch {
 			case singleLive:
-				perItemSink = nil // live stream to Log via runInference
+				// nil here means "use Log via logMu" — makeStageInput handles
+				// that translation.
+				itemSink = nil
 			case tokenSink != nil:
-				// We're already inside a parallel group whose log block is
-				// owned by the caller. Append per-item tokens to that block
-				// with our own [index] sub-headers so individual items are
-				// distinguishable.
 				buf = &bytes.Buffer{}
-				perItemSink = buf
+				itemSink = buf
 			default:
-				// Single-stage group, multiple items: each item gets its own
-				// buffer and flushes under its own header.
 				buf = &bytes.Buffer{}
-				perItemSink = buf
+				itemSink = buf
 			}
-			out, runErr := e.runInference(groupCtx, st, baseURL, modelID, prompts[i], perItemSink)
+			in := e.makeStageInput(st, baseURL, modelID, itemSink, items[i], i)
+			out, runErr := exec.Execute(groupCtx, in)
 			if buf != nil {
 				if tokenSink != nil {
 					sinkMu.Lock()
@@ -352,19 +400,12 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, baseURL, 
 				cancel()
 				return
 			}
-			if st.OutputFormat == "json" {
-				if err := validateJSON(out); err != nil {
-					errs[i] = fmt.Errorf("item %d: stage output is not valid JSON: %w", i, err)
-					cancel()
-					return
-				}
-			}
-			if err := writeFile(filepath.Join(e.RunDir, outPaths[i]), out); err != nil {
+			if err := writeFile(filepath.Join(e.RunDir, outPaths[i]), out.Text); err != nil {
 				errs[i] = fmt.Errorf("item %d: write output: %w", i, err)
 				cancel()
 				return
 			}
-			outputs[i] = out
+			outputs[i] = out.Text
 		}()
 	}
 	wg.Wait()
@@ -382,49 +423,142 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, baseURL, 
 	return nil
 }
 
-// runInference wraps a single inference call with the executor's token-sink
-// plumbing. When tokenSink is nil and Log is set, tokens stream live to Log
-// under logMu so they can't interleave with scheduler status lines.
-func (e *Executor) runInference(ctx context.Context, st *Stage, baseURL, modelID, prompt string, tokenSink io.Writer) (string, error) {
-	start := time.Now()
-	var onToken StreamFunc
-	if tokenSink != nil {
-		onToken = func(delta string) {
-			_, _ = tokenSink.Write([]byte(delta))
-		}
-	} else if e.Log != nil {
-		onToken = func(delta string) {
-			e.logMu.Lock()
-			_, _ = e.Log.Write([]byte(delta))
-			e.logMu.Unlock()
-		}
+// makeStageInput assembles a StageInput for one invocation. tokenSink is the
+// caller-provided buffer for token streaming, or nil to stream directly to
+// e.Log under logMu. item / itemIdx are bound for foreach invocations.
+func (e *Executor) makeStageInput(st *Stage, baseURL, modelID string, tokenSink io.Writer, item any, itemIdx int) StageInput {
+	return StageInput{
+		Stage:       st,
+		Inputs:      e.Inputs,
+		Prior:       e.snapshotPrior(st.Inputs),
+		RunDir:      e.RunDir,
+		PipelineDir: e.PipelineDir,
+		Log:         e.tokenLog(tokenSink),
+		Vibe:        e.Vibe,
+		Item:        item,
+		ItemIdx:     itemIdx,
+		BaseURL:     baseURL,
+		ModelID:     modelID,
 	}
-	out, err := e.Inference(ctx, baseURL+"/v1", modelID, prompt, st.Params, onToken)
-	if err != nil {
-		return "", fmt.Errorf("inference: %w", err)
-	}
-	if tokenSink == nil && e.Log != nil {
-		// Ensure the next status line starts on its own line after a
-		// live-streamed completion.
-		e.logMu.Lock()
-		_, _ = e.Log.Write([]byte("\n"))
-		e.logMu.Unlock()
-	}
-	e.logf("  <- stage %q: %d-char response in %s", st.ID, len(out), time.Since(start).Round(time.Millisecond))
-	return out, nil
 }
 
-// resolveForeachItems renders the Foreach template and parses the resulting
-// string as a JSON array. Items may be strings, numbers, booleans, or
-// objects; null is rejected as inadmissible.
-func (e *Executor) resolveForeachItems(st *Stage) ([]any, error) {
-	rendered, err := e.renderTemplate("foreach:"+st.ID, st.Foreach, st.Inputs, nil)
-	if err != nil {
-		return nil, fmt.Errorf("render foreach template: %w", err)
+// executorFor selects the StageExecutor for st based on its type. An unknown
+// type produces a clear error so Phase 2 stage types that ship without a
+// matching executor fail loudly instead of silently defaulting to text.
+func (e *Executor) executorFor(st *Stage) (StageExecutor, error) {
+	t := StageTypeText // empty type defaults to text (Phase 1 only ships text)
+	exec, ok := e.registry[t]
+	if !ok {
+		return nil, fmt.Errorf("stage %s: no executor registered for type %q", st.ID, t)
 	}
-	rendered = strings.TrimSpace(rendered)
+	return exec, nil
+}
+
+// snapshotPrior returns a copy of the executor's stageOutputs limited to the
+// declared dependency ids. Callers receive a snapshot so concurrent stage
+// completions can't mutate the map under them while they render templates.
+func (e *Executor) snapshotPrior(deps []string) map[string]*stageResult {
+	out := make(map[string]*stageResult, len(deps))
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, dep := range deps {
+		if res, ok := e.stageOutputs[dep]; ok {
+			out[dep] = res
+		}
+	}
+	return out
+}
+
+// tokenLog returns the io.Writer that an executor should hand to its
+// inference call for live token streaming. When tokenSink is non-nil the
+// caller (a buffered parallel group) owns it directly; when nil and Log is
+// set we wrap Log with a writer that takes logMu so live tokens can't
+// interleave with scheduler status lines.
+func (e *Executor) tokenLog(tokenSink io.Writer) io.Writer {
+	if tokenSink != nil {
+		return tokenSink
+	}
+	if e.Log == nil {
+		return nil
+	}
+	return &lockedWriter{mu: &e.logMu, w: e.Log}
+}
+
+// lockedWriter serializes Write calls on an underlying writer with a shared
+// mutex. Used so live token deltas can't interleave with scheduler logf lines
+// on the same Log sink.
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+// textExecutor handles StageTypeText stages: render the prompt template, call
+// vibe's OpenAI-compatible inference endpoint with optional token streaming,
+// validate the JSON output_format if requested, and return the response.
+//
+// The inference function is held as a field rather than passed through
+// StageInput because (a) it's a stable per-Executor dependency, not per-stage
+// routing info, and (b) the StageInput.Vibe client is the gRPC control plane,
+// distinct from the OpenAI-compatible chat-completion HTTP client.
+type textExecutor struct {
+	inference InferenceFunc
+}
+
+func (t *textExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput, error) {
+	st := in.Stage
+	var extra map[string]any
+	if st.Foreach != nil {
+		extra = map[string]any{st.Foreach.Var: in.Item}
+	}
+	prompt, err := renderPrompt(st, in.PipelineDir, in.Inputs, in.Prior, in.RunDir, extra)
+	if err != nil {
+		return nil, fmt.Errorf("render prompt: %w", err)
+	}
+
+	var onToken StreamFunc
+	if in.Log != nil {
+		onToken = func(delta string) {
+			_, _ = in.Log.Write([]byte(delta))
+		}
+	}
+	out, err := t.inference(ctx, in.BaseURL+"/v1", in.ModelID, prompt, st.Params, onToken)
+	if err != nil {
+		return nil, fmt.Errorf("inference: %w", err)
+	}
+	if in.Log != nil {
+		// Ensure the next status line starts on its own line after a
+		// live-streamed completion.
+		_, _ = in.Log.Write([]byte("\n"))
+	}
+
+	if st.OutputFormat == "json" {
+		if err := validateJSON(out); err != nil {
+			return nil, fmt.Errorf("stage output is not valid JSON: %w", err)
+		}
+	}
+	return &StageOutput{Text: out}, nil
+}
+
+// resolveForeachItems reads the upstream stage's stored JSON output (the stage
+// named by Foreach.From) and parses it as an array. Items may be strings,
+// numbers, booleans, or objects; null is rejected as inadmissible.
+func (e *Executor) resolveForeachItems(st *Stage) ([]any, error) {
+	from := st.Foreach.From
+	e.mu.Lock()
+	res, ok := e.stageOutputs[from]
+	e.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("foreach.from %q has no output yet (scheduler bug or unresolved dependency)", from)
+	}
+	rendered := strings.TrimSpace(res.Output)
 	if rendered == "" {
-		return nil, fmt.Errorf("foreach template rendered to empty string")
+		return nil, fmt.Errorf("foreach upstream %q produced empty output", from)
 	}
 	var raw any
 	if err := json.Unmarshal([]byte(rendered), &raw); err != nil {
@@ -469,15 +603,18 @@ func (e *Executor) flushStageLog(id string, body []byte) {
 	_, _ = e.Log.Write([]byte("\n"))
 }
 
-// renderPrompt renders the stage's prompt template. extra is merged on top of
-// the standard template data (inputs/stages/runDir) so foreach can inject the
-// current item under its ForeachAs name.
-func (e *Executor) renderPrompt(st *Stage, extra map[string]any) (string, error) {
+// renderPrompt is the package-level prompt renderer used by stage executors.
+// It loads prompt_file content from disk when needed (resolving relative
+// paths against pipelineDir) and then renders the resulting template.
+//
+// extra is merged on top of the standard template data (inputs/stages/runDir)
+// so foreach can inject the current item under its Var name.
+func renderPrompt(st *Stage, pipelineDir string, cliInputs map[string]string, prior map[string]*stageResult, runDir string, extra map[string]any) (string, error) {
 	raw := st.Prompt
 	if raw == "" && st.PromptFile != "" {
 		path := st.PromptFile
 		if !filepath.IsAbs(path) {
-			path = filepath.Join(e.PipelineDir, path)
+			path = filepath.Join(pipelineDir, path)
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -485,31 +622,30 @@ func (e *Executor) renderPrompt(st *Stage, extra map[string]any) (string, error)
 		}
 		raw = string(data)
 	}
-	return e.renderTemplate(st.ID, raw, st.Inputs, extra)
+	return renderTemplate(st.ID, raw, st.Inputs, cliInputs, prior, runDir, extra)
 }
 
-// renderOutputPath renders the stage's Output template with the same data
-// shape as renderPrompt. The returned path is always relative to RunDir.
+// renderOutputPath renders the stage's Output template against the executor's
+// current state. The returned path is always relative to RunDir.
 func (e *Executor) renderOutputPath(st *Stage, extra map[string]any) (string, error) {
-	return e.renderTemplate(st.ID+":output", st.Output, st.Inputs, extra)
+	prior := e.snapshotPrior(st.Inputs)
+	return renderTemplate(st.ID+":output", st.Output, st.Inputs, e.Inputs, prior, e.RunDir, extra)
 }
 
-// renderTemplate is the common rendering routine for prompt / output / foreach
+// renderTemplate is the common rendering routine for prompt / output
 // templates. It exposes inputs, stages (with both .output and .outputs), and
-// runDir, plus any extra bindings supplied by the caller (foreach injects the
-// per-item value under its ForeachAs name). Only stage ids listed in deps are
+// runDir, plus any extra bindings supplied by the caller (foreach injects
+// the per-item value under its Var name). Only stage ids listed in deps are
 // exposed under .stages, matching the dependency declared in YAML.
-func (e *Executor) renderTemplate(name, raw string, deps []string, extra map[string]any) (string, error) {
+func renderTemplate(name, raw string, deps []string, cliInputs map[string]string, prior map[string]*stageResult, runDir string, extra map[string]any) (string, error) {
 	tmpl, err := template.New(name).Option("missingkey=error").Funcs(templateFuncs()).Parse(raw)
 	if err != nil {
 		return "", fmt.Errorf("parse template: %w", err)
 	}
 	stages := make(map[string]map[string]any, len(deps))
-	e.mu.Lock()
 	for _, dep := range deps {
-		res, ok := e.stageOutputs[dep]
+		res, ok := prior[dep]
 		if !ok {
-			e.mu.Unlock()
 			return "", fmt.Errorf("input %q has no output yet (scheduler bug or unresolved dependency)", dep)
 		}
 		// Always expose .output. .outputs is the per-item slice for foreach
@@ -520,11 +656,10 @@ func (e *Executor) renderTemplate(name, raw string, deps []string, extra map[str
 			"outputs": res.Outputs,
 		}
 	}
-	e.mu.Unlock()
 	data := map[string]any{
-		"inputs": e.Inputs,
+		"inputs": cliInputs,
 		"stages": stages,
-		"runDir": e.RunDir,
+		"runDir": runDir,
 	}
 	for k, v := range extra {
 		data[k] = v
