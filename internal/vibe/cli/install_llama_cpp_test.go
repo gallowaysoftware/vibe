@@ -286,6 +286,92 @@ func TestPickLlamaLinuxAsset_NoLinuxAsset(t *testing.T) {
 	}
 }
 
+// ─── pickLlamaMacOSAsset ────────────────────────────────────────────────────
+
+func TestPickLlamaMacOSAsset_AppleSilicon(t *testing.T) {
+	// Realistic asset list as published by upstream (b9174 snapshot).
+	rel := &llamaGitHubRelease{TagName: "b9174"}
+	for _, n := range []string{
+		"llama-b9174-bin-macos-arm64.tar.gz",
+		"llama-b9174-bin-macos-arm64-kleidiai.tar.gz",
+		"llama-b9174-bin-macos-x64.tar.gz",
+		"llama-b9174-bin-ubuntu-x64.tar.gz",
+	} {
+		rel.Assets = append(rel.Assets, struct {
+			Name        string `json:"name"`
+			DownloadURL string `json:"browser_download_url"`
+		}{Name: n, DownloadURL: "https://x/" + n})
+	}
+	got := pickLlamaMacOSAsset(rel, "arm64")
+	if got.Name != "llama-b9174-bin-macos-arm64.tar.gz" {
+		t.Errorf("got %q, want plain macos-arm64 (not kleidiai)", got.Name)
+	}
+}
+
+func TestPickLlamaMacOSAsset_IntelMac(t *testing.T) {
+	rel := &llamaGitHubRelease{TagName: "b9174"}
+	for _, n := range []string{
+		"llama-b9174-bin-macos-arm64.tar.gz",
+		"llama-b9174-bin-macos-x64.tar.gz",
+		"llama-b9174-bin-ubuntu-x64.tar.gz",
+	} {
+		rel.Assets = append(rel.Assets, struct {
+			Name        string `json:"name"`
+			DownloadURL string `json:"browser_download_url"`
+		}{Name: n, DownloadURL: "https://x/" + n})
+	}
+	got := pickLlamaMacOSAsset(rel, "amd64")
+	if got.Name != "llama-b9174-bin-macos-x64.tar.gz" {
+		t.Errorf("got %q, want llama-b9174-bin-macos-x64.tar.gz", got.Name)
+	}
+}
+
+func TestPickLlamaMacOSAsset_NoMacAsset(t *testing.T) {
+	rel := &llamaGitHubRelease{TagName: "b9174"}
+	for _, n := range []string{"llama-b9174-bin-ubuntu-x64.tar.gz"} {
+		rel.Assets = append(rel.Assets, struct {
+			Name        string `json:"name"`
+			DownloadURL string `json:"browser_download_url"`
+		}{Name: n, DownloadURL: "https://x/" + n})
+	}
+	got := pickLlamaMacOSAsset(rel, "arm64")
+	if got.Name != "" {
+		t.Errorf("got %q, want empty when no mac asset exists", got.Name)
+	}
+}
+
+// ─── pickLlamaAsset dispatch ────────────────────────────────────────────────
+
+func TestPickLlamaAsset_Dispatch(t *testing.T) {
+	rel := &llamaGitHubRelease{TagName: "b9174"}
+	for _, n := range []string{
+		"llama-b9174-bin-ubuntu-x64.tar.gz",
+		"llama-b9174-bin-macos-arm64.tar.gz",
+		"llama-b9174-bin-macos-x64.tar.gz",
+	} {
+		rel.Assets = append(rel.Assets, struct {
+			Name        string `json:"name"`
+			DownloadURL string `json:"browser_download_url"`
+		}{Name: n, DownloadURL: "https://x/" + n})
+	}
+	cases := []struct {
+		goos, goarch, want string
+	}{
+		{"linux", "amd64", "llama-b9174-bin-ubuntu-x64.tar.gz"},
+		{"darwin", "arm64", "llama-b9174-bin-macos-arm64.tar.gz"},
+		{"darwin", "amd64", "llama-b9174-bin-macos-x64.tar.gz"},
+		{"linux", "arm64", ""}, // no ubuntu-arm64 in this fixture
+		{"freebsd", "amd64", ""},
+		{"windows", "amd64", ""}, // we explicitly don't ship the Win zip
+	}
+	for _, c := range cases {
+		got := pickLlamaAsset(rel, false, c.goos, c.goarch)
+		if got.Name != c.want {
+			t.Errorf("pickLlamaAsset(%s/%s) = %q, want %q", c.goos, c.goarch, got.Name, c.want)
+		}
+	}
+}
+
 // ─── fetchLatestLlamaRelease ───────────────────────────────────────────────
 
 func TestFetchLatestLlamaRelease_OK(t *testing.T) {

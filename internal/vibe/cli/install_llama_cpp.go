@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -312,12 +313,12 @@ func installLlamaCppRelease(env *llamaInstallerEnv) error {
 	}
 	fmt.Fprintf(env.stdout, "[info] latest release: %s (%d assets)\n", release.TagName, len(release.Assets))
 
-	asset := pickLlamaLinuxAsset(release, env.cuda)
+	asset := pickLlamaAsset(release, env.cuda, runtime.GOOS, runtime.GOARCH)
 	if asset.Name == "" {
 		if env.cuda {
 			return errors.New("no CUDA-flavoured Linux x86_64 asset found; build from source with -DGGML_CUDA=ON (try `vibe doctor --install llama-cpp` and pick [s])")
 		}
-		return errors.New("no Linux x86_64 asset found in latest release")
+		return fmt.Errorf("no llama.cpp release asset found for %s/%s; build from source or install via your OS package manager", runtime.GOOS, runtime.GOARCH)
 	}
 	fmt.Fprintf(env.stdout, "[info] picked asset: %s\n", asset.Name)
 
@@ -412,6 +413,65 @@ func fetchLatestLlamaRelease(env *llamaInstallerEnv) (*llamaGitHubRelease, error
 		return nil, fmt.Errorf("decode GitHub release JSON: %w", err)
 	}
 	return &release, nil
+}
+
+// pickLlamaAsset dispatches to the per-platform picker based on goos/goarch.
+// Today we ship release-tarball installs for linux/amd64 and darwin/arm64 +
+// darwin/amd64; everything else returns an empty result so the caller can
+// surface a "build from source / use your package manager" error.
+//
+// The cuda flag is only meaningful on linux/amd64 — macOS Metal builds are
+// always GPU-accelerated, there's no separate "CUDA" variant to pick. Other
+// platforms ignore the flag.
+func pickLlamaAsset(release *llamaGitHubRelease, cuda bool, goos, goarch string) struct{ Name, DownloadURL string } {
+	switch goos {
+	case "linux":
+		if goarch == "amd64" {
+			return pickLlamaLinuxAsset(release, cuda)
+		}
+	case "darwin":
+		return pickLlamaMacOSAsset(release, goarch)
+	}
+	return struct{ Name, DownloadURL string }{}
+}
+
+// pickLlamaMacOSAsset chooses the macOS release tarball matching goarch.
+// llama.cpp upstream ships `llama-<ver>-bin-macos-arm64.tar.gz` (Apple
+// Silicon, Metal-enabled) and `llama-<ver>-bin-macos-x64.tar.gz` (Intel Mac).
+// The plain build is preferred over the `kleidiai` variant — kleidiai is an
+// ARM CPU-only optimization path, but we want the Metal-default build for
+// the unified-memory GPU use case.
+func pickLlamaMacOSAsset(release *llamaGitHubRelease, goarch string) struct{ Name, DownloadURL string } {
+	out := struct{ Name, DownloadURL string }{}
+	var archToken string
+	switch goarch {
+	case "arm64":
+		archToken = "arm64"
+	case "amd64":
+		archToken = "x64"
+	default:
+		return out
+	}
+	target := "bin-macos-" + archToken
+	for _, a := range release.Assets {
+		name := strings.ToLower(a.Name)
+		if !strings.Contains(name, target) {
+			continue
+		}
+		if !strings.HasSuffix(name, ".tar.gz") && !strings.HasSuffix(name, ".tgz") && !strings.HasSuffix(name, ".zip") {
+			continue
+		}
+		// Skip alternative backends. `kleidiai` is a CPU-only ARM path; we
+		// want the Metal-default plain build. Add new exclusions here if
+		// upstream starts shipping more variants.
+		if strings.Contains(name, "kleidiai") {
+			continue
+		}
+		out.Name = a.Name
+		out.DownloadURL = a.DownloadURL
+		return out
+	}
+	return out
 }
 
 // pickLlamaLinuxAsset chooses a release asset for x86_64 Linux. Preference

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -541,7 +542,10 @@ func checkMCPsAt(dir string) checkResult {
 func checkGPU(ctx context.Context, env *doctorEnv) checkResult {
 	const name = "gpu"
 	if _, err := env.lookPath("nvidia-smi"); err != nil {
-		return checkResult{Name: name, Status: statusInfo, Message: "nvidia-smi not found (CPU-only fine)"}
+		if runtime.GOOS == "darwin" {
+			return checkResult{Name: name, Status: statusInfo, Message: "macOS: using Metal (unified memory; VRAM pre-flight skipped)"}
+		}
+		return checkResult{Name: name, Status: statusInfo, Message: "nvidia-smi not found (CPU-only or non-Nvidia GPU; VRAM pre-flight skipped)"}
 	}
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
