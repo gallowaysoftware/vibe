@@ -1,0 +1,42 @@
+name: notify_pipeline
+description: |
+  Two-stage pipeline that drafts a haiku via the "reasoning" capability and
+  posts it to a Slack/Discord/Mattermost-compatible incoming webhook. The
+  webhook URL is read from the VAMP_SLACK_WEBHOOK environment variable so
+  the secret never ends up in YAML.
+
+inputs:
+  topic:
+    type: string
+    required: true
+
+stages:
+  # 1. Generate a short haiku about the topic. Capability "reasoning" maps
+  # to whatever llama-server profile your capabilities.yaml configures.
+  - id: haiku
+    type: text
+    capability: reasoning
+    prompt: |
+      Write a single 5-7-5 haiku about {{.inputs.topic}}.
+      Output ONLY the three lines, separated by newlines. No preamble.
+    output: haiku.txt
+    params:
+      max_tokens: 256
+      temperature: 0.8
+
+  # 2. POST the haiku to a Slack-compatible incoming webhook. The
+  # webhook URL is templated from $VAMP_SLACK_WEBHOOK so the example
+  # YAML never contains a secret. Adjust the body shape if your
+  # destination is Discord (uses "content") or Mattermost (also "text").
+  - id: notify
+    type: webhook
+    inputs: [haiku]
+    url: '{{ env "VAMP_SLACK_WEBHOOK" }}'
+    body:
+      text: |
+        :sparkles: Pipeline `{{ .pipeline_name }}` finished.
+        Topic: *{{ .inputs.topic }}*
+        ```
+        {{ .stages.haiku.output }}
+        ```
+    output: webhook_response.txt

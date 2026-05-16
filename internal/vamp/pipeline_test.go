@@ -418,6 +418,189 @@ func TestLoadPipeline_YouTubeExampleFile(t *testing.T) {
 	}
 }
 
+// TestLoadPipeline_WebhookValid parses a minimal webhook stage with inline
+// body / headers / custom method and verifies the fields round-trip onto
+// the Stage struct.
+func TestLoadPipeline_WebhookValid(t *testing.T) {
+	yaml := `
+name: hk
+stages:
+  - id: notify
+    type: webhook
+    url: "https://example.com/hooks/abc"
+    method: POST
+    body:
+      text: "done"
+    headers:
+      Authorization: "Bearer xyz"
+    output: webhook_response.txt
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := p.Stages[0]
+	if st.Type != StageTypeWebhook {
+		t.Errorf("type = %q, want %q", st.Type, StageTypeWebhook)
+	}
+	if st.URL != "https://example.com/hooks/abc" {
+		t.Errorf("url = %q", st.URL)
+	}
+	if st.Method != "POST" {
+		t.Errorf("method = %q", st.Method)
+	}
+	if got, ok := st.Body["text"].(string); !ok || got != "done" {
+		t.Errorf("body.text = %v", st.Body["text"])
+	}
+	if st.Headers["Authorization"] != "Bearer xyz" {
+		t.Errorf("Authorization = %q", st.Headers["Authorization"])
+	}
+}
+
+// TestLoadPipeline_WebhookBodyTemplateFile verifies the alternate body
+// source (a templated file) parses without requiring an inline body.
+func TestLoadPipeline_WebhookBodyTemplateFile(t *testing.T) {
+	yaml := `
+name: hk
+stages:
+  - id: notify
+    type: webhook
+    url: "https://example.com/hooks/abc"
+    body_template_file: ./body.json.tmpl
+    output: resp.txt
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Stages[0].BodyTemplateFile != "./body.json.tmpl" {
+		t.Errorf("body_template_file = %q", p.Stages[0].BodyTemplateFile)
+	}
+}
+
+// TestLoadPipeline_WebhookRetryOn5xxDefault verifies that omitting
+// retry_on_5xx (default true) AND retry: causes the validator to
+// synthesise a default retry policy so 5xx errors are retried out of the
+// box. Explicit retry_on_5xx: false suppresses the synthesised policy.
+func TestLoadPipeline_WebhookRetryOn5xxDefault(t *testing.T) {
+	yaml := `
+name: hk
+stages:
+  - id: notify
+    type: webhook
+    url: "https://example.com/hooks/abc"
+    body:
+      text: "x"
+    output: resp.txt
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Stages[0].Retry == nil {
+		t.Fatal("expected synthesised Retry policy")
+	}
+	if p.Stages[0].Retry.MaxAttempts < 2 {
+		t.Errorf("MaxAttempts = %d, want > 1 (default webhook retry)", p.Stages[0].Retry.MaxAttempts)
+	}
+}
+
+// TestLoadPipeline_WebhookRetryOn5xxFalseSkipsSynth verifies that
+// explicitly disabling retry_on_5xx leaves Retry nil (the user opted out).
+func TestLoadPipeline_WebhookRetryOn5xxFalseSkipsSynth(t *testing.T) {
+	yaml := `
+name: hk
+stages:
+  - id: notify
+    type: webhook
+    url: "https://example.com/hooks/abc"
+    body:
+      text: "x"
+    output: resp.txt
+    retry_on_5xx: false
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Stages[0].Retry != nil {
+		t.Errorf("expected Retry == nil when retry_on_5xx is false, got %+v", p.Stages[0].Retry)
+	}
+}
+
+// TestLoadPipeline_WebhookExplicitRetryWins verifies a user-supplied
+// retry: block is preserved verbatim — we do not overwrite or merge it.
+func TestLoadPipeline_WebhookExplicitRetryWins(t *testing.T) {
+	yaml := `
+name: hk
+stages:
+  - id: notify
+    type: webhook
+    url: "https://example.com/hooks/abc"
+    body:
+      text: "x"
+    output: resp.txt
+    retry:
+      max_attempts: 5
+      retry_on: [timeout]
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Stages[0].Retry == nil {
+		t.Fatal("expected explicit Retry policy preserved")
+	}
+	if p.Stages[0].Retry.MaxAttempts != 5 {
+		t.Errorf("MaxAttempts = %d, want 5 (user override)", p.Stages[0].Retry.MaxAttempts)
+	}
+	if len(p.Stages[0].Retry.RetryOn) != 1 || p.Stages[0].Retry.RetryOn[0] != "timeout" {
+		t.Errorf("RetryOn = %v, want [timeout]", p.Stages[0].Retry.RetryOn)
+	}
+}
+
+// TestLoadPipeline_WebhookCapabilityRejected verifies a webhook stage with
+// a capability: is rejected — webhook is a plain HTTP client, no profile
+// activation. Mirrors the youtube-stage behaviour.
+func TestLoadPipeline_WebhookCapabilityRejected(t *testing.T) {
+	yaml := `
+name: hk
+stages:
+  - id: notify
+    type: webhook
+    capability: reasoning
+    url: "https://example.com/hooks/abc"
+    body:
+      text: "x"
+    output: resp.txt
+`
+	_, err := LoadPipeline(writePipeline(t, yaml))
+	if err == nil {
+		t.Fatal("expected error for webhook with capability")
+	}
+	if !strings.Contains(err.Error(), "capability") {
+		t.Errorf("error should mention capability, got: %v", err)
+	}
+}
+
+// TestLoadPipeline_WebhookExampleFile parses the shipped example pipeline
+// so CI catches drift between the example YAML and the validator.
+func TestLoadPipeline_WebhookExampleFile(t *testing.T) {
+	p, err := LoadPipeline(filepath.Join("..", "..", "examples", "notify-pipeline", "pipeline.yaml"))
+	if err != nil {
+		t.Fatalf("load example: %v", err)
+	}
+	foundWebhook := false
+	for _, s := range p.Stages {
+		if s.Type == StageTypeWebhook {
+			foundWebhook = true
+		}
+	}
+	if !foundWebhook {
+		t.Error("example pipeline contains no webhook stage")
+	}
+}
+
 // TestLoadPipeline_ComfyUIValid sanity-checks a minimal valid comfyui stage.
 func TestLoadPipeline_ComfyUIValid(t *testing.T) {
 	yaml := `
@@ -1322,6 +1505,66 @@ stages:
   output: a.mp4
   thumbnail: cover.png`,
 			wantErr: "thumbnail is only valid on type: youtube",
+		},
+		{
+			name: "webhook missing url",
+			yaml: `name: x
+stages:
+- id: a
+  type: webhook
+  body:
+    text: hi
+  output: a.txt`,
+			wantErr: "url is required for type: webhook",
+		},
+		{
+			name: "webhook with unsupported method",
+			yaml: `name: x
+stages:
+- id: a
+  type: webhook
+  url: https://example.com/hook
+  method: TRACE
+  body:
+    text: hi
+  output: a.txt`,
+			wantErr: "method \"TRACE\" is not supported",
+		},
+		{
+			name: "text stage with webhook url (webhook-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  capability: r
+  prompt: hi
+  output: a.md
+  url: https://example.com/hook`,
+			wantErr: "url is only valid on type: webhook",
+		},
+		{
+			name: "ffmpeg stage with webhook headers (webhook-only field)",
+			yaml: `name: x
+stages:
+- id: a
+  type: ffmpeg
+  ffmpeg_args: ["-i", "x"]
+  output: a.mp4
+  headers:
+    X-Foo: bar`,
+			wantErr: "headers is only valid on type: webhook",
+		},
+		{
+			name: "webhook with capability rejected",
+			yaml: `name: x
+stages:
+- id: a
+  type: webhook
+  capability: reasoning
+  url: https://example.com/hook
+  body:
+    text: hi
+  output: a.txt`,
+			wantErr: "capability is only valid on stage types that activate a vibe profile",
 		},
 		{
 			name: "retry with negative max_attempts",

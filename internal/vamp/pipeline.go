@@ -3,6 +3,7 @@ package vamp
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"regexp"
 	"strings"
@@ -29,7 +30,7 @@ type InputSpec struct {
 // Stage is a single step in the pipeline.
 type Stage struct {
 	ID           string         `yaml:"id"`
-	Type         StageType      `yaml:"type,omitempty"` // "" | "text" | "comfyui" | "audio" | "ffmpeg"; empty defaults to "text"
+	Type         StageType      `yaml:"type,omitempty"` // "" | "text" | "comfyui" | "audio" | "ffmpeg" | "youtube" | "webhook"; empty defaults to "text"
 	Capability   string         `yaml:"capability,omitempty"`
 	Prompt       string         `yaml:"prompt,omitempty"`
 	PromptFile   string         `yaml:"prompt_file,omitempty"`
@@ -91,6 +92,24 @@ type Stage struct {
 	Thumbnail       string   `yaml:"thumbnail,omitempty"`
 	CredentialsFile string   `yaml:"credentials_file,omitempty"`
 
+	// Webhook-stage fields. URL is a template-rendered destination URL the
+	// executor POSTs to (Slack/Discord/Mattermost-compatible incoming webhook
+	// shape). Method overrides the HTTP method (default POST). Body, when
+	// non-nil, is a template-rendered map that the executor marshals to JSON;
+	// each leaf string value is rendered as a Go template against the
+	// standard binding. BodyTemplateFile, when non-empty, names a file
+	// (resolved relative to PipelineDir) whose contents are rendered as a
+	// single template and sent verbatim as the request body — mutually
+	// exclusive with Body. Headers is a flat map of header name -> templated
+	// value. RetryOn5xx defaults to true; when set together with a stage-
+	// level retry: block of its own the stage's explicit policy wins.
+	URL              string            `yaml:"url,omitempty"`
+	Method           string            `yaml:"method,omitempty"`
+	Body             map[string]any    `yaml:"body,omitempty"`
+	BodyTemplateFile string            `yaml:"body_template_file,omitempty"`
+	Headers          map[string]string `yaml:"headers,omitempty"`
+	RetryOn5xx       *bool             `yaml:"retry_on_5xx,omitempty"`
+
 	// Retry, when non-nil, enables per-stage retry-with-exponential-backoff
 	// for transient failures. The runner wraps each executor.Execute call
 	// (per-item for foreach stages) in a retry loop governed by this
@@ -121,6 +140,14 @@ const (
 	retryOnTransient = "transient"
 	retryOnTimeout   = "timeout"
 )
+
+// defaultWebhookRetryAttempts is the synthesised retry count we inject onto
+// webhook stages with retry_on_5xx=true (the default) and no explicit
+// retry: block. Three attempts (one initial + two retries) is the
+// pragmatic ceiling: it survives a single transient blip on the receiving
+// webhook ingestion endpoint without dragging out a doomed pipeline by an
+// order of magnitude.
+const defaultWebhookRetryAttempts = 3
 
 func (r *RetryPolicy) Normalize() {
 	if r == nil {
@@ -283,10 +310,10 @@ func (p *Pipeline) Validate() error {
 			stageType = StageTypeText
 		}
 		// Capability is required for every stage type except the
-		// subprocess-only ones (audio, ffmpeg) and the network-only youtube
-		// stage, which talk to a third-party API and never activate a vibe
-		// profile.
-		if stageType != StageTypeAudio && stageType != StageTypeFFmpeg && stageType != StageTypeYouTube && s.Capability == "" {
+		// subprocess-only ones (audio, ffmpeg) and the network-only types
+		// (youtube, webhook), which talk to a third-party API and never
+		// activate a vibe profile.
+		if stageType != StageTypeAudio && stageType != StageTypeFFmpeg && stageType != StageTypeYouTube && stageType != StageTypeWebhook && s.Capability == "" {
 			return fmt.Errorf("%s: capability is required", ctx)
 		}
 		switch stageType {
@@ -307,6 +334,9 @@ func (p *Pipeline) Validate() error {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
 			}
 			if err := rejectYouTubeFields(ctx, s); err != nil {
+				return err
+			}
+			if err := rejectWebhookFields(ctx, s); err != nil {
 				return err
 			}
 		case StageTypeAudio:
@@ -341,6 +371,9 @@ func (p *Pipeline) Validate() error {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
 			}
 			if err := rejectYouTubeFields(ctx, s); err != nil {
+				return err
+			}
+			if err := rejectWebhookFields(ctx, s); err != nil {
 				return err
 			}
 		case StageTypeFFmpeg:
@@ -379,6 +412,9 @@ func (p *Pipeline) Validate() error {
 			if err := rejectYouTubeFields(ctx, s); err != nil {
 				return err
 			}
+			if err := rejectWebhookFields(ctx, s); err != nil {
+				return err
+			}
 		case StageTypeComfyUI:
 			if s.Workflow == "" {
 				return fmt.Errorf("%s: workflow is required for type: comfyui stages", ctx)
@@ -410,6 +446,9 @@ func (p *Pipeline) Validate() error {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
 			}
 			if err := rejectYouTubeFields(ctx, s); err != nil {
+				return err
+			}
+			if err := rejectWebhookFields(ctx, s); err != nil {
 				return err
 			}
 		case StageTypeYouTube:
@@ -452,8 +491,80 @@ func (p *Pipeline) Validate() error {
 			if len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
 			}
+			if err := rejectWebhookFields(ctx, s); err != nil {
+				return err
+			}
+			// (youtube fields are valid here — already checked above)
+		case StageTypeWebhook:
+			// retry_on_5xx defaults to true (per the documented schema). The
+			// transient-error classifier already picks up the
+			// "webhook returned HTTP 5xx" error string the executor
+			// produces; we just need to ensure a retry policy exists so the
+			// classifier is consulted at all. If the user supplied their own
+			// retry: block we respect it (their explicit choice wins). When
+			// retry_on_5xx is explicitly false we leave Retry alone.
+			if s.URL == "" {
+				return fmt.Errorf("%s: url is required for type: webhook stages", ctx)
+			}
+			wantsRetry := s.RetryOn5xx == nil || *s.RetryOn5xx
+			if wantsRetry && p.Stages[i].Retry == nil {
+				p.Stages[i].Retry = &RetryPolicy{
+					MaxAttempts: defaultWebhookRetryAttempts,
+					RetryOn:     []string{retryOnTransient},
+				}
+			}
+			// Body and BodyTemplateFile are mutually exclusive AND at least
+			// one is required. Anything else either silently sends an empty
+			// body (surprising for a notification stage) or accepts both and
+			// makes precedence rules a footgun.
+			hasInlineBody := len(s.Body) > 0
+			hasBodyFile := s.BodyTemplateFile != ""
+			if hasInlineBody && hasBodyFile {
+				return fmt.Errorf("%s: exactly one of body or body_template_file is required (both set)", ctx)
+			}
+			if !hasInlineBody && !hasBodyFile {
+				return fmt.Errorf("%s: exactly one of body or body_template_file is required (neither set)", ctx)
+			}
+			if s.Method != "" {
+				m := strings.ToUpper(s.Method)
+				switch m {
+				case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+				default:
+					return fmt.Errorf("%s: method %q is not supported (allowed: GET, POST, PUT, PATCH, DELETE)", ctx, s.Method)
+				}
+			}
+			if s.Capability != "" {
+				return fmt.Errorf("%s: capability is only valid on stage types that activate a vibe profile (webhook is a plain HTTP client)", ctx)
+			}
+			if s.Prompt != "" {
+				return fmt.Errorf("%s: prompt is only valid on type: text stages", ctx)
+			}
+			if s.PromptFile != "" {
+				return fmt.Errorf("%s: prompt_file is only valid on type: text stages", ctx)
+			}
+			if len(s.Params) > 0 {
+				return fmt.Errorf("%s: params is only valid on type: text stages", ctx)
+			}
+			if s.OutputFormat != "" {
+				return fmt.Errorf("%s: output_format is only valid on type: text stages", ctx)
+			}
+			if s.Workflow != "" {
+				return fmt.Errorf("%s: workflow is only valid on type: comfyui stages", ctx)
+			}
+			if len(s.Parameters) > 0 {
+				return fmt.Errorf("%s: parameters is only valid on type: comfyui stages", ctx)
+			}
+			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" {
+				return fmt.Errorf("%s: voice/text/voices_dir are only valid on type: audio stages", ctx)
+			}
+			if len(s.FFmpegArgs) > 0 {
+				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
+			}
+			if err := rejectYouTubeFields(ctx, s); err != nil {
+				return err
+			}
 		default:
-			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio, ffmpeg, youtube)", ctx, s.Type)
+			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio, ffmpeg, youtube, webhook)", ctx, s.Type)
 		}
 		if s.OutputFormat != "" && s.OutputFormat != "json" {
 			return fmt.Errorf("%s: output_format %q is not supported (allowed: \"\", json)", ctx, s.OutputFormat)
@@ -564,6 +675,34 @@ func rejectYouTubeFields(ctx string, s Stage) error {
 	}
 	if s.CredentialsFile != "" {
 		return fmt.Errorf("%s: credentials_file is only valid on type: youtube stages", ctx)
+	}
+	return nil
+}
+
+// rejectWebhookFields rejects the webhook-only fields on non-webhook stages.
+// Mirrors rejectYouTubeFields. URL is the canonical marker — body /
+// body_template_file / headers / retry_on_5xx / method only make sense in
+// concert with a destination, so the URL check would already catch most
+// misuse, but enumerating each field gives users a clearer error pointing at
+// the field they actually set in YAML.
+func rejectWebhookFields(ctx string, s Stage) error {
+	if s.URL != "" {
+		return fmt.Errorf("%s: url is only valid on type: webhook stages", ctx)
+	}
+	if s.Method != "" {
+		return fmt.Errorf("%s: method is only valid on type: webhook stages", ctx)
+	}
+	if len(s.Body) > 0 {
+		return fmt.Errorf("%s: body is only valid on type: webhook stages", ctx)
+	}
+	if s.BodyTemplateFile != "" {
+		return fmt.Errorf("%s: body_template_file is only valid on type: webhook stages", ctx)
+	}
+	if len(s.Headers) > 0 {
+		return fmt.Errorf("%s: headers is only valid on type: webhook stages", ctx)
+	}
+	if s.RetryOn5xx != nil {
+		return fmt.Errorf("%s: retry_on_5xx is only valid on type: webhook stages", ctx)
 	}
 	return nil
 }

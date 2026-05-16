@@ -59,6 +59,11 @@ const (
 	// Like the subprocess stage types it does not activate a vibe profile;
 	// it talks directly to Google's OAuth / upload endpoints over HTTPS.
 	StageTypeYouTube StageType = "youtube"
+	// StageTypeWebhook POSTs a template-rendered JSON body to a
+	// Slack/Discord/Mattermost-compatible incoming webhook URL. Typically
+	// the final stage of a pipeline to announce completion. Like the
+	// network-only youtube type it does not activate a vibe profile.
+	StageTypeWebhook StageType = "webhook"
 )
 
 // StageExecutor implements the run of a single stage instance. The receiver
@@ -83,10 +88,16 @@ type StageInput struct {
 	Prior       map[string]*stageResult // outputs of already-completed stages
 	RunDir      string
 	PipelineDir string
-	Log         io.Writer          // for token streaming when group size == 1
-	Vibe        *vibeclient.Client // available to TextExecutor
-	Item        any                // foreach item bound here (nil when not in a foreach)
-	ItemIdx     int                // foreach index (0 when not in a foreach)
+	// PipelineName is the parent Pipeline.Name from YAML. Exposed to
+	// executors so e.g. the webhook stage can template `{{ .pipeline_name }}`
+	// into its body without us threading it through every per-stage call
+	// site. Empty when the runner is invoked directly (some tests) without
+	// a populated Pipeline.
+	PipelineName string
+	Log          io.Writer          // for token streaming when group size == 1
+	Vibe         *vibeclient.Client // available to TextExecutor
+	Item         any                // foreach item bound here (nil when not in a foreach)
+	ItemIdx      int                // foreach index (0 when not in a foreach)
 
 	// BaseURL is the inference root for this invocation (e.g.
 	// http://127.0.0.1:9000); /v1 is NOT included. Populated by the
@@ -227,6 +238,7 @@ func (e *Executor) Run(ctx context.Context) error {
 		StageTypeAudio:   &audioExecutor{},
 		StageTypeFFmpeg:  &ffmpegExecutor{},
 		StageTypeYouTube: &youtubeExecutor{},
+		StageTypeWebhook: &webhookExecutor{},
 	}
 
 	// Stage lookup and dependency counts for wave-based scheduling.
@@ -833,19 +845,24 @@ var http5xxRE = regexp.MustCompile(`(?:^|\D)5[0-9]{2}(?:\D|$)`)
 // caller-provided buffer for token streaming, or nil to stream directly to
 // e.Log under logMu. item / itemIdx are bound for foreach invocations.
 func (e *Executor) makeStageInput(st *Stage, baseURL, modelID, backendAddr string, tokenSink io.Writer, item any, itemIdx int) StageInput {
+	var name string
+	if e.Pipeline != nil {
+		name = e.Pipeline.Name
+	}
 	return StageInput{
-		Stage:       st,
-		Inputs:      e.Inputs,
-		Prior:       e.snapshotPrior(st.Inputs),
-		RunDir:      e.RunDir,
-		PipelineDir: e.PipelineDir,
-		Log:         e.tokenLog(tokenSink),
-		Vibe:        e.Vibe,
-		Item:        item,
-		ItemIdx:     itemIdx,
-		BaseURL:     baseURL,
-		ModelID:     modelID,
-		BackendAddr: backendAddr,
+		Stage:        st,
+		Inputs:       e.Inputs,
+		Prior:        e.snapshotPrior(st.Inputs),
+		RunDir:       e.RunDir,
+		PipelineDir:  e.PipelineDir,
+		PipelineName: name,
+		Log:          e.tokenLog(tokenSink),
+		Vibe:         e.Vibe,
+		Item:         item,
+		ItemIdx:      itemIdx,
+		BaseURL:      baseURL,
+		ModelID:      modelID,
+		BackendAddr:  backendAddr,
 	}
 }
 
@@ -864,7 +881,7 @@ func stageTypeOrDefault(st *Stage) StageType {
 // scheduler skips EnsureActive for groups consisting entirely of these stages.
 func stageRequiresVibeProfile(st *Stage) bool {
 	switch stageTypeOrDefault(st) {
-	case StageTypeAudio, StageTypeFFmpeg, StageTypeYouTube:
+	case StageTypeAudio, StageTypeFFmpeg, StageTypeYouTube, StageTypeWebhook:
 		return false
 	default:
 		return true
