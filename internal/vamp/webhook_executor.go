@@ -223,10 +223,12 @@ func renderWebhookTemplate(st *Stage, name, raw string, in StageInput, extra map
 		}
 	}
 	data := map[string]any{
-		"inputs":        in.Inputs,
-		"stages":        stages,
-		"runDir":        in.RunDir,
-		"pipeline_name": in.PipelineName,
+		"inputs":          in.Inputs,
+		"stages":          stages,
+		"runDir":          in.RunDir,
+		"pipeline_name":   in.PipelineName,
+		"pipeline_status": in.PipelineStatus,
+		"failure_summary": in.FailureSummary,
 	}
 	for k, v := range extra {
 		data[k] = v

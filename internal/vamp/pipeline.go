@@ -116,6 +116,16 @@ type Stage struct {
 	// policy. Absent / nil means "no retry" — the executor's first error
 	// is returned verbatim, matching pre-retry behaviour.
 	Retry *RetryPolicy `yaml:"retry,omitempty"`
+
+	// RunWhen controls whether the stage runs based on the status of its
+	// declared Inputs (and, when Inputs is empty, the pipeline as a whole).
+	// Values are "success" (the default; runs only when every dep succeeded),
+	// "failure" (runs only when at least one dep — or any prior stage when
+	// Inputs is empty — errored), or "always" (runs regardless of prior
+	// status, e.g. cleanup hooks). For "failure" and "always" stages the
+	// template namespace gains {{ .pipeline_status }} and
+	// {{ .failure_summary }} bindings.
+	RunWhen string `yaml:"run_when,omitempty"`
 }
 
 // RetryPolicy controls per-stage retry behaviour for transient executor
@@ -139,6 +149,17 @@ const (
 const (
 	retryOnTransient = "transient"
 	retryOnTimeout   = "timeout"
+)
+
+// Stage.RunWhen string values. RunWhenSuccess is the default applied when
+// the field is empty; the executor inspects RunWhen to decide whether a
+// stage is eligible to run after its declared deps finish (regardless of
+// whether they succeeded). Centralised here so pipeline.go's validation
+// and exec.go's scheduler stay in sync.
+const (
+	RunWhenSuccess = "success"
+	RunWhenFailure = "failure"
+	RunWhenAlways  = "always"
 )
 
 // defaultWebhookRetryAttempts is the synthesised retry count we inject onto
@@ -588,6 +609,19 @@ func (p *Pipeline) Validate() error {
 			return err
 		}
 		p.Stages[i].Retry.Normalize()
+		// RunWhen: default to "success" when unset; reject any other value
+		// up-front so misspellings (run_when: failrue) surface at validate
+		// time instead of silently being treated as the default and never
+		// firing. We mutate the slice entry in place so the scheduler can
+		// read the canonical value without re-applying the default.
+		switch s.RunWhen {
+		case "":
+			p.Stages[i].RunWhen = RunWhenSuccess
+		case RunWhenSuccess, RunWhenFailure, RunWhenAlways:
+			// ok
+		default:
+			return fmt.Errorf("%s: run_when %q is not supported (allowed: %q, %q, %q)", ctx, s.RunWhen, RunWhenSuccess, RunWhenFailure, RunWhenAlways)
+		}
 		if s.Foreach != nil {
 			if s.Foreach.From == "" {
 				return fmt.Errorf("%s: foreach.from is required", ctx)
