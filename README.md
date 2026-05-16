@@ -126,6 +126,34 @@ then `vibe` swaps to a larger profile to expand it. Both
 `profiles/fast.example.yaml` and `profiles/code.example.yaml` are
 referenced by that example.
 
+## Shell completion
+
+Both `vibe` and `vamp` ship Cobra-generated completion scripts plus
+dynamic completers: `vibe start <TAB>` / `vibe pull <TAB>` suggest profile
+names from `$XDG_CONFIG_HOME/vibe/profiles/` (silently filtering out
+profiles that fail to parse), and `vamp run <TAB>` / `vamp validate <TAB>`
+suggest pipeline files from `$XDG_CONFIG_HOME/vamp/pipelines/` plus any
+`*.yaml` in the current directory.
+
+Install the completion script for your shell once and reload:
+
+```
+# Bash
+vibe completion bash > /etc/bash_completion.d/vibe
+vamp completion bash > /etc/bash_completion.d/vamp
+
+# Zsh (fpath[1] is typically ~/.zsh/completions or similar)
+vibe completion zsh > "${fpath[1]}/_vibe"
+vamp completion zsh > "${fpath[1]}/_vamp"
+
+# Fish
+vibe completion fish > ~/.config/fish/completions/vibe.fish
+vamp completion fish > ~/.config/fish/completions/vamp.fish
+```
+
+For a quick try without persisting, source the script in your current
+shell: `source <(vibe completion bash)`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

@@ -10,9 +10,10 @@ import (
 
 func validateCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "validate <pipeline.yaml>",
-		Short: "Load and validate a pipeline file (does not run it).",
-		Args:  cobra.ExactArgs(1),
+		Use:               "validate <pipeline.yaml>",
+		Short:             "Load and validate a pipeline file (does not run it).",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completePipelineFiles,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			p, err := vamp.LoadPipeline(args[0])
 			if err != nil {

@@ -24,9 +24,10 @@ func runCmd() *cobra.Command {
 		dryRunFlag      bool
 	)
 	cmd := &cobra.Command{
-		Use:   "run <pipeline.yaml>",
-		Short: "Execute a pipeline end-to-end.",
-		Args:  cobra.ExactArgs(1),
+		Use:               "run <pipeline.yaml>",
+		Short:             "Execute a pipeline end-to-end.",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completePipelineFiles,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {

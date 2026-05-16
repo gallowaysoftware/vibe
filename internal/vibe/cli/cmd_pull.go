@@ -14,9 +14,10 @@ import (
 
 func pullCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "pull <profile>",
-		Short: "Download the profile's model from HuggingFace if not already cached.",
-		Args:  cobra.ExactArgs(1),
+		Use:               "pull <profile>",
+		Short:             "Download the profile's model from HuggingFace if not already cached.",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeProfileNames,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
