@@ -12,9 +12,10 @@ import (
 func startCmd() *cobra.Command {
 	var noVRAMCheck bool
 	cmd := &cobra.Command{
-		Use:   "start <profile>",
-		Short: "Start a profile (auto-spawns the daemon if needed).",
-		Args:  cobra.ExactArgs(1),
+		Use:               "start <profile>",
+		Short:             "Start a profile (auto-spawns the daemon if needed).",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeProfileNames,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
