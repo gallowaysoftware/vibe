@@ -82,14 +82,14 @@ func (c *ChatCompletion) Call(ctx context.Context, baseURL, model, prompt string
 		return r.Choices[0].Message.Content, nil
 	}
 
-	return parseSSEStream(resp.Body, onToken)
+	return parseSSEStream(ctx, resp.Body, onToken)
 }
 
 // parseSSEStream reads an OpenAI-compatible Server-Sent Events stream from r.
 // It accumulates content deltas, invoking onToken for each non-empty one, and
 // returns the full concatenated content once it sees the [DONE] sentinel or
 // EOF.
-func parseSSEStream(r io.Reader, onToken StreamFunc) (string, error) {
+func parseSSEStream(ctx context.Context, r io.Reader, onToken StreamFunc) (string, error) {
 	scanner := bufio.NewScanner(r)
 	// Reasoning models can emit large single-chunk JSON; bump well above the
 	// 64KB default so we don't choke mid-stream.
@@ -142,6 +142,14 @@ func parseSSEStream(r io.Reader, onToken StreamFunc) (string, error) {
 		onToken(delta)
 	}
 	if err := scanner.Err(); err != nil {
+		// A canceled parent context aborts the HTTP transport mid-read; the
+		// resulting body-read error may or may not unwrap to context.Canceled
+		// depending on Go version and transport (HTTP/1.1 vs HTTP/2). Prefer
+		// ctx.Err() so writePipelineJSON can tell operator-cancel apart from
+		// a real upstream failure via errors.Is(err, context.Canceled).
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("read SSE stream: %w", ctx.Err())
+		}
 		return "", fmt.Errorf("read SSE stream: %w", err)
 	}
 	// Stream ended without [DONE]; return what we have.
