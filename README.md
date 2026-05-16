@@ -126,6 +126,13 @@ then `vibe` swaps to a larger profile to expand it. Both
 `profiles/fast.example.yaml` and `profiles/code.example.yaml` are
 referenced by that example.
 
+`vamp viz <pipeline.yaml>` emits a Mermaid `flowchart TD` description of
+the pipeline's DAG to stdout (or `--out <file>`), suitable for pasting
+into a markdown doc or the [Mermaid live editor](https://mermaid.live/).
+Nodes are colour-coded by stage type, foreach stages get a dotted edge
+from their JSON source, and `--show-inputs` adds a `subgraph inputs`
+block listing the pipeline's declared inputs.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

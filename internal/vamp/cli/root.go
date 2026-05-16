@@ -18,6 +18,7 @@ func rootCmd() *cobra.Command {
 		validateCmd(),
 		listCmd(),
 		capabilitiesCmd(),
+		vizCmd(),
 	)
 	return root
 }
