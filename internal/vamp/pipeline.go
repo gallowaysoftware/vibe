@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"text/template"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -125,7 +126,26 @@ type Stage struct {
 	// status, e.g. cleanup hooks). For "failure" and "always" stages the
 	// template namespace gains {{ .pipeline_status }} and
 	// {{ .failure_summary }} bindings.
+	//
+	// Anything other than the three keywords is treated as a Go text/template
+	// expression that renders against the same namespace as a stage's prompt
+	// template (inputs/stages/runDir + pipeline_status/failure_summary). The
+	// rendered output is trimmed and lowercased; "true"/"yes"/"1" → run,
+	// "false"/"no"/"0"/"" → skip, anything else → pipeline error at runtime.
+	// A template-form run_when is treated as an implicit "success" keyword
+	// for upstream-status gating: the template fires only after the deps
+	// have all succeeded.
 	RunWhen string `yaml:"run_when,omitempty"`
+
+	// Message is the rendered prompt a `type: confirm` stage prints to the
+	// operator (and writes into the marker file) when asking for approval.
+	// Required for confirm stages; rejected on every other stage type.
+	Message string `yaml:"message,omitempty"`
+
+	// Timeout, when non-zero, bounds how long a `type: confirm` stage will
+	// wait for the operator to respond before auto-rejecting. Zero (the
+	// default) means "wait forever". Rejected on every other stage type.
+	Timeout time.Duration `yaml:"timeout,omitempty"`
 }
 
 // RetryPolicy controls per-stage retry behaviour for transient executor
@@ -342,8 +362,9 @@ func (p *Pipeline) Validate() error {
 		// Capability is required for every stage type except the
 		// subprocess-only ones (audio, ffmpeg) and the network-only types
 		// (youtube, webhook), which talk to a third-party API and never
-		// activate a vibe profile.
-		if stageType != StageTypeAudio && stageType != StageTypeFFmpeg && stageType != StageTypeYouTube && stageType != StageTypeWebhook && s.Capability == "" {
+		// activate a vibe profile. Confirm stages are pure local I/O —
+		// stdin or a marker file — and also don't activate a profile.
+		if stageType != StageTypeAudio && stageType != StageTypeFFmpeg && stageType != StageTypeYouTube && stageType != StageTypeWebhook && stageType != StageTypeConfirm && s.Capability == "" {
 			return fmt.Errorf("%s: capability is required", ctx)
 		}
 		switch stageType {
@@ -367,6 +388,9 @@ func (p *Pipeline) Validate() error {
 				return err
 			}
 			if err := rejectWebhookFields(ctx, s); err != nil {
+				return err
+			}
+			if err := rejectConfirmFields(ctx, s); err != nil {
 				return err
 			}
 		case StageTypeAudio:
@@ -404,6 +428,9 @@ func (p *Pipeline) Validate() error {
 				return err
 			}
 			if err := rejectWebhookFields(ctx, s); err != nil {
+				return err
+			}
+			if err := rejectConfirmFields(ctx, s); err != nil {
 				return err
 			}
 		case StageTypeFFmpeg:
@@ -445,6 +472,9 @@ func (p *Pipeline) Validate() error {
 			if err := rejectWebhookFields(ctx, s); err != nil {
 				return err
 			}
+			if err := rejectConfirmFields(ctx, s); err != nil {
+				return err
+			}
 		case StageTypeComfyUI:
 			if s.Workflow == "" {
 				return fmt.Errorf("%s: workflow is required for type: comfyui stages", ctx)
@@ -479,6 +509,9 @@ func (p *Pipeline) Validate() error {
 				return err
 			}
 			if err := rejectWebhookFields(ctx, s); err != nil {
+				return err
+			}
+			if err := rejectConfirmFields(ctx, s); err != nil {
 				return err
 			}
 		case StageTypeYouTube:
@@ -522,6 +555,9 @@ func (p *Pipeline) Validate() error {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
 			}
 			if err := rejectWebhookFields(ctx, s); err != nil {
+				return err
+			}
+			if err := rejectConfirmFields(ctx, s); err != nil {
 				return err
 			}
 			// (youtube fields are valid here — already checked above)
@@ -593,8 +629,55 @@ func (p *Pipeline) Validate() error {
 			if err := rejectYouTubeFields(ctx, s); err != nil {
 				return err
 			}
+			if err := rejectConfirmFields(ctx, s); err != nil {
+				return err
+			}
+		case StageTypeConfirm:
+			// Confirm stages are pure local I/O: render Message, prompt the
+			// operator on stdin (TTY mode) or via a marker file (detach
+			// mode), and write "accepted"/"rejected" into Output. Nothing
+			// from the other stage types is meaningful here.
+			if s.Message == "" {
+				return fmt.Errorf("%s: message is required for type: confirm stages", ctx)
+			}
+			if s.Timeout < 0 {
+				return fmt.Errorf("%s: timeout must be >= 0 (got %s)", ctx, s.Timeout)
+			}
+			if s.Capability != "" {
+				return fmt.Errorf("%s: capability is only valid on stage types that activate a vibe profile (confirm is a local prompt)", ctx)
+			}
+			if s.Prompt != "" {
+				return fmt.Errorf("%s: prompt is only valid on type: text stages", ctx)
+			}
+			if s.PromptFile != "" {
+				return fmt.Errorf("%s: prompt_file is only valid on type: text stages", ctx)
+			}
+			if len(s.Params) > 0 {
+				return fmt.Errorf("%s: params is only valid on type: text stages", ctx)
+			}
+			if s.OutputFormat != "" {
+				return fmt.Errorf("%s: output_format is only valid on type: text stages", ctx)
+			}
+			if s.Workflow != "" {
+				return fmt.Errorf("%s: workflow is only valid on type: comfyui stages", ctx)
+			}
+			if len(s.Parameters) > 0 {
+				return fmt.Errorf("%s: parameters is only valid on type: comfyui stages", ctx)
+			}
+			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" {
+				return fmt.Errorf("%s: voice/text/voices_dir/binary are only valid on type: audio stages", ctx)
+			}
+			if len(s.FFmpegArgs) > 0 {
+				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
+			}
+			if err := rejectYouTubeFields(ctx, s); err != nil {
+				return err
+			}
+			if err := rejectWebhookFields(ctx, s); err != nil {
+				return err
+			}
 		default:
-			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio, ffmpeg, youtube, webhook)", ctx, s.Type)
+			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio, ffmpeg, youtube, webhook, confirm)", ctx, s.Type)
 		}
 		if s.OutputFormat != "" && s.OutputFormat != "json" {
 			return fmt.Errorf("%s: output_format %q is not supported (allowed: \"\", json)", ctx, s.OutputFormat)
@@ -609,18 +692,31 @@ func (p *Pipeline) Validate() error {
 			return err
 		}
 		p.Stages[i].Retry.Normalize()
-		// RunWhen: default to "success" when unset; reject any other value
-		// up-front so misspellings (run_when: failrue) surface at validate
-		// time instead of silently being treated as the default and never
-		// firing. We mutate the slice entry in place so the scheduler can
-		// read the canonical value without re-applying the default.
+		// RunWhen: default to "success" when unset. The three reserved
+		// keywords (success/failure/always) are gating qualifiers that
+		// inspect upstream status; anything else is interpreted as a Go
+		// text/template expression evaluated at dispatch time. We try-parse
+		// template-form values up-front so syntax errors fail loud here
+		// rather than surfacing only when the stage runs. Mutates the slice
+		// entry in place so the scheduler can read the canonical value
+		// without re-applying the default.
 		switch s.RunWhen {
 		case "":
 			p.Stages[i].RunWhen = RunWhenSuccess
 		case RunWhenSuccess, RunWhenFailure, RunWhenAlways:
 			// ok
 		default:
-			return fmt.Errorf("%s: run_when %q is not supported (allowed: %q, %q, %q)", ctx, s.RunWhen, RunWhenSuccess, RunWhenFailure, RunWhenAlways)
+			if !looksLikeTemplate(s.RunWhen) {
+				return fmt.Errorf("%s: run_when %q is not supported (allowed: %q, %q, %q, or a Go text/template expression containing %q)", ctx, s.RunWhen, RunWhenSuccess, RunWhenFailure, RunWhenAlways, "{{")
+			}
+			// Try-parse the template with the same funcs renderTemplate
+			// will use at runtime; otherwise `{{ contains ... }}` and
+			// other user-visible helpers would parse here but fail with a
+			// "function X not defined" mid-run. Sharing the FuncMap keeps
+			// the two paths in lock-step automatically.
+			if _, err := template.New(s.ID + ":run_when").Funcs(templateFuncs()).Parse(s.RunWhen); err != nil {
+				return fmt.Errorf("%s: parse run_when template: %w", ctx, err)
+			}
 		}
 		if s.Foreach != nil {
 			if s.Foreach.From == "" {
@@ -725,6 +821,20 @@ func rejectYouTubeFields(ctx string, s Stage) error {
 	return nil
 }
 
+// rejectConfirmFields rejects the confirm-only fields on non-confirm stages.
+// Mirrors rejectWebhookFields / rejectYouTubeFields. message is the human-
+// readable prompt, timeout bounds how long the stage waits for approval;
+// both only make sense on a confirm stage.
+func rejectConfirmFields(ctx string, s Stage) error {
+	if s.Message != "" {
+		return fmt.Errorf("%s: message is only valid on type: confirm stages", ctx)
+	}
+	if s.Timeout != 0 {
+		return fmt.Errorf("%s: timeout is only valid on type: confirm stages", ctx)
+	}
+	return nil
+}
+
 // rejectWebhookFields rejects the webhook-only fields on non-webhook stages.
 // Mirrors rejectYouTubeFields. URL is the canonical marker — body /
 // body_template_file / headers / retry_on_5xx / method only make sense in
@@ -751,6 +861,20 @@ func rejectWebhookFields(ctx string, s Stage) error {
 		return fmt.Errorf("%s: retry_on_5xx is only valid on type: webhook stages", ctx)
 	}
 	return nil
+}
+
+// looksLikeTemplate reports whether s is plausibly a Go text/template
+// expression (contains a `{{` action marker). Used to decide whether a
+// run_when string that isn't one of the three reserved keywords should be
+// passed to template.Parse for validation. We deliberately keep the check
+// cheap (substring rather than a full lexer pass): a string that *looks*
+// templated but parses as garbage produces a clear "parse run_when
+// template" error in Validate's template.Parse call; a string that doesn't
+// look templated is rejected as "not supported" so users get a precise
+// error pointing at the typo'd keyword rather than a confusing template
+// parse error from a flat string.
+func looksLikeTemplate(s string) bool {
+	return strings.Contains(s, "{{")
 }
 
 // findCycle returns the participating stage ids if the dependency graph

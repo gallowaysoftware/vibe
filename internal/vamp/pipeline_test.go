@@ -1665,3 +1665,160 @@ stages:
 		t.Errorf("err = %v, want message mentioning run_when", err)
 	}
 }
+
+// TestLoadPipeline_RunWhenTemplateAccepted accepts a run_when value that
+// looks like a Go text/template expression and try-parses it at
+// LoadPipeline time. Syntax errors fail loud here so users don't only
+// see them at runtime.
+func TestLoadPipeline_RunWhenTemplateAccepted(t *testing.T) {
+	yaml := `
+name: rw_tmpl
+stages:
+  - id: a
+    capability: reasoning
+    prompt: hi
+    output: a.md
+  - id: b
+    capability: reasoning
+    prompt: world
+    inputs: [a]
+    output: b.md
+    run_when: '{{ contains .stages.a.output "hi" }}'
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatalf("LoadPipeline: %v", err)
+	}
+	if !strings.Contains(p.Stages[1].RunWhen, "contains") {
+		t.Errorf("RunWhen = %q, want template-form preserved", p.Stages[1].RunWhen)
+	}
+}
+
+// TestLoadPipeline_RunWhenTemplateSyntaxRejected rejects a template-form
+// run_when whose body fails to parse. The Validate path try-parses the
+// template so we surface the parse error here rather than at run time.
+func TestLoadPipeline_RunWhenTemplateSyntaxRejected(t *testing.T) {
+	yaml := `
+name: rw_tmpl
+stages:
+  - id: a
+    capability: reasoning
+    prompt: hi
+    output: a.md
+    run_when: '{{ this is not valid }}'
+`
+	_, err := LoadPipeline(writePipeline(t, yaml))
+	if err == nil {
+		t.Fatal("expected parse error for malformed run_when template")
+	}
+	if !strings.Contains(err.Error(), "run_when") {
+		t.Errorf("err = %v, want one mentioning run_when", err)
+	}
+}
+
+// TestLoadPipeline_ConfirmValid parses a minimal confirm stage and
+// confirms the optional timeout field round-trips through yaml.v3's
+// duration parser.
+func TestLoadPipeline_ConfirmValid(t *testing.T) {
+	yaml := `
+name: conf
+stages:
+  - id: render
+    capability: image
+    prompt: render
+    output: cover.png
+  - id: review
+    type: confirm
+    message: "approve cover {{ .stages.render.output }}"
+    timeout: 30m
+    inputs: [render]
+    output: review.txt
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatalf("LoadPipeline: %v", err)
+	}
+	st := p.Stages[1]
+	if st.Type != StageTypeConfirm {
+		t.Errorf("type = %q, want %q", st.Type, StageTypeConfirm)
+	}
+	if st.Timeout != 30*time.Minute {
+		t.Errorf("timeout = %s, want 30m", st.Timeout)
+	}
+	if !strings.Contains(st.Message, "{{") {
+		t.Errorf("message lost the template form: %q", st.Message)
+	}
+}
+
+// TestLoadPipeline_ConfirmRejectsCrossTypeFields verifies confirm stages
+// cannot smuggle text/comfyui/etc. fields. We also flip the assertion
+// the other way: non-confirm stages reject the message/timeout fields.
+func TestLoadPipeline_ConfirmRejectsCrossTypeFields(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{
+			name: "missing_message",
+			yaml: `
+name: c
+stages:
+  - id: review
+    type: confirm
+    output: r.txt
+`,
+			want: "message is required",
+		},
+		{
+			name: "message_on_text",
+			yaml: `
+name: c
+stages:
+  - id: a
+    capability: r
+    prompt: hi
+    message: "no"
+    output: a.txt
+`,
+			want: "message is only valid",
+		},
+		{
+			name: "timeout_on_text",
+			yaml: `
+name: c
+stages:
+  - id: a
+    capability: r
+    prompt: hi
+    timeout: 5m
+    output: a.txt
+`,
+			want: "timeout is only valid",
+		},
+		{
+			name: "capability_on_confirm",
+			yaml: `
+name: c
+stages:
+  - id: a
+    type: confirm
+    capability: r
+    message: hi
+    output: a.txt
+`,
+			want: "capability",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadPipeline(writePipeline(t, tc.yaml))
+			if err == nil {
+				t.Fatal("expected validation error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want one containing %q", err, tc.want)
+			}
+		})
+	}
+}

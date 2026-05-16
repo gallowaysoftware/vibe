@@ -92,12 +92,14 @@ func TestSchemaJSON_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestSchema_RunWhenEnum guarantees that the run_when enum on the Stage
-// schema lists exactly the four canonical values (empty + the three valid
-// states). Pinned because run_when is a new field and we want the schema
-// to fail loudly if a future contributor adds a value to the constant
-// list but forgets to thread it through here.
-func TestSchema_RunWhenEnum(t *testing.T) {
+// TestSchema_RunWhenStringNotEnum guarantees that the run_when field on
+// the Stage schema is a free-form string with a documented default — the
+// field accepts the three reserved keywords (success / failure / always)
+// AND an arbitrary Go text/template expression evaluated at dispatch
+// time, so an enum constraint would falsely reject every valid template
+// form. Pinned because regressing to an enum would silently break every
+// pipeline that uses the template form.
+func TestSchema_RunWhenStringNotEnum(t *testing.T) {
 	s := Schema()
 	stage := s.Properties["stages"].Items
 	if stage == nil {
@@ -107,14 +109,45 @@ func TestSchema_RunWhenEnum(t *testing.T) {
 	if !ok {
 		t.Fatal("stage schema missing run_when")
 	}
-	want := map[string]bool{"": true, RunWhenSuccess: true, RunWhenFailure: true, RunWhenAlways: true}
-	if len(rw.Enum) != len(want) {
-		t.Errorf("run_when enum len = %d, want %d (%v)", len(rw.Enum), len(want), rw.Enum)
+	if rw.Type != "string" {
+		t.Errorf("run_when type = %q, want %q", rw.Type, "string")
 	}
-	for _, e := range rw.Enum {
-		if !want[e.(string)] {
-			t.Errorf("run_when enum has unexpected value %q", e)
+	if len(rw.Enum) != 0 {
+		t.Errorf("run_when must not be an enum (got %v); template-form values would be rejected", rw.Enum)
+	}
+	if rw.Default != RunWhenSuccess {
+		t.Errorf("run_when default = %v, want %q", rw.Default, RunWhenSuccess)
+	}
+}
+
+// TestSchema_ConfirmFields verifies that the confirm-related stage fields
+// (message + timeout) are present in the schema so editor autocomplete
+// surfaces them, and that the stage-type enum lists "confirm".
+func TestSchema_ConfirmFields(t *testing.T) {
+	s := Schema()
+	stage := s.Properties["stages"].Items
+	if stage == nil {
+		t.Fatal("schema missing stages.items")
+	}
+	if _, ok := stage.Properties["message"]; !ok {
+		t.Errorf("stage schema missing message property")
+	}
+	if _, ok := stage.Properties["timeout"]; !ok {
+		t.Errorf("stage schema missing timeout property")
+	}
+	typeProp, ok := stage.Properties["type"]
+	if !ok {
+		t.Fatal("stage schema missing type property")
+	}
+	found := false
+	for _, v := range typeProp.Enum {
+		if s, _ := v.(string); s == string(StageTypeConfirm) {
+			found = true
+			break
 		}
+	}
+	if !found {
+		t.Errorf("stage type enum missing %q (got %v)", StageTypeConfirm, typeProp.Enum)
 	}
 }
 

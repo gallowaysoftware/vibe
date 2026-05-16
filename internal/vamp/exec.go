@@ -64,6 +64,13 @@ const (
 	// the final stage of a pipeline to announce completion. Like the
 	// network-only youtube type it does not activate a vibe profile.
 	StageTypeWebhook StageType = "webhook"
+	// StageTypeConfirm is a human-in-the-loop gate. It renders Stage.Message,
+	// either prompts the operator on stdin (TTY foreground runs) or writes a
+	// `<stage-id>.pending` marker file the operator clears with `vamp
+	// confirm` (background `--detach` runs), and writes "accepted" or
+	// "rejected" into the stage's output file. Like other subprocess-only
+	// types it does not activate a vibe profile.
+	StageTypeConfirm StageType = "confirm"
 )
 
 // StageExecutor implements the run of a single stage instance. The receiver
@@ -338,6 +345,7 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 		StageTypeFFmpeg:  &ffmpegExecutor{},
 		StageTypeYouTube: &youtubeExecutor{},
 		StageTypeWebhook: &webhookExecutor{},
+		StageTypeConfirm: newConfirmExecutor(),
 	}
 
 	// Stage lookup and dependency counts for wave-based scheduling.
@@ -392,14 +400,48 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 		// further dependents (whose own RunWhen will see "skipped" deps,
 		// equivalent to a pipeline failure for the purposes of failure/always
 		// gating).
+		//
+		// Two gates run in sequence:
+		//   1. The keyword gate (shouldRunStage): inspects upstream status
+		//      against the stage's success/failure/always qualifier.
+		//   2. The template gate (evalRunWhenTemplate): for template-form
+		//      run_when, renders the expression and checks the boolean.
+		//      Only consulted when the keyword gate approved — a
+		//      template-form run_when is implicitly "success" (see
+		//      runWhenOrDefault), so a failed upstream skips the stage
+		//      before we even render the template.
 		var toRun []*Stage
 		var toSkip []*Stage
 		for _, st := range ready {
-			if e.shouldRunStage(st) {
-				toRun = append(toRun, st)
-			} else {
+			if !e.shouldRunStage(st) {
 				toSkip = append(toSkip, st)
+				continue
 			}
+			if hasRunWhenTemplate(st) {
+				ok, err := e.evalRunWhenTemplate(st)
+				if err != nil {
+					// Template render / shape error: attribute to the
+					// stage so the aggregated pipeline error names it,
+					// and skip downstream dependents the same way a real
+					// stage failure would.
+					e.markStageStatus(st.ID, err)
+					e.recordStageFinish(st.ID, time.Now(), err)
+					e.logf("  -> stage %q: run_when template error: %v", st.ID, err)
+					for _, child := range dependents[st.ID] {
+						if _, ok := indeg[child]; ok {
+							indeg[child]--
+						}
+					}
+					remaining--
+					continue
+				}
+				if !ok {
+					e.logf("  -> stage %q: skipped (run_when template evaluated to false)", st.ID)
+					toSkip = append(toSkip, st)
+					continue
+				}
+			}
+			toRun = append(toRun, st)
 		}
 		// Mark skipped stages first so their status is visible before any
 		// of the parallel runners in this wave check dep statuses for
@@ -528,13 +570,79 @@ func (e *Executor) shouldRunStage(st *Stage) bool {
 }
 
 // runWhenOrDefault returns Stage.RunWhen with the empty-default rule
-// applied. Centralised so the executor and any future callers agree on
-// the canonical value when the YAML omits the field.
+// applied and template-form values mapped to RunWhenSuccess. Centralised
+// so the executor and any future callers agree on the canonical *keyword*
+// value when the YAML omits the field or supplies a template expression.
+//
+// Template-form run_when is treated as an implicit "success" keyword for
+// upstream-status gating: the template fires only after the deps have all
+// succeeded. The actual template evaluation (the second gate) is handled
+// separately in evalRunWhenTemplate.
 func runWhenOrDefault(st *Stage) string {
-	if st.RunWhen == "" {
+	switch st.RunWhen {
+	case "":
+		return RunWhenSuccess
+	case RunWhenSuccess, RunWhenFailure, RunWhenAlways:
+		return st.RunWhen
+	default:
+		// Template form. The keyword gate is implicit success.
 		return RunWhenSuccess
 	}
-	return st.RunWhen
+}
+
+// hasRunWhenTemplate reports whether the stage's run_when carries a Go
+// text/template expression rather than one of the reserved keywords.
+// Validate has already try-parsed the template, so callers can trust that
+// a true return means template.Parse will succeed.
+func hasRunWhenTemplate(st *Stage) bool {
+	switch st.RunWhen {
+	case "", RunWhenSuccess, RunWhenFailure, RunWhenAlways:
+		return false
+	default:
+		return true
+	}
+}
+
+// runWhenTemplateAcceptValues / runWhenTemplateRejectValues enumerate the
+// rendered template outputs that map to "run" vs "skip". Anything outside
+// these sets is a runtime error attributed to the stage so misrendered
+// expressions surface loudly instead of silently falling through. The
+// canonical comparison form is trimmed lowercase: we accept "true", "yes",
+// "1" as the truthy set and "false", "no", "0", "" as the falsy set.
+var (
+	runWhenTemplateAcceptValues = map[string]bool{"true": true, "yes": true, "1": true}
+	runWhenTemplateRejectValues = map[string]bool{"false": true, "no": true, "0": true, "": true}
+)
+
+// evalRunWhenTemplate renders the stage's run_when template against the
+// standard binding (inputs/stages/runDir + pipeline_status/failure_summary)
+// and reports whether the stage should run. The boolean is meaningful only
+// when err is nil; a non-nil err mentions the stage id and the rendered
+// value so users can grep their pipeline for the mistake.
+//
+// The caller must have established that hasRunWhenTemplate(st) is true.
+// Foreach injection isn't supported here because run_when is evaluated
+// once per stage dispatch (not per-item) — by design: a foreach gate would
+// be a different feature (skipping individual items), not a different
+// shape for the same one.
+func (e *Executor) evalRunWhenTemplate(st *Stage) (bool, error) {
+	prior := e.snapshotPrior(st.Inputs)
+	extra := map[string]any{
+		"pipeline_status": e.pipelineStatusString(),
+		"failure_summary": e.failureSummary(),
+	}
+	rendered, err := renderTemplate(st.ID+":run_when", st.RunWhen, st.Inputs, e.Inputs, prior, e.RunDir, extra)
+	if err != nil {
+		return false, fmt.Errorf("stage %s: render run_when: %w", st.ID, err)
+	}
+	v := strings.ToLower(strings.TrimSpace(rendered))
+	if runWhenTemplateAcceptValues[v] {
+		return true, nil
+	}
+	if runWhenTemplateRejectValues[v] {
+		return false, nil
+	}
+	return false, fmt.Errorf("stage %s: run_when template rendered %q, expected one of true/yes/1 (run) or false/no/0/\"\" (skip)", st.ID, rendered)
 }
 
 // markStageStatus records the terminal outcome of a stage. err==nil ->
@@ -1382,7 +1490,7 @@ func stageTypeOrDefault(st *Stage) StageType {
 // scheduler skips EnsureActive for groups consisting entirely of these stages.
 func stageRequiresVibeProfile(st *Stage) bool {
 	switch stageTypeOrDefault(st) {
-	case StageTypeAudio, StageTypeFFmpeg, StageTypeYouTube, StageTypeWebhook:
+	case StageTypeAudio, StageTypeFFmpeg, StageTypeYouTube, StageTypeWebhook, StageTypeConfirm:
 		return false
 	default:
 		return true
@@ -1860,11 +1968,28 @@ func renderTemplate(name, raw string, deps []string, cliInputs map[string]string
 	return buf.String(), nil
 }
 
-// templateFuncs returns the function map registered on every stage template.
-// Currently only slugify; intentionally small to keep templates predictable.
+// templateFuncs returns the function map registered on every stage
+// template. We register a small, predictable surface:
+//   - slugify: filesystem-safe slugs from arbitrary values (see slugify).
+//   - contains: strings.Contains(haystack, needle). Particularly useful
+//     for template-form run_when ("did the cover prompt mention rainy?").
+//   - hasPrefix / hasSuffix: strings.HasPrefix / HasSuffix wrappers, same
+//     motivation as contains.
+//   - lower / upper / trim: thin wrappers around the strings package; the
+//     stdlib template package's built-ins don't include these and they're
+//     the obvious helpers for run_when gates that compare stage outputs.
+//
+// Kept small on purpose: each new function widens the API surface that
+// pipelines silently depend on. Add deliberately, document inline.
 func templateFuncs() template.FuncMap {
 	return template.FuncMap{
-		"slugify": slugify,
+		"slugify":   slugify,
+		"contains":  func(haystack, needle string) bool { return strings.Contains(haystack, needle) },
+		"hasPrefix": func(s, prefix string) bool { return strings.HasPrefix(s, prefix) },
+		"hasSuffix": func(s, suffix string) bool { return strings.HasSuffix(s, suffix) },
+		"lower":     strings.ToLower,
+		"upper":     strings.ToUpper,
+		"trim":      strings.TrimSpace,
 	}
 }
 

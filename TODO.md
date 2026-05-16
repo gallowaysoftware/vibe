@@ -8,6 +8,21 @@
   the pre-flight check, and (c) a vamp scheduler that can run two
   capabilities concurrently when they land on different cards.
 
+## Recently landed
+
+- **Template-expression `run_when` + `type: confirm` stage** (2026-05-16).
+  Stages can now gate on rendered template booleans
+  (`run_when: '{{ contains .stages.cover.output "rainy" }}'`) on top of
+  the existing success/failure/always keyword qualifier; the keyword
+  gate runs first (template form is implicit `success`), then the
+  template renders and must evaluate to one of true/yes/1 or
+  false/no/0/"" (anything else is a pipeline error). The companion
+  `type: confirm` stage blocks until an operator approves: TTY mode
+  prompts on stdin, `--detach` mode writes a `<stage-id>.pending` marker
+  cleared with `vamp confirm <run-dir> <stage-id> [--reject]`. Optional
+  `timeout:` rejects automatically. Rejection is a sentinel error so
+  downstream `run_when: failure`/`always` stages fire as expected.
+
 ## History (phases 1 + 2, done)
 
 The bulk of the original phase-1 + phase-2 plan has shipped over the
