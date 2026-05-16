@@ -267,6 +267,11 @@ LAN access with bearer-token auth. See [`TODO.md`](TODO.md) for what's
 open — the headline item still on the radar is multi-GPU scheduling
 (today's single-profile-at-a-time invariant assumes one GPU).
 
+## Contributing
+
+PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the mechanical
+setup and [AGENTS.md](AGENTS.md) for the project conventions.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
