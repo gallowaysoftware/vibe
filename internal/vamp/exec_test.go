@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -1119,25 +1120,13 @@ func dumpSyncMapKeys(m *sync.Map) []string {
 	return out
 }
 
-// TestExecutor_ResumeRunsForeachIfAnyItemMissing verifies that a foreach
-// stage's partial output forces a full rerun in Phase 1: with 3 items in the
-// upstream array and only 2 of 3 per-item files present, all 3 items must run
-// again.
-func TestExecutor_ResumeRunsForeachIfAnyItemMissing(t *testing.T) {
-	var consumerCalls sync.Map
-	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
-		if prompt == "TITLES" {
-			return `["a","b","c"]`, nil
-		}
-		if strings.HasPrefix(prompt, "UP:") {
-			tok := strings.TrimPrefix(prompt, "UP:")
-			consumerCalls.Store(tok, true)
-			return strings.ToUpper(tok), nil
-		}
-		return "", fmt.Errorf("unexpected prompt %q", prompt)
-	}
-	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
-	pipeline := &Pipeline{
+// foreachResumePipeline returns a 4-item foreach pipeline reused by the
+// per-item resume tests below. The upstream "titles" stage emits a static
+// JSON array so the resume helper can rely on a stable item order; the
+// consumer stage's Output template embeds {{.title}} so each per-item file
+// has a unique on-disk name.
+func foreachResumePipeline() *Pipeline {
+	return &Pipeline{
 		Name: "fan",
 		Stages: []Stage{
 			{ID: "titles", Capability: "reasoning", Prompt: "TITLES", Output: "titles.json", OutputFormat: "json"},
@@ -1150,22 +1139,53 @@ func TestExecutor_ResumeRunsForeachIfAnyItemMissing(t *testing.T) {
 			},
 		},
 	}
-	pipelineSource := "name: fan\n" // placeholder; the contents don't matter so long as resume's hash check sees the SAME bytes in snapshot and PipelineSource
-	exec, runDir := stubExecutor(t, pipeline, caps, inf)
-	// Pre-populate upstream JSON output + 2 of 3 per-item files.
-	if err := os.WriteFile(filepath.Join(runDir, "titles.json"), []byte(`["a","b","c"]`), 0o644); err != nil {
+}
+
+// foreachResumeInfFn is the inference stub shared by the per-item resume
+// tests: it returns a fixed JSON array for the upstream stage and uppercases
+// each consumer item's token, recording every consumer invocation by token
+// into calls so the assertions can verify which items actually ran.
+func foreachResumeInfFn(calls *sync.Map) InferenceFunc {
+	return func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		if prompt == "TITLES" {
+			return `["a","b","c","d"]`, nil
+		}
+		if strings.HasPrefix(prompt, "UP:") {
+			tok := strings.TrimPrefix(prompt, "UP:")
+			calls.Store(tok, true)
+			return strings.ToUpper(tok), nil
+		}
+		return "", fmt.Errorf("unexpected prompt %q", prompt)
+	}
+}
+
+// TestExecutor_ResumeForeach_PartialPresentRerunsMissingOnly verifies that a
+// foreach stage with some per-item outputs already on disk reruns ONLY the
+// missing items on resume — the previously-completed ones are loaded straight
+// from disk into stageResult.Outputs at their original input-array index.
+func TestExecutor_ResumeForeach_PartialPresentRerunsMissingOnly(t *testing.T) {
+	var consumerCalls sync.Map
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
+	pipeline := foreachResumePipeline()
+	pipelineSource := "name: fan\n" // placeholder; resume's hash check just needs snapshot bytes to match PipelineSource
+	exec, runDir := stubExecutor(t, pipeline, caps, foreachResumeInfFn(&consumerCalls))
+	// Pre-populate upstream JSON output + 3 of 4 per-item files.
+	if err := os.WriteFile(filepath.Join(runDir, "titles.json"), []byte(`["a","b","c","d"]`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(runDir, "items"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(runDir, "items", "a.txt"), []byte("A"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(runDir, "items", "a.txt"), []byte("A-prior"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(runDir, "items", "b.txt"), []byte("B"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(runDir, "items", "b.txt"), []byte("B-prior"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	// items/c.txt deliberately missing.
+	if err := os.WriteFile(filepath.Join(runDir, "items", "d.txt"), []byte("D-prior"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(runDir, "pipeline.yaml.snapshot"), []byte(pipelineSource), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1174,20 +1194,227 @@ func TestExecutor_ResumeRunsForeachIfAnyItemMissing(t *testing.T) {
 	if err := exec.Run(context.Background()); err != nil {
 		t.Fatalf("resume run: %v", err)
 	}
-	// Every item must have been invoked because Phase 1 reruns the whole
-	// foreach when any per-item file is missing.
-	for _, tok := range []string{"a", "b", "c"} {
-		if _, ran := consumerCalls.Load(tok); !ran {
-			t.Errorf("expected foreach item %q to rerun, but it did not", tok)
+	// Only the missing item should have been invoked; the rest must have
+	// resumed straight from disk.
+	for _, tok := range []string{"a", "b", "d"} {
+		if _, ran := consumerCalls.Load(tok); ran {
+			t.Errorf("foreach item %q was rerun despite its output existing on disk", tok)
 		}
 	}
-	// And the previously-missing c.txt must now exist with the right body.
+	if _, ran := consumerCalls.Load("c"); !ran {
+		t.Errorf("expected missing foreach item %q to rerun, but it did not (saw: %v)", "c", dumpSyncMapKeys(&consumerCalls))
+	}
+	// The previously-missing c.txt must now exist with the freshly-computed
+	// body.
 	got, err := os.ReadFile(filepath.Join(runDir, "items", "c.txt"))
 	if err != nil {
 		t.Fatalf("expected items/c.txt to be written on rerun: %v", err)
 	}
 	if string(got) != "C" {
 		t.Errorf("items/c.txt = %q, want %q", got, "C")
+	}
+	// Resumed items must NOT have been overwritten — their prior body
+	// survives the rerun.
+	for _, c := range []struct {
+		path string
+		want string
+	}{
+		{"items/a.txt", "A-prior"},
+		{"items/b.txt", "B-prior"},
+		{"items/d.txt", "D-prior"},
+	} {
+		got, err := os.ReadFile(filepath.Join(runDir, c.path))
+		if err != nil {
+			t.Fatalf("read %s: %v", c.path, err)
+		}
+		if string(got) != c.want {
+			t.Errorf("%s = %q, want %q (resumed file was overwritten)", c.path, got, c.want)
+		}
+	}
+	// stageResult.Outputs must be input-array ordered: A-prior, B-prior, C, D-prior.
+	exec.mu.Lock()
+	res, ok := exec.stageOutputs["consumer"]
+	exec.mu.Unlock()
+	if !ok {
+		t.Fatalf("consumer stage produced no stageResult")
+	}
+	want := []string{"A-prior", "B-prior", "C", "D-prior"}
+	if got := res.Outputs; !reflect.DeepEqual(got, want) {
+		t.Errorf("consumer.Outputs = %#v, want %#v", got, want)
+	}
+}
+
+// TestExecutor_ResumeForeach_PerItem verifies the same partial-resume
+// invariants on a 4-item foreach with 2 missing items in non-contiguous
+// positions: only the missing indices run, the resumed slots keep their
+// on-disk bodies, and the final per-item Outputs slice is in input-array
+// order regardless of which items ran in this pass.
+func TestExecutor_ResumeForeach_PerItem(t *testing.T) {
+	var consumerCalls sync.Map
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
+	pipeline := foreachResumePipeline()
+	pipelineSource := "name: fan\n"
+	exec, runDir := stubExecutor(t, pipeline, caps, foreachResumeInfFn(&consumerCalls))
+	if err := os.WriteFile(filepath.Join(runDir, "titles.json"), []byte(`["a","b","c","d"]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(runDir, "items"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Present: a (idx 0) and c (idx 2). Missing: b (idx 1) and d (idx 3).
+	if err := os.WriteFile(filepath.Join(runDir, "items", "a.txt"), []byte("A-prior"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "items", "c.txt"), []byte("C-prior"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "pipeline.yaml.snapshot"), []byte(pipelineSource), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec.PipelineSource = []byte(pipelineSource)
+	exec.ResumeDir = runDir
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("resume run: %v", err)
+	}
+	// Only b and d should have invoked the executor.
+	for _, tok := range []string{"a", "c"} {
+		if _, ran := consumerCalls.Load(tok); ran {
+			t.Errorf("foreach item %q was rerun despite its output existing on disk", tok)
+		}
+	}
+	for _, tok := range []string{"b", "d"} {
+		if _, ran := consumerCalls.Load(tok); !ran {
+			t.Errorf("expected missing foreach item %q to rerun, but it did not (saw: %v)", tok, dumpSyncMapKeys(&consumerCalls))
+		}
+	}
+	// Outputs slice must stay input-array ordered: A-prior, B (rerun), C-prior, D (rerun).
+	exec.mu.Lock()
+	res, ok := exec.stageOutputs["consumer"]
+	exec.mu.Unlock()
+	if !ok {
+		t.Fatalf("consumer stage produced no stageResult")
+	}
+	want := []string{"A-prior", "B", "C-prior", "D"}
+	if got := res.Outputs; !reflect.DeepEqual(got, want) {
+		t.Errorf("consumer.Outputs = %#v, want %#v", got, want)
+	}
+	// Resumed files survive intact; missing files were written with fresh bodies.
+	for _, c := range []struct {
+		path string
+		want string
+	}{
+		{"items/a.txt", "A-prior"},
+		{"items/b.txt", "B"},
+		{"items/c.txt", "C-prior"},
+		{"items/d.txt", "D"},
+	} {
+		got, err := os.ReadFile(filepath.Join(runDir, c.path))
+		if err != nil {
+			t.Fatalf("read %s: %v", c.path, err)
+		}
+		if string(got) != c.want {
+			t.Errorf("%s = %q, want %q", c.path, got, c.want)
+		}
+	}
+}
+
+// TestExecutor_ResumeForeach_AllPresent verifies the all-resumed shortcut is
+// preserved: when every per-item output is present on disk, the foreach
+// stage's executor is never invoked, but its stageResult.Outputs is fully
+// populated from the on-disk files.
+func TestExecutor_ResumeForeach_AllPresent(t *testing.T) {
+	var consumerCalls sync.Map
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
+	pipeline := foreachResumePipeline()
+	pipelineSource := "name: fan\n"
+	exec, runDir := stubExecutor(t, pipeline, caps, foreachResumeInfFn(&consumerCalls))
+	if err := os.WriteFile(filepath.Join(runDir, "titles.json"), []byte(`["a","b","c","d"]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(runDir, "items"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []struct{ name, body string }{
+		{"items/a.txt", "A-prior"},
+		{"items/b.txt", "B-prior"},
+		{"items/c.txt", "C-prior"},
+		{"items/d.txt", "D-prior"},
+	} {
+		if err := os.WriteFile(filepath.Join(runDir, p.name), []byte(p.body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "pipeline.yaml.snapshot"), []byte(pipelineSource), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec.PipelineSource = []byte(pipelineSource)
+	exec.ResumeDir = runDir
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("resume run: %v", err)
+	}
+	// Not a single consumer call should have happened.
+	for _, tok := range []string{"a", "b", "c", "d"} {
+		if _, ran := consumerCalls.Load(tok); ran {
+			t.Errorf("foreach item %q was rerun despite all outputs existing on disk", tok)
+		}
+	}
+	// Outputs slice must reflect the on-disk bodies in input-array order.
+	exec.mu.Lock()
+	res, ok := exec.stageOutputs["consumer"]
+	exec.mu.Unlock()
+	if !ok {
+		t.Fatalf("consumer stage produced no stageResult")
+	}
+	want := []string{"A-prior", "B-prior", "C-prior", "D-prior"}
+	if got := res.Outputs; !reflect.DeepEqual(got, want) {
+		t.Errorf("consumer.Outputs = %#v, want %#v", got, want)
+	}
+}
+
+// TestExecutor_ResumeForeach_NonePresent verifies the all-missing branch is
+// unchanged: when no per-item outputs exist on disk, every item runs through
+// the executor exactly as a fresh run would (preserving the pre-per-item-
+// resume behaviour for the "first crash on item 0" case).
+func TestExecutor_ResumeForeach_NonePresent(t *testing.T) {
+	var consumerCalls sync.Map
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
+	pipeline := foreachResumePipeline()
+	pipelineSource := "name: fan\n"
+	exec, runDir := stubExecutor(t, pipeline, caps, foreachResumeInfFn(&consumerCalls))
+	if err := os.WriteFile(filepath.Join(runDir, "titles.json"), []byte(`["a","b","c","d"]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// No per-item files on disk.
+	if err := os.WriteFile(filepath.Join(runDir, "pipeline.yaml.snapshot"), []byte(pipelineSource), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec.PipelineSource = []byte(pipelineSource)
+	exec.ResumeDir = runDir
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("resume run: %v", err)
+	}
+	for _, tok := range []string{"a", "b", "c", "d"} {
+		if _, ran := consumerCalls.Load(tok); !ran {
+			t.Errorf("expected foreach item %q to run (no outputs on disk), but it did not", tok)
+		}
+	}
+	// All per-item files now exist with fresh bodies.
+	for _, c := range []struct {
+		path string
+		want string
+	}{
+		{"items/a.txt", "A"},
+		{"items/b.txt", "B"},
+		{"items/c.txt", "C"},
+		{"items/d.txt", "D"},
+	} {
+		got, err := os.ReadFile(filepath.Join(runDir, c.path))
+		if err != nil {
+			t.Fatalf("read %s: %v", c.path, err)
+		}
+		if string(got) != c.want {
+			t.Errorf("%s = %q, want %q", c.path, got, c.want)
+		}
 	}
 }
 

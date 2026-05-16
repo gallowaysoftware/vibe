@@ -129,20 +129,23 @@ webhook URL.
 - ~~VRAM-aware *scheduling* (today's pre-flight rejects when free VRAM is
   insufficient for the chosen profile; smarter scheduling could pick a
   smaller capable profile that fits the budget).~~ Done — capabilities can
-  now bind to a `candidates: [biggest, ..., smallest]` list (see the
-  README's "Capabilities" section). When the daemon rejects the first
-  candidate with the pre-flight VRAM precondition error, vamp falls back
-  to the next candidate and logs the skip.
+  now bind to a `candidates: [biggest, ..., smallest]` list. When the
+  daemon rejects the first candidate with the pre-flight VRAM precondition
+  error, vamp falls back to the next candidate and logs the skip.
 - ~~vamp daemon mode: background runs with job IDs, `vamp logs <id>` to
   follow live, `vamp jobs ls` for the queue.~~ Done — `vamp run --detach`
   forks the same `vamp` binary into a setsid'd worker that writes
   `vamp.pid` + `vamp.log` into the run dir; `vamp jobs ls/show`,
-  `vamp logs <id> [-f]`, and `vamp cancel <id>` (alias of
-  `vamp jobs cancel`) drive it. Cancellation propagates via SIGTERM ->
-  signal.NotifyContext -> Executor ctx cancel; `pipeline.json` records
-  `status: "canceled"` for cancelled runs.
-- Per-foreach-item resume (today resume granularity is whole-stage; a
-  failed item in a foreach causes the whole stage to rerun on resume).
+  `vamp logs <id> [-f]`, and `vamp cancel <id>` drive it. Cancellation
+  propagates via SIGTERM → ctx cancel; `pipeline.json` records
+  `status: "canceled"`.
+- ~~Per-foreach-item resume (today resume granularity is whole-stage; a
+  failed item in a foreach causes the whole stage to rerun on resume).~~
+  Done — `tryResumeForeachStage` now classifies each item independently
+  and `executeForeachStage` only dispatches the missing indices. Resumed
+  items are loaded from disk into `stageResult.Outputs` at their original
+  index, and the JSON integrity check still runs per item. See
+  `TestExecutor_ResumeForeach_PerItem` in `internal/vamp/exec_test.go`.
 - ~~Real LAN access from a laptop: HTTP control plane is loopback-bound
   today. Needs auth (the deferred token-based-auth decision from earlier).~~
   Done — `bind_all: true` in `~/.config/vibe/config.yaml` flips the TCP

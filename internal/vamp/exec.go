@@ -141,6 +141,31 @@ type stageResult struct {
 	Outputs []string
 }
 
+// foreachResumeInfo carries per-item resume state from the resume pre-pass
+// (tryResumeForeachStage) down into executeForeachStage. The pre-pass detects
+// which items already have on-disk outputs and pre-renders every per-item
+// output path; the executor reuses the pre-rendered paths (so collision
+// detection stays deterministic) and only runs the items whose indices appear
+// in MissingIndices. ResumedOutputs is the per-item content/path map for items
+// that were loaded successfully; the executor splices these into the final
+// stageResult.Outputs slot at their original index alongside the rerun items.
+type foreachResumeInfo struct {
+	// OutPaths is the pre-rendered per-item output path (relative to RunDir)
+	// for every index in input-array order. The executor reuses these instead
+	// of re-rendering so the pre-pass and the run share the same canonical map.
+	OutPaths []string
+	// MissingIndices lists the indices whose on-disk output is missing,
+	// zero-sized, or (for output_format: json) failed validation. Only these
+	// items are dispatched to the executor; everything else is loaded from
+	// disk.
+	MissingIndices []int
+	// ResumedOutputs is keyed by original input-array index; its value is
+	// already the canonical per-item entry the runner records in
+	// stageResult.Outputs[i] (text for text/youtube stages, absolute path for
+	// binary stages).
+	ResumedOutputs map[int]string
+}
+
 // defaultMaxForeachConcurrency caps in-flight items inside a single foreach
 // stage when the caller doesn't set Executor.MaxForeachConcurrency. Four is a
 // pragmatic default: large enough to overlap latency-bound work (e.g. ComfyUI
@@ -194,7 +219,8 @@ type Executor struct {
 	// in-memory state populated during Run
 	mu                 sync.Mutex // guards stageOutputs and the model cache
 	stageOutputs       map[string]*stageResult
-	completedStages    map[string]bool // stage ids whose outputs were loaded from a prior run via Resume
+	completedStages    map[string]bool               // stage ids whose outputs were loaded from a prior run via Resume
+	foreachResumes     map[string]*foreachResumeInfo // partial-resume state for foreach stages whose execution is still required
 	cachedModelID      string
 	cachedModelProfile string
 
@@ -333,6 +359,7 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 	e.stageOutputs = make(map[string]*stageResult, len(e.Pipeline.Stages))
 	e.stageStatus = make(map[string]string, len(e.Pipeline.Stages))
 	e.stageErrors = make(map[string]error)
+	e.foreachResumes = make(map[string]*foreachResumeInfo)
 	remaining := len(e.Pipeline.Stages)
 	wave := 0
 	for remaining > 0 {
@@ -880,6 +907,13 @@ func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID
 // non-nil Foreach. The items list is read from the upstream stage's JSON
 // output (referenced by Foreach.From). Each item runs in its own goroutine
 // through the registered executor and writes its own output file.
+//
+// Per-item resume: when e.foreachResumes[st.ID] is populated (set by the
+// resume pre-pass in tryResumeStage), only the indices listed in
+// MissingIndices are dispatched to the executor. Previously-completed items
+// are loaded straight from disk into the outputs slice at their original
+// index so the final stageResult.Outputs stays in input-array order
+// regardless of which items ran in this invocation.
 func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec StageExecutor, baseURL, modelID, backendAddr string, tokenSink io.Writer) (stageErr error) {
 	// Mirror executeStage's per-stage timing: the foreach stage's
 	// "duration" is the elapsed wall-clock for the whole fan-out
@@ -901,7 +935,17 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 		e.logf("  -> stage %q: foreach array empty, no items to run", st.ID)
 		return nil
 	}
-	e.logf("  -> stage %q: foreach fanning out %d item(s)", st.ID, len(items))
+
+	// Pull any per-item resume info stashed by tryResumeForeachStage. When
+	// present, OutPaths is already pre-rendered (same template eval the
+	// pre-pass used) and ResumedOutputs holds the on-disk content for items
+	// that resumed successfully; only MissingIndices need to be dispatched
+	// here. We delete the entry on first read because the executor owns it
+	// from here on.
+	e.mu.Lock()
+	resumeInfo := e.foreachResumes[st.ID]
+	delete(e.foreachResumes, st.ID)
+	e.mu.Unlock()
 
 	// Runtime check (moved here from Validate so single-item foreach with a
 	// non-templated Output is accepted): if the upstream resolves to more
@@ -914,30 +958,69 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 	}
 
 	// Pre-render each item's output path so we can detect collisions before
-	// launching any executor work.
+	// launching any executor work. When the resume pre-pass already pre-
+	// rendered the same paths, reuse them verbatim — they are the canonical
+	// per-index map the rest of the function operates on.
 	outPaths := make([]string, len(items))
+	if resumeInfo != nil && len(resumeInfo.OutPaths) == len(items) {
+		copy(outPaths, resumeInfo.OutPaths)
+	}
 	seenPaths := make(map[string]int, len(items))
 	for i, item := range items {
-		// `.i` is the per-iteration index, also bound in the prompt template
-		// below; lets users template paths like `assets/img_{{.i}}.png`.
-		extra := map[string]any{st.Foreach.Var: item, "i": i}
-		path, err := e.renderOutputPath(st, extra)
-		if err != nil {
-			return fmt.Errorf("render output path for item %d: %w", i, err)
+		if outPaths[i] == "" {
+			// `.i` is the per-iteration index, also bound in the prompt
+			// template below; lets users template paths like
+			// `assets/img_{{.i}}.png`.
+			extra := map[string]any{st.Foreach.Var: item, "i": i}
+			path, err := e.renderOutputPath(st, extra)
+			if err != nil {
+				return fmt.Errorf("render output path for item %d: %w", i, err)
+			}
+			outPaths[i] = path
 		}
-		if prev, ok := seenPaths[path]; ok {
-			return fmt.Errorf("stage %s: foreach output path collision: items %d and %d both produce %q", st.ID, prev, i, path)
+		if prev, ok := seenPaths[outPaths[i]]; ok {
+			return fmt.Errorf("stage %s: foreach output path collision: items %d and %d both produce %q", st.ID, prev, i, outPaths[i])
 		}
-		seenPaths[path] = i
-		outPaths[i] = path
+		seenPaths[outPaths[i]] = i
+	}
+
+	// Decide which indices the executor needs to run this pass. With no
+	// resumeInfo (fresh run or all-missing resume) we dispatch every index;
+	// with partial resumeInfo only the missing ones execute and the rest
+	// load straight from the on-disk paths we already pre-rendered.
+	runIndices := make([]int, 0, len(items))
+	if resumeInfo != nil && len(resumeInfo.MissingIndices) > 0 {
+		runIndices = append(runIndices, resumeInfo.MissingIndices...)
+	} else {
+		for i := range items {
+			runIndices = append(runIndices, i)
+		}
+	}
+
+	// outputs is per-original-index regardless of completion order; we
+	// pre-seed slots for items that already resumed so the final aggregation
+	// produces input-array-ordered Outputs without a second pass.
+	outputs := make([]string, len(items))
+	if resumeInfo != nil {
+		for idx, val := range resumeInfo.ResumedOutputs {
+			outputs[idx] = val
+		}
+	}
+
+	if resumeInfo != nil && len(resumeInfo.MissingIndices) > 0 && len(resumeInfo.MissingIndices) < len(items) {
+		// Partial resume: announce the split so the run log makes the
+		// reuse vs rerun balance obvious.
+		e.logf("  -> stage %q: foreach resuming %d/%d items, running %d", st.ID, len(items)-len(runIndices), len(items), len(runIndices))
+	} else {
+		e.logf("  -> stage %q: foreach fanning out %d item(s)", st.ID, len(items))
 	}
 
 	// Streaming policy:
-	//   - n == 1 AND tokenSink == nil (single-stage group): stream live to Log.
+	//   - exactly one item is actually executing AND tokenSink == nil
+	//     (single-stage group): stream live to Log.
 	//   - otherwise: buffer per-item and flush with [index] headers so the
 	//     log stays readable when multiple items run in parallel.
-	singleLive := len(items) == 1 && tokenSink == nil
-	outputs := make([]string, len(items))
+	singleLive := len(runIndices) == 1 && tokenSink == nil
 	groupCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
@@ -955,11 +1038,17 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 	if maxConc <= 0 {
 		maxConc = defaultMaxForeachConcurrency
 	}
-	if maxConc > len(items) {
-		maxConc = len(items)
+	if maxConc > len(runIndices) {
+		maxConc = len(runIndices)
+	}
+	if maxConc < 1 {
+		// All items resumed from disk: there is no executor work to dispatch.
+		// Skip the semaphore plumbing entirely (a zero-cap channel would
+		// deadlock anyway).
+		maxConc = 1
 	}
 	sem := make(chan struct{}, maxConc)
-	for i := range items {
+	for _, i := range runIndices {
 		i := i
 		// Acquire BEFORE goroutine launch so we don't spawn N goroutines for
 		// a 1000-item foreach with cap=4. Honor cancellation while waiting
@@ -1434,6 +1523,13 @@ func (t *textExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput
 // missing case so the caller falls through to the normal execution path.
 // An error is only returned for unexpected I/O failures.
 //
+// For foreach stages a (false, nil) return may still have side-effected: when
+// at least one per-item output was loaded but others are missing, the
+// per-item resume info is stashed in e.foreachResumes[st.ID] so the
+// subsequent executeForeachStage runs only the missing indices and splices
+// the resumed items into the final outputs slice. The (true, nil) shortcut
+// still fires when every per-item output is present.
+//
 // Output integrity: the spec mandates "size > 0". We layer on one cheap extra
 // check — stages declared as output_format: json must contain valid JSON —
 // because a truncated/corrupted JSON output from a crashed prior run would
@@ -1443,7 +1539,27 @@ func (t *textExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput
 // without persisting extra state.
 func (e *Executor) tryResumeStage(st *Stage) (bool, error) {
 	if st.Foreach != nil {
-		return e.tryResumeForeachStage(st)
+		info, err := e.tryResumeForeachStage(st)
+		if err != nil {
+			return false, err
+		}
+		if info == nil {
+			// Resume couldn't make any forward progress (upstream items
+			// unresolvable, template render failed, etc.). Run from scratch.
+			return false, nil
+		}
+		if len(info.MissingIndices) == 0 {
+			// Every per-item output was loaded; stageOutputs is already
+			// populated. Tell the scheduler to skip the stage entirely.
+			return true, nil
+		}
+		// Partial resume: stash the per-item state and let the scheduler run
+		// the stage. executeForeachStage will see the entry and dispatch only
+		// the missing indices.
+		e.mu.Lock()
+		e.foreachResumes[st.ID] = info
+		e.mu.Unlock()
+		return false, nil
 	}
 	outPath, err := e.renderOutputPath(st, nil)
 	if err != nil {
@@ -1489,19 +1605,30 @@ func (e *Executor) tryResumeStage(st *Stage) (bool, error) {
 	return true, nil
 }
 
-// tryResumeForeachStage is the foreach analogue of tryResumeStage. Phase 1
-// per-item granularity: if ANY rendered per-item output is missing or empty,
-// the whole foreach reruns. That's intentional — partial recovery for foreach
-// is gated on us tracking per-item state across runs, which is a future
-// polish.
-func (e *Executor) tryResumeForeachStage(st *Stage) (bool, error) {
+// tryResumeForeachStage is the foreach analogue of tryResumeStage with
+// per-item granularity: it pre-renders every item's output path, classifies
+// each path as resumed (exists, non-zero, and — for output_format: json —
+// parses) or missing, and returns a foreachResumeInfo with the canonical
+// per-item path map plus the index list still in need of execution.
+//
+// When every item resumes successfully the function populates
+// e.stageOutputs[st.ID] before returning so the caller can short-circuit
+// stage execution exactly the way the all-resumed pre-pass used to. When
+// some items resume and others are missing the caller is expected to stash
+// the returned info on the executor and let executeForeachStage dispatch
+// only the missing indices.
+//
+// A nil return means the resume pre-pass couldn't make any forward progress
+// (upstream items unresolvable, template render failed, etc.). The caller
+// runs the whole stage from scratch in that case.
+func (e *Executor) tryResumeForeachStage(st *Stage) (*foreachResumeInfo, error) {
 	items, err := e.resolveForeachItems(st)
 	if err != nil {
 		// The upstream's output is missing or unparseable in this run dir;
 		// rerun the foreach so the upstream's failure (if any) surfaces
 		// naturally. Don't propagate the error — the upstream's own resume
 		// check already had its chance to bail out.
-		return false, nil
+		return nil, nil
 	}
 	if len(items) == 0 {
 		// Empty foreach is trivially "complete" with no outputs. Mirror
@@ -1510,47 +1637,81 @@ func (e *Executor) tryResumeForeachStage(st *Stage) (bool, error) {
 		e.mu.Lock()
 		e.stageOutputs[st.ID] = &stageResult{Output: "", Outputs: nil}
 		e.mu.Unlock()
-		return true, nil
+		return &foreachResumeInfo{
+			OutPaths:       nil,
+			MissingIndices: nil,
+			ResumedOutputs: map[int]string{},
+		}, nil
 	}
-	outputs := make([]string, len(items))
 	// YouTube records the watch URL as the file body; downstream stages see
 	// the URL string the same way they'd see a text-stage completion, so we
 	// treat youtube like text for resume purposes.
 	rt := stageTypeOrDefault(st)
 	isText := rt == StageTypeText || rt == StageTypeYouTube
+
+	outPaths := make([]string, len(items))
+	resumed := make(map[int]string, len(items))
+	var missing []int
 	for i, item := range items {
 		extra := map[string]any{st.Foreach.Var: item, "i": i}
 		path, err := e.renderOutputPath(st, extra)
 		if err != nil {
-			return false, nil
+			// Output template can't render for this item; we can't decide
+			// resumability per-item without it. Treat the whole resume as
+			// not-applicable so the caller runs the stage from scratch
+			// (executeForeachStage will hit the same render error and
+			// surface it cleanly).
+			return nil, nil
 		}
+		outPaths[i] = path
 		full := filepath.Join(e.RunDir, path)
 		body, ok, err := readNonEmpty(full)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 		if !ok {
-			return false, nil
+			missing = append(missing, i)
+			continue
 		}
 		if isText {
+			// Apply the same output_format: json integrity check the
+			// single-stage resume path applies. A corrupted JSON body
+			// would otherwise satisfy readNonEmpty but poison downstream
+			// foreach consumers that parse it.
 			if st.OutputFormat == "json" {
 				if err := validateJSON(string(body)); err != nil {
-					return false, nil
+					missing = append(missing, i)
+					continue
 				}
 			}
-			outputs[i] = string(body)
+			resumed[i] = string(body)
 		} else {
 			// Binary foreach items (comfyui) expose an ABSOLUTE path so
 			// downstream {{ .stages.X.outputs[i] }} references work as
 			// subprocess argv strings (the daemon's CWD is not RunDir).
-			outputs[i] = full
+			resumed[i] = full
 		}
 	}
-	combined := strings.Join(outputs, "\n\n")
-	e.mu.Lock()
-	e.stageOutputs[st.ID] = &stageResult{Output: combined, Outputs: outputs}
-	e.mu.Unlock()
-	return true, nil
+
+	info := &foreachResumeInfo{
+		OutPaths:       outPaths,
+		MissingIndices: missing,
+		ResumedOutputs: resumed,
+	}
+
+	if len(missing) == 0 {
+		// Every item resumed — seed stageOutputs the same way the
+		// all-present path used to so the scheduler can skip the stage.
+		outputs := make([]string, len(items))
+		for i := range items {
+			outputs[i] = resumed[i]
+		}
+		combined := strings.Join(outputs, "\n\n")
+		e.mu.Lock()
+		e.stageOutputs[st.ID] = &stageResult{Output: combined, Outputs: outputs}
+		e.mu.Unlock()
+	}
+	return info, nil
 }
 
 // readNonEmpty reads path and reports whether the file exists with non-zero
