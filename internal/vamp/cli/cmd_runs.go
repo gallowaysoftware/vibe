@@ -126,7 +126,7 @@ func runsShowCmd() *cobra.Command {
 					return nil
 				}
 				switch rel {
-				case "pipeline.yaml.snapshot", "inputs.json", "pipeline.json":
+				case "pipeline.yaml.snapshot", "inputs.json", "pipeline.json", vamp.LogFileName, vamp.PidFileName, "pipeline_timing.json":
 					return nil
 				}
 				fmt.Fprintf(out, "%s\t%s\n", vamp.FormatSize(info.Size()), rel)

@@ -129,8 +129,16 @@ webhook URL.
 - VRAM-aware *scheduling* (today's pre-flight rejects when free VRAM is
   insufficient for the chosen profile; smarter scheduling could pick a
   smaller capable profile that fits the budget).
-- vamp daemon mode: background runs with job IDs, `vamp logs <id>` to
-  follow live, `vamp jobs ls` for the queue.
+- ~~vamp daemon mode: background runs with job IDs, `vamp logs <id>` to
+  follow live, `vamp jobs ls` for the queue.~~ Done — `vamp run --detach`
+  forks the same `vamp` binary into a setsid'd worker that writes
+  `vamp.pid` + `vamp.log` into the run dir; `vamp jobs ls/show`,
+  `vamp logs <id> [-f]`, and `vamp cancel <id>` (alias of
+  `vamp jobs cancel`) drive it. Cancellation propagates via SIGTERM ->
+  signal.NotifyContext -> Executor ctx cancel; `pipeline.json` records
+  `status: "canceled"` for cancelled runs. Linux-only by virtue of the
+  Setsid detach pattern (matches `vibe daemon`'s spawn approach in
+  `internal/vibe/cli/spawn.go`).
 - Per-foreach-item resume (today resume granularity is whole-stage; a
   failed item in a foreach causes the whole stage to rerun on resume).
 - ~~Real LAN access from a laptop: HTTP control plane is loopback-bound

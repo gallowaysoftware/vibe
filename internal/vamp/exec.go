@@ -1870,6 +1870,14 @@ func (e *Executor) writePipelineJSON(start, end time.Time, runErr error) {
 	status := "ok"
 	if runErr != nil {
 		status = "error"
+		// Detect SIGTERM / SIGINT-driven cancellation so daemon-mode
+		// callers (`vamp cancel`) can distinguish an aborted run from a
+		// stage-level failure. Anything wrapping context.Canceled (the
+		// typical Run() return when the parent context was canceled)
+		// gets the dedicated "canceled" status.
+		if errors.Is(runErr, context.Canceled) {
+			status = "canceled"
+		}
 	} else {
 		// "partial" reflects a clean run where one or more stages were
 		// marked error or skipped via resume. Right now `error` already
