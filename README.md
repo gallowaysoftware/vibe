@@ -2,238 +2,217 @@
 
 ![CI](https://github.com/gallowaysoftware/vibe/actions/workflows/ci.yml/badge.svg)
 
+`vibe` is a task launcher for local AI: a profile bundles a model with a
+frontend (llama-server + opencode, llama-server + Open WebUI, raw ComfyUI,
+...) and one command brings the whole task up. `vamp` is a pipeline
+orchestrator built on top of it — pipelines chain stages across model
+swaps and non-LLM backends (ComfyUI image/video, Piper TTS, ffmpeg,
+webhooks, YouTube upload) into a single DAG with parallel waves,
+per-foreach-item resume, and try/finally semantics.
+
 ## Quick install
 
 ```
 curl -sSL https://raw.githubusercontent.com/gallowaysoftware/vibe/main/install.sh | sh
 ```
 
-This drops `vibe` and `vamp` in `~/.local/bin/` and runs `vibe doctor`.
-Pin a version with `VIBE_VERSION=v1.2.3` or change the destination with
-`INSTALL_DIR=/some/other/path`. Pass `--dry-run` to preview without
-downloading.
+Drops `vibe` and `vamp` in `~/.local/bin/` and runs `vibe doctor`. Pin a
+version with `VIBE_VERSION=v1.2.3`, redirect with `INSTALL_DIR=...`, or
+pass `--dry-run` to preview. To build from source: `go install
+./cmd/vibe ./cmd/vamp` from a checkout of this repo.
 
-A task-oriented launcher for local AI inference. Think `docker compose` for local AI workflows: define a profile that bundles a model configuration with a frontend, and one command brings up everything for a task.
-
-```
-vibe doctor                          # verify the machine is set up to run vibe
-vibe profile init llama-server --name code  # drop a starter profile to edit
-vibe start code                      # llama-server + opencode wired up for coding
-vibe start research                  # different model, different context, different frontend
-vibe ps                              # what's running
-vibe tui                             # real-time dashboard (start/stop, status, logs)
-vibe stop                            # tear it all down
-```
-
-## Starter profiles
-
-`vibe profile init <kind> [--name <name>]` drops a starter YAML file at
-`$XDG_CONFIG_HOME/vibe/profiles/<name>.yaml` so you don't have to copy
-from this repo's `profiles/` directory. Each rendered file carries
-`# REPLACE: ...` markers on fields you must edit (model path, alias,
-ComfyUI directory, frontend app, ...) before `vibe start <name>` will
-accept it.
+## Hello world
 
 ```
-vibe profile init llama-server --name code
-vibe profile init llama-server --name code --hf Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF
-vibe profile init comfyui --name comfyui
-vibe profile init docker-compose --name perplexica
-vibe profile init managed --name open-webui    # template only; kind not wired up yet
+vibe doctor                                # verify the machine is set up
+vibe profile init llama-server --name code # drop a starter profile to edit
+vibe start code                            # llama-server + opencode wired up
 ```
 
-The command refuses to overwrite an existing file unless `--force` is
-passed. `--hf <repo>[:<file>]` is llama-server-only and injects a
-`huggingface:` block under `backend.llama_server` so `vibe pull` can fetch
-the weights for you.
+The profile is written to `$XDG_CONFIG_HOME/vibe/profiles/code.yaml` with
+`# REPLACE: ...` markers on fields you must fill in (model path, alias,
+frontend app). `vibe start` validates, runs the pre-flight VRAM check,
+launches both backend and frontend, and exits with the env vars to set
+in the calling shell.
 
-## First run
+## How it works
 
-`vibe doctor` is the one-shot diagnostic. It checks for `llama-server` and
-the HuggingFace `hf` CLI on `$PATH`, ensures the XDG config/state/runtime
-directories exist and are writable, probes the control-plane (`:9001`) and
-proxy (`:9000`) ports, validates every profile under
-`~/.config/vibe/profiles/`, counts MCP definitions, and — best-effort —
-reports `nvidia-smi` output. Each line is tagged `[ OK ]`, `[WARN]`,
-`[FAIL]`, or `[INFO]`; the command exits non-zero only when something
-fails. Run it before your first `vibe start` and again whenever
-something behaves unexpectedly.
+**Profiles.** A YAML file under `$XDG_CONFIG_HOME/vibe/profiles/` bundling
+a backend spec, an optional frontend integration, and template variables
+that wire them together. `vibe profile init <kind> [--name <name>]` drops
+a starter (`llama-server`, `comfyui`, `docker-compose`, `managed`); pass
+`--hf <repo>[:<file>]` on the `llama-server` kind to inject a
+`huggingface:` block so `vibe pull` can fetch the weights.
 
-`vibe doctor --install comfyui` switches doctor into install mode and
-runs the ComfyUI bring-up steps idempotently: clones
-[ComfyUI](https://github.com/comfyanonymous/ComfyUI) to `~/ComfyUI`,
-creates `.venv`, runs `pip install -r requirements.txt`, optionally
-downloads the SDXL-Turbo checkpoint (~7 GB), and drops a default
-`comfyui.yaml` profile. Each step skips when already satisfied; pass
-`--yes` to bypass the confirmation prompts (for automation).
+**Backends.** A discriminated union under `backend:` — exactly one
+sub-block must be set:
 
-`vibe doctor --install llama-cpp` does the same for
-[llama.cpp](https://github.com/ggerganov/llama.cpp) itself, offering
-three install methods: `[d]istro` (probes the local package manager —
-`pacman` on Arch, `dnf` on Fedora — and prints the `sudo` install
-command rather than running it for you), `[r]elease tarball` (downloads
-the latest published Linux x86_64 build from GitHub, extracts to
-`~/.local/share/vibe/llama-cpp/`, and symlinks `llama-server` into
-`~/.local/bin/`), or `[s]ource build` (prints the canonical
-`cmake -B build -DGGML_CUDA=ON` commands — too operator-specific to
-run for you). Falls through automatically from the distro path to the
-tarball when the package isn't in standard repos (the Ubuntu/Debian
-case in Phase 1). Pass `--yes` to skip the menu and pick the tarball
-path; pass `--cuda` to prefer a CUDA-flavoured asset.
+- `llama_server` — supervises [`llama-server`](https://github.com/ggml-org/llama.cpp)
+  for an OpenAI-compatible chat/completion API.
+- `comfyui` — supervises a [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
+  python process for image/video generation. ComfyUI ships its own UI,
+  so these profiles carry no `frontend:` block.
 
-## Why
+**Frontends.** Only applicable to `backend.llama_server` profiles:
 
-Today running local AI looks like:
+- `external` — vibe renders a sidecar config (e.g. `opencode.json`) and
+  surfaces the env vars to set when launching the tool. No process
+  lifecycle.
+- `docker-compose` — `docker compose up -d` against a user-supplied
+  compose file on `vibe start`, `down` on `vibe stop`. Polls any
+  `wait_for` health endpoints. Good fit for Perplexica, Open WebUI.
+- `managed` — execs a native binary with the configured args/env/workdir,
+  polls `wait_for` URLs, stops it with SIGINT → SIGKILL (10s grace).
 
-1. Launch `llama-server` with the right flags (model, context, parallel, GPU layers, cache types, jinja, ...).
-2. Launch the frontend separately and configure it to match.
-3. Hope the frontend's context size agrees with what llama-server actually loaded.
-4. Repeat all of the above whenever you switch tasks.
+**MCP composition.** One YAML file per MCP server under
+`$XDG_CONFIG_HOME/vibe/mcp/` (`datadog.yaml`, `jira.yaml`, ...). Profiles
+compose them by name: `frontend.mcps: [datadog, jira]`. Secrets stay in
+env vars (`${env:...}` references in the MCP file); profiles never name
+them inline.
 
-`vibe` collapses that into one command and a versioned YAML profile.
+**Proxy and control plane.** The daemon reverse-proxies frontends to the
+active llama-server on `:9000` so swapping models doesn't require
+reconfiguring the frontend. The Connect/protobuf control plane listens
+on `$XDG_RUNTIME_DIR/vibe/vibe.sock` (0600) and, optionally,
+`127.0.0.1:9001`.
 
-## Architecture
+**VRAM check.** `vibe start` runs a pre-flight check against the
+profile's `estimated_vram_gb` and refuses to launch when free VRAM is
+short. Pass `--no-vram-check` to bypass; pair with `vamp`'s capability
+fallback (below) for graceful degradation.
 
-- **Profile**: the unit of configuration. A YAML file bundling a backend spec, an optional frontend integration, and template variables that wire them together.
-- **Backend kinds** (discriminated union under `backend:`; exactly one block must be set):
-  - `llama_server` — supervises [`llama-server`](https://github.com/ggml-org/llama.cpp) for an OpenAI-compatible chat/completion API. See [`profiles/code.example.yaml`](profiles/code.example.yaml).
-  - `comfyui` — supervises a [ComfyUI](https://github.com/comfyanonymous/ComfyUI) python process for image/video generation. ComfyUI ships its own UI, so these profiles have no `frontend:` block; vibe exposes the backend addr via `Status.BackendAddr` for tools like `vamp`. See [`profiles/comfyui.example.yaml`](profiles/comfyui.example.yaml).
-- **MCP definitions**: one YAML file per Model Context Protocol server, dropped into `~/.config/vibe/mcp/` (e.g. `datadog.yaml`, `jira.yaml`). Profiles compose them by listing names: `frontend.mcps: [datadog, jira]`. Vibe injects a top-level `mcp` map into the rendered frontend config. Secrets stay in env vars (the frontend resolves `${env:...}` references); profiles never name them inline.
-- **Daemon**: supervises the active backend (llama-server or ComfyUI) and the active frontend. Exposes a control plane over a Unix socket.
-- **Frontend kinds** (only applicable to `backend.llama_server` profiles):
-  - `external` — vibe renders a sidecar config file (e.g. an `opencode.json`) and surfaces the env vars to set when launching the tool. No process lifecycle.
-  - `docker-compose` — vibe runs `docker compose up -d` against a user-supplied compose file on `vibe start`, polls any `wait_for` health endpoints, and runs `docker compose down` on `vibe stop`. Good fit for heavy stacks like Perplexica or Open WebUI that benefit from being lifecycle-coupled to a profile. See [`profiles/docker-compose.example.yaml`](profiles/docker-compose.example.yaml).
-  - `managed` — vibe execs a native binary directly with the configured args/env/workdir, polls any `wait_for` URLs, and stops it on `vibe stop` with a SIGINT (10s graceful) → SIGKILL contract. Good fit for tools that ship as a single executable (e.g. an Open-WebUI launcher script) and want to be lifecycle-coupled without a container dependency. See [`profiles/managed.example.yaml`](profiles/managed.example.yaml).
-- **Proxy**: reverse-proxies frontends to the active llama-server so swapping models doesn't require reconfiguring the frontend.
-- **CLI**: `start`, `stop`, `ps`, `logs`, `list`.
+## vamp pipelines
+
+A vamp pipeline is a YAML file declaring stages and their data
+dependencies. The executor builds a DAG, runs independent stages in
+parallel waves, and resolves each stage's `capability:` to a vibe profile
+on the fly. A foreach stage forks one task per item in a JSON array and
+runs them in parallel up to a configurable cap. Per-stage retry with
+exponential backoff handles transient errors; `run_when:
+success|failure|always` gives you try/finally semantics for cleanup and
+failure-path notifications.
+
+| Stage type | What it does |
+| --- | --- |
+| `text`    | LLM chat completion. `output_format: json` validates the model's output. SSE-streamed when the frontend asks for it. |
+| `comfyui` | Runs a ComfyUI workflow JSON. WebSocket progress (RFC 6455, polling fallback); collects images, videos, and gifs. |
+| `audio`   | Piper TTS. Picks the voice ONNX from `~/.local/share/piper-voices/`. |
+| `ffmpeg`  | Shells out to `ffmpeg` with templated args; tail-rings stderr for diagnostics. |
+| `youtube` | Uploads a finished video via the YouTube Data API (OAuth token cache under XDG). |
+| `webhook` | Slack/Discord/Mattermost-style JSON POST. Honors `run_when: failure` so a failed pipeline still pings. |
+
+**Resumes.** `vamp run --resume <run-dir>` re-uses outputs already on
+disk, including per-foreach-item granularity (a failed item in an
+otherwise-successful foreach stage re-runs only that item). Snapshot
+drift aborts unless `--resume-force` is set.
+
+**Detach.** `vamp run --detach` forks a setsid'd worker, writes
+`vamp.pid` + `vamp.log` into the run dir, and returns the job id. Drive
+it with `vamp jobs ls/show/cancel` and `vamp logs <id> [-f]`.
+
+**Capability fallback.** `$XDG_CONFIG_HOME/vamp/capabilities.yaml` maps
+each capability to a profile, or to an ordered list of candidates
+(biggest first). When the daemon's VRAM precondition fails, vamp falls
+back to the next candidate and logs the skip; other errors still abort.
+
+```yaml
+capabilities:
+  reasoning:
+    candidates: [code, code_small]   # tries code first, falls back
+  creative_writing: chat              # shorthand still works
+```
+
+## CLI reference
+
+`vibe`:
+
+| Command | Purpose |
+| --- | --- |
+| `vibe doctor` | One-shot diagnostic; `--install comfyui\|llama-cpp` runs the bring-up steps. |
+| `vibe profile init <kind>` | Drop a starter YAML; `--hf <repo>[:<file>]` for gated llama-server. |
+| `vibe start <profile>` | Activate backend + frontend; pulls missing weights; `--no-vram-check` to bypass. |
+| `vibe stop` | Tear it all down. |
+| `vibe ps` | What's running. |
+| `vibe list` | List profiles. |
+| `vibe logs` | Tail backend/frontend logs. |
+| `vibe tui` | Bubbletea dashboard (start/stop, status, logs). |
+| `vibe token` | Print the bearer token; `--regenerate` rotates. |
+| `vibe env` | Print env vars for the active profile's frontend. |
+| `vibe pull <profile>` | Fetch the HF weights for a profile (auto-invoked by `start`). |
+| `vibe shutdown` | Stop the daemon. |
+| `vibe daemon` | Run the daemon in the foreground (normally auto-spawned). |
+
+`vamp`:
+
+| Command | Purpose |
+| --- | --- |
+| `vamp run <pipeline.yaml>` | Execute. Flags: `--detach`, `--resume <dir>`, `--resume-force`, `--dry-run`, `--input k=v`. |
+| `vamp validate <pipeline.yaml>` | Parse + schema-check without running. |
+| `vamp list` | List pipelines under `$XDG_CONFIG_HOME/vamp/pipelines/`. |
+| `vamp capabilities` | Print the resolved capability table. |
+| `vamp runs ls/show/cleanup` | History across run dirs under `$XDG_STATE_HOME/vamp/runs/`. |
+| `vamp jobs ls/show/cancel` | Detached-run management. |
+| `vamp logs <id> [-f]` | Cat or follow the detached worker's log. |
+| `vamp cancel <id>` | SIGTERM a detached worker (same as `jobs cancel`). |
+| `vamp viz <pipeline.yaml>` | Mermaid `flowchart TD` of the DAG; `--show-inputs` for the input block. |
+| `vamp schema` | Emit the pipeline JSON Schema (draft-07); `--out <file>` to write. |
 
 ## Remote access
 
-By default the daemon's TCP control plane binds `127.0.0.1:9001` and the
-unix socket at `$XDG_RUNTIME_DIR/vibe/vibe.sock` (0600 perms) is the
-preferred path for local commands. To talk to a daemon running on another
-machine on your LAN (e.g. driving the dev box from a laptop):
+By default the TCP control plane binds `127.0.0.1:9001` and the unix
+socket is the preferred local path. To drive a daemon from another
+machine on your LAN:
 
-1. **On the dev box**, edit `~/.config/vibe/config.yaml`:
+1. On the dev box, edit `~/.config/vibe/config.yaml`:
 
    ```yaml
    bind_all: true
    ```
 
-   (or set `http_addr: "0.0.0.0:9001"` directly). Restart with
-   `vibe shutdown` so the next command spawns a daemon with the new bind.
+   (or `http_addr: "0.0.0.0:9001"`). Then `vibe shutdown` so the next
+   command spawns a daemon with the new bind.
 
-2. **Get the bearer token.** On the dev box:
+2. On the dev box, `vibe token` prints
+   `$XDG_STATE_HOME/vibe/token` (mode 0600, generated on first daemon
+   start). Copy it to your laptop.
 
-   ```
-   vibe token
-   ```
-
-   This prints the contents of `$XDG_STATE_HOME/vibe/token` (mode `0600`,
-   generated on first daemon start). Copy the value to your laptop.
-
-3. **On the laptop**, export the token and point at the dev box:
+3. On the laptop:
 
    ```
    export VIBE_TOKEN=<paste>
    export VIBE_API=http://devbox.local:9001
    vibe ps
-   vamp run examples/multi-profile-pipeline/pipeline.yaml
    ```
 
-   `vibeclient` reads `$VIBE_TOKEN` first, falls back to
-   `$XDG_STATE_HOME/vibe/token` (which makes the same-machine case work
-   without any setup). Requests over the unix socket never carry a token.
+`vibeclient` reads `$VIBE_TOKEN` first, falls back to
+`$XDG_STATE_HOME/vibe/token`. Requests over the unix socket are never
+authed (gated by filesystem perms instead). If the token leaks, run
+`vibe token --regenerate` on the dev box, restart the daemon, re-copy.
 
-If the token is ever exposed, run `vibe token --regenerate` on the dev
-box, restart the daemon, and re-copy the new value. The daemon enforces
-the bearer header on every TCP RPC (`401 Unauthorized` otherwise); the
-unix socket is unauthenticated by design and gated by filesystem perms.
+## Examples
 
-## Status
+Under `examples/`:
 
-Phase 1 in progress: profile schema, llama-server supervision, proxy, CLI, opencode integration, docker-compose frontends, managed-binary frontends, LAN access with bearer-token auth.
+| Pipeline | What it shows |
+| --- | --- |
+| [`multi-profile-pipeline`](examples/multi-profile-pipeline/) | Two-stage demo: small profile drafts, larger profile expands. |
+| [`comfyui-image-batch`](examples/comfyui-image-batch/) | SDXL-Turbo image batch via the ComfyUI WS client. |
+| [`comfyui-video`](examples/comfyui-video/) | LTX-Video 2B end-to-end with video output collection. |
+| [`video-pipeline`](examples/video-pipeline/) | Cross-backend image-to-video chain. |
+| [`voiceover-pipeline`](examples/voiceover-pipeline/) | Piper TTS + ffmpeg over a still image. |
+| [`notify-pipeline`](examples/notify-pipeline/) | Minimal webhook stage demo. |
+| [`youtube-upload`](examples/youtube-upload/) | OAuth-driven YouTube Data API upload. |
+| [`content-mill`](examples/content-mill/) | Every stage type stitched end-to-end with a failure-path webhook. |
 
-Not yet:
+## Editor support
 
-- VRAM enforcement
-
-## TUI
-
-`vibe tui` opens a Bubbletea-based dashboard that polls the daemon once a
-second for status and recent logs. Arrow keys (or `j`/`k`) navigate the
-profile list, `s` (or Enter) starts the selected profile, `x` stops the
-active one, `r` forces an immediate refresh, and `q` quits. The TUI honors
-`NO_COLOR` and is comfortable over SSH. It deliberately does not auto-spawn
-the daemon — if it isn't running, the TUI says so and points at `vibe
-daemon &` rather than springing side effects on the operator.
-
-## Multi-profile example
-
-`vamp` is a sibling tool in this repo that drives `vibe` to run a
-multi-stage pipeline where each stage can use a different profile (and
-therefore a different model). See
-[`examples/multi-profile-pipeline/`](examples/multi-profile-pipeline/)
-for a runnable two-stage demo: a small 7B profile drafts an outline,
-then `vibe` swaps to a larger profile to expand it. Both
-`profiles/fast.example.yaml` and `profiles/code.example.yaml` are
-referenced by that example.
-
-Every `vamp run` writes its artifacts to a timestamped directory under
-`$XDG_STATE_HOME/vamp/runs/`. The `vamp runs` subcommand inspects and
-manages that history:
-
-```
-vamp runs ls                            # list past runs, newest first
-vamp runs show <id-or-path>             # cat snapshot + inputs.json + outputs index
-vamp runs cleanup --older-than 7d       # delete run dirs older than 7 days
-vamp runs cleanup --older-than 7d --dry-run   # preview what would go
-```
-
-`<id>` is a prefix of the run-dir basename (e.g. `2026-05-15T12`);
-ambiguous prefixes list candidates and bail. The executor also writes
-a small `pipeline.json` to each run dir on completion that powers
-the listing's pipeline name, stage count, duration, and status
-columns.
-
-### Daemon mode (`vamp run --detach`)
-
-`vamp run pipeline.yaml --detach` forks the run into a background
-`vamp` worker and returns immediately, printing the job id (the
-run-dir basename). The worker writes its pid to `<run-dir>/vamp.pid`,
-streams the same output you'd see from a foreground `vamp run` to
-`<run-dir>/vamp.log`, and lives in its own session so closing the
-parent terminal doesn't hang it up. Manage detached runs with:
-
-```
-vamp jobs ls                        # running + recently-finished jobs
-vamp jobs show <id-or-prefix>       # state, timing, and outputs index
-vamp logs  <id-or-prefix>           # cat vamp.log
-vamp logs  <id-or-prefix> -f        # follow live (exits when the worker pid is gone)
-vamp cancel <id-or-prefix>          # SIGTERM the worker
-```
-
-Cancellation propagates via `signal.NotifyContext` into the executor's
-context; the deferred `pipeline.json` write records `status: "canceled"`
-so subsequent `jobs show` calls explain what happened. The detach
-machinery is Linux-only by virtue of the `Setsid` syscall it uses
-to detach from the parent's tty (the same pattern `vibe daemon` uses).
-
-`vamp viz <pipeline.yaml>` emits a Mermaid `flowchart TD` description of
-the pipeline's DAG to stdout (or `--out <file>`), suitable for pasting
-into a markdown doc or the [Mermaid live editor](https://mermaid.live/).
-Nodes are colour-coded by stage type, foreach stages get a dotted edge
-from their JSON source, and `--show-inputs` adds a `subgraph inputs`
-block listing the pipeline's declared inputs.
-
-`vamp schema` emits a JSON Schema (draft-07) document describing
-pipeline.yaml so editors with `yaml-language-server` (VS Code's RedHat
+`vamp schema` emits a JSON Schema (draft-07) document for `pipeline.yaml`
+so editors with the `yaml-language-server` integration (VS Code's RedHat
 YAML extension, Helix, vim's coc, IntelliJ) provide validation and
 autocomplete:
 
 ```
-vamp schema                          # print to stdout
-vamp schema --out vamp.schema.json   # write to a file
+vamp schema --out vamp.schema.json
 ```
 
 Point editors at the rendered file with a directive at the top of your
@@ -246,65 +225,29 @@ stages:
   - ...
 ```
 
-The example under `examples/multi-profile-pipeline/` ships a checked-in
-`vamp.schema.json` alongside its `pipeline.yaml` to show the wiring.
+`examples/multi-profile-pipeline/` ships a checked-in `vamp.schema.json`
+alongside its `pipeline.yaml` to show the wiring.
 
-### Capabilities and VRAM-aware fallback
-
-`vamp` looks up each stage's `capability:` in
-`$XDG_CONFIG_HOME/vamp/capabilities.yaml` to decide which vibe profile to
-activate. The shorthand form pins a capability to one profile:
-
-```yaml
-capabilities:
-  reasoning: code
-  creative_writing: chat
-```
-
-The long form binds a capability to an ordered list of candidate profiles,
-biggest first. When the vibe daemon rejects the first candidate with its
-pre-flight VRAM check (not enough free VRAM for the profile's
-`estimated_vram_gb`), `vamp` skips it and tries the next candidate, logging
-the fallback to the run log. Useful on hosts where free VRAM varies because
-another GPU consumer (browser, another model, a game) might be in the way:
-
-```yaml
-capabilities:
-  reasoning:
-    candidates: [code, code_small]   # tries code first, falls back to code_small
-```
-
-The two forms can be mixed in the same file. Only the daemon's specific
-VRAM precondition error triggers fallback — any other error (auth failure,
-profile-not-found, ...) aborts the run so genuine failures aren't masked.
-
-## Shell completion
-
-Both `vibe` and `vamp` ship Cobra-generated completion scripts plus
-dynamic completers: `vibe start <TAB>` / `vibe pull <TAB>` suggest profile
-names from `$XDG_CONFIG_HOME/vibe/profiles/` (silently filtering out
-profiles that fail to parse), and `vamp run <TAB>` / `vamp validate <TAB>`
-suggest pipeline files from `$XDG_CONFIG_HOME/vamp/pipelines/` plus any
-`*.yaml` in the current directory.
-
-Install the completion script for your shell once and reload:
+Both `vibe` and `vamp` ship Cobra-generated shell completion with
+dynamic completers (`vibe start <TAB>` lists profiles; `vamp run <TAB>`
+lists pipelines). Install once per shell:
 
 ```
-# Bash
-vibe completion bash > /etc/bash_completion.d/vibe
-vamp completion bash > /etc/bash_completion.d/vamp
-
-# Zsh (fpath[1] is typically ~/.zsh/completions or similar)
-vibe completion zsh > "${fpath[1]}/_vibe"
-vamp completion zsh > "${fpath[1]}/_vamp"
-
-# Fish
-vibe completion fish > ~/.config/fish/completions/vibe.fish
-vamp completion fish > ~/.config/fish/completions/vamp.fish
+vibe completion bash > /etc/bash_completion.d/vibe        # bash
+vibe completion zsh  > "${fpath[1]}/_vibe"                # zsh
+vibe completion fish > ~/.config/fish/completions/vibe.fish # fish
 ```
 
-For a quick try without persisting, source the script in your current
-shell: `source <(vibe completion bash)`.
+Same flags work on `vamp completion`.
+
+## Status
+
+Phase 1 and most of phase 2 have shipped: profile schema, llama-server
+and ComfyUI supervision, proxy, full vamp DAG executor with detach +
+per-item resume + `run_when` qualifiers, JSON-Schema editor wiring,
+LAN access with bearer-token auth. See [`TODO.md`](TODO.md) for what's
+open — the headline item still on the radar is multi-GPU scheduling
+(today's single-profile-at-a-time invariant assumes one GPU).
 
 ## License
 
