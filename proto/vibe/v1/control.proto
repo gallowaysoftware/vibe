@@ -62,6 +62,10 @@ message FrontendInfo {
   // env_vars the user should set when launching the external frontend.
   // Example: {"OPENCODE_CONFIG": "/home/.../state/vibe/frontend/code/opencode.json"}.
   map<string, string> env_vars = 4;
+  // kind echoes profile.Frontend.Kind so the CLI can word its output
+  // differently for external (config written, user launches binary) vs
+  // managed/docker-compose (vibe also launched the binary).
+  string kind = 5;
 }
 
 message StatusRequest {}

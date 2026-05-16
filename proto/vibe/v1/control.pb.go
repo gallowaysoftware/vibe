@@ -246,7 +246,11 @@ type FrontendInfo struct {
 	RestartRequired bool                   `protobuf:"varint,3,opt,name=restart_required,json=restartRequired,proto3" json:"restart_required,omitempty"`
 	// env_vars the user should set when launching the external frontend.
 	// Example: {"OPENCODE_CONFIG": "/home/.../state/vibe/frontend/code/opencode.json"}.
-	EnvVars       map[string]string `protobuf:"bytes,4,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	EnvVars map[string]string `protobuf:"bytes,4,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// kind echoes profile.Frontend.Kind so the CLI can word its output
+	// differently for external (config written, user launches binary) vs
+	// managed/docker-compose (vibe also launched the binary).
+	Kind          string `protobuf:"bytes,5,opt,name=kind,proto3" json:"kind,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -307,6 +311,13 @@ func (x *FrontendInfo) GetEnvVars() map[string]string {
 		return x.EnvVars
 	}
 	return nil
+}
+
+func (x *FrontendInfo) GetKind() string {
+	if x != nil {
+		return x.Kind
+	}
+	return ""
 }
 
 type StatusRequest struct {
@@ -943,13 +954,14 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\aProfile\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12 \n" +
 	"\vdescription\x18\x02 \x01(\tR\vdescription\x12\x12\n" +
-	"\x04path\x18\x03 \x01(\tR\x04path\"\xe5\x01\n" +
+	"\x04path\x18\x03 \x01(\tR\x04path\"\xf9\x01\n" +
 	"\fFrontendInfo\x12\x10\n" +
 	"\x03app\x18\x01 \x01(\tR\x03app\x12\x1d\n" +
 	"\n" +
 	"wrote_file\x18\x02 \x01(\tR\twroteFile\x12)\n" +
 	"\x10restart_required\x18\x03 \x01(\bR\x0frestartRequired\x12=\n" +
-	"\benv_vars\x18\x04 \x03(\v2\".vibe.v1.FrontendInfo.EnvVarsEntryR\aenvVars\x1a:\n" +
+	"\benv_vars\x18\x04 \x03(\v2\".vibe.v1.FrontendInfo.EnvVarsEntryR\aenvVars\x12\x12\n" +
+	"\x04kind\x18\x05 \x01(\tR\x04kind\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x0f\n" +

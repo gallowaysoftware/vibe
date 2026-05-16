@@ -405,20 +405,7 @@ frontend: {kind: managed, app: x, binary: ` + stubManagedBinaryNotExec(t) + `}
 			wantErr: "not executable",
 		},
 		{
-			name: "managed rejects write_file",
-			yaml: `
-name: x
-backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
-frontend:
-  kind: managed
-  app: x
-  binary: ` + stubManagedBinary(t) + `
-  write_file: /tmp/x.json
-`,
-			wantErr: "write_file is only valid for kind=external",
-		},
-		{
-			name: "managed rejects template",
+			name: "managed rejects template without write_file",
 			yaml: `
 name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
@@ -428,10 +415,10 @@ frontend:
   binary: ` + stubManagedBinary(t) + `
   template: {a: 1}
 `,
-			wantErr: "template is only valid for kind=external",
+			wantErr: "template requires frontend.write_file",
 		},
 		{
-			name: "managed rejects mcps",
+			name: "managed rejects mcps without write_file",
 			yaml: `
 name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
@@ -441,7 +428,7 @@ frontend:
   binary: ` + stubManagedBinary(t) + `
   mcps: [datadog]
 `,
-			wantErr: "mcps is only valid for kind=external",
+			wantErr: "mcps requires frontend.write_file",
 		},
 		{
 			name: "managed rejects compose_file",
@@ -822,6 +809,44 @@ frontend:
 	}
 	if p.Frontend.WaitFor[0].Timeout != 30*time.Second {
 		t.Errorf("wait_for[0].timeout = %v, want 30s", p.Frontend.WaitFor[0].Timeout)
+	}
+}
+
+// TestLoad_Managed_WithWriteFile covers the opencode-style profile: managed
+// kind that also renders a config file the binary then reads via env. The
+// validator must accept write_file/template/mcps when paired with a binary.
+func TestLoad_Managed_WithWriteFile(t *testing.T) {
+	model := stubModelFile(t)
+	bin := stubManagedBinary(t)
+	yaml := `
+name: code
+backend:
+  llama_server:
+    path: ` + model + `
+    alias: m
+    context: 1024
+frontend:
+  kind: managed
+  app: opencode
+  binary: ` + bin + `
+  write_file: /tmp/opencode.json
+  template:
+    model: llama-local/m
+  env:
+    OPENCODE_CONFIG: ${WRITE_FILE}
+`
+	p, err := Load(writeProfile(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Frontend.Kind != FrontendManaged {
+		t.Errorf("kind = %q", p.Frontend.Kind)
+	}
+	if p.Frontend.WriteFile != "/tmp/opencode.json" {
+		t.Errorf("write_file = %q", p.Frontend.WriteFile)
+	}
+	if _, ok := p.Frontend.Template["model"]; !ok {
+		t.Errorf("template missing model key: %v", p.Frontend.Template)
 	}
 }
 

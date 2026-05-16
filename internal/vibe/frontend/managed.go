@@ -154,9 +154,13 @@ func (m *managedDriver) Activate(reqCtx context.Context, p *profile.Profile, ctx
 		return nil, errors.New("managed: frontend.binary is required")
 	}
 
-	env, err := p.ExpandEnv(ctx)
+	// Render write_file/template if the profile supplied them (opencode and
+	// similar tools need both a config file and a launched process). Empty
+	// write_file is fine — writeFrontendConfig is a no-op then and we still
+	// get the expanded env back.
+	wroteFile, env, err := writeFrontendConfig(p, &ctx)
 	if err != nil {
-		return nil, fmt.Errorf("expand env: %w", err)
+		return nil, err
 	}
 	envSlice := envMapToSlice(env)
 
@@ -171,6 +175,7 @@ func (m *managedDriver) Activate(reqCtx context.Context, p *profile.Profile, ctx
 		"binary", p.Frontend.Binary,
 		"pid", proc.PID(),
 		"workdir", p.Frontend.Workdir,
+		"wrote_file", wroteFile,
 	)
 
 	if err := m.waitForReady(reqCtx, p.Frontend.WaitFor); err != nil {
@@ -186,10 +191,14 @@ func (m *managedDriver) Activate(reqCtx context.Context, p *profile.Profile, ctx
 		return m.stopProcess(tdCtx, proc)
 	}
 
+	// Surface the config file when one was written; otherwise fall back to
+	// the binary path so `vibe status` still has something to display.
+	wrote := wroteFile
+	if wrote == "" {
+		wrote = p.Frontend.Binary
+	}
 	return &Result{
-		// No file is written for managed; surface the binary path so
-		// `vibe status` has something useful to display.
-		WroteFile:       p.Frontend.Binary,
+		WroteFile:       wrote,
 		RestartRequired: p.Frontend.RestartRequired,
 		Env:             env,
 		Kind:            profile.FrontendManaged,

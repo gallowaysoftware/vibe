@@ -39,16 +39,30 @@ func startCmd() *cobra.Command {
 			fmt.Printf("  backend: %s\n", r.Status.BackendAddr)
 			fmt.Printf("  proxy:   %s\n", r.Status.ProxyAddr)
 			if r.Frontend != nil {
-				fmt.Printf("  frontend: %s\n", r.Frontend.App)
-				fmt.Printf("  wrote:    %s\n", r.Frontend.WroteFile)
+				// external = config rendered, user launches the binary;
+				// managed / docker-compose = vibe also launched the binary.
+				// The label + trailing note differ accordingly.
+				external := r.Frontend.Kind == "external"
+				if external {
+					fmt.Printf("  frontend: %s (external — launch yourself)\n", r.Frontend.App)
+				} else {
+					fmt.Printf("  frontend: %s (running)\n", r.Frontend.App)
+				}
+				if r.Frontend.WroteFile != "" {
+					fmt.Printf("  wrote:    %s\n", r.Frontend.WroteFile)
+				}
 				if len(r.Frontend.EnvVars) > 0 {
-					fmt.Println("  to use:")
+					if external {
+						fmt.Println("  to use:")
+					} else {
+						fmt.Println("  env (already applied to the running frontend):")
+					}
 					for k, v := range r.Frontend.EnvVars {
 						fmt.Printf("    export %s=%q\n", k, v)
 					}
 				}
-				if r.Frontend.RestartRequired {
-					fmt.Printf("  note: %s does not hot-reload — relaunch it (with the env above) to pick up the new endpoint\n", r.Frontend.App)
+				if external && r.Frontend.RestartRequired {
+					fmt.Printf("  note: %s does not hot-reload — start (or relaunch) it with the env above\n", r.Frontend.App)
 				}
 			}
 			return nil

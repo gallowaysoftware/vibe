@@ -345,14 +345,15 @@ func (p *Profile) validateFrontend() error {
 		if p.Frontend.Binary == "" {
 			return errors.New("frontend.binary is required for kind=managed")
 		}
-		if p.Frontend.WriteFile != "" {
-			return errors.New("frontend.write_file is only valid for kind=external")
+		// write_file / template / mcps are accepted: tools like opencode
+		// need both a config file rendered AND a binary spawned, so the
+		// managed driver reuses external's config-write step. If you don't
+		// need a config file, just omit those fields.
+		if len(p.Frontend.Template) > 0 && p.Frontend.WriteFile == "" {
+			return errors.New("frontend.template requires frontend.write_file")
 		}
-		if len(p.Frontend.Template) > 0 {
-			return errors.New("frontend.template is only valid for kind=external")
-		}
-		if len(p.Frontend.MCPs) > 0 {
-			return errors.New("frontend.mcps is only valid for kind=external")
+		if len(p.Frontend.MCPs) > 0 && p.Frontend.WriteFile == "" {
+			return errors.New("frontend.mcps requires frontend.write_file (the MCPs are merged into the rendered template)")
 		}
 		if p.Frontend.ComposeFile != "" {
 			return errors.New("frontend.compose_file is only valid for kind=docker-compose")

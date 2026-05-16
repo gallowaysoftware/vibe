@@ -14,31 +14,62 @@ import (
 // any frontend.mcps merged in) to frontend.write_file. The user is then
 // responsible for launching their tool against the resulting config.
 func activateExternal(p *profile.Profile, ctx profile.ExpandContext) (*Result, error) {
-	// Resolve write_file first; it may reference ${VIBE_STATE_DIR} or other
-	// template variables.
-	resolved, err := profile.ExpandPathString(p.Frontend.WriteFile, ctx)
+	resolved, env, err := writeFrontendConfig(p, &ctx)
 	if err != nil {
-		return nil, fmt.Errorf("expand write_file: %w", err)
+		return nil, err
 	}
-	ctx.WriteFile = resolved
+	return &Result{
+		WroteFile:       resolved,
+		RestartRequired: p.Frontend.RestartRequired,
+		Env:             env,
+		Kind:            profile.FrontendExternal,
+	}, nil
+}
 
-	env, err := p.ExpandEnv(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("expand env: %w", err)
+// writeFrontendConfig renders the profile's frontend.template (with
+// frontend.mcps merged in) to frontend.write_file. Returns the resolved
+// path and the expanded env block so the caller can use them in the
+// Result it returns (external) or pass them through to a child process
+// (managed). When write_file is empty this is a no-op that still returns
+// the expanded env — useful for managed frontends that just want to
+// inherit OPENCODE_CONFIG-style variables without writing a file.
+//
+// The ctx pointer is mutated so subsequent template expansions (e.g.
+// frontend.env that references ${WRITE_FILE}) see the resolved path.
+func writeFrontendConfig(p *profile.Profile, ctx *profile.ExpandContext) (string, map[string]string, error) {
+	var resolved string
+	if p.Frontend.WriteFile != "" {
+		r, err := profile.ExpandPathString(p.Frontend.WriteFile, *ctx)
+		if err != nil {
+			return "", nil, fmt.Errorf("expand write_file: %w", err)
+		}
+		resolved = r
+		ctx.WriteFile = resolved
 	}
 
-	expanded, err := p.ExpandTemplate(ctx)
+	env, err := p.ExpandEnv(*ctx)
 	if err != nil {
-		return nil, fmt.Errorf("expand template: %w", err)
+		return "", nil, fmt.Errorf("expand env: %w", err)
+	}
+
+	if resolved == "" {
+		// No file to write — managed kind without a template just gets the
+		// expanded env back.
+		return "", env, nil
+	}
+
+	expanded, err := p.ExpandTemplate(*ctx)
+	if err != nil {
+		return "", nil, fmt.Errorf("expand template: %w", err)
 	}
 
 	if len(p.Frontend.MCPs) > 0 {
 		if _, exists := expanded["mcp"]; exists {
-			return nil, fmt.Errorf("frontend.template already defines top-level %q key; cannot merge with frontend.mcps", "mcp")
+			return "", nil, fmt.Errorf("frontend.template already defines top-level %q key; cannot merge with frontend.mcps", "mcp")
 		}
 		specs, err := mcp.LoadMany(p.Frontend.MCPs)
 		if err != nil {
-			return nil, fmt.Errorf("load mcps: %w", err)
+			return "", nil, fmt.Errorf("load mcps: %w", err)
 		}
 		mcpBlock := make(map[string]any, len(specs))
 		for name, spec := range specs {
@@ -49,18 +80,13 @@ func activateExternal(p *profile.Profile, ctx profile.ExpandContext) (*Result, e
 
 	body, err := json.MarshalIndent(expanded, "", "  ")
 	if err != nil {
-		return nil, fmt.Errorf("marshal template: %w", err)
+		return "", nil, fmt.Errorf("marshal template: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
-		return nil, fmt.Errorf("mkdir for %s: %w", resolved, err)
+		return "", nil, fmt.Errorf("mkdir for %s: %w", resolved, err)
 	}
 	if err := os.WriteFile(resolved, append(body, '\n'), 0o644); err != nil {
-		return nil, fmt.Errorf("write %s: %w", resolved, err)
+		return "", nil, fmt.Errorf("write %s: %w", resolved, err)
 	}
-	return &Result{
-		WroteFile:       resolved,
-		RestartRequired: p.Frontend.RestartRequired,
-		Env:             env,
-		Kind:            profile.FrontendExternal,
-	}, nil
+	return resolved, env, nil
 }
