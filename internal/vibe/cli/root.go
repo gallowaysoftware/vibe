@@ -37,6 +37,7 @@ func rootCmd() *cobra.Command {
 		doctorCmd(),
 		tuiCmd(),
 		profileCmd(),
+		tokenCmd(),
 	)
 	return root
 }

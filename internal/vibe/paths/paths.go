@@ -41,6 +41,12 @@ func ProfilesDir() string { return filepath.Join(ConfigHome(), "profiles") }
 func MCPDir() string      { return filepath.Join(ConfigHome(), "mcp") }
 func ConfigFile() string  { return filepath.Join(ConfigHome(), "config.yaml") }
 
+// TokenFile is the path to the daemon's bearer-token file. The token lives in
+// $XDG_STATE_HOME/vibe rather than $XDG_CONFIG_HOME because it's a generated
+// runtime secret, not user-authored configuration — same reasoning that puts
+// the PID file under StateHome.
+func TokenFile() string { return filepath.Join(StateHome(), "token") }
+
 // EnsureDirs creates the directories vibe needs at runtime.
 func EnsureDirs() error {
 	for _, d := range []string{ConfigHome(), StateHome(), RuntimeDir(), LogDir(), ProfilesDir(), MCPDir()} {

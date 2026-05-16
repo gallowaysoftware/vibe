@@ -187,7 +187,7 @@ func stubComfyRuntime(t *testing.T, pipeline *Pipeline, workflowJSON string) (*E
 		Pipeline:     pipeline,
 		PipelineDir:  pipelineDir,
 		Capabilities: &Capabilities{Mapping: map[string]string{"image": "comfyui-flux", "reasoning": "code"}},
-		Vibe:         vibeclient.NewWithHTTPClient(vibeSrv.URL, vibeSrv.Client()),
+		Vibe:         vibeclient.NewWithHTTPClient(vibeSrv.URL, vibeSrv.Client(), ""),
 		RunDir:       runDir,
 	}
 	return exec, runDir, pipelineDir, fcs
@@ -700,7 +700,7 @@ func TestComfyUIExecutor_PropagatesSubmitError(t *testing.T) {
 	})
 	vibeSrv := httptest.NewServer(vibeMux)
 	t.Cleanup(vibeSrv.Close)
-	exec.Vibe = vibeclient.NewWithHTTPClient(vibeSrv.URL, vibeSrv.Client())
+	exec.Vibe = vibeclient.NewWithHTTPClient(vibeSrv.URL, vibeSrv.Client(), "")
 
 	err := exec.Run(context.Background())
 	if err == nil {

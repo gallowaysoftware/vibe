@@ -133,8 +133,14 @@ webhook URL.
   follow live, `vamp jobs ls` for the queue.
 - Per-foreach-item resume (today resume granularity is whole-stage; a
   failed item in a foreach causes the whole stage to rerun on resume).
-- Real LAN access from a laptop: HTTP control plane is loopback-bound
-  today. Needs auth (the deferred token-based-auth decision from earlier).
+- ~~Real LAN access from a laptop: HTTP control plane is loopback-bound
+  today. Needs auth (the deferred token-based-auth decision from earlier).~~
+  Done — `bind_all: true` in `~/.config/vibe/config.yaml` flips the TCP
+  listener to `0.0.0.0:9001`, bearer-token auth is enforced on every TCP
+  RPC, and the unix socket stays unauthenticated. Token lives at
+  `$XDG_STATE_HOME/vibe/token` (mode 0600); print it with `vibe token` and
+  rotate with `vibe token --regenerate`. See the README's "Remote access"
+  section.
 - Multi-GPU scheduling: single-profile-at-a-time invariant assumes one
   GPU.
 - ~~vamp pipeline JSON-schema export for editor IDE support

@@ -39,12 +39,19 @@ import (
 const (
 	defaultProxyPort = 9000
 	defaultHTTPAddr  = "127.0.0.1:9001"
+	defaultHTTPPort  = "9001"
 )
 
 type Config struct {
 	ProxyPort   int    `yaml:"proxy_port,omitempty"`
 	HTTPAddr    string `yaml:"http_addr,omitempty"`    // empty → "127.0.0.1:9001"
 	LlamaBinary string `yaml:"llama_binary,omitempty"` // empty → "llama-server" from $PATH
+	// BindAll, when true, switches the TCP listener from 127.0.0.1 to
+	// 0.0.0.0 so a remote machine on the LAN can reach the control plane.
+	// Bearer-token auth is enforced on the TCP listener regardless. If the
+	// user sets HTTPAddr explicitly (e.g. "0.0.0.0:9001"), that value wins
+	// and BindAll is ignored.
+	BindAll bool `yaml:"bind_all,omitempty"`
 }
 
 // LoadConfig reads the global vibe config; missing file is not an error.
@@ -52,21 +59,36 @@ func LoadConfig() (Config, error) {
 	c := Config{ProxyPort: defaultProxyPort, HTTPAddr: defaultHTTPAddr}
 	data, err := os.ReadFile(paths.ConfigFile())
 	if errors.Is(err, os.ErrNotExist) {
-		return c, nil
+		return c.resolveHTTPAddr(), nil
 	}
 	if err != nil {
 		return c, err
 	}
+	// Don't default HTTPAddr before unmarshal: we need to tell "user didn't
+	// set it" from "user set it to the default" so BindAll can take effect
+	// only when HTTPAddr is unset.
+	c.HTTPAddr = ""
 	if err := yaml.Unmarshal(data, &c); err != nil {
 		return c, err
 	}
 	if c.ProxyPort == 0 {
 		c.ProxyPort = defaultProxyPort
 	}
-	if c.HTTPAddr == "" {
+	return c.resolveHTTPAddr(), nil
+}
+
+// resolveHTTPAddr fills in HTTPAddr from BindAll when the user didn't set
+// HTTPAddr explicitly. An explicit HTTPAddr always wins.
+func (c Config) resolveHTTPAddr() Config {
+	if c.HTTPAddr != "" {
+		return c
+	}
+	if c.BindAll {
+		c.HTTPAddr = "0.0.0.0:" + defaultHTTPPort
+	} else {
 		c.HTTPAddr = defaultHTTPAddr
 	}
-	return c, nil
+	return c
 }
 
 type Daemon struct {
@@ -151,12 +173,26 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer d.prx.Stop(context.Background())
 
+	// Generate or load the bearer token before binding the TCP server.
+	// The unix socket reuses the same Connect handler but skips token
+	// validation (0600 socket perms are the auth boundary there).
+	token, err := LoadOrCreateToken()
+	if err != nil {
+		unixLn.Close()
+		httpLn.Close()
+		return fmt.Errorf("load token: %w", err)
+	}
+
 	mux := http.NewServeMux()
 	mountPath, connectHandler := vibev1connect.NewControlServiceHandler(d)
 	mux.Handle(mountPath, connectHandler)
 
 	unixSrv := &http.Server{Handler: mux}
-	httpSrv := &http.Server{Handler: mux}
+	// The TCP server gets a bearer-auth wrapper around the same mux. Two
+	// separate http.Server instances (one per listener) is the cleanest
+	// way to express "only TCP requires auth" without leaking the
+	// distinction into per-RPC interceptors.
+	httpSrv := &http.Server{Handler: bearerAuthMiddleware(token, mux)}
 	errCh := make(chan error, 2)
 	serve := func(srv *http.Server, ln net.Listener) {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -170,7 +206,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 		"unix_socket", sockPath,
 		"http_addr", d.cfg.HTTPAddr,
 		"proxy_addr", fmt.Sprintf("127.0.0.1:%d", d.cfg.ProxyPort),
-		"llama_binary", d.cfg.LlamaBinary)
+		"llama_binary", d.cfg.LlamaBinary,
+		"token_file", paths.TokenFile())
 
 	var shutReason string
 	select {

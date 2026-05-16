@@ -22,7 +22,10 @@ func newClient() *vibeclient.Client {
 			},
 		},
 	}
-	return vibeclient.NewWithHTTPClient("http://vibe.local", hc)
+	// Empty token: the daemon doesn't enforce auth on the unix socket
+	// (filesystem perms are the auth boundary there). Avoids forcing the
+	// local CLI through token discovery for every command.
+	return vibeclient.NewWithHTTPClient("http://vibe.local", hc, "")
 }
 
 // pingDaemon returns nil if the daemon answers Status within the given timeout.

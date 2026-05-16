@@ -107,14 +107,56 @@ Today running local AI looks like:
 - **Proxy**: reverse-proxies frontends to the active llama-server so swapping models doesn't require reconfiguring the frontend.
 - **CLI**: `start`, `stop`, `ps`, `logs`, `list`.
 
+## Remote access
+
+By default the daemon's TCP control plane binds `127.0.0.1:9001` and the
+unix socket at `$XDG_RUNTIME_DIR/vibe/vibe.sock` (0600 perms) is the
+preferred path for local commands. To talk to a daemon running on another
+machine on your LAN (e.g. driving the dev box from a laptop):
+
+1. **On the dev box**, edit `~/.config/vibe/config.yaml`:
+
+   ```yaml
+   bind_all: true
+   ```
+
+   (or set `http_addr: "0.0.0.0:9001"` directly). Restart with
+   `vibe shutdown` so the next command spawns a daemon with the new bind.
+
+2. **Get the bearer token.** On the dev box:
+
+   ```
+   vibe token
+   ```
+
+   This prints the contents of `$XDG_STATE_HOME/vibe/token` (mode `0600`,
+   generated on first daemon start). Copy the value to your laptop.
+
+3. **On the laptop**, export the token and point at the dev box:
+
+   ```
+   export VIBE_TOKEN=<paste>
+   export VIBE_API=http://devbox.local:9001
+   vibe ps
+   vamp run examples/multi-profile-pipeline/pipeline.yaml
+   ```
+
+   `vibeclient` reads `$VIBE_TOKEN` first, falls back to
+   `$XDG_STATE_HOME/vibe/token` (which makes the same-machine case work
+   without any setup). Requests over the unix socket never carry a token.
+
+If the token is ever exposed, run `vibe token --regenerate` on the dev
+box, restart the daemon, and re-copy the new value. The daemon enforces
+the bearer header on every TCP RPC (`401 Unauthorized` otherwise); the
+unix socket is unauthenticated by design and gated by filesystem perms.
+
 ## Status
 
-Phase 1 in progress: profile schema, llama-server supervision, proxy, CLI, opencode integration, docker-compose frontends, managed-binary frontends. Single-host, local-only.
+Phase 1 in progress: profile schema, llama-server supervision, proxy, CLI, opencode integration, docker-compose frontends, managed-binary frontends, LAN access with bearer-token auth.
 
 Not yet:
 
 - VRAM enforcement
-- Remote (LAN) access from a laptop
 
 ## TUI
 

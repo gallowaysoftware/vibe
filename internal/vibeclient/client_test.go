@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -198,5 +200,128 @@ func TestLogs(t *testing.T) {
 	}
 	if len(lines) != 2 || lines[0] != "line1" {
 		t.Errorf("lines = %v", lines)
+	}
+}
+
+// TestResolveToken_PrefersEnv asserts the documented precedence: $VIBE_TOKEN
+// wins over the on-disk file. This is the path a remote laptop hits — the
+// user exports VIBE_TOKEN even though their machine has no token file.
+func TestResolveToken_PrefersEnv(t *testing.T) {
+	t.Setenv("VIBE_TOKEN", "from-env")
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	if got := ResolveToken(); got != "from-env" {
+		t.Errorf("ResolveToken = %q, want from-env", got)
+	}
+}
+
+// TestResolveToken_FallsBackToFile covers the same-machine case: $VIBE_TOKEN
+// unset, but the daemon's token file is present at $XDG_STATE_HOME/vibe/token.
+func TestResolveToken_FallsBackToFile(t *testing.T) {
+	t.Setenv("VIBE_TOKEN", "")
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	dir := filepath.Join(state, "vibe")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "token"), []byte("from-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := ResolveToken(); got != "from-file" {
+		t.Errorf("ResolveToken = %q, want from-file", got)
+	}
+}
+
+// TestResolveToken_EmptyWhenNothingSet keeps the unix-socket-CLI path
+// working: if there's no env and no file, ResolveToken returns "" rather
+// than erroring.
+func TestResolveToken_EmptyWhenNothingSet(t *testing.T) {
+	t.Setenv("VIBE_TOKEN", "")
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	if got := ResolveToken(); got != "" {
+		t.Errorf("ResolveToken = %q, want empty", got)
+	}
+}
+
+// TestClient_InjectsBearerHeader confirms the client wraps every outgoing
+// RPC with `Authorization: Bearer <token>`. We can't observe the header
+// through the Connect SDK directly, so spin up an http.Handler that records
+// it and verifies the value.
+func TestClient_InjectsBearerHeader(t *testing.T) {
+	var gotAuth string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		// Reply with an empty body that Connect will parse as a fail; we
+		// don't care, we only need to observe the header.
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := NewWithToken(srv.URL, "the-secret")
+	_, _ = c.Status(context.Background()) // error expected — server isn't Connect-aware
+	if gotAuth != "Bearer the-secret" {
+		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer the-secret")
+	}
+}
+
+// TestClient_NoTokenMeansNoHeader is the unix-socket happy path: when no
+// token is supplied, the client must NOT set Authorization (or the daemon's
+// TCP middleware would reject a header it didn't expect on the socket — and
+// more importantly, we don't want bogus headers on the wire).
+func TestClient_NoTokenMeansNoHeader(t *testing.T) {
+	var gotAuth string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := NewWithToken(srv.URL, "")
+	_, _ = c.Status(context.Background())
+	if gotAuth != "" {
+		t.Errorf("Authorization = %q, want empty", gotAuth)
+	}
+}
+
+// TestClient_TCPRejectsMissingTokenAgainstSecuredHandler proves a client
+// constructed without a token is actually rejected by a server that requires
+// one. End-to-end shape check against a real Connect handler wrapped in the
+// bearer-auth middleware.
+func TestClient_TCPRejectsMissingTokenAgainstSecuredHandler(t *testing.T) {
+	const token = "right-token"
+	mux := http.NewServeMux()
+	path, handler := vibev1connect.NewControlServiceHandler(&fakeControl{status: &vibev1.Status{}})
+	mux.Handle(path, handler)
+	// Inline the daemon's middleware here so the test stays in
+	// internal/vibeclient (no daemon import cycle).
+	authMux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := r.Header.Get("Authorization")
+		if h != "Bearer "+token {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+	srv := httptest.NewServer(authMux)
+	t.Cleanup(srv.Close)
+
+	// 1) Wrong token → error.
+	wrong := NewWithToken(srv.URL, "wrong")
+	if _, err := wrong.Status(context.Background()); err == nil {
+		t.Errorf("Status with wrong token: nil err; want unauthenticated")
+	}
+	// 2) No token → error.
+	none := NewWithToken(srv.URL, "")
+	if _, err := none.Status(context.Background()); err == nil {
+		t.Errorf("Status with no token: nil err; want unauthenticated")
+	}
+	// 3) Right token → success.
+	good := NewWithToken(srv.URL, token)
+	if _, err := good.Status(context.Background()); err != nil {
+		t.Errorf("Status with right token: %v", err)
 	}
 }
