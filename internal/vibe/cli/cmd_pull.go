@@ -51,7 +51,11 @@ func renderPull(stream *vibeclient.PullStream) error {
 			fmt.Println("resolving huggingface metadata...")
 		case vibev1.PullProgress_PHASE_DOWNLOADING:
 			if bar == nil {
-				fmt.Printf("downloading %s\n", humanBytes(m.TotalBytes))
+				if m.TotalBytes > 0 {
+					fmt.Printf("downloading %s\n", humanBytes(m.TotalBytes))
+				} else {
+					fmt.Println("downloading (size unknown)")
+				}
 				bar = newProgressBar(m.TotalBytes)
 			}
 			bar.update(m.DownloadedBytes)
@@ -89,15 +93,19 @@ func newProgressBar(total int64) *progressBar {
 }
 
 func (b *progressBar) update(downloaded int64) {
-	var pct float64
-	if b.total > 0 {
-		pct = float64(downloaded) / float64(b.total) * 100
-	}
 	elapsed := time.Since(b.start).Seconds()
 	if elapsed < 0.01 {
 		elapsed = 0.01
 	}
 	rate := float64(downloaded) / elapsed / (1024 * 1024) // MB/s
+	if b.total <= 0 {
+		// Unknown-size mode (HEAD returned no Content-Length). Skip the
+		// bar/percentage and just print bytes + rate so the user can see
+		// the download is making progress.
+		fmt.Printf("\r  %s (%.1f MB/s)", humanBytes(downloaded), rate)
+		return
+	}
+	pct := float64(downloaded) / float64(b.total) * 100
 	const w = 30
 	filled := int(pct * w / 100)
 	if filled > w {

@@ -166,3 +166,33 @@ func TestSpec_URL(t *testing.T) {
 
 // silence "imported and not used" if we trim later
 var _ = io.Copy
+
+// TestLargestFileSize covers the in-flight polling path used by the hf-CLI
+// downloader: while `hf` writes to a `.incomplete` sibling we must find
+// THAT file (largest in the tree), not the final filename which doesn't
+// exist yet.
+func TestLargestFileSize(t *testing.T) {
+	dir := t.TempDir()
+	if got := largestFileSize(dir); got != 0 {
+		t.Errorf("empty dir: got %d, want 0", got)
+	}
+	if got := largestFileSize(filepath.Join(dir, "missing")); got != 0 {
+		t.Errorf("missing dir: got %d, want 0 (walk should be tolerant)", got)
+	}
+	// Drop several files: one small, one large, plus one in a subdir to
+	// exercise the recursive walk.
+	if err := os.WriteFile(filepath.Join(dir, "small.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(dir, "nested")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	big := bytes.Repeat([]byte("a"), 4096)
+	if err := os.WriteFile(filepath.Join(sub, "model.gguf.incomplete"), big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := largestFileSize(dir); got != int64(len(big)) {
+		t.Errorf("got %d, want %d (should find nested .incomplete)", got, len(big))
+	}
+}

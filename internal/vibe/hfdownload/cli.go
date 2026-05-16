@@ -68,7 +68,16 @@ func downloadViaHFCLI(ctx context.Context, hfBin string, spec Spec, destPath str
 			case <-stop:
 				return
 			case <-ticker.C:
-				if info, err := os.Stat(hfWritePath); err == nil {
+				// hf writes to a `.incomplete` sibling (or a `.cache/`
+				// subdir) until the download finishes, so stat'ing the
+				// final filename returns "not exist" the entire time
+				// and no progress is reported. Walk the target dir for
+				// the largest file size instead — covers both the
+				// in-flight `.incomplete` file and the final renamed
+				// one without caring which layout `hf` is using.
+				if n := largestFileSize(targetDir); n > 0 {
+					report(progress, n, total)
+				} else if info, err := os.Stat(hfWritePath); err == nil {
 					report(progress, info.Size(), total)
 				}
 			}
@@ -100,4 +109,29 @@ func downloadViaHFCLI(ctx context.Context, hfBin string, spec Spec, destPath str
 		report(progress, size, size)
 	}
 	return nil
+}
+
+// largestFileSize returns the size of the largest regular file under root
+// (recursively), or 0 if the walk finds nothing. Used by the hf-CLI polling
+// path to track in-flight `.incomplete` files that the modern hf client
+// writes alongside the final destination filename. Walk errors are best-
+// effort: missing-directory at start-of-download is normal, and the next
+// tick will retry.
+func largestFileSize(root string) int64 {
+	var max int64
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			// Skip unreadable entries instead of bailing — partially-
+			// created subdirs are normal mid-download.
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if info.Size() > max {
+			max = info.Size()
+		}
+		return nil
+	})
+	return max
 }
