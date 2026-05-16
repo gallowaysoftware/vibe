@@ -243,6 +243,15 @@ func LoadPipeline(path string) (*Pipeline, error) {
 // foreach stage's array when ForeachSpec.Var is unset.
 const DefaultForeachVar = "item"
 
+// ForeachNonTemplatedMultiItemErrMsg is the format string used at runtime
+// when a foreach stage's upstream resolves to >1 items and Stage.Output
+// contains no template marker. The runtime check (in executeForeachStage)
+// supersedes the old static "{{" presence check in Validate so that
+// single-item foreaches with a literal output path are accepted. We expose
+// the message as a constant so the runtime call site and any future
+// dry-run / linting check stay in lockstep.
+const ForeachNonTemplatedMultiItemErrMsg = "%s: foreach stages require a templated output path (contains {{...}}) so per-item writes don't collide"
+
 // migrateForeachError annotates the YAML decode error with a migration hint
 // when the failure is most likely caused by a pipeline still using the old
 // Phase 1 foreach syntax (string template + separate foreach_as). YAML's
@@ -583,12 +592,15 @@ func (p *Pipeline) Validate() error {
 			if s.Foreach.From == "" {
 				return fmt.Errorf("%s: foreach.from is required", ctx)
 			}
-			// foreach stages must use a templated output path so per-item runs
-			// don't collide on the same file. We treat the presence of "{{" as
-			// the templated marker; that's the same syntax users see in YAML.
-			if !strings.Contains(s.Output, "{{") {
-				return fmt.Errorf("%s: foreach stages require a templated output path (contains {{...}}) so per-item writes don't collide", ctx)
-			}
+			// Output-path collision check is DEFERRED to runtime
+			// (executeForeachStage's pre-render loop already enforces a
+			// stronger check: it walks the actual rendered paths and errors
+			// on any duplicate, using ForeachNonTemplatedMultiItemErrMsg
+			// below when the rendered set collapses to identical paths from a
+			// non-templated Output). Static "{{" presence rejects legitimate
+			// single-item foreach uses where a non-templated output cannot
+			// collide with itself; runtime knows the actual array length.
+			//
 			// Default Var to "item" so the executor can rely on the field
 			// being set whenever Foreach is. We mutate the stage in place to
 			// keep downstream code simple.

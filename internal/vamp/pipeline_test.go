@@ -960,24 +960,6 @@ stages:
 			wantErr: "output_format: json",
 		},
 		{
-			name: "foreach with static output path",
-			yaml: `name: x
-stages:
-- id: src
-  capability: r
-  prompt: hi
-  output: src.json
-  output_format: json
-- id: a
-  capability: r
-  prompt: hi
-  inputs: [src]
-  output: out.md
-  foreach:
-    from: src`,
-			wantErr: "templated output path",
-		},
-		{
 			name: "comfyui without workflow",
 			yaml: `name: x
 stages:

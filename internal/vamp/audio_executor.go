@@ -66,7 +66,9 @@ const piperVoicesURL = "https://huggingface.co/rhasspy/piper-voices"
 // invocations have Item=nil and ItemIdx=0.
 //
 // Side effects: writes the rendered .wav file to <RunDir>/<rendered output>
-// and reports that path in StageOutput.Files.
+// and reports that path in StageOutput.Files as an ABSOLUTE path. Downstream
+// stages render subprocesses (ffmpeg) from the daemon's CWD, so a relative
+// path wouldn't resolve there; absolute is the only safe shape.
 func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput, error) {
 	st := in.Stage
 	if st == nil {
@@ -155,7 +157,10 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 	if err := runner.Run(ctx, binary, args, text); err != nil {
 		return nil, fmt.Errorf("stage %s: piper: %w", st.ID, err)
 	}
-	return &StageOutput{Files: []string{outRel}}, nil
+	// Report ABSOLUTE path: downstream {{ .stages.X.output(s) }} references
+	// land on argv strings consumed by ffmpeg/etc. subprocesses running from
+	// the daemon's CWD, which can't resolve a path relative to RunDir.
+	return &StageOutput{Files: []string{outAbs}}, nil
 }
 
 // execCommandRunner is the production audioRunner. It spawns the piper binary
