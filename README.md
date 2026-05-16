@@ -126,6 +126,23 @@ then `vibe` swaps to a larger profile to expand it. Both
 `profiles/fast.example.yaml` and `profiles/code.example.yaml` are
 referenced by that example.
 
+Every `vamp run` writes its artifacts to a timestamped directory under
+`$XDG_STATE_HOME/vamp/runs/`. The `vamp runs` subcommand inspects and
+manages that history:
+
+```
+vamp runs ls                            # list past runs, newest first
+vamp runs show <id-or-path>             # cat snapshot + inputs.json + outputs index
+vamp runs cleanup --older-than 7d       # delete run dirs older than 7 days
+vamp runs cleanup --older-than 7d --dry-run   # preview what would go
+```
+
+`<id>` is a prefix of the run-dir basename (e.g. `2026-05-15T12`);
+ambiguous prefixes list candidates and bail. The executor also writes
+a small `pipeline.json` to each run dir on completion that powers
+the listing's pipeline name, stage count, duration, and status
+columns.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
