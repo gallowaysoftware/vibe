@@ -20,6 +20,7 @@ import (
 
 	"connectrpc.com/connect"
 
+	vampcache "github.com/gallowaysoftware/vibe/internal/vamp/cache"
 	"github.com/gallowaysoftware/vibe/internal/vibeclient"
 	vibev1 "github.com/gallowaysoftware/vibe/proto/vibe/v1"
 	"github.com/gallowaysoftware/vibe/proto/vibe/v1/vibev1connect"
@@ -2365,4 +2366,148 @@ func (a *abortControl) Logs(ctx context.Context, req *connect.Request[vibev1.Log
 }
 func (a *abortControl) Pull(ctx context.Context, req *connect.Request[vibev1.PullRequest], stream *connect.ServerStream[vibev1.PullProgress]) error {
 	return a.inner.Pull(ctx, req, stream)
+}
+
+// TestExecutor_CacheHit verifies that a second run with byte-identical inputs
+// (same prompt, params, model) reads from the cache and never invokes the
+// inference function. This is the core promise of the content-addressed
+// cache; the inference call count is the cleanest observable for it.
+func TestExecutor_CacheHit(t *testing.T) {
+	calls := 0
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		calls++
+		return "out:" + prompt, nil
+	}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
+	pipeline := &Pipeline{
+		Name: "cache-hit",
+		Stages: []Stage{
+			{ID: "plan", Capability: "reasoning", Prompt: "topic-X", Output: "plan.txt"},
+		},
+	}
+	store, err := cacheNew(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Run 1: cache miss, executor runs.
+	exec, runDir := stubExecutor(t, pipeline, caps, inf)
+	exec.Cache = store
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("run 1: calls = %d, want 1", calls)
+	}
+	body, _ := os.ReadFile(filepath.Join(runDir, "plan.txt"))
+	if string(body) != "out:topic-X" {
+		t.Fatalf("run 1 output = %q", body)
+	}
+	// Run 2: same pipeline, same inputs — should be a cache hit so the
+	// inference function MUST NOT be called again.
+	exec2, runDir2 := stubExecutor(t, pipeline, caps, inf)
+	exec2.Cache = store
+	if err := exec2.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("run 2: calls = %d, want 1 (cache should have served the hit)", calls)
+	}
+	body2, _ := os.ReadFile(filepath.Join(runDir2, "plan.txt"))
+	if string(body2) != "out:topic-X" {
+		t.Fatalf("run 2 output = %q", body2)
+	}
+}
+
+// TestExecutor_CacheMissOnPromptChange verifies that changing the rendered
+// prompt produces a fresh cache key (i.e. a miss) and the executor runs
+// again. This is the prompt-engineering use case: tweak one stage's prompt,
+// and that stage runs but the others don't.
+func TestExecutor_CacheMissOnPromptChange(t *testing.T) {
+	calls := 0
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		calls++
+		return "out:" + prompt, nil
+	}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
+	store, err := cacheNew(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec1, _ := stubExecutor(t, &Pipeline{
+		Name: "cache-prompt",
+		Stages: []Stage{
+			{ID: "plan", Capability: "reasoning", Prompt: "prompt v1", Output: "plan.txt"},
+		},
+	}, caps, inf)
+	exec1.Cache = store
+	if err := exec1.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Same pipeline name, same stage id, different prompt: must miss cache.
+	exec2, _ := stubExecutor(t, &Pipeline{
+		Name: "cache-prompt",
+		Stages: []Stage{
+			{ID: "plan", Capability: "reasoning", Prompt: "prompt v2 (changed)", Output: "plan.txt"},
+		},
+	}, caps, inf)
+	exec2.Cache = store
+	if err := exec2.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2 (prompt change must produce a miss)", calls)
+	}
+}
+
+// TestExecutor_CacheDisabled verifies that a pipeline-level `cache: false`
+// produces neither cache reads nor cache writes. The store remains empty
+// after the run.
+func TestExecutor_CacheDisabled(t *testing.T) {
+	calls := 0
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		calls++
+		return "out:" + prompt, nil
+	}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
+	store, err := cacheNew(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cacheOff := false
+	pipeline := &Pipeline{
+		Name:  "cache-off",
+		Cache: &cacheOff,
+		Stages: []Stage{
+			{ID: "plan", Capability: "reasoning", Prompt: "x", Output: "plan.txt"},
+		},
+	}
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	exec.Cache = store
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("calls run 1 = %d", calls)
+	}
+	// Run again: cache is off, so the executor runs again AND no entry was
+	// written.
+	exec2, _ := stubExecutor(t, pipeline, caps, inf)
+	exec2.Cache = store
+	if err := exec2.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls run 2 = %d, want 2 (cache disabled must not serve hits)", calls)
+	}
+	if _, count, _ := store.Size(); count != 0 {
+		t.Fatalf("cache entry count = %d, want 0 (no writes when disabled)", count)
+	}
+}
+
+// cacheNew constructs a fresh cache store under a t.TempDir(). Centralised so
+// the three cache tests share the same setup without leaking state across
+// tests (each test gets its own temp dir).
+func cacheNew(t *testing.T) (*vampcache.Store, error) {
+	t.Helper()
+	return vampcache.New(t.TempDir())
 }

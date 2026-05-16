@@ -18,6 +18,13 @@ type Pipeline struct {
 	Description string               `yaml:"description,omitempty"`
 	Inputs      map[string]InputSpec `yaml:"inputs,omitempty"`
 	Stages      []Stage              `yaml:"stages"`
+	// Cache, when explicitly false, disables the content-addressed cache
+	// for every stage in the pipeline. A nil pointer means "default"
+	// (caching is on for cacheable stage types); the explicit-bool /
+	// nil-vs-false discrimination is the reason the field is a *bool
+	// rather than a plain bool. Individual stages can override the
+	// pipeline default via Stage.Cache.
+	Cache *bool `yaml:"cache,omitempty"`
 }
 
 // InputSpec declares a pipeline-level input passed on the CLI as --input.
@@ -116,6 +123,14 @@ type Stage struct {
 	// policy. Absent / nil means "no retry" — the executor's first error
 	// is returned verbatim, matching pre-retry behaviour.
 	Retry *RetryPolicy `yaml:"retry,omitempty"`
+
+	// Cache, when explicitly false, disables the content-addressed cache
+	// for this stage even when the pipeline-level default is on. A nil
+	// pointer falls through to the pipeline-level setting, which in turn
+	// defaults to "on" for cacheable stage types when both layers are
+	// nil. Non-cacheable stage types (webhook/youtube) are never cached
+	// regardless of this field's value.
+	Cache *bool `yaml:"cache,omitempty"`
 
 	// RunWhen controls whether the stage runs based on the status of its
 	// declared Inputs (and, when Inputs is empty, the pipeline as a whole).

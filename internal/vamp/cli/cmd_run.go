@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/gallowaysoftware/vibe/internal/vamp"
+	"github.com/gallowaysoftware/vibe/internal/vamp/cache"
 	"github.com/gallowaysoftware/vibe/internal/vibeclient"
 )
 
@@ -43,6 +44,7 @@ func runCmd() *cobra.Command {
 		resumeForceFlag bool
 		dryRunFlag      bool
 		detachFlag      bool
+		noCacheFlag     bool
 		internalRunJob  bool
 	)
 	cmd := &cobra.Command{
@@ -189,6 +191,20 @@ func runCmd() *cobra.Command {
 				RunDir:         runDir,
 				Log:            logOut,
 			}
+			// Wire the content-addressed cache unless the user explicitly
+			// opted out via --no-cache or VAMP_NO_CACHE=1. Per-pipeline /
+			// per-stage `cache: false` is honoured inside the executor; the
+			// CLI surface only decides whether to instantiate the store at
+			// all. A store init failure is a soft failure: log via slog
+			// inside the executor (Executor.Cache stays nil) and run as if
+			// caching were disabled.
+			if !noCacheFlag && !vamp.EnvCacheDisabled() {
+				if store, err := cache.New(cache.DefaultRoot()); err == nil {
+					exec.Cache = store
+				} else {
+					fmt.Fprintf(cmd.ErrOrStderr(), "cache: init failed: %v (continuing without cache)\n", err)
+				}
+			}
 			if resumeFlag != "" {
 				exec.ResumeDir = runDir
 				exec.ResumeForce = resumeForceFlag
@@ -211,6 +227,7 @@ func runCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&resumeForceFlag, "resume-force", false, "With --resume, skip the safety check that errors out when the pipeline file has changed since the run was started.")
 	cmd.Flags().BoolVar(&dryRunFlag, "dry-run", false, "Render templates and validate per-stage shape without contacting vibe, an LLM, ComfyUI, ffmpeg, Piper, or YouTube. Prints a per-stage plan and a final error/warning count.")
 	cmd.Flags().BoolVar(&detachFlag, "detach", false, "Fork the run into a background `vamp` worker and return immediately with a job id. Use `vamp jobs ls`, `vamp logs <id>`, `vamp cancel <id>` to drive it.")
+	cmd.Flags().BoolVar(&noCacheFlag, "no-cache", false, "Disable the content-addressed cache for this run; overrides per-pipeline / per-stage `cache: true` defaults.")
 	cmd.Flags().BoolVar(&internalRunJob, internalRunJobFlag, false, "Internal: marks this process as the detached worker spawned by --detach. Sets up vamp.log + vamp.pid in the run dir. Do not invoke manually.")
 	_ = cmd.Flags().MarkHidden(internalRunJobFlag)
 	return cmd

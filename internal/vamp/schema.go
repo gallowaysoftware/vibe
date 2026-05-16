@@ -279,6 +279,10 @@ func Schema() *schemaProperty {
 				Description: "Gate the stage on prior outcome: success (default), failure, or always.",
 				Default:     RunWhenSuccess,
 			},
+			"cache": {
+				Type:        "boolean",
+				Description: "Per-stage opt-out: explicit false disables the content-addressed cache for this stage; absent inherits the pipeline default.",
+			},
 		},
 	}
 
@@ -309,6 +313,10 @@ func Schema() *schemaProperty {
 				Type:        "array",
 				Description: "Ordered list of stages forming the pipeline DAG.",
 				Items:       stage,
+			},
+			"cache": {
+				Type:        "boolean",
+				Description: "Pipeline-level opt-out: explicit false disables the content-addressed cache for every stage in the pipeline.",
 			},
 		},
 		Definitions: map[string]*schemaProperty{
