@@ -31,6 +31,7 @@ import (
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 	"github.com/gallowaysoftware/vibe/internal/vibe/proxy"
 	"github.com/gallowaysoftware/vibe/internal/vibe/supervisor"
+	"github.com/gallowaysoftware/vibe/internal/vibe/vram"
 	vibev1 "github.com/gallowaysoftware/vibe/proto/vibe/v1"
 	"github.com/gallowaysoftware/vibe/proto/vibe/v1/vibev1connect"
 )
@@ -73,6 +74,14 @@ type Daemon struct {
 	sup *supervisor.Supervisor
 	prx *proxy.Proxy
 
+	// nvidiaSMI is the VRAM probe used by Start for its pre-flight check.
+	// Tests inject a stub here; production wires vram.NvidiaSMIProbe via New.
+	nvidiaSMI vram.Probe
+	// vramSlopGiB is added to free VRAM before comparing to the profile's
+	// estimate, absorbing the inherent fuzziness of those numbers. Defaults
+	// to vram.DefaultSlopGiB in New.
+	vramSlopGiB float64
+
 	// startMu serializes start/stop operations against each other.
 	startMu sync.Mutex
 
@@ -90,11 +99,19 @@ var _ vibev1connect.ControlServiceHandler = (*Daemon)(nil)
 
 func New(cfg Config) *Daemon {
 	return &Daemon{
-		cfg:      cfg,
-		sup:      supervisor.New(),
-		prx:      proxy.New(fmt.Sprintf("127.0.0.1:%d", cfg.ProxyPort)),
-		shutdown: make(chan struct{}),
+		cfg:         cfg,
+		sup:         supervisor.New(),
+		prx:         proxy.New(fmt.Sprintf("127.0.0.1:%d", cfg.ProxyPort)),
+		nvidiaSMI:   vram.NvidiaSMIProbe,
+		vramSlopGiB: vram.DefaultSlopGiB,
+		shutdown:    make(chan struct{}),
 	}
+}
+
+// SetVRAMProbe overrides the VRAM-free probe. Used by tests to avoid shelling
+// out to nvidia-smi.
+func (d *Daemon) SetVRAMProbe(p vram.Probe) {
+	d.nvidiaSMI = p
 }
 
 // Run brings up the proxy and both control-plane listeners (unix + TCP),
@@ -242,6 +259,35 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 
 	startCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+
+	// Pre-flight VRAM check. We only run this when the profile declares an
+	// estimate (otherwise the older zero-VRAM profiles would all skip
+	// silently). A missing nvidia-smi degrades to a warning so users on
+	// CPU/AMD/Apple-Silicon hosts aren't blocked.
+	if !req.Msg.NoVramCheck && p.EstimatedVRAMGB > 0 {
+		res := vram.Check(startCtx, d.nvidiaSMI, p.EstimatedVRAMGB, d.vramSlopGiB)
+		switch {
+		case res.Skipped:
+			slog.Warn("vram pre-flight skipped",
+				"profile", p.Name,
+				"estimated_gib", p.EstimatedVRAMGB,
+				"reason", res.Message)
+		case !res.OK:
+			msg := fmt.Sprintf(
+				"profile %q needs ~%.1f GiB free VRAM but only %.1f GiB is free.\nStop the current profile (`vibe stop`) or close other GPU users first.",
+				p.Name, p.EstimatedVRAMGB, res.FreeGiB)
+			slog.Warn("vram pre-flight failed",
+				"profile", p.Name,
+				"estimated_gib", p.EstimatedVRAMGB,
+				"free_gib", res.FreeGiB)
+			return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New(msg))
+		default:
+			slog.Info("vram pre-flight ok",
+				"profile", p.Name,
+				"estimated_gib", p.EstimatedVRAMGB,
+				"free_gib", res.FreeGiB)
+		}
+	}
 
 	// Dispatch by backend kind. Each branch fully populates `spec` and the
 	// chosen `port`, then the shared tail starts the supervisor.

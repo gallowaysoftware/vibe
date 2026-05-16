@@ -470,8 +470,12 @@ func (x *ListProfilesResponse) GetProfiles() []*Profile {
 }
 
 type StartRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Profile       string                 `protobuf:"bytes,1,opt,name=profile,proto3" json:"profile,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Profile string                 `protobuf:"bytes,1,opt,name=profile,proto3" json:"profile,omitempty"`
+	// no_vram_check, when true, skips the pre-flight VRAM check the daemon
+	// performs against the profile's estimated_vram_gb. For users who know
+	// their setup better than the heuristic.
+	NoVramCheck   bool `protobuf:"varint,2,opt,name=no_vram_check,json=noVramCheck,proto3" json:"no_vram_check,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -511,6 +515,13 @@ func (x *StartRequest) GetProfile() string {
 		return x.Profile
 	}
 	return ""
+}
+
+func (x *StartRequest) GetNoVramCheck() bool {
+	if x != nil {
+		return x.NoVramCheck
+	}
+	return false
 }
 
 type StartResponse struct {
@@ -947,9 +958,10 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\x06status\x18\x01 \x01(\v2\x0f.vibe.v1.StatusR\x06status\"\x15\n" +
 	"\x13ListProfilesRequest\"D\n" +
 	"\x14ListProfilesResponse\x12,\n" +
-	"\bprofiles\x18\x01 \x03(\v2\x10.vibe.v1.ProfileR\bprofiles\"(\n" +
+	"\bprofiles\x18\x01 \x03(\v2\x10.vibe.v1.ProfileR\bprofiles\"L\n" +
 	"\fStartRequest\x12\x18\n" +
-	"\aprofile\x18\x01 \x01(\tR\aprofile\"k\n" +
+	"\aprofile\x18\x01 \x01(\tR\aprofile\x12\"\n" +
+	"\rno_vram_check\x18\x02 \x01(\bR\vnoVramCheck\"k\n" +
 	"\rStartResponse\x12'\n" +
 	"\x06status\x18\x01 \x01(\v2\x0f.vibe.v1.StatusR\x06status\x121\n" +
 	"\bfrontend\x18\x02 \x01(\v2\x15.vibe.v1.FrontendInfoR\bfrontend\"\r\n" +

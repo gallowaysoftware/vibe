@@ -62,7 +62,24 @@ type StartResult struct {
 }
 
 func (c *Client) Start(ctx context.Context, profile string) (*StartResult, error) {
-	resp, err := c.rpc.Start(ctx, connect.NewRequest(&vibev1.StartRequest{Profile: profile}))
+	return c.StartWithOptions(ctx, profile, StartOptions{})
+}
+
+// StartOptions tunes a Start call. NoVRAMCheck bypasses the daemon's
+// pre-flight VRAM check (for users who know their setup better than the
+// heuristic).
+type StartOptions struct {
+	NoVRAMCheck bool
+}
+
+// StartWithOptions is the same as Start but exposes optional flags. Existing
+// callers can continue using Start; new callers that need bypass behavior
+// should use this.
+func (c *Client) StartWithOptions(ctx context.Context, profile string, opts StartOptions) (*StartResult, error) {
+	resp, err := c.rpc.Start(ctx, connect.NewRequest(&vibev1.StartRequest{
+		Profile:     profile,
+		NoVramCheck: opts.NoVRAMCheck,
+	}))
 	if err != nil {
 		return nil, err
 	}
