@@ -385,12 +385,17 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 
 		if p.Frontend.Kind != "" {
 			vibeAPI := fmt.Sprintf("http://127.0.0.1:%d/v1", d.cfg.ProxyPort)
-			fr, err = frontend.ActivateWithContext(startCtx, p, profile.ExpandContext{
+			ectx := profile.ExpandContext{
 				VibeAPI:      vibeAPI,
 				ModelAlias:   p.Backend.LlamaServer.Alias,
 				ModelContext: p.Backend.LlamaServer.Context,
 				VibeStateDir: paths.StateHome(),
-			})
+			}
+			if req.Msg.Foreground {
+				fr, err = frontend.ActivateForeground(startCtx, p, ectx)
+			} else {
+				fr, err = frontend.ActivateWithContext(startCtx, p, ectx)
+			}
 			if err != nil {
 				_ = d.sup.Stop(context.Background())
 				d.prx.SetBackend(nil)

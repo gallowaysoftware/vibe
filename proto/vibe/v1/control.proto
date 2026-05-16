@@ -84,6 +84,13 @@ message StartRequest {
   // performs against the profile's estimated_vram_gb. For users who know
   // their setup better than the heuristic.
   bool no_vram_check = 2;
+  // foreground, when true, asks the daemon to render the frontend's config
+  // file and expand its env, but NOT spawn the frontend binary. The caller
+  // (typically `vibe run`) then exec's the binary in its own terminal so
+  // TUI tools like opencode get attached stdio. The daemon ignores this
+  // flag for kind=external (already config-only) and rejects it for
+  // kind=docker-compose (compose is inherently supervised).
+  bool foreground = 3;
 }
 message StartResponse {
   Status status = 1;

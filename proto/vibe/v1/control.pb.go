@@ -486,7 +486,14 @@ type StartRequest struct {
 	// no_vram_check, when true, skips the pre-flight VRAM check the daemon
 	// performs against the profile's estimated_vram_gb. For users who know
 	// their setup better than the heuristic.
-	NoVramCheck   bool `protobuf:"varint,2,opt,name=no_vram_check,json=noVramCheck,proto3" json:"no_vram_check,omitempty"`
+	NoVramCheck bool `protobuf:"varint,2,opt,name=no_vram_check,json=noVramCheck,proto3" json:"no_vram_check,omitempty"`
+	// foreground, when true, asks the daemon to render the frontend's config
+	// file and expand its env, but NOT spawn the frontend binary. The caller
+	// (typically `vibe run`) then exec's the binary in its own terminal so
+	// TUI tools like opencode get attached stdio. The daemon ignores this
+	// flag for kind=external (already config-only) and rejects it for
+	// kind=docker-compose (compose is inherently supervised).
+	Foreground    bool `protobuf:"varint,3,opt,name=foreground,proto3" json:"foreground,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -531,6 +538,13 @@ func (x *StartRequest) GetProfile() string {
 func (x *StartRequest) GetNoVramCheck() bool {
 	if x != nil {
 		return x.NoVramCheck
+	}
+	return false
+}
+
+func (x *StartRequest) GetForeground() bool {
+	if x != nil {
+		return x.Foreground
 	}
 	return false
 }
@@ -970,10 +984,13 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\x06status\x18\x01 \x01(\v2\x0f.vibe.v1.StatusR\x06status\"\x15\n" +
 	"\x13ListProfilesRequest\"D\n" +
 	"\x14ListProfilesResponse\x12,\n" +
-	"\bprofiles\x18\x01 \x03(\v2\x10.vibe.v1.ProfileR\bprofiles\"L\n" +
+	"\bprofiles\x18\x01 \x03(\v2\x10.vibe.v1.ProfileR\bprofiles\"l\n" +
 	"\fStartRequest\x12\x18\n" +
 	"\aprofile\x18\x01 \x01(\tR\aprofile\x12\"\n" +
-	"\rno_vram_check\x18\x02 \x01(\bR\vnoVramCheck\"k\n" +
+	"\rno_vram_check\x18\x02 \x01(\bR\vnoVramCheck\x12\x1e\n" +
+	"\n" +
+	"foreground\x18\x03 \x01(\bR\n" +
+	"foreground\"k\n" +
 	"\rStartResponse\x12'\n" +
 	"\x06status\x18\x01 \x01(\v2\x0f.vibe.v1.StatusR\x06status\x121\n" +
 	"\bfrontend\x18\x02 \x01(\v2\x15.vibe.v1.FrontendInfoR\bfrontend\"\r\n" +

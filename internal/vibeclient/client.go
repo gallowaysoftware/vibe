@@ -153,9 +153,12 @@ func (c *Client) Start(ctx context.Context, profile string) (*StartResult, error
 
 // StartOptions tunes a Start call. NoVRAMCheck bypasses the daemon's
 // pre-flight VRAM check (for users who know their setup better than the
-// heuristic).
+// heuristic). Foreground asks the daemon to render the frontend's config
+// + env but not spawn the binary; used by `vibe run` which exec's the
+// frontend in its own terminal.
 type StartOptions struct {
 	NoVRAMCheck bool
+	Foreground  bool
 }
 
 // StartWithOptions is the same as Start but exposes optional flags. Existing
@@ -165,6 +168,7 @@ func (c *Client) StartWithOptions(ctx context.Context, profile string, opts Star
 	resp, err := c.rpc.Start(ctx, connect.NewRequest(&vibev1.StartRequest{
 		Profile:     profile,
 		NoVramCheck: opts.NoVRAMCheck,
+		Foreground:  opts.Foreground,
 	}))
 	if err != nil {
 		return nil, err

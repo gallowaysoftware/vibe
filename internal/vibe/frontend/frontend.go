@@ -54,12 +54,44 @@ func Activate(p *profile.Profile, ctx profile.ExpandContext) (*Result, error) {
 // ActivateWithContext is like Activate but threads a context through to any
 // underlying long-running operations (compose up + wait_for polling).
 func ActivateWithContext(reqCtx context.Context, p *profile.Profile, ctx profile.ExpandContext) (*Result, error) {
+	return activate(reqCtx, p, ctx, false)
+}
+
+// ActivateForeground is like ActivateWithContext but skips spawning the
+// frontend binary on kind=managed — the config file is still rendered and
+// env expanded. Callers use this when they intend to exec the frontend
+// themselves in their own terminal (`vibe run`). Docker-compose is
+// rejected because compose is inherently supervised. External profiles
+// don't spawn anything anyway, so they pass through unchanged.
+func ActivateForeground(reqCtx context.Context, p *profile.Profile, ctx profile.ExpandContext) (*Result, error) {
+	return activate(reqCtx, p, ctx, true)
+}
+
+func activate(reqCtx context.Context, p *profile.Profile, ctx profile.ExpandContext, foreground bool) (*Result, error) {
 	switch p.Frontend.Kind {
 	case profile.FrontendExternal:
 		return activateExternal(p, ctx)
 	case profile.FrontendDockerCompose:
+		if foreground {
+			return nil, fmt.Errorf("foreground mode is not supported for kind=docker-compose")
+		}
 		return defaultCompose().Activate(reqCtx, p, ctx)
 	case profile.FrontendManaged:
+		if foreground {
+			// Render the config file + env, but don't spawn the binary.
+			// `vibe run` will exec the binary in the caller's terminal so
+			// TUI frontends like opencode get attached stdio.
+			resolved, env, err := writeFrontendConfig(p, &ctx)
+			if err != nil {
+				return nil, err
+			}
+			return &Result{
+				WroteFile:       resolved,
+				RestartRequired: p.Frontend.RestartRequired,
+				Env:             env,
+				Kind:            profile.FrontendManaged,
+			}, nil
+		}
 		return defaultManaged().Activate(reqCtx, p, ctx)
 	default:
 		return nil, fmt.Errorf("frontend.kind %q is not supported yet", p.Frontend.Kind)
