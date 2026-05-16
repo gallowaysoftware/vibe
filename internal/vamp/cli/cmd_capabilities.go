@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -29,7 +30,16 @@ func capabilitiesCmd() *cobra.Command {
 			}
 			sort.Strings(keys)
 			for _, k := range keys {
-				fmt.Printf("%-25s  %s\n", k, caps.Mapping[k])
+				// Resolve through Profiles so both the string-shorthand
+				// and long-form candidates list render the same way. A
+				// single-element list looks like the historical
+				// "<cap>  <profile>" output; longer lists are joined
+				// with a comma so the candidate order is visible.
+				ps, err := caps.Profiles(k)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("%-25s  %s\n", k, strings.Join(ps, ", "))
 			}
 			return nil
 		},

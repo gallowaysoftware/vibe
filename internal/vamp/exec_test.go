@@ -88,7 +88,7 @@ func TestExecutor_SequentialStagesShareOutputs(t *testing.T) {
 	defer srv.Close()
 	stub.proxyURL = srv.URL
 
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	runDir := t.TempDir()
 	pipeline := &Pipeline{
 		Name: "test",
@@ -127,7 +127,7 @@ func TestExecutor_MissingCapabilityErrors(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	exec := &Executor{
 		Pipeline: &Pipeline{
 			Name:   "t",
@@ -202,7 +202,7 @@ func TestExecutor_StreamsTokensToLog(t *testing.T) {
 				{ID: "only", Capability: "reasoning", Prompt: "hi", Output: "only.txt"},
 			},
 		},
-		Capabilities: &Capabilities{Mapping: map[string]string{"reasoning": "code"}},
+		Capabilities: &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}},
 		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client(), ""),
 		RunDir:       runDir,
 		Log:          &logBuf,
@@ -254,7 +254,7 @@ func TestExecutor_JSONOutputFormatRejectsBadJSON(t *testing.T) {
 				{ID: "a", Capability: "r", Prompt: "x", Output: "a.json", OutputFormat: "json"},
 			},
 		},
-		Capabilities: &Capabilities{Mapping: map[string]string{"r": "code"}},
+		Capabilities: &Capabilities{Mapping: map[string]CapabilityBinding{"r": {Profile: "code"}}},
 		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client(), ""),
 		RunDir:       t.TempDir(),
 	}
@@ -303,7 +303,7 @@ func TestExecutor_ParallelStagesSameProfile(t *testing.T) {
 		}
 		return "out:" + prompt, nil
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "parallel",
 		Stages: []Stage{
@@ -360,7 +360,7 @@ func TestExecutor_ParallelGroupedByCapability(t *testing.T) {
 		mu.Unlock()
 		return "ok:" + prompt, nil
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reason": "code", "write": "fast"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reason": {Profile: "code"}, "write": {Profile: "fast"}}}
 	pipeline := &Pipeline{
 		Name: "grouped",
 		Stages: []Stage{
@@ -422,7 +422,7 @@ func TestExecutor_PerStageBufferingInParallel(t *testing.T) {
 		}
 		return "", fmt.Errorf("unexpected prompt %q", prompt)
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	// Both stages must run in the SAME wave (no inputs) and SAME capability
 	// to land in a multi-stage parallel group, which triggers buffering.
 	pipeline := &Pipeline{
@@ -498,7 +498,7 @@ func TestExecutor_DAGErrorAggregation(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		return "", fmt.Errorf("boom from %q", prompt)
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "fail",
 		Stages: []Stage{
@@ -541,7 +541,7 @@ func TestExecutor_ForeachFansOut(t *testing.T) {
 		}
 		return "", fmt.Errorf("unexpected prompt %q", prompt)
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "fan",
 		Stages: []Stage{
@@ -610,7 +610,7 @@ func TestExecutor_ForeachParseError(t *testing.T) {
 		}
 		return "", fmt.Errorf("unexpected prompt %q", prompt)
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "fail",
 		Stages: []Stage{
@@ -653,7 +653,7 @@ func TestExecutor_ForeachSingleItemStaticOutput(t *testing.T) {
 		}
 		return "", fmt.Errorf("unexpected prompt %q", prompt)
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "solo",
 		Stages: []Stage{
@@ -704,7 +704,7 @@ func TestExecutor_ForeachMultiItemStaticOutputRejected(t *testing.T) {
 		t.Errorf("consumer must not run when static-output collision is detected, got prompt %q", prompt)
 		return "", nil
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "static_collide",
 		Stages: []Stage{
@@ -750,7 +750,7 @@ func TestExecutor_ForeachOutputCollision(t *testing.T) {
 		t.Errorf("consumer should not run on collision, but got prompt %q", prompt)
 		return "", nil
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "collide",
 		Stages: []Stage{
@@ -794,7 +794,7 @@ func TestExecutor_ParallelForeach_RunsInParallel(t *testing.T) {
 		}
 		return "", fmt.Errorf("unexpected prompt %q", prompt)
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "par",
 		Stages: []Stage{
@@ -845,7 +845,7 @@ func TestExecutor_ParallelForeach_RespectsCap(t *testing.T) {
 		}
 		return "", fmt.Errorf("unexpected prompt %q", prompt)
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "cap",
 		Stages: []Stage{
@@ -908,7 +908,7 @@ func TestExecutor_ParallelForeach_CancelsSiblings(t *testing.T) {
 		}
 		return "", fmt.Errorf("unexpected prompt %q", prompt)
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "cancel",
 		Stages: []Stage{
@@ -977,7 +977,7 @@ func TestExecutor_ParallelForeach_OutputsInDeclaredOrder(t *testing.T) {
 		}
 		return "", fmt.Errorf("unexpected prompt %q", prompt)
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "order",
 		Stages: []Stage{
@@ -1074,7 +1074,7 @@ func TestExecutor_ResumeSkipsCompletedStages(t *testing.T) {
 		called.Store(prompt, true)
 		return "ran:" + prompt, nil
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 
 	// Set up a run dir that already has stage "one"'s output from a
 	// hypothetical prior run, plus the original pipeline snapshot.
@@ -1136,7 +1136,7 @@ func TestExecutor_ResumeRunsForeachIfAnyItemMissing(t *testing.T) {
 		}
 		return "", fmt.Errorf("unexpected prompt %q", prompt)
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "fan",
 		Stages: []Stage{
@@ -1200,7 +1200,7 @@ func TestExecutor_ResumePipelineChangedRejects(t *testing.T) {
 		t.Errorf("inference should not be called when resume aborts on snapshot mismatch")
 		return "", nil
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	exec, runDir := stubExecutor(t, resumePipeline(), caps, inf)
 	// Snapshot says the run started against version V1; current pipeline
 	// source is V2 (a single extra comment line is enough to change the
@@ -1228,7 +1228,7 @@ func TestExecutor_ResumeForceAllowsChanged(t *testing.T) {
 		called.Store(prompt, true)
 		return "ran:" + prompt, nil
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	exec, runDir := stubExecutor(t, resumePipeline(), caps, inf)
 	// Pre-stage one's output exists; snapshot bytes differ from current
 	// PipelineSource. Without --resume-force this would error.
@@ -1282,7 +1282,7 @@ func TestExecutor_RetriesTransientError(t *testing.T) {
 		}
 		return "ok", nil
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "retry",
 		Stages: []Stage{
@@ -1314,7 +1314,7 @@ func TestExecutor_RespectsMaxAttempts(t *testing.T) {
 		atomic.AddInt32(&attempts, 1)
 		return "", fmt.Errorf("chat completion 502 Bad Gateway: upstream gone")
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "retry_cap",
 		Stages: []Stage{
@@ -1349,7 +1349,7 @@ func TestExecutor_DoesNotRetryUserCancel(t *testing.T) {
 		cancel()
 		return "", ctx.Err()
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "cancel_retry",
 		Stages: []Stage{
@@ -1383,7 +1383,7 @@ func TestExecutor_DoesNotRetryNonTransient(t *testing.T) {
 		// That error has no transient markers, so retry must NOT fire.
 		return "not json", nil
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "non_transient",
 		Stages: []Stage{
@@ -1437,7 +1437,7 @@ func TestExecutor_ForeachPerItemRetry(t *testing.T) {
 		}
 		return "", fmt.Errorf("unexpected prompt %q", prompt)
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "foreach_retry",
 		Stages: []Stage{
@@ -1511,7 +1511,7 @@ func TestExecutor_ExponentialBackoffTiming(t *testing.T) {
 		}
 		return "ok", nil
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "backoff_timing",
 		Stages: []Stage{
@@ -1574,7 +1574,7 @@ func TestExecutor_WritesPipelineJSON(t *testing.T) {
 	defer srv.Close()
 	stub.proxyURL = srv.URL
 
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	runDir := t.TempDir()
 	pipeline := &Pipeline{
 		Name: "metadata-demo",
@@ -1629,7 +1629,7 @@ func TestExecutor_PipelineJSONOnError(t *testing.T) {
 	defer srv.Close()
 	stub.proxyURL = srv.URL
 
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	runDir := t.TempDir()
 	pipeline := &Pipeline{
 		Name: "fail-demo",
@@ -1688,7 +1688,7 @@ func TestExecutor_WritesPipelineTimingJSON(t *testing.T) {
 				{ID: "only", Capability: "reasoning", Prompt: "hi", Output: "only.txt"},
 			},
 		},
-		Capabilities: &Capabilities{Mapping: map[string]string{"reasoning": "code"}},
+		Capabilities: &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}},
 		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client(), ""),
 		RunDir:       runDir,
 		Log:          &logBuf,
@@ -1741,7 +1741,7 @@ func TestExecutor_RunWhenFailureFiresOnError(t *testing.T) {
 		}
 		return "", fmt.Errorf("unexpected prompt %q", prompt)
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "runwhen_failure",
 		Stages: []Stage{
@@ -1789,7 +1789,7 @@ func TestExecutor_RunWhenFailureSkippedOnSuccess(t *testing.T) {
 		}
 		return "ok", nil
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "runwhen_failure_skip",
 		Stages: []Stage{
@@ -1827,7 +1827,7 @@ func TestExecutor_RunWhenAlwaysFiresOnSuccess(t *testing.T) {
 		}
 		return "ok", nil
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "runwhen_always_success",
 		Stages: []Stage{
@@ -1875,7 +1875,7 @@ func TestExecutor_RunWhenAlwaysFiresOnFailure(t *testing.T) {
 		}
 		return "ok", nil
 	}
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "runwhen_always_failure",
 		Stages: []Stage{
@@ -1906,4 +1906,236 @@ func TestExecutor_RunWhenAlwaysFiresOnFailure(t *testing.T) {
 	if !strings.Contains(cleanupPrompt, "summary=work: ") {
 		t.Errorf("cleanup prompt missing failure_summary referencing work: %q", cleanupPrompt)
 	}
+}
+
+// vramFallbackControl is a ControlServiceHandler tuned for the candidate
+// fallback test. It rejects Start for any profile whose name appears in
+// rejectProfiles with the daemon's well-known VRAM precondition error;
+// other profiles succeed. Records every Start call so the test can verify
+// the executor walked the candidate list in order.
+type vramFallbackControl struct {
+	mu              sync.Mutex
+	profile         string
+	proxyURL        string
+	rejectProfiles  map[string]bool
+	startedProfiles []string
+}
+
+func (s *vramFallbackControl) Status(_ context.Context, _ *connect.Request[vibev1.StatusRequest]) (*connect.Response[vibev1.StatusResponse], error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return connect.NewResponse(&vibev1.StatusResponse{Status: &vibev1.Status{
+		Running: s.profile != "", Ready: s.profile != "", Profile: s.profile, ProxyAddr: s.proxyURL,
+	}}), nil
+}
+func (s *vramFallbackControl) Start(_ context.Context, req *connect.Request[vibev1.StartRequest]) (*connect.Response[vibev1.StartResponse], error) {
+	s.mu.Lock()
+	s.startedProfiles = append(s.startedProfiles, req.Msg.Profile)
+	reject := s.rejectProfiles[req.Msg.Profile]
+	if !reject {
+		s.profile = req.Msg.Profile
+	}
+	s.mu.Unlock()
+	if reject {
+		// Mirror the daemon's pre-flight VRAM rejection: same code
+		// (FailedPrecondition) and the "free VRAM" substring that
+		// vibeclient.IsVRAMRejection looks for.
+		return nil, connect.NewError(
+			connect.CodeFailedPrecondition,
+			fmt.Errorf(`profile %q needs ~24.0 GiB free VRAM but only 8.0 GiB is free`, req.Msg.Profile),
+		)
+	}
+	r, _ := s.Status(nil, nil)
+	return connect.NewResponse(&vibev1.StartResponse{Status: r.Msg.Status}), nil
+}
+func (s *vramFallbackControl) Stop(_ context.Context, _ *connect.Request[vibev1.StopRequest]) (*connect.Response[vibev1.StopResponse], error) {
+	s.mu.Lock()
+	s.profile = ""
+	s.mu.Unlock()
+	return connect.NewResponse(&vibev1.StopResponse{Status: &vibev1.Status{}}), nil
+}
+func (s *vramFallbackControl) ListProfiles(context.Context, *connect.Request[vibev1.ListProfilesRequest]) (*connect.Response[vibev1.ListProfilesResponse], error) {
+	return connect.NewResponse(&vibev1.ListProfilesResponse{}), nil
+}
+func (s *vramFallbackControl) Shutdown(context.Context, *connect.Request[vibev1.ShutdownRequest]) (*connect.Response[vibev1.ShutdownResponse], error) {
+	return connect.NewResponse(&vibev1.ShutdownResponse{}), nil
+}
+func (s *vramFallbackControl) Logs(context.Context, *connect.Request[vibev1.LogsRequest]) (*connect.Response[vibev1.LogsResponse], error) {
+	return connect.NewResponse(&vibev1.LogsResponse{}), nil
+}
+func (s *vramFallbackControl) Pull(_ context.Context, _ *connect.Request[vibev1.PullRequest], stream *connect.ServerStream[vibev1.PullProgress]) error {
+	return stream.Send(&vibev1.PullProgress{Phase: vibev1.PullProgress_PHASE_DONE})
+}
+
+// TestExecutor_VRAMFallbackPicksNextCandidate runs the executor against a
+// capability with two candidates [code, code_small]. The daemon rejects the
+// first with the well-known VRAM FailedPrecondition error; the second
+// succeeds. The executor must:
+//  1. attempt candidate 1, see the VRAM rejection,
+//  2. fall back to candidate 2 (the smaller fit) and activate it,
+//  3. write a "skipping <candidate>" line to the run log so the operator
+//     can tell from after-the-fact log inspection that fallback fired.
+func TestExecutor_VRAMFallbackPicksNextCandidate(t *testing.T) {
+	stub := &vramFallbackControl{rejectProfiles: map[string]bool{"code": true}}
+	mux := http.NewServeMux()
+	path, handler := vibev1connect.NewControlServiceHandler(stub)
+	mux.Handle(path, handler)
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]string{{"id": "stub-model"}}})
+	})
+	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]string{"content": "ok"}}},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	stub.proxyURL = srv.URL
+
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{
+		"reasoning": {Candidates: []string{"code", "code_small"}},
+	}}
+	pipeline := &Pipeline{
+		Name: "vram-fallback",
+		Stages: []Stage{
+			{ID: "plan", Capability: "reasoning", Prompt: "hi", Output: "plan.txt"},
+		},
+	}
+	var logBuf bytes.Buffer
+	exec := &Executor{
+		Pipeline:     pipeline,
+		Capabilities: caps,
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client(), ""),
+		RunDir:       t.TempDir(),
+		Log:          &logBuf,
+	}
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Both candidates should have been attempted, in order.
+	stub.mu.Lock()
+	started := append([]string(nil), stub.startedProfiles...)
+	stub.mu.Unlock()
+	if len(started) != 2 || started[0] != "code" || started[1] != "code_small" {
+		t.Errorf("startedProfiles = %v, want [code code_small]", started)
+	}
+
+	// And the log must record the fallback in human-readable form so
+	// after-the-fact debugging shows why we landed on candidate 2.
+	logTxt := logBuf.String()
+	if !strings.Contains(logTxt, `skipping "code"`) {
+		t.Errorf("log missing skip notice for 'code': %s", logTxt)
+	}
+	if !strings.Contains(logTxt, "free VRAM") {
+		t.Errorf("log missing VRAM reason from the daemon: %s", logTxt)
+	}
+	if !strings.Contains(logTxt, `activating profile "code_small"`) {
+		t.Errorf("log missing activation notice for 'code_small': %s", logTxt)
+	}
+}
+
+// TestExecutor_VRAMFallbackAllCandidatesFail confirms that when EVERY
+// candidate VRAM-rejects, the executor surfaces the last error (so the
+// operator sees a real "needs N GiB" message) rather than silently
+// proceeding with no active profile.
+func TestExecutor_VRAMFallbackAllCandidatesFail(t *testing.T) {
+	stub := &vramFallbackControl{rejectProfiles: map[string]bool{"code": true, "code_small": true}}
+	mux := http.NewServeMux()
+	path, handler := vibev1connect.NewControlServiceHandler(stub)
+	mux.Handle(path, handler)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	stub.proxyURL = srv.URL
+
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{
+		"reasoning": {Candidates: []string{"code", "code_small"}},
+	}}
+	pipeline := &Pipeline{
+		Name: "vram-all-fail",
+		Stages: []Stage{
+			{ID: "plan", Capability: "reasoning", Prompt: "hi", Output: "plan.txt"},
+		},
+	}
+	exec := &Executor{
+		Pipeline:     pipeline,
+		Capabilities: caps,
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client(), ""),
+		RunDir:       t.TempDir(),
+	}
+	err := exec.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected error when all candidates VRAM-reject")
+	}
+	if !strings.Contains(err.Error(), "free VRAM") {
+		t.Errorf("err = %v, want a 'free VRAM' message from the daemon", err)
+	}
+}
+
+// TestExecutor_VRAMFallbackAbortsOnNonVRAMError asserts that a
+// non-VRAM-rejection error from the daemon stops the candidate walk
+// immediately. If we kept retrying past genuine failures we'd mask real
+// problems (auth errors, profile-not-found, etc.) behind a fallback
+// chain.
+func TestExecutor_VRAMFallbackAbortsOnNonVRAMError(t *testing.T) {
+	// custom handler that returns a non-VRAM FailedPrecondition for the
+	// first candidate, so the executor must NOT fall back.
+	stub := &vramFallbackControl{rejectProfiles: map[string]bool{}}
+	mux := http.NewServeMux()
+	path, handler := vibev1connect.NewControlServiceHandler(&abortControl{inner: stub})
+	mux.Handle(path, handler)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	stub.proxyURL = srv.URL
+
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{
+		"reasoning": {Candidates: []string{"code", "code_small"}},
+	}}
+	pipeline := &Pipeline{
+		Name: "vram-abort",
+		Stages: []Stage{
+			{ID: "plan", Capability: "reasoning", Prompt: "hi", Output: "plan.txt"},
+		},
+	}
+	exec := &Executor{
+		Pipeline:     pipeline,
+		Capabilities: caps,
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client(), ""),
+		RunDir:       t.TempDir(),
+	}
+	err := exec.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected error on non-VRAM activation failure")
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Errorf("err = %v, want the upstream 'boom' message", err)
+	}
+}
+
+// abortControl wraps a vramFallbackControl but always fails Start with a
+// non-VRAM error. Used by TestExecutor_VRAMFallbackAbortsOnNonVRAMError.
+type abortControl struct {
+	inner *vramFallbackControl
+}
+
+func (a *abortControl) Status(ctx context.Context, req *connect.Request[vibev1.StatusRequest]) (*connect.Response[vibev1.StatusResponse], error) {
+	return a.inner.Status(ctx, req)
+}
+func (a *abortControl) Start(_ context.Context, _ *connect.Request[vibev1.StartRequest]) (*connect.Response[vibev1.StartResponse], error) {
+	return nil, connect.NewError(connect.CodeInternal, errors.New("boom"))
+}
+func (a *abortControl) Stop(ctx context.Context, req *connect.Request[vibev1.StopRequest]) (*connect.Response[vibev1.StopResponse], error) {
+	return a.inner.Stop(ctx, req)
+}
+func (a *abortControl) ListProfiles(ctx context.Context, req *connect.Request[vibev1.ListProfilesRequest]) (*connect.Response[vibev1.ListProfilesResponse], error) {
+	return a.inner.ListProfiles(ctx, req)
+}
+func (a *abortControl) Shutdown(ctx context.Context, req *connect.Request[vibev1.ShutdownRequest]) (*connect.Response[vibev1.ShutdownResponse], error) {
+	return a.inner.Shutdown(ctx, req)
+}
+func (a *abortControl) Logs(ctx context.Context, req *connect.Request[vibev1.LogsRequest]) (*connect.Response[vibev1.LogsResponse], error) {
+	return a.inner.Logs(ctx, req)
+}
+func (a *abortControl) Pull(ctx context.Context, req *connect.Request[vibev1.PullRequest], stream *connect.ServerStream[vibev1.PullProgress]) error {
+	return a.inner.Pull(ctx, req, stream)
 }

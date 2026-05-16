@@ -5,6 +5,7 @@ package vibeclient
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -210,6 +211,30 @@ func (c *Client) Pull(ctx context.Context, profile string) (*PullStream, error) 
 		return nil, err
 	}
 	return &PullStream{s: stream}, nil
+}
+
+// IsVRAMRejection reports whether err is the daemon's pre-flight VRAM
+// rejection (i.e. "this profile needs more VRAM than is currently free").
+//
+// We identify it by the Connect status code AND a substring match on the
+// daemon's well-known message body. The dual check keeps unrelated
+// FailedPrecondition errors (e.g. "no profile is active") from being
+// misclassified as VRAM rejections, which would otherwise cause vamp's
+// candidate-fallback loop to swallow legitimate errors. We control both
+// ends of the wire so a string match is acceptable; if the daemon message
+// changes, IsVRAMRejection moves in lockstep.
+func IsVRAMRejection(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ce *connect.Error
+	if !errors.As(err, &ce) {
+		return false
+	}
+	if ce.Code() != connect.CodeFailedPrecondition {
+		return false
+	}
+	return strings.Contains(ce.Message(), "free VRAM")
 }
 
 // EnsureActive returns immediately if `profile` is already the active, ready

@@ -126,9 +126,13 @@ webhook URL.
 
 ## Larger nice-to-haves still on the radar
 
-- VRAM-aware *scheduling* (today's pre-flight rejects when free VRAM is
+- ~~VRAM-aware *scheduling* (today's pre-flight rejects when free VRAM is
   insufficient for the chosen profile; smarter scheduling could pick a
-  smaller capable profile that fits the budget).
+  smaller capable profile that fits the budget).~~ Done — capabilities can
+  now bind to a `candidates: [biggest, ..., smallest]` list (see the
+  README's "Capabilities" section). When the daemon rejects the first
+  candidate with the pre-flight VRAM precondition error, vamp falls back
+  to the next candidate and logs the skip.
 - vamp daemon mode: background runs with job IDs, `vamp logs <id>` to
   follow live, `vamp jobs ls` for the queue.
 - Per-foreach-item resume (today resume granularity is whole-stage; a

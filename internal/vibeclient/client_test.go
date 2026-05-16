@@ -3,6 +3,7 @@ package vibeclient
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -284,6 +285,70 @@ func TestClient_NoTokenMeansNoHeader(t *testing.T) {
 	_, _ = c.Status(context.Background())
 	if gotAuth != "" {
 		t.Errorf("Authorization = %q, want empty", gotAuth)
+	}
+}
+
+// TestIsVRAMRejection covers the heuristic vamp uses to tell a VRAM
+// pre-flight rejection apart from any other FailedPrecondition (e.g. "no
+// profile is active"). The dual check (code + message substring) is
+// deliberate: vamp will only fall back to a smaller candidate on a true
+// VRAM rejection, so this matcher decides whether a candidate gets
+// skipped or the whole pipeline aborts.
+func TestIsVRAMRejection(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "nil",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "real VRAM rejection",
+			err: connect.NewError(
+				connect.CodeFailedPrecondition,
+				errors.New(`profile "code" needs ~24.0 GiB free VRAM but only 8.0 GiB is free.`),
+			),
+			want: true,
+		},
+		{
+			name: "FailedPrecondition but unrelated message",
+			err: connect.NewError(
+				connect.CodeFailedPrecondition,
+				errors.New("no profile is active"),
+			),
+			want: false,
+		},
+		{
+			name: "right message wrong code",
+			err: connect.NewError(
+				connect.CodeInternal,
+				errors.New("free VRAM probe failed"),
+			),
+			want: false,
+		},
+		{
+			name: "wrapped connect error",
+			err: fmt.Errorf("activate: %w", connect.NewError(
+				connect.CodeFailedPrecondition,
+				errors.New(`needs 24.0 GiB free VRAM`),
+			)),
+			want: true,
+		},
+		{
+			name: "plain error",
+			err:  errors.New("free VRAM"),
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsVRAMRejection(tc.err); got != tc.want {
+				t.Errorf("IsVRAMRejection(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }
 
