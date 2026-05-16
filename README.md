@@ -214,6 +214,7 @@ authed (gated by filesystem perms instead). If the token leaks, run
 | Profile | What it shows |
 | --- | --- |
 | [`chat-with-search`](examples/profiles/chat-with-search/) | Local LLM + Open WebUI + SearXNG sidecar for web search + Tier-1 RAG (BGE-M3 + reranker + hybrid). Copy-and-adapt. |
+| [`rag-with-qdrant`](examples/profiles/rag-with-qdrant/) | Tier-2 RAG: local LLM + Open WebUI + TEI (BGE-M3) + Qdrant. Dedicated embedding service + observable vector store. |
 
 `vamp` pipelines under `examples/`:
 

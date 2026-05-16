@@ -240,6 +240,21 @@ func TestCheckProxyPort_DaemonHoldsIt(t *testing.T) {
 	}
 }
 
+// TestCheckCommonPorts_Smoke verifies the check runs without error and
+// returns one of the expected status/message shapes. We can't dictate
+// what's bound on the test runner so we accept both "all free" and
+// "in use" outputs; the test catches structural regressions only
+// (wrong Name field, panic, non-info-or-ok status).
+func TestCheckCommonPorts_Smoke(t *testing.T) {
+	r := checkCommonPorts()
+	if r.Name != "common ports" {
+		t.Errorf("Name = %q, want 'common ports'", r.Name)
+	}
+	if r.Status != statusOK && r.Status != statusInfo {
+		t.Errorf("Status = %v, want OK or INFO (got message: %q)", r.Status, r.Message)
+	}
+}
+
 func TestIsAddrInUse(t *testing.T) {
 	if isAddrInUse(nil) {
 		t.Fatal("nil should not be addr-in-use")

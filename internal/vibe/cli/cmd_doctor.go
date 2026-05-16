@@ -220,6 +220,7 @@ func runChecks(ctx context.Context, env *doctorEnv) []checkResult {
 
 	results = append(results, checkProfiles())
 	results = append(results, checkFrontendState())
+	results = append(results, checkCommonPorts())
 	results = append(results, checkMCPs())
 
 	if st.daemonOnControl {
@@ -440,6 +441,46 @@ func checkProxyPort(ctx context.Context, env *doctorEnv, daemonOnControl bool) c
 		Name:    name,
 		Status:  statusFail,
 		Message: "in use by another process (no vibe daemon detected on :9001)",
+	}
+}
+
+// checkCommonPorts probes the loopback ports that AI-stack frontends
+// typically claim (Open WebUI, SearXNG, TEI, Qdrant) and reports any
+// that are already bound. Bound != bad — the bind could be one of
+// vibe's own frontends still running from a previous session, or some
+// unrelated service. Goal is just to make conflicts visible BEFORE a
+// `vibe start` runs into them. The 9000/9001 checks above cover the
+// vibe-owned ports specifically; this check covers the next tier.
+//
+// Adding a new port here is harmless: extra INFO output, no
+// behavioral consequence.
+func checkCommonPorts() checkResult {
+	const name = "common ports"
+	type p struct {
+		port int
+		role string
+	}
+	probes := []p{
+		{8080, "Open WebUI"},
+		{8081, "TEI embeddings"},
+		{8888, "SearXNG"},
+		{6333, "Qdrant REST"},
+		{6334, "Qdrant gRPC"},
+	}
+	var bound []string
+	for _, pr := range probes {
+		free, _ := tryBind(fmt.Sprintf("127.0.0.1:%d", pr.port))
+		if !free {
+			bound = append(bound, fmt.Sprintf(":%d (%s)", pr.port, pr.role))
+		}
+	}
+	if len(bound) == 0 {
+		return checkResult{Name: name, Status: statusOK, Message: "8080/8081/8888/6333/6334 free"}
+	}
+	return checkResult{
+		Name:    name,
+		Status:  statusInfo,
+		Message: "in use: " + strings.Join(bound, ", "),
 	}
 }
 

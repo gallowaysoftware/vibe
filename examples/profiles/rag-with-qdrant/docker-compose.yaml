@@ -1,0 +1,86 @@
+# Tier-2 RAG stack: Open WebUI + dedicated embedding service (TEI)
+# + Qdrant.
+#
+# Why three containers instead of letting Open WebUI handle everything
+# in-process (Tier 1 / chat-with-search):
+#   - TEI is HuggingFace's purpose-built embedding server. Faster
+#     than SentenceTransformers in-process, OpenAI-compatible API,
+#     supports BGE-M3 natively. CPU here so the GPU stays dedicated
+#     to the chat model; for ~10x throughput swap the image to
+#     ghcr.io/huggingface/text-embeddings-inference:cuda-1.9 and add
+#     the nvidia runtime — BGE-M3 only needs ~1.2 GB of VRAM.
+#   - Qdrant scales further than the in-process ChromaDB once you
+#     have more than a few thousand chunks, and gives a real query
+#     API for inspection.
+#
+# `network_mode: host` shares the user's network namespace with the
+# containers so they reach each other (and vibe's :9000 proxy)
+# through 127.0.0.1.
+#
+# Port layout:
+#   :9000  vibe OpenAI-compat proxy (chat LLM)  ← vibe owns
+#   :9001  vibe control plane                   ← vibe owns
+#   :8080  Open WebUI                           ← this stack
+#   :8081  TEI (embeddings, OpenAI-compat)      ← this stack
+#   :6333  Qdrant REST                          ← this stack
+#   :6334  Qdrant gRPC                          ← this stack
+#   :9100  TEI Prometheus (relocated; default :9000 collides with
+#          vibe's proxy)                        ← this stack
+
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: vibe-rag-webui
+    network_mode: host
+    environment:
+      - OPENAI_API_BASE_URL=http://127.0.0.1:9000/v1
+      - OPENAI_API_KEY=vibe-local
+      - WEBUI_AUTH=False
+      - ENABLE_OLLAMA_API=False
+      - PORT=8080
+      # Vector store → Qdrant container below.
+      - VECTOR_DB=qdrant
+      - QDRANT_URI=http://127.0.0.1:6333
+      # Embeddings → TEI container below (OpenAI-compatible endpoint).
+      - RAG_EMBEDDING_ENGINE=openai
+      - RAG_OPENAI_API_BASE_URL=http://127.0.0.1:8081/v1
+      - RAG_OPENAI_API_KEY=any
+      - RAG_EMBEDDING_MODEL=BAAI/bge-m3
+      # Reranker stays in-process (SentenceTransformers): ~600 MB,
+      # reranks ~50 docs in <1 s on CPU, not worth a fourth container.
+      - ENABLE_RAG_HYBRID_SEARCH=True
+      - RAG_RERANKING_MODEL=BAAI/bge-reranker-v2-m3
+      - CHUNK_SIZE=1000
+      - CHUNK_OVERLAP=200
+      - RAG_TOP_K=5
+    volumes:
+      - ${VIBE_FRONTEND_STATE}/webui:/app/backend/data
+    restart: unless-stopped
+    depends_on:
+      - tei
+      - qdrant
+
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    container_name: vibe-rag-tei
+    network_mode: host
+    command:
+      - --model-id=BAAI/bge-m3
+      - --port=8081
+      # GOTCHA: TEI's Prometheus metrics endpoint defaults to :9000,
+      # which collides with vibe's OpenAI-compat proxy. Without this
+      # override TEI crash-loops on "Address already in use" and never
+      # binds :8081 — wait_for times out and the stack tears down.
+      # The metrics port is rarely scraped; pick anything free.
+      - --prometheus-port=9100
+    volumes:
+      - ${VIBE_FRONTEND_STATE}/tei-cache:/data
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: vibe-rag-qdrant
+    network_mode: host
+    volumes:
+      - ${VIBE_FRONTEND_STATE}/qdrant:/qdrant/storage
+    restart: unless-stopped

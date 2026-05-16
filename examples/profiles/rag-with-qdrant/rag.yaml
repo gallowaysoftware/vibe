@@ -1,0 +1,62 @@
+# Example: rag profile with Open WebUI + TEI (BGE-M3) + Qdrant.
+#
+# When to pick this over chat-with-search:
+#   - Indexing thousands of documents and want the lower-latency
+#     external embedding service (TEI on CPU is faster + more parallel
+#     than Open WebUI's in-process SentenceTransformers; TEI on GPU is
+#     another order of magnitude on top of that).
+#   - Want vector observability — curl http://127.0.0.1:6333/collections
+#     to inspect Qdrant directly, dump backups via Qdrant snapshots.
+#   - Want to share the same vector store across multiple frontends or
+#     embedding experiments later.
+# Otherwise chat-with-search (Tier 1, in-process Chroma) is fine.
+#
+# Three containers come up under one profile: Open WebUI, TEI, Qdrant.
+# State paths bind-mount to $XDG_STATE_HOME/vibe/frontend/rag/.
+
+name: rag
+description: RAG-equipped chat — local LLM + Open WebUI + TEI (BGE-M3) + Qdrant.
+
+backend:
+  llama_server:
+    # REPLACE: absolute or ~/-prefixed path to your GGUF model.
+    path: ~/models/qwen3-32b-gguf/Qwen3-32B-Q5_K_M.gguf
+    # REPLACE: HF repo + file so `vibe pull rag` can fetch the
+    # weights on first start.
+    huggingface:
+      repo: unsloth/Qwen3-32B-GGUF
+      file: Qwen3-32B-Q5_K_M.gguf
+    alias: qwen3-32b-q5km
+    context: 32768
+    parallel: 1
+    gpu_layers: 999
+    flash_attn: true
+    cache_type_k: q8_0
+    cache_type_v: q8_0
+    jinja: true
+
+frontend:
+  kind: docker-compose
+  app: open-webui
+  # REPLACE: absolute path to where you dropped the docker-compose.yaml.
+  compose_file: ~/.config/vibe/compose/rag/docker-compose.yaml
+  project_name: vibe-rag
+  env:
+    # Passed through to compose's process env. ${VIBE_STATE_DIR} is
+    # expanded by vibe itself (resolves to $XDG_STATE_HOME/vibe).
+    VIBE_FRONTEND_STATE: ${VIBE_STATE_DIR}/frontend/rag
+  wait_for:
+    # Qdrant comes up fast. TEI has to download BGE-M3 weights
+    # (~2.3 GB) on first start and then warm up the ONNX backend on
+    # CPU (~30-60 s). Open WebUI waits on neither but its own boot is
+    # ~30 s. Generous timeouts for cold runs; subsequent starts are
+    # under 10 s end-to-end.
+    - url: http://127.0.0.1:6333/readyz
+      timeout: 60s
+    - url: http://127.0.0.1:8081/health
+      timeout: 600s
+    - url: http://127.0.0.1:8080/
+      timeout: 180s
+
+# REPLACE: approximate VRAM the loaded model needs.
+estimated_vram_gb: 28
