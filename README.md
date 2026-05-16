@@ -2,6 +2,17 @@
 
 ![CI](https://github.com/gallowaysoftware/vibe/actions/workflows/ci.yml/badge.svg)
 
+## Quick install
+
+```
+curl -sSL https://raw.githubusercontent.com/gallowaysoftware/vibe/main/install.sh | sh
+```
+
+This drops `vibe` and `vamp` in `~/.local/bin/` and runs `vibe doctor`.
+Pin a version with `VIBE_VERSION=v1.2.3` or change the destination with
+`INSTALL_DIR=/some/other/path`. Pass `--dry-run` to preview without
+downloading.
+
 A task-oriented launcher for local AI inference. Think `docker compose` for local AI workflows: define a profile that bundles a model configuration with a frontend, and one command brings up everything for a task.
 
 ```
