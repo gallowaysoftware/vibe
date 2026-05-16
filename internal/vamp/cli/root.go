@@ -19,6 +19,7 @@ func rootCmd() *cobra.Command {
 		listCmd(),
 		capabilitiesCmd(),
 		runsCmd(),
+		vizCmd(),
 	)
 	return root
 }
