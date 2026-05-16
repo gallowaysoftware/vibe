@@ -47,8 +47,14 @@ type schemaProperty struct {
 // trips the generated schema and re-validates the example pipelines against
 // it so the two stay in sync.
 func Schema() *schemaProperty {
-	stageTypeEnum := []any{"", "text", "comfyui", "audio", "ffmpeg", "youtube", "webhook"}
+	stageTypeEnum := []any{"", "text", "comfyui", "audio", "ffmpeg", "youtube", "webhook", "confirm"}
+	// runWhenEnum captures the keyword forms only; template-form run_when
+	// values can be any Go text/template expression and are validated at
+	// LoadPipeline time. Leaving the field as `type: string` (no enum
+	// constraint) on the actual schema property accommodates both shapes
+	// while keeping the keyword set discoverable for editor autocomplete.
 	runWhenEnum := []any{"", RunWhenSuccess, RunWhenFailure, RunWhenAlways}
+	_ = runWhenEnum
 	httpMethodEnum := []any{"", "GET", "POST", "PUT", "PATCH", "DELETE"}
 	privacyEnum := []any{"", "private", "unlisted", "public"}
 	retryOnEnum := []any{retryOnTransient, retryOnTimeout}
@@ -275,14 +281,18 @@ func Schema() *schemaProperty {
 			"retry": retryPolicy,
 			"run_when": {
 				Type:        "string",
-				Enum:        runWhenEnum,
-				Description: "Gate the stage on prior outcome: success (default), failure, or always.",
+				Description: "Gate the stage. Reserved keywords success (default) / failure / always inspect upstream status; any other value is a Go text/template expression that must render to one of true/yes/1 (run) or false/no/0/\"\" (skip).",
 				Default:     RunWhenSuccess,
 			},
 			"cache": {
 				Type:        "boolean",
 				Description: "Per-stage opt-out: explicit false disables the content-addressed cache for this stage; absent inherits the pipeline default.",
 			},
+			"message": {
+				Type:        "string",
+				Description: "Approval prompt rendered to the operator (confirm stages).",
+			},
+			"timeout": durationSchema,
 		},
 	}
 

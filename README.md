@@ -90,7 +90,10 @@ on the fly. A foreach stage forks one task per item in a JSON array and
 runs them in parallel up to a configurable cap. Per-stage retry with
 exponential backoff handles transient errors; `run_when:
 success|failure|always` gives you try/finally semantics for cleanup and
-failure-path notifications.
+failure-path notifications, and a template-form `run_when:
+'{{ contains .stages.cover.output "rainy" }}'` makes stages conditional
+on upstream content (renders to one of true/yes/1 or false/no/0/"" —
+anything else is a pipeline error).
 
 | Stage type | What it does |
 | --- | --- |
@@ -100,6 +103,7 @@ failure-path notifications.
 | `ffmpeg`  | Shells out to `ffmpeg` with templated args; tail-rings stderr for diagnostics. |
 | `youtube` | Uploads a finished video via the YouTube Data API (OAuth token cache under XDG). |
 | `webhook` | Slack/Discord/Mattermost-style JSON POST. Honors `run_when: failure` so a failed pipeline still pings. |
+| `confirm` | Human-in-the-loop gate: prompts on stdin (TTY) or writes a marker file the operator clears with `vamp confirm <run-dir> <stage-id> [--reject]` (detach mode). Optional `timeout: 30m` auto-rejects. |
 
 **Resumes.** `vamp run --resume <run-dir>` re-uses outputs already on
 disk, including per-foreach-item granularity (a failed item in an

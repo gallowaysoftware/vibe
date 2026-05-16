@@ -192,6 +192,18 @@ func (s *dryRunState) formatStageHeader(st *Stage, stageType StageType, idx, tot
 			fmt.Fprintf(&b, ", foreach over %s", st.Foreach.From)
 		}
 		b.WriteString(")")
+	case StageTypeWebhook:
+		b.WriteString(" (network: webhook")
+		if st.Foreach != nil {
+			fmt.Fprintf(&b, ", foreach over %s", st.Foreach.From)
+		}
+		b.WriteString(")")
+	case StageTypeConfirm:
+		b.WriteString(" (human-in-the-loop: confirm")
+		if st.Timeout > 0 {
+			fmt.Fprintf(&b, ", timeout %s", st.Timeout)
+		}
+		b.WriteString(")")
 	default:
 		return b.String(), fmt.Errorf("stage %s: unknown stage type %q", st.ID, stageType)
 	}
@@ -411,6 +423,16 @@ func (s *dryRunState) dryRunRenderPerType(st *Stage, stageType StageType, prior 
 		if _, err := exec.LookPath(binary); err != nil {
 			s.warnings++
 			s.executor.dryRunLogf("%s  warning: ffmpeg binary %q not on PATH", indent, binary)
+		}
+	case StageTypeConfirm:
+		message, err := renderTemplate(st.ID+":message", st.Message, st.Inputs, s.executor.Inputs, prior, s.executor.RunDir, extra)
+		if err != nil {
+			return fmt.Errorf("stage %s: render message: %w", st.ID, err)
+		}
+		s.executor.dryRunLogf("%smessage (%d chars):", indent, len(message))
+		s.dryRunWriteIndented(indent+"  ", message)
+		if st.Timeout > 0 {
+			s.executor.dryRunLogf("%stimeout: %s", indent, st.Timeout)
 		}
 	case StageTypeYouTube:
 		title, err := renderTemplate(st.ID+":title", st.Title, st.Inputs, s.executor.Inputs, prior, s.executor.RunDir, extra)

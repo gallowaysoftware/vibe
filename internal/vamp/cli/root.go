@@ -28,13 +28,11 @@ func rootCmd() *cobra.Command {
 		jobsCmd(),
 		logsCmd(),
 		cancelCmd(),
+		confirmCmd(),
 		vizCmd(),
 		schemaCmd(),
-<<<<<<< HEAD
 		diffCmd(),
-=======
 		cacheCmd(),
->>>>>>> feat/content-cache
 	)
 	return root
 }

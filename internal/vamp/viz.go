@@ -32,6 +32,7 @@ var stageStyleByType = map[StageType]stageTypeStyle{
 	StageTypeFFmpeg:  {class: "ffmpeg", fill: "#cfe9cf"},
 	StageTypeYouTube: {class: "youtube", fill: "#f5c2c7"},
 	StageTypeWebhook: {class: "webhook", fill: "#dcdcdc"},
+	StageTypeConfirm: {class: "confirm", fill: "#fff3cd"},
 }
 
 // stageStyleOrder is the canonical class-definition emission order so the
@@ -45,6 +46,7 @@ var stageStyleOrder = []StageType{
 	StageTypeFFmpeg,
 	StageTypeYouTube,
 	StageTypeWebhook,
+	StageTypeConfirm,
 }
 
 // RenderMermaid emits a `flowchart TD` description of the pipeline's stage

@@ -2136,6 +2136,131 @@ func TestExecutor_RunWhenAlwaysFiresOnFailure(t *testing.T) {
 	}
 }
 
+// TestRunWhen_TemplateTrue verifies that a stage whose run_when renders
+// to "true" executes normally. The downstream stage references the
+// upstream's output to confirm it actually ran (vs. being silently
+// skipped by an over-eager template gate).
+func TestRunWhen_TemplateTrue(t *testing.T) {
+	var downstreamCalled atomic.Bool
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		if strings.HasPrefix(prompt, "DOWN") {
+			downstreamCalled.Store(true)
+			return "down", nil
+		}
+		return "rainy", nil
+	}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
+	pipeline := &Pipeline{
+		Name: "runwhen_template_true",
+		Stages: []Stage{
+			{ID: "cover", Capability: "reasoning", Prompt: "cover", Output: "cover.txt"},
+			{ID: "shoot", Capability: "reasoning", Prompt: "DOWN",
+				Inputs:  []string{"cover"},
+				Output:  "shoot.txt",
+				RunWhen: `{{ contains .stages.cover.output "rainy" }}`,
+			},
+		},
+	}
+	// Validate explicitly so we exercise the LoadPipeline-time parse check
+	// on the template form.
+	if err := pipeline.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !downstreamCalled.Load() {
+		t.Fatal("downstream stage with template run_when=true did not run")
+	}
+}
+
+// TestRunWhen_TemplateFalse verifies that a stage whose run_when renders
+// to "false" is skipped. Output file should never be written.
+func TestRunWhen_TemplateFalse(t *testing.T) {
+	var downstreamCalled atomic.Bool
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		if strings.HasPrefix(prompt, "DOWN") {
+			downstreamCalled.Store(true)
+			return "down", nil
+		}
+		return "sunny", nil
+	}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
+	pipeline := &Pipeline{
+		Name: "runwhen_template_false",
+		Stages: []Stage{
+			{ID: "cover", Capability: "reasoning", Prompt: "cover", Output: "cover.txt"},
+			{ID: "shoot", Capability: "reasoning", Prompt: "DOWN",
+				Inputs:  []string{"cover"},
+				Output:  "shoot.txt",
+				RunWhen: `{{ contains .stages.cover.output "rainy" }}`,
+			},
+		},
+	}
+	if err := pipeline.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	exec, runDir := stubExecutor(t, pipeline, caps, inf)
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if downstreamCalled.Load() {
+		t.Fatal("downstream stage with template run_when=false should not have run")
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "shoot.txt")); !os.IsNotExist(err) {
+		t.Errorf("shoot.txt should not exist (err=%v)", err)
+	}
+}
+
+// TestRunWhen_TemplateBadShape verifies that a template whose rendered
+// output is not in the accepted true/false set surfaces as a pipeline
+// error naming the stage and the rendered value.
+func TestRunWhen_TemplateBadShape(t *testing.T) {
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		return "ok", nil
+	}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
+	pipeline := &Pipeline{
+		Name: "runwhen_template_bad",
+		Stages: []Stage{
+			{ID: "cover", Capability: "reasoning", Prompt: "cover", Output: "cover.txt"},
+			{ID: "shoot", Capability: "reasoning", Prompt: "down",
+				Inputs:  []string{"cover"},
+				Output:  "shoot.txt",
+				RunWhen: `maybe`,
+			},
+		},
+	}
+	// "maybe" doesn't contain "{{" — it should be rejected at Validate
+	// time as not-a-keyword-and-not-a-template. Make sure that error
+	// fires; otherwise we'd never reach the rendered-value gate at all.
+	if err := pipeline.Validate(); err == nil {
+		t.Fatal("Validate: expected error for non-keyword, non-template run_when")
+	} else if !strings.Contains(err.Error(), "run_when") {
+		t.Errorf("Validate err = %v, want one mentioning run_when", err)
+	}
+
+	// Now exercise the runtime branch: a template that renders to an
+	// unaccepted value. Pipeline.Validate accepts the parse; Run should
+	// then error pointing at the stage and the rendered value.
+	pipeline.Stages[1].RunWhen = `{{ printf "%s" "maybe" }}`
+	if err := pipeline.Validate(); err != nil {
+		t.Fatalf("Validate (template form): %v", err)
+	}
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	err := exec.Run(context.Background())
+	if err == nil {
+		t.Fatal("Run: expected pipeline error from bad-shape run_when template")
+	}
+	if !strings.Contains(err.Error(), "shoot") {
+		t.Errorf("err %v should mention stage id 'shoot'", err)
+	}
+	if !strings.Contains(err.Error(), "maybe") {
+		t.Errorf("err %v should mention rendered value 'maybe'", err)
+	}
+}
+
 // vramFallbackControl is a ControlServiceHandler tuned for the candidate
 // fallback test. It rejects Start for any profile whose name appears in
 // rejectProfiles with the daemon's well-known VRAM precondition error;
