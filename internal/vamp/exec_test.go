@@ -635,6 +635,108 @@ func TestExecutor_ForeachParseError(t *testing.T) {
 	}
 }
 
+// TestExecutor_ForeachSingleItemStaticOutput verifies that a foreach stage
+// whose upstream resolves to exactly ONE item accepts a non-templated
+// Stage.Output. The static {{...}}-required check used to live in Validate;
+// it was moved to runtime so the single-item case (where there's nothing to
+// collide with) loads and runs cleanly. Regression test for the morning
+// smoke "foreach with single item still requires templated output" bug.
+func TestExecutor_ForeachSingleItemStaticOutput(t *testing.T) {
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		switch {
+		case prompt == "ONE":
+			// Single-element array — the moved-to-runtime check sees
+			// len(items) == 1 and must NOT reject the static Output.
+			return `["solo"]`, nil
+		case strings.HasPrefix(prompt, "UP:"):
+			return strings.ToUpper(strings.TrimPrefix(prompt, "UP:")), nil
+		}
+		return "", fmt.Errorf("unexpected prompt %q", prompt)
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "solo",
+		Stages: []Stage{
+			{
+				ID: "titles", Capability: "reasoning",
+				Prompt: "ONE", Output: "titles.json", OutputFormat: "json",
+			},
+			{
+				ID: "consumer", Capability: "reasoning",
+				Inputs:  []string{"titles"},
+				Foreach: &ForeachSpec{From: "titles", Var: "title"},
+				Prompt:  "UP:{{.title}}",
+				// Intentionally non-templated: a single-item foreach
+				// cannot collide with itself, so this MUST be accepted.
+				Output: "only.txt",
+			},
+		},
+	}
+	// Validate first — the static {{ check is gone, so this pipeline must
+	// load cleanly. (Previously this would have failed with
+	// "templated output path" before Run was reached.)
+	if err := pipeline.Validate(); err != nil {
+		t.Fatalf("Validate: %v (single-item foreach with static output must pass static validation now)", err)
+	}
+	exec, runDir := stubExecutor(t, pipeline, caps, inf)
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(runDir, "only.txt"))
+	if err != nil {
+		t.Fatalf("read only.txt: %v", err)
+	}
+	if string(got) != "SOLO" {
+		t.Errorf("only.txt = %q, want %q", got, "SOLO")
+	}
+}
+
+// TestExecutor_ForeachMultiItemStaticOutputRejected verifies that the
+// validator-message-preserving runtime check still fires when the foreach
+// upstream actually resolves to >1 items and the Output template is static.
+// The error message MUST match the original validator wording so users who
+// hit the rejection see the same hint they used to.
+func TestExecutor_ForeachMultiItemStaticOutputRejected(t *testing.T) {
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		if prompt == "MANY" {
+			return `["a","b","c"]`, nil
+		}
+		t.Errorf("consumer must not run when static-output collision is detected, got prompt %q", prompt)
+		return "", nil
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "static_collide",
+		Stages: []Stage{
+			{
+				ID: "titles", Capability: "reasoning",
+				Prompt: "MANY", Output: "titles.json", OutputFormat: "json",
+			},
+			{
+				ID: "consumer", Capability: "reasoning",
+				Inputs:  []string{"titles"},
+				Foreach: &ForeachSpec{From: "titles", Var: "title"},
+				Prompt:  "x",
+				Output:  "all.txt", // 3 items + static output = guaranteed collision
+			},
+		},
+	}
+	// Static validation must accept this; the rejection is runtime now.
+	if err := pipeline.Validate(); err != nil {
+		t.Fatalf("Validate: %v (static check is deferred; this must load and only fail at runtime)", err)
+	}
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	err := exec.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected runtime rejection of multi-item foreach with static output")
+	}
+	// The runtime message MUST contain the original validator wording so
+	// users hitting this for the first time read the same hint.
+	if !strings.Contains(err.Error(), "templated output path") {
+		t.Errorf("error must surface the original validator wording, got: %v", err)
+	}
+}
+
 // TestExecutor_ForeachOutputCollision verifies that two items whose templated
 // output paths collide cause an error before any inference runs.
 func TestExecutor_ForeachOutputCollision(t *testing.T) {

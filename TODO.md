@@ -108,21 +108,21 @@ webhook URL.
 
 ## Bugs found during the morning smokes
 
-- **vamp ffmpeg executor: tail-ring buffer returns short writes.**
+- ~~**vamp ffmpeg executor: tail-ring buffer returns short writes.**
   When ffmpeg's default verbose output exceeds the executor's stderr
   tail-ring buffer capacity, the Write() call returns a short count,
   which ffmpeg surfaces as a non-zero exit "short write" error even
   though the output file is valid. Workaround in the example pipeline
   is `-hide_banner -loglevel error`; real fix is to make the tail-ring
-  always consume the full Write (drop excess, never return short).
-- **{{ .stages.X.output }} returns paths relative to RunDir.** Stages
+  always consume the full Write (drop excess, never return short).~~
+- ~~**{{ .stages.X.output }} returns paths relative to RunDir.** Stages
   invoked as subprocesses (audio/ffmpeg) run from the daemon's CWD, so
   the relative path doesn't resolve. Workaround: prefix templates with
   `{{ .runDir }}/`. Future polish: pre-resolve stage outputs to
-  absolute paths before exposing them in the template namespace.
-- **foreach with a single item still requires a `{{...}}`-templated
+  absolute paths before exposing them in the template namespace.~~
+- ~~**foreach with a single item still requires a `{{...}}`-templated
   output path.** Cosmetic; the safety check for cross-item path
-  collisions could short-circuit when the array length is 1.
+  collisions could short-circuit when the array length is 1.~~
 
 ## Larger nice-to-haves still on the radar
 

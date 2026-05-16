@@ -79,22 +79,20 @@ stages:
   - id: assemble
     type: ffmpeg
     inputs: [render, voice]
-    # Quiet ffmpeg's verbose default output: vamp's stderr tail-ring
-    # returns short writes when ffmpeg's banner + libx264 stats overflow
-    # the ring, which ffmpeg surfaces as a non-zero exit "short write"
-    # error. -hide_banner + -loglevel error keeps the output minimal.
+    # Stage outputs are now absolute paths so {{ .stages.X.output(s) }}
+    # references resolve from the daemon's CWD; no need for the old
+    # `{{ .runDir }}/` prefix workaround. ffmpeg's banner + libx264 stats
+    # used to overflow the executor's stderr tail-ring with a short
+    # write; that's been fixed too so we can keep the verbose default.
     ffmpeg_args:
-      - "-hide_banner"
-      - "-loglevel"
-      - "error"
       - "-loop"
       - "1"
       - "-framerate"
       - "25"
       - "-i"
-      - "{{ .runDir }}/{{ index .stages.render.outputs 0 }}"
+      - "{{ index .stages.render.outputs 0 }}"
       - "-i"
-      - "{{ .runDir }}/{{ .stages.voice.output }}"
+      - "{{ .stages.voice.output }}"
       - "-map"
       - "0:v"
       - "-map"

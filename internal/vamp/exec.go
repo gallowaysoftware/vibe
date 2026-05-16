@@ -118,7 +118,7 @@ type StageInput struct {
 // stageResult{Output, Outputs} shape; executors don't need to know about that.
 type StageOutput struct {
 	Text  string   // for text stages
-	Files []string // for binary outputs (Phase 2+); paths relative to RunDir
+	Files []string // for binary outputs (Phase 2+); ABSOLUTE paths so subprocess argv strings resolve from the daemon's CWD
 }
 
 // stageResult holds the output(s) of a completed stage. For ordinary stages
@@ -623,6 +623,16 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 		return nil
 	}
 	e.logf("  -> stage %q: foreach fanning out %d item(s)", st.ID, len(items))
+
+	// Runtime check (moved here from Validate so single-item foreach with a
+	// non-templated Output is accepted): if the upstream resolves to more
+	// than one item and the Output template is static, every item writes to
+	// the same file. The validator used to flag this statically; the
+	// dynamic form re-uses ForeachNonTemplatedMultiItemErrMsg so the
+	// message text users see is unchanged.
+	if len(items) > 1 && !strings.Contains(st.Output, "{{") {
+		return fmt.Errorf(ForeachNonTemplatedMultiItemErrMsg, "stage "+st.ID)
+	}
 
 	// Pre-render each item's output path so we can detect collisions before
 	// launching any executor work.
@@ -1148,15 +1158,17 @@ func (e *Executor) tryResumeStage(st *Stage) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	// Binary stages (comfyui/audio) only record the relative path in
-	// stageResult.Output; templates that reference `.stages.<id>.output`
-	// for those stages already see a path, not file contents. YouTube is
-	// the exception: its "output" is the watch URL we wrote to disk, and
-	// downstream stages expect the URL string itself — same shape as text.
+	// Binary stages (comfyui/audio/ffmpeg) record an ABSOLUTE path in
+	// stageResult.Output so downstream subprocesses (ffmpeg/Piper running
+	// from the daemon's CWD) can open it without re-prefixing RunDir. This
+	// matches the live-run path (executors return absolute paths in
+	// out.Files). YouTube is the exception: its "output" is the watch URL we
+	// wrote to disk, and downstream stages expect the URL string itself —
+	// same shape as text.
 	t := stageTypeOrDefault(st)
 	if t != StageTypeText && t != StageTypeYouTube {
 		e.mu.Lock()
-		e.stageOutputs[st.ID] = &stageResult{Output: outPath}
+		e.stageOutputs[st.ID] = &stageResult{Output: full}
 		e.mu.Unlock()
 		return true, nil
 	}
@@ -1224,7 +1236,10 @@ func (e *Executor) tryResumeForeachStage(st *Stage) (bool, error) {
 			}
 			outputs[i] = string(body)
 		} else {
-			outputs[i] = path
+			// Binary foreach items (comfyui) expose an ABSOLUTE path so
+			// downstream {{ .stages.X.outputs[i] }} references work as
+			// subprocess argv strings (the daemon's CWD is not RunDir).
+			outputs[i] = full
 		}
 	}
 	combined := strings.Join(outputs, "\n\n")

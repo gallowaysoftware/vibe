@@ -121,10 +121,14 @@ func TestFFmpegExecutor_RendersArgsAndCallsFFmpeg(t *testing.T) {
 	if !equalStringSlices(call.Args, wantArgs) {
 		t.Errorf("args mismatch:\n got:  %v\n want: %v", call.Args, wantArgs)
 	}
-	// Output reporting: a single relative path so downstream
-	// .stages.<id>.output references stay rooted at the run dir.
-	if len(out.Files) != 1 || out.Files[0] != "final.mp4" {
-		t.Errorf("out.Files = %v, want [final.mp4]", out.Files)
+	// Output reporting: a single ABSOLUTE path so downstream
+	// .stages.<id>.output references resolve from the daemon's CWD when
+	// passed as argv to subprocesses (ffmpeg/Piper). The relative form
+	// would leave subprocesses opening files relative to wherever the
+	// daemon was started.
+	wantFile := filepath.Join(runDir, "final.mp4")
+	if len(out.Files) != 1 || out.Files[0] != wantFile {
+		t.Errorf("out.Files = %v, want [%s]", out.Files, wantFile)
 	}
 }
 
@@ -310,8 +314,9 @@ func TestFFmpegExecutor_OutputUnderRunDir(t *testing.T) {
 	if call.Args[len(call.Args)-2] != "-y" || call.Args[len(call.Args)-1] != wantOut {
 		t.Errorf("trailing argv = %v %v, want -y %s", call.Args[len(call.Args)-2], call.Args[len(call.Args)-1], wantOut)
 	}
-	if len(out.Files) != 1 || out.Files[0] != "renders/2024/final.mp4" {
-		t.Errorf("out.Files = %v, want [renders/2024/final.mp4]", out.Files)
+	wantFile := filepath.Join(runDir, "renders/2024/final.mp4")
+	if len(out.Files) != 1 || out.Files[0] != wantFile {
+		t.Errorf("out.Files = %v, want [%s]", out.Files, wantFile)
 	}
 }
 
@@ -357,5 +362,72 @@ func TestLineRingBuffer_CRSplit(t *testing.T) {
 	// Last two CR-bounded segments survive the ring; ffmpeg-style.
 	if !strings.Contains(got, "frame=  3") || !strings.Contains(got, "frame=  4") {
 		t.Errorf("ring buffer = %q, expected last two frames", got)
+	}
+}
+
+// TestLineRingBuffer_AlwaysFullWriteCount drives ~10 KB of mixed-delimiter
+// stderr through the ring buffer in chunks of varying size and asserts that
+// EVERY Write returned the full input count. This is the regression test for
+// the "ffmpeg: short write" bug: the ring's Write wraps cmd.Stderr inside an
+// io.MultiWriter, and any short count (or any count != len(p)) is translated
+// by MultiWriter into io.ErrShortWrite — which os/exec then surfaces as a
+// non-zero exit and vamp reports as `stage assemble: ffmpeg: short write`,
+// even when the output MP4 is valid. The bound is line count (max), not byte
+// count, so the writer MUST consume the whole buffer regardless of size; ring
+// storage drops oldest lines silently.
+func TestLineRingBuffer_AlwaysFullWriteCount(t *testing.T) {
+	buf := newLineRingBuffer(20) // realistic ffmpegStderrTailLines value
+	// Build a ~10 KB stream that mixes '\n' lines (banner/codec block) with
+	// long '\r'-terminated progress segments — ffmpeg's actual output shape.
+	var blob bytes.Buffer
+	for i := 0; i < 200; i++ {
+		fmt.Fprintf(&blob, "[libx264 @ 0x55] frame I:1 Avg QP:21.55 size: 12345 line %d\n", i)
+	}
+	for i := 0; i < 100; i++ {
+		fmt.Fprintf(&blob, "frame=  %d fps= 60 q=28.0 size=    %dkB time=00:00:%02d.00\r", i, i*64, i)
+	}
+	// Slice the blob into uneven chunks (matches a real os/exec stderr pump
+	// where individual reads don't align with line boundaries).
+	data := blob.Bytes()
+	if len(data) < 10*1024 {
+		t.Fatalf("test blob is %d bytes, want >= 10240", len(data))
+	}
+	chunkSizes := []int{1, 17, 64, 256, 1024, 4096, 7, 3}
+	off := 0
+	chunkIdx := 0
+	for off < len(data) {
+		size := chunkSizes[chunkIdx%len(chunkSizes)]
+		chunkIdx++
+		if off+size > len(data) {
+			size = len(data) - off
+		}
+		chunk := data[off : off+size]
+		n, err := buf.Write(chunk)
+		if err != nil {
+			t.Fatalf("Write(off=%d, size=%d): unexpected error %v", off, size, err)
+		}
+		if n != len(chunk) {
+			t.Fatalf("Write(off=%d, size=%d): n=%d, want %d (short write would surface as `ffmpeg: short write` to the user)", off, size, n, len(chunk))
+		}
+		off += size
+	}
+	// MultiWriter parity check: a real ffmpeg invocation wraps the ring
+	// inside io.MultiWriter(ring, stderr). Drive the same blob through a
+	// MultiWriter targeting the ring + a discard sink to verify the wrapped
+	// path doesn't trip io.ErrShortWrite either.
+	ring2 := newLineRingBuffer(20)
+	mw := io.MultiWriter(ring2, io.Discard)
+	for off := 0; off < len(data); off += 1024 {
+		end := off + 1024
+		if end > len(data) {
+			end = len(data)
+		}
+		n, err := mw.Write(data[off:end])
+		if err != nil {
+			t.Fatalf("MultiWriter.Write: unexpected error %v (this is the regression: io.MultiWriter returns ErrShortWrite when an inner writer's n != len(p))", err)
+		}
+		if n != end-off {
+			t.Fatalf("MultiWriter.Write: n=%d, want %d", n, end-off)
+		}
 	}
 }

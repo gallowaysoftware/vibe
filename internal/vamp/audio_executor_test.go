@@ -134,8 +134,9 @@ func TestAudioExecutor_RendersTextAndCallsPiper(t *testing.T) {
 	if call.Stdin != "Hello Kyle, welcome." {
 		t.Errorf("stdin = %q, want %q", call.Stdin, "Hello Kyle, welcome.")
 	}
-	if len(out.Files) != 1 || out.Files[0] != "voiceover.wav" {
-		t.Errorf("out.Files = %v, want [voiceover.wav]", out.Files)
+	wantFile := filepath.Join(runDir, "voiceover.wav")
+	if len(out.Files) != 1 || out.Files[0] != wantFile {
+		t.Errorf("out.Files = %v, want [%s]", out.Files, wantFile)
 	}
 }
 
@@ -342,8 +343,9 @@ func TestAudioExecutor_TemplatedOutputPath(t *testing.T) {
 	if gotOut != wantOut {
 		t.Errorf("--output-file = %q, want %q", gotOut, wantOut)
 	}
-	if len(out.Files) != 1 || out.Files[0] != "audio/clip_3.wav" {
-		t.Errorf("out.Files = %v, want [audio/clip_3.wav]", out.Files)
+	wantFile := filepath.Join(runDir, "audio", "clip_3.wav")
+	if len(out.Files) != 1 || out.Files[0] != wantFile {
+		t.Errorf("out.Files = %v, want [%s]", out.Files, wantFile)
 	}
 	if runner.call(0).Stdin != "item hello" {
 		t.Errorf("stdin = %q, want %q", runner.call(0).Stdin, "item hello")

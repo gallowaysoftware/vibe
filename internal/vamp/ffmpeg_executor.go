@@ -86,9 +86,10 @@ func (f *ffmpegExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 
 	// Render the output path. ffmpeg stages own their own output write (the
 	// ffmpeg subprocess does it), so we render here and pass the absolute
-	// path on the argv. The relative form is what we report in
-	// StageOutput.Files so downstream `.stages.<id>.output` references stay
-	// rooted at the run dir.
+	// path on the argv. We ALSO report the absolute form in StageOutput.Files
+	// so downstream `.stages.<id>.output` references resolve from the
+	// daemon's CWD (subprocesses like ffmpeg/Piper can't open RunDir-relative
+	// paths).
 	outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
 	if err != nil {
 		return nil, fmt.Errorf("stage %s: render output path: %w", st.ID, err)
@@ -126,7 +127,7 @@ func (f *ffmpegExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 	if err := runner.Run(ctx, binary, args, in.Log); err != nil {
 		return nil, fmt.Errorf("stage %s: ffmpeg: %w", st.ID, err)
 	}
-	return &StageOutput{Files: []string{outRel}}, nil
+	return &StageOutput{Files: []string{outAbs}}, nil
 }
 
 // ffmpegCommandRunner is the production ffmpegRunner. It spawns ffmpeg via
@@ -189,33 +190,47 @@ func newLineRingBuffer(max int) *lineRingBuffer {
 }
 
 func (b *lineRingBuffer) Write(p []byte) (int, error) {
+	// CRITICAL: this writer wraps ffmpeg's stderr inside an io.MultiWriter.
+	// io.MultiWriter's contract forwards a short count from any inner writer
+	// as a short write to the caller; cmd.Run then surfaces it as
+	// `short write`. ffmpeg's banner+libx264 stats easily overflow whatever
+	// "natural" capacity a line-ring exposes, so we ALWAYS report the full
+	// input as consumed — ring storage drops oldest lines silently to keep
+	// the bound, but the Write call itself never short-counts. The only
+	// way out is an explicit sink error (we don't have one today; if a
+	// future variant introduces one, return io.ErrClosedPipe — never a
+	// short count).
+	n := len(p)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	// Stitch any leftover from the previous write onto this one so a line
-	// that spans Write boundaries lands as a single ring entry.
+	// that spans Write boundaries lands as a single ring entry. The stitched
+	// buffer is local — `p` (the caller's slice) is not mutated and `n` is
+	// captured above so the short-write invariant holds regardless.
+	buf := p
 	if len(b.leftover) > 0 {
 		combined := make([]byte, 0, len(b.leftover)+len(p))
 		combined = append(combined, b.leftover...)
 		combined = append(combined, p...)
-		p = combined
+		buf = combined
 		b.leftover = nil
 	}
 	// ffmpeg progress uses CR ('\r') to overwrite a single status line, so
 	// split on '\n' OR '\r' — otherwise we'd accumulate one "line" with all
 	// the progress in it and lose the tail bound.
-	scanner := bufio.NewScanner(bytes.NewReader(p))
+	scanner := bufio.NewScanner(bytes.NewReader(buf))
 	scanner.Split(scanCRLF)
 	for scanner.Scan() {
 		b.appendLine(scanner.Text())
 	}
 	// Anything after the last delimiter is incomplete and held for the next
 	// Write so we don't double-count it once the rest arrives.
-	if i := lastDelim(p); i >= 0 {
-		b.leftover = append([]byte(nil), p[i+1:]...)
+	if i := lastDelim(buf); i >= 0 {
+		b.leftover = append([]byte(nil), buf[i+1:]...)
 	} else {
-		b.leftover = append([]byte(nil), p...)
+		b.leftover = append([]byte(nil), buf...)
 	}
-	return len(p), nil
+	return n, nil
 }
 
 func (b *lineRingBuffer) appendLine(s string) {

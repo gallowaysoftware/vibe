@@ -42,8 +42,11 @@ var _ StageExecutor = (*comfyuiExecutor)(nil)
 // invocations have Item=nil and ItemIdx=0.
 //
 // Side effects: writes one rendered file to <RunDir>/<rendered output path>
-// and reports that path in StageOutput.Files. StageOutput.Text is empty so
-// the runner knows to skip its text-stage write-back path.
+// and reports that path in StageOutput.Files as an ABSOLUTE path. Downstream
+// stages render subprocesses (ffmpeg/Piper) from the daemon's CWD, so a
+// relative path can't be opened by them; absolute is the only safe shape.
+// StageOutput.Text is empty so the runner knows to skip its text-stage
+// write-back path.
 func (e *comfyuiExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput, error) {
 	st := in.Stage
 	if st == nil {
@@ -112,7 +115,10 @@ func (e *comfyuiExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 	if _, err := client.SaveOutputToFile(ctx, files[0], dest); err != nil {
 		return nil, fmt.Errorf("stage %s: save output: %w", st.ID, err)
 	}
-	return &StageOutput{Files: []string{outRel}}, nil
+	// Report ABSOLUTE path: downstream {{ .stages.X.output(s) }} references
+	// land on argv strings consumed by ffmpeg/Piper subprocesses running
+	// from the daemon's CWD, which can't resolve a path relative to RunDir.
+	return &StageOutput{Files: []string{dest}}, nil
 }
 
 // clientFor returns a ComfyUI client targeting baseURL, threading the test
