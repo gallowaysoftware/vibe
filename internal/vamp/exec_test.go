@@ -1451,3 +1451,143 @@ func TestExecutor_ExponentialBackoffTiming(t *testing.T) {
 		t.Errorf("gap3 = %s, expected <= 50ms (cap is 25ms, would be 40ms uncapped)", g3)
 	}
 }
+
+// TestExecutor_WritesPipelineJSON asserts that a successful run leaves a
+// pipeline.json file in the run dir with one stage record per declared
+// stage and the start/end timestamps populated. We don't pin durations
+// (real wall-clock varies on slow CI) but we do check that durations
+// are non-negative and statuses are "ok".
+func TestExecutor_WritesPipelineJSON(t *testing.T) {
+	stub := &stubControl{}
+	mux := http.NewServeMux()
+	path, handler := vibev1connect.NewControlServiceHandler(stub)
+	mux.Handle(path, handler)
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"data": []map[string]string{{"id": "stub-model"}}})
+	})
+	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]string{"content": "hi"}}},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	stub.proxyURL = srv.URL
+
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	runDir := t.TempDir()
+	pipeline := &Pipeline{
+		Name: "metadata-demo",
+		Stages: []Stage{
+			{ID: "first", Capability: "reasoning", Prompt: "hi", Output: "a.txt"},
+			{ID: "second", Capability: "reasoning", Prompt: "hi", Inputs: []string{"first"}, Output: "b.txt"},
+		},
+	}
+	exec := &Executor{
+		Pipeline:     pipeline,
+		Capabilities: caps,
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client()),
+		RunDir:       runDir,
+	}
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(runDir, "pipeline.json"))
+	if err != nil {
+		t.Fatalf("read pipeline.json: %v", err)
+	}
+	var rec RunRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		t.Fatalf("unmarshal pipeline.json: %v", err)
+	}
+	if rec.Name != "metadata-demo" {
+		t.Errorf("Name = %q, want metadata-demo", rec.Name)
+	}
+	if rec.Status != "ok" {
+		t.Errorf("Status = %q, want ok", rec.Status)
+	}
+	if rec.StartTime.IsZero() || rec.EndTime.IsZero() {
+		t.Errorf("StartTime/EndTime not populated: %+v", rec)
+	}
+	if !rec.EndTime.After(rec.StartTime) && !rec.EndTime.Equal(rec.StartTime) {
+		t.Errorf("EndTime (%s) should be >= StartTime (%s)", rec.EndTime, rec.StartTime)
+	}
+	if len(rec.Stages) != 2 {
+		t.Fatalf("Stages = %v, want 2 entries", rec.Stages)
+	}
+	wantIDs := []string{"first", "second"}
+	for i, st := range rec.Stages {
+		if st.ID != wantIDs[i] {
+			t.Errorf("Stages[%d].ID = %q, want %q", i, st.ID, wantIDs[i])
+		}
+		if st.Status != "ok" {
+			t.Errorf("Stages[%d].Status = %q, want ok", i, st.Status)
+		}
+		if st.DurationMS < 0 {
+			t.Errorf("Stages[%d].DurationMS = %d, want >= 0", i, st.DurationMS)
+		}
+	}
+}
+
+// TestExecutor_PipelineJSONOnError asserts that a failed run still leaves
+// a pipeline.json record behind. The failed stage shows status=error;
+// stages that never got dispatched (downstream of the failure) show up
+// with an empty status string so they're still counted.
+func TestExecutor_PipelineJSONOnError(t *testing.T) {
+	stub := &stubControl{}
+	mux := http.NewServeMux()
+	path, handler := vibev1connect.NewControlServiceHandler(stub)
+	mux.Handle(path, handler)
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"data": []map[string]string{{"id": "stub-model"}}})
+	})
+	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "kaboom", http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	stub.proxyURL = srv.URL
+
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	runDir := t.TempDir()
+	pipeline := &Pipeline{
+		Name: "fail-demo",
+		Stages: []Stage{
+			{ID: "boom", Capability: "reasoning", Prompt: "hi", Output: "a.txt"},
+			{ID: "never", Capability: "reasoning", Prompt: "hi", Inputs: []string{"boom"}, Output: "b.txt"},
+		},
+	}
+	exec := &Executor{
+		Pipeline:     pipeline,
+		Capabilities: caps,
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client()),
+		RunDir:       runDir,
+	}
+	if err := exec.Run(context.Background()); err == nil {
+		t.Fatal("Run: expected error from 500 response")
+	}
+	data, err := os.ReadFile(filepath.Join(runDir, "pipeline.json"))
+	if err != nil {
+		t.Fatalf("read pipeline.json: %v", err)
+	}
+	var rec RunRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		t.Fatalf("unmarshal pipeline.json: %v", err)
+	}
+	if rec.Status != "error" {
+		t.Errorf("Status = %q, want error", rec.Status)
+	}
+	if len(rec.Stages) != 2 {
+		t.Fatalf("Stages = %v, want 2 entries", rec.Stages)
+	}
+	if rec.Stages[0].ID != "boom" || rec.Stages[0].Status != "error" {
+		t.Errorf("Stages[0] = %+v, want {ID:boom, Status:error}", rec.Stages[0])
+	}
+	// "never" was a downstream stage that didn't get a chance to run. It
+	// is still listed (declaration order) but with an empty status so
+	// the count matches the pipeline definition.
+	if rec.Stages[1].ID != "never" || rec.Stages[1].Status != "" {
+		t.Errorf("Stages[1] = %+v, want {ID:never, Status:\"\"}", rec.Stages[1])
+	}
+}

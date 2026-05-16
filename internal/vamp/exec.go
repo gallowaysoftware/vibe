@@ -194,6 +194,15 @@ type Executor struct {
 	// registry maps StageType -> executor. Built once in Run and shared by
 	// every stage; per-stage state must travel via StageInput.
 	registry map[StageType]StageExecutor
+
+	// stageTimings is populated by executeStage as stages finish; the keys
+	// are stage ids. recordMu guards stageTimings AND the start/end
+	// timestamps used to assemble pipeline.json at run end. We can't reuse
+	// `mu` because executeStage already takes it inside the per-stage
+	// completion path, and recording the timing happens outside that
+	// critical section.
+	recordMu     sync.Mutex
+	stageTimings map[string]StageRecord
 }
 
 func defaultInference() InferenceFunc {
@@ -206,10 +215,24 @@ func defaultInference() InferenceFunc {
 // shares a single profile activation, and stages in a group execute
 // concurrently. Earlier stage outputs are exposed to dependents via
 // .stages.<id>.output in their templates.
-func (e *Executor) Run(ctx context.Context) error {
+func (e *Executor) Run(ctx context.Context) (runErr error) {
 	if e.Inference == nil {
 		e.Inference = defaultInference()
 	}
+	// Capture the wall-clock start time before any I/O so pipeline.json's
+	// `start_time` reflects "when the user kicked off the run" rather than
+	// "after the run dir existed". The deferred writePipelineJSON below
+	// pairs this with EndTime at completion. We use a local variable
+	// rather than a field because Run is documented as single-call and
+	// the timing only matters within one invocation.
+	runStart := time.Now()
+	e.stageTimings = make(map[string]StageRecord)
+	defer func() {
+		// pipeline.json is best-effort: a failed write must never alter
+		// the run's exit code. writePipelineJSON logs internally and
+		// returns nothing so a write failure can't bubble up.
+		e.writePipelineJSON(runStart, time.Now(), runErr)
+	}()
 	// Resume mode: the run dir already exists, snapshot drift is checked
 	// against the prior run's pipeline.yaml.snapshot, and per-stage outputs
 	// from disk seed stageOutputs so completed work is skipped. We do this
@@ -337,6 +360,11 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 				e.mu.Lock()
 				e.completedStages[st.ID] = true
 				e.mu.Unlock()
+				// Resumed stages still get an entry in pipeline.json so
+				// `vamp runs show` can see they participated. Duration
+				// is zero (we don't know what the original run took) and
+				// the status string differentiates them from fresh runs.
+				e.recordSkippedStage(st.ID)
 				continue
 			}
 			remaining = append(remaining, st)
@@ -470,12 +498,26 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 // Resume skipping happens upstream in runGroup (so an all-resumed group can
 // skip profile activation entirely); by the time we get here, every stage in
 // the group needs a real executor call.
-func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID, backendAddr string, tokenSink io.Writer) error {
+func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID, backendAddr string, tokenSink io.Writer) (stageErr error) {
+	// Capture per-stage wall-clock duration for pipeline.json. The defer
+	// records the StageRecord regardless of which return path we take so
+	// failure stages still show up in `vamp runs show` with status=error
+	// and a real timestamp delta. Foreach stages delegate to
+	// executeForeachStage below, which records its own timing; we skip
+	// recording here in that case to avoid double-counting.
+	stageStart := time.Now()
+	recordTiming := true
+	defer func() {
+		if recordTiming {
+			e.recordStageFinish(st.ID, stageStart, stageErr)
+		}
+	}()
 	exec, err := e.executorFor(st)
 	if err != nil {
 		return err
 	}
 	if st.Foreach != nil {
+		recordTiming = false
 		return e.executeForeachStage(ctx, st, exec, baseURL, modelID, backendAddr, tokenSink)
 	}
 
@@ -514,7 +556,14 @@ func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID
 // non-nil Foreach. The items list is read from the upstream stage's JSON
 // output (referenced by Foreach.From). Each item runs in its own goroutine
 // through the registered executor and writes its own output file.
-func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec StageExecutor, baseURL, modelID, backendAddr string, tokenSink io.Writer) error {
+func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec StageExecutor, baseURL, modelID, backendAddr string, tokenSink io.Writer) (stageErr error) {
+	// Mirror executeStage's per-stage timing: the foreach stage's
+	// "duration" is the elapsed wall-clock for the whole fan-out
+	// (resolve + render + run-all-items), which is the user-visible cost.
+	stageStart := time.Now()
+	defer func() {
+		e.recordStageFinish(st.ID, stageStart, stageErr)
+	}()
 	items, err := e.resolveForeachItems(st)
 	if err != nil {
 		return fmt.Errorf("resolve foreach: %w", err)
@@ -1402,4 +1451,133 @@ func (e *Executor) logf(format string, args ...any) {
 func validateJSON(s string) error {
 	var v any
 	return json.Unmarshal([]byte(s), &v)
+}
+
+// recordStageFinish writes one StageRecord to the per-run timing map.
+// "ok" maps to nil error; anything else (including context.Canceled
+// from a sibling cancel) records "error". The record overwrites any
+// existing entry under the same id so a retried stage's last attempt is
+// what shows up in pipeline.json — matching what the user would see in
+// the live log.
+func (e *Executor) recordStageFinish(stageID string, start time.Time, err error) {
+	status := "ok"
+	if err != nil {
+		status = "error"
+	}
+	rec := StageRecord{
+		ID:         stageID,
+		DurationMS: time.Since(start).Milliseconds(),
+		Status:     status,
+	}
+	e.recordMu.Lock()
+	if e.stageTimings == nil {
+		e.stageTimings = make(map[string]StageRecord)
+	}
+	e.stageTimings[stageID] = rec
+	e.recordMu.Unlock()
+}
+
+// recordSkippedStage records a "skipped" entry for a stage whose output
+// the resume pre-pass loaded from disk. Duration is intentionally zero:
+// we don't know what the original run took, and we don't want to mislead
+// `runs ls` into thinking a 0ms duration is the real cost.
+func (e *Executor) recordSkippedStage(stageID string) {
+	rec := StageRecord{ID: stageID, DurationMS: 0, Status: "skipped"}
+	e.recordMu.Lock()
+	if e.stageTimings == nil {
+		e.stageTimings = make(map[string]StageRecord)
+	}
+	e.stageTimings[stageID] = rec
+	e.recordMu.Unlock()
+}
+
+// writePipelineJSON emits the run's pipeline.json record. The function is
+// best-effort: it logs and swallows every error. We intentionally do not
+// return an error because Run already deferred this call and a write
+// failure must not change the run's exit code (a successful pipeline
+// whose metadata write failed is still a successful pipeline).
+//
+// Stages are listed in declaration order so the file reads naturally
+// alongside the YAML; stages that didn't run (because an earlier stage
+// failed) are still listed but without a status entry.
+func (e *Executor) writePipelineJSON(start, end time.Time, runErr error) {
+	// No run dir → nothing to write. This happens when MkdirAll itself
+	// failed; the user already saw that error and we have nowhere to
+	// put the file.
+	if e.RunDir == "" {
+		return
+	}
+	if _, err := os.Stat(e.RunDir); err != nil {
+		return
+	}
+	status := "ok"
+	if runErr != nil {
+		status = "error"
+	} else {
+		// "partial" reflects a clean run where one or more stages were
+		// marked error or skipped via resume. Right now `error` already
+		// short-circuits Run() (we wouldn't reach here with a stage
+		// error and a nil runErr) so this only fires for resume runs
+		// where some stages were rehydrated from disk.
+		e.recordMu.Lock()
+		anySkipped := false
+		for _, rec := range e.stageTimings {
+			if rec.Status == "skipped" {
+				anySkipped = true
+				break
+			}
+		}
+		e.recordMu.Unlock()
+		if anySkipped {
+			status = "partial"
+		}
+	}
+	name := ""
+	if e.Pipeline != nil {
+		name = e.Pipeline.Name
+	}
+	rec := RunRecord{
+		Name:      name,
+		StartTime: start,
+		EndTime:   end,
+		Status:    status,
+	}
+	// Walk the pipeline definition in declaration order so the JSON
+	// stage list mirrors the YAML. Stages with no recorded timing
+	// (i.e. they never got dispatched because an earlier sibling
+	// failed) still appear with status "" so the count matches
+	// `len(pipeline.Stages)` and downstream tools don't have to
+	// special-case missing rows.
+	e.recordMu.Lock()
+	if e.Pipeline != nil {
+		for _, st := range e.Pipeline.Stages {
+			if got, ok := e.stageTimings[st.ID]; ok {
+				rec.Stages = append(rec.Stages, got)
+			} else {
+				rec.Stages = append(rec.Stages, StageRecord{ID: st.ID})
+			}
+		}
+	} else {
+		// Defensive: some tests construct an Executor without a
+		// Pipeline and only the stageTimings map; emit those in
+		// alphabetical order so the output stays deterministic.
+		ids := make([]string, 0, len(e.stageTimings))
+		for id := range e.stageTimings {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			rec.Stages = append(rec.Stages, e.stageTimings[id])
+		}
+	}
+	e.recordMu.Unlock()
+	data, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		slog.Warn("pipeline.json marshal failed", "err", err)
+		return
+	}
+	path := filepath.Join(e.RunDir, "pipeline.json")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		slog.Warn("pipeline.json write failed", "path", path, "err", err)
+	}
 }

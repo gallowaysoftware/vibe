@@ -201,7 +201,7 @@ func (w *webhookExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 //     identifier. The example README documents this.
 func renderWebhookTemplate(st *Stage, name, raw string, in StageInput, extra map[string]any) (string, error) {
 	deps := st.Inputs
-	tmpl, err := template.New(st.ID+":"+name).
+	tmpl, err := template.New(st.ID + ":" + name).
 		Option("missingkey=error").
 		Funcs(templateFuncs()).
 		Funcs(template.FuncMap{
