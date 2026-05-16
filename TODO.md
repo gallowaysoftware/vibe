@@ -131,8 +131,13 @@ webhook URL.
   smaller capable profile that fits the budget).
 - vamp daemon mode: background runs with job IDs, `vamp logs <id>` to
   follow live, `vamp jobs ls` for the queue.
-- Per-foreach-item resume (today resume granularity is whole-stage; a
-  failed item in a foreach causes the whole stage to rerun on resume).
+- ~~Per-foreach-item resume (today resume granularity is whole-stage; a
+  failed item in a foreach causes the whole stage to rerun on resume).~~
+  Done — `tryResumeForeachStage` now classifies each item independently and
+  `executeForeachStage` only dispatches the missing indices. Resumed items
+  are loaded from disk into `stageResult.Outputs` at their original index,
+  and the JSON integrity check still runs per item. See
+  `TestExecutor_ResumeForeach_PerItem` and friends in `internal/vamp/exec_test.go`.
 - ~~Real LAN access from a laptop: HTTP control plane is loopback-bound
   today. Needs auth (the deferred token-based-auth decision from earlier).~~
   Done — `bind_all: true` in `~/.config/vibe/config.yaml` flips the TCP
