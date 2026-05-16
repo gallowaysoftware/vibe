@@ -186,7 +186,7 @@ func stubComfyRuntime(t *testing.T, pipeline *Pipeline, workflowJSON string) (*E
 	exec := &Executor{
 		Pipeline:     pipeline,
 		PipelineDir:  pipelineDir,
-		Capabilities: &Capabilities{Mapping: map[string]string{"image": "comfyui-flux", "reasoning": "code"}},
+		Capabilities: &Capabilities{Mapping: map[string]CapabilityBinding{"image": {Profile: "comfyui-flux"}, "reasoning": {Profile: "code"}}},
 		Vibe:         vibeclient.NewWithHTTPClient(vibeSrv.URL, vibeSrv.Client(), ""),
 		RunDir:       runDir,
 	}

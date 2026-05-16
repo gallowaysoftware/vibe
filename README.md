@@ -249,6 +249,35 @@ stages:
 The example under `examples/multi-profile-pipeline/` ships a checked-in
 `vamp.schema.json` alongside its `pipeline.yaml` to show the wiring.
 
+### Capabilities and VRAM-aware fallback
+
+`vamp` looks up each stage's `capability:` in
+`$XDG_CONFIG_HOME/vamp/capabilities.yaml` to decide which vibe profile to
+activate. The shorthand form pins a capability to one profile:
+
+```yaml
+capabilities:
+  reasoning: code
+  creative_writing: chat
+```
+
+The long form binds a capability to an ordered list of candidate profiles,
+biggest first. When the vibe daemon rejects the first candidate with its
+pre-flight VRAM check (not enough free VRAM for the profile's
+`estimated_vram_gb`), `vamp` skips it and tries the next candidate, logging
+the fallback to the run log. Useful on hosts where free VRAM varies because
+another GPU consumer (browser, another model, a game) might be in the way:
+
+```yaml
+capabilities:
+  reasoning:
+    candidates: [code, code_small]   # tries code first, falls back to code_small
+```
+
+The two forms can be mixed in the same file. Only the daemon's specific
+VRAM precondition error triggers fallback — any other error (auth failure,
+profile-not-found, ...) aborts the run so genuine failures aren't masked.
+
 ## Shell completion
 
 Both `vibe` and `vamp` ship Cobra-generated completion scripts plus

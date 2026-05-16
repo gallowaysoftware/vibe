@@ -682,17 +682,51 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 		return errors.Join(errs...)
 	}
 
-	profile, err := e.Capabilities.Profile(capability)
+	candidates, err := e.Capabilities.Profiles(capability)
 	if err != nil {
 		return err
 	}
-	e.logf("  -> activating profile %q", profile)
-	status, err := e.Vibe.EnsureActive(ctx, profile)
-	if err != nil {
-		return fmt.Errorf("activate %q: %w", profile, err)
+	// Walk the candidate list in declared order (biggest first). Stop on
+	// the first one that activates; skip on a VRAM rejection (the daemon's
+	// FailedPrecondition pre-flight error) so we can fall back to a
+	// smaller profile; abort on any other error so genuine failures aren't
+	// silently re-tried against a different profile.
+	var (
+		status  *vibev1.Status
+		lastErr error
+		picked  bool
+	)
+	for _, cand := range candidates {
+		if len(candidates) > 1 {
+			e.logf("  -> activating profile %q (candidate for %q)", cand, capability)
+		} else {
+			e.logf("  -> activating profile %q", cand)
+		}
+		st, actErr := e.Vibe.EnsureActive(ctx, cand)
+		if actErr != nil {
+			if vibeclient.IsVRAMRejection(actErr) {
+				e.logf("  -> skipping %q: %s", cand, actErr.Error())
+				lastErr = fmt.Errorf("activate %q: %w", cand, actErr)
+				continue
+			}
+			return fmt.Errorf("activate %q: %w", cand, actErr)
+		}
+		if !st.Ready {
+			// Treat a not-ready response from EnsureActive the same as
+			// a generic activation failure: don't try the next
+			// candidate, since "not ready" is usually a daemon
+			// integration bug rather than a VRAM problem.
+			return fmt.Errorf("profile %q is not ready", cand)
+		}
+		status = st
+		picked = true
+		break
 	}
-	if !status.Ready {
-		return fmt.Errorf("profile %q is not ready", profile)
+	if !picked {
+		// All candidates VRAM-rejected. Return the last error so the
+		// caller still sees a useful "needs N GiB" message rather than a
+		// vague "no candidates fit".
+		return lastErr
 	}
 	// Only resolve the chat-completion model id when at least one stage in
 	// this group needs it. ComfyUI backends don't speak OpenAI /v1/models, so

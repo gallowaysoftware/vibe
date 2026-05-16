@@ -406,7 +406,7 @@ func TestAudioExecutor_RunGroupSkipsProfile(t *testing.T) {
 	// Empty Capabilities is fine: the runner short-circuits profile
 	// resolution for audio-only groups, so the unmapped capability never
 	// trips the scheduler.
-	exec, runDir := stubExecutor(t, pipeline, &Capabilities{Mapping: map[string]string{}}, nil)
+	exec, runDir := stubExecutor(t, pipeline, &Capabilities{Mapping: map[string]CapabilityBinding{}}, nil)
 	// Inject our recording runner via the registry seam: re-register the
 	// audio executor with the stub runner. We can't rely on Run building
 	// the registry because it runs before we'd get a chance to override;

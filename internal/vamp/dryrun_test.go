@@ -39,7 +39,7 @@ func TestExecutor_DryRunRendersAllStages(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code", "image_gen": "comfy"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}, "image_gen": {Profile: "comfy"}}}
 	pipeline := &Pipeline{
 		Name: "all_types",
 		Stages: []Stage{
@@ -119,7 +119,7 @@ func TestExecutor_DryRunRendersAllStages(t *testing.T) {
 // an undefined input surfaces a clear error. The Go template "missingkey=error"
 // path is the same one Run uses, so the diagnostic is identical.
 func TestExecutor_DryRunDetectsTemplateError(t *testing.T) {
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "bad_template",
 		Stages: []Stage{
@@ -147,7 +147,7 @@ func TestExecutor_DryRunDetectsTemplateError(t *testing.T) {
 // capability is absent from the loaded capabilities map fails with a
 // diagnostic that names the missing capability.
 func TestExecutor_DryRunDetectsCapabilityMissing(t *testing.T) {
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "bad_capability",
 		Stages: []Stage{
@@ -175,7 +175,7 @@ func TestExecutor_DryRunDetectsCapabilityMissing(t *testing.T) {
 // resolver falls back to the canned 2-item stub and the printed plan
 // explicitly says so.
 func TestExecutor_DryRunForeachItemsFromUpstream(t *testing.T) {
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "foreach_stub",
 		Stages: []Stage{
@@ -270,7 +270,7 @@ func TestExecutor_DryRunForeachItemsFromUpstream(t *testing.T) {
 // whose rendered output paths collide cause an error during dry-run, with the
 // failing item indices included in the diagnostic so the user can find them.
 func TestExecutor_DryRunDetectsForeachCollision(t *testing.T) {
-	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
 		Name: "collide",
 		Stages: []Stage{
