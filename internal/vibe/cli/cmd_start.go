@@ -5,10 +5,13 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+
+	"github.com/gallowaysoftware/vibe/internal/vibeclient"
 )
 
 func startCmd() *cobra.Command {
-	return &cobra.Command{
+	var noVRAMCheck bool
+	cmd := &cobra.Command{
 		Use:   "start <profile>",
 		Short: "Start a profile (auto-spawns the daemon if needed).",
 		Args:  cobra.ExactArgs(1),
@@ -25,7 +28,9 @@ func startCmd() *cobra.Command {
 			if err := pullProfile(ctx, args[0]); err != nil {
 				return err
 			}
-			r, err := newClient().Start(ctx, args[0])
+			r, err := newClient().StartWithOptions(ctx, args[0], vibeclient.StartOptions{
+				NoVRAMCheck: noVRAMCheck,
+			})
 			if err != nil {
 				return err
 			}
@@ -48,4 +53,7 @@ func startCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&noVRAMCheck, "no-vram-check", false,
+		"Skip the daemon's pre-flight VRAM check against the profile's estimated_vram_gb.")
+	return cmd
 }

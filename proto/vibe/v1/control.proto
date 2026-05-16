@@ -76,6 +76,10 @@ message ListProfilesResponse {
 
 message StartRequest {
   string profile = 1;
+  // no_vram_check, when true, skips the pre-flight VRAM check the daemon
+  // performs against the profile's estimated_vram_gb. For users who know
+  // their setup better than the heuristic.
+  bool no_vram_check = 2;
 }
 message StartResponse {
   Status status = 1;
