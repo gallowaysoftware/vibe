@@ -209,7 +209,13 @@ authed (gated by filesystem perms instead). If the token leaks, run
 
 ## Examples
 
-Under `examples/`:
+`vibe` profile starters under `examples/profiles/`:
+
+| Profile | What it shows |
+| --- | --- |
+| [`chat-with-search`](examples/profiles/chat-with-search/) | Local LLM + Open WebUI + SearXNG sidecar for web search + Tier-1 RAG (BGE-M3 + reranker + hybrid). Copy-and-adapt. |
+
+`vamp` pipelines under `examples/`:
 
 | Pipeline | What it shows |
 | --- | --- |

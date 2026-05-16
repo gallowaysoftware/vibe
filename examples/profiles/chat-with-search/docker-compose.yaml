@@ -1,0 +1,59 @@
+# Open WebUI + SearXNG sidecar, wired to vibe's OpenAI-compatible
+# proxy on 127.0.0.1:9000.
+#
+# `network_mode: host` shares the user's network namespace with the
+# containers so they reach the proxy + each other through 127.0.0.1.
+# Works under both Docker and rootless podman.
+#
+# Bind-mount paths come from the profile's frontend.env block:
+#   VIBE_FRONTEND_STATE  ~/.local/state/vibe/frontend/chat
+#   SEARXNG_CONFIG       the searxng/ dir bundled with this example
+#
+# Tier-1 RAG (in-process Chroma + BGE-M3 embeddings + reranker +
+# hybrid search) is on. For Tier-2 (separate Qdrant + TEI containers)
+# see the rag profile example.
+
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: vibe-chat-webui
+    network_mode: host
+    environment:
+      - OPENAI_API_BASE_URL=http://127.0.0.1:9000/v1
+      - OPENAI_API_KEY=vibe-local
+      - WEBUI_AUTH=False
+      - ENABLE_OLLAMA_API=False
+      - PORT=8080
+      # Tier-1 RAG: BGE-M3 embeddings (CPU, in-process) + reranker.
+      - RAG_EMBEDDING_ENGINE=
+      - RAG_EMBEDDING_MODEL=BAAI/bge-m3
+      - ENABLE_RAG_HYBRID_SEARCH=True
+      - RAG_RERANKING_MODEL=BAAI/bge-reranker-v2-m3
+      - CHUNK_SIZE=1000
+      - CHUNK_OVERLAP=200
+      - RAG_TOP_K=5
+      # Web search via SearXNG sidecar.
+      - ENABLE_RAG_WEB_SEARCH=True
+      - RAG_WEB_SEARCH_ENGINE=searxng
+      - SEARXNG_QUERY_URL=http://127.0.0.1:8888/search?q=<query>
+      - RAG_WEB_SEARCH_RESULT_COUNT=5
+      - RAG_WEB_SEARCH_CONCURRENT_REQUESTS=10
+    volumes:
+      - ${VIBE_FRONTEND_STATE}/data:/app/backend/data
+    restart: unless-stopped
+    depends_on:
+      - searxng
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: vibe-chat-searxng
+    network_mode: host
+    volumes:
+      - ${SEARXNG_CONFIG}:/etc/searxng
+    environment:
+      # Modern SearXNG images alias SEARXNG_PORT → granian --port at
+      # startup; settings.yml server.port is ignored. Move SearXNG off
+      # 8080 so Open WebUI can have it.
+      - SEARXNG_PORT=8888
+      - SEARXNG_BASE_URL=http://127.0.0.1:8888/
+    restart: unless-stopped

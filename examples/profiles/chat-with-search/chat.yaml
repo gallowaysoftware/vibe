@@ -1,0 +1,59 @@
+# Example: chat profile with Open WebUI + SearXNG + Tier-1 RAG (BGE-M3).
+#
+# Copy this file to $XDG_CONFIG_HOME/vibe/profiles/chat.yaml and adapt
+# the marked sections. Companion docker-compose.yaml lives next door;
+# copy it to $XDG_CONFIG_HOME/vibe/compose/chat/ and the searxng/
+# subdir alongside (then generate a real secret_key — see README).
+#
+# Frontend.env values are expanded at activation time by vibe and
+# passed through to the compose subprocess, so the compose file can
+# reference $VIBE_FRONTEND_STATE and $SEARXNG_CONFIG without hard-
+# coding home paths. Adapt $VIBE_FRONTEND_STATE if you rename the
+# profile (it must match the profile.name above so vibe's mkdir-on-
+# activate creates the right directory).
+
+name: chat
+description: General-purpose chat — local LLM + Open WebUI + SearXNG.
+
+backend:
+  llama_server:
+    # REPLACE: absolute or ~/-prefixed path to your GGUF model.
+    path: ~/models/qwen3-32b-gguf/Qwen3-32B-Q5_K_M.gguf
+    # REPLACE: HF repo + file so `vibe pull chat` can fetch the
+    # weights on first start. Drop this block if you supply your own.
+    huggingface:
+      repo: unsloth/Qwen3-32B-GGUF
+      file: Qwen3-32B-Q5_K_M.gguf
+    # REPLACE: must match the alias llama-server advertises at
+    # /v1/models — Open WebUI uses it as the model picker label.
+    alias: qwen3-32b-q5km
+    context: 32768
+    parallel: 1
+    gpu_layers: 999
+    flash_attn: true
+    cache_type_k: q8_0
+    cache_type_v: q8_0
+    jinja: true
+
+frontend:
+  kind: docker-compose
+  app: open-webui
+  # REPLACE: absolute path to where you dropped the docker-compose.yaml.
+  compose_file: ~/.config/vibe/compose/chat/docker-compose.yaml
+  project_name: vibe-chat
+  env:
+    # Passed through to docker compose's process env so the compose
+    # file can reference ${VIBE_FRONTEND_STATE}. ${VIBE_STATE_DIR} is
+    # expanded by vibe itself (resolves to $XDG_STATE_HOME/vibe).
+    VIBE_FRONTEND_STATE: ${VIBE_STATE_DIR}/frontend/chat
+    # REPLACE: absolute path to the searxng/ config dir bundled with
+    # this example. Must contain a settings.yml with a real secret_key.
+    SEARXNG_CONFIG: ~/.config/vibe/compose/chat/searxng
+  wait_for:
+    - url: http://127.0.0.1:8888/healthz
+      timeout: 120s
+    - url: http://127.0.0.1:8080/
+      timeout: 120s
+
+# REPLACE: approximate VRAM the loaded model needs.
+estimated_vram_gb: 28

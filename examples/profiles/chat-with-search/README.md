@@ -1,0 +1,107 @@
+# Chat profile: local LLM + Open WebUI + SearXNG + Tier-1 RAG
+
+A vibe profile that brings up a Claude/ChatGPT-style chat experience
+against a local model: Open WebUI for the UI, SearXNG sidecar for
+"turbo Google" web search, and Open WebUI's built-in RAG (BGE-M3
+embeddings + BGE-reranker-v2-m3 reranker + hybrid BM25+vector
+search) for chatting with your own documents.
+
+The whole stack is two containers managed by `vibe start chat`. State
+(SQLite chat history, ChromaDB vectors, uploads, embedding model
+cache) lives at `$XDG_STATE_HOME/vibe/frontend/chat/data` as bind-
+mounted files you can back up with `tar` or inspect with `sqlite3`.
+
+## Install
+
+```sh
+# 1. Drop the profile.
+mkdir -p ~/.config/vibe/profiles ~/.config/vibe/compose/chat
+cp chat.yaml ~/.config/vibe/profiles/chat.yaml
+
+# 2. Drop the compose file + SearXNG config alongside.
+cp docker-compose.yaml ~/.config/vibe/compose/chat/docker-compose.yaml
+cp -r searxng ~/.config/vibe/compose/chat/
+
+# 3. Generate a real SearXNG secret_key. The placeholder is rejected
+#    at startup so you can't accidentally skip this.
+sed -i "s/REPLACE-WITH-RAND-HEX-32/$(openssl rand -hex 32)/" \
+  ~/.config/vibe/compose/chat/searxng/settings.yml
+
+# 4. Edit ~/.config/vibe/profiles/chat.yaml: point backend.llama_server
+#    at the GGUF model you want, fix the absolute paths under frontend.
+#    The REPLACE: markers call out the lines you need to change.
+
+# 5. Bring it up. First boot pulls 2 images (~1.6 GB), downloads the
+#    embedding model (~2.3 GB) on first knowledge upload, and may pull
+#    the LLM weights from HuggingFace.
+vibe start chat
+# → browser to http://127.0.0.1:8080
+```
+
+## What's in here
+
+| File | Goes to | What it is |
+|---|---|---|
+| `chat.yaml` | `~/.config/vibe/profiles/chat.yaml` | The vibe profile (model + frontend block). |
+| `docker-compose.yaml` | `~/.config/vibe/compose/chat/docker-compose.yaml` | Open WebUI + SearXNG. |
+| `searxng/settings.yml` | `~/.config/vibe/compose/chat/searxng/settings.yml` | SearXNG config (replace secret_key). |
+
+## Using it
+
+- **Plain chat** — pick the model in the top-left dropdown and start
+  typing. The LLM streams via the OpenAI-compatible proxy at :9000.
+- **Web search** — toggle the globe icon next to the chat box (or
+  prefix a message with `#web`) to have Open WebUI dispatch the query
+  to SearXNG, fetch the top results, and include them as retrieval
+  context.
+- **RAG over your docs** — Workspace → Knowledge → New, upload PDFs /
+  Markdown / text. Attach the knowledge collection to a model
+  (Workspace → Models → Edit) or reference it per-chat with `#`.
+- **Multiple knowledge collections** — recommended over one big
+  bucket. Retrieval quality degrades as the corpus grows mixed;
+  separating `work`, `code`, `personal` collections and attaching the
+  right ones per-question is the higher-signal pattern.
+
+## State
+
+```
+~/.local/state/vibe/frontend/chat/data/
+├── webui.db, .db-shm, .db-wal     SQLite — chats, settings, knowledge meta
+├── vector_db/                     ChromaDB — RAG embeddings
+├── uploads/                       raw attached files
+└── cache/                         downloaded embedding model weights
+```
+
+Inspect: `sqlite3 ~/.local/state/vibe/frontend/chat/data/webui.db`.
+Back up: `tar czf chat-state.tar.gz -C ~/.local/state/vibe/frontend chat`.
+
+## Why these choices
+
+**SearXNG over DuckDuckGo / Tavily / Brave** — self-hosted, no API
+key, no per-query cost, aggregates multiple upstream engines, JSON
+output mode is purpose-built for LLM consumption.
+
+**BGE-M3 over OpenAI / smaller models** — multilingual, hybrid
+dense+sparse+ColBERT representations, currently best-in-class for
+self-hosted RAG, runs on CPU at ~30 docs/sec so it doesn't compete
+with the LLM for GPU. Cached on first use.
+
+**Tier 1 (in-process Chroma) over Tier 2 (Qdrant + TEI)** — fewer
+moving parts; good through ~10K chunks. When you outgrow it, swap
+to a dedicated `rag` profile with TEI for embeddings and Qdrant for
+storage; the chat profile keeps its in-process setup for casual use.
+
+## Customizing
+
+- **Different LLM**: change `backend.llama_server.{path, huggingface,
+  alias, context}` in `chat.yaml`. The frontend doesn't care which
+  model serves the OpenAI-compat endpoint.
+- **Different chunk size / top-k**: edit the `CHUNK_SIZE`,
+  `CHUNK_OVERLAP`, `RAG_TOP_K` env vars in the compose file. Code
+  collections want smaller chunks (200/50); long-form prose wants
+  larger (1500/300).
+- **Disable web search**: drop the `searxng:` service from the compose
+  file and set `ENABLE_RAG_WEB_SEARCH=False`. Two-line change.
+- **Reset chat history**: stop the profile, `rm -rf
+  ~/.local/state/vibe/frontend/chat/data/`, start again. The state
+  dir gets recreated on activate.
