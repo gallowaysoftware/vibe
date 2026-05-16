@@ -91,17 +91,38 @@ idempotent; the release path picks `llama-<ver>-bin-ubuntu-x64.tar.gz`
 extracts under `~/.local/share/vibe/llama-cpp/`, and symlinks into
 `~/.local/bin/`. See `internal/vibe/cli/install_llama_cpp.go`.
 
-## ComfyUI video smoke
+## ~~ComfyUI video smoke~~ (done)
 
-The ComfyUI client and the vamp executor now collect non-image outputs
-(`videos`, `gifs`) from a workflow's `/history` response, and an example
-sits at `examples/comfyui-video/`. The plumbing is covered by unit tests
-against a fake ComfyUI server, but we haven't yet run the pipeline against
-a real video model (LTX-Video, HunyuanVideo, Wan2.2, etc.). Open follow-up:
-download a public video checkpoint, run the example end-to-end, and
-confirm the MP4 lands at `<run-dir>/assets/video.mp4` with sensible
-contents. May also need to add a `VHS_VideoCombine`-flavoured variant if
-that turns out to be the more common community node in practice.
+LTX-Video 2B (0.9.8 distilled FP8) ran end-to-end on the live machine
+via `vamp run examples/comfyui-video/pipeline.yaml` and produced a
+valid 2.04s 512x320 H.264 MP4 in 7.3s. The video/gif output collection
+path is verified against a real workflow, not just unit tests.
+
+## ~~End-to-end content-mill smoke~~ (done)
+
+`examples/content-mill/pipeline.yaml` chains every stage type together:
+text → text(JSON) → ComfyUI image → Piper TTS → ffmpeg muxing → webhook
+(Slack/Discord/Mattermost). Verified against the live machine; produces
+a 9.31s H.264+AAC MP4 and POSTs the run details to the configured
+webhook URL.
+
+## Bugs found during the morning smokes
+
+- **vamp ffmpeg executor: tail-ring buffer returns short writes.**
+  When ffmpeg's default verbose output exceeds the executor's stderr
+  tail-ring buffer capacity, the Write() call returns a short count,
+  which ffmpeg surfaces as a non-zero exit "short write" error even
+  though the output file is valid. Workaround in the example pipeline
+  is `-hide_banner -loglevel error`; real fix is to make the tail-ring
+  always consume the full Write (drop excess, never return short).
+- **{{ .stages.X.output }} returns paths relative to RunDir.** Stages
+  invoked as subprocesses (audio/ffmpeg) run from the daemon's CWD, so
+  the relative path doesn't resolve. Workaround: prefix templates with
+  `{{ .runDir }}/`. Future polish: pre-resolve stage outputs to
+  absolute paths before exposing them in the template namespace.
+- **foreach with a single item still requires a `{{...}}`-templated
+  output path.** Cosmetic; the safety check for cross-item path
+  collisions could short-circuit when the array length is 1.
 
 ## Larger nice-to-haves still on the radar
 
