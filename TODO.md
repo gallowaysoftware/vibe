@@ -46,8 +46,11 @@ starter YAML (with `# REPLACE: ...` markers for the fields the user must
 edit) to `$XDG_CONFIG_HOME/vibe/profiles/`. See
 `internal/vibe/cli/cmd_profile.go`.
 
-Still open from the original list: a one-shot binary install script
-(`curl ... | sh` or `go install`).
+~~Still open from the original list: a one-shot binary install script
+(`curl ... | sh` or `go install`).~~ Done — see `install.sh` (POSIX
+shell, OS/arch detection, idempotent, `--dry-run`), `.goreleaser.yaml`,
+and `.github/workflows/release.yaml`. The next operator step is to tag
+the first `v*` release; the workflow takes care of the rest.
 
 ## ~~MCP composition for profiles~~ (done)
 

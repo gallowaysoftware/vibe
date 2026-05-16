@@ -1,0 +1,94 @@
+# goreleaser config for vibe + vamp.
+#
+# Local sanity check:
+#   goreleaser check
+#   goreleaser release --snapshot --clean --skip=publish
+#
+# Real release flow lives in .github/workflows/release.yaml — push a `v*` tag.
+
+version: 2
+
+project_name: vibe
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: vibe
+    binary: vibe
+    main: ./cmd/vibe
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/gallowaysoftware/vibe/internal/buildinfo.Version={{ .Version }}
+      - -X github.com/gallowaysoftware/vibe/internal/buildinfo.Commit={{ .ShortCommit }}
+      - -X github.com/gallowaysoftware/vibe/internal/buildinfo.Date={{ .CommitDate }}
+
+  - id: vamp
+    binary: vamp
+    main: ./cmd/vamp
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/gallowaysoftware/vibe/internal/buildinfo.Version={{ .Version }}
+      - -X github.com/gallowaysoftware/vibe/internal/buildinfo.Commit={{ .ShortCommit }}
+      - -X github.com/gallowaysoftware/vibe/internal/buildinfo.Date={{ .CommitDate }}
+
+archives:
+  - id: vibe-archive
+    ids:
+      - vibe
+      - vamp
+    # Produces vibe_<version>_<os>_<arch>.tar.gz containing both binaries plus
+    # README, LICENSE, and the starter profile examples. Version is the bare
+    # tag (e.g. 1.2.3) — the `v` prefix is stripped by goreleaser's default
+    # name template (`{{ .Version }}`).
+    name_template: >-
+      vibe_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    formats:
+      - tar.gz
+    files:
+      - README.md
+      - LICENSE
+      - src: profiles/*.example.yaml
+        dst: profiles
+        info:
+          mode: 0644
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  # Stub: list every commit since the previous tag. Wire up a richer
+  # template (groups, scopes, etc.) once the release cadence stabilises.
+  use: git
+  sort: asc
+
+release:
+  # Draft to false so the published tag is immediately visible; the install
+  # script keys off /releases/latest which only resolves to non-draft tags.
+  draft: false
+  prerelease: auto
