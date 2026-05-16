@@ -3,10 +3,12 @@ package frontend
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
@@ -54,15 +56,45 @@ func defaultCompose() *composeDriver {
 
 // execCommand runs `name args...` with env appended to the current
 // environment and streams stdout/stderr to the daemon's standard handles.
+// On non-zero exit, the last ~4 KiB of stderr is captured into a
+// teeReader-style buffer and wrapped into the returned error so the CLI
+// sees the real "failed to connect to podman socket" / "no such image"
+// detail instead of an opaque `exit status 1`.
 func execCommand(ctx context.Context, name string, args []string, env []string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
 	if len(env) > 0 {
 		cmd.Env = append(os.Environ(), env...)
 	}
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	stderrTail := &tailBuffer{max: 4096}
+	cmd.Stderr = io.MultiWriter(os.Stderr, stderrTail)
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderrTail.String()); msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+		return err
+	}
+	return nil
 }
+
+// tailBuffer keeps only the last `max` bytes written to it. We don't want
+// to balloon the daemon's memory with the full stdout of a compose pull
+// (can be hundreds of MB of layer-progress lines), but the LAST few KB
+// is almost always where the real failure message lives.
+type tailBuffer struct {
+	buf []byte
+	max int
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > t.max {
+		t.buf = t.buf[len(t.buf)-t.max:]
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) String() string { return string(t.buf) }
 
 // httpProbe issues a single GET to url and returns the response status code.
 // Any transport error is returned to the caller, who decides whether to
