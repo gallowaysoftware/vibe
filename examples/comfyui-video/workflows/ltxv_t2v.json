@@ -1,0 +1,101 @@
+{
+  "38": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "t5xxl_fp8_e4m3fn.safetensors",
+      "type": "ltxv",
+      "device": "default"
+    }
+  },
+  "44": {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": {
+      "ckpt_name": "ltxv-2b-0.9.8-distilled-fp8.safetensors"
+    }
+  },
+  "6": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "A cinematic wide shot of a quiet forest path at dawn, soft golden sunlight filtering through tall mossy trees, gentle mist drifting between trunks, leaves slowly falling. Camera holds still while wind sways branches. Photorealistic, high detail, natural color grading.",
+      "clip": ["38", 0]
+    }
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly",
+      "clip": ["38", 0]
+    }
+  },
+  "70": {
+    "class_type": "EmptyLTXVLatentVideo",
+    "inputs": {
+      "width": 512,
+      "height": 320,
+      "length": 49,
+      "batch_size": 1
+    }
+  },
+  "69": {
+    "class_type": "LTXVConditioning",
+    "inputs": {
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "frame_rate": 25
+    }
+  },
+  "73": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "euler"
+    }
+  },
+  "71": {
+    "class_type": "LTXVScheduler",
+    "inputs": {
+      "steps": 20,
+      "max_shift": 2.05,
+      "base_shift": 0.95,
+      "stretch": true,
+      "terminal": 0.1,
+      "latent": ["70", 0]
+    }
+  },
+  "72": {
+    "class_type": "SamplerCustom",
+    "inputs": {
+      "add_noise": true,
+      "noise_seed": 42,
+      "cfg": 3.0,
+      "model": ["44", 0],
+      "positive": ["69", 0],
+      "negative": ["69", 1],
+      "sampler": ["73", 0],
+      "sigmas": ["71", 0],
+      "latent_image": ["70", 0]
+    }
+  },
+  "8": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["72", 0],
+      "vae": ["44", 2]
+    }
+  },
+  "78": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "images": ["8", 0],
+      "fps": 24
+    }
+  },
+  "79": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": ["78", 0],
+      "filename_prefix": "vamp_ltx",
+      "format": "auto",
+      "codec": "auto"
+    }
+  }
+}

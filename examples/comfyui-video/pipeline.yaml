@@ -1,24 +1,27 @@
-name: video_basic_smoke
+name: ltxv_video_smoke
 description: |
-  Minimal ComfyUI video pipeline. Demonstrates the plumbing that lets vamp
-  collect non-image outputs (SaveVideo / VHS_VideoCombine) from a workflow
-  and copy them into the run dir. This file is not a runnable smoke against
-  a real model unless you separately install LTX-Video — see README.md.
+  Single-stage vamp pipeline that submits an LTX-Video 2B workflow to
+  ComfyUI and copies the resulting MP4 into the run dir. Demonstrates
+  that the comfyui executor's NodeOutputs.Videos / collectOutputs path
+  works against a real video-generating workflow.
+
+  Requires:
+    - vibe `comfyui` profile pointing at ~/ComfyUI
+    - ~/ComfyUI/models/checkpoints/ltxv-2b-0.9.8-distilled-fp8.safetensors
+    - ~/ComfyUI/models/text_encoders/t5xxl_fp8_e4m3fn.safetensors
+  Both files are public on HuggingFace (Lightricks/LTX-Video and
+  comfyanonymous/flux_text_encoders).
 
 inputs:
-  scene:
+  prompt:
     type: string
     required: true
-  seed:
-    type: integer
-    default: 42
 
 stages:
   - id: render
     type: comfyui
     capability: image_gen
-    workflow: workflows/video_basic.json
+    workflow: workflows/ltxv_t2v.json
     parameters:
-      "2.text": "{{.inputs.scene}}"
-      "5.seed": "{{.inputs.seed}}"
-    output: assets/video.mp4
+      "6.text": "{{.inputs.prompt}}"
+    output: video.mp4
