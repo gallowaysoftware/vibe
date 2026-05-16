@@ -151,6 +151,7 @@ capabilities:
 | `vamp list` | List pipelines under `$XDG_CONFIG_HOME/vamp/pipelines/`. |
 | `vamp capabilities` | Print the resolved capability table. |
 | `vamp runs ls/show/cleanup` | History across run dirs under `$XDG_STATE_HOME/vamp/runs/`. |
+| `vamp diff <run-a> <run-b>` | Side-by-side comparison of two runs: pipeline YAML, inputs, per-stage prompt / output / status / duration. `--json` for a machine-readable shape, `--stage <id>` to narrow, `--no-content` for metadata only. Honors `NO_COLOR`. |
 | `vamp jobs ls/show/cancel` | Detached-run management. |
 | `vamp logs <id> [-f]` | Cat or follow the detached worker's log. |
 | `vamp cancel <id>` | SIGTERM a detached worker (same as `jobs cancel`). |
