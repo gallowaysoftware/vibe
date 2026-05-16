@@ -384,6 +384,17 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 		d.prx.SetBackend(backendURL)
 
 		if p.Frontend.Kind != "" {
+			// Pre-create the per-profile frontend state dir so docker-compose
+			// bind mounts (and any other path the profile points inside it)
+			// don't fail with a "no such directory" race the first time a
+			// profile activates. Cheap idempotent mkdir.
+			stateDir := paths.FrontendStateDir(p.Name)
+			if err := os.MkdirAll(stateDir, 0o755); err != nil {
+				_ = d.sup.Stop(context.Background())
+				d.prx.SetBackend(nil)
+				return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("create frontend state dir %s: %w", stateDir, err))
+			}
+
 			vibeAPI := fmt.Sprintf("http://127.0.0.1:%d/v1", d.cfg.ProxyPort)
 			ectx := profile.ExpandContext{
 				VibeAPI:      vibeAPI,

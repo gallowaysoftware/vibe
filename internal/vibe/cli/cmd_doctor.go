@@ -219,6 +219,7 @@ func runChecks(ctx context.Context, env *doctorEnv) []checkResult {
 	results = append(results, checkProxyPort(ctx, env, st.daemonOnControl))
 
 	results = append(results, checkProfiles())
+	results = append(results, checkFrontendState())
 	results = append(results, checkMCPs())
 
 	if st.daemonOnControl {
@@ -514,6 +515,37 @@ func checkProfilesAt(dir string) checkResult {
 		status = statusWarn
 	}
 	return checkResult{Name: name, Status: status, Message: msg}
+}
+
+// checkFrontendState surfaces where per-profile frontend state lives so
+// users can find their Open WebUI db, opencode config, etc. without
+// spelunking through container volumes or grepping CLAUDE.md. The dir is
+// created lazily on profile activation; missing-here is fine.
+func checkFrontendState() checkResult {
+	const name = "frontend state"
+	root := paths.FrontendStateRoot()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return checkResult{Name: name, Status: statusInfo, Message: root + " (not yet created — populated on first profile start)"}
+		}
+		return checkResult{Name: name, Status: statusWarn, Message: err.Error()}
+	}
+	var profs []string
+	for _, e := range entries {
+		if e.IsDir() {
+			profs = append(profs, e.Name())
+		}
+	}
+	sort.Strings(profs)
+	if len(profs) == 0 {
+		return checkResult{Name: name, Status: statusInfo, Message: root + " (empty)"}
+	}
+	return checkResult{
+		Name:    name,
+		Status:  statusInfo,
+		Message: fmt.Sprintf("%s (profiles: %s)", root, strings.Join(profs, ", ")),
+	}
 }
 
 func checkMCPs() checkResult {

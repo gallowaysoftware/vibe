@@ -41,6 +41,19 @@ func ProfilesDir() string { return filepath.Join(ConfigHome(), "profiles") }
 func MCPDir() string      { return filepath.Join(ConfigHome(), "mcp") }
 func ConfigFile() string  { return filepath.Join(ConfigHome(), "config.yaml") }
 
+// FrontendStateRoot is the parent dir that holds per-profile frontend
+// state (opencode config files, Open WebUI bind-mount data, etc.).
+// Each profile gets a subdirectory keyed on its name.
+func FrontendStateRoot() string { return filepath.Join(StateHome(), "frontend") }
+
+// FrontendStateDir is the per-profile state dir under FrontendStateRoot.
+// Vibe ensures this exists at profile-activate time so docker-compose
+// bind mounts pointing inside it don't fail when the user has never
+// activated the profile before.
+func FrontendStateDir(profile string) string {
+	return filepath.Join(FrontendStateRoot(), profile)
+}
+
 // TokenFile is the path to the daemon's bearer-token file. The token lives in
 // $XDG_STATE_HOME/vibe rather than $XDG_CONFIG_HOME because it's a generated
 // runtime secret, not user-authored configuration — same reasoning that puts
