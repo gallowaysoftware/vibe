@@ -74,7 +74,8 @@ func newAPI(apiURL string) (vibeAPI, string) {
 				},
 			},
 		}
-		c := vibeclient.NewWithHTTPClient("http://vibe.local", hc)
+		// Unix socket: no token required (filesystem perms gate access).
+		c := vibeclient.NewWithHTTPClient("http://vibe.local", hc, "")
 		return vibeClientAdapter{c: c}, "unix://" + sock
 	}
 	c := vibeclient.New(apiURL)

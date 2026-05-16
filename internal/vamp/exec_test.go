@@ -101,7 +101,7 @@ func TestExecutor_SequentialStagesShareOutputs(t *testing.T) {
 	exec := &Executor{
 		Pipeline:     pipeline,
 		Capabilities: caps,
-		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client()),
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client(), ""),
 		Inputs:       map[string]string{"topic": "robots"},
 		RunDir:       runDir,
 	}
@@ -134,7 +134,7 @@ func TestExecutor_MissingCapabilityErrors(t *testing.T) {
 			Stages: []Stage{{ID: "a", Capability: "vision", Prompt: "x", Output: "a.txt"}},
 		},
 		Capabilities: caps,
-		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client()),
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client(), ""),
 		RunDir:       t.TempDir(),
 	}
 	err := exec.Run(context.Background())
@@ -203,7 +203,7 @@ func TestExecutor_StreamsTokensToLog(t *testing.T) {
 			},
 		},
 		Capabilities: &Capabilities{Mapping: map[string]string{"reasoning": "code"}},
-		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client()),
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client(), ""),
 		RunDir:       runDir,
 		Log:          &logBuf,
 	}
@@ -255,7 +255,7 @@ func TestExecutor_JSONOutputFormatRejectsBadJSON(t *testing.T) {
 			},
 		},
 		Capabilities: &Capabilities{Mapping: map[string]string{"r": "code"}},
-		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client()),
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client(), ""),
 		RunDir:       t.TempDir(),
 	}
 	err := exec.Run(context.Background())
@@ -286,7 +286,7 @@ func stubExecutor(t *testing.T, pipeline *Pipeline, caps *Capabilities, inf Infe
 	exec := &Executor{
 		Pipeline:     pipeline,
 		Capabilities: caps,
-		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client()),
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client(), ""),
 		RunDir:       runDir,
 		Inference:    inf,
 	}
@@ -1484,7 +1484,7 @@ func TestExecutor_WritesPipelineJSON(t *testing.T) {
 	exec := &Executor{
 		Pipeline:     pipeline,
 		Capabilities: caps,
-		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client()),
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client(), ""),
 		RunDir:       runDir,
 	}
 	if err := exec.Run(context.Background()); err != nil {
@@ -1538,7 +1538,7 @@ func TestExecutor_PipelineJSONOnError(t *testing.T) {
 	exec := &Executor{
 		Pipeline:     pipeline,
 		Capabilities: caps,
-		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client()),
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client(), ""),
 		RunDir:       runDir,
 	}
 	if err := exec.Run(context.Background()); err == nil {
@@ -1587,7 +1587,7 @@ func TestExecutor_WritesPipelineTimingJSON(t *testing.T) {
 			},
 		},
 		Capabilities: &Capabilities{Mapping: map[string]string{"reasoning": "code"}},
-		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client()),
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client(), ""),
 		RunDir:       runDir,
 		Log:          &logBuf,
 	}

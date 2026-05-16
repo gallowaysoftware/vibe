@@ -222,7 +222,7 @@ func unixClient(t *testing.T) *vibeclient.Client {
 			},
 		},
 	}
-	return vibeclient.NewWithHTTPClient("http://vibe.local", hc)
+	return vibeclient.NewWithHTTPClient("http://vibe.local", hc, "")
 }
 
 func makeDaemon(t *testing.T) *daemon.Daemon {

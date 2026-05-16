@@ -7,6 +7,8 @@ import (
 	"context"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"connectrpc.com/connect"
 
@@ -22,22 +24,105 @@ type Client struct {
 
 // New returns a Client targeting vibe's control plane. baseURL is the first
 // non-empty of: argument, $VIBE_API, DefaultBaseURL.
+//
+// The bearer token (required for TCP control-plane RPCs; ignored on the
+// unix-socket path) is discovered automatically — see ResolveToken. Use
+// NewWithToken if you need to supply it explicitly.
 func New(baseURL string) *Client {
-	return NewWithHTTPClient(baseURL, http.DefaultClient)
+	return NewWithToken(baseURL, ResolveToken())
+}
+
+// NewWithToken is like New but takes an explicit bearer token. Pass "" to
+// skip the Authorization header entirely (appropriate for unix-socket
+// clients).
+func NewWithToken(baseURL, token string) *Client {
+	return NewWithHTTPClient(baseURL, http.DefaultClient, token)
 }
 
 // NewWithHTTPClient is for callers who need to control the transport — e.g.
-// the vibe CLI, which dials a unix socket instead of TCP.
-func NewWithHTTPClient(baseURL string, hc *http.Client) *Client {
+// the vibe CLI, which dials a unix socket instead of TCP. The token is
+// passed as a separate argument because it's a Connect-level concern (an
+// interceptor on the rpc client), independent of how the bytes get to the
+// daemon. Unix-socket callers should pass "" for token.
+func NewWithHTTPClient(baseURL string, hc *http.Client, token string) *Client {
 	if baseURL == "" {
 		baseURL = os.Getenv("VIBE_API")
 	}
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
-	return &Client{
-		rpc: vibev1connect.NewControlServiceClient(hc, baseURL),
+	var opts []connect.ClientOption
+	if token != "" {
+		opts = append(opts, connect.WithInterceptors(bearerAuthInterceptor(token)))
 	}
+	return &Client{
+		rpc: vibev1connect.NewControlServiceClient(hc, baseURL, opts...),
+	}
+}
+
+// ResolveToken returns the bearer token to use for TCP requests. Priority:
+//  1. $VIBE_TOKEN (the documented way to inject one on a remote laptop).
+//  2. $XDG_STATE_HOME/vibe/token (works without setup on the same machine).
+//  3. "" — no token available; callers will get 401 from a remote daemon.
+//
+// Returning "" intentionally lets unix-socket callers work seamlessly: they
+// pass the token through but the daemon doesn't check it on the unix
+// listener.
+func ResolveToken() string {
+	if v := strings.TrimSpace(os.Getenv("VIBE_TOKEN")); v != "" {
+		return v
+	}
+	data, err := os.ReadFile(tokenFilePath())
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// tokenFilePath duplicates a tiny piece of paths.TokenFile here so the
+// vibeclient package stays free of internal/vibe/paths (the SDK is consumed
+// by vamp and could one day live in a separate repo).
+func tokenFilePath() string {
+	stateHome := os.Getenv("XDG_STATE_HOME")
+	if stateHome == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		stateHome = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(stateHome, "vibe", "token")
+}
+
+// bearerAuthInterceptor injects `Authorization: Bearer <token>` on every
+// outgoing RPC (unary + streaming).
+func bearerAuthInterceptor(token string) connect.Interceptor {
+	header := "Bearer " + token
+	return &authInterceptor{header: header}
+}
+
+type authInterceptor struct {
+	header string
+}
+
+func (a *authInterceptor) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
+	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+		req.Header().Set("Authorization", a.header)
+		return next(ctx, req)
+	}
+}
+
+func (a *authInterceptor) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
+	return func(ctx context.Context, spec connect.Spec) connect.StreamingClientConn {
+		conn := next(ctx, spec)
+		conn.RequestHeader().Set("Authorization", a.header)
+		return conn
+	}
+}
+
+func (a *authInterceptor) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
+	// Client-only interceptor; the handler side does nothing.
+	return next
 }
 
 func (c *Client) Status(ctx context.Context) (*vibev1.Status, error) {

@@ -103,7 +103,10 @@ func defaultDaemonStatus(ctx context.Context, addr string) (string, error) {
 			},
 		},
 	}
-	c := vibeclient.NewWithHTTPClient("http://"+addr, hc)
+	// Probe runs locally against the daemon's TCP listener; resolve the
+	// token from $VIBE_TOKEN or the on-disk file so a bind_all daemon
+	// doesn't fail this check with 401.
+	c := vibeclient.NewWithHTTPClient("http://"+addr, hc, vibeclient.ResolveToken())
 	s, err := c.Status(ctx)
 	if err != nil {
 		return "", err
