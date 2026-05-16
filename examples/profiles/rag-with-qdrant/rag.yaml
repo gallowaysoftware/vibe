@@ -53,7 +53,7 @@ frontend:
     # under 10 s end-to-end.
     - url: http://127.0.0.1:6333/readyz
       timeout: 60s
-    - url: http://127.0.0.1:8081/health
+    - url: http://127.0.0.1:14002/health
       timeout: 600s
     - url: http://127.0.0.1:8080/
       timeout: 180s

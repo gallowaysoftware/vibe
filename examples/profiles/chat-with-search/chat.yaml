@@ -50,7 +50,7 @@ frontend:
     # this example. Must contain a settings.yml with a real secret_key.
     SEARXNG_CONFIG: ~/.config/vibe/compose/chat/searxng
   wait_for:
-    - url: http://127.0.0.1:8888/healthz
+    - url: http://127.0.0.1:14001/healthz
       timeout: 120s
     - url: http://127.0.0.1:8080/
       timeout: 120s

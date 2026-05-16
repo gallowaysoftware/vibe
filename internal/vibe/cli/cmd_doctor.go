@@ -462,8 +462,9 @@ func checkCommonPorts() checkResult {
 	}
 	probes := []p{
 		{8080, "Open WebUI"},
-		{8081, "TEI embeddings"},
-		{8888, "SearXNG"},
+		{14001, "SearXNG (vibe-chat sidecar)"},
+		{14002, "TEI embeddings (vibe-rag sidecar)"},
+		{14003, "TEI Prometheus (vibe-rag sidecar)"},
 		{6333, "Qdrant REST"},
 		{6334, "Qdrant gRPC"},
 	}
@@ -475,7 +476,7 @@ func checkCommonPorts() checkResult {
 		}
 	}
 	if len(bound) == 0 {
-		return checkResult{Name: name, Status: statusOK, Message: "8080/8081/8888/6333/6334 free"}
+		return checkResult{Name: name, Status: statusOK, Message: "8080/14001/14002/14003/6333/6334 free"}
 	}
 	return checkResult{
 		Name:    name,

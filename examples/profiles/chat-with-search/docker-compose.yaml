@@ -35,7 +35,7 @@ services:
       # Web search via SearXNG sidecar.
       - ENABLE_RAG_WEB_SEARCH=True
       - RAG_WEB_SEARCH_ENGINE=searxng
-      - SEARXNG_QUERY_URL=http://127.0.0.1:8888/search?q=<query>
+      - SEARXNG_QUERY_URL=http://127.0.0.1:14001/search?q=<query>
       - RAG_WEB_SEARCH_RESULT_COUNT=5
       - RAG_WEB_SEARCH_CONCURRENT_REQUESTS=10
     volumes:
@@ -52,8 +52,9 @@ services:
       - ${SEARXNG_CONFIG}:/etc/searxng
     environment:
       # Modern SearXNG images alias SEARXNG_PORT → granian --port at
-      # startup; settings.yml server.port is ignored. Move SearXNG off
-      # 8080 so Open WebUI can have it.
-      - SEARXNG_PORT=8888
-      - SEARXNG_BASE_URL=http://127.0.0.1:8888/
+      # startup; settings.yml server.port is ignored. Picked 14001
+      # rather than the SearXNG default 8888 — that collides with
+      # Jupyter notebook for ML users.
+      - SEARXNG_PORT=14001
+      - SEARXNG_BASE_URL=http://127.0.0.1:14001/
     restart: unless-stopped

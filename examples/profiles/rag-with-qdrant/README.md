@@ -56,18 +56,19 @@ vibe start rag
 | 9000 | OpenAI-compat proxy (chat LLM) | **vibe** |
 | 9001 | Control plane | **vibe** |
 | 8080 | Open WebUI | this stack |
-| 8081 | TEI embeddings (OpenAI-compat) | this stack |
+| 14002 | TEI embeddings (OpenAI-compat) | this stack |
+| 14003 | TEI Prometheus metrics | this stack |
 | 6333 | Qdrant REST | this stack |
 | 6334 | Qdrant gRPC | this stack |
-| 9100 | TEI Prometheus metrics | this stack |
 
 **Gotcha worth knowing:** TEI defaults its Prometheus metrics endpoint
-to **port 9000**, which collides with vibe's OpenAI-compat proxy. The
-compose file passes `--prometheus-port=9100` to TEI to avoid this.
-Without the override, TEI crash-loops on "Address already in use" and
-the `wait_for` timeout fires after 600s with an opaque "TEI didn't
-come up" error. If you ever swap the TEI image version, keep that
-flag in place.
+to **port 9000**, which collides with vibe's OpenAI-compat proxy.
+TEI's main HTTP port defaults to 8081 (Sonatype Nexus collision risk)
+and TEI's Prometheus default 9100 collides with node_exporter. The
+compose file overrides both via `--port=14002` and
+`--prometheus-port=14003` to land somewhere low-collision. Without
+those overrides TEI crash-loops on "Address already in use" and the
+`wait_for` times out with an opaque "TEI didn't come up" error.
 
 ## State
 
