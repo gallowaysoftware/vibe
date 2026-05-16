@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/mattn/go-isatty"
 )
 
 // confirmExecutor implements StageExecutor for `type: confirm` stages — the
@@ -156,23 +158,18 @@ func (c *confirmExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 }
 
 // detectTTY decides between the foreground (stdin-driven) and the
-// external-command (marker-file-driven) paths. The spec mandates the
-// stdlib portable form `(os.Stdin.Stat().Mode() & os.ModeCharDevice) != 0`
-// — true on a real terminal, false on a redirected stdin (`<`, pipes,
-// /dev/null, the Setsid'd detached worker). Tests override this via
-// isStdinTTYForTest.
+// external-command (marker-file-driven) paths. We need a real isatty
+// check here, not the Stat-mode shortcut: /dev/null is also a character
+// device (the detached worker's stdin), so ModeCharDevice alone would
+// route detached runs to the foreground prompt and hang on a read that
+// returns EOF — which then rejects every confirm gate. isatty issues
+// the termios ioctl, which only succeeds on a real terminal. Tests
+// override this via isStdinTTYForTest.
 func (c *confirmExecutor) detectTTY() bool {
 	if c.isStdinTTYForTest != nil {
 		return c.isStdinTTYForTest()
 	}
-	info, err := os.Stdin.Stat()
-	if err != nil {
-		// On stat failure assume we're not on a TTY; falling through to
-		// the marker-file path is the safer default for a daemonized
-		// worker that has redirected stdin away from a terminal.
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
+	return isatty.IsTerminal(os.Stdin.Fd())
 }
 
 // executeForeground prints the rendered prompt to in.Log (the executor's
