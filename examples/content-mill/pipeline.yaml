@@ -1,0 +1,119 @@
+# content-mill: end-to-end demo pipeline showcasing every vamp stage type
+# stacked together. Outputs a finished MP4 + a webhook ping announcing it.
+#
+# Stages:
+#   script   - LLM writes a short narration (text)
+#   cover    - LLM emits scene prompt as JSON (text, output_format: json)
+#   render   - ComfyUI renders one cover image (comfyui, foreach over cover's 1-item JSON)
+#   voice    - Piper TTS narrates the script (audio)
+#   assemble - ffmpeg muxes the cover image (looped) + narration into MP4
+#   notify   - Slack/Discord/Mattermost webhook announces completion (webhook)
+#
+# Run:
+#   vamp run examples/content-mill/pipeline.yaml --input topic="..."
+#
+# The notify stage reads its URL from $VAMP_SLACK_WEBHOOK. If unset, it
+# POSTs to a literal "no-op://" URL which the executor rejects so the
+# whole pipeline fails before the network call leaves the machine. Set
+# the env var (or skip the notify stage) before running for real.
+
+name: content_mill
+description: text -> image -> TTS -> ffmpeg -> webhook end-to-end demo
+
+inputs:
+  topic:
+    type: string
+    required: true
+
+stages:
+  - id: script
+    type: text
+    capability: reasoning
+    prompt: |
+      Write exactly two sentences of narration for a short video about
+      "{{.inputs.topic}}". Plain prose. No markdown, no titles, no
+      numbered lists. Aim for ~30 spoken words total.
+    output: script.txt
+    params:
+      max_tokens: 2048
+      temperature: 0.4
+
+  - id: cover
+    type: text
+    capability: reasoning
+    inputs: [script]
+    prompt: |
+      Given this two-sentence narration:
+
+      "{{.stages.script.output}}"
+
+      Emit a JSON array with exactly ONE element shaped:
+        [{"description": "<vivid still-image scene capturing the topic>", "seed": <integer>}]
+
+      Keep description under 30 words; cinematic style; no people's
+      faces. Seed is a positive integer. Output ONLY the JSON.
+    output: cover.json
+    output_format: json
+    params:
+      max_tokens: 4096
+      temperature: 0.5
+
+  - id: render
+    type: comfyui
+    capability: image_gen
+    inputs: [cover]
+    workflow: ../comfyui-image-batch/workflows/sdxl_turbo.json
+    foreach: { from: cover, var: scene }
+    parameters:
+      "4.text": "{{.scene.description}}"
+      "7.seed": "{{.scene.seed}}"
+    output: cover_{{.i}}.png
+
+  - id: voice
+    type: audio
+    inputs: [script]
+    voice: en_US-lessac-medium
+    text: "{{.stages.script.output}}"
+    output: voice.wav
+
+  - id: assemble
+    type: ffmpeg
+    inputs: [render, voice]
+    # Quiet ffmpeg's verbose default output: vamp's stderr tail-ring
+    # returns short writes when ffmpeg's banner + libx264 stats overflow
+    # the ring, which ffmpeg surfaces as a non-zero exit "short write"
+    # error. -hide_banner + -loglevel error keeps the output minimal.
+    ffmpeg_args:
+      - "-hide_banner"
+      - "-loglevel"
+      - "error"
+      - "-loop"
+      - "1"
+      - "-framerate"
+      - "25"
+      - "-i"
+      - "{{ .runDir }}/{{ index .stages.render.outputs 0 }}"
+      - "-i"
+      - "{{ .runDir }}/{{ .stages.voice.output }}"
+      - "-map"
+      - "0:v"
+      - "-map"
+      - "1:a"
+      - "-c:v"
+      - "libx264"
+      - "-pix_fmt"
+      - "yuv420p"
+      - "-c:a"
+      - "aac"
+      - "-b:a"
+      - "192k"
+      - "-shortest"
+    output: final.mp4
+
+  - id: notify
+    type: webhook
+    inputs: [assemble]
+    url: "{{ env \"VAMP_SLACK_WEBHOOK\" }}"
+    body:
+      text: "vamp content-mill done for '{{.inputs.topic}}'. Run dir: {{.runDir}}"
+    output: webhook_response.txt
