@@ -106,6 +106,18 @@ disk, including per-foreach-item granularity (a failed item in an
 otherwise-successful foreach stage re-runs only that item). Snapshot
 drift aborts unless `--resume-force` is set.
 
+**Content-addressed cache.** Cacheable stages (`text`, `comfyui`,
+`audio`, `ffmpeg`) hash their full input — prompt/params/model for
+text, post-substitution workflow JSON for ComfyUI, rendered text +
+voice-model size for audio, rendered argv + per-input-file sha256 for
+ffmpeg — and store outputs under `$XDG_CACHE_HOME/vamp/sha256/<2>/<full>`.
+Across runs, unchanged stages short-circuit to a cache hit; a single
+tweaked prompt reruns only that stage (plus everything downstream).
+Foreach is per-item: changing 3 items of a 50-item foreach reuses 47.
+Disable with `cache: false` on the pipeline or stage, `--no-cache`, or
+`VAMP_NO_CACHE=1`. `webhook` and `youtube` are never cached (network
+side effects). Inspect with `vamp cache {ls,size,prune,clean}`.
+
 **Detach.** `vamp run --detach` forks a setsid'd worker, writes
 `vamp.pid` + `vamp.log` into the run dir, and returns the job id. Drive
 it with `vamp jobs ls/show/cancel` and `vamp logs <id> [-f]`.
@@ -146,7 +158,7 @@ capabilities:
 
 | Command | Purpose |
 | --- | --- |
-| `vamp run <pipeline.yaml>` | Execute. Flags: `--detach`, `--resume <dir>`, `--resume-force`, `--dry-run`, `--input k=v`. |
+| `vamp run <pipeline.yaml>` | Execute. Flags: `--detach`, `--resume <dir>`, `--resume-force`, `--dry-run`, `--no-cache`, `--input k=v`. |
 | `vamp validate <pipeline.yaml>` | Parse + schema-check without running. |
 | `vamp list` | List pipelines under `$XDG_CONFIG_HOME/vamp/pipelines/`. |
 | `vamp capabilities` | Print the resolved capability table. |
@@ -156,6 +168,7 @@ capabilities:
 | `vamp cancel <id>` | SIGTERM a detached worker (same as `jobs cancel`). |
 | `vamp viz <pipeline.yaml>` | Mermaid `flowchart TD` of the DAG; `--show-inputs` for the input block. |
 | `vamp schema` | Emit the pipeline JSON Schema (draft-07); `--out <file>` to write. |
+| `vamp cache ls/size/prune/clean` | Inspect and manage the content-addressed cache under `$XDG_CACHE_HOME/vamp/`. |
 
 ## Remote access
 

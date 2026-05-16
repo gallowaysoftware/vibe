@@ -21,6 +21,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/gallowaysoftware/vibe/internal/vamp/cache"
 	"github.com/gallowaysoftware/vibe/internal/vibeclient"
 	vibev1 "github.com/gallowaysoftware/vibe/proto/vibe/v1"
 )
@@ -215,6 +216,14 @@ type Executor struct {
 	// scheduler's per-wave/per-capability concurrency above; it only governs
 	// fan-out *within* one Stage.Foreach invocation.
 	MaxForeachConcurrency int
+
+	// Cache, when non-nil, enables the content-addressed cache layer.
+	// nil keeps the prior behaviour (no caching, no extra disk writes).
+	// Callers that want caching should construct the store via
+	// cache.New(cache.DefaultRoot()) and stash it here. Per-pipeline and
+	// per-stage opt-outs are honoured by computeStageCacheKey regardless
+	// of this field being set.
+	Cache *cache.Store
 
 	// in-memory state populated during Run
 	mu                 sync.Mutex // guards stageOutputs and the model cache
@@ -1161,7 +1170,48 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 // final-attempt log message and the early-return path both see the correct
 // value. itemTag, when non-empty, is appended to log lines so the foreach
 // per-item retry loop produces a unique header.
+//
+// Cache integration: before any executor call we check the content-addressed
+// cache (when enabled). On hit the cached bytes/text become the StageOutput
+// without invoking the executor; on miss we run the executor and write the
+// result back. Both cache lookups and writes are best-effort — a failed
+// cache write logs a slog.Warn but does not fail the run.
 func (e *Executor) runWithRetry(ctx context.Context, st *Stage, exec StageExecutor, in StageInput) (*StageOutput, error) {
+	// Cache pre-check: when the cache layer is enabled and this stage type
+	// is eligible, compute the key and try Get before paying for the
+	// executor call. A cache miss falls through to the normal retry path
+	// below; a hit short-circuits with the cached payload.
+	cacheKey, _ := e.computeStageCacheKey(st, in.Item, in.ItemIdx)
+	if hit, err := e.tryCacheGet(cacheKey); err != nil {
+		slog.Warn("cache get failed", "stage", st.ID, "key", cacheKey, "err", err)
+	} else if hit != nil {
+		out, err := e.materializeCacheHit(ctx, st, in, hit)
+		if err != nil {
+			// Materialisation failure is a real run error (couldn't write
+			// the cached bytes into the run dir for downstream consumers).
+			// Treat as a cache miss and fall through so the stage gets a
+			// fresh executor invocation.
+			slog.Warn("cache materialize failed; falling through to live execute", "stage", st.ID, "err", err)
+		} else {
+			e.logf("  -> stage %q: cache hit (%s)", st.ID, cacheKey[:12])
+			return out, nil
+		}
+	}
+	// Live execute path with optional retry, followed by cache write on
+	// success. The cache write is best-effort and never fails the run.
+	out, err := e.runWithRetryInner(ctx, st, exec, in)
+	if err == nil && cacheKey != "" {
+		if putErr := e.tryCachePut(cacheKey, string(stageTypeOrDefault(st)), out); putErr != nil {
+			slog.Warn("cache put failed", "stage", st.ID, "key", cacheKey, "err", putErr)
+		}
+	}
+	return out, err
+}
+
+// runWithRetryInner is the cacheless retry loop body extracted from
+// runWithRetry so the cache wrapper can compose cleanly around it. Its
+// semantics match the pre-cache behaviour exactly.
+func (e *Executor) runWithRetryInner(ctx context.Context, st *Stage, exec StageExecutor, in StageInput) (*StageOutput, error) {
 	policy := st.Retry
 	// Fast path: no policy (nil) or single-attempt policy means "no retry".
 	// Skip the loop entirely so the existing call graph is unchanged for

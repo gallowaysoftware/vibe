@@ -8,6 +8,18 @@
   the pre-flight check, and (c) a vamp scheduler that can run two
   capabilities concurrently when they land on different cards.
 
+## Recently shipped
+
+- **Content-addressed cache** (`feat/content-cache`). Per-stage
+  cache keys derived from rendered prompt/params/model (text),
+  post-substitution workflow JSON (comfyui), rendered text + voice
+  model size (audio), and rendered argv + per-input-file sha256
+  (ffmpeg). Entries land under `$XDG_CACHE_HOME/vamp/sha256/<2>/<hash>/`
+  with `meta.json`; foreach caches per item. Opt-out via
+  pipeline-level `cache: false`, per-stage `cache: false`,
+  `--no-cache`, or `VAMP_NO_CACHE=1`. Webhook + YouTube never cached.
+  CLI surface: `vamp cache ls/size/prune/clean`.
+
 ## History (phases 1 + 2, done)
 
 The bulk of the original phase-1 + phase-2 plan has shipped over the

@@ -30,6 +30,7 @@ func rootCmd() *cobra.Command {
 		cancelCmd(),
 		vizCmd(),
 		schemaCmd(),
+		cacheCmd(),
 	)
 	return root
 }
