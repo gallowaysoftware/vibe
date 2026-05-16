@@ -445,10 +445,10 @@ func pickLlamaLinuxAsset(release *llamaGitHubRelease, cuda bool) struct{ Name, D
 	}
 
 	var (
-		preferred  string
+		preferred    string
 		preferredURL string
-		fallback   string
-		fallbackURL string
+		fallback     string
+		fallbackURL  string
 	)
 	for _, a := range release.Assets {
 		name := strings.ToLower(a.Name)

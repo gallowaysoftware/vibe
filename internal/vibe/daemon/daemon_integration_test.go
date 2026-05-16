@@ -511,4 +511,3 @@ func TestDaemon_PullForComfyUI(t *testing.T) {
 		t.Errorf("message = %q, want ComfyUI-specific short-circuit", last.Message)
 	}
 }
-

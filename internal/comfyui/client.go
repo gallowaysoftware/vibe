@@ -72,10 +72,10 @@ func (c *Client) BaseURL() string { return c.baseURL }
 
 // promptResponse is the JSON shape ComfyUI returns from POST /prompt.
 type promptResponse struct {
-	PromptID   string                       `json:"prompt_id"`
-	Number     int                          `json:"number"`
-	NodeErrors map[string]nodeErrorEntry    `json:"node_errors"`
-	Error      *promptTopLevelError         `json:"error,omitempty"`
+	PromptID   string                    `json:"prompt_id"`
+	Number     int                       `json:"number"`
+	NodeErrors map[string]nodeErrorEntry `json:"node_errors"`
+	Error      *promptTopLevelError      `json:"error,omitempty"`
 }
 
 // nodeErrorEntry is ComfyUI's per-node error record. The server emits this
@@ -83,16 +83,16 @@ type promptResponse struct {
 // node id, each value with a class_type, a dependent_outputs list, and a list
 // of per-error structs.
 type nodeErrorEntry struct {
-	ClassType        string             `json:"class_type"`
-	DependentOutputs []string           `json:"dependent_outputs"`
-	Errors           []nodeErrorDetail  `json:"errors"`
+	ClassType        string            `json:"class_type"`
+	DependentOutputs []string          `json:"dependent_outputs"`
+	Errors           []nodeErrorDetail `json:"errors"`
 }
 
 type nodeErrorDetail struct {
-	Type         string         `json:"type"`
-	Message      string         `json:"message"`
-	Details      string         `json:"details"`
-	ExtraInfo    map[string]any `json:"extra_info,omitempty"`
+	Type      string         `json:"type"`
+	Message   string         `json:"message"`
+	Details   string         `json:"details"`
+	ExtraInfo map[string]any `json:"extra_info,omitempty"`
 }
 
 // promptTopLevelError is the (rarer) workflow-level validation error
@@ -270,9 +270,9 @@ type History struct {
 
 // HistoryStatus is the status sub-object inside a /history entry.
 type HistoryStatus struct {
-	Completed bool      `json:"completed"`
-	Messages  [][]any   `json:"messages,omitempty"`
-	StatusStr string    `json:"status_str,omitempty"`
+	Completed bool    `json:"completed"`
+	Messages  [][]any `json:"messages,omitempty"`
+	StatusStr string  `json:"status_str,omitempty"`
 }
 
 // NodeOutputs is a node's outputs map. ComfyUI buckets outputs by media kind

@@ -17,14 +17,14 @@ import (
 // model unit tests. It records the most recent action so tests can assert
 // that key presses dispatched the right RPC.
 type stubAPI struct {
-	status       *vibev1.Status
-	profiles     []*vibev1.Profile
-	logs         []string
-	statusErr    error
-	startCalls   []string
-	stopCalls    int
-	startErr     error
-	stopErr      error
+	status     *vibev1.Status
+	profiles   []*vibev1.Profile
+	logs       []string
+	statusErr  error
+	startCalls []string
+	stopCalls  int
+	startErr   error
+	stopErr    error
 }
 
 func (s *stubAPI) Status(ctx context.Context) (*vibev1.Status, error) {
