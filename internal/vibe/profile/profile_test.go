@@ -244,6 +244,49 @@ frontend:
 	}
 }
 
+// TestLoad_ComposeFileTildeExpansion guards the docker-compose path field.
+// Skipped this once and the daemon's stat() failed at activation time with
+// a literal "~" in the path; if it regresses, this test catches it before
+// the user sees it.
+func TestLoad_ComposeFileTildeExpansion(t *testing.T) {
+	home, _ := os.UserHomeDir()
+	dir, err := os.MkdirTemp(home, "vibe-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	modelPath := filepath.Join(dir, "m.gguf")
+	if err := os.WriteFile(modelPath, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	composePath := filepath.Join(dir, "docker-compose.yaml")
+	if err := os.WriteFile(composePath, []byte("services: {x: {image: nginx}}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	rel, _ := filepath.Rel(home, modelPath)
+	composeRel, _ := filepath.Rel(home, composePath)
+
+	yaml := `
+name: x
+backend:
+  llama_server:
+    path: ~/` + rel + `
+    alias: x
+    context: 1024
+frontend:
+  kind: docker-compose
+  app: open-webui
+  compose_file: ~/` + composeRel + `
+`
+	p, err := Load(writeProfile(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Frontend.ComposeFile != composePath {
+		t.Errorf("compose_file = %q, want %q", p.Frontend.ComposeFile, composePath)
+	}
+}
+
 func TestValidate(t *testing.T) {
 	model := stubModelFile(t)
 	comfyDir := stubComfyDir(t)

@@ -181,6 +181,7 @@ func Load(path string) (*Profile, error) {
 	p.Frontend.WriteFile = expandTilde(p.Frontend.WriteFile)
 	p.Frontend.Binary = expandTilde(p.Frontend.Binary)
 	p.Frontend.Workdir = expandTilde(p.Frontend.Workdir)
+	p.Frontend.ComposeFile = expandTilde(p.Frontend.ComposeFile)
 
 	if err := p.Validate(); err != nil {
 		return nil, fmt.Errorf("validate profile %s: %w", path, err)
