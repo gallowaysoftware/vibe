@@ -2,12 +2,15 @@
 # stacked together. Outputs a finished MP4 + a webhook ping announcing it.
 #
 # Stages:
-#   script   - LLM writes a short narration (text)
-#   cover    - LLM emits scene prompt as JSON (text, output_format: json)
-#   render   - ComfyUI renders one cover image (comfyui, foreach over cover's 1-item JSON)
-#   voice    - Piper TTS narrates the script (audio)
-#   assemble - ffmpeg muxes the cover image (looped) + narration into MP4
-#   notify   - Slack/Discord/Mattermost webhook announces completion (webhook)
+#   script         - LLM writes a short narration (text)
+#   cover          - LLM emits scene prompt as JSON (text, output_format: json)
+#   render         - ComfyUI renders one cover image (comfyui, foreach over cover's 1-item JSON)
+#   voice          - Piper TTS narrates the script (audio)
+#   assemble       - ffmpeg muxes the cover image (looped) + narration into MP4
+#   notify         - Slack/Discord/Mattermost webhook announces completion (webhook)
+#   notify_failure - same channel, but only fires when an earlier stage
+#                    fails (run_when: failure). Gives the operator a ping
+#                    even when stage 3 of 7 explodes.
 #
 # Run:
 #   vamp run examples/content-mill/pipeline.yaml --input topic="..."
@@ -115,3 +118,17 @@ stages:
     body:
       text: "vamp content-mill done for '{{.inputs.topic}}'. Run dir: {{.runDir}}"
     output: webhook_response.txt
+
+  # Failure-path notification. run_when: failure makes the executor
+  # schedule this stage only when an earlier stage failed (and the
+  # pipeline overall has the "failed" status). It does NOT declare
+  # `inputs:` on the success-path stages, so it isn't blocked by them.
+  # The {{ .failure_summary }} template binding is populated by the
+  # executor with the first failed stage's id + error message.
+  - id: notify_failure
+    type: webhook
+    run_when: failure
+    url: "{{ env \"VAMP_SLACK_WEBHOOK\" }}"
+    body:
+      text: "vamp content-mill FAILED for '{{ .inputs.topic }}'. Stage: {{ .failure_summary }}."
+    output: notify_failure.txt
