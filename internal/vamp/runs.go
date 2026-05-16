@@ -21,7 +21,7 @@ type RunRecord struct {
 	Name      string        `json:"name"`
 	StartTime time.Time     `json:"start_time"`
 	EndTime   time.Time     `json:"end_time"`
-	Status    string        `json:"status"` // "ok" | "error" | "partial"
+	Status    string        `json:"status"` // "ok" | "error" | "partial" | "canceled"
 	Stages    []StageRecord `json:"stages"`
 }
 

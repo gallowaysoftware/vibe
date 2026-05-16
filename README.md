@@ -196,6 +196,29 @@ a small `pipeline.json` to each run dir on completion that powers
 the listing's pipeline name, stage count, duration, and status
 columns.
 
+### Daemon mode (`vamp run --detach`)
+
+`vamp run pipeline.yaml --detach` forks the run into a background
+`vamp` worker and returns immediately, printing the job id (the
+run-dir basename). The worker writes its pid to `<run-dir>/vamp.pid`,
+streams the same output you'd see from a foreground `vamp run` to
+`<run-dir>/vamp.log`, and lives in its own session so closing the
+parent terminal doesn't hang it up. Manage detached runs with:
+
+```
+vamp jobs ls                        # running + recently-finished jobs
+vamp jobs show <id-or-prefix>       # state, timing, and outputs index
+vamp logs  <id-or-prefix>           # cat vamp.log
+vamp logs  <id-or-prefix> -f        # follow live (exits when the worker pid is gone)
+vamp cancel <id-or-prefix>          # SIGTERM the worker
+```
+
+Cancellation propagates via `signal.NotifyContext` into the executor's
+context; the deferred `pipeline.json` write records `status: "canceled"`
+so subsequent `jobs show` calls explain what happened. The detach
+machinery is Linux-only by virtue of the `Setsid` syscall it uses
+to detach from the parent's tty (the same pattern `vibe daemon` uses).
+
 `vamp viz <pipeline.yaml>` emits a Mermaid `flowchart TD` description of
 the pipeline's DAG to stdout (or `--out <file>`), suitable for pasting
 into a markdown doc or the [Mermaid live editor](https://mermaid.live/).

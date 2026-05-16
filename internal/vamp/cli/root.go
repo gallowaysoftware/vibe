@@ -25,6 +25,9 @@ func rootCmd() *cobra.Command {
 		listCmd(),
 		capabilitiesCmd(),
 		runsCmd(),
+		jobsCmd(),
+		logsCmd(),
+		cancelCmd(),
 		vizCmd(),
 		schemaCmd(),
 	)
