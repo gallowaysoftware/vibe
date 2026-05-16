@@ -1,5 +1,38 @@
 # TODO
 
+## Overnight progress (2026-05-15 → 16)
+
+Five batches of four parallel agent-built features landed since the
+user went to bed. Headline additions:
+
+**vibe**: `doctor` (+ `--install comfyui|llama-cpp`), `tui`,
+`profile init`, `frontend.kind: managed`, `backend.comfyui` as a
+first-class backend supervised alongside llama-server, VRAM
+pre-flight check (`--no-vram-check` bypass), HF download via the
+`hf` CLI for gated repos, shell completion (bash/zsh/fish) with
+dynamic profile-name suggestions, GitHub Actions CI gating
+build / vet / `-race` / gofmt / mod tidy.
+
+**vamp**: stage types `text`, `comfyui`, `audio` (Piper), `ffmpeg`,
+`youtube`, `webhook` (Slack/Discord/Mattermost); DAG executor with
+parallel waves + parallel foreach (configurable cap); ComfyUI
+WebSocket progress (stdlib RFC 6455, polling fallback); video/gif
+output handling; per-stage retry with exponential backoff;
+`--resume <dir>` with snapshot-drift detection + `--resume-force`;
+`--dry-run`; `runs ls/show/cleanup`; `viz` (Mermaid `flowchart TD`);
+per-pipeline timing report + `pipeline_timing.json`; SSE streaming
+for live tokens.
+
+**Architecture**: Connect/protobuf control plane (unix socket + TCP);
+`internal/vibeclient/` typed SDK; `internal/comfyui/` typed REST + WS
+client; slog JSON daemon logs; profile schema migrated to
+`backend.{llama_server,comfyui}` discriminated union.
+
+~376 test functions across 104 Go files; CI green on main. Two
+end-to-end smokes ran against the live GPU during the session: the
+multi-stage Qwen3.6-27B coding pipeline (~2m) and the cross-backend
+SDXL-Turbo image-batch pipeline (~40s) — both produced real artifacts.
+
 ## ~~Installation path~~ (done)
 
 `vibe doctor` is the entry point. It verifies binaries (`llama-server`,
@@ -66,3 +99,22 @@ download a public video checkpoint, run the example end-to-end, and
 confirm the MP4 lands at `<run-dir>/assets/video.mp4` with sensible
 contents. May also need to add a `VHS_VideoCombine`-flavoured variant if
 that turns out to be the more common community node in practice.
+
+## Larger nice-to-haves still on the radar
+
+- VRAM-aware *scheduling* (today's pre-flight rejects when free VRAM is
+  insufficient for the chosen profile; smarter scheduling could pick a
+  smaller capable profile that fits the budget).
+- vamp daemon mode: background runs with job IDs, `vamp logs <id>` to
+  follow live, `vamp jobs ls` for the queue.
+- Per-foreach-item resume (today resume granularity is whole-stage; a
+  failed item in a foreach causes the whole stage to rerun on resume).
+- Real LAN access from a laptop: HTTP control plane is loopback-bound
+  today. Needs auth (the deferred token-based-auth decision from earlier).
+- Multi-GPU scheduling: single-profile-at-a-time invariant assumes one
+  GPU.
+- vamp pipeline JSON-schema export for editor IDE support
+  (yaml-language-server etc.).
+- Webhook-on-failure: today the webhook stage runs as a normal pipeline
+  stage; firing it from a `defer` on pipeline failure (so users get a
+  notification even when stage 3 of 5 explodes) is a separate feature.
