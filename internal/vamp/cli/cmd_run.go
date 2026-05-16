@@ -21,6 +21,7 @@ func runCmd() *cobra.Command {
 		apiFlag         string
 		resumeFlag      string
 		resumeForceFlag bool
+		dryRunFlag      bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run <pipeline.yaml>",
@@ -54,6 +55,20 @@ func runCmd() *cobra.Command {
 			inputs, err := parseInputs(inputFlags, p)
 			if err != nil {
 				return err
+			}
+			// --dry-run rejects flags that only make sense when actually
+			// running the pipeline. Resume / resume-force imply mutating
+			// disk state for a real run; --run-dir overrides the
+			// destination of artifacts dry-run never writes. Each
+			// combination is rejected explicitly so the user sees which
+			// flag conflicts rather than a silent override.
+			if dryRunFlag {
+				if resumeFlag != "" || resumeForceFlag {
+					return fmt.Errorf("--dry-run is incompatible with --resume / --resume-force")
+				}
+				if runDirFlag != "" {
+					return fmt.Errorf("--dry-run is incompatible with --run-dir (no files are written)")
+				}
 			}
 			// Resume short-circuits the timestamped-dir computation:
 			// the resume directory IS the run directory. --run-dir is
@@ -90,6 +105,14 @@ func runCmd() *cobra.Command {
 				exec.ResumeDir = runDir
 				exec.ResumeForce = resumeForceFlag
 			}
+			if dryRunFlag {
+				// Dry-run never touches vibe, never spawns subprocesses,
+				// and never writes outputs. We skip vibe-client + Run
+				// entirely; the executor's other fields (Pipeline,
+				// Capabilities, Inputs, RunDir, Log) are still consulted
+				// by DryRun.
+				return exec.DryRun(ctx)
+			}
 			return exec.Run(ctx)
 		},
 	}
@@ -98,6 +121,7 @@ func runCmd() *cobra.Command {
 	cmd.Flags().StringVar(&apiFlag, "api", "", "vibe control-plane URL (default: $VIBE_API or http://127.0.0.1:9001).")
 	cmd.Flags().StringVar(&resumeFlag, "resume", "", "Resume a previous run from <dir>. Stages whose output files already exist with non-zero size are skipped; missing stages run as usual.")
 	cmd.Flags().BoolVar(&resumeForceFlag, "resume-force", false, "With --resume, skip the safety check that errors out when the pipeline file has changed since the run was started.")
+	cmd.Flags().BoolVar(&dryRunFlag, "dry-run", false, "Render templates and validate per-stage shape without contacting vibe, an LLM, ComfyUI, ffmpeg, Piper, or YouTube. Prints a per-stage plan and a final error/warning count.")
 	return cmd
 }
 
