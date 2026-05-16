@@ -1451,3 +1451,73 @@ func TestExecutor_ExponentialBackoffTiming(t *testing.T) {
 		t.Errorf("gap3 = %s, expected <= 50ms (cap is 25ms, would be 40ms uncapped)", g3)
 	}
 }
+
+// TestExecutor_WritesPipelineTimingJSON verifies that a successful run leaves
+// pipeline_timing.json next to the other run-dir artifacts and that the file
+// contains the expected pipeline name + stage entry.
+func TestExecutor_WritesPipelineTimingJSON(t *testing.T) {
+	stub := &stubControl{}
+	mux := http.NewServeMux()
+	path, handler := vibev1connect.NewControlServiceHandler(stub)
+	mux.Handle(path, handler)
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]string{{"id": "stub"}}})
+	})
+	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]string{"content": "hello"}}},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	stub.proxyURL = srv.URL
+
+	runDir := t.TempDir()
+	var logBuf bytes.Buffer
+	exec := &Executor{
+		Pipeline: &Pipeline{
+			Name: "timing_smoke",
+			Stages: []Stage{
+				{ID: "only", Capability: "reasoning", Prompt: "hi", Output: "only.txt"},
+			},
+		},
+		Capabilities: &Capabilities{Mapping: map[string]string{"reasoning": "code"}},
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client()),
+		RunDir:       runDir,
+		Log:          &logBuf,
+	}
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(runDir, "pipeline_timing.json"))
+	if err != nil {
+		t.Fatalf("read pipeline_timing.json: %v", err)
+	}
+	var rep map[string]any
+	if err := json.Unmarshal(data, &rep); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if rep["pipeline"] != "timing_smoke" {
+		t.Errorf("pipeline = %v, want timing_smoke", rep["pipeline"])
+	}
+	stages, ok := rep["stages"].([]any)
+	if !ok || len(stages) != 1 {
+		t.Fatalf("stages = %v, want 1 entry", rep["stages"])
+	}
+	stage := stages[0].(map[string]any)
+	if stage["id"] != "only" {
+		t.Errorf("stage[0].id = %v, want only", stage["id"])
+	}
+	if stage["status"] != "ok" {
+		t.Errorf("stage[0].status = %v, want ok", stage["status"])
+	}
+	// The deferred summary should also print to Log: at minimum a header
+	// and the stage row land there.
+	logged := logBuf.String()
+	if !strings.Contains(logged, "pipeline \"timing_smoke\" finished in") {
+		t.Errorf("missing summary header in log:\n%s", logged)
+	}
+	if !strings.Contains(logged, "only") {
+		t.Errorf("missing stage row in log:\n%s", logged)
+	}
+}

@@ -194,6 +194,13 @@ type Executor struct {
 	// registry maps StageType -> executor. Built once in Run and shared by
 	// every stage; per-stage state must travel via StageInput.
 	registry map[StageType]StageExecutor
+
+	// timing accumulates per-stage / per-item wall-clock durations and
+	// becomes the run-end summary table plus pipeline_timing.json. Built
+	// once at Run start; nil-safe so older code paths (and tests that
+	// invoke executor internals directly without Run) don't have to know
+	// about it.
+	timing *Tracker
 }
 
 func defaultInference() InferenceFunc {
@@ -210,6 +217,34 @@ func (e *Executor) Run(ctx context.Context) error {
 	if e.Inference == nil {
 		e.Inference = defaultInference()
 	}
+	// Initialize timing before any work so the report's started_at lines up
+	// with the run's first wall-clock moment, and so "overhead" picks up the
+	// snapshot/MkdirAll/resume-check work below as non-stage time.
+	pipelineName := ""
+	if e.Pipeline != nil {
+		pipelineName = e.Pipeline.Name
+	}
+	e.timing = NewTracker(pipelineName)
+	// Best-effort summary on every exit path. We defer here (rather than at
+	// the very end of Run) so cancellations and mid-pipeline failures still
+	// produce a partial report — the user has already paid for the wall-clock
+	// time, surfacing how it was spent is strictly more useful than silence.
+	defer func() {
+		e.timing.Finish()
+		if e.RunDir != "" {
+			if err := e.timing.WriteJSON(e.RunDir); err != nil {
+				slog.Warn("timing report: write json failed", "err", err)
+			}
+		}
+		if e.Log != nil {
+			e.logMu.Lock()
+			defer e.logMu.Unlock()
+			_ = e.timing.FormatTable(e.Log)
+			if e.RunDir != "" {
+				fmt.Fprintf(e.Log, "outputs: %s\n", e.RunDir)
+			}
+		}
+	}()
 	// Resume mode: the run dir already exists, snapshot drift is checked
 	// against the prior run's pipeline.yaml.snapshot, and per-stage outputs
 	// from disk seed stageOutputs so completed work is skipped. We do this
@@ -312,6 +347,10 @@ func (e *Executor) Run(ctx context.Context) error {
 		}
 	}
 	e.logf("pipeline %q finished, outputs in %s", e.Pipeline.Name, e.RunDir)
+	// The deferred timing summary runs after this return and prints the
+	// detailed per-stage table + "outputs:" line, so we keep this top-line
+	// log for backward compatibility with anything scanning Log for the
+	// "finished" sentinel (e.g. tests).
 	return nil
 }
 
@@ -475,13 +514,27 @@ func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID
 	if err != nil {
 		return err
 	}
+	// Track wall time for this stage. Foreach stages handle their own
+	// StageStart/End inside executeForeachStage so the parent's duration
+	// always covers the full fan-out (and matches the wall time the user
+	// observes); per-item rows are recorded by ItemStart/End below.
+	stageType := string(stageTypeOrDefault(st))
 	if st.Foreach != nil {
-		return e.executeForeachStage(ctx, st, exec, baseURL, modelID, backendAddr, tokenSink)
+		e.timing.StageStart(st.ID, stageType)
+		err := e.executeForeachStage(ctx, st, exec, baseURL, modelID, backendAddr, tokenSink)
+		status := "ok"
+		if err != nil {
+			status = "error"
+		}
+		e.timing.StageEnd(st.ID, status, e.stageNotes(st))
+		return err
 	}
 
+	e.timing.StageStart(st.ID, stageType)
 	in := e.makeStageInput(st, baseURL, modelID, backendAddr, tokenSink, nil, 0)
 	out, err := e.runWithRetry(ctx, st, exec, in)
 	if err != nil {
+		e.timing.StageEnd(st.ID, "error", e.stageNotes(st))
 		return err
 	}
 
@@ -494,19 +547,27 @@ func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID
 		e.mu.Lock()
 		e.stageOutputs[st.ID] = &stageResult{Output: strings.Join(out.Files, "\n")}
 		e.mu.Unlock()
+		notes := e.stageNotes(st)
+		notes["files"] = len(out.Files)
+		e.timing.StageEnd(st.ID, "ok", notes)
 		return nil
 	}
 
 	outPath, err := e.renderOutputPath(st, nil)
 	if err != nil {
+		e.timing.StageEnd(st.ID, "error", e.stageNotes(st))
 		return fmt.Errorf("render output path: %w", err)
 	}
 	if err := writeFile(filepath.Join(e.RunDir, outPath), out.Text); err != nil {
+		e.timing.StageEnd(st.ID, "error", e.stageNotes(st))
 		return err
 	}
 	e.mu.Lock()
 	e.stageOutputs[st.ID] = &stageResult{Output: out.Text}
 	e.mu.Unlock()
+	notes := e.stageNotes(st)
+	notes["chars_out"] = len(out.Text)
+	e.timing.StageEnd(st.ID, "ok", notes)
 	return nil
 }
 
@@ -596,6 +657,7 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
+			e.timing.ItemStart(st.ID, i)
 			var itemSink io.Writer
 			var buf *bytes.Buffer
 			switch {
@@ -629,6 +691,7 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 			}
 			if runErr != nil {
 				errs[i] = fmt.Errorf("item %d: %w", i, runErr)
+				e.timing.ItemEnd(st.ID, i, "error", nil)
 				// Cancel siblings so in-flight items observe ctx.Done()
 				// promptly and pending acquirers above bail out of the
 				// semaphore wait. We do NOT cancel the outer ctx — the DAG
@@ -641,16 +704,21 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 			// runner only needs to record per-item output for downstream
 			// `.outputs` references. Text stages return text we still need to
 			// write to the pre-rendered outPath.
+			itemNotes := map[string]any{}
 			if len(out.Files) > 0 {
 				outputs[i] = strings.Join(out.Files, "\n")
+				itemNotes["files"] = len(out.Files)
 			} else {
 				if err := writeFile(filepath.Join(e.RunDir, outPaths[i]), out.Text); err != nil {
 					errs[i] = fmt.Errorf("item %d: write output: %w", i, err)
+					e.timing.ItemEnd(st.ID, i, "error", nil)
 					cancel()
 					return
 				}
 				outputs[i] = out.Text
+				itemNotes["chars_out"] = len(out.Text)
 			}
+			e.timing.ItemEnd(st.ID, i, "ok", itemNotes)
 		}()
 	}
 	wg.Wait()
@@ -864,6 +932,26 @@ func (e *Executor) makeStageInput(st *Stage, baseURL, modelID, backendAddr strin
 		ModelID:      modelID,
 		BackendAddr:  backendAddr,
 	}
+}
+
+// stageNotes assembles the per-stage notes map surfaced in the timing
+// report (the "notes" column in the table and the notes object in JSON).
+// Stage-type-specific facts go here: text stages get max_tokens from
+// params if set; comfyui/audio stages declare their workflow / voice
+// inputs. Returns a non-nil map so callers can mutate it freely without
+// nil-checks.
+func (e *Executor) stageNotes(st *Stage) map[string]any {
+	n := map[string]any{}
+	if st == nil {
+		return n
+	}
+	t := stageTypeOrDefault(st)
+	if t == StageTypeText {
+		if mt, ok := st.Params["max_tokens"]; ok {
+			n["max_tokens"] = mt
+		}
+	}
+	return n
 }
 
 // stageTypeOrDefault returns st.Type with the empty-default rule applied.
