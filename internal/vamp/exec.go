@@ -111,6 +111,17 @@ type StageInput struct {
 	// (e.g. "http://127.0.0.1:8188" for a ComfyUI backend). Stage types that
 	// talk directly to a non-OpenAI backend (today: comfyui) use this.
 	BackendAddr string
+
+	// PipelineStatus is the run's current aggregated status ("ok" or
+	// "error") at the moment the stage is dispatched. Surfaced to templates
+	// as {{ .pipeline_status }} and intended for run_when: failure / always
+	// stages that need to mention the outcome in their body.
+	PipelineStatus string
+	// FailureSummary is a short "<stage-id>: <error>" string describing the
+	// FIRST stage error seen during the run, or "" when no stage has
+	// errored. Surfaced to templates as {{ .failure_summary }}; only
+	// meaningful for failure/always stages.
+	FailureSummary string
 }
 
 // StageOutput is what an executor returns for ONE invocation (one item if
@@ -186,6 +197,26 @@ type Executor struct {
 	completedStages    map[string]bool // stage ids whose outputs were loaded from a prior run via Resume
 	cachedModelID      string
 	cachedModelProfile string
+
+	// stageStatus tracks the live success/failure outcome of every stage as
+	// the DAG progresses. Values are "ok", "error", or "skipped"; populated
+	// the moment a stage's group finishes (or it's decided not to run).
+	// run_when scheduling consults this map to decide whether each newly
+	// ready stage should fire. Guarded by mu.
+	stageStatus map[string]string
+	// stageErrors records the first error seen for each stage that produced
+	// one (matched 1:1 with stageStatus["error"] entries). Drives the
+	// {{ .failure_summary }} template binding for run_when failure/always
+	// stages. Guarded by mu.
+	stageErrors map[string]error
+	// failureOrder preserves the order in which stages errored so the
+	// failure_summary picks the FIRST failure deterministically, even when
+	// multiple stages fail in parallel within the same wave. Guarded by mu.
+	failureOrder []string
+	// failedSoFar mirrors len(failureOrder) > 0; centralised flag so the
+	// run_when scheduler can short-circuit without taking the lock just to
+	// check. Guarded by mu.
+	failedSoFar bool
 	// logMu serializes writes to Log from concurrent stages so buffered
 	// stage outputs land contiguously even when status lines from the
 	// scheduler are interleaved.
@@ -300,11 +331,16 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 	}
 
 	e.stageOutputs = make(map[string]*stageResult, len(e.Pipeline.Stages))
+	e.stageStatus = make(map[string]string, len(e.Pipeline.Stages))
+	e.stageErrors = make(map[string]error)
 	remaining := len(e.Pipeline.Stages)
 	wave := 0
 	for remaining > 0 {
-		// Collect every stage whose deps are satisfied. Sort by id so the
-		// scheduling order is deterministic across runs.
+		// Collect every stage whose deps are satisfied. A dep is "satisfied"
+		// as soon as it has reached a terminal status (ok / error / skipped);
+		// run_when scheduling decides per-stage whether to actually fire,
+		// skip, or short-circuit based on the deps' outcomes.
+		// Sort by id so the scheduling order is deterministic across runs.
 		var ready []*Stage
 		for id, deg := range indeg {
 			if deg == 0 {
@@ -323,11 +359,41 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 		}
 		wave++
 
-		// Group ready stages by capability, preserving alphabetical capability
-		// order for determinism.
+		// Decide per-stage whether to run or skip based on RunWhen and the
+		// deps' current statuses. Skipped stages do not run an executor and
+		// do not propagate output to dependents, but they DO release any
+		// further dependents (whose own RunWhen will see "skipped" deps,
+		// equivalent to a pipeline failure for the purposes of failure/always
+		// gating).
+		var toRun []*Stage
+		var toSkip []*Stage
+		for _, st := range ready {
+			if e.shouldRunStage(st) {
+				toRun = append(toRun, st)
+			} else {
+				toSkip = append(toSkip, st)
+			}
+		}
+		// Mark skipped stages first so their status is visible before any
+		// of the parallel runners in this wave check dep statuses for
+		// downstream scheduling. (Within a wave dep checks already happened
+		// above; this is a belt-and-braces ordering.)
+		for _, st := range toSkip {
+			e.markStageSkipped(st.ID)
+			e.logf("  -> stage %q: skipped (run_when=%s, pipeline status=%s)", st.ID, runWhenOrDefault(st), e.pipelineStatusString())
+			for _, child := range dependents[st.ID] {
+				if _, ok := indeg[child]; ok {
+					indeg[child]--
+				}
+			}
+			remaining--
+		}
+
+		// Group runnable stages by capability, preserving alphabetical
+		// capability order for determinism.
 		groups := make(map[string][]*Stage)
 		var capOrder []string
-		for _, st := range ready {
+		for _, st := range toRun {
 			if _, ok := groups[st.Capability]; !ok {
 				capOrder = append(capOrder, st.Capability)
 			}
@@ -338,11 +404,25 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 		for _, capName := range capOrder {
 			group := groups[capName]
 			e.logf("wave %d: capability %q running %d stage(s)", wave, capName, len(group))
-			if err := e.runGroup(ctx, capName, group); err != nil {
-				return err
+			// runGroup returns an aggregated error when one or more stages
+			// in the group failed OR when group setup itself failed
+			// (capability not mapped, profile activation refused, etc.).
+			// Per-stage failures are already recorded via markStageStatus
+			// inside executeStage's defer; setup-time failures predate any
+			// stage's executor call, so we attribute them to every stage
+			// in the group here so downstream run_when=failure stages can
+			// still observe the failure.
+			groupErr := e.runGroup(ctx, capName, group)
+			if groupErr != nil {
+				e.logf("wave %d: capability %q produced error(s): %v", wave, capName, groupErr)
+				for _, st := range group {
+					e.markStageStatus(st.ID, groupErr)
+				}
 			}
 			// Decrement indegree for everything that depended on stages in
-			// this group; their outputs are now in stageOutputs.
+			// this group regardless of their outcomes; the dependents'
+			// scheduling decision will consult stageStatus when they're
+			// considered.
 			for _, st := range group {
 				for _, child := range dependents[st.ID] {
 					if _, ok := indeg[child]; ok {
@@ -354,11 +434,166 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 		}
 	}
 	e.logf("pipeline %q finished, outputs in %s", e.Pipeline.Name, e.RunDir)
+	// If any stage errored over the course of the run, surface a single
+	// aggregated error so callers (including tests) still observe the
+	// failure. The aggregated form joins every per-stage error in the
+	// order they were recorded; the first error remains accessible via
+	// errors.Unwrap chains for callers that inspect them.
+	if e.failedSoFar {
+		errs := make([]error, 0, len(e.failureOrder))
+		e.mu.Lock()
+		for _, id := range e.failureOrder {
+			if err, ok := e.stageErrors[id]; ok {
+				errs = append(errs, fmt.Errorf("stage %s: %w", id, err))
+			}
+		}
+		e.mu.Unlock()
+		return errors.Join(errs...)
+	}
 	// The deferred timing summary runs after this return and prints the
 	// detailed per-stage table + "outputs:" line, so we keep this top-line
 	// log for backward compatibility with anything scanning Log for the
 	// "finished" sentinel (e.g. tests).
 	return nil
+}
+
+// shouldRunStage decides whether a freshly-ready stage should fire based
+// on its RunWhen qualifier and the current statuses of its declared deps
+// (or, for empty-Inputs failure stages, the overall pipeline status).
+//
+// Semantics (matching the documented schema):
+//   - "success": run iff every dep reached status "ok". Skip if any dep
+//     errored or was skipped, OR if the dep is missing a status entry
+//     (shouldn't happen — wave gating ensures deps have run before this
+//     check — but err on "skip" rather than fire on a half-tracked dep).
+//   - "failure": run iff at least one dep errored OR was skipped (a
+//     skipped dep means an upstream failure cascaded past it). When the
+//     stage has no Inputs, fall back to the pipeline-wide failedSoFar
+//     flag so users can place a notify_on_failure stage at the top
+//     level of the DAG.
+//   - "always": run unconditionally — the cleanup/finally case.
+func (e *Executor) shouldRunStage(st *Stage) bool {
+	mode := runWhenOrDefault(st)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	switch mode {
+	case RunWhenAlways:
+		return true
+	case RunWhenFailure:
+		if len(st.Inputs) == 0 {
+			return e.failedSoFar
+		}
+		for _, dep := range st.Inputs {
+			s := e.stageStatus[dep]
+			if s == "error" || s == "skipped" {
+				return true
+			}
+		}
+		return false
+	default: // RunWhenSuccess
+		for _, dep := range st.Inputs {
+			if e.stageStatus[dep] != "ok" {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+// runWhenOrDefault returns Stage.RunWhen with the empty-default rule
+// applied. Centralised so the executor and any future callers agree on
+// the canonical value when the YAML omits the field.
+func runWhenOrDefault(st *Stage) string {
+	if st.RunWhen == "" {
+		return RunWhenSuccess
+	}
+	return st.RunWhen
+}
+
+// markStageStatus records the terminal outcome of a stage. err==nil ->
+// status "ok"; otherwise the error is recorded under stageErrors and the
+// stage joins failureOrder so failure_summary can pick a deterministic
+// "first failure" later. Idempotent: only the first call wins so a retry
+// loop or a sibling cancel can't overwrite a real error with a follow-up
+// context.Canceled.
+func (e *Executor) markStageStatus(stageID string, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// Lazy init so tests that bypass Run() (and call runGroup or
+	// executeStage directly) don't panic on nil-map writes. Production
+	// callers go through Run() which initialises the maps up front.
+	if e.stageStatus == nil {
+		e.stageStatus = make(map[string]string)
+	}
+	if e.stageErrors == nil {
+		e.stageErrors = make(map[string]error)
+	}
+	if _, already := e.stageStatus[stageID]; already {
+		return
+	}
+	if err == nil {
+		e.stageStatus[stageID] = "ok"
+		return
+	}
+	e.stageStatus[stageID] = "error"
+	e.stageErrors[stageID] = err
+	e.failureOrder = append(e.failureOrder, stageID)
+	e.failedSoFar = true
+}
+
+// markStageSkipped is the run_when="success" sibling of markStageStatus
+// for stages that never invoked an executor because their deps failed
+// (or the pipeline status didn't match the stage's run_when qualifier).
+// Skipped stages produce no output and do NOT contribute to the
+// aggregated run error, but they still get a timing-record entry so
+// pipeline.json reflects the full DAG.
+func (e *Executor) markStageSkipped(stageID string) {
+	e.mu.Lock()
+	if e.stageStatus == nil {
+		e.stageStatus = make(map[string]string)
+	}
+	if _, already := e.stageStatus[stageID]; !already {
+		e.stageStatus[stageID] = "skipped"
+	}
+	e.mu.Unlock()
+	e.recordSkippedStage(stageID)
+	e.timing.StageStart(stageID, "")
+	e.timing.StageEnd(stageID, "skipped", nil)
+}
+
+// pipelineStatusString returns the current pipeline-wide status for
+// templating and logging. Mirrors the {{ .pipeline_status }} binding
+// exposed to failure/always stages: "ok" while no stage has errored,
+// "error" once one has. Centralised so the wave loop log and the
+// template renderer agree on the string.
+func (e *Executor) pipelineStatusString() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.failedSoFar {
+		return "error"
+	}
+	return "ok"
+}
+
+// failureSummary composes the {{ .failure_summary }} template binding.
+// When multiple stages have failed (possibly in parallel within a wave),
+// we pick the FIRST recorded failure (failureOrder[0]) — markStageStatus
+// guarantees deterministic ordering by the order it was first called per
+// stage. The string is "<stage-id>: <error>" so users can wire it
+// directly into a Slack/Discord webhook body without extra formatting.
+// Returns "" when no stage has errored (kept so always-mode stages can
+// distinguish success runs).
+func (e *Executor) failureSummary() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.failureOrder) == 0 {
+		return ""
+	}
+	first := e.failureOrder[0]
+	if err, ok := e.stageErrors[first]; ok {
+		return fmt.Sprintf("%s: %s", first, err.Error())
+	}
+	return first
 }
 
 // runGroup activates `capability`'s profile once, then runs every stage in the
@@ -388,6 +623,11 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 				// is zero (we don't know what the original run took) and
 				// the status string differentiates them from fresh runs.
 				e.recordSkippedStage(st.ID)
+				// For run_when scheduling treat a resumed stage as having
+				// succeeded — it produced its output in the original run,
+				// so downstream "success" stages should still consider it
+				// satisfied.
+				e.markStageStatus(st.ID, nil)
 				continue
 			}
 			remaining = append(remaining, st)
@@ -534,6 +774,11 @@ func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID
 		if recordTiming {
 			e.recordStageFinish(st.ID, stageStart, stageErr)
 		}
+		// Mark the live run_when status regardless of which return path we
+		// took. Foreach stages set their own timing record (above) but we
+		// still want the per-stage status published here so downstream
+		// run_when scheduling sees the outcome promptly.
+		e.markStageStatus(st.ID, stageErr)
 	}()
 	exec, err := e.executorFor(st)
 	if err != nil {
@@ -951,19 +1196,21 @@ func (e *Executor) makeStageInput(st *Stage, baseURL, modelID, backendAddr strin
 		name = e.Pipeline.Name
 	}
 	return StageInput{
-		Stage:        st,
-		Inputs:       e.Inputs,
-		Prior:        e.snapshotPrior(st.Inputs),
-		RunDir:       e.RunDir,
-		PipelineDir:  e.PipelineDir,
-		PipelineName: name,
-		Log:          e.tokenLog(tokenSink),
-		Vibe:         e.Vibe,
-		Item:         item,
-		ItemIdx:      itemIdx,
-		BaseURL:      baseURL,
-		ModelID:      modelID,
-		BackendAddr:  backendAddr,
+		Stage:          st,
+		Inputs:         e.Inputs,
+		Prior:          e.snapshotPrior(st.Inputs),
+		RunDir:         e.RunDir,
+		PipelineDir:    e.PipelineDir,
+		PipelineName:   name,
+		Log:            e.tokenLog(tokenSink),
+		Vibe:           e.Vibe,
+		Item:           item,
+		ItemIdx:        itemIdx,
+		BaseURL:        baseURL,
+		ModelID:        modelID,
+		BackendAddr:    backendAddr,
+		PipelineStatus: e.pipelineStatusString(),
+		FailureSummary: e.failureSummary(),
 	}
 }
 
@@ -1024,6 +1271,13 @@ func (e *Executor) executorFor(st *Stage) (StageExecutor, error) {
 // snapshotPrior returns a copy of the executor's stageOutputs limited to the
 // declared dependency ids. Callers receive a snapshot so concurrent stage
 // completions can't mutate the map under them while they render templates.
+//
+// run_when failure/always stages may reference deps whose executors never
+// produced an output (because they errored or were skipped); we synthesise
+// an empty stageResult for those so `.stages.<id>.output` resolves to "" in
+// the template instead of crashing renderTemplate. Successful resume seeding
+// always lands a real entry in stageOutputs, so the synthesised-empty path
+// only fires for known-failed/skipped deps.
 func (e *Executor) snapshotPrior(deps []string) map[string]*stageResult {
 	out := make(map[string]*stageResult, len(deps))
 	e.mu.Lock()
@@ -1031,6 +1285,18 @@ func (e *Executor) snapshotPrior(deps []string) map[string]*stageResult {
 	for _, dep := range deps {
 		if res, ok := e.stageOutputs[dep]; ok {
 			out[dep] = res
+			continue
+		}
+		// No output recorded. If we've already marked the dep as
+		// terminated (error or skipped) make the empty result visible to
+		// the template so failure/always stages can reference the dep
+		// without erroring. We leave deps that haven't been processed at
+		// all out — Validate + the wave-gating prevent that case in
+		// practice, and a real "scheduler bug" still surfaces as a clear
+		// renderTemplate error rather than silently rendering "".
+		switch e.stageStatus[dep] {
+		case "error", "skipped":
+			out[dep] = &stageResult{}
 		}
 	}
 	return out
@@ -1079,9 +1345,13 @@ type textExecutor struct {
 
 func (t *textExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput, error) {
 	st := in.Stage
-	var extra map[string]any
+	extra := map[string]any{
+		"pipeline_status": in.PipelineStatus,
+		"failure_summary": in.FailureSummary,
+	}
 	if st.Foreach != nil {
-		extra = map[string]any{st.Foreach.Var: in.Item, "i": in.ItemIdx}
+		extra[st.Foreach.Var] = in.Item
+		extra["i"] = in.ItemIdx
 	}
 	prompt, err := renderPrompt(st, in.PipelineDir, in.Inputs, in.Prior, in.RunDir, extra)
 	if err != nil {

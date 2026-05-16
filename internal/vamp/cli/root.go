@@ -26,6 +26,7 @@ func rootCmd() *cobra.Command {
 		capabilitiesCmd(),
 		runsCmd(),
 		vizCmd(),
+		schemaCmd(),
 	)
 	return root
 }

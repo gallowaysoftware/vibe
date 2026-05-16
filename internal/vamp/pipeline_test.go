@@ -1615,3 +1615,71 @@ stages:
 		})
 	}
 }
+
+// TestLoadPipeline_RunWhenDefault verifies that omitting run_when on a
+// stage normalises to "success" after parsing, matching the documented
+// default and what the executor's run_when scheduler keys on.
+func TestLoadPipeline_RunWhenDefault(t *testing.T) {
+	yaml := `
+name: rw
+stages:
+  - id: a
+    capability: reasoning
+    prompt: hi
+    output: a.md
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := p.Stages[0].RunWhen; got != RunWhenSuccess {
+		t.Errorf("RunWhen default = %q, want %q", got, RunWhenSuccess)
+	}
+}
+
+// TestLoadPipeline_RunWhenValidValues parses every legal run_when value
+// and verifies the slice entry's RunWhen lands verbatim.
+func TestLoadPipeline_RunWhenValidValues(t *testing.T) {
+	for _, value := range []string{RunWhenSuccess, RunWhenFailure, RunWhenAlways} {
+		t.Run(value, func(t *testing.T) {
+			yaml := `
+name: rw
+stages:
+  - id: a
+    capability: reasoning
+    prompt: hi
+    output: a.md
+    run_when: ` + value + `
+`
+			p, err := LoadPipeline(writePipeline(t, yaml))
+			if err != nil {
+				t.Fatalf("LoadPipeline: %v", err)
+			}
+			if got := p.Stages[0].RunWhen; got != value {
+				t.Errorf("RunWhen = %q, want %q", got, value)
+			}
+		})
+	}
+}
+
+// TestLoadPipeline_RunWhenInvalid rejects a typoed run_when value at
+// validate time so users see a clear error pointing at the unsupported
+// keyword.
+func TestLoadPipeline_RunWhenInvalid(t *testing.T) {
+	yaml := `
+name: rw
+stages:
+  - id: a
+    capability: reasoning
+    prompt: hi
+    output: a.md
+    run_when: failrue
+`
+	_, err := LoadPipeline(writePipeline(t, yaml))
+	if err == nil {
+		t.Fatal("expected validation error for invalid run_when")
+	}
+	if !strings.Contains(err.Error(), "run_when") {
+		t.Errorf("err = %v, want message mentioning run_when", err)
+	}
+}

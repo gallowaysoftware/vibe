@@ -161,6 +161,29 @@ Nodes are colour-coded by stage type, foreach stages get a dotted edge
 from their JSON source, and `--show-inputs` adds a `subgraph inputs`
 block listing the pipeline's declared inputs.
 
+`vamp schema` emits a JSON Schema (draft-07) document describing
+pipeline.yaml so editors with `yaml-language-server` (VS Code's RedHat
+YAML extension, Helix, vim's coc, IntelliJ) provide validation and
+autocomplete:
+
+```
+vamp schema                          # print to stdout
+vamp schema --out vamp.schema.json   # write to a file
+```
+
+Point editors at the rendered file with a directive at the top of your
+pipeline YAML:
+
+```yaml
+# yaml-language-server: $schema=./vamp.schema.json
+name: my-pipeline
+stages:
+  - ...
+```
+
+The example under `examples/multi-profile-pipeline/` ships a checked-in
+`vamp.schema.json` alongside its `pipeline.yaml` to show the wiring.
+
 ## Shell completion
 
 Both `vibe` and `vamp` ship Cobra-generated completion scripts plus

@@ -1,0 +1,621 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/gallowaysoftware/vibe/schemas/vamp.pipeline.schema.json",
+  "title": "vamp pipeline",
+  "type": "object",
+  "description": "A vamp pipeline definition: name, optional inputs, and a list of stages forming a DAG.",
+  "properties": {
+    "description": {
+      "type": "string",
+      "description": "Free-form human description."
+    },
+    "inputs": {
+      "type": "object",
+      "description": "Map of pipeline-level input name -\u003e spec, passed on the CLI as --input.",
+      "additionalProperties": {
+        "type": "object",
+        "description": "Pipeline-level input passed on the CLI via --input.",
+        "properties": {
+          "default": {
+            "type": "string",
+            "description": "Default value applied when --input \u003cname\u003e is omitted."
+          },
+          "required": {
+            "type": "boolean",
+            "description": "When true, the runner errors if the user doesn't pass --input \u003cname\u003e=..."
+          },
+          "type": {
+            "type": "string",
+            "description": "Input value type. Phase 1 only supports \"string\".",
+            "enum": [
+              "",
+              "string"
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "name": {
+      "type": "string",
+      "description": "Pipeline name; identifier-like, used in run dir names and pipeline.json.",
+      "pattern": "^[a-zA-Z0-9_-]+$"
+    },
+    "stages": {
+      "type": "array",
+      "description": "Ordered list of stages forming the pipeline DAG.",
+      "items": {
+        "type": "object",
+        "description": "A single stage in the pipeline DAG.",
+        "properties": {
+          "binary": {
+            "type": "string",
+            "description": "Override the path to the piper or ffmpeg binary on $PATH."
+          },
+          "body": {
+            "type": "object",
+            "description": "Templated JSON body (webhook stages). Mutually exclusive with body_template_file.",
+            "additionalProperties": true
+          },
+          "body_template_file": {
+            "type": "string",
+            "description": "Path to a body template file; rendered verbatim and sent as the request body."
+          },
+          "capability": {
+            "type": "string",
+            "description": "Capability name resolved to a vibe profile via capabilities.yaml."
+          },
+          "category_id": {
+            "type": "string",
+            "description": "YouTube numeric category id (default \"22\")."
+          },
+          "credentials_file": {
+            "type": "string",
+            "description": "OAuth refresh-token JSON path (youtube stages)."
+          },
+          "description": {
+            "type": "string",
+            "description": "Templated video description (youtube stages)."
+          },
+          "ffmpeg_args": {
+            "type": "array",
+            "description": "Literal argv passed to ffmpeg (each entry template-rendered).",
+            "items": {
+              "type": "string"
+            }
+          },
+          "foreach": {
+            "type": "object",
+            "description": "Fan-out descriptor: run this stage once per item of an upstream JSON-array output.",
+            "properties": {
+              "from": {
+                "type": "string",
+                "description": "ID of the upstream stage whose JSON-array output drives the fan-out."
+              },
+              "var": {
+                "type": "string",
+                "description": "Template variable name bound to each item (defaults to \"item\")."
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "from"
+            ]
+          },
+          "headers": {
+            "type": "object",
+            "description": "Flat map of header name -\u003e templated value (webhook stages).",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "id": {
+            "type": "string",
+            "description": "Stage id; template-syntax-safe identifier.",
+            "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$"
+          },
+          "inputs": {
+            "type": "array",
+            "description": "IDs of prior stages this stage depends on.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "method": {
+            "type": "string",
+            "description": "HTTP method (default POST).",
+            "enum": [
+              "",
+              "GET",
+              "POST",
+              "PUT",
+              "PATCH",
+              "DELETE"
+            ]
+          },
+          "output": {
+            "type": "string",
+            "description": "Templated output path, relative to the run dir."
+          },
+          "output_format": {
+            "type": "string",
+            "description": "When \"json\", the runner validates the stage output parses as JSON.",
+            "enum": [
+              "",
+              "json"
+            ]
+          },
+          "parameters": {
+            "type": "object",
+            "description": "Map of \"\u003cnode_id\u003e.\u003cinput_name\u003e\" -\u003e templated value for comfyui workflows.",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "params": {
+            "type": "object",
+            "description": "Extra fields merged into the chat-completion body (text stages only).",
+            "additionalProperties": true
+          },
+          "privacy": {
+            "type": "string",
+            "description": "YouTube visibility: private, unlisted, or public.",
+            "enum": [
+              "",
+              "private",
+              "unlisted",
+              "public"
+            ]
+          },
+          "prompt": {
+            "type": "string",
+            "description": "Inline prompt template (text stages only). Mutually exclusive with prompt_file."
+          },
+          "prompt_file": {
+            "type": "string",
+            "description": "Path to a prompt template file, relative to the pipeline YAML's directory."
+          },
+          "retry": {
+            "type": "object",
+            "description": "Per-stage retry-with-exponential-backoff policy for transient executor failures.",
+            "properties": {
+              "initial_backoff": {
+                "type": "string",
+                "description": "Go time.ParseDuration form, e.g. \"500ms\", \"5s\", \"1m\".",
+                "pattern": "^[0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h)$"
+              },
+              "max_attempts": {
+                "type": "integer",
+                "description": "Maximum number of attempts before giving up (\u003e= 1).",
+                "minimum": 1
+              },
+              "max_backoff": {
+                "type": "string",
+                "description": "Go time.ParseDuration form, e.g. \"500ms\", \"5s\", \"1m\".",
+                "pattern": "^[0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h)$"
+              },
+              "multiplier": {
+                "type": "number",
+                "description": "Backoff growth factor per attempt (\u003e= 1.0).",
+                "minimum": 1
+              },
+              "retry_on": {
+                "type": "array",
+                "description": "Error classes to retry on.",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "transient",
+                    "timeout"
+                  ]
+                }
+              }
+            },
+            "additionalProperties": false
+          },
+          "retry_on_5xx": {
+            "type": "boolean",
+            "description": "When true (the default) a 5xx response triggers the transient-error retry path."
+          },
+          "run_when": {
+            "type": "string",
+            "description": "Gate the stage on prior outcome: success (default), failure, or always.",
+            "enum": [
+              "",
+              "success",
+              "failure",
+              "always"
+            ],
+            "default": "success"
+          },
+          "tags": {
+            "type": "array",
+            "description": "Fixed string list of YouTube tags.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "text": {
+            "type": "string",
+            "description": "Templated text fed to Piper on stdin (audio stages)."
+          },
+          "thumbnail": {
+            "type": "string",
+            "description": "Optional template path to a thumbnail image (youtube stages)."
+          },
+          "title": {
+            "type": "string",
+            "description": "Templated video title (youtube stages)."
+          },
+          "type": {
+            "type": "string",
+            "description": "Stage executor type (empty defaults to \"text\").",
+            "enum": [
+              "",
+              "text",
+              "comfyui",
+              "audio",
+              "ffmpeg",
+              "youtube",
+              "webhook"
+            ]
+          },
+          "url": {
+            "type": "string",
+            "description": "Templated webhook destination URL."
+          },
+          "video": {
+            "type": "string",
+            "description": "Templated path to the MP4 to upload (youtube stages)."
+          },
+          "voice": {
+            "type": "string",
+            "description": "Piper voice model name (audio stages)."
+          },
+          "voices_dir": {
+            "type": "string",
+            "description": "Override directory containing \u003cvoice\u003e.onnx model files (audio stages)."
+          },
+          "workflow": {
+            "type": "string",
+            "description": "Path to a ComfyUI workflow JSON, relative to the pipeline YAML (comfyui stages)."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "output"
+        ]
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "stages"
+  ],
+  "definitions": {
+    "ForeachSpec": {
+      "type": "object",
+      "description": "Fan-out descriptor: run this stage once per item of an upstream JSON-array output.",
+      "properties": {
+        "from": {
+          "type": "string",
+          "description": "ID of the upstream stage whose JSON-array output drives the fan-out."
+        },
+        "var": {
+          "type": "string",
+          "description": "Template variable name bound to each item (defaults to \"item\")."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "from"
+      ]
+    },
+    "InputSpec": {
+      "type": "object",
+      "description": "Pipeline-level input passed on the CLI via --input.",
+      "properties": {
+        "default": {
+          "type": "string",
+          "description": "Default value applied when --input \u003cname\u003e is omitted."
+        },
+        "required": {
+          "type": "boolean",
+          "description": "When true, the runner errors if the user doesn't pass --input \u003cname\u003e=..."
+        },
+        "type": {
+          "type": "string",
+          "description": "Input value type. Phase 1 only supports \"string\".",
+          "enum": [
+            "",
+            "string"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RetryPolicy": {
+      "type": "object",
+      "description": "Per-stage retry-with-exponential-backoff policy for transient executor failures.",
+      "properties": {
+        "initial_backoff": {
+          "type": "string",
+          "description": "Go time.ParseDuration form, e.g. \"500ms\", \"5s\", \"1m\".",
+          "pattern": "^[0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h)$"
+        },
+        "max_attempts": {
+          "type": "integer",
+          "description": "Maximum number of attempts before giving up (\u003e= 1).",
+          "minimum": 1
+        },
+        "max_backoff": {
+          "type": "string",
+          "description": "Go time.ParseDuration form, e.g. \"500ms\", \"5s\", \"1m\".",
+          "pattern": "^[0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h)$"
+        },
+        "multiplier": {
+          "type": "number",
+          "description": "Backoff growth factor per attempt (\u003e= 1.0).",
+          "minimum": 1
+        },
+        "retry_on": {
+          "type": "array",
+          "description": "Error classes to retry on.",
+          "items": {
+            "type": "string",
+            "enum": [
+              "transient",
+              "timeout"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Stage": {
+      "type": "object",
+      "description": "A single stage in the pipeline DAG.",
+      "properties": {
+        "binary": {
+          "type": "string",
+          "description": "Override the path to the piper or ffmpeg binary on $PATH."
+        },
+        "body": {
+          "type": "object",
+          "description": "Templated JSON body (webhook stages). Mutually exclusive with body_template_file.",
+          "additionalProperties": true
+        },
+        "body_template_file": {
+          "type": "string",
+          "description": "Path to a body template file; rendered verbatim and sent as the request body."
+        },
+        "capability": {
+          "type": "string",
+          "description": "Capability name resolved to a vibe profile via capabilities.yaml."
+        },
+        "category_id": {
+          "type": "string",
+          "description": "YouTube numeric category id (default \"22\")."
+        },
+        "credentials_file": {
+          "type": "string",
+          "description": "OAuth refresh-token JSON path (youtube stages)."
+        },
+        "description": {
+          "type": "string",
+          "description": "Templated video description (youtube stages)."
+        },
+        "ffmpeg_args": {
+          "type": "array",
+          "description": "Literal argv passed to ffmpeg (each entry template-rendered).",
+          "items": {
+            "type": "string"
+          }
+        },
+        "foreach": {
+          "type": "object",
+          "description": "Fan-out descriptor: run this stage once per item of an upstream JSON-array output.",
+          "properties": {
+            "from": {
+              "type": "string",
+              "description": "ID of the upstream stage whose JSON-array output drives the fan-out."
+            },
+            "var": {
+              "type": "string",
+              "description": "Template variable name bound to each item (defaults to \"item\")."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "from"
+          ]
+        },
+        "headers": {
+          "type": "object",
+          "description": "Flat map of header name -\u003e templated value (webhook stages).",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "id": {
+          "type": "string",
+          "description": "Stage id; template-syntax-safe identifier.",
+          "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$"
+        },
+        "inputs": {
+          "type": "array",
+          "description": "IDs of prior stages this stage depends on.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "method": {
+          "type": "string",
+          "description": "HTTP method (default POST).",
+          "enum": [
+            "",
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE"
+          ]
+        },
+        "output": {
+          "type": "string",
+          "description": "Templated output path, relative to the run dir."
+        },
+        "output_format": {
+          "type": "string",
+          "description": "When \"json\", the runner validates the stage output parses as JSON.",
+          "enum": [
+            "",
+            "json"
+          ]
+        },
+        "parameters": {
+          "type": "object",
+          "description": "Map of \"\u003cnode_id\u003e.\u003cinput_name\u003e\" -\u003e templated value for comfyui workflows.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "params": {
+          "type": "object",
+          "description": "Extra fields merged into the chat-completion body (text stages only).",
+          "additionalProperties": true
+        },
+        "privacy": {
+          "type": "string",
+          "description": "YouTube visibility: private, unlisted, or public.",
+          "enum": [
+            "",
+            "private",
+            "unlisted",
+            "public"
+          ]
+        },
+        "prompt": {
+          "type": "string",
+          "description": "Inline prompt template (text stages only). Mutually exclusive with prompt_file."
+        },
+        "prompt_file": {
+          "type": "string",
+          "description": "Path to a prompt template file, relative to the pipeline YAML's directory."
+        },
+        "retry": {
+          "type": "object",
+          "description": "Per-stage retry-with-exponential-backoff policy for transient executor failures.",
+          "properties": {
+            "initial_backoff": {
+              "type": "string",
+              "description": "Go time.ParseDuration form, e.g. \"500ms\", \"5s\", \"1m\".",
+              "pattern": "^[0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h)$"
+            },
+            "max_attempts": {
+              "type": "integer",
+              "description": "Maximum number of attempts before giving up (\u003e= 1).",
+              "minimum": 1
+            },
+            "max_backoff": {
+              "type": "string",
+              "description": "Go time.ParseDuration form, e.g. \"500ms\", \"5s\", \"1m\".",
+              "pattern": "^[0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h)$"
+            },
+            "multiplier": {
+              "type": "number",
+              "description": "Backoff growth factor per attempt (\u003e= 1.0).",
+              "minimum": 1
+            },
+            "retry_on": {
+              "type": "array",
+              "description": "Error classes to retry on.",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "transient",
+                  "timeout"
+                ]
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "retry_on_5xx": {
+          "type": "boolean",
+          "description": "When true (the default) a 5xx response triggers the transient-error retry path."
+        },
+        "run_when": {
+          "type": "string",
+          "description": "Gate the stage on prior outcome: success (default), failure, or always.",
+          "enum": [
+            "",
+            "success",
+            "failure",
+            "always"
+          ],
+          "default": "success"
+        },
+        "tags": {
+          "type": "array",
+          "description": "Fixed string list of YouTube tags.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "text": {
+          "type": "string",
+          "description": "Templated text fed to Piper on stdin (audio stages)."
+        },
+        "thumbnail": {
+          "type": "string",
+          "description": "Optional template path to a thumbnail image (youtube stages)."
+        },
+        "title": {
+          "type": "string",
+          "description": "Templated video title (youtube stages)."
+        },
+        "type": {
+          "type": "string",
+          "description": "Stage executor type (empty defaults to \"text\").",
+          "enum": [
+            "",
+            "text",
+            "comfyui",
+            "audio",
+            "ffmpeg",
+            "youtube",
+            "webhook"
+          ]
+        },
+        "url": {
+          "type": "string",
+          "description": "Templated webhook destination URL."
+        },
+        "video": {
+          "type": "string",
+          "description": "Templated path to the MP4 to upload (youtube stages)."
+        },
+        "voice": {
+          "type": "string",
+          "description": "Piper voice model name (audio stages)."
+        },
+        "voices_dir": {
+          "type": "string",
+          "description": "Override directory containing \u003cvoice\u003e.onnx model files (audio stages)."
+        },
+        "workflow": {
+          "type": "string",
+          "description": "Path to a ComfyUI workflow JSON, relative to the pipeline YAML (comfyui stages)."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "output"
+      ]
+    }
+  }
+}

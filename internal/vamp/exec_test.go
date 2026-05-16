@@ -1614,3 +1614,194 @@ func TestExecutor_WritesPipelineTimingJSON(t *testing.T) {
 		t.Errorf("missing stage row in log:\n%s", logged)
 	}
 }
+
+// TestExecutor_RunWhenFailureFiresOnError verifies that a stage marked
+// run_when: failure runs only when an upstream input has errored, that
+// the run still returns a non-nil error from the original failure, and
+// that the {{ .failure_summary }} binding is populated for the failure
+// stage's prompt.
+func TestExecutor_RunWhenFailureFiresOnError(t *testing.T) {
+	var notifyPrompt string
+	var notifyCalled bool
+	var notifyMu sync.Mutex
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		switch {
+		case prompt == "heavy":
+			return "ok", nil
+		case strings.HasPrefix(prompt, "BOOM"):
+			return "", fmt.Errorf("stage 2 exploded")
+		case strings.HasPrefix(prompt, "NOTIFY:"):
+			notifyMu.Lock()
+			notifyPrompt = prompt
+			notifyCalled = true
+			notifyMu.Unlock()
+			return "sent", nil
+		}
+		return "", fmt.Errorf("unexpected prompt %q", prompt)
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "runwhen_failure",
+		Stages: []Stage{
+			{ID: "heavy", Capability: "reasoning", Prompt: "heavy", Output: "a.txt"},
+			{ID: "boom", Capability: "reasoning", Prompt: "BOOM", Inputs: []string{"heavy"}, Output: "b.txt"},
+			{ID: "notify", Capability: "reasoning",
+				Prompt: "NOTIFY: status={{.pipeline_status}} summary={{.failure_summary}}",
+				Inputs: []string{"boom"}, Output: "notify.txt", RunWhen: "failure"},
+		},
+	}
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	err := exec.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected pipeline error after stage 2 failure")
+	}
+	if !strings.Contains(err.Error(), "stage 2 exploded") {
+		t.Errorf("aggregated error %v should contain stage 2's message", err)
+	}
+	notifyMu.Lock()
+	defer notifyMu.Unlock()
+	if !notifyCalled {
+		t.Fatal("notify stage did not run after upstream failure")
+	}
+	if !strings.Contains(notifyPrompt, "status=error") {
+		t.Errorf("notify prompt missing pipeline_status=error: %q", notifyPrompt)
+	}
+	if !strings.Contains(notifyPrompt, "summary=boom: ") {
+		t.Errorf("notify prompt missing failure_summary referencing boom: %q", notifyPrompt)
+	}
+	if !strings.Contains(notifyPrompt, "stage 2 exploded") {
+		t.Errorf("notify prompt missing original error text: %q", notifyPrompt)
+	}
+}
+
+// TestExecutor_RunWhenFailureSkippedOnSuccess verifies that a stage
+// marked run_when: failure is skipped when its inputs all succeeded.
+// The pipeline returns nil and the failure stage's output file is never
+// written.
+func TestExecutor_RunWhenFailureSkippedOnSuccess(t *testing.T) {
+	var notifyCalled atomic.Bool
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		if strings.HasPrefix(prompt, "NOTIFY") {
+			notifyCalled.Store(true)
+			return "sent", nil
+		}
+		return "ok", nil
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "runwhen_failure_skip",
+		Stages: []Stage{
+			{ID: "heavy", Capability: "reasoning", Prompt: "heavy", Output: "a.txt"},
+			{ID: "follow", Capability: "reasoning", Prompt: "follow", Inputs: []string{"heavy"}, Output: "b.txt"},
+			{ID: "notify", Capability: "reasoning", Prompt: "NOTIFY", Inputs: []string{"follow"}, Output: "notify.txt", RunWhen: "failure"},
+		},
+	}
+	exec, runDir := stubExecutor(t, pipeline, caps, inf)
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if notifyCalled.Load() {
+		t.Fatal("notify stage should not have run when upstream succeeded")
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "notify.txt")); !os.IsNotExist(err) {
+		t.Errorf("notify.txt should not exist (got err=%v)", err)
+	}
+}
+
+// TestExecutor_RunWhenAlwaysFiresOnSuccess verifies that a stage marked
+// run_when: always runs after a successful pipeline and that its
+// pipeline_status template binding reports "ok".
+func TestExecutor_RunWhenAlwaysFiresOnSuccess(t *testing.T) {
+	var cleanupPrompt string
+	var cleanupCalled bool
+	var cleanupMu sync.Mutex
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		if strings.HasPrefix(prompt, "CLEANUP:") {
+			cleanupMu.Lock()
+			cleanupPrompt = prompt
+			cleanupCalled = true
+			cleanupMu.Unlock()
+			return "cleaned", nil
+		}
+		return "ok", nil
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "runwhen_always_success",
+		Stages: []Stage{
+			{ID: "work", Capability: "reasoning", Prompt: "work", Output: "a.txt"},
+			{ID: "cleanup", Capability: "reasoning",
+				Prompt: "CLEANUP: status={{.pipeline_status}} summary={{.failure_summary}}",
+				Inputs: []string{"work"}, Output: "cleanup.txt", RunWhen: "always"},
+		},
+	}
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cleanupMu.Lock()
+	defer cleanupMu.Unlock()
+	if !cleanupCalled {
+		t.Fatal("cleanup stage with run_when=always did not run")
+	}
+	if !strings.Contains(cleanupPrompt, "status=ok") {
+		t.Errorf("cleanup prompt missing pipeline_status=ok: %q", cleanupPrompt)
+	}
+	if !strings.Contains(cleanupPrompt, "summary=") || strings.Contains(cleanupPrompt, "summary=boom") {
+		t.Errorf("cleanup prompt failure_summary should be empty on a successful run: %q", cleanupPrompt)
+	}
+}
+
+// TestExecutor_RunWhenAlwaysFiresOnFailure verifies that a stage marked
+// run_when: always runs after a failed pipeline, that the pipeline still
+// returns the aggregated error, and that the cleanup stage observes the
+// failure via {{ .pipeline_status }} / {{ .failure_summary }}.
+func TestExecutor_RunWhenAlwaysFiresOnFailure(t *testing.T) {
+	var cleanupPrompt string
+	var cleanupCalled bool
+	var cleanupMu sync.Mutex
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		switch {
+		case strings.HasPrefix(prompt, "CLEANUP:"):
+			cleanupMu.Lock()
+			cleanupPrompt = prompt
+			cleanupCalled = true
+			cleanupMu.Unlock()
+			return "cleaned", nil
+		case prompt == "BOOM":
+			return "", fmt.Errorf("kaboom")
+		}
+		return "ok", nil
+	}
+	caps := &Capabilities{Mapping: map[string]string{"reasoning": "code"}}
+	pipeline := &Pipeline{
+		Name: "runwhen_always_failure",
+		Stages: []Stage{
+			{ID: "work", Capability: "reasoning", Prompt: "BOOM", Output: "a.txt"},
+			{ID: "cleanup", Capability: "reasoning",
+				Prompt: "CLEANUP: status={{.pipeline_status}} summary={{.failure_summary}}",
+				Inputs: []string{"work"}, Output: "cleanup.txt", RunWhen: "always"},
+		},
+	}
+	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	var logBuf bytes.Buffer
+	exec.Log = &logBuf
+	err := exec.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected aggregated error from work stage")
+	}
+	if !strings.Contains(err.Error(), "kaboom") {
+		t.Errorf("err = %v, want kaboom", err)
+	}
+	cleanupMu.Lock()
+	defer cleanupMu.Unlock()
+	if !cleanupCalled {
+		t.Fatalf("cleanup stage with run_when=always did not run after failure\nlog:\n%s", logBuf.String())
+	}
+	if !strings.Contains(cleanupPrompt, "status=error") {
+		t.Errorf("cleanup prompt missing pipeline_status=error: %q", cleanupPrompt)
+	}
+	if !strings.Contains(cleanupPrompt, "summary=work: ") {
+		t.Errorf("cleanup prompt missing failure_summary referencing work: %q", cleanupPrompt)
+	}
+}

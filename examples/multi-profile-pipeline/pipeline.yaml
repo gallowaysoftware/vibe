@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=./vamp.schema.json
 name: multi-profile-demo
 description: |
   Two-stage demo that exercises two distinct vibe profiles in a single run.
