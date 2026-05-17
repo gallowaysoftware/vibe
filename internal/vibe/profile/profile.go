@@ -52,6 +52,16 @@ type LlamaServerBackend struct {
 	CacheTypeV  string       `yaml:"cache_type_v,omitempty"`
 	Jinja       bool         `yaml:"jinja,omitempty"`
 	ExtraArgs   []string     `yaml:"extra_args,omitempty"`
+	// Binary overrides which llama-server binary to spawn for this
+	// profile. Empty (default) means "use the daemon's configured
+	// llama-server, which falls back to the first one on $PATH" — the
+	// usual recipe (~/.local/bin/llama-server is a symlink at whichever
+	// flavor `vibe doctor --install llama-cpp` planted). Set this when
+	// you want one profile to pin a specific build (e.g. a feature
+	// branch under ~/src/llama.cpp/build/bin/llama-server) without
+	// affecting the others. Tilde-expanded at load; validated to exist
+	// and be executable.
+	Binary string `yaml:"binary,omitempty"`
 }
 
 // ComfyUIBackend supervises a ComfyUI python entrypoint. ComfyUI manages its
@@ -173,6 +183,7 @@ func Load(path string) (*Profile, error) {
 			p.Backend.LlamaServer.Parallel = 1
 		}
 		p.Backend.LlamaServer.Path = expandTilde(p.Backend.LlamaServer.Path)
+		p.Backend.LlamaServer.Binary = expandTilde(p.Backend.LlamaServer.Binary)
 	}
 	if p.Backend.ComfyUI != nil {
 		p.Backend.ComfyUI.Dir = expandTilde(p.Backend.ComfyUI.Dir)
@@ -241,6 +252,18 @@ func validateLlamaServer(m *LlamaServerBackend) error {
 	}
 	if m.Context <= 0 {
 		return errors.New("backend.llama_server.context must be > 0")
+	}
+	if m.Binary != "" {
+		info, err := os.Stat(m.Binary)
+		if err != nil {
+			return fmt.Errorf("backend.llama_server.binary %s: %w", m.Binary, err)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("backend.llama_server.binary %s: is a directory", m.Binary)
+		}
+		if info.Mode().Perm()&0o111 == 0 {
+			return fmt.Errorf("backend.llama_server.binary %s: not executable (mode %v)", m.Binary, info.Mode().Perm())
+		}
 	}
 	return nil
 }

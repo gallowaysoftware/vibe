@@ -64,10 +64,12 @@ them before pushing.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.
-- Path fields (`backend.*.path`, `backend.*.dir`, `backend.comfyui.python`,
-  `frontend.workdir`, `frontend.binary`, `frontend.write_file.path`)
-  are tilde-expanded in `internal/vibe/profile/profile.go:expandTilde`.
-  Add new path fields to that list.
+- Path fields (`backend.*.path`, `backend.*.dir`,
+  `backend.comfyui.python`, `backend.llama_server.binary`,
+  `frontend.workdir`, `frontend.binary`, `frontend.write_file`,
+  `frontend.compose_file`) are tilde-expanded in
+  `internal/vibe/profile/profile.go:Load`. Add new path fields to
+  that list.
 
 ## vamp stage rules
 

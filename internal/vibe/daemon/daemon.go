@@ -338,13 +338,22 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 		if err != nil {
 			return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("pick port: %w", err))
 		}
-		spec, err = profile.LlamaServerSpec(p, d.cfg.LlamaBinary, port)
+		// Per-profile binary override beats the daemon-wide default.
+		// Empty falls through to d.cfg.LlamaBinary (which is itself
+		// empty by default, so spawning resolves "llama-server" via
+		// $PATH — the usual symlink-at-~/.local/bin/llama-server case).
+		llamaBin := d.cfg.LlamaBinary
+		if p.Backend.LlamaServer.Binary != "" {
+			llamaBin = p.Backend.LlamaServer.Binary
+		}
+		spec, err = profile.LlamaServerSpec(p, llamaBin, port)
 		if err != nil {
 			return nil, connect.NewError(connect.CodeInternal, err)
 		}
 		slog.Info("starting profile (llama_server)",
 			"profile", p.Name, "alias", p.Backend.LlamaServer.Alias,
-			"context", p.Backend.LlamaServer.Context, "port", port)
+			"context", p.Backend.LlamaServer.Context, "port", port,
+			"binary", llamaBin)
 	case p.Backend.ComfyUI != nil:
 		port = p.Backend.ComfyUI.Port
 		if port == 0 {

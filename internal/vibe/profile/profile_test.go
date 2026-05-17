@@ -791,6 +791,87 @@ frontend:
 	}
 }
 
+// TestLoad_LlamaServer_BinaryOverride covers the per-profile binary
+// override: when set, the path is tilde-expanded, validated to exist +
+// be executable, and threaded through to the backend struct. When
+// unset, the field is empty (daemon falls back to $PATH).
+func TestLoad_LlamaServer_BinaryOverride(t *testing.T) {
+	model := stubModelFile(t)
+	bin := stubManagedBinary(t) // reusable: an executable file under tmp
+	yaml := `
+name: x
+backend:
+  llama_server:
+    path: ` + model + `
+    alias: x
+    context: 1024
+    binary: ` + bin + `
+frontend:
+  kind: external
+  app: opencode
+  write_file: /tmp/oc.json
+  template: {a: 1}
+`
+	p, err := Load(writeProfile(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Backend.LlamaServer.Binary != bin {
+		t.Errorf("binary = %q, want %q", p.Backend.LlamaServer.Binary, bin)
+	}
+}
+
+func TestLoad_LlamaServer_BinaryMissing(t *testing.T) {
+	model := stubModelFile(t)
+	yaml := `
+name: x
+backend:
+  llama_server:
+    path: ` + model + `
+    alias: x
+    context: 1024
+    binary: /definitely/does/not/exist
+frontend:
+  kind: external
+  app: opencode
+  write_file: /tmp/oc.json
+  template: {a: 1}
+`
+	_, err := Load(writeProfile(t, yaml))
+	if err == nil {
+		t.Fatal("expected error on missing binary")
+	}
+	if !strings.Contains(err.Error(), "binary") {
+		t.Errorf("error should mention binary; got %v", err)
+	}
+}
+
+func TestLoad_LlamaServer_BinaryNotExecutable(t *testing.T) {
+	model := stubModelFile(t)
+	notExec := stubManagedBinaryNotExec(t)
+	yaml := `
+name: x
+backend:
+  llama_server:
+    path: ` + model + `
+    alias: x
+    context: 1024
+    binary: ` + notExec + `
+frontend:
+  kind: external
+  app: opencode
+  write_file: /tmp/oc.json
+  template: {a: 1}
+`
+	_, err := Load(writeProfile(t, yaml))
+	if err == nil {
+		t.Fatal("expected error on non-executable binary")
+	}
+	if !strings.Contains(err.Error(), "not executable") {
+		t.Errorf("error should mention 'not executable'; got %v", err)
+	}
+}
+
 func TestLoad_Managed_Valid(t *testing.T) {
 	model := stubModelFile(t)
 	bin := stubManagedBinary(t)
