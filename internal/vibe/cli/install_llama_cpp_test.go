@@ -704,38 +704,128 @@ func TestInstallLlamaCpp_ReleasePathRateLimited(t *testing.T) {
 	}
 }
 
-func TestInstallLlamaCpp_SourcePathPrintsOnly(t *testing.T) {
-	env, out, calls := newLlamaTestEnv(t, llamaTestOpts{
+// TestInstallLlamaCpp_SourcePathRunsCloneAndCmake covers the happy path
+// for the source build: git clone (fresh repo), cmake configure, cmake
+// build target llama-server, symlink into ~/.local/bin/.
+//
+// We stub runCmd so no real network / compile happens. The cmake-build
+// invocation's stub creates a fake llama-server file at the expected
+// location so the post-build findExecutableUnder + symlink step
+// succeeds.
+func TestInstallLlamaCpp_SourcePathRunsCloneAndCmake(t *testing.T) {
+	var home string
+	env, _, calls := newLlamaTestEnv(t, llamaTestOpts{
 		osRelease: `ID=ubuntu` + "\n",
 		method:    llamaMethodSource,
+		runHandler: func(name string, args []string) *exec.Cmd {
+			// On `git clone`, materialize the target dir so subsequent
+			// cmake invocations (which set cmd.Dir = repoDir) don't
+			// fail with chdir-not-exist. argv-shape: git clone <url> <dir>.
+			if name == "git" && len(args) >= 3 && args[0] == "clone" {
+				_ = os.MkdirAll(args[2], 0o755)
+				_ = os.MkdirAll(filepath.Join(args[2], ".git"), 0o755)
+			}
+			// On `cmake --build`, drop a stub llama-server at the path
+			// the installer expects to find one. argv[0]=cmake,
+			// argv[1]=--build, argv[2]=build.
+			if name == "cmake" && len(args) > 1 && args[0] == "--build" {
+				binDir := filepath.Join(home, ".local", "share", "vibe", "llama-cpp-source", "llama.cpp", "build", "bin")
+				_ = os.MkdirAll(binDir, 0o755)
+				_ = os.WriteFile(filepath.Join(binDir, "llama-server"), []byte("#!/bin/sh\necho stub\n"), 0o755)
+			}
+			return exec.Command("/bin/true")
+		},
 	})
+	home = env.home
 	if err := installLlamaCpp(env); err != nil {
 		t.Fatalf("install: %v", err)
 	}
-	s := out.String()
-	if !strings.Contains(s, "git clone https://github.com/ggerganov/llama.cpp") {
-		t.Errorf("missing canonical git clone command:\n%s", s)
+
+	// Expect git clone (no .git present) + cmake configure + cmake build.
+	wantContains := []string{
+		"git clone https://github.com/ggerganov/llama.cpp",
+		"cmake -B build",
+		"cmake --build build",
 	}
-	if !strings.Contains(s, "cmake -B build -DGGML_CUDA=ON") {
-		t.Errorf("missing canonical cmake command:\n%s", s)
+	for _, want := range wantContains {
+		found := false
+		for _, c := range *calls {
+			if strings.Contains(c, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected a call containing %q, got: %v", want, *calls)
+		}
 	}
-	// Source path doesn't run subprocesses (no verify step either).
-	if len(*calls) != 0 {
-		t.Errorf("source path ran subprocesses: %v", *calls)
+
+	// Symlink should now point at the stub binary.
+	target, err := os.Readlink(filepath.Join(home, ".local", "bin", "llama-server"))
+	if err != nil {
+		t.Fatalf("symlink not created: %v", err)
+	}
+	if !strings.HasSuffix(target, "/build/bin/llama-server") {
+		t.Errorf("symlink target = %q, want suffix /build/bin/llama-server", target)
 	}
 }
 
-func TestInstallLlamaCpp_SourcePathWithCUDAFlagStillPrintsCUDA(t *testing.T) {
-	env, out, _ := newLlamaTestEnv(t, llamaTestOpts{
+// TestInstallLlamaCpp_SourcePathWithCUDA verifies the configure step
+// passes -DGGML_CUDA=ON when cuda=true.
+func TestInstallLlamaCpp_SourcePathWithCUDA(t *testing.T) {
+	var home string
+	env, _, calls := newLlamaTestEnv(t, llamaTestOpts{
 		osRelease: `ID=ubuntu` + "\n",
 		method:    llamaMethodSource,
 		cuda:      true,
+		runHandler: func(name string, args []string) *exec.Cmd {
+			if name == "git" && len(args) >= 3 && args[0] == "clone" {
+				_ = os.MkdirAll(args[2], 0o755)
+				_ = os.MkdirAll(filepath.Join(args[2], ".git"), 0o755)
+			}
+			if name == "cmake" && len(args) > 1 && args[0] == "--build" {
+				binDir := filepath.Join(home, ".local", "share", "vibe", "llama-cpp-source", "llama.cpp", "build", "bin")
+				_ = os.MkdirAll(binDir, 0o755)
+				_ = os.WriteFile(filepath.Join(binDir, "llama-server"), []byte("#!/bin/sh\n"), 0o755)
+			}
+			return exec.Command("/bin/true")
+		},
 	})
+	home = env.home
 	if err := installLlamaCpp(env); err != nil {
 		t.Fatalf("install: %v", err)
 	}
-	if !strings.Contains(out.String(), "-DGGML_CUDA=ON") {
-		t.Errorf("missing CUDA flag in source build:\n%s", out.String())
+	found := false
+	for _, c := range *calls {
+		if strings.Contains(c, "cmake -B build -DGGML_CUDA=ON") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected cmake configure with -DGGML_CUDA=ON; calls: %v", *calls)
+	}
+}
+
+// TestInstallLlamaCpp_SourcePathMissingToolchain fails fast with a clear
+// message rather than crashing partway through cmake.
+func TestInstallLlamaCpp_SourcePathMissingToolchain(t *testing.T) {
+	env, _, _ := newLlamaTestEnv(t, llamaTestOpts{
+		osRelease: `ID=ubuntu` + "\n",
+		method:    llamaMethodSource,
+		lookPath: func(name string) (string, error) {
+			if name == "cmake" {
+				return "", errors.New("not found")
+			}
+			return "/usr/bin/" + name, nil
+		},
+	})
+	err := installLlamaCpp(env)
+	if err == nil {
+		t.Fatal("expected error when cmake is missing")
+	}
+	if !strings.Contains(err.Error(), "cmake") {
+		t.Errorf("error should mention cmake; got %v", err)
 	}
 }
 

@@ -120,9 +120,10 @@ func defaultDaemonStatus(ctx context.Context, addr string) (string, error) {
 
 func doctorCmd() *cobra.Command {
 	var (
-		installName string
-		installYes  bool
-		installCUDA bool
+		installName   string
+		installYes    bool
+		installCUDA   bool
+		installMethod string
 	)
 	cmd := &cobra.Command{
 		Use:   "doctor",
@@ -144,7 +145,7 @@ func doctorCmd() *cobra.Command {
 				ctx = context.Background()
 			}
 			if installName != "" {
-				return runInstall(cmd, installName, installYes, installCUDA)
+				return runInstall(cmd, installName, installYes, installCUDA, installMethod)
 			}
 			env := defaultDoctorEnv()
 			results := runChecks(ctx, env)
@@ -172,19 +173,33 @@ func doctorCmd() *cobra.Command {
 		"skip confirmation prompts when used with --install")
 	cmd.Flags().BoolVar(&installCUDA, "cuda", false,
 		"prefer CUDA-flavoured assets when used with --install llama-cpp")
+	cmd.Flags().StringVar(&installMethod, "method", "",
+		"with --install llama-cpp, skip the interactive prompt and pick "+
+			"a method directly: distro | release | source. Source builds "+
+			"from upstream master so you get features (e.g. MTP) before "+
+			"they reach a release tag.")
 	return cmd
 }
 
 // runInstall dispatches to the named installer. New installers plug in here
 // without touching the diagnostic path.
-func runInstall(cmd *cobra.Command, name string, yes, cuda bool) error {
+func runInstall(cmd *cobra.Command, name string, yes, cuda bool, method string) error {
 	out := cmd.OutOrStdout()
 	errOut := cmd.ErrOrStderr()
 	switch name {
 	case "comfyui":
 		return installComfyUI(defaultInstallerEnv(out, errOut, yes))
 	case "llama-cpp":
-		return installLlamaCpp(defaultLlamaInstallerEnv(out, errOut, yes, cuda))
+		env := defaultLlamaInstallerEnv(out, errOut, yes, cuda)
+		switch method {
+		case "":
+			// honor the interactive prompt (or default to release when --yes)
+		case "distro", "release", "source":
+			env.forcedMethod = llamaInstallMethod(method[:1])
+		default:
+			return fmt.Errorf("--method %q: unknown (allowed: distro, release, source)", method)
+		}
+		return installLlamaCpp(env)
 	default:
 		cmd.SilenceErrors = true
 		return fmt.Errorf("--install %q: unknown component (supported: comfyui, llama-cpp)", name)

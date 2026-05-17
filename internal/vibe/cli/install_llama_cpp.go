@@ -64,6 +64,9 @@ type llamaInstallerEnv struct {
 	// cuda is set when --install-cuda is passed; prefers a CUDA-flavoured
 	// release asset and warns when none exists for Linux.
 	cuda bool
+	// forcedMethod, when non-empty, skips the interactive prompt and
+	// pins the install method. Set by the CLI's --method flag.
+	forcedMethod llamaInstallMethod
 }
 
 // defaultLlamaInstallerEnv constructs an env with real implementations of
@@ -123,8 +126,14 @@ func installLlamaCpp(env *llamaInstallerEnv) error {
 	}
 
 	// ── Step 2: choose install method. ──────────────────────────────────
-	method := llamaMethodRelease // default for --yes
-	if !env.yes {
+	// Precedence: forcedMethod (--method flag) > --yes default > prompt.
+	var method llamaInstallMethod
+	switch {
+	case env.forcedMethod != "":
+		method = env.forcedMethod
+	case env.yes:
+		method = llamaMethodRelease
+	default:
 		menu := "Install llama.cpp (llama-server)? Choose method: [d]istro / [r]elease tarball / [s]ource build / [c]ancel: "
 		method = env.chooseMethod(menu)
 	}
@@ -158,10 +167,9 @@ func installLlamaCpp(env *llamaInstallerEnv) error {
 			return err
 		}
 	case llamaMethodSource:
-		// Source build is print-only. We DON'T verify at the end since
-		// the user hasn't actually built anything yet.
-		printLlamaSourceBuild(env)
-		return nil
+		if err := installLlamaCppSource(env); err != nil {
+			return err
+		}
 	}
 
 	// ── Step 4: verify. ─────────────────────────────────────────────────
@@ -776,21 +784,124 @@ func findExecutableUnder(root, name string) (string, error) {
 	return found, nil
 }
 
-// printLlamaSourceBuild prints the canonical build commands. We don't run
-// them — compilation flags and toolchains are too operator-specific
-// (CUDA version pinning, AVX-512 vs not, ccache, etc.).
-func printLlamaSourceBuild(env *llamaInstallerEnv) {
-	fmt.Fprintln(env.stdout, "Source build commands (run them yourself):")
-	fmt.Fprintln(env.stdout, "    git clone https://github.com/ggerganov/llama.cpp")
-	fmt.Fprintln(env.stdout, "    cd llama.cpp")
+// installLlamaCppSource clones llama.cpp from upstream main, cmakes it,
+// builds with --parallel, and symlinks build/bin/llama-server into
+// ~/.local/bin/. This is the path users take when they want features
+// that haven't shipped in a release tag yet (e.g. MTP support).
+//
+// Pre-flight verifies git + cmake + a C++ compiler exist; with cuda=true
+// nvcc is also required. The build itself streams stdout/stderr to the
+// user so they see compile progress — a fresh build is 5-15 min on
+// modern hardware.
+//
+// Idempotent: rerunning re-pulls from origin (git fetch + reset --hard
+// origin/main), rebuilds incrementally, refreshes the symlink. The
+// "wipe and re-clone" path isn't worth the disk write for routine
+// updates.
+func installLlamaCppSource(env *llamaInstallerEnv) error {
+	// ── Pre-flight: required toolchain. ─────────────────────────────────
+	required := []string{"git", "cmake"}
 	if env.cuda {
-		fmt.Fprintln(env.stdout, "    cmake -B build -DGGML_CUDA=ON")
-	} else {
-		fmt.Fprintln(env.stdout, "    cmake -B build -DGGML_CUDA=ON   # drop -DGGML_CUDA=ON for CPU-only")
+		required = append(required, "nvcc")
 	}
-	fmt.Fprintln(env.stdout, "    cmake --build build --config Release -j")
-	fmt.Fprintln(env.stdout, "")
-	fmt.Fprintln(env.stdout, "Then add the resulting `build/bin/` to your $PATH (or symlink llama-server into ~/.local/bin/).")
+	for _, bin := range required {
+		if _, err := env.lookPath(bin); err != nil {
+			return fmt.Errorf("source build needs %s on $PATH (install it and retry)", bin)
+		}
+	}
+	// At least one C++ compiler. cmake will discover it but we want to
+	// fail fast with a helpful message rather than 30s into the cmake
+	// configure step.
+	var cxxFound string
+	for _, bin := range []string{"c++", "g++", "clang++"} {
+		if _, err := env.lookPath(bin); err == nil {
+			cxxFound = bin
+			break
+		}
+	}
+	if cxxFound == "" {
+		return errors.New("source build needs a C++ compiler (c++, g++, or clang++) on $PATH")
+	}
+	fmt.Fprintf(env.stdout, "[info] toolchain: git, cmake, %s present\n", cxxFound)
+
+	// ── Clone or update. ────────────────────────────────────────────────
+	srcRoot := filepath.Join(env.home, ".local", "share", "vibe", "llama-cpp-source")
+	repoDir := filepath.Join(srcRoot, "llama.cpp")
+	binDir := filepath.Join(env.home, ".local", "bin")
+	symlink := filepath.Join(binDir, "llama-server")
+
+	if err := os.MkdirAll(srcRoot, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", srcRoot, err)
+	}
+
+	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err == nil {
+		fmt.Fprintf(env.stdout, "[run ] git -C %s fetch origin\n", repoDir)
+		fetch := env.runCmd("git", "-C", repoDir, "fetch", "origin")
+		fetch.Stdout = env.stdout
+		fetch.Stderr = env.stderr
+		if err := fetch.Run(); err != nil {
+			return fmt.Errorf("git fetch: %w", err)
+		}
+		fmt.Fprintf(env.stdout, "[run ] git -C %s reset --hard origin/master\n", repoDir)
+		reset := env.runCmd("git", "-C", repoDir, "reset", "--hard", "origin/master")
+		reset.Stdout = env.stdout
+		reset.Stderr = env.stderr
+		if err := reset.Run(); err != nil {
+			return fmt.Errorf("git reset: %w", err)
+		}
+	} else {
+		fmt.Fprintf(env.stdout, "[run ] git clone https://github.com/ggerganov/llama.cpp %s\n", repoDir)
+		clone := env.runCmd("git", "clone", "https://github.com/ggerganov/llama.cpp", repoDir)
+		clone.Stdout = env.stdout
+		clone.Stderr = env.stderr
+		if err := clone.Run(); err != nil {
+			return fmt.Errorf("git clone: %w", err)
+		}
+	}
+
+	// ── Configure. ──────────────────────────────────────────────────────
+	cfgArgs := []string{"-B", "build"}
+	if env.cuda {
+		cfgArgs = append(cfgArgs, "-DGGML_CUDA=ON")
+	}
+	fmt.Fprintf(env.stdout, "[run ] cmake %s (in %s)\n", strings.Join(cfgArgs, " "), repoDir)
+	cfg := env.runCmd("cmake", cfgArgs...)
+	cfg.Dir = repoDir
+	cfg.Stdout = env.stdout
+	cfg.Stderr = env.stderr
+	if err := cfg.Run(); err != nil {
+		return fmt.Errorf("cmake configure: %w", err)
+	}
+
+	// ── Build. ──────────────────────────────────────────────────────────
+	// --parallel without a value asks cmake to pick a sensible job count
+	// based on $CMAKE_BUILD_PARALLEL_LEVEL or the host's nproc. Release
+	// config matters for ggml hot-path optimization.
+	buildArgs := []string{"--build", "build", "--config", "Release", "--parallel", "--target", "llama-server"}
+	fmt.Fprintf(env.stdout, "[run ] cmake %s   (this takes 5-15 min on a fresh checkout)\n", strings.Join(buildArgs, " "))
+	build := env.runCmd("cmake", buildArgs...)
+	build.Dir = repoDir
+	build.Stdout = env.stdout
+	build.Stderr = env.stderr
+	if err := build.Run(); err != nil {
+		return fmt.Errorf("cmake build: %w", err)
+	}
+
+	// ── Locate the built binary and refresh the symlink. ────────────────
+	serverPath, err := findExecutableUnder(filepath.Join(repoDir, "build"), "llama-server")
+	if err != nil {
+		return fmt.Errorf("locate llama-server after build: %w", err)
+	}
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", binDir, err)
+	}
+	_ = os.Remove(symlink)
+	if err := os.Symlink(serverPath, symlink); err != nil {
+		return fmt.Errorf("symlink %s -> %s: %w", symlink, serverPath, err)
+	}
+	fmt.Fprintf(env.stdout, "[ok  ] symlink %s -> %s\n", symlink, serverPath)
+	pathWarning(env, binDir)
+	return nil
 }
 
 // verifyLlamaInstall runs `llama-server --version` and reports whatever it
