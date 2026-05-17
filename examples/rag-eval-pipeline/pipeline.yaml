@@ -1,0 +1,101 @@
+name: rag-eval
+description: |
+  Drives the `rag` profile's RAG stack end-to-end: embeds a list of
+  test queries with TEI, retrieves top-k chunks from a Qdrant
+  collection, asks the LLM to score retrieval quality per query,
+  and synthesizes a final report.
+
+  Pre-flight: `vibe start rag` must be running (TEI on :14002,
+  Qdrant on :6333, chat LLM on :9000) with a populated Qdrant
+  collection. Populate by uploading documents to Open WebUI's
+  Knowledge UI; the collection name appears in the Workspace.
+
+inputs:
+  collection:
+    type: string
+    required: true
+
+stages:
+  # 1. Materialize the query suite as JSON. A text stage with a
+  #    deterministic echo prompt + temperature 0 + seed 1 produces
+  #    a known JSON array foreach can iterate over. Edit the inline
+  #    list to your own queries (or swap to prompt_file + a separate
+  #    queries.tmpl when the suite grows).
+  - id: queries
+    type: text
+    capability: fast_drafting
+    prompt: |
+      Output ONLY this JSON array of strings verbatim, with no preamble
+      and no Markdown formatting:
+      [
+        "What does BGE-M3 do?",
+        "How does Qdrant index vectors?",
+        "What is hybrid search and why does it help RAG?"
+      ]
+    output: queries.json
+    output_format: json
+    params:
+      max_tokens: 512
+      temperature: 0
+      seed: 1
+
+  # 2. Embed each query via TEI. Per-query response is the full
+  #    OpenAI-compat embeddings response written to embed_<i>.json.
+  - id: embed
+    type: webhook
+    inputs: [queries]
+    foreach:
+      from: queries
+      var: query
+    url: http://127.0.0.1:14002/v1/embeddings
+    method: POST
+    body:
+      model: bge-m3
+      input: "{{.query}}"
+    output: embed_{{.i}}.json
+
+  # 3. Retrieve top-k chunks from Qdrant. The body needs the vector
+  #    inlined as a real JSON array, not a stringified one — vamp's
+  #    inline body: rendering treats string values as templates and
+  #    keeps them strings, so for a typed array we use a body
+  #    template file rendered through readFile + parseJSON + toJSON.
+  - id: retrieve
+    type: webhook
+    inputs: [embed, queries]
+    foreach:
+      from: queries
+      var: query
+    url: "http://127.0.0.1:6333/collections/{{.inputs.collection}}/points/search"
+    method: POST
+    body_template_file: body_templates/qdrant_search.json.tmpl
+    output: retrieve_{{.i}}.json
+
+  # 4. Per-query judge: LLM scores retrieval relevance against the
+  #    original query, in a structured JSON shape the report stage
+  #    aggregates.
+  - id: judge
+    type: text
+    capability: careful_reasoning
+    inputs: [retrieve, queries]
+    foreach:
+      from: queries
+      var: query
+    prompt_file: prompts/judge.tmpl
+    output: judge_{{.i}}.json
+    output_format: json
+    params:
+      max_tokens: 1024
+      temperature: 0
+      seed: 1
+
+  # 5. Aggregate across all per-query judgments into a human-readable
+  #    Markdown report. Operates on the concatenation of judge_*.json.
+  - id: report
+    type: text
+    capability: careful_reasoning
+    inputs: [judge]
+    prompt_file: prompts/report.tmpl
+    output: report.md
+    params:
+      max_tokens: 4096
+      temperature: 0.2

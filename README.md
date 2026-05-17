@@ -228,6 +228,7 @@ authed (gated by filesystem perms instead). If the token leaks, run
 | [`notify-pipeline`](examples/notify-pipeline/) | Minimal webhook stage demo. |
 | [`youtube-upload`](examples/youtube-upload/) | OAuth-driven YouTube Data API upload. |
 | [`content-mill`](examples/content-mill/) | Every stage type stitched end-to-end with a failure-path webhook. |
+| [`rag-eval-pipeline`](examples/rag-eval-pipeline/) | Tier-3 RAG: embed query suite via TEI, retrieve from Qdrant, judge quality with the LLM, aggregate report. Demonstrates `readFile`/`parseJSON`/`toJSON` chaining. |
 
 ## Editor support
 

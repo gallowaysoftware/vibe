@@ -2031,6 +2031,23 @@ func renderTemplate(name, raw string, deps []string, cliInputs map[string]string
 //
 // Kept small on purpose: each new function widens the API surface that
 // pipelines silently depend on. Add deliberately, document inline.
+//
+//   - readFile: reads the file at path and returns its contents as a
+//     string. Intended for chaining stage outputs as data: a webhook
+//     stage's response is written to its output file; the next stage
+//     can `{{ readFile .stages.embed.output | parseJSON | toJSON }}`
+//     to thread the response body into a downstream call. Errors at
+//     template-render time if the file is missing or unreadable.
+//   - parseJSON: decodes a JSON string into the structure Go's encoding
+//     /json gives back (map[string]any / []any / scalars). Combined
+//     with readFile, lets templates pull specific fields out of a
+//     prior stage's response — e.g. `{{ index (readFile X | parseJSON
+//     | index "data" 0) "embedding" | toJSON }}` extracts the first
+//     embedding vector from a TEI response and inlines it as a JSON
+//     array.
+//   - toJSON: re-marshals a value to its JSON representation. Needed
+//     to take a parseJSON result (a Go slice / map) and emit it as a
+//     valid JSON fragment in a webhook body.
 func templateFuncs() template.FuncMap {
 	return template.FuncMap{
 		"slugify":   slugify,
@@ -2040,7 +2057,42 @@ func templateFuncs() template.FuncMap {
 		"lower":     strings.ToLower,
 		"upper":     strings.ToUpper,
 		"trim":      strings.TrimSpace,
+		"readFile":  readFileTemplate,
+		"parseJSON": parseJSONTemplate,
+		"toJSON":    toJSONTemplate,
 	}
+}
+
+// readFileTemplate reads the file at path and returns its contents as a
+// string. Surfaces a wrapped error on miss so the template engine reports
+// the failing stage clearly.
+func readFileTemplate(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("readFile %s: %w", path, err)
+	}
+	return string(b), nil
+}
+
+// parseJSONTemplate decodes the given JSON string. Returns the natural
+// Go shape (map[string]any / []any / float64 / string / bool / nil).
+func parseJSONTemplate(s string) (any, error) {
+	var v any
+	if err := json.Unmarshal([]byte(s), &v); err != nil {
+		return nil, fmt.Errorf("parseJSON: %w", err)
+	}
+	return v, nil
+}
+
+// toJSONTemplate marshals v to its JSON representation. Compact form
+// (no indentation) — templates that want pretty-printing can pipe
+// through a downstream tool.
+func toJSONTemplate(v any) (string, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", fmt.Errorf("toJSON: %w", err)
+	}
+	return string(b), nil
 }
 
 // slugify converts an arbitrary value to a filesystem-safe slug: lowercase

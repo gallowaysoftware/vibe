@@ -86,8 +86,10 @@ them before pushing.
   the pipeline its reason for existing.
 - **Output is always a path.** `.stages.X.output` in templates renders
   the absolute path of the stage's output file, not its contents.
-  Template chains read the upstream file by passing the path verbatim
-  to the next stage's prompt/argv.
+  Template chains that need the *contents* (e.g. extracting a field
+  from a webhook response) use the registered `readFile` helper:
+  `{{ readFile .stages.X.output | parseJSON | <accessor> | toJSON }}`.
+  See `examples/rag-eval-pipeline/` for the canonical pattern.
 - **Stage executors take injectable runners.** Every executor accepts
   a runner / httpDoer / process spawner that tests can swap. Don't
   hard-code `exec.Command` or `http.DefaultClient` at the executor
