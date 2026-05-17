@@ -66,6 +66,11 @@ message FrontendInfo {
   // differently for external (config written, user launches binary) vs
   // managed/docker-compose (vibe also launched the binary).
   string kind = 5;
+  // url is the address the user should open in their browser, derived
+  // from profile.Frontend.BrowserURL() (explicit frontend.url field or
+  // the wait_for entry with a "/" path). Empty when neither applies —
+  // the CLI omits the browser hint in that case.
+  string url = 6;
 }
 
 message StatusRequest {}

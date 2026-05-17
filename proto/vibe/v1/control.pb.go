@@ -250,7 +250,12 @@ type FrontendInfo struct {
 	// kind echoes profile.Frontend.Kind so the CLI can word its output
 	// differently for external (config written, user launches binary) vs
 	// managed/docker-compose (vibe also launched the binary).
-	Kind          string `protobuf:"bytes,5,opt,name=kind,proto3" json:"kind,omitempty"`
+	Kind string `protobuf:"bytes,5,opt,name=kind,proto3" json:"kind,omitempty"`
+	// url is the address the user should open in their browser, derived
+	// from profile.Frontend.BrowserURL() (explicit frontend.url field or
+	// the wait_for entry with a "/" path). Empty when neither applies —
+	// the CLI omits the browser hint in that case.
+	Url           string `protobuf:"bytes,6,opt,name=url,proto3" json:"url,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -316,6 +321,13 @@ func (x *FrontendInfo) GetEnvVars() map[string]string {
 func (x *FrontendInfo) GetKind() string {
 	if x != nil {
 		return x.Kind
+	}
+	return ""
+}
+
+func (x *FrontendInfo) GetUrl() string {
+	if x != nil {
+		return x.Url
 	}
 	return ""
 }
@@ -968,14 +980,15 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\aProfile\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12 \n" +
 	"\vdescription\x18\x02 \x01(\tR\vdescription\x12\x12\n" +
-	"\x04path\x18\x03 \x01(\tR\x04path\"\xf9\x01\n" +
+	"\x04path\x18\x03 \x01(\tR\x04path\"\x8b\x02\n" +
 	"\fFrontendInfo\x12\x10\n" +
 	"\x03app\x18\x01 \x01(\tR\x03app\x12\x1d\n" +
 	"\n" +
 	"wrote_file\x18\x02 \x01(\tR\twroteFile\x12)\n" +
 	"\x10restart_required\x18\x03 \x01(\bR\x0frestartRequired\x12=\n" +
 	"\benv_vars\x18\x04 \x03(\v2\".vibe.v1.FrontendInfo.EnvVarsEntryR\aenvVars\x12\x12\n" +
-	"\x04kind\x18\x05 \x01(\tR\x04kind\x1a:\n" +
+	"\x04kind\x18\x05 \x01(\tR\x04kind\x12\x10\n" +
+	"\x03url\x18\x06 \x01(\tR\x03url\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x0f\n" +

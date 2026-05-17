@@ -439,6 +439,7 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 			RestartRequired: fr.RestartRequired,
 			EnvVars:         fr.Env,
 			Kind:            p.Frontend.Kind,
+			Url:             p.Frontend.BrowserURL(),
 		}
 	} else {
 		slog.Info("profile started", "profile", p.Name, "backend", st.Addr)

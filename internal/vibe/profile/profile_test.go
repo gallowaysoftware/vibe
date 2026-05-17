@@ -872,6 +872,70 @@ frontend:
 	}
 }
 
+// TestFrontend_BrowserURL covers both branches of the URL resolver:
+// explicit frontend.url wins; otherwise the wait_for entry with a "/"
+// path is picked; otherwise empty.
+func TestFrontend_BrowserURL(t *testing.T) {
+	cases := []struct {
+		name string
+		f    Frontend
+		want string
+	}{
+		{
+			name: "explicit url wins",
+			f: Frontend{
+				URL: "http://127.0.0.1:8080/",
+				WaitFor: []WaitForURL{
+					{URL: "http://127.0.0.1:9000/health"},
+				},
+			},
+			want: "http://127.0.0.1:8080/",
+		},
+		{
+			name: "fallback to wait_for root path",
+			f: Frontend{
+				WaitFor: []WaitForURL{
+					{URL: "http://127.0.0.1:6333/readyz"},
+					{URL: "http://127.0.0.1:14002/health"},
+					{URL: "http://127.0.0.1:8080/"},
+				},
+			},
+			want: "http://127.0.0.1:8080/",
+		},
+		{
+			name: "no obvious root path returns empty",
+			f: Frontend{
+				WaitFor: []WaitForURL{
+					{URL: "http://127.0.0.1:6333/readyz"},
+					{URL: "http://127.0.0.1:14002/health"},
+				},
+			},
+			want: "",
+		},
+		{
+			name: "no url no wait_for returns empty",
+			f:    Frontend{},
+			want: "",
+		},
+		{
+			name: "url without trailing slash counts as root",
+			f: Frontend{
+				WaitFor: []WaitForURL{
+					{URL: "http://127.0.0.1:8080"},
+				},
+			},
+			want: "http://127.0.0.1:8080",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.f.BrowserURL(); got != c.want {
+				t.Errorf("BrowserURL() = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestLoad_Managed_Valid(t *testing.T) {
 	model := stubModelFile(t)
 	bin := stubManagedBinary(t)

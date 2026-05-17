@@ -90,6 +90,49 @@ const (
 	FrontendManaged       = "managed"
 )
 
+// BrowserURL returns the URL to suggest to a user once the frontend is
+// up. Precedence:
+//
+//  1. The explicit Frontend.URL field, when set.
+//  2. Otherwise, the wait_for entry whose URL ends in a root path
+//     ("/" or no path) — the conventional "UI is on this URL"
+//     marker that distinguishes the user-visible endpoint from
+//     health-check URLs (`/health`, `/readyz`, etc.).
+//
+// Returns "" when neither produces an answer, signalling the CLI not
+// to print a browser hint.
+func (f Frontend) BrowserURL() string {
+	if f.URL != "" {
+		return f.URL
+	}
+	for _, w := range f.WaitFor {
+		if isUIRootURL(w.URL) {
+			return w.URL
+		}
+	}
+	return ""
+}
+
+// isUIRootURL returns true when u has no path component or a path of
+// just "/". Probe URLs for health endpoints (".../health", "/readyz",
+// etc.) carry a non-trivial path; this lets us separate them from the
+// "open this in a browser" URL without a schema field.
+func isUIRootURL(u string) bool {
+	// Find the path after the host: look for a "://" then the next "/".
+	// We deliberately avoid url.Parse here to stay tolerant of slightly
+	// malformed inputs (the daemon validates wait_for URLs separately).
+	i := strings.Index(u, "://")
+	if i < 0 {
+		return false
+	}
+	rest := u[i+3:]
+	slash := strings.Index(rest, "/")
+	if slash < 0 {
+		return true // no path at all
+	}
+	return rest[slash:] == "/"
+}
+
 type Frontend struct {
 	Kind            string            `yaml:"kind"`
 	App             string            `yaml:"app"`
@@ -98,6 +141,13 @@ type Frontend struct {
 	Template        map[string]any    `yaml:"template,omitempty"`
 	Env             map[string]string `yaml:"env,omitempty"`
 	MCPs            []string          `yaml:"mcps,omitempty"`
+	// URL is the address the user should point their browser at once
+	// the frontend is up. Optional: when unset, the daemon falls back
+	// to the wait_for entry whose URL path is "/" (the conventional
+	// "root of the UI") and uses that. Surfaced in the `vibe start`
+	// summary as "browser: <url>" so the user doesn't have to
+	// remember whether they're on :8080, :3000, or whatever.
+	URL string `yaml:"url,omitempty"`
 
 	// docker-compose kind fields.
 	ComposeFile string       `yaml:"compose_file,omitempty"`

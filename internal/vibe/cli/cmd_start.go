@@ -53,6 +53,9 @@ func startCmd() *cobra.Command {
 				} else {
 					fmt.Printf("  frontend: %s (running)\n", r.Frontend.App)
 				}
+				if r.Frontend.Url != "" && !external {
+					fmt.Printf("  browser: %s\n", r.Frontend.Url)
+				}
 				if r.Frontend.WroteFile != "" {
 					fmt.Printf("  wrote:    %s\n", r.Frontend.WroteFile)
 				}
