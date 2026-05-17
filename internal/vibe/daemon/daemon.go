@@ -352,6 +352,7 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 		}
 		slog.Info("starting profile (llama_server)",
 			"profile", p.Name, "alias", p.Backend.LlamaServer.Alias,
+			"model_file", filepath.Base(p.Backend.LlamaServer.Path),
 			"context", p.Backend.LlamaServer.Context, "port", port,
 			"binary", llamaBin)
 	case p.Backend.ComfyUI != nil:

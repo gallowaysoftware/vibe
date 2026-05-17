@@ -43,9 +43,19 @@ func TestRenderDaemonEvent(t *testing.T) {
 			want: "vram ok (29.6 GiB free, 28.0 GiB estimated)",
 		},
 		{
-			name: "starting llama_server",
+			name: "starting llama_server (no alias)",
 			line: `{"msg":"starting profile (llama_server)","profile":"chat"}`,
 			want: "loading model into llama-server",
+		},
+		{
+			name: "starting llama_server (alias only)",
+			line: `{"msg":"starting profile (llama_server)","alias":"qwen3-32b-q5km"}`,
+			want: "loading qwen3-32b-q5km into llama-server",
+		},
+		{
+			name: "starting llama_server (alias + file)",
+			line: `{"msg":"starting profile (llama_server)","alias":"qwen3-32b-q5km","model_file":"Qwen3-32B-Q5_K_M.gguf"}`,
+			want: "loading qwen3-32b-q5km (Qwen3-32B-Q5_K_M.gguf) into llama-server",
 		},
 		{
 			name: "backend ready",

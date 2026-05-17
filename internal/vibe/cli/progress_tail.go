@@ -113,6 +113,8 @@ func renderDaemonEvent(line string, out io.Writer) {
 		Elapsed      int64   `json:"elapsed"` // nanoseconds
 		URL          string  `json:"url"`
 		Project      string  `json:"project"`
+		Alias        string  `json:"alias"`
+		ModelFile    string  `json:"model_file"`
 	}
 	var e event
 	if err := json.Unmarshal([]byte(line), &e); err != nil {
@@ -124,7 +126,14 @@ func renderDaemonEvent(line string, out io.Writer) {
 	case "vram pre-flight skipped":
 		fmt.Fprintln(out, "  vram check skipped (probe unavailable)")
 	case "starting profile (llama_server)":
-		fmt.Fprintln(out, "  loading model into llama-server...")
+		switch {
+		case e.Alias != "" && e.ModelFile != "":
+			fmt.Fprintf(out, "  loading %s (%s) into llama-server...\n", e.Alias, e.ModelFile)
+		case e.Alias != "":
+			fmt.Fprintf(out, "  loading %s into llama-server...\n", e.Alias)
+		default:
+			fmt.Fprintln(out, "  loading model into llama-server...")
+		}
 	case "starting profile (comfyui)":
 		fmt.Fprintln(out, "  starting ComfyUI...")
 	case "backend ready":
