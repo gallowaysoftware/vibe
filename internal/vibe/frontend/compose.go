@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -137,10 +138,23 @@ func (c *composeDriver) Activate(reqCtx context.Context, p *profile.Profile, ctx
 	envSlice := envMapToSlice(env)
 
 	upArgs := composeUpArgs(composeFile, projectName, p.Frontend.Services)
+	slog.Info("frontend compose: up",
+		"profile", p.Name,
+		"compose_file", composeFile,
+		"project", projectName,
+	)
 	if err := c.runCommand(reqCtx, "docker", upArgs, envSlice); err != nil {
 		return nil, fmt.Errorf("docker compose up: %w", err)
 	}
+	slog.Info("frontend compose: up done", "profile", p.Name, "project", projectName)
 
+	if len(p.Frontend.WaitFor) > 0 {
+		urls := make([]string, len(p.Frontend.WaitFor))
+		for i, w := range p.Frontend.WaitFor {
+			urls[i] = w.URL
+		}
+		slog.Info("frontend compose: waiting for ready", "profile", p.Name, "urls", urls)
+	}
 	if err := c.waitForReady(reqCtx, p.Frontend.WaitFor); err != nil {
 		// Best-effort teardown: bring the stack back down so the caller
 		// isn't left with a half-up stack on failure.
@@ -237,6 +251,7 @@ func (c *composeDriver) pollURL(reqCtx context.Context, url string, timeout time
 		status, err := c.probeURL(probeCtx, url)
 		cancel()
 		if err == nil && status >= 200 && status < 300 {
+			slog.Info("frontend compose: wait_for ready", "url", url)
 			return nil
 		}
 		lastStatus = status

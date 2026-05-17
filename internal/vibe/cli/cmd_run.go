@@ -61,6 +61,9 @@ func runCmd() *cobra.Command {
 				return err
 			}
 
+			cancelTail := startProgressTail(cmd.OutOrStdout())
+			defer cancelTail()
+
 			client := newClient()
 			r, err := client.StartWithOptions(ctx, args[0], vibeclient.StartOptions{
 				NoVRAMCheck: noVRAMCheck,

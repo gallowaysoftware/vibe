@@ -29,6 +29,11 @@ func startCmd() *cobra.Command {
 			if err := pullProfile(ctx, args[0]); err != nil {
 				return err
 			}
+			// Tail the daemon log during the Start RPC so the user sees
+			// vram check, model load, backend-ready, compose-up, etc.
+			// land in real time instead of staring at silence.
+			cancelTail := startProgressTail(cmd.OutOrStdout())
+			defer cancelTail()
 			r, err := newClient().StartWithOptions(ctx, args[0], vibeclient.StartOptions{
 				NoVRAMCheck: noVRAMCheck,
 			})
