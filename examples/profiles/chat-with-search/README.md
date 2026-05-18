@@ -49,6 +49,7 @@ vibe start chat
 | `chat.yaml` | `~/.config/vibe/profiles/chat.yaml` | The vibe profile (model + frontend block). |
 | `docker-compose.yaml` | `~/.config/vibe/compose/chat/docker-compose.yaml` | Open WebUI + SearXNG. |
 | `searxng/settings.yml` | `~/.config/vibe/compose/chat/searxng/settings.yml` | SearXNG config (replace secret_key). |
+| `smoke.yaml` | (run in place) | vamp smoke pipeline: probes SearXNG, Wikipedia, Open WebUI, the vibe proxy, and a 1-token LLM round-trip. |
 
 ## Using it
 
@@ -84,6 +85,24 @@ vibe start chat
 
 Inspect: `sqlite3 ~/.local/state/vibe/frontend/chat/data/webui.db`.
 Back up: `tar czf chat-state.tar.gz -C ~/.local/state/vibe/frontend chat`.
+
+## Smoke test
+
+Once the profile is running (`vibe start chat`), check every layer of
+the stack in one command:
+
+```sh
+vamp run examples/profiles/chat-with-search/smoke.yaml
+```
+
+Hits SearXNG, scrapes Wikipedia with an identifying UA (catches
+bot-policy regressions), confirms Open WebUI is serving its shell,
+asks the vibe proxy for `/v1/models`, and fires a 1-token LLM
+round-trip ("reply PONG"). Total wall time ~1–2s. Every stage is a
+`webhook` with an `assert:` block — exit code 0 = the stack is
+healthy end-to-end. See the file header for what's deliberately not
+covered (the OWUI search API needs a JWT we can't bootstrap from a
+fresh deploy without a UI round-trip).
 
 ## Why these choices
 

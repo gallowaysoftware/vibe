@@ -426,3 +426,205 @@ func TestWebhookExecutor_BodyPreservesNonStringTypes(t *testing.T) {
 		t.Errorf("color = %v (%T), want float64 15158332", parsed["color"], parsed["color"])
 	}
 }
+
+// ─── Assertion path (smoke-test webhook stages) ──────────────────────────────
+
+// TestWebhookExecutor_AssertStatusCode_Match: assert.status_code=200 should
+// accept exactly that and return the body, even though we otherwise default
+// to "any 2xx".
+func TestWebhookExecutor_AssertStatusCode_Match(t *testing.T) {
+	srv := newWebhookTestServer(t)
+	srv.status = 200
+	srv.respBody = "ok"
+	stage := &Stage{
+		ID:     "probe",
+		Type:   StageTypeWebhook,
+		URL:    srv.URL(),
+		Method: "GET",
+		Assert: &AssertSpec{StatusCode: 200},
+		Output: "resp.txt",
+	}
+	in := StageInput{Stage: stage, PipelineName: "p", RunDir: t.TempDir()}
+	out, err := (&webhookExecutor{}).Execute(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if out.Text != "ok" {
+		t.Errorf("Text = %q", out.Text)
+	}
+}
+
+// TestWebhookExecutor_AssertStatusCode_AcceptsNon2xx: a status_code: 401
+// assertion should treat a 401 response as success — useful for testing
+// that auth IS required on an endpoint.
+func TestWebhookExecutor_AssertStatusCode_AcceptsNon2xx(t *testing.T) {
+	srv := newWebhookTestServer(t)
+	srv.status = 401
+	srv.respBody = `{"detail":"Not authenticated"}`
+	stage := &Stage{
+		ID:     "probe",
+		Type:   StageTypeWebhook,
+		URL:    srv.URL(),
+		Method: "GET",
+		Assert: &AssertSpec{StatusCode: 401},
+		Output: "resp.txt",
+	}
+	in := StageInput{Stage: stage, PipelineName: "p", RunDir: t.TempDir()}
+	if _, err := (&webhookExecutor{}).Execute(context.Background(), in); err != nil {
+		t.Fatalf("expected 401 to be accepted with assert.status_code=401, got: %v", err)
+	}
+}
+
+// TestWebhookExecutor_AssertStatusCode_Mismatch reports both expected and
+// actual in the error so the user can debug without re-running.
+func TestWebhookExecutor_AssertStatusCode_Mismatch(t *testing.T) {
+	srv := newWebhookTestServer(t)
+	srv.status = 500
+	srv.respBody = "kaboom"
+	stage := &Stage{
+		ID:     "probe",
+		Type:   StageTypeWebhook,
+		URL:    srv.URL(),
+		Method: "GET",
+		Assert: &AssertSpec{StatusCode: 200},
+		Output: "resp.txt",
+	}
+	in := StageInput{Stage: stage, PipelineName: "p", RunDir: t.TempDir()}
+	_, err := (&webhookExecutor{}).Execute(context.Background(), in)
+	if err == nil {
+		t.Fatal("expected error for status mismatch")
+	}
+	msg := err.Error()
+	for _, want := range []string{"assert", "expected HTTP 200", "got HTTP 500", "kaboom"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error missing %q: %v", want, err)
+		}
+	}
+}
+
+// TestWebhookExecutor_AssertBodyChecks exercises every body-check shape in
+// one go: body_contains (pass + fail), body_not_contains, min_body_length.
+// The interesting property is that ALL failures appear in a single error so
+// the user gets the full picture without re-running.
+func TestWebhookExecutor_AssertBodyChecks_AllFailures(t *testing.T) {
+	srv := newWebhookTestServer(t)
+	srv.status = 200
+	srv.respBody = "short"
+	stage := &Stage{
+		ID:     "probe",
+		Type:   StageTypeWebhook,
+		URL:    srv.URL(),
+		Method: "GET",
+		Assert: &AssertSpec{
+			BodyContains:    []string{"missing-token"},
+			BodyNotContains: []string{"short"}, // present, should fail
+			MinBodyLength:   100,
+		},
+		Output: "resp.txt",
+	}
+	in := StageInput{Stage: stage, PipelineName: "p", RunDir: t.TempDir()}
+	_, err := (&webhookExecutor{}).Execute(context.Background(), in)
+	if err == nil {
+		t.Fatal("expected assertion failures")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		`body_contains: missing "missing-token"`,
+		`body_not_contains: found "short"`,
+		`body length 5 < min_body_length 100`,
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error missing %q in %q", want, msg)
+		}
+	}
+}
+
+// TestWebhookExecutor_AssertBodyChecks_Pass: the happy path with body checks.
+func TestWebhookExecutor_AssertBodyChecks_Pass(t *testing.T) {
+	srv := newWebhookTestServer(t)
+	srv.status = 200
+	srv.respBody = `{"results":[{"url":"https://en.wikipedia.org/wiki/Iran","title":"Iran"}]}`
+	stage := &Stage{
+		ID:     "probe",
+		Type:   StageTypeWebhook,
+		URL:    srv.URL(),
+		Method: "GET",
+		Assert: &AssertSpec{
+			BodyContains:  []string{`"results"`, "wikipedia.org"},
+			MinBodyLength: 20,
+		},
+		Output: "resp.txt",
+	}
+	in := StageInput{Stage: stage, PipelineName: "p", RunDir: t.TempDir()}
+	if _, err := (&webhookExecutor{}).Execute(context.Background(), in); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+}
+
+// TestWebhookExecutor_GETNoBody confirms the validator allows GET stages
+// with no body. The smoke-test pattern probes a URL and asserts on the
+// response — having to invent a body just to satisfy the validator was
+// the prior friction.
+func TestWebhookExecutor_GETNoBody(t *testing.T) {
+	yaml := `
+name: probe
+stages:
+  - id: ping
+    type: webhook
+    url: https://example.com/health
+    method: GET
+    assert:
+      status_code: 200
+    output: resp.txt
+`
+	if _, err := LoadPipeline(writePipeline(t, yaml)); err != nil {
+		t.Fatalf("GET with no body should validate, got: %v", err)
+	}
+}
+
+// TestWebhookExecutor_AssertRejectedOnNonWebhook keeps assert: scoped to
+// webhook stages. Putting it on a text stage would silently no-op today;
+// surfacing it as a validation error is friendlier.
+func TestWebhookExecutor_AssertRejectedOnNonWebhook(t *testing.T) {
+	yaml := `
+name: x
+stages:
+  - id: greet
+    type: text
+    capability: chat
+    prompt: hi
+    assert:
+      status_code: 200
+    output: out.txt
+`
+	_, err := LoadPipeline(writePipeline(t, yaml))
+	if err == nil {
+		t.Fatal("expected validation error for assert on text stage")
+	}
+	if !strings.Contains(err.Error(), "assert is only valid on type: webhook stages") {
+		t.Errorf("error: %v", err)
+	}
+}
+
+// TestWebhookExecutor_AssertStatusCodeRange validates the schema accepts
+// real HTTP codes and rejects garbage.
+func TestWebhookExecutor_AssertStatusCodeRange(t *testing.T) {
+	yaml := `
+name: x
+stages:
+  - id: probe
+    type: webhook
+    url: https://example.com/h
+    method: GET
+    assert:
+      status_code: 99
+    output: r.txt
+`
+	_, err := LoadPipeline(writePipeline(t, yaml))
+	if err == nil {
+		t.Fatal("expected validation error for status_code=99")
+	}
+	if !strings.Contains(err.Error(), "not a valid HTTP status") {
+		t.Errorf("error: %v", err)
+	}
+}

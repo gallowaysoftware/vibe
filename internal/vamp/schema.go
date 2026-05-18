@@ -278,6 +278,31 @@ func Schema() *schemaProperty {
 				Type:        "boolean",
 				Description: "When true (the default) a 5xx response triggers the transient-error retry path.",
 			},
+			"assert": {
+				Type:                 "object",
+				Description:          "Optional response checks (webhook stages). Turns a webhook into a smoke-test probe: status_code, body_contains, body_not_contains, min_body_length are all validated against the response. Setting status_code overrides the default 2xx-required behaviour so tests can confirm a 401/4xx.",
+				AdditionalProperties: false,
+				Properties: map[string]*schemaProperty{
+					"status_code": {
+						Type:        "integer",
+						Description: "Exact HTTP status code required. Overrides the default 2xx check.",
+					},
+					"body_contains": {
+						Type:        "array",
+						Description: "Substrings that ALL must appear in the response body.",
+						Items:       &schemaProperty{Type: "string"},
+					},
+					"body_not_contains": {
+						Type:        "array",
+						Description: "Substrings that must NOT appear in the response body.",
+						Items:       &schemaProperty{Type: "string"},
+					},
+					"min_body_length": {
+						Type:        "integer",
+						Description: "Minimum response body length in bytes. Catches 200 + empty body.",
+					},
+				},
+			},
 			"retry": retryPolicy,
 			"run_when": {
 				Type:        "string",

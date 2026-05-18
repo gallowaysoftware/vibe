@@ -117,6 +117,14 @@ type Stage struct {
 	BodyTemplateFile string            `yaml:"body_template_file,omitempty"`
 	Headers          map[string]string `yaml:"headers,omitempty"`
 	RetryOn5xx       *bool             `yaml:"retry_on_5xx,omitempty"`
+	// Assert, when non-nil, turns a webhook stage into a smoke-test
+	// probe: the executor runs the request, then validates the response
+	// against the declared expectations and fails the stage with a
+	// descriptive error when any check fails. Designed for end-to-end
+	// regression pipelines that exercise a stack from the outside (HTTP
+	// → real services → response shape) without having to write a
+	// downstream `text:` stage just to read the body and judge it.
+	Assert *AssertSpec `yaml:"assert,omitempty"`
 
 	// Retry, when non-nil, enables per-stage retry-with-exponential-backoff
 	// for transient failures. The runner wraps each executor.Execute call
@@ -250,6 +258,36 @@ func (r *RetryPolicy) Validate(ctx string) error {
 		}
 	}
 	return nil
+}
+
+// AssertSpec turns a webhook stage into an assertion: after the request
+// completes, the executor checks the response against these expectations
+// and fails the stage with a descriptive error when any check fails.
+//
+// The presence of any check changes the executor's default behaviour:
+// when StatusCode is non-zero, only that exact status is accepted (so
+// assert.status_code: 401 lets a test confirm that auth IS required).
+// Body checks run after the status check on success; an empty StatusCode
+// keeps the default "2xx required" behaviour.
+//
+// All non-zero/non-empty checks are evaluated. The error message lists
+// every failed check, so a single run gives the user a full picture
+// rather than failing fast on the first mismatch.
+type AssertSpec struct {
+	// StatusCode, when non-zero, is the exact HTTP status code that
+	// must be returned. Overrides the executor's default 2xx check.
+	StatusCode int `yaml:"status_code,omitempty"`
+	// BodyContains is a list of substrings that must ALL appear in the
+	// response body. Comparison is case-sensitive.
+	BodyContains []string `yaml:"body_contains,omitempty"`
+	// BodyNotContains is a list of substrings that must NOT appear in
+	// the response body. Useful for negative assertions (e.g. that an
+	// error string is absent).
+	BodyNotContains []string `yaml:"body_not_contains,omitempty"`
+	// MinBodyLength, when non-zero, requires the body to be at least
+	// this many bytes — catches "endpoint returned 200 + empty body"
+	// (a common silent-failure shape).
+	MinBodyLength int `yaml:"min_body_length,omitempty"`
 }
 
 // ForeachSpec is the structured fan-out descriptor for a stage. The previous
@@ -594,24 +632,38 @@ func (p *Pipeline) Validate() error {
 					RetryOn:     []string{retryOnTransient},
 				}
 			}
-			// Body and BodyTemplateFile are mutually exclusive AND at least
-			// one is required. Anything else either silently sends an empty
-			// body (surprising for a notification stage) or accepts both and
-			// makes precedence rules a footgun.
+			// Body and BodyTemplateFile are mutually exclusive. For
+			// POST/PUT/PATCH (the notification shape) at least one is
+			// required so we don't silently send an empty body. GET/DELETE
+			// commonly carry no body — relaxed because the smoke-test
+			// pattern (probe a URL) is awkward when you have to invent
+			// a body just to satisfy the validator.
 			hasInlineBody := len(s.Body) > 0
 			hasBodyFile := s.BodyTemplateFile != ""
 			if hasInlineBody && hasBodyFile {
 				return fmt.Errorf("%s: exactly one of body or body_template_file is required (both set)", ctx)
 			}
-			if !hasInlineBody && !hasBodyFile {
+			method := strings.ToUpper(s.Method)
+			if method == "" {
+				method = http.MethodPost
+			}
+			bodyOptional := method == http.MethodGet || method == http.MethodDelete
+			if !hasInlineBody && !hasBodyFile && !bodyOptional {
 				return fmt.Errorf("%s: exactly one of body or body_template_file is required (neither set)", ctx)
 			}
 			if s.Method != "" {
-				m := strings.ToUpper(s.Method)
-				switch m {
+				switch method {
 				case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
 				default:
 					return fmt.Errorf("%s: method %q is not supported (allowed: GET, POST, PUT, PATCH, DELETE)", ctx, s.Method)
+				}
+			}
+			if s.Assert != nil {
+				if sc := s.Assert.StatusCode; sc != 0 && (sc < 100 || sc > 599) {
+					return fmt.Errorf("%s: assert.status_code %d is not a valid HTTP status (100-599)", ctx, sc)
+				}
+				if s.Assert.MinBodyLength < 0 {
+					return fmt.Errorf("%s: assert.min_body_length must be >= 0", ctx)
 				}
 			}
 			if s.Capability != "" {
@@ -874,6 +926,9 @@ func rejectWebhookFields(ctx string, s Stage) error {
 	}
 	if s.RetryOn5xx != nil {
 		return fmt.Errorf("%s: retry_on_5xx is only valid on type: webhook stages", ctx)
+	}
+	if s.Assert != nil {
+		return fmt.Errorf("%s: assert is only valid on type: webhook stages", ctx)
 	}
 	return nil
 }

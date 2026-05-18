@@ -169,7 +169,24 @@ func (w *webhookExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode/100 != 2 {
+
+	// Status-code policy. When the stage declares assert.status_code, that
+	// exact code wins (a smoke test can require a 401 to confirm auth IS
+	// required). Otherwise fall back to the historical "2xx required" rule
+	// so notification-style webhooks keep failing loudly on 4xx/5xx.
+	expectStatus := 0
+	if st.Assert != nil {
+		expectStatus = st.Assert.StatusCode
+	}
+	if expectStatus != 0 {
+		if resp.StatusCode != expectStatus {
+			preview := respBody
+			if len(preview) > maxWebhookErrorBody {
+				preview = preview[:maxWebhookErrorBody]
+			}
+			return nil, fmt.Errorf("stage %s: assert: expected HTTP %d, got HTTP %d: %s", st.ID, expectStatus, resp.StatusCode, strings.TrimSpace(string(preview)))
+		}
+	} else if resp.StatusCode/100 != 2 {
 		preview := respBody
 		if len(preview) > maxWebhookErrorBody {
 			preview = preview[:maxWebhookErrorBody]
@@ -182,12 +199,43 @@ func (w *webhookExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 		return nil, fmt.Errorf("stage %s: webhook returned HTTP %d: %s", st.ID, resp.StatusCode, strings.TrimSpace(string(preview)))
 	}
 
+	if st.Assert != nil {
+		if failures := runWebhookAsserts(st.Assert, respBody); len(failures) > 0 {
+			return nil, fmt.Errorf("stage %s: assert: %s", st.ID, strings.Join(failures, "; "))
+		}
+	}
+
 	// Return the response body as StageOutput.Text. The runner's
 	// executeStage path persists this to <RunDir>/<rendered output> the
 	// same way it handles text-stage completions — same as how the
 	// youtube stage records the watch URL — so the executor doesn't
 	// own the write path.
 	return &StageOutput{Text: string(respBody)}, nil
+}
+
+// runWebhookAsserts evaluates every non-empty body check in spec and
+// returns a list of human-readable failure messages. All checks run on
+// every call (no fail-fast) so a single error message tells the user
+// every problem with the response rather than only the first.
+func runWebhookAsserts(spec *AssertSpec, body []byte) []string {
+	var failures []string
+	if n := spec.MinBodyLength; n > 0 && len(body) < n {
+		failures = append(failures, fmt.Sprintf("body length %d < min_body_length %d", len(body), n))
+	}
+	if len(spec.BodyContains) > 0 || len(spec.BodyNotContains) > 0 {
+		s := string(body)
+		for _, want := range spec.BodyContains {
+			if !strings.Contains(s, want) {
+				failures = append(failures, fmt.Sprintf("body_contains: missing %q", want))
+			}
+		}
+		for _, unwant := range spec.BodyNotContains {
+			if strings.Contains(s, unwant) {
+				failures = append(failures, fmt.Sprintf("body_not_contains: found %q", unwant))
+			}
+		}
+	}
+	return failures
 }
 
 // renderWebhookTemplate is a small wrapper that mirrors the package-level

@@ -109,6 +109,17 @@ them before pushing.
   a runner / httpDoer / process spawner that tests can swap. Don't
   hard-code `exec.Command` or `http.DefaultClient` at the executor
   level.
+- **Webhook assertions.** `webhook` stages take an optional
+  `assert:` block with `status_code` / `body_contains` /
+  `body_not_contains` / `min_body_length` checks, exercised in
+  `webhook_executor.go:runWebhookAsserts`. Designed for smoke-test
+  pipelines that probe a stack from the outside. Setting
+  `assert.status_code` overrides the executor's default "2xx
+  required" so tests can verify a 401/4xx. GET/DELETE webhooks may
+  omit `body:` / `body_template_file:` (POST/PUT/PATCH still
+  require one to avoid silent empty notifications). The
+  `examples/profiles/chat-with-search/smoke.yaml` pipeline is the
+  canonical use.
 
 ## Detach / job lifecycle
 

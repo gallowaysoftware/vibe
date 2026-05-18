@@ -1,0 +1,137 @@
+# Smoke-test pipeline for the chat-with-search profile.
+#
+# Run: vibe start chat; then in another terminal:
+#   vamp run examples/profiles/chat-with-search/smoke.yaml
+#
+# Pass = every layer the chat profile depends on is healthy:
+#   1. SearXNG returns JSON search results.
+#   2. Identifying-UA scrape of Wikipedia returns the real article
+#      body (catches Wikipedia's bot-policy 403 regressions and
+#      proves outbound HTTPS from this host works).
+#   3. Open WebUI's HTTP server is up and serving its SvelteKit shell.
+#   4. vibe's OpenAI-compatible proxy is up and advertises the
+#      configured model alias.
+#   5. The LLM actually answers a trivial 1-token chat completion
+#      via the proxy (proves llama-server has the model loaded
+#      and is responding, not just listening).
+#
+# What this pipeline deliberately does NOT test:
+#   - Open WebUI's web-search code path. That endpoint requires JWT
+#     auth from Open WebUI (which WEBUI_AUTH=False does NOT disable
+#     server-side), and there's no documented way to bootstrap an
+#     API token from a fresh deploy without a UI round-trip. Probe
+#     stages 1-5 cover every component the search path depends on;
+#     a failure in the OWUI glue between them is the residual
+#     uncovered surface. Add a `chat_with_search` stage here once
+#     you've generated an OWUI API key and stuffed it into
+#     OPENWEBUI_TOKEN — example commented at the bottom.
+#
+# Cost: ~3 seconds wall time (mostly the LLM call).
+
+name: chat_smoke
+description: End-to-end smoke test for the chat-with-search profile.
+
+stages:
+  # 1. SearXNG sidecar. The chat profile bind-mounts a searxng/
+  #    config dir; if the SEARXNG_SECRET placeholder hasn't been
+  #    replaced this fails to start at all (separate failure mode
+  #    that vibe start surfaces). This step covers the live-traffic
+  #    path: query routed to upstream engines and aggregated JSON.
+  - id: searxng_query
+    type: webhook
+    url: "http://127.0.0.1:14001/search?q=wikipedia&format=json"
+    method: GET
+    output: searxng.json
+    assert:
+      status_code: 200
+      body_contains: ['"results"']
+      min_body_length: 200
+
+  # 2. Wikipedia with identifying UA — the canonical "does outbound
+  #    HTTPS reach a real site, and is our UA polite enough for
+  #    its bot policy" test. The same UA pattern Playwright /
+  #    sitecustomize use; if Wikipedia 403s here, that regression
+  #    will silently break Open WebUI's web search too.
+  - id: wikipedia_fetch
+    type: webhook
+    url: https://en.wikipedia.org/wiki/Iran
+    method: GET
+    headers:
+      User-Agent: "vibe-chat-smoke/0.1 (+https://github.com/gallowaysoftware/vibe; contact via repo)"
+    output: wiki.html
+    assert:
+      status_code: 200
+      body_contains: ["<!DOCTYPE html", "Iran"]
+      min_body_length: 100000
+
+  # 3. Open WebUI HTTP server. Its SvelteKit shell consistently
+  #    contains "data-sveltekit-preload-data" near the top of <html>;
+  #    no real content check beyond "it served HTML" because the
+  #    page is heavily client-rendered.
+  - id: openwebui_up
+    type: webhook
+    url: "http://127.0.0.1:8080/"
+    method: GET
+    output: owui.html
+    assert:
+      status_code: 200
+      # SvelteKit emits lowercase "<!doctype html>" — keep the
+      # check loose enough to survive doctype-case quirks across
+      # Open WebUI versions and frameworks.
+      body_contains: ["<!doctype html"]
+
+  # 4. vibe's OpenAI-compatible proxy. /v1/models advertises the
+  #    profile's configured alias. The string check is deliberately
+  #    coupled to chat.yaml's alias — if you change one, change both
+  #    or this fails loudly (which is exactly what we want).
+  - id: vibe_models
+    type: webhook
+    url: "http://127.0.0.1:9000/v1/models"
+    method: GET
+    output: models.json
+    assert:
+      status_code: 200
+      body_contains: ["gemma-3-27b-it"]
+
+  # 5. End-to-end LLM ping via the proxy. A 1-token "reply PONG"
+   # check proves llama-server has the model loaded and is
+  #    responding, distinct from "the proxy is up". 30s ceiling is
+  #    generous: first call after model load can spend a couple
+  #    seconds on prompt-cache warmup; well under that on warm.
+  - id: llm_ping
+    type: webhook
+    inputs: [vibe_models]
+    url: "http://127.0.0.1:9000/v1/chat/completions"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+    body:
+      model: "gemma-3-27b-it"
+      max_tokens: 8
+      stream: false
+      messages:
+        - role: user
+          content: "Reply with the single word PONG and nothing else."
+    output: llm_response.json
+    assert:
+      status_code: 200
+      body_contains: ["PONG"]
+
+# ── Add this once you've created an Open WebUI API key in the UI
+#    (Settings → Account → API Keys) and exported it as OPENWEBUI_TOKEN ──
+#
+#  - id: openwebui_search
+#    type: webhook
+#    inputs: [searxng_query, openwebui_up]
+#    url: "http://127.0.0.1:8080/api/v1/retrieval/process/web/search"
+#    method: POST
+#    headers:
+#      Authorization: 'Bearer {{ env "OPENWEBUI_TOKEN" }}'
+#      Content-Type: "application/json"
+#    body:
+#      query: "wikipedia"
+#    output: owui_search.json
+#    assert:
+#      status_code: 200
+#      body_contains: ["collection_name", "filenames"]
+#      min_body_length: 200
