@@ -20,9 +20,15 @@ mounted files you can back up with `tar` or inspect with `sqlite3`.
 mkdir -p ~/.config/vibe/profiles ~/.config/vibe/compose/chat
 cp chat.yaml ~/.config/vibe/profiles/chat.yaml
 
-# 2. Drop the compose file + SearXNG config alongside.
+# 2. Drop the compose file + SearXNG config + sitecustomize patch
+#    alongside. sitecustomize.py patches langchain's WebBaseLoader UA
+#    so web search actually retrieves real article content instead of
+#    Wikipedia's 403 "respect our robot policy" response — without it,
+#    the model gets zero web context and answers from hallucinated
+#    knowledge even when search "succeeds".
 cp docker-compose.yaml ~/.config/vibe/compose/chat/docker-compose.yaml
 cp -r searxng ~/.config/vibe/compose/chat/
+cp sitecustomize.py ~/.config/vibe/compose/chat/sitecustomize.py
 
 # 3. Generate a real SearXNG secret_key. The placeholder is rejected
 #    at startup so you can't accidentally skip this.
@@ -47,6 +53,7 @@ vibe start chat
 | `chat.yaml` | `~/.config/vibe/profiles/chat.yaml` | The vibe profile (model + frontend block). |
 | `docker-compose.yaml` | `~/.config/vibe/compose/chat/docker-compose.yaml` | Open WebUI + SearXNG. |
 | `searxng/settings.yml` | `~/.config/vibe/compose/chat/searxng/settings.yml` | SearXNG config (replace secret_key). |
+| `sitecustomize.py` | `~/.config/vibe/compose/chat/sitecustomize.py` | Patches langchain's WebBaseLoader UA (required for web search to return real content). |
 
 ## Using it
 
