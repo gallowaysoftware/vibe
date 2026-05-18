@@ -20,15 +20,9 @@ mounted files you can back up with `tar` or inspect with `sqlite3`.
 mkdir -p ~/.config/vibe/profiles ~/.config/vibe/compose/chat
 cp chat.yaml ~/.config/vibe/profiles/chat.yaml
 
-# 2. Drop the compose file + SearXNG config + sitecustomize patch
-#    alongside. sitecustomize.py patches langchain's WebBaseLoader UA
-#    so web search actually retrieves real article content instead of
-#    Wikipedia's 403 "respect our robot policy" response — without it,
-#    the model gets zero web context and answers from hallucinated
-#    knowledge even when search "succeeds".
+# 2. Drop the compose file + SearXNG config alongside.
 cp docker-compose.yaml ~/.config/vibe/compose/chat/docker-compose.yaml
 cp -r searxng ~/.config/vibe/compose/chat/
-cp sitecustomize.py ~/.config/vibe/compose/chat/sitecustomize.py
 
 # 3. Generate a real SearXNG secret_key. The placeholder is rejected
 #    at startup so you can't accidentally skip this.
@@ -39,9 +33,11 @@ sed -i "s/REPLACE-WITH-RAND-HEX-32/$(openssl rand -hex 32)/" \
 #    at the GGUF model you want, fix the absolute paths under frontend.
 #    The REPLACE: markers call out the lines you need to change.
 
-# 5. Bring it up. First boot pulls 2 images (~1.6 GB), downloads the
-#    embedding model (~2.3 GB) on first knowledge upload, and may pull
-#    the LLM weights from HuggingFace.
+# 5. Bring it up. First boot pulls 2 images (~1.6 GB), downloads
+#    Playwright's Chromium (~500 MB, for web-search scraping), the
+#    embedding model (~2.3 GB on first knowledge upload), and may
+#    pull the LLM weights from HuggingFace. Subsequent starts are
+#    fast — everything is cached.
 vibe start chat
 # → browser to http://127.0.0.1:8080
 ```
@@ -53,7 +49,6 @@ vibe start chat
 | `chat.yaml` | `~/.config/vibe/profiles/chat.yaml` | The vibe profile (model + frontend block). |
 | `docker-compose.yaml` | `~/.config/vibe/compose/chat/docker-compose.yaml` | Open WebUI + SearXNG. |
 | `searxng/settings.yml` | `~/.config/vibe/compose/chat/searxng/settings.yml` | SearXNG config (replace secret_key). |
-| `sitecustomize.py` | `~/.config/vibe/compose/chat/sitecustomize.py` | Patches langchain's WebBaseLoader UA (required for web search to return real content). |
 
 ## Using it
 
@@ -95,6 +90,15 @@ Back up: `tar czf chat-state.tar.gz -C ~/.local/state/vibe/frontend chat`.
 **SearXNG over DuckDuckGo / Tavily / Brave** — self-hosted, no API
 key, no per-query cost, aggregates multiple upstream engines, JSON
 output mode is purpose-built for LLM consumption.
+
+**Playwright over Open WebUI's default `safe_web` scraper** — Open
+WebUI's default uses langchain's `WebBaseLoader` (aiohttp) with a
+custom override whose `_fetch` has a latent `allow_redirects`
+TypeError, no per-request timeout (single slow URL hangs the whole
+search), and a User-Agent that Wikipedia's bot policy rejects.
+Playwright drives real Chromium — no UA dance, no JS-rendering
+gaps, supported scraping path. Costs ~500 MB Chromium download on
+first start and slower per-query render; worth it.
 
 **BGE-M3 over OpenAI / smaller models** — multilingual, hybrid
 dense+sparse+ColBERT representations, currently best-in-class for

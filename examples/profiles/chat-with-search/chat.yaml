@@ -59,13 +59,6 @@ frontend:
     # REPLACE: absolute path to the searxng/ config dir bundled with
     # this example. Must contain a settings.yml with a real secret_key.
     SEARXNG_CONFIG: ~/.config/vibe/compose/chat/searxng
-    # REPLACE: absolute path to the sitecustomize.py bundled with this
-    # example. Mounted into Open WebUI's site-packages to patch
-    # langchain WebBaseLoader's default User-Agent — without it, web
-    # search "works" but every URL fetch gets a 403 from Wikipedia and
-    # most other sites, the model gets zero context, and answers are
-    # hallucinated. See sitecustomize.py for the full rationale.
-    SITECUSTOMIZE_PY: ~/.config/vibe/compose/chat/sitecustomize.py
   wait_for:
     - url: http://127.0.0.1:14001/healthz
       timeout: 120s

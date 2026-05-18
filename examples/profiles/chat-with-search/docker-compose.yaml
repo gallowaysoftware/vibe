@@ -32,29 +32,22 @@ services:
       - CHUNK_SIZE=1000
       - CHUNK_OVERLAP=200
       - RAG_TOP_K=5
-      # Web search via SearXNG sidecar.
+      # Web search via SearXNG sidecar + Playwright scraper. We
+      # deliberately use the playwright engine rather than the default
+      # safe_web (langchain WebBaseLoader): real Chromium handles WAFs,
+      # JS-rendered pages, and Wikipedia's bot-policy UA rejection that
+      # would otherwise 403 every fetch. Open WebUI's start.sh
+      # auto-installs Chromium when WEB_LOADER_ENGINE=playwright is set
+      # (~500 MB download on first container start, cached after).
+      - WEB_LOADER_ENGINE=playwright
+      - PLAYWRIGHT_TIMEOUT=15000
       - ENABLE_RAG_WEB_SEARCH=True
       - RAG_WEB_SEARCH_ENGINE=searxng
       - SEARXNG_QUERY_URL=http://127.0.0.1:14001/search?q=<query>
       - RAG_WEB_SEARCH_RESULT_COUNT=5
       - RAG_WEB_SEARCH_CONCURRENT_REQUESTS=10
-      # Open WebUI builds langchain's WebBaseLoader without a
-      # header_template, so it inherits langchain's baked-in browser UA.
-      # Wikipedia (and most anti-scraping WAFs) 403 that exact pattern
-      # from an aiohttp client and return a 141-byte "respect our robot
-      # policy" notice. Result: every scraped page is empty → Chroma
-      # collection stays empty → model gets zero web context → answers
-      # by hallucinating from training data even though SearXNG +
-      # loader both "succeeded". sitecustomize.py (bind-mounted below)
-      # monkeypatches the default UA from this env var to an
-      # identifying one, which Wikipedia's bot policy accepts.
-      - WEB_LOADER_USER_AGENT=vibe-chat/0.1 (+https://github.com/gallowaysoftware/vibe; contact via repo)
     volumes:
       - ${VIBE_FRONTEND_STATE}/data:/app/backend/data
-      # See sitecustomize.py for why this exists. Mounted at Python's
-      # site-packages root so it auto-runs at every Python startup
-      # inside the container.
-      - ${SITECUSTOMIZE_PY}:/usr/local/lib/python3.11/site-packages/sitecustomize.py:ro
     restart: unless-stopped
     depends_on:
       - searxng
