@@ -22,12 +22,16 @@ backend:
     # weights) for a 24 GB card, or to gemma-3-12b-it-GGUF for 16 GB.
     # The accompanying mmproj GGUF is what enables image input.
     path: ~/models/gemma-3-27b-it-GGUF/gemma-3-27b-it-Q6_K.gguf
-    mmproj: ~/models/gemma-3-27b-it-GGUF/mmproj-model-f16.gguf
+    mmproj: ~/models/gemma-3-27b-it-GGUF/mmproj-F16.gguf
+    # unsloth publishes the full quant ladder for Gemma 3 27B
+    # (Q4_K_M/Q5_K_M/Q6_K/Q8_0 + UD-* dynamic variants). ggml-org's
+    # repo only carries Q4_K_M and Q8_0, so picking anything in
+    # between requires the unsloth repo.
     huggingface:
-      repo: ggml-org/gemma-3-27b-it-GGUF
+      repo: unsloth/gemma-3-27b-it-GGUF
       file: gemma-3-27b-it-Q6_K.gguf
       # Same repo, second file — pulled into the mmproj path above.
-      mmproj_file: mmproj-model-f16.gguf
+      mmproj_file: mmproj-F16.gguf
     # Must match the alias llama-server advertises at /v1/models —
     # Open WebUI uses it as the model picker label.
     alias: gemma-3-27b-it
