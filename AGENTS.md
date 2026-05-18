@@ -66,10 +66,23 @@ them before pushing.
   fields; the sub-block-presence trick doesn't fit.
 - Path fields (`backend.*.path`, `backend.*.dir`,
   `backend.comfyui.python`, `backend.llama_server.binary`,
-  `frontend.workdir`, `frontend.binary`, `frontend.write_file`,
-  `frontend.compose_file`) are tilde-expanded in
-  `internal/vibe/profile/profile.go:Load`. Add new path fields to
-  that list.
+  `backend.llama_server.mmproj`, `frontend.workdir`,
+  `frontend.binary`, `frontend.write_file`, `frontend.compose_file`)
+  are tilde-expanded in `internal/vibe/profile/profile.go:Load`. Add
+  new path fields to that list.
+- **Vision models (mmproj).** `backend.llama_server.mmproj` is the
+  path to the multimodal projector GGUF that llama-server loads via
+  `--mmproj`. Required to enable image input on vision-capable
+  models (Gemma 3, Qwen2.5-VL, LLaVA, etc.) — without it,
+  llama-server rejects image content parts with "image input is not
+  supported". When `huggingface.mmproj_file` is set, vibe pulls a
+  second file from the same repo/revision into the mmproj path.
+  Validation rules (in `validateLlamaServer`): mmproj path must
+  exist on disk unless an HF mmproj_file is provided; setting
+  mmproj_file without an mmproj target is rejected. The HF pull
+  flow in `daemon.Pull` is a helper closure (`pullOne`) called
+  twice — once for the weights, once for the mmproj — both
+  streaming download progress over the same RPC stream.
 
 ## vamp stage rules
 

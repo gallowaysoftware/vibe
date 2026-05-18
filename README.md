@@ -48,7 +48,12 @@ a starter (`llama-server`, `comfyui`, `docker-compose`, `managed`); pass
 sub-block must be set:
 
 - `llama_server` — supervises [`llama-server`](https://github.com/ggml-org/llama.cpp)
-  for an OpenAI-compatible chat/completion API.
+  for an OpenAI-compatible chat/completion API. Set
+  `backend.llama_server.mmproj` (and optionally
+  `huggingface.mmproj_file`) to enable image input on vision-capable
+  models (Gemma 3, Qwen2.5-VL, LLaVA, etc.). See the
+  `examples/profiles/chat-with-search/` profile for a full multimodal
+  example.
 - `comfyui` — supervises a [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
   python process for image/video generation. ComfyUI ships its own UI,
   so these profiles carry no `frontend:` block.
