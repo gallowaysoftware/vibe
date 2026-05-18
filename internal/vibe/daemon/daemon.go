@@ -507,47 +507,68 @@ func (d *Daemon) Pull(ctx context.Context, req *connect.Request[vibev1.PullReque
 		})
 	}
 
-	spec := hfdownload.Spec{
-		Repo:     m.Huggingface.Repo,
-		File:     m.Huggingface.File,
-		Revision: m.Huggingface.Revision,
-	}
 	if err := stream.Send(&vibev1.PullProgress{Phase: vibev1.PullProgress_PHASE_RESOLVING}); err != nil {
 		return err
 	}
-	slog.Info("pulling model", "profile", p.Name, "repo", spec.Repo, "file", spec.File)
 
-	// Track whether bytes actually flowed; hfdownload.Download skips the
-	// progress callback when it short-circuits (local-and-cached path).
-	var bytesFlowed bool
-	progress := func(downloaded, total int64) {
-		bytesFlowed = true
-		_ = stream.Send(&vibev1.PullProgress{
-			Phase:           vibev1.PullProgress_PHASE_DOWNLOADING,
-			DownloadedBytes: downloaded,
-			TotalBytes:      total,
-		})
+	// pullOne fetches a single repo file into dest, streaming download
+	// progress over the same RPC stream. Returns the file's final size
+	// on disk and whether the download actually transferred bytes (vs.
+	// short-circuiting on a cached copy).
+	pullOne := func(file, dest string) (int64, bool, error) {
+		spec := hfdownload.Spec{
+			Repo:     m.Huggingface.Repo,
+			File:     file,
+			Revision: m.Huggingface.Revision,
+		}
+		slog.Info("pulling model file", "profile", p.Name, "repo", spec.Repo, "file", spec.File, "dest", dest)
+		var bytesFlowed bool
+		progress := func(downloaded, total int64) {
+			bytesFlowed = true
+			_ = stream.Send(&vibev1.PullProgress{
+				Phase:           vibev1.PullProgress_PHASE_DOWNLOADING,
+				DownloadedBytes: downloaded,
+				TotalBytes:      total,
+			})
+		}
+		if err := hfdownload.Download(ctx, spec, dest, progress); err != nil {
+			return 0, false, err
+		}
+		var size int64
+		if info, statErr := os.Stat(dest); statErr == nil {
+			size = info.Size()
+		}
+		return size, bytesFlowed, nil
 	}
-	if err := hfdownload.Download(ctx, spec, m.Path, progress); err != nil {
+
+	modelSize, modelFlowed, err := pullOne(m.Huggingface.File, m.Path)
+	if err != nil {
 		slog.Error("download failed", "profile", p.Name, "err", err)
-		return connect.NewError(connect.CodeInternal, fmt.Errorf("download: %w", err))
+		return connect.NewError(connect.CodeInternal, fmt.Errorf("download model: %w", err))
 	}
 
-	var finalSize int64
-	if info, err := os.Stat(m.Path); err == nil {
-		finalSize = info.Size()
+	var mmprojSize int64
+	mmprojFlowed := false
+	if m.Huggingface.MMProjFile != "" {
+		size, flowed, err := pullOne(m.Huggingface.MMProjFile, m.MMProj)
+		if err != nil {
+			slog.Error("mmproj download failed", "profile", p.Name, "err", err)
+			return connect.NewError(connect.CodeInternal, fmt.Errorf("download mmproj: %w", err))
+		}
+		mmprojSize = size
+		mmprojFlowed = flowed
 	}
+
+	total := modelSize + mmprojSize
 	msg := "complete"
-	if !bytesFlowed {
+	if !modelFlowed && !mmprojFlowed {
 		msg = "already cached"
-		slog.Info("model already cached", "profile", p.Name, "path", m.Path, "size", finalSize)
-	} else {
-		slog.Info("download complete", "profile", p.Name, "path", m.Path, "size", finalSize)
 	}
+	slog.Info("pull done", "profile", p.Name, "model", m.Path, "model_size", modelSize, "mmproj", m.MMProj, "mmproj_size", mmprojSize, "flowed", modelFlowed || mmprojFlowed)
 	return stream.Send(&vibev1.PullProgress{
 		Phase:           vibev1.PullProgress_PHASE_DONE,
-		DownloadedBytes: finalSize,
-		TotalBytes:      finalSize,
+		DownloadedBytes: total,
+		TotalBytes:      total,
 		Message:         msg,
 	})
 }

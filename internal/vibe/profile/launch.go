@@ -45,6 +45,9 @@ func LlamaServerSpec(p *Profile, binary string, port int) (supervisor.LaunchSpec
 	if m.Jinja {
 		args = append(args, "--jinja")
 	}
+	if m.MMProj != "" {
+		args = append(args, "--mmproj", m.MMProj)
+	}
 	args = append(args, m.ExtraArgs...)
 
 	return supervisor.LaunchSpec{

@@ -1142,3 +1142,139 @@ frontend:
 		t.Errorf("context_note = %v", out["context_note"])
 	}
 }
+
+func TestLoad_MMProj_OnDisk(t *testing.T) {
+	model := stubModelFile(t)
+	mmproj := filepath.Join(t.TempDir(), "mmproj.gguf")
+	if err := os.WriteFile(mmproj, []byte("stub"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	yaml := `
+name: vl
+backend:
+  llama_server:
+    path: ` + model + `
+    mmproj: ` + mmproj + `
+    alias: gemma
+    context: 8192
+frontend:
+  kind: external
+  app: opencode
+  write_file: /tmp/x.json
+  template: {a: 1}
+`
+	p, err := Load(writeProfile(t, yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if p.Backend.LlamaServer.MMProj != mmproj {
+		t.Errorf("mmproj = %q, want %q", p.Backend.LlamaServer.MMProj, mmproj)
+	}
+}
+
+func TestLoad_MMProj_RejectsMissingFile(t *testing.T) {
+	model := stubModelFile(t)
+	yaml := `
+name: vl
+backend:
+  llama_server:
+    path: ` + model + `
+    mmproj: /nonexistent/mmproj.gguf
+    alias: g
+    context: 1024
+frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+`
+	_, err := Load(writeProfile(t, yaml))
+	if err == nil {
+		t.Fatal("expected error for missing mmproj file with no HF entry")
+	}
+	if !strings.Contains(err.Error(), "mmproj") {
+		t.Errorf("err = %v, want mention of mmproj", err)
+	}
+}
+
+// TestLoad_MMProj_HFPullDeferred: when huggingface.mmproj_file is set, the
+// target path is allowed to not yet exist — `vibe pull` will create it,
+// same contract as path/huggingface.file.
+func TestLoad_MMProj_HFPullDeferred(t *testing.T) {
+	model := stubModelFile(t)
+	yaml := `
+name: vl
+backend:
+  llama_server:
+    path: ` + model + `
+    mmproj: /tmp/vibe-test-mmproj-does-not-exist.gguf
+    huggingface:
+      repo: ggml-org/gemma-3-12b-it-GGUF
+      file: gemma-3-12b-it-Q4_K_M.gguf
+      mmproj_file: mmproj-model-f16.gguf
+    alias: g
+    context: 1024
+frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+`
+	// Note: path validation is also skipped here because Huggingface is set.
+	// We just need both to load cleanly.
+	if _, err := Load(writeProfile(t, yaml)); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+}
+
+func TestLoad_MMProj_RejectsMMProjFileWithoutMMProj(t *testing.T) {
+	model := stubModelFile(t)
+	yaml := `
+name: vl
+backend:
+  llama_server:
+    path: ` + model + `
+    huggingface:
+      repo: r
+      file: f.gguf
+      mmproj_file: mmproj.gguf
+    alias: g
+    context: 1024
+frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+`
+	_, err := Load(writeProfile(t, yaml))
+	if err == nil {
+		t.Fatal("expected error when mmproj_file is set without mmproj target")
+	}
+	if !strings.Contains(err.Error(), "mmproj is required") {
+		t.Errorf("err = %v, want 'mmproj is required' message", err)
+	}
+}
+
+func TestLoad_MMProj_TildeExpansion(t *testing.T) {
+	home, _ := os.UserHomeDir()
+	dir, err := os.MkdirTemp(home, "vibe-test-mmproj-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	modelPath := filepath.Join(dir, "m.gguf")
+	if err := os.WriteFile(modelPath, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mmprojPath := filepath.Join(dir, "mmproj.gguf")
+	if err := os.WriteFile(mmprojPath, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	modelRel, _ := filepath.Rel(home, modelPath)
+	mmprojRel, _ := filepath.Rel(home, mmprojPath)
+	yaml := `
+name: vl
+backend:
+  llama_server:
+    path: ~/` + modelRel + `
+    mmproj: ~/` + mmprojRel + `
+    alias: g
+    context: 1024
+frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+`
+	p, err := Load(writeProfile(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Backend.LlamaServer.MMProj != mmprojPath {
+		t.Errorf("mmproj = %q, want %q", p.Backend.LlamaServer.MMProj, mmprojPath)
+	}
+}

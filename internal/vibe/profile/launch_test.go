@@ -50,6 +50,34 @@ func TestLlamaServerSpec_Full(t *testing.T) {
 	}
 }
 
+func TestLlamaServerSpec_MMProj(t *testing.T) {
+	p := &Profile{
+		Backend: Backend{LlamaServer: &LlamaServerBackend{
+			Path:     "/m/gemma.gguf",
+			MMProj:   "/m/mmproj.gguf",
+			Alias:    "gemma",
+			Context:  8192,
+			Parallel: 1,
+		}},
+	}
+	spec, err := LlamaServerSpec(p, "llama-server", 8080)
+	if err != nil {
+		t.Fatalf("LlamaServerSpec: %v", err)
+	}
+	var sawMMProj bool
+	for i, a := range spec.Args {
+		if a == "--mmproj" {
+			sawMMProj = true
+			if i+1 >= len(spec.Args) || spec.Args[i+1] != "/m/mmproj.gguf" {
+				t.Errorf("--mmproj value: got %v, want /m/mmproj.gguf", spec.Args[i+1:])
+			}
+		}
+	}
+	if !sawMMProj {
+		t.Errorf("expected --mmproj flag, got args: %v", spec.Args)
+	}
+}
+
 func TestLlamaServerSpec_OmitsZeroValueFlags(t *testing.T) {
 	p := &Profile{
 		Backend: Backend{LlamaServer: &LlamaServerBackend{
@@ -66,7 +94,7 @@ func TestLlamaServerSpec_OmitsZeroValueFlags(t *testing.T) {
 	if spec.Binary != "llama-server" {
 		t.Errorf("binary = %q (empty should default to llama-server)", spec.Binary)
 	}
-	mustNotContain := []string{"--flash-attn", "--jinja", "--cache-type-k", "--cache-type-v", "--n-gpu-layers"}
+	mustNotContain := []string{"--flash-attn", "--jinja", "--cache-type-k", "--cache-type-v", "--n-gpu-layers", "--mmproj"}
 	for _, bad := range mustNotContain {
 		for _, a := range spec.Args {
 			if a == bad {

@@ -52,6 +52,14 @@ type LlamaServerBackend struct {
 	CacheTypeV  string       `yaml:"cache_type_v,omitempty"`
 	Jinja       bool         `yaml:"jinja,omitempty"`
 	ExtraArgs   []string     `yaml:"extra_args,omitempty"`
+	// MMProj is the multimodal projector GGUF that llama-server loads
+	// via --mmproj to enable image input on vision-capable models
+	// (Gemma 3, Qwen2.5-VL, LLaVA, etc.). The accompanying weights file
+	// at Path must be a vision-capable model; loading a text-only model
+	// with an mmproj is a configuration error llama-server will reject.
+	// When Huggingface.MMProjFile is set, this path is the *target* for
+	// the pulled file and may not yet exist.
+	MMProj string `yaml:"mmproj,omitempty"`
 	// Binary overrides which llama-server binary to spawn for this
 	// profile. Empty (default) means "use the daemon's configured
 	// llama-server, which falls back to the first one on $PATH" — the
@@ -78,10 +86,17 @@ type ComfyUIBackend struct {
 // Huggingface points at a model file on huggingface.co. When set, vibe
 // downloads the file to LlamaServerBackend.Path on demand (via `vibe pull` or
 // implicitly at the start of `vibe start`).
+//
+// MMProjFile, when non-empty, names a second file from the same Repo/Revision
+// (the multimodal projector for vision-capable models). It is downloaded to
+// LlamaServerBackend.MMProj. Setting MMProjFile without MMProj — or vice
+// versa, when MMProj points at a non-existent path with no HF spec — is a
+// validation error.
 type Huggingface struct {
-	Repo     string `yaml:"repo"`
-	File     string `yaml:"file"`
-	Revision string `yaml:"revision,omitempty"` // default "main"
+	Repo       string `yaml:"repo"`
+	File       string `yaml:"file"`
+	Revision   string `yaml:"revision,omitempty"` // default "main"
+	MMProjFile string `yaml:"mmproj_file,omitempty"`
 }
 
 const (
@@ -234,6 +249,7 @@ func Load(path string) (*Profile, error) {
 		}
 		p.Backend.LlamaServer.Path = expandTilde(p.Backend.LlamaServer.Path)
 		p.Backend.LlamaServer.Binary = expandTilde(p.Backend.LlamaServer.Binary)
+		p.Backend.LlamaServer.MMProj = expandTilde(p.Backend.LlamaServer.MMProj)
 	}
 	if p.Backend.ComfyUI != nil {
 		p.Backend.ComfyUI.Dir = expandTilde(p.Backend.ComfyUI.Dir)
@@ -313,6 +329,19 @@ func validateLlamaServer(m *LlamaServerBackend) error {
 		}
 		if info.Mode().Perm()&0o111 == 0 {
 			return fmt.Errorf("backend.llama_server.binary %s: not executable (mode %v)", m.Binary, info.Mode().Perm())
+		}
+	}
+	if m.Huggingface != nil && m.Huggingface.MMProjFile != "" && m.MMProj == "" {
+		return errors.New("backend.llama_server.mmproj is required when huggingface.mmproj_file is set (it's the target path for the pulled file)")
+	}
+	if m.MMProj != "" {
+		// If no HF spec covers the mmproj, the file must already exist.
+		// Mirrors the Path/Huggingface relationship above.
+		hasHFPull := m.Huggingface != nil && m.Huggingface.MMProjFile != ""
+		if !hasHFPull {
+			if _, err := os.Stat(m.MMProj); err != nil {
+				return fmt.Errorf("backend.llama_server.mmproj %s: %w", m.MMProj, err)
+			}
 		}
 	}
 	return nil

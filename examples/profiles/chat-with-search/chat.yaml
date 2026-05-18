@@ -13,20 +13,26 @@
 # activate creates the right directory).
 
 name: chat
-description: General-purpose chat — local LLM + Open WebUI + SearXNG.
+description: General-purpose chat — local Gemma 3 (vision) + Open WebUI + SearXNG.
 
 backend:
   llama_server:
-    # REPLACE: absolute or ~/-prefixed path to your GGUF model.
-    path: ~/models/qwen3-32b-gguf/Qwen3-32B-Q5_K_M.gguf
-    # REPLACE: HF repo + file so `vibe pull chat` can fetch the
-    # weights on first start. Drop this block if you supply your own.
+    # Gemma 3 27B-it at Q6_K — biggest Gemma 3, near-Q8 quality, fits
+    # on a 32 GB card alongside a 32K KV cache. Drop to Q4_K_M (~17 GB
+    # weights) for a 24 GB card, or to gemma-3-12b-it-GGUF for 16 GB.
+    # The accompanying mmproj GGUF is what enables image input.
+    path: ~/models/gemma-3-27b-it-GGUF/gemma-3-27b-it-Q6_K.gguf
+    mmproj: ~/models/gemma-3-27b-it-GGUF/mmproj-model-f16.gguf
     huggingface:
-      repo: unsloth/Qwen3-32B-GGUF
-      file: Qwen3-32B-Q5_K_M.gguf
-    # REPLACE: must match the alias llama-server advertises at
-    # /v1/models — Open WebUI uses it as the model picker label.
-    alias: qwen3-32b-q5km
+      repo: ggml-org/gemma-3-27b-it-GGUF
+      file: gemma-3-27b-it-Q6_K.gguf
+      # Same repo, second file — pulled into the mmproj path above.
+      mmproj_file: mmproj-model-f16.gguf
+    # Must match the alias llama-server advertises at /v1/models —
+    # Open WebUI uses it as the model picker label.
+    alias: gemma-3-27b-it
+    # Gemma 3 supports 128k; 32k is a sane VRAM/quality default. Bump
+    # if you need long-context retrieval and have headroom.
     context: 32768
     parallel: 1
     gpu_layers: 999
@@ -55,5 +61,7 @@ frontend:
     - url: http://127.0.0.1:8080/
       timeout: 120s
 
-# REPLACE: approximate VRAM the loaded model needs.
+# Approximate VRAM: Gemma 3 27B-it Q6_K weights (~22 GB) + mmproj
+# (~1 GB) + KV cache at 32k ctx q8_0 (~3 GB) + overhead ≈ 26 GB.
+# Adjust if you raise the context window, swap quants, or swap model.
 estimated_vram_gb: 28

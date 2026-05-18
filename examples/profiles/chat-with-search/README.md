@@ -1,10 +1,12 @@
-# Chat profile: local LLM + Open WebUI + SearXNG + Tier-1 RAG
+# Chat profile: local Gemma 3 (vision) + Open WebUI + SearXNG + Tier-1 RAG
 
 A vibe profile that brings up a Claude/ChatGPT-style chat experience
-against a local model: Open WebUI for the UI, SearXNG sidecar for
-"turbo Google" web search, and Open WebUI's built-in RAG (BGE-M3
-embeddings + BGE-reranker-v2-m3 reranker + hybrid BM25+vector
-search) for chatting with your own documents.
+against a local **multimodal** model: Gemma 3 27B-it at Q6_K (text +
+image input) served by llama-server, Open WebUI for the UI, SearXNG
+sidecar for "turbo Google" web search, and Open WebUI's built-in RAG
+(BGE-M3 embeddings + BGE-reranker-v2-m3 reranker + hybrid BM25+vector
+search) for chatting with your own documents. Profile targets a 32 GB
+GPU; drop to Q4_K_M for 24 GB or to 12B for 16 GB (see Customizing).
 
 The whole stack is two containers managed by `vibe start chat`. State
 (SQLite chat history, ChromaDB vectors, uploads, embedding model
@@ -50,10 +52,16 @@ vibe start chat
 
 - **Plain chat** — pick the model in the top-left dropdown and start
   typing. The LLM streams via the OpenAI-compatible proxy at :9000.
-- **Web search** — toggle the globe icon next to the chat box (or
-  prefix a message with `#web`) to have Open WebUI dispatch the query
-  to SearXNG, fetch the top results, and include them as retrieval
-  context.
+- **Image input** — attach an image to a chat message (paperclip /
+  drag-and-drop). Open WebUI ships the image to the OpenAI-compat
+  `/v1/chat/completions` endpoint as a `image_url` content part;
+  llama-server uses the mmproj projector to encode it before passing
+  the joint token sequence to Gemma 3. Works in any chat.
+- **Web search** — toggle the globe icon in the chat composer
+  (Workspace → Settings → Web Search → enabled). The `#web` prefix
+  is *not* a real Open WebUI trigger — the globe toggle is the only
+  reliable way to dispatch the query to SearXNG and have the top
+  results included as retrieval context.
 - **RAG over your docs** — Workspace → Knowledge → New, upload PDFs /
   Markdown / text. Attach the knowledge collection to a model
   (Workspace → Models → Edit) or reference it per-chat with `#`.
@@ -96,6 +104,15 @@ storage; the chat profile keeps its in-process setup for casual use.
 - **Different LLM**: change `backend.llama_server.{path, huggingface,
   alias, context}` in `chat.yaml`. The frontend doesn't care which
   model serves the OpenAI-compat endpoint.
+- **Text-only model**: drop the `mmproj` field and the
+  `huggingface.mmproj_file` entry. llama-server will start without
+  multimodal support and Open WebUI will just hide the image
+  attach affordance for that model.
+- **Swap vision model**: any GGUF model with a matching mmproj works
+  (Qwen2.5-VL, LLaVA, InternVL3, MiniCPM-V). Point `path` at the
+  weights, `mmproj` at the projector, and update both `huggingface`
+  files. Setting `mmproj_file` without `mmproj` (or pointing `mmproj`
+  at a non-existent path with no HF entry) is rejected at load.
 - **Different chunk size / top-k**: edit the `CHUNK_SIZE`,
   `CHUNK_OVERLAP`, `RAG_TOP_K` env vars in the compose file. Code
   collections want smaller chunks (200/50); long-form prose wants
