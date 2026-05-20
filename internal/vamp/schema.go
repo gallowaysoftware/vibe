@@ -57,7 +57,7 @@ func Schema() *schemaProperty {
 	_ = runWhenEnum
 	httpMethodEnum := []any{"", "GET", "POST", "PUT", "PATCH", "DELETE"}
 	privacyEnum := []any{"", "private", "unlisted", "public"}
-	retryOnEnum := []any{retryOnTransient, retryOnTimeout}
+	retryOnEnum := []any{retryOnTransient, retryOnTimeout, retryOnInvalidOutput}
 	outputFormatEnum := []any{"", "json"}
 
 	inputSpec := &schemaProperty{
@@ -126,7 +126,7 @@ func Schema() *schemaProperty {
 				Description: "Error classes to retry on.",
 				Items: &schemaProperty{
 					Type: "string",
-					Enum: anySliceFromStrings([]string{retryOnTransient, retryOnTimeout}),
+					Enum: anySliceFromStrings([]string{retryOnTransient, retryOnTimeout, retryOnInvalidOutput}),
 				},
 			},
 		},
@@ -192,7 +192,16 @@ func Schema() *schemaProperty {
 			},
 			"voices_dir": {
 				Type:        "string",
-				Description: "Override directory containing <voice>.onnx model files (audio stages).",
+				Description: "Override directory containing <voice>.onnx model files (audio stages, engine: piper).",
+			},
+			"engine": {
+				Type:        "string",
+				Enum:        []any{"", "piper", "kokoro"},
+				Description: "TTS backend for audio stages. \"piper\" (default) shells out to the piper binary. \"kokoro\" POSTs to an OpenAI-compatible /v1/audio/speech endpoint.",
+			},
+			"engine_url": {
+				Type:        "string",
+				Description: "OpenAI-compatible TTS endpoint base URL (engine: kokoro). Defaults to http://127.0.0.1:8880. Executor appends /v1/audio/speech.",
 			},
 			"binary": {
 				Type:        "string",

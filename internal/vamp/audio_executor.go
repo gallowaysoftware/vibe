@@ -3,13 +3,16 @@ package vamp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // audioExecutor implements StageExecutor for type: audio stages. It synthesizes
@@ -36,7 +39,23 @@ type audioExecutor struct {
 	// defaultBinary, when non-empty, overrides "piper" as the fallback
 	// binary name. Used by tests; production callers leave it empty.
 	defaultBinary string
+	// httpClient is the injectable HTTP client used by the kokoro engine
+	// path. Tests swap this for a recorder; production callers leave it
+	// nil and we use http.DefaultClient.
+	httpClient *http.Client
 }
+
+// AudioEngine* constants name the supported TTS backends for `type: audio`
+// stages. Centralised so the validator, executor, and cache key all agree.
+const (
+	AudioEnginePiper  = "piper"
+	AudioEngineKokoro = "kokoro"
+)
+
+// defaultKokoroURL is the localhost address Kokoro-FastAPI binds to in its
+// shipped docker-compose. Surfaced as a default so a pipeline that doesn't
+// pin engine_url still works against a typical local install.
+const defaultKokoroURL = "http://127.0.0.1:8880"
 
 // audioRunner is the subprocess driver interface used by audioExecutor. The
 // real implementation is execCommandRunner; tests replace it with a recorder
@@ -92,12 +111,41 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 	// Stage.Prompt because text stages route prompts through a chat
 	// completion (with system/user role wrapping conceptually owned by
 	// the LLM) while audio stages feed raw rendered text directly to
-	// piper's stdin. Reusing Stage.Prompt would conflate "LLM prompt" with
-	// "literal speech transcript" and force the validator to accept the
-	// same field for two semantically different inputs.
+	// the TTS engine. Reusing Stage.Prompt would conflate "LLM prompt"
+	// with "literal speech transcript" and force the validator to
+	// accept the same field for two semantically different inputs.
 	text, err := renderTemplate(st.ID+":text", st.Text, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
 	if err != nil {
 		return nil, fmt.Errorf("stage %s: render text: %w", st.ID, err)
+	}
+
+	// Render the output path. Audio stages own their own output write so
+	// we render here and pass the absolute path to whichever engine writes
+	// the file (piper subprocess via --output-file, kokoro path via our
+	// own os.WriteFile after the HTTP response).
+	outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
+	if err != nil {
+		return nil, fmt.Errorf("stage %s: render output path: %w", st.ID, err)
+	}
+	if !strings.HasSuffix(outRel, ".wav") {
+		return nil, fmt.Errorf("stage %s: rendered output %q must end in .wav", st.ID, outRel)
+	}
+	outAbs := filepath.Join(in.RunDir, outRel)
+	if err := os.MkdirAll(filepath.Dir(outAbs), 0o755); err != nil {
+		return nil, fmt.Errorf("stage %s: create output dir: %w", st.ID, err)
+	}
+
+	engine := st.Engine
+	if engine == "" {
+		engine = AudioEnginePiper
+	}
+	switch engine {
+	case AudioEngineKokoro:
+		return a.executeKokoro(ctx, in, st, text, outAbs, outRel)
+	case AudioEnginePiper:
+		// fallthrough to legacy piper path below
+	default:
+		return nil, fmt.Errorf("stage %s: unknown audio engine %q (allowed: %q, %q)", st.ID, engine, AudioEnginePiper, AudioEngineKokoro)
 	}
 
 	// Resolve the voice model path. Stat upfront so a missing file fails
@@ -117,23 +165,6 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 			return nil, fmt.Errorf("stage %s: voice model %q not found at %s (download Piper voices from %s and place the .onnx file in %s)", st.ID, st.Voice, voicePath, piperVoicesURL, voicesDir)
 		}
 		return nil, fmt.Errorf("stage %s: stat voice model %s: %w", st.ID, voicePath, err)
-	}
-
-	// Render the output path. Audio stages own their own output write (the
-	// piper subprocess does it), so we render here and pass the absolute
-	// path on the argv.
-	outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
-	if err != nil {
-		return nil, fmt.Errorf("stage %s: render output path: %w", st.ID, err)
-	}
-	if !strings.HasSuffix(outRel, ".wav") {
-		// Validate() rejects this at load time; runtime guard catches
-		// pipelines built in-memory that skip Validate.
-		return nil, fmt.Errorf("stage %s: rendered output %q must end in .wav", st.ID, outRel)
-	}
-	outAbs := filepath.Join(in.RunDir, outRel)
-	if err := os.MkdirAll(filepath.Dir(outAbs), 0o755); err != nil {
-		return nil, fmt.Errorf("stage %s: create output dir: %w", st.ID, err)
 	}
 
 	binary := st.Binary
@@ -160,6 +191,64 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 	// Report ABSOLUTE path: downstream {{ .stages.X.output(s) }} references
 	// land on argv strings consumed by ffmpeg/etc. subprocesses running from
 	// the daemon's CWD, which can't resolve a path relative to RunDir.
+	return &StageOutput{Files: []string{outAbs}}, nil
+}
+
+// executeKokoro routes the stage through an OpenAI-compatible TTS endpoint
+// (Kokoro-FastAPI by default — ghcr.io/remsky/kokoro-fastapi-gpu). One HTTP
+// call per Execute invocation; chunk size for long lecture segments is the
+// upstream pipeline's responsibility (a chunk_for_tts LLM stage that splits
+// each segment into ~100-200-token chunks before this stage's foreach runs).
+//
+// Wire shape: POST {EngineURL}/v1/audio/speech with
+// `{"model": "kokoro", "input": "<text>", "voice": "<voice>", "response_format": "wav"}`,
+// raw WAV bytes back in the response body. Server timeout is generous (2 min
+// per chunk) to tolerate startup latency on cold starts.
+func (a *audioExecutor) executeKokoro(ctx context.Context, in StageInput, st *Stage, text, outAbs, outRel string) (*StageOutput, error) {
+	base := strings.TrimRight(st.EngineURL, "/")
+	if base == "" {
+		base = defaultKokoroURL
+	}
+	body, err := json.Marshal(map[string]any{
+		"model":           "kokoro",
+		"input":           text,
+		"voice":           st.Voice,
+		"response_format": "wav",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("stage %s: marshal kokoro request: %w", st.ID, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1/audio/speech", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("stage %s: build kokoro request: %w", st.ID, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := a.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 2 * time.Minute}
+	}
+	if in.Log != nil {
+		fmt.Fprintf(in.Log, "kokoro: %s (voice=%s, %d chars) -> %s\n", outRel, st.Voice, len(text), base)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("stage %s: kokoro request: %w", st.ID, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("stage %s: kokoro %s: %s", st.ID, resp.Status, strings.TrimSpace(string(msg)))
+	}
+	wav, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("stage %s: read kokoro response: %w", st.ID, err)
+	}
+	if len(wav) == 0 {
+		return nil, fmt.Errorf("stage %s: kokoro returned empty body", st.ID)
+	}
+	if err := os.WriteFile(outAbs, wav, 0o644); err != nil {
+		return nil, fmt.Errorf("stage %s: write %s: %w", st.ID, outAbs, err)
+	}
 	return &StageOutput{Files: []string{outAbs}}, nil
 }
 

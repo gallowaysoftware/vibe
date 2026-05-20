@@ -90,7 +90,9 @@ type keyInput struct {
 	Voice          string            // audio only
 	RenderedText   string            // audio only
 	Binary         string            // audio/ffmpeg only
-	VoiceModelSize int64             // audio only
+	VoiceModelSize int64             // audio only — piper engine
+	AudioEngine    string            // audio only — "" / piper / kokoro
+	AudioURL       string            // audio only — kokoro endpoint base
 	FFmpegArgs     []string          // ffmpeg only — rendered argv
 	FFmpegInputs   []string          // ffmpeg only — absolute paths to inputs, sha-mixed below
 }
@@ -143,11 +145,29 @@ func stageCacheKey(in keyInput) (string, error) {
 			string(paramsJSON),
 		), nil
 	case StageTypeAudio:
+		engine := in.AudioEngine
+		if engine == "" {
+			engine = "piper"
+		}
+		// The piper path keys on the voice-file size so a swapped .onnx
+		// (same name, different bytes) invalidates. Kokoro is HTTP-served
+		// and there's no local artefact to hash; the endpoint URL goes in
+		// instead so two different Kokoro servers / two different voices
+		// won't collide.
+		if engine == "kokoro" {
+			return cache.HashStrings("audio",
+				engine,
+				in.AudioURL,
+				in.Voice,
+				in.RenderedText,
+			), nil
+		}
 		binary := in.Binary
 		if binary == "" {
 			binary = "piper"
 		}
 		return cache.HashStrings("audio",
+			engine,
 			in.Voice,
 			in.RenderedText,
 			binary,
@@ -329,6 +349,23 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 		if err != nil {
 			return "", fmt.Errorf("cache key: render audio text: %w", err)
 		}
+		engine := st.Engine
+		if engine == "" {
+			engine = AudioEnginePiper
+		}
+		if engine == AudioEngineKokoro {
+			url := strings.TrimRight(st.EngineURL, "/")
+			if url == "" {
+				url = defaultKokoroURL
+			}
+			return stageCacheKey(keyInput{
+				StageType:    StageTypeAudio,
+				Voice:        st.Voice,
+				RenderedText: text,
+				AudioEngine:  AudioEngineKokoro,
+				AudioURL:     url,
+			})
+		}
 		// Resolve the voice's .onnx path the same way audioExecutor does so
 		// the file-size mixed into the key reflects the same file the live
 		// path will load. A missing model surfaces as a zero size + the
@@ -345,9 +382,6 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 			if !errors.Is(err, os.ErrNotExist) {
 				return "", fmt.Errorf("cache key: stat voice %s: %w", voicePath, err)
 			}
-			// Missing voice file: include the path in the key so different
-			// missing voices don't collide; the live path will fail with a
-			// clear error before any cache lookup matters.
 			size = 0
 		}
 		return stageCacheKey(keyInput{
@@ -356,6 +390,7 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 			RenderedText:   text,
 			Binary:         st.Binary,
 			VoiceModelSize: size,
+			AudioEngine:    AudioEnginePiper,
 		})
 	case StageTypeFFmpeg:
 		args := make([]string, 0, len(st.FFmpegArgs))

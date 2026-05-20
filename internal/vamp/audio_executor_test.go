@@ -2,8 +2,12 @@ package vamp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -515,3 +519,98 @@ func runWithAudioRunner(e *Executor, runner audioRunner) error {
 	}
 	return nil
 }
+
+
+// TestAudioExecutor_KokoroEngine_PostsToEndpointAndWritesWAV covers the
+// kokoro audio path: the executor posts a JSON body matching the OpenAI
+// /v1/audio/speech shape to EngineURL and writes the response body as the
+// stage output WAV. Stubs an httptest server in place of Kokoro-FastAPI.
+func TestAudioExecutor_KokoroEngine_PostsToEndpointAndWritesWAV(t *testing.T) {
+	var gotBody []byte
+	var gotPath string
+	var gotMethod string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotMethod = r.Method
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		// Minimal sentinel WAV: RIFF header bytes are enough that the test
+		// can assert byte-identity without smuggling a real codec in here.
+		_, _ = w.Write([]byte("RIFF....WAVEsentinel"))
+	}))
+	defer srv.Close()
+
+	runDir := t.TempDir()
+	exec := &audioExecutor{}
+	out, err := exec.Execute(context.Background(), StageInput{
+		Stage: &Stage{
+			ID:        "audio",
+			Type:      StageTypeAudio,
+			Voice:     "af_bella",
+			Text:      "Hello, lecture world.",
+			Output:    "out.wav",
+			Engine:    AudioEngineKokoro,
+			EngineURL: srv.URL,
+		},
+		RunDir: runDir,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotPath != "/v1/audio/speech" {
+		t.Errorf("path = %q, want /v1/audio/speech", gotPath)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(gotBody, &body); err != nil {
+		t.Fatalf("body not JSON: %v", err)
+	}
+	if body["voice"] != "af_bella" || body["input"] != "Hello, lecture world." || body["model"] != "kokoro" || body["response_format"] != "wav" {
+		t.Errorf("unexpected body: %+v", body)
+	}
+	if len(out.Files) != 1 {
+		t.Fatalf("expected one output file, got %v", out.Files)
+	}
+	got, err := os.ReadFile(out.Files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "RIFF....WAVEsentinel" {
+		t.Errorf("WAV bytes not written verbatim: %q", got)
+	}
+}
+
+// TestAudioExecutor_KokoroEngine_400IsAStageError checks that a non-2xx
+// response surfaces as a stage error with the server's body included, so
+// a misconfigured voice or unreachable server fails loudly rather than
+// silently producing an empty WAV.
+func TestAudioExecutor_KokoroEngine_400IsAStageError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"unknown voice"}`))
+	}))
+	defer srv.Close()
+	runDir := t.TempDir()
+	exec := &audioExecutor{}
+	_, err := exec.Execute(context.Background(), StageInput{
+		Stage: &Stage{
+			ID:        "audio",
+			Type:      StageTypeAudio,
+			Voice:     "af_nope",
+			Text:      "x",
+			Output:    "out.wav",
+			Engine:    AudioEngineKokoro,
+			EngineURL: srv.URL,
+		},
+		RunDir: runDir,
+	})
+	if err == nil {
+		t.Fatal("expected error on 400 response")
+	}
+	if !strings.Contains(err.Error(), "unknown voice") {
+		t.Errorf("error should surface server body: %v", err)
+	}
+}
+

@@ -72,6 +72,19 @@ type Stage struct {
 	Text      string `yaml:"text,omitempty"`
 	VoicesDir string `yaml:"voices_dir,omitempty"`
 	Binary    string `yaml:"binary,omitempty"`
+	// Engine selects the TTS backend for a `type: audio` stage. Default is
+	// "piper" (subprocess + .onnx voices on disk). "kokoro" routes through
+	// an OpenAI-compatible HTTP endpoint (Kokoro-FastAPI) — markedly more
+	// natural narration for English long-form, with deterministic output
+	// (same voice + text → same WAV).
+	Engine string `yaml:"engine,omitempty"`
+	// EngineURL is the OpenAI-compatible TTS endpoint base, used when
+	// engine: kokoro (and any future HTTP-backed engines). Defaults to
+	// http://127.0.0.1:8880 (Kokoro-FastAPI's docker default). The
+	// executor appends "/v1/audio/speech". Kept distinct from the URL
+	// field on webhook stages so each stage type's validator can reject
+	// fields that don't apply.
+	EngineURL string `yaml:"engine_url,omitempty"`
 	// Foreach, when non-nil, makes this a fan-out stage. The upstream stage
 	// referenced by From must produce output_format: json and its output must
 	// parse as a JSON array (or {"items":[...]} convenience wrap). The stage
@@ -286,6 +299,12 @@ const (
 const (
 	retryOnTransient = "transient"
 	retryOnTimeout   = "timeout"
+	// retryOnInvalidOutput retries when the stage returned a non-error
+	// response that didn't satisfy the stage's output_format contract —
+	// e.g. an LLM emitted text that fails validateJSON. A re-roll with a
+	// different sample usually succeeds; not transient in the network
+	// sense, but observationally identical from the pipeline's POV.
+	retryOnInvalidOutput = "invalid_output"
 )
 
 // Stage.RunWhen string values. RunWhenSuccess is the default applied when
@@ -346,9 +365,9 @@ func (r *RetryPolicy) Validate(ctx string) error {
 	}
 	for _, mode := range r.RetryOn {
 		switch mode {
-		case retryOnTransient, retryOnTimeout:
+		case retryOnTransient, retryOnTimeout, retryOnInvalidOutput:
 		default:
-			return fmt.Errorf("%s: retry.retry_on entry %q is not supported (allowed: %q, %q)", ctx, mode, retryOnTransient, retryOnTimeout)
+			return fmt.Errorf("%s: retry.retry_on entry %q is not supported (allowed: %q, %q, %q)", ctx, mode, retryOnTransient, retryOnTimeout, retryOnInvalidOutput)
 		}
 	}
 	return nil
@@ -560,6 +579,25 @@ func (p *Pipeline) Validate() error {
 			}
 			if !hasAudioExtension(s.Output) {
 				return fmt.Errorf("%s: output %q must end in a supported audio extension for type: audio stages (allowed: %s)", ctx, s.Output, strings.Join(audioOutputExtensions, ", "))
+			}
+			engine := s.Engine
+			if engine == "" {
+				engine = AudioEnginePiper
+			}
+			switch engine {
+			case AudioEnginePiper:
+				if s.EngineURL != "" {
+					return fmt.Errorf("%s: engine_url is only valid on engine: kokoro audio stages", ctx)
+				}
+			case AudioEngineKokoro:
+				if s.VoicesDir != "" {
+					return fmt.Errorf("%s: voices_dir is only valid on engine: piper audio stages", ctx)
+				}
+				if s.Binary != "" {
+					return fmt.Errorf("%s: binary is only valid on engine: piper audio stages", ctx)
+				}
+			default:
+				return fmt.Errorf("%s: engine %q is not supported (allowed: %q, %q)", ctx, engine, AudioEnginePiper, AudioEngineKokoro)
 			}
 			if s.Prompt != "" {
 				return fmt.Errorf("%s: prompt is only valid on type: text stages", ctx)

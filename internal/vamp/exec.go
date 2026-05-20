@@ -1470,13 +1470,26 @@ func isRetryable(err error, policy *RetryPolicy) bool {
 	}
 	hasTimeoutMode := false
 	hasTransientMode := false
+	hasInvalidOutputMode := false
 	for _, mode := range policy.RetryOn {
 		switch mode {
 		case retryOnTimeout:
 			hasTimeoutMode = true
 		case retryOnTransient:
 			hasTransientMode = true
+		case retryOnInvalidOutput:
+			hasInvalidOutputMode = true
 		}
+	}
+	// invalid_output: classified by error-string substring because the
+	// executor emits validateJSON failures via fmt.Errorf("stage output
+	// is not valid JSON: ...") and we don't want to thread a typed error
+	// through every stage type just for this one retry class. Re-rolling
+	// a text-stage call with the same prompt usually succeeds (LLM
+	// sampling chose a slightly different path on the first attempt and
+	// produced a parse error).
+	if hasInvalidOutputMode && strings.Contains(err.Error(), "stage output is not valid JSON") {
+		return true
 	}
 	// Timeout detection: works for both "timeout" and "transient" modes
 	// because every timeout is also a transient by definition.
@@ -2155,7 +2168,92 @@ func templateFuncs() template.FuncMap {
 		"stripDataURIs":    stripDataURIsTemplate,
 		"truncate":         truncateTemplate,
 		"flattenItems":     flattenItemsTemplate,
+		"uniqueByKey":      uniqueByKeyTemplate,
 	}
+}
+
+// uniqueByKeyTemplate dedupes a JSON array of objects by the named key,
+// keeping the first occurrence of each unique value and preserving input
+// order. Used to derive a `{"items":[...]}` set of distinct "parents"
+// from a flat list whose items reference a parent id — e.g. a
+// generate-per-sub-unit foreach producing 15 sub-units, with an mp3
+// stage that needs to foreach the 8 distinct parent_unit_ids.
+//
+// Input shapes accepted (mirrors flattenItemsTemplate / mergeJSONTemplate):
+//   - bare JSON array: `[{...},{...}]`
+//   - wrapped object:   `{"items":[{...},{...}]}`
+//   - foreach output:   blank-line-separated concatenation of either of
+//     the above, with optional ```json fences (LLM artifact).
+//
+// Output is always `{"items":[<deduped>]}` so it can drive a foreach.
+// Items lacking the named key are passed through verbatim (treated as
+// non-mergeable singletons).
+func uniqueByKeyTemplate(key, raw string) (string, error) {
+	if key == "" {
+		return "", fmt.Errorf("uniqueByKey: key is required")
+	}
+	var b strings.Builder
+	for _, line := range strings.Split(raw, "\n") {
+		trim := strings.TrimSpace(line)
+		if trim == "```json" || trim == "```JSON" || trim == "```" {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	dec := json.NewDecoder(strings.NewReader(b.String()))
+	var flat []any
+	for {
+		var v any
+		err := dec.Decode(&v)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("uniqueByKey: decode at offset %d: %w", dec.InputOffset(), err)
+		}
+		switch t := v.(type) {
+		case []any:
+			flat = append(flat, t...)
+		case map[string]any:
+			if items, ok := t["items"].([]any); ok {
+				flat = append(flat, items...)
+			} else {
+				flat = append(flat, t)
+			}
+		default:
+			flat = append(flat, t)
+		}
+	}
+	seen := make(map[string]bool)
+	var out []any
+	for _, item := range flat {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			out = append(out, item)
+			continue
+		}
+		val, hasKey := obj[key]
+		if !hasKey {
+			out = append(out, obj)
+			continue
+		}
+		k := fmt.Sprint(val)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, obj)
+	}
+	if out == nil {
+		out = []any{}
+	}
+	wrapped := map[string]any{"items": out}
+	res, err := json.Marshal(wrapped)
+	if err != nil {
+		return "", fmt.Errorf("uniqueByKey: marshal: %w", err)
+	}
+	return string(res), nil
 }
 
 // flattenItemsTemplate takes the concatenated foreach output of a stage

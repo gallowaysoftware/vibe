@@ -179,6 +179,58 @@ func TestFlattenItemsTemplate(t *testing.T) {
 	}
 }
 
+// TestUniqueByKeyTemplate covers the parent-deduplication transform: a
+// flat array of sub-unit items, each with a parent_unit_id, collapses
+// to one item per distinct parent (preserving input order, keeping
+// first occurrence).
+func TestUniqueByKeyTemplate(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+		in   string
+		want string
+	}{
+		{
+			name: "two parents three sub-units",
+			key:  "parent_unit_id",
+			in:   `[{"unit_id":"a_part1","parent_unit_id":"a"},{"unit_id":"a_part2","parent_unit_id":"a"},{"unit_id":"b","parent_unit_id":"b"}]`,
+			want: `{"items":[{"parent_unit_id":"a","unit_id":"a_part1"},{"parent_unit_id":"b","unit_id":"b"}]}`,
+		},
+		{
+			name: "wrapped object input",
+			key:  "parent_unit_id",
+			in:   `{"items":[{"x":1,"parent_unit_id":"a"},{"x":2,"parent_unit_id":"a"}]}`,
+			want: `{"items":[{"parent_unit_id":"a","x":1}]}`,
+		},
+		{
+			name: "missing key passes through",
+			key:  "parent_unit_id",
+			in:   `[{"unit_id":"x"}]`,
+			want: `{"items":[{"unit_id":"x"}]}`,
+		},
+		{
+			name: "empty",
+			key:  "parent_unit_id",
+			in:   "",
+			want: `{"items":[]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := uniqueByKeyTemplate(tc.key, tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("\n got:  %s\n want: %s", got, tc.want)
+			}
+		})
+	}
+	if _, err := uniqueByKeyTemplate("", "[]"); err == nil {
+		t.Error("expected error on empty key")
+	}
+}
+
 // TestStageCacheKey_ImageHashesInvalidate locks down that text-stage cache
 // keys differ when the attached image bytes differ. Without this, a lesson
 // dir with an updated SVG (e.g. a corrected diagram) would serve the
