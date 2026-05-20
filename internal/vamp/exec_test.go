@@ -28,18 +28,21 @@ import (
 
 // stubControl is a minimal ControlServiceHandler that satisfies vamp's needs:
 // Status reflects the most recent Start, and EnsureActive's Start path lands
-// here.
+// here. parallel, when non-zero, is surfaced as Status.Parallel so tests can
+// exercise the foreach concurrency cap that's bounded by the active profile's
+// llama_server parallel-slot count.
 type stubControl struct {
 	mu       sync.Mutex
 	profile  string
 	proxyURL string
+	parallel int32
 }
 
 func (s *stubControl) Status(_ context.Context, _ *connect.Request[vibev1.StatusRequest]) (*connect.Response[vibev1.StatusResponse], error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return connect.NewResponse(&vibev1.StatusResponse{Status: &vibev1.Status{
-		Running: s.profile != "", Ready: s.profile != "", Profile: s.profile, ProxyAddr: s.proxyURL,
+		Running: s.profile != "", Ready: s.profile != "", Profile: s.profile, ProxyAddr: s.proxyURL, Parallel: s.parallel,
 	}}), nil
 }
 func (s *stubControl) Start(_ context.Context, req *connect.Request[vibev1.StartRequest]) (*connect.Response[vibev1.StartResponse], error) {
@@ -274,6 +277,16 @@ func TestExecutor_JSONOutputFormatRejectsBadJSON(t *testing.T) {
 // mocked by the caller so tests can control latency and content.
 func stubExecutor(t *testing.T, pipeline *Pipeline, caps *Capabilities, inf InferenceFunc) (*Executor, string) {
 	t.Helper()
+	ex, runDir, _ := stubExecutorWithControl(t, pipeline, caps, inf)
+	return ex, runDir
+}
+
+// stubExecutorWithControl is the variant that also returns the underlying
+// stubControl so tests can program profile-derived Status fields (notably
+// Parallel for the foreach-cap test). Other tests stick with the simpler
+// stubExecutor helper.
+func stubExecutorWithControl(t *testing.T, pipeline *Pipeline, caps *Capabilities, inf InferenceFunc) (*Executor, string, *stubControl) {
+	t.Helper()
 	stub := &stubControl{}
 	mux := http.NewServeMux()
 	path, handler := vibev1connect.NewControlServiceHandler(stub)
@@ -292,7 +305,7 @@ func stubExecutor(t *testing.T, pipeline *Pipeline, caps *Capabilities, inf Infe
 		RunDir:       runDir,
 		Inference:    inf,
 	}
-	return exec, runDir
+	return exec, runDir, stub
 }
 
 func TestExecutor_ParallelStagesSameProfile(t *testing.T) {
@@ -880,21 +893,19 @@ func TestExecutor_ParallelForeach_RespectsCap(t *testing.T) {
 	t.Logf("cap=2 wall-clock for 8 items: %s", elapsed)
 }
 
-// TestExecutor_ParallelForeach_CancelsSiblings verifies that an erroring item
-// cancels its siblings via the per-stage context. Sibling items observe
-// ctx.Done() and return promptly instead of sleeping out their full latency.
-func TestExecutor_ParallelForeach_CancelsSiblings(t *testing.T) {
-	const longLatency = 800 * time.Millisecond
-	var aborted int32
+// TestExecutor_ParallelForeach_IndependentItems verifies that an erroring item
+// does NOT cancel its siblings. Each item runs independently; a single failure
+// is collected but the remaining items complete normally. The stage aggregates
+// partial output from the successful items and reports the joined error.
+func TestExecutor_ParallelForeach_IndependentItems(t *testing.T) {
+	const longLatency = 100 * time.Millisecond
 	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
 		switch {
 		case prompt == "ITEMS":
 			return `["fail","slow1","slow2","slow3"]`, nil
 		case prompt == "ITEM:fail":
-			// Sleep just long enough for siblings to be in flight before we
-			// poison the context.
 			select {
-			case <-time.After(100 * time.Millisecond):
+			case <-time.After(50 * time.Millisecond):
 			case <-ctx.Done():
 				return "", ctx.Err()
 			}
@@ -904,7 +915,6 @@ func TestExecutor_ParallelForeach_CancelsSiblings(t *testing.T) {
 			case <-time.After(longLatency):
 				return strings.TrimPrefix(prompt, "ITEM:"), nil
 			case <-ctx.Done():
-				atomic.AddInt32(&aborted, 1)
 				return "", ctx.Err()
 			}
 		}
@@ -912,7 +922,7 @@ func TestExecutor_ParallelForeach_CancelsSiblings(t *testing.T) {
 	}
 	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
 	pipeline := &Pipeline{
-		Name: "cancel",
+		Name: "independent",
 		Stages: []Stage{
 			{ID: "items", Capability: "reasoning", Prompt: "ITEMS", Output: "items.json", OutputFormat: "json"},
 			{
@@ -924,31 +934,29 @@ func TestExecutor_ParallelForeach_CancelsSiblings(t *testing.T) {
 			},
 		},
 	}
-	exec, _ := stubExecutor(t, pipeline, caps, inf)
+	exec, dir := stubExecutor(t, pipeline, caps, inf)
 	exec.MaxForeachConcurrency = 4
-	start := time.Now()
 	err := exec.Run(context.Background())
-	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	// The failing item's error is wrapped and joined; verify both the failure
-	// surfaces and the joined error mentions item 0 (or the relevant items
-	// indices) and the underlying error.
 	if !strings.Contains(err.Error(), "intentional failure") {
 		t.Errorf("expected 'intentional failure' in aggregated error, got: %v", err)
 	}
-	// At least one sibling must have observed cancellation rather than
-	// running to completion.
-	if got := atomic.LoadInt32(&aborted); got < 1 {
-		t.Errorf("expected >= 1 sibling to observe ctx cancellation, got %d", got)
+	// Siblings should have completed successfully despite item 0 failing.
+	// Check that the 3 successful items wrote their output files.
+	for _, name := range []string{"slow1.txt", "slow2.txt", "slow3.txt"} {
+		data, err := os.ReadFile(filepath.Join(dir, "out", name))
+		if err != nil {
+			t.Errorf("expected output file out/%s after sibling completion: %v", name, err)
+		} else if string(data) != strings.TrimPrefix(name, "")[:len(name)-4] {
+			t.Errorf("out/%s = %q, want %q", name, string(data), strings.TrimPrefix(name, "")[:len(name)-4])
+		}
 	}
-	// And the whole stage must have finished WELL before the slow items'
-	// nominal 800ms latency — that's the whole point of cooperative cancel.
-	if elapsed >= 600*time.Millisecond {
-		t.Errorf("cancel propagation took %s, expected < 600ms (slow items did not honor ctx)", elapsed)
+	// The failing item's output should not exist.
+	if _, err := os.Stat(filepath.Join(dir, "out", "fail.txt")); !os.IsNotExist(err) {
+		t.Error("expected out/fail.txt to not exist after item failure")
 	}
-	t.Logf("cancel propagation wall-clock: %s (aborted siblings: %d)", elapsed, atomic.LoadInt32(&aborted))
 }
 
 // TestExecutor_ParallelForeach_OutputsInDeclaredOrder verifies that even when
@@ -2635,4 +2643,287 @@ func TestExecutor_CacheDisabled(t *testing.T) {
 func cacheNew(t *testing.T) (*vampcache.Store, error) {
 	t.Helper()
 	return vampcache.New(t.TempDir())
+}
+
+// TestExecutor_RunStageCleanup_RemovesMatchingFiles invokes runStageCleanup
+// against a temp run dir containing a mix of files: ones that match the
+// declared glob (should be removed) and ones that don't (should survive).
+// Driving the helper directly rather than through a full executor run keeps
+// the assertion narrow to "cleanup did exactly the disk work we asked for".
+func TestExecutor_RunStageCleanup_RemovesMatchingFiles(t *testing.T) {
+	runDir := t.TempDir()
+	// Seed: two .wav files we expect to be cleaned, plus one .mp3 and one
+	// file under a sibling dir that must survive.
+	mustMkdir := func(p string) {
+		if err := os.MkdirAll(filepath.Join(runDir, p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWrite := func(p string) {
+		if err := os.WriteFile(filepath.Join(runDir, p), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustMkdir("audio")
+	mustMkdir("keep")
+	mustWrite("audio/a.wav")
+	mustWrite("audio/b.wav")
+	mustWrite("audio/keep.mp3")
+	mustWrite("keep/survivor.bin")
+	mustWrite("podcast.mp3")
+	exec := &Executor{RunDir: runDir}
+	st := &Stage{ID: "cleanup", Cleanup: []string{"audio/*.wav"}}
+	exec.runStageCleanup(st)
+	if _, err := os.Stat(filepath.Join(runDir, "audio/a.wav")); !os.IsNotExist(err) {
+		t.Errorf("audio/a.wav still present (err=%v); cleanup should have removed it", err)
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "audio/b.wav")); !os.IsNotExist(err) {
+		t.Errorf("audio/b.wav still present (err=%v); cleanup should have removed it", err)
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "audio/keep.mp3")); err != nil {
+		t.Errorf("audio/keep.mp3 missing (err=%v); cleanup pattern should not have matched it", err)
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "keep/survivor.bin")); err != nil {
+		t.Errorf("keep/survivor.bin missing (err=%v); cleanup pattern should not have matched it", err)
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "podcast.mp3")); err != nil {
+		t.Errorf("podcast.mp3 missing (err=%v); cleanup pattern should not have matched it", err)
+	}
+}
+
+// TestExecutor_RunStageCleanup_NoOpForEmptyList verifies cleanup is a no-op
+// when the stage has no patterns declared. The function is called from
+// every stage's success path so this fast path must NOT touch disk or log.
+func TestExecutor_RunStageCleanup_NoOpForEmptyList(t *testing.T) {
+	runDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(runDir, "keepme.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec := &Executor{RunDir: runDir}
+	exec.runStageCleanup(&Stage{ID: "x"})
+	if _, err := os.Stat(filepath.Join(runDir, "keepme.txt")); err != nil {
+		t.Errorf("keepme.txt missing after no-op cleanup (err=%v)", err)
+	}
+}
+
+// TestExecutor_RunStageCleanup_MissingFilesAreFine confirms cleanup's
+// best-effort contract: a pattern that doesn't match anything is not an
+// error and doesn't blow up the stage. This is the cache-hit path's
+// behaviour — the re-run might cleanup-hit on files an earlier run
+// already removed.
+func TestExecutor_RunStageCleanup_MissingFilesAreFine(t *testing.T) {
+	runDir := t.TempDir()
+	exec := &Executor{RunDir: runDir}
+	st := &Stage{ID: "x", Cleanup: []string{"never_existed/*.tmp"}}
+	exec.runStageCleanup(st) // must not panic, must not log an error
+}
+
+// TestExecutor_RunStageCleanup_SkipsUnsafePatterns is a defence-in-depth
+// check: even if a Pipeline was constructed in-memory (bypassing the
+// LoadPipeline validator) with an absolute or ../ pattern, runStageCleanup
+// must refuse to act on it. Mirrors the validate-time rejection so the
+// invariant holds at both load- and run-time.
+func TestExecutor_RunStageCleanup_SkipsUnsafePatterns(t *testing.T) {
+	runDir := t.TempDir()
+	outside := t.TempDir()
+	sentinel := filepath.Join(outside, "do_not_delete.txt")
+	if err := os.WriteFile(sentinel, []byte("important"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec := &Executor{RunDir: runDir}
+	st := &Stage{ID: "x", Cleanup: []string{outside + "/*.txt", "../*"}}
+	exec.runStageCleanup(st)
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("sentinel %q was removed (err=%v); runStageCleanup must refuse absolute/parent-traversal patterns", sentinel, err)
+	}
+}
+
+// TestExecutor_CleanupRunsOnSuccessfulStage runs a real one-stage pipeline
+// against a stub chat-completion server, then asserts the file declared in
+// cleanup: was scrubbed from disk after the stage completed. This covers
+// the wire-up: executeStage's success exit calls runStageCleanup AFTER the
+// stage's own output has been written.
+func TestExecutor_CleanupRunsOnSuccessfulStage(t *testing.T) {
+	stub := &stubControl{}
+	mux := http.NewServeMux()
+	path, handler := vibev1connect.NewControlServiceHandler(stub)
+	mux.Handle(path, handler)
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"data": []map[string]string{{"id": "stub-model"}}})
+	})
+	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]string{"content": "ok"}}},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	stub.proxyURL = srv.URL
+
+	runDir := t.TempDir()
+	// Seed an intermediate file the cleanup pattern is expected to match.
+	scratch := filepath.Join(runDir, "scratch")
+	if err := os.MkdirAll(scratch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	doomed := filepath.Join(scratch, "doomed.tmp")
+	if err := os.WriteFile(doomed, []byte("trash"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}}
+	pipeline := &Pipeline{
+		Name: "cleanup_e2e",
+		Stages: []Stage{{
+			ID:         "a",
+			Capability: "reasoning",
+			Prompt:     "hi",
+			Output:     "a.txt",
+			Cleanup:    []string{"scratch/*.tmp"},
+		}},
+	}
+	exec := &Executor{
+		Pipeline:     pipeline,
+		Capabilities: caps,
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client(), ""),
+		RunDir:       runDir,
+	}
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "a.txt")); err != nil {
+		t.Errorf("stage output missing (err=%v) — cleanup must run AFTER output write", err)
+	}
+	if _, err := os.Stat(doomed); !os.IsNotExist(err) {
+		t.Errorf("doomed file still present (err=%v); cleanup did not run on success", err)
+	}
+}
+
+// TestExecutor_ForeachConcurrency_CappedByProfileParallel verifies the
+// profile-parallel cap is applied to text foreach stages. A synthetic
+// profile with parallel=1 backs a 10-item foreach stage; the per-item
+// concurrency the runner actually achieves must be 1 even though
+// MaxForeachConcurrency is left at the default (4) and 10 items are
+// available.
+//
+// The observation is done at the runner layer (inside the InferenceFunc):
+// each item increments a live counter on entry, sleeps a few milliseconds
+// (long enough for sibling goroutines to race in if the cap leaked), and
+// tracks the max-witnessed counter via atomic.Max. That max is the
+// concurrency the runner actually achieved — exactly the value we want
+// bounded by profile.parallel.
+func TestExecutor_ForeachConcurrency_CappedByProfileParallel(t *testing.T) {
+	const itemLatency = 30 * time.Millisecond
+	var inflight, maxInflight int32
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		switch {
+		case prompt == "ITEMS":
+			return `["a","b","c","d","e","f","g","h","i","j"]`, nil
+		case strings.HasPrefix(prompt, "ITEM:"):
+			n := atomic.AddInt32(&inflight, 1)
+			// Lock-free monotonic-max via CAS loop so the witness is
+			// thread-safe without an extra mutex.
+			for {
+				prev := atomic.LoadInt32(&maxInflight)
+				if n <= prev || atomic.CompareAndSwapInt32(&maxInflight, prev, n) {
+					break
+				}
+			}
+			select {
+			case <-time.After(itemLatency):
+			case <-ctx.Done():
+				atomic.AddInt32(&inflight, -1)
+				return "", ctx.Err()
+			}
+			atomic.AddInt32(&inflight, -1)
+			return strings.TrimPrefix(prompt, "ITEM:"), nil
+		}
+		return "", fmt.Errorf("unexpected prompt %q", prompt)
+	}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "serial"}}}
+	pipeline := &Pipeline{
+		Name: "cap-by-profile",
+		Stages: []Stage{
+			{ID: "items", Capability: "reasoning", Prompt: "ITEMS", Output: "items.json", OutputFormat: "json"},
+			{
+				ID: "consumer", Capability: "reasoning",
+				Inputs:  []string{"items"},
+				Foreach: &ForeachSpec{From: "items", Var: "x"},
+				Prompt:  "ITEM:{{.x}}",
+				Output:  "out/{{.x}}.txt",
+			},
+		},
+	}
+	exec, _, stub := stubExecutorWithControl(t, pipeline, caps, inf)
+	// Program the synthetic profile as parallel=1: a single inference slot
+	// on the backend. The executor must cap the foreach concurrency at
+	// this value even though MaxForeachConcurrency would otherwise allow
+	// 4 (the default).
+	stub.parallel = 1
+	// Leave MaxForeachConcurrency at zero (default 4) so the cap-from-profile
+	// path is exercised independently of any per-Executor override.
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := atomic.LoadInt32(&maxInflight); got != 1 {
+		t.Errorf("max observed concurrency = %d, want 1 (cap = profile.parallel)", got)
+	}
+	t.Logf("max-witnessed concurrency: %d", atomic.LoadInt32(&maxInflight))
+}
+
+// TestExecutor_ForeachConcurrency_RespectsExplicitOverrideUnderCap verifies
+// the cap is a MINIMUM (lower of (stage concurrency, profile parallel)).
+// When MaxForeachConcurrency is set to a value smaller than profile.parallel
+// the executor must still honor the smaller value — the cap doesn't lift
+// concurrency, it only lowers it.
+func TestExecutor_ForeachConcurrency_RespectsExplicitOverrideUnderCap(t *testing.T) {
+	const itemLatency = 30 * time.Millisecond
+	var inflight, maxInflight int32
+	inf := func(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+		switch {
+		case prompt == "ITEMS":
+			return `["a","b","c","d","e","f","g","h"]`, nil
+		case strings.HasPrefix(prompt, "ITEM:"):
+			n := atomic.AddInt32(&inflight, 1)
+			for {
+				prev := atomic.LoadInt32(&maxInflight)
+				if n <= prev || atomic.CompareAndSwapInt32(&maxInflight, prev, n) {
+					break
+				}
+			}
+			select {
+			case <-time.After(itemLatency):
+			case <-ctx.Done():
+				atomic.AddInt32(&inflight, -1)
+				return "", ctx.Err()
+			}
+			atomic.AddInt32(&inflight, -1)
+			return strings.TrimPrefix(prompt, "ITEM:"), nil
+		}
+		return "", fmt.Errorf("unexpected prompt %q", prompt)
+	}
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "wide"}}}
+	pipeline := &Pipeline{
+		Name: "explicit-under-cap",
+		Stages: []Stage{
+			{ID: "items", Capability: "reasoning", Prompt: "ITEMS", Output: "items.json", OutputFormat: "json"},
+			{
+				ID: "consumer", Capability: "reasoning",
+				Inputs:  []string{"items"},
+				Foreach: &ForeachSpec{From: "items", Var: "x"},
+				Prompt:  "ITEM:{{.x}}",
+				Output:  "out/{{.x}}.txt",
+			},
+		},
+	}
+	exec, _, stub := stubExecutorWithControl(t, pipeline, caps, inf)
+	// Profile allows 8 parallel slots; user explicitly capped at 2.
+	stub.parallel = 8
+	exec.MaxForeachConcurrency = 2
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := atomic.LoadInt32(&maxInflight); got != 2 {
+		t.Errorf("max observed concurrency = %d, want 2 (explicit override wins over higher profile.parallel)", got)
+	}
 }

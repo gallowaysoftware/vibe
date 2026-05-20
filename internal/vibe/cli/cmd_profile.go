@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
+	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 )
 
 // profileNameRE mirrors profile.Validate()'s allowed name shape. We
@@ -84,6 +85,157 @@ func profileCmd() *cobra.Command {
 		},
 	}
 	cmd.AddCommand(profileInitCmd())
+	cmd.AddCommand(profileNewCmd())
+	cmd.AddCommand(profileSchemaCmd())
+	return cmd
+}
+
+// profileKindEnum is the user-facing --kind values for `vibe profile new`.
+// It deliberately mirrors the backend discriminators in profile.Backend
+// (llama_server, comfyui) using kebab-case so the CLI matches `vibe`'s
+// flag-naming conventions; the internal mapping to template filenames
+// happens in templateForKindFrontend.
+var profileKindEnum = []string{"llama-server", "comfyui"}
+
+// profileFrontendEnum is the user-facing --frontend values. Only meaningful
+// for kind=llama-server; ignored (with a friendly note) for kind=comfyui
+// since ComfyUI ships its own UI and the profile schema rejects a
+// frontend block on comfyui-backed profiles.
+var profileFrontendEnum = []string{
+	profile.FrontendExternal,
+	profile.FrontendDockerCompose,
+	profile.FrontendManaged,
+}
+
+// templateForKindFrontend maps the (--kind, --frontend) pair onto a
+// concrete template filename under profile_templates/. The mapping
+// recognizes that the existing templates are organized by frontend kind
+// for llama-server (one template per frontend variant) but by backend
+// for comfyui (a single template, frontend ignored). Future kinds plug
+// in by extending this switch.
+func templateForKindFrontend(kind, frontend string) (string, error) {
+	switch kind {
+	case "llama-server":
+		switch frontend {
+		case profile.FrontendExternal:
+			return "llama-server", nil
+		case profile.FrontendDockerCompose:
+			return "docker-compose", nil
+		case profile.FrontendManaged:
+			return "managed", nil
+		default:
+			return "", fmt.Errorf("--frontend %q: unknown (allowed: %s)",
+				frontend, strings.Join(profileFrontendEnum, ", "))
+		}
+	case "comfyui":
+		// Frontend is irrelevant for comfyui (the backend ships its own UI),
+		// so we accept any value and route to the comfyui template. The
+		// alternative — erroring on --frontend != "" — would be surprising
+		// when users tab-complete the default. The validator in profile
+		// rejects frontend blocks for comfyui profiles, so there's no
+		// hidden risk in accepting the flag here.
+		return "comfyui", nil
+	default:
+		return "", fmt.Errorf("--kind %q: unknown (allowed: %s)",
+			kind, strings.Join(profileKindEnum, ", "))
+	}
+}
+
+// profileSchemaCmd emits the JSON Schema (draft-07) describing profile YAML.
+// Mirrors `vamp schema` in shape: stdout-by-default with --out for writing
+// the canonical file, no other options. Editor extensions point a
+// `# yaml-language-server: $schema=...` directive at the rendered file to
+// get autocomplete + validation on profile YAMLs.
+func profileSchemaCmd() *cobra.Command {
+	var outFlag string
+	cmd := &cobra.Command{
+		Use:   "schema",
+		Short: "Emit the vibe profile JSON Schema (draft-07).",
+		Long: "schema prints a JSON Schema document describing profile YAML " +
+			"to stdout (or --out <file>). The schema covers every Backend " +
+			"(llama_server / comfyui) and Frontend (external / " +
+			"docker-compose / managed) shape, including the huggingface " +
+			"pull block and the mmproj field. Point yaml-language-server at " +
+			"the rendered file with a " +
+			"`# yaml-language-server: $schema=./profile.schema.json` " +
+			"directive at the top of your profile YAML to get editor " +
+			"validation and autocomplete.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			data, err := profile.SchemaJSON()
+			if err != nil {
+				return err
+			}
+			if outFlag == "" {
+				_, err := cmd.OutOrStdout().Write(data)
+				return err
+			}
+			if err := os.WriteFile(outFlag, data, 0o644); err != nil {
+				return fmt.Errorf("write %s: %w", outFlag, err)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&outFlag, "out", "",
+		"Write the schema to this file instead of stdout.")
+	return cmd
+}
+
+// profileNewCmd is the user-facing alternative to `vibe profile init`. The
+// shape is closer to what a UNIX user expects from `<noun> new`:
+// flag-driven kind selection, an explicit name positional argument, and
+// shell completion on the enum-shaped flags. The internals reuse
+// runProfileInit so behavior stays identical across the two entry points.
+func profileNewCmd() *cobra.Command {
+	var (
+		kind     string
+		frontend string
+		hfRef    string
+		force    bool
+	)
+	cmd := &cobra.Command{
+		Use:   "new <name>",
+		Short: "Create a new profile YAML under $XDG_CONFIG_HOME/vibe/profiles/.",
+		Long: "Generates a starter profile YAML at " +
+			"$XDG_CONFIG_HOME/vibe/profiles/<name>.yaml from the bundled " +
+			"templates. The --kind flag selects the backend " +
+			"(llama-server | comfyui); --frontend selects the rendering " +
+			"strategy for llama-server (external | docker-compose | " +
+			"managed) and is ignored for comfyui (which ships its own UI).\n\n" +
+			"After the file is written, edit the REPLACE-marked lines, then " +
+			"`vibe start <name>`. Refuses to overwrite an existing file " +
+			"unless --force is passed.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			tmplName, err := templateForKindFrontend(kind, frontend)
+			if err != nil {
+				return err
+			}
+			return runProfileInit(cmd.OutOrStdout(), tmplName, name, hfRef, force)
+		},
+		ValidArgsFunction: cobra.NoFileCompletions,
+	}
+	cmd.Flags().StringVar(&kind, "kind", "llama-server",
+		"backend kind: "+strings.Join(profileKindEnum, " | "))
+	cmd.Flags().StringVar(&frontend, "frontend", profile.FrontendExternal,
+		"frontend kind (llama-server only): "+strings.Join(profileFrontendEnum, " | "))
+	cmd.Flags().StringVar(&hfRef, "hf", "",
+		"add a HuggingFace block to a llama-server profile (format: <repo>[:<file>])")
+	cmd.Flags().BoolVar(&force, "force", false,
+		"overwrite an existing profile file")
+
+	// Tab-complete the enum flags so users discover the allowed values
+	// without consulting --help.
+	_ = cmd.RegisterFlagCompletionFunc("kind",
+		func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+			return profileKindEnum, cobra.ShellCompDirectiveNoFileComp
+		})
+	_ = cmd.RegisterFlagCompletionFunc("frontend",
+		func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+			return profileFrontendEnum, cobra.ShellCompDirectiveNoFileComp
+		})
+
 	return cmd
 }
 

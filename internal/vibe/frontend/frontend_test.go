@@ -10,6 +10,17 @@ import (
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 )
 
+// stripGeneratedComment removes the vibe-generated comment header from file
+// contents so json.Unmarshal can parse the result. vibe prepends a `#` comment
+// to remind the user not to edit the file.
+func stripGeneratedComment(data []byte) []byte {
+	idx := strings.Index(string(data), "{")
+	if idx == -1 {
+		return data
+	}
+	return data[idx:]
+}
+
 func TestActivate_External_WritesExpandedJSON(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "nested", "opencode.json")
 	p := &profile.Profile{
@@ -22,7 +33,6 @@ func TestActivate_External_WritesExpandedJSON(t *testing.T) {
 		}},
 		Frontend: profile.Frontend{
 			Kind:            profile.FrontendExternal,
-			App:             "opencode",
 			RestartRequired: true,
 			WriteFile:       target,
 			Template: map[string]any{
@@ -62,7 +72,7 @@ func TestActivate_External_WritesExpandedJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got map[string]any
-	if err := json.Unmarshal(data, &got); err != nil {
+	if err := json.Unmarshal(stripGeneratedComment(data), &got); err != nil {
 		t.Fatal(err)
 	}
 	if got["model"] != "vibe-local/qwen3" {
@@ -100,7 +110,6 @@ func TestValidate_DockerCompose_RejectsWriteFile(t *testing.T) {
 		Backend: profile.Backend{LlamaServer: &profile.LlamaServerBackend{Path: modelPath, Alias: "x", Context: 1, Parallel: 1}},
 		Frontend: profile.Frontend{
 			Kind:        profile.FrontendDockerCompose,
-			App:         "x",
 			ComposeFile: "/tmp/dc.yaml",
 			WriteFile:   "/tmp/x.json",
 		},
@@ -154,7 +163,6 @@ command: [npx, -y, "@some/jira-mcp"]
 		}},
 		Frontend: profile.Frontend{
 			Kind:      profile.FrontendExternal,
-			App:       "opencode",
 			WriteFile: target,
 			MCPs:      []string{"datadog", "jira"},
 			Template: map[string]any{
@@ -178,7 +186,7 @@ command: [npx, -y, "@some/jira-mcp"]
 		t.Fatal(err)
 	}
 	var got map[string]any
-	if err := json.Unmarshal(data, &got); err != nil {
+	if err := json.Unmarshal(stripGeneratedComment(data), &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -231,7 +239,6 @@ func TestActivate_External_NoMCPs_OmitsBlock(t *testing.T) {
 		Backend: profile.Backend{LlamaServer: &profile.LlamaServerBackend{Path: "/m.gguf", Alias: "x", Context: 1, Parallel: 1}},
 		Frontend: profile.Frontend{
 			Kind:      profile.FrontendExternal,
-			App:       "opencode",
 			WriteFile: target,
 			Template:  map[string]any{"a": 1},
 		},
@@ -244,7 +251,7 @@ func TestActivate_External_NoMCPs_OmitsBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got map[string]any
-	if err := json.Unmarshal(data, &got); err != nil {
+	if err := json.Unmarshal(stripGeneratedComment(data), &got); err != nil {
 		t.Fatal(err)
 	}
 	if _, present := got["mcp"]; present {
@@ -263,7 +270,6 @@ func TestActivate_External_MCPConflictsWithTemplateKey(t *testing.T) {
 		Backend: profile.Backend{LlamaServer: &profile.LlamaServerBackend{Path: "/m.gguf", Alias: "x", Context: 1, Parallel: 1}},
 		Frontend: profile.Frontend{
 			Kind:      profile.FrontendExternal,
-			App:       "opencode",
 			WriteFile: target,
 			MCPs:      []string{"datadog"},
 			Template: map[string]any{
@@ -295,7 +301,6 @@ func TestActivate_External_MissingMCPDefinition(t *testing.T) {
 		Backend: profile.Backend{LlamaServer: &profile.LlamaServerBackend{Path: "/m.gguf", Alias: "x", Context: 1, Parallel: 1}},
 		Frontend: profile.Frontend{
 			Kind:      profile.FrontendExternal,
-			App:       "opencode",
 			WriteFile: target,
 			MCPs:      []string{"datadog"},
 			Template:  map[string]any{"a": 1},

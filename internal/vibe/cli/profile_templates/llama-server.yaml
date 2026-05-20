@@ -28,7 +28,6 @@ backend:
 
 frontend:
   kind: external
-  app: opencode
   # opencode reads its config once at startup and does not hot-reload, so
   # relaunching opencode is required to pick up the new endpoint.
   restart_required: true

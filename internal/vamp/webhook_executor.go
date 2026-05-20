@@ -10,9 +10,90 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"text/template"
+	"time"
 )
+
+// transientHTTPError is the typed error a webhook stage returns when it
+// classifies a response as retryable-by-status (HTTP 429 or 5xx). The retry
+// loop in exec.go's runWithRetryInner unwraps it to:
+//   - confirm "this counts as transient" (classifier path)
+//   - honor a server-supplied Retry-After hint (capped at policy.MaxBackoff)
+//     instead of using the next exponential-backoff value
+//
+// The literal error string still embeds the status digits the legacy
+// http5xxRE/http429RE patterns match, so the classifier works even when a
+// transientHTTPError is wrapped by intermediate %w calls. Both layers
+// (typed-error + substring) are deliberate redundancy: substring matching
+// keeps the door open for other executors that emit "HTTP 429" / "HTTP 503"
+// strings without typed errors, while the typed form is what we use for
+// Retry-After plumbing.
+type transientHTTPError struct {
+	// StatusCode is the HTTP status the server returned (429 or 5xx).
+	StatusCode int
+	// RetryAfter is the parsed value of the Retry-After response header,
+	// or zero when absent. Per RFC 7231 the header is either an integer
+	// number of seconds OR an HTTP-date; we accept both. The value is
+	// already an absolute duration (not a timestamp) so the retry loop can
+	// sleep for exactly RetryAfter without worrying about clock skew.
+	RetryAfter time.Duration
+	// Underlying is the human-readable description (status + body preview)
+	// that gets surfaced to logs / the user when retries are exhausted.
+	Underlying string
+}
+
+func (e *transientHTTPError) Error() string { return e.Underlying }
+
+// asTransientHTTPError unwraps err looking for a *transientHTTPError. Returns
+// nil when err is not (or does not wrap) one. Kept as a small helper so the
+// retry loop's lookup site reads cleanly: `if th := asTransientHTTPError(err);
+// th != nil { ... }`.
+func asTransientHTTPError(err error) *transientHTTPError {
+	var th *transientHTTPError
+	if errors.As(err, &th) {
+		return th
+	}
+	return nil
+}
+
+// parseRetryAfter parses an HTTP Retry-After header value per RFC 7231
+// §7.1.3. The header is either:
+//   - a non-negative integer number of seconds ("120")
+//   - an HTTP-date ("Wed, 21 Oct 2015 07:28:00 GMT")
+//
+// Returns zero (and ok=false) when the value is empty, malformed, or in the
+// past. The caller is responsible for clamping the result to a policy max —
+// a misconfigured server could send Retry-After: 86400 and we don't want
+// to sleep for a day.
+func parseRetryAfter(headerValue string, now time.Time) (time.Duration, bool) {
+	v := strings.TrimSpace(headerValue)
+	if v == "" {
+		return 0, false
+	}
+	// Try the seconds form first; it's the common case for rate-limited
+	// APIs (Slack/Discord/most search APIs).
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs < 0 {
+			return 0, false
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	// Fall through to HTTP-date. net/http exports the canonical layout as
+	// http.TimeFormat; time.RFC1123 and RFC850 are also legal per the spec
+	// but in practice servers emit http.TimeFormat. We accept only that
+	// one form: a more permissive parser would also accept date strings
+	// that look like garbage seconds (e.g. "Sunday").
+	if t, err := time.Parse(http.TimeFormat, v); err == nil {
+		d := t.Sub(now)
+		if d <= 0 {
+			return 0, false
+		}
+		return d, true
+	}
+	return 0, false
+}
 
 // webhookExecutor implements StageExecutor for type: webhook stages. It
 // renders the URL, method, headers, and body templates, POSTs the resulting
@@ -191,12 +272,22 @@ func (w *webhookExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 		if len(preview) > maxWebhookErrorBody {
 			preview = preview[:maxWebhookErrorBody]
 		}
-		// The 5xx-vs-other split is what the runner's transient-error
-		// classifier keys on (via http5xxRE). When retry_on_5xx is true and
-		// the user didn't set their own retry policy we want the runner to
-		// treat this as transient — see the caller in exec.go's executor
-		// registration for the policy injection that makes that happen.
-		return nil, fmt.Errorf("stage %s: webhook returned HTTP %d: %s", st.ID, resp.StatusCode, strings.TrimSpace(string(preview)))
+		msg := fmt.Sprintf("stage %s: webhook returned HTTP %d: %s", st.ID, resp.StatusCode, strings.TrimSpace(string(preview)))
+		// The transient-error classifier in exec.go's isRetryable() keys off
+		// HTTP 429 / 5xx status forms. For 429 / 5xx we return a typed
+		// transientHTTPError so the retry loop can also honor any
+		// Retry-After header the server supplied. Non-429 4xx errors fall
+		// through as a plain error: those are permanent (auth, bad
+		// payload, etc.) and retrying would only make it worse.
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode/100 == 5 {
+			ra, _ := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+			return nil, &transientHTTPError{
+				StatusCode: resp.StatusCode,
+				RetryAfter: ra,
+				Underlying: msg,
+			}
+		}
+		return nil, errors.New(msg)
 	}
 
 	if st.Assert != nil {

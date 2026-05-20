@@ -80,7 +80,6 @@ backend:
       - --no-mmap
 frontend:
   kind: external
-  app: opencode
   restart_required: true
   write_file: /tmp/opencode.json
   template:
@@ -159,7 +158,6 @@ backend:
     weird_field: nope
 frontend:
   kind: external
-  app: opencode
   write_file: /tmp/x.json
   template:
     a: 1
@@ -183,7 +181,6 @@ model:
   context: 1024
 frontend:
   kind: external
-  app: opencode
   write_file: /tmp/x.json
   template: {a: 1}
 `
@@ -228,7 +225,6 @@ backend:
     context: 1024
 frontend:
   kind: external
-  app: opencode
   write_file: ~/oc.json
   template: {a: 1}
 `
@@ -275,7 +271,6 @@ backend:
     context: 1024
 frontend:
   kind: docker-compose
-  app: open-webui
   compose_file: ~/` + composeRel + `
 `
 	p, err := Load(writeProfile(t, yaml))
@@ -300,7 +295,7 @@ func TestValidate(t *testing.T) {
 			name: "missing name",
 			yaml: `
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
-frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 `,
 			wantErr: "name is required",
 		},
@@ -309,7 +304,7 @@ frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
 			yaml: `
 name: "has spaces"
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
-frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 `,
 			wantErr: "must match",
 		},
@@ -317,7 +312,7 @@ frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
 			name: "missing backend entirely",
 			yaml: `
 name: x
-frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 `,
 			wantErr: "backend is required",
 		},
@@ -328,7 +323,7 @@ name: x
 backend:
   llama_server: {path: ` + model + `, alias: x, context: 1024}
   comfyui: {dir: ` + comfyDir + `}
-frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 `,
 			wantErr: "only one of",
 		},
@@ -337,7 +332,7 @@ frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
 			yaml: `
 name: x
 backend: {llama_server: {path: ` + model + `, context: 1024}}
-frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 `,
 			wantErr: "backend.llama_server.alias is required",
 		},
@@ -346,7 +341,7 @@ frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
 			yaml: `
 name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 0}}
-frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 `,
 			wantErr: "backend.llama_server.context must be > 0",
 		},
@@ -355,7 +350,7 @@ frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
 			yaml: `
 name: x
 backend: {llama_server: {path: /nonexistent/model.gguf, alias: x, context: 1024}}
-frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 `,
 			wantErr: "backend.llama_server.path",
 		},
@@ -380,7 +375,7 @@ backend: {comfyui: {dir: /this/path/does/not/exist/anywhere}}
 			yaml: `
 name: x
 backend: {comfyui: {dir: ` + comfyDir + `}}
-frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 `,
 			wantErr: "frontend is not supported for comfyui",
 		},
@@ -389,7 +384,7 @@ frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
 			yaml: `
 name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
-frontend: {kind: weird, app: x, write_file: /tmp/x, template: {a: 1}}
+frontend: {kind: weird, write_file: /tmp/x, template: {a: 1}}
 `,
 			wantErr: "is unknown",
 		},
@@ -398,7 +393,7 @@ frontend: {kind: weird, app: x, write_file: /tmp/x, template: {a: 1}}
 			yaml: `
 name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
-frontend: {app: x, write_file: /tmp/x, template: {a: 1}}
+frontend: {write_file: /tmp/x, template: {a: 1}}
 `,
 			wantErr: "frontend.kind is required",
 		},
@@ -407,7 +402,7 @@ frontend: {app: x, write_file: /tmp/x, template: {a: 1}}
 			yaml: `
 name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
-frontend: {kind: external, app: opencode, template: {a: 1}}
+frontend: {kind: external, template: {a: 1}}
 `,
 			wantErr: "write_file is required",
 		},
@@ -416,7 +411,7 @@ frontend: {kind: external, app: opencode, template: {a: 1}}
 			yaml: `
 name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
-frontend: {kind: external, app: opencode, write_file: /tmp/x}
+frontend: {kind: external, write_file: /tmp/x}
 `,
 			wantErr: "template is required",
 		},
@@ -425,7 +420,7 @@ frontend: {kind: external, app: opencode, write_file: /tmp/x}
 			yaml: `
 name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
-frontend: {kind: managed, app: x}
+frontend: {kind: managed}
 `,
 			wantErr: "binary is required",
 		},
@@ -434,7 +429,7 @@ frontend: {kind: managed, app: x}
 			yaml: `
 name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
-frontend: {kind: managed, app: x, binary: /nonexistent/run-server.sh}
+frontend: {kind: managed, binary: /nonexistent/run-server.sh}
 `,
 			wantErr: "frontend.binary",
 		},
@@ -443,7 +438,7 @@ frontend: {kind: managed, app: x, binary: /nonexistent/run-server.sh}
 			yaml: `
 name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
-frontend: {kind: managed, app: x, binary: ` + stubManagedBinaryNotExec(t) + `}
+frontend: {kind: managed, binary: ` + stubManagedBinaryNotExec(t) + `}
 `,
 			wantErr: "not executable",
 		},
@@ -454,7 +449,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: managed
-  app: x
   binary: ` + stubManagedBinary(t) + `
   template: {a: 1}
 `,
@@ -467,7 +461,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: managed
-  app: x
   binary: ` + stubManagedBinary(t) + `
   mcps: [datadog]
 `,
@@ -480,7 +473,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: managed
-  app: x
   binary: ` + stubManagedBinary(t) + `
   compose_file: /tmp/dc.yaml
 `,
@@ -493,7 +485,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: managed
-  app: x
   binary: ` + stubManagedBinary(t) + `
   project_name: vibe-x
 `,
@@ -506,7 +497,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: managed
-  app: x
   binary: ` + stubManagedBinary(t) + `
   services: [web]
 `,
@@ -519,7 +509,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: managed
-  app: x
   binary: ` + stubManagedBinary(t) + `
   wait_for:
     - timeout: 5s
@@ -533,7 +522,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: external
-  app: opencode
   write_file: /tmp/x
   template: {a: 1}
   binary: /usr/local/bin/foo
@@ -547,7 +535,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: external
-  app: opencode
   write_file: /tmp/x
   template: {a: 1}
   args: [--foo]
@@ -561,7 +548,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: external
-  app: opencode
   write_file: /tmp/x
   template: {a: 1}
   workdir: /tmp
@@ -575,7 +561,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: docker-compose
-  app: x
   compose_file: /tmp/dc.yaml
   binary: /usr/local/bin/foo
 `,
@@ -588,7 +573,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: docker-compose
-  app: x
   compose_file: /tmp/dc.yaml
   args: [--foo]
 `,
@@ -601,7 +585,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: docker-compose
-  app: x
   compose_file: /tmp/dc.yaml
   workdir: /tmp
 `,
@@ -612,7 +595,7 @@ frontend:
 			yaml: `
 name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
-frontend: {kind: docker-compose, app: x}
+frontend: {kind: docker-compose}
 `,
 			wantErr: "compose_file is required",
 		},
@@ -623,7 +606,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: docker-compose
-  app: x
   compose_file: /tmp/dc.yaml
   write_file: /tmp/x.json
 `,
@@ -636,7 +618,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: docker-compose
-  app: x
   compose_file: /tmp/dc.yaml
   template: {a: 1}
 `,
@@ -649,7 +630,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: docker-compose
-  app: x
   compose_file: /tmp/dc.yaml
   mcps: [datadog]
 `,
@@ -662,7 +642,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: docker-compose
-  app: x
   compose_file: /tmp/dc.yaml
   services: [a, b, a]
 `,
@@ -675,7 +654,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: docker-compose
-  app: x
   compose_file: /tmp/dc.yaml
   wait_for:
     - timeout: 5s
@@ -689,7 +667,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: docker-compose
-  app: x
   compose_file: /tmp/dc.yaml
   wait_for:
     - {url: "http://x/", timeout: nope}
@@ -703,7 +680,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: external
-  app: opencode
   write_file: /tmp/x
   template: {a: 1}
   compose_file: /tmp/dc.yaml
@@ -717,7 +693,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: external
-  app: opencode
   write_file: /tmp/x
   template: {a: 1}
   mcps: [datadog, jira, datadog]
@@ -750,7 +725,6 @@ backend:
     context: 1024
 frontend:
   kind: docker-compose
-  app: perplexica
   compose_file: /tmp/dc.yaml
   project_name: vibe-perplexica
   services: [searxng, perplexica]
@@ -808,7 +782,6 @@ backend:
     binary: ` + bin + `
 frontend:
   kind: external
-  app: opencode
   write_file: /tmp/oc.json
   template: {a: 1}
 `
@@ -833,7 +806,6 @@ backend:
     binary: /definitely/does/not/exist
 frontend:
   kind: external
-  app: opencode
   write_file: /tmp/oc.json
   template: {a: 1}
 `
@@ -859,7 +831,6 @@ backend:
     binary: ` + notExec + `
 frontend:
   kind: external
-  app: opencode
   write_file: /tmp/oc.json
   template: {a: 1}
 `
@@ -950,7 +921,6 @@ backend:
     context: 1024
 frontend:
   kind: managed
-  app: open-webui
   binary: ` + bin + `
   args:
     - "--listen"
@@ -1015,7 +985,6 @@ backend:
     context: 1024
 frontend:
   kind: managed
-  app: opencode
   binary: ` + bin + `
   write_file: /tmp/opencode.json
   template:
@@ -1045,7 +1014,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: my-model, context: 8192}}
 frontend:
   kind: external
-  app: opencode
   write_file: /tmp/x
   template:
     provider:
@@ -1096,7 +1064,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend:
   kind: external
-  app: opencode
   write_file: /tmp/x
   template:
     weird: ${NONEXISTENT}
@@ -1121,7 +1088,6 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: m, context: 1024}}
 frontend:
   kind: external
-  app: opencode
   write_file: /tmp/x
   template:
     model_id: "vibe-local/${MODEL_ALIAS}"
@@ -1159,7 +1125,6 @@ backend:
     context: 8192
 frontend:
   kind: external
-  app: opencode
   write_file: /tmp/x.json
   template: {a: 1}
 `
@@ -1182,7 +1147,7 @@ backend:
     mmproj: /nonexistent/mmproj.gguf
     alias: g
     context: 1024
-frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 `
 	_, err := Load(writeProfile(t, yaml))
 	if err == nil {
@@ -1210,7 +1175,7 @@ backend:
       mmproj_file: mmproj-model-f16.gguf
     alias: g
     context: 1024
-frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 `
 	// Note: path validation is also skipped here because Huggingface is set.
 	// We just need both to load cleanly.
@@ -1232,7 +1197,7 @@ backend:
       mmproj_file: mmproj.gguf
     alias: g
     context: 1024
-frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 `
 	_, err := Load(writeProfile(t, yaml))
 	if err == nil {
@@ -1268,7 +1233,7 @@ backend:
     mmproj: ~/` + mmprojRel + `
     alias: g
     context: 1024
-frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 `
 	p, err := Load(writeProfile(t, yaml))
 	if err != nil {
@@ -1276,5 +1241,39 @@ frontend: {kind: external, app: opencode, write_file: /tmp/x, template: {a: 1}}
 	}
 	if p.Backend.LlamaServer.MMProj != mmprojPath {
 		t.Errorf("mmproj = %q, want %q", p.Backend.LlamaServer.MMProj, mmprojPath)
+	}
+}
+
+// TestLoad_LegacyAppFieldIgnored verifies that a profile YAML carrying the
+// deprecated `frontend.app:` field (purely cosmetic, removed from the
+// schema) still loads cleanly. We accept it via the inline-map catch-all
+// on Frontend and strip it in Load, so the field is invisible to every
+// downstream consumer but on-disk YAMLs written before the field was
+// dropped continue to parse without manual migration.
+func TestLoad_LegacyAppFieldIgnored(t *testing.T) {
+	model := stubModelFile(t)
+	yaml := `
+name: legacy
+backend:
+  llama_server:
+    path: ` + model + `
+    alias: x
+    context: 1024
+frontend:
+  kind: external
+  app: opencode
+  write_file: /tmp/x
+  template:
+    a: 1
+`
+	p, err := Load(writeProfile(t, yaml))
+	if err != nil {
+		t.Fatalf("Load with legacy app: %v", err)
+	}
+	if p.Frontend.Legacy != nil {
+		t.Errorf("Legacy map should be cleared after load; got %+v", p.Frontend.Legacy)
+	}
+	if p.Frontend.Kind != FrontendExternal {
+		t.Errorf("Kind = %q, want %q", p.Frontend.Kind, FrontendExternal)
 	}
 }

@@ -46,12 +46,14 @@ func startCmd() *cobra.Command {
 			if r.Frontend != nil {
 				// external = config rendered, user launches the binary;
 				// managed / docker-compose = vibe also launched the binary.
-				// The label + trailing note differ accordingly.
+				// The label + trailing note differ accordingly. The profile
+				// name doubles as the human-readable frontend label here —
+				// the historical `frontend.app` cosmetic field was dropped.
 				external := r.Frontend.Kind == "external"
 				if external {
-					fmt.Printf("  frontend: %s (external — launch yourself)\n", r.Frontend.App)
+					fmt.Printf("  frontend: %s (external — launch yourself)\n", r.Status.Profile)
 				} else {
-					fmt.Printf("  frontend: %s (running)\n", r.Frontend.App)
+					fmt.Printf("  frontend: %s (running)\n", r.Status.Profile)
 				}
 				if r.Frontend.Url != "" && !external {
 					fmt.Printf("  browser: %s\n", r.Frontend.Url)
@@ -70,7 +72,7 @@ func startCmd() *cobra.Command {
 					}
 				}
 				if external && r.Frontend.RestartRequired {
-					fmt.Printf("  note: %s does not hot-reload — start (or relaunch) it with the env above\n", r.Frontend.App)
+					fmt.Printf("  note: %s does not hot-reload — start (or relaunch) it with the env above\n", r.Status.Profile)
 				}
 			}
 			return nil

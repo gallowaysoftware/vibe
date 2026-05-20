@@ -204,6 +204,8 @@ func (s *dryRunState) formatStageHeader(st *Stage, stageType StageType, idx, tot
 			fmt.Fprintf(&b, ", timeout %s", st.Timeout)
 		}
 		b.WriteString(")")
+	case StageTypeRender:
+		b.WriteString(" (template render, no LLM)")
 	default:
 		return b.String(), fmt.Errorf("stage %s: unknown stage type %q", st.ID, stageType)
 	}
@@ -457,6 +459,13 @@ func (s *dryRunState) dryRunRenderPerType(st *Stage, stageType StageType, prior 
 		s.executor.dryRunLogf("%s  description (%d chars):", indent, len(description))
 		s.dryRunWriteIndented(indent+"    ", description)
 		s.executor.dryRunLogf("%s  privacy:     %s", indent, privacy)
+	case StageTypeRender:
+		rendered, err := renderPrompt(st, s.executor.PipelineDir, s.executor.Inputs, prior, s.executor.RunDir, extra)
+		if err != nil {
+			return fmt.Errorf("stage %s: render template: %w", st.ID, err)
+		}
+		s.executor.dryRunLogf("%stemplate output (%d chars):", indent, len(rendered))
+		s.dryRunWriteIndented(indent+"  ", rendered)
 	}
 	return nil
 }

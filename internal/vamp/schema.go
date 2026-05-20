@@ -274,9 +274,13 @@ func Schema() *schemaProperty {
 					Type: "string",
 				},
 			},
+			"retry_on_transient": {
+				Type:        "boolean",
+				Description: "When true (the default) HTTP 429 (rate-limited) and HTTP 5xx responses trigger the transient-error retry path with exponential backoff. Replaces retry_on_5xx; mutually exclusive with that deprecated alias.",
+			},
 			"retry_on_5xx": {
 				Type:        "boolean",
-				Description: "When true (the default) a 5xx response triggers the transient-error retry path.",
+				Description: "Deprecated alias for retry_on_transient. When true (the default) a 5xx response triggers the transient-error retry path. New pipelines should use retry_on_transient — it covers HTTP 429 too.",
 			},
 			"assert": {
 				Type:                 "object",
@@ -318,6 +322,11 @@ func Schema() *schemaProperty {
 				Description: "Approval prompt rendered to the operator (confirm stages).",
 			},
 			"timeout": durationSchema,
+			"cleanup": {
+				Type:        "array",
+				Description: "Glob patterns (relative to the run dir) removed from disk after the stage's success path completes. Best-effort: cleanup failures log a warning and never fail the stage. Patterns must NOT escape the run dir (no absolute paths, no \"..\" segments). Only valid on stage types that produce a stable on-disk output (text/comfyui/audio/ffmpeg).",
+				Items:       &schemaProperty{Type: "string"},
+			},
 		},
 	}
 

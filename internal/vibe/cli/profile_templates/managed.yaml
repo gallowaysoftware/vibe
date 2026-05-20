@@ -26,8 +26,6 @@ backend:
 
 frontend:
   kind: managed
-  # REPLACE: human-readable name of the frontend app (open-webui, ...).
-  app: REPLACE-app-name
 
   # REPLACE: shape of the managed-frontend block is provisional. When the
   # `managed` kind lands, expect fields for the binary path, working dir,

@@ -91,7 +91,7 @@ func runCmd() *cobra.Command {
 			if r.Frontend != nil && r.Frontend.WroteFile != "" {
 				fmt.Printf("  wrote:   %s\n", r.Frontend.WroteFile)
 			}
-			fmt.Printf("launching %s — Ctrl+D / quit the frontend to stop the profile\n", p.Frontend.App)
+			fmt.Printf("launching %s — Ctrl+D / quit the frontend to stop the profile\n", p.Name)
 
 			child := exec.Command(p.Frontend.Binary, p.Frontend.Args...)
 			child.Stdin = os.Stdin

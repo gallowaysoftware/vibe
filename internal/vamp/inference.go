@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -31,14 +34,34 @@ type StreamFunc func(delta string)
 // SSE streaming: each content delta is passed to onToken, and the accumulated
 // content is returned at the end so callers can persist it.
 func (c *ChatCompletion) Call(ctx context.Context, baseURL, model, prompt string, params map[string]any, onToken StreamFunc) (string, error) {
+	return c.CallMultimodal(ctx, baseURL, model, prompt, nil, params, onToken)
+}
+
+// CallMultimodal is like Call but accepts image files that are base64-encoded
+// and attached as multimodal content alongside the text prompt. The messages
+// body uses the OpenAI-compatible content-as-array format with image_url
+// entries. imagePaths is a list of absolute paths to image files (.png, .jpg,
+// etc.) to include.
+func (c *ChatCompletion) CallMultimodal(ctx context.Context, baseURL, model, prompt string, imagePaths []string, params map[string]any, onToken StreamFunc) (string, error) {
 	if c.HTTPClient == nil {
 		c.HTTPClient = http.DefaultClient
 	}
 	stream := onToken != nil
+
+	// Build content: plain string for text-only, array for multimodal.
+	var content any
+	if len(imagePaths) == 0 {
+		content = prompt
+	} else {
+		content = buildMultimodalContent(prompt, imagePaths)
+	}
+
 	body := map[string]any{
-		"model":    model,
-		"messages": []map[string]string{{"role": "user", "content": prompt}},
-		"stream":   stream,
+		"model": model,
+		"messages": []map[string]any{
+			{"role": "user", "content": content},
+		},
+		"stream": stream,
 	}
 	for k, v := range params {
 		body[k] = v
@@ -187,4 +210,58 @@ func ResolveModelID(ctx context.Context, hc *http.Client, baseURL string) (strin
 		return "vibe", nil
 	}
 	return r.Data[0].ID, nil
+}
+
+// buildMultimodalContent builds the OpenAI-compatible content array for a
+// multimodal request. Returns [{type: "text", text: ...}, {type: "image_url",
+// image_url: {url: "data:image/...;base64,..."}}] for each image. Only common
+// image extensions are accepted; non-image files are silently skipped.
+func buildMultimodalContent(text string, imagePaths []string) []map[string]any {
+	var content []map[string]any
+	content = append(content, map[string]any{"type": "text", "text": text})
+
+	allowed := map[string]bool{
+		".png":  true,
+		".jpg":  true,
+		".jpeg": true,
+		".gif":  true,
+		".webp": true,
+		".bmp":  true,
+	}
+	for _, p := range imagePaths {
+		ext := strings.ToLower(filepath.Ext(p))
+		if !allowed[ext] {
+			continue
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		mime := mimeTypeForExt(ext)
+		content = append(content, map[string]any{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": fmt.Sprintf("data:%s;base64,%s", mime, base64.StdEncoding.EncodeToString(data))},
+		})
+	}
+	return content
+}
+
+// mimeTypeForExt returns a MIME type for common image extensions. Defaults to
+// "application/octet-stream" for unknown extensions (shouldn't happen given
+// the allowed set above, but defensive).
+func mimeTypeForExt(ext string) string {
+	switch ext {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".bmp":
+		return "image/bmp"
+	default:
+		return "application/octet-stream"
+	}
 }

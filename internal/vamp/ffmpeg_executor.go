@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -61,8 +62,8 @@ func (f *ffmpegExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 	if st == nil {
 		return nil, errors.New("ffmpeg: missing stage")
 	}
-	if len(st.FFmpegArgs) == 0 {
-		return nil, fmt.Errorf("stage %s: ffmpeg_args is required for type: ffmpeg", st.ID)
+	if !st.ConcatWavs && len(st.FFmpegArgs) == 0 {
+		return nil, fmt.Errorf("stage %s: ffmpeg_args is required for type: ffmpeg (unless concat_wavs is true)", st.ID)
 	}
 
 	// Foreach binding goes into argv-template rendering and the output-path
@@ -70,6 +71,11 @@ func (f *ffmpegExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 	var extra map[string]any
 	if st.Foreach != nil {
 		extra = map[string]any{st.Foreach.Var: in.Item, "i": in.ItemIdx}
+	}
+
+	// concat_wavs mode: auto-glob all WAVs in run dir and concatenate them.
+	if st.ConcatWavs {
+		return f.executeConcatWavs(ctx, in, st, extra)
 	}
 
 	// Render each argv entry independently. We name each template with its
@@ -126,6 +132,72 @@ func (f *ffmpegExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 	}
 	if err := runner.Run(ctx, binary, args, in.Log); err != nil {
 		return nil, fmt.Errorf("stage %s: ffmpeg: %w", st.ID, err)
+	}
+	return &StageOutput{Files: []string{outAbs}}, nil
+}
+
+// executeConcatWavs globs all "*.wav" files in the run dir, sorts them
+// numerically (segment_0.wav, segment_1.wav, ...), creates a concat file
+// list, and runs ffmpeg to merge them into the output MP3.
+func (f *ffmpegExecutor) executeConcatWavs(ctx context.Context, in StageInput, st *Stage, extra map[string]any) (*StageOutput, error) {
+	wavs, err := filepath.Glob(filepath.Join(in.RunDir, "*.wav"))
+	if err != nil {
+		return nil, fmt.Errorf("stage %s: glob *.wav: %w", st.ID, err)
+	}
+	if len(wavs) == 0 {
+		return nil, fmt.Errorf("stage %s: no .wav files found in run dir", st.ID)
+	}
+	// Sort numerically: segment_0.wav before segment_10.wav.
+	sort.Slice(wavs, func(i, j int) bool {
+		return wavs[i] < wavs[j]
+	})
+
+	// Render the output path.
+	outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
+	if err != nil {
+		return nil, fmt.Errorf("stage %s: render output path: %w", st.ID, err)
+	}
+	outAbs := filepath.Join(in.RunDir, outRel)
+	if err := os.MkdirAll(filepath.Dir(outAbs), 0o755); err != nil {
+		return nil, fmt.Errorf("stage %s: create output dir: %w", st.ID, err)
+	}
+
+	// Create concat file list.
+	listPath := filepath.Join(in.RunDir, ".ffmpeg-concat.txt")
+	listContent := strings.Builder{}
+	for _, w := range wavs {
+		fmt.Fprintf(&listContent, "file '%s'\n", w)
+	}
+	if err := os.WriteFile(listPath, []byte(listContent.String()), 0o644); err != nil {
+		return nil, fmt.Errorf("stage %s: write concat list: %w", st.ID, err)
+	}
+
+	binary := st.Binary
+	if binary == "" {
+		binary = f.defaultBinary
+	}
+	if binary == "" {
+		binary = "ffmpeg"
+	}
+
+	args := []string{
+		"-f", "concat",
+		"-safe", "0",
+		"-i", listPath,
+		"-c:a", "libmp3lame",
+		"-b:a", "128k",
+		"-y", outAbs,
+	}
+
+	runner := f.runner
+	if runner == nil {
+		runner = ffmpegCommandRunner{}
+	}
+	if in.Log != nil {
+		fmt.Fprintf(in.Log, "ffmpeg concat: %s (%d wav(s))\n", outRel, len(wavs))
+	}
+	if err := runner.Run(ctx, binary, args, in.Log); err != nil {
+		return nil, fmt.Errorf("stage %s: ffmpeg concat: %w", st.ID, err)
 	}
 	return &StageOutput{Files: []string{outAbs}}, nil
 }

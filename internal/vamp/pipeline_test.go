@@ -505,6 +505,83 @@ stages:
 	}
 }
 
+// TestLoadPipeline_WebhookRetryOnTransientDefault verifies that omitting
+// retry_on_transient (the modern field, default true) AND retry: causes the
+// validator to synthesise a transient-error retry policy so 429 + 5xx are
+// retried out of the box. Mirrors the deprecated retry_on_5xx default test
+// but exercises the rename.
+func TestLoadPipeline_WebhookRetryOnTransientDefault(t *testing.T) {
+	yaml := `
+name: hk
+stages:
+  - id: notify
+    type: webhook
+    url: "https://example.com/hooks/abc"
+    body:
+      text: "x"
+    output: resp.txt
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Stages[0].Retry == nil {
+		t.Fatal("expected synthesised Retry policy under default retry_on_transient")
+	}
+	if p.Stages[0].Retry.MaxAttempts < 2 {
+		t.Errorf("MaxAttempts = %d, want > 1", p.Stages[0].Retry.MaxAttempts)
+	}
+}
+
+// TestLoadPipeline_WebhookRetryOnTransientFalseSkipsSynth verifies the
+// modern opt-out: retry_on_transient: false leaves Retry nil.
+func TestLoadPipeline_WebhookRetryOnTransientFalseSkipsSynth(t *testing.T) {
+	yaml := `
+name: hk
+stages:
+  - id: notify
+    type: webhook
+    url: "https://example.com/hooks/abc"
+    body:
+      text: "x"
+    output: resp.txt
+    retry_on_transient: false
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Stages[0].Retry != nil {
+		t.Errorf("expected Retry == nil when retry_on_transient is false, got %+v", p.Stages[0].Retry)
+	}
+}
+
+// TestLoadPipeline_WebhookRetryOnTransientAnd5xxMutuallyExclusive verifies
+// that setting both the new and deprecated field at the same time is
+// rejected at validate time. Silent "one wins" would surprise users mid-
+// migration.
+func TestLoadPipeline_WebhookRetryOnTransientAnd5xxMutuallyExclusive(t *testing.T) {
+	yaml := `
+name: hk
+stages:
+  - id: notify
+    type: webhook
+    url: "https://example.com/hooks/abc"
+    body:
+      text: "x"
+    output: resp.txt
+    retry_on_transient: true
+    retry_on_5xx: false
+`
+	_, err := LoadPipeline(writePipeline(t, yaml))
+	if err == nil {
+		t.Fatal("expected validation error for both retry_on_transient and retry_on_5xx")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error should mention mutual exclusion, got: %v", err)
+	}
+}
+
 // TestLoadPipeline_WebhookRetryOn5xxFalseSkipsSynth verifies that
 // explicitly disabling retry_on_5xx leaves Retry nil (the user opted out).
 func TestLoadPipeline_WebhookRetryOn5xxFalseSkipsSynth(t *testing.T) {
@@ -1092,15 +1169,15 @@ stages:
 			wantErr: "text is required",
 		},
 		{
-			name: "audio output not .wav",
+			name: "audio output not an audio extension",
 			yaml: `name: x
 stages:
 - id: a
   type: audio
   voice: en_US-lessac-medium
   text: "hi"
-  output: a.mp3`,
-			wantErr: "must end in .wav",
+  output: a.json`,
+			wantErr: "supported audio extension",
 		},
 		{
 			name: "audio with prompt (text-only field)",
@@ -1820,5 +1897,225 @@ stages:
 				t.Errorf("err = %v, want one containing %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestLoadPipeline_ParamsKnownKeysAccepted verifies that the canonical
+// chat-completion params we recognise all parse through validation. A
+// regression in knownTextParamKeys would surface here as the first key
+// removed from the allowlist.
+func TestLoadPipeline_ParamsKnownKeysAccepted(t *testing.T) {
+	yaml := `
+name: p
+stages:
+  - id: a
+    capability: r
+    prompt: hi
+    output: a.md
+    params:
+      temperature: 0.7
+      top_p: 0.9
+      top_k: 40
+      min_p: 0.05
+      max_tokens: 1024
+      presence_penalty: 0.1
+      frequency_penalty: 0.0
+      repetition_penalty: 1.1
+      seed: 42
+      stop: ["\n\n"]
+      stream: false
+      n: 1
+`
+	if _, err := LoadPipeline(writePipeline(t, yaml)); err != nil {
+		t.Fatalf("expected canonical params to validate, got: %v", err)
+	}
+}
+
+// TestLoadPipeline_ParamsUnknownKeyRejected catches the common
+// `temperture: 0.7` typo at load time so a no-op stage doesn't silently
+// hit the wire. The error must include a "did you mean" hint pointing at
+// the closest canonical key.
+func TestLoadPipeline_ParamsUnknownKeyRejected(t *testing.T) {
+	yaml := `
+name: p
+stages:
+  - id: a
+    capability: r
+    prompt: hi
+    output: a.md
+    params:
+      temperture: 0.7
+`
+	_, err := LoadPipeline(writePipeline(t, yaml))
+	if err == nil {
+		t.Fatal("expected validation error for unknown params key")
+	}
+	if !strings.Contains(err.Error(), `"temperture"`) {
+		t.Errorf("err = %v, want one mentioning the typo key", err)
+	}
+	if !strings.Contains(err.Error(), "did you mean") {
+		t.Errorf("err = %v, want a \"did you mean\" hint", err)
+	}
+	if !strings.Contains(err.Error(), "temperature") {
+		t.Errorf("err = %v, want suggestion 'temperature'", err)
+	}
+}
+
+// TestLoadPipeline_ParamsUnknownKeyNoSuggestion verifies the "no close
+// match" branch of the hint: a key with no near neighbour produces a
+// rejection without an inappropriate "did you mean: <wildly wrong>".
+func TestLoadPipeline_ParamsUnknownKeyNoSuggestion(t *testing.T) {
+	yaml := `
+name: p
+stages:
+  - id: a
+    capability: r
+    prompt: hi
+    output: a.md
+    params:
+      xyzzy_nope_param: 1
+`
+	_, err := LoadPipeline(writePipeline(t, yaml))
+	if err == nil {
+		t.Fatal("expected validation error for unknown params key")
+	}
+	if !strings.Contains(err.Error(), "xyzzy_nope_param") {
+		t.Errorf("err = %v, want one mentioning the unknown key", err)
+	}
+	if strings.Contains(err.Error(), "did you mean") {
+		t.Errorf("err = %v, should not include a misleading hint for a far-out key", err)
+	}
+}
+
+// TestLoadPipeline_AudioOutputExtensions verifies the audio stage's output
+// extension allowlist accepts every codec we promise and rejects the
+// obvious non-audio shapes.
+func TestLoadPipeline_AudioOutputExtensions(t *testing.T) {
+	cases := []struct {
+		ext    string
+		wantOK bool
+	}{
+		{".wav", true},
+		{".mp3", true},
+		{".opus", true},
+		{".flac", true},
+		{".ogg", true},
+		{".WAV", true}, // case-insensitive suffix
+		{".json", false},
+		{".png", false},
+		{".txt", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.ext, func(t *testing.T) {
+			yaml := `name: x
+stages:
+- id: a
+  type: audio
+  voice: en_US-lessac-medium
+  text: "hi"
+  output: a` + tc.ext
+			_, err := LoadPipeline(writePipeline(t, yaml))
+			if tc.wantOK && err != nil {
+				t.Errorf("expected %q to validate, got: %v", tc.ext, err)
+			}
+			if !tc.wantOK && err == nil {
+				t.Errorf("expected %q to be rejected, got nil error", tc.ext)
+			}
+		})
+	}
+}
+
+// TestLoadPipeline_CleanupAccepted parses a stage with a valid cleanup
+// list and verifies the patterns land verbatim on the parsed Stage.
+func TestLoadPipeline_CleanupAccepted(t *testing.T) {
+	yaml := `
+name: p
+stages:
+  - id: a
+    capability: r
+    prompt: hi
+    output: a.md
+    cleanup:
+      - "scratch/*.tmp"
+      - "intermediate/foo.bin"
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatalf("expected valid cleanup to parse, got: %v", err)
+	}
+	got := p.Stages[0].Cleanup
+	want := []string{"scratch/*.tmp", "intermediate/foo.bin"}
+	if len(got) != len(want) {
+		t.Fatalf("Cleanup = %v, want %v", got, want)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("Cleanup[%d] = %q, want %q", i, got[i], w)
+		}
+	}
+}
+
+// TestLoadPipeline_CleanupRejectsBadPatterns asserts every path-escape and
+// "wipe the run dir" shape is rejected at load time. These error messages
+// are what surface from `vamp validate` when a user typos a cleanup glob.
+func TestLoadPipeline_CleanupRejectsBadPatterns(t *testing.T) {
+	cases := []struct {
+		name    string
+		pattern string
+		want    string
+	}{
+		{"parent traversal", "../etc/passwd", "escapes the run dir"},
+		{"absolute path", "/etc/passwd", "absolute paths are rejected"},
+		{"dot only", ".", "run dir itself"},
+		{"empty", "", "must not be empty"},
+		{"deep parent traversal", "foo/../../bar", "escapes the run dir"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			yaml := `
+name: p
+stages:
+  - id: a
+    capability: r
+    prompt: hi
+    output: a.md
+    cleanup:
+      - "` + tc.pattern + `"
+`
+			_, err := LoadPipeline(writePipeline(t, yaml))
+			if err == nil {
+				t.Fatalf("expected error for pattern %q", tc.pattern)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want one containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadPipeline_CleanupRejectsOnWebhookStage rejects the cleanup field
+// on stage types that don't produce a stable on-disk output. The user
+// would be confused by a silently-ignored field; failing fast at validate
+// time is the friendlier shape.
+func TestLoadPipeline_CleanupRejectsOnWebhookStage(t *testing.T) {
+	yaml := `
+name: p
+stages:
+  - id: a
+    type: webhook
+    url: https://example.invalid/hook
+    body:
+      text: hi
+    output: a.txt
+    cleanup:
+      - "scratch/*.tmp"
+`
+	_, err := LoadPipeline(writePipeline(t, yaml))
+	if err == nil {
+		t.Fatal("expected error for cleanup on webhook stage")
+	}
+	if !strings.Contains(err.Error(), "cleanup is only valid") {
+		t.Errorf("err = %v, want \"cleanup is only valid\" rejection", err)
 	}
 }

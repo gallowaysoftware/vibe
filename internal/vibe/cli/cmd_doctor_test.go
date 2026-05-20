@@ -298,7 +298,6 @@ backend:
     context: 4096
 frontend:
   kind: external
-  app: opencode
   write_file: /tmp/opencode.json
   template:
     foo: bar
@@ -431,6 +430,143 @@ func TestStatusTag(t *testing.T) {
 		if got := c.s.tag(); got != c.want {
 			t.Fatalf("tag(%d) = %q, want %q", c.s, got, c.want)
 		}
+	}
+}
+
+// ─── rsvg-convert (vision) ──────────────────────────────────────────────────
+
+// TestCheckRSVG_NoMMProjProfiles asserts the check returns ok=false when
+// no installed profile declares an mmproj path; we don't want a warning
+// for users who only run text-only profiles.
+func TestCheckRSVG_NoMMProjProfiles(t *testing.T) {
+	dir := t.TempDir()
+	// Text-only profile (no mmproj).
+	model := filepath.Join(dir, "model.gguf")
+	if err := os.WriteFile(model, []byte("stub"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	textProfile := fmt.Sprintf(`name: textonly
+backend:
+  llama_server:
+    path: %s
+    alias: t
+    context: 1024
+frontend:
+  kind: external
+  write_file: /tmp/x
+  template:
+    a: 1
+`, model)
+	if err := os.WriteFile(filepath.Join(dir, "text.yaml"), []byte(textProfile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env := &doctorEnv{lookPath: func(string) (string, error) { return "", errors.New("absent") }}
+	_, ok := checkRSVGForVision(env, dir)
+	if ok {
+		t.Fatal("expected ok=false when no mmproj profile installed")
+	}
+}
+
+// TestCheckRSVG_MissingWithMMProj asserts WARN when an mmproj profile
+// exists but rsvg-convert is unavailable. This is the case the user
+// explicitly requested coverage for.
+func TestCheckRSVG_MissingWithMMProj(t *testing.T) {
+	dir := t.TempDir()
+	model := filepath.Join(dir, "model.gguf")
+	mmproj := filepath.Join(dir, "mmproj.gguf")
+	for _, p := range []string{model, mmproj} {
+		if err := os.WriteFile(p, []byte("stub"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	visionProfile := fmt.Sprintf(`name: visionprof
+backend:
+  llama_server:
+    path: %s
+    mmproj: %s
+    alias: v
+    context: 1024
+frontend:
+  kind: external
+  write_file: /tmp/x
+  template:
+    a: 1
+`, model, mmproj)
+	if err := os.WriteFile(filepath.Join(dir, "vision.yaml"), []byte(visionProfile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env := &doctorEnv{lookPath: func(name string) (string, error) {
+		if name == "rsvg-convert" {
+			return "", errors.New("not found")
+		}
+		t.Fatalf("unexpected lookup of %q", name)
+		return "", nil
+	}}
+	r, ok := checkRSVGForVision(env, dir)
+	if !ok {
+		t.Fatal("expected ok=true when mmproj profile present")
+	}
+	if r.Status != statusWarn {
+		t.Fatalf("status = %v, want WARN", r.Status)
+	}
+	if !strings.Contains(r.Message, "visionprof") {
+		t.Errorf("message missing profile name: %q", r.Message)
+	}
+	if !strings.Contains(r.Message, "librsvg2-bin") {
+		t.Errorf("message missing install hint: %q", r.Message)
+	}
+}
+
+// TestCheckRSVG_PresentWithMMProj asserts OK when both rsvg-convert and
+// an mmproj profile are present. Keeps the success path covered so a
+// regression to "always warn" would fail.
+func TestCheckRSVG_PresentWithMMProj(t *testing.T) {
+	dir := t.TempDir()
+	model := filepath.Join(dir, "model.gguf")
+	mmproj := filepath.Join(dir, "mmproj.gguf")
+	for _, p := range []string{model, mmproj} {
+		if err := os.WriteFile(p, []byte("stub"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	visionProfile := fmt.Sprintf(`name: visionprof
+backend:
+  llama_server:
+    path: %s
+    mmproj: %s
+    alias: v
+    context: 1024
+frontend:
+  kind: external
+  write_file: /tmp/x
+  template:
+    a: 1
+`, model, mmproj)
+	if err := os.WriteFile(filepath.Join(dir, "vision.yaml"), []byte(visionProfile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env := &doctorEnv{lookPath: func(name string) (string, error) {
+		if name == "rsvg-convert" {
+			return "/usr/bin/rsvg-convert", nil
+		}
+		return "", errors.New("absent")
+	}}
+	r, ok := checkRSVGForVision(env, dir)
+	if !ok {
+		t.Fatal("expected ok=true when mmproj profile present")
+	}
+	if r.Status != statusOK {
+		t.Fatalf("status = %v, want OK; msg=%q", r.Status, r.Message)
+	}
+}
+
+// TestCheckRSVG_MissingProfilesDir guards against a runtime panic when
+// $XDG_CONFIG_HOME/vibe/profiles doesn't exist yet (first-run users).
+func TestCheckRSVG_MissingProfilesDir(t *testing.T) {
+	env := &doctorEnv{lookPath: func(string) (string, error) { return "", errors.New("absent") }}
+	_, ok := checkRSVGForVision(env, filepath.Join(t.TempDir(), "nope"))
+	if ok {
+		t.Fatal("expected ok=false when profiles dir missing")
 	}
 }
 

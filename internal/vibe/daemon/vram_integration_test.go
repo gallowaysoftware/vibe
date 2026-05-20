@@ -26,7 +26,6 @@ backend:
     parallel: 1
 frontend:
   kind: external
-  app: stub
   write_file: ${VIBE_STATE_DIR}/frontend/%s/sidecar.json
   env:
     STUB_CONFIG: ${WRITE_FILE}

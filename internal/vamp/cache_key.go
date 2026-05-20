@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/gallowaysoftware/vibe/internal/vamp/cache"
@@ -34,7 +35,7 @@ func EnvCacheDisabled() bool {
 // CLI/docs all agree on the same allow-list.
 func stageCacheable(st *Stage) bool {
 	switch stageTypeOrDefault(st) {
-	case StageTypeText, StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg:
+	case StageTypeText, StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg, StageTypeRender:
 		return true
 	default:
 		return false
@@ -83,6 +84,7 @@ type keyInput struct {
 	ModelID        string            // text only
 	Params         map[string]any    // text only
 	OutputFormat   string            // text only
+	ImageHashes    []string          // text/vision only — sha of each image attached via image_dir, sorted by source path
 	Workflow       map[string]any    // comfyui only — the pre-applied workflow JSON
 	WorkflowParams map[string]string // comfyui only — rendered parameter values
 	Voice          string            // audio only
@@ -103,12 +105,17 @@ func stageCacheKey(in keyInput) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("text cache key: marshal params: %w", err)
 		}
+		imagesJSON, err := cache.CanonicalJSON(stringSliceToAny(in.ImageHashes))
+		if err != nil {
+			return "", fmt.Errorf("text cache key: marshal image hashes: %w", err)
+		}
 		return cache.HashStrings("text",
 			in.Capability,
 			in.RenderedPrompt,
 			in.ModelID,
 			string(paramsJSON),
 			in.OutputFormat,
+			string(imagesJSON),
 		), nil
 	case StageTypeComfyUI:
 		// The workflow we hash here is the post-substitution form: each
@@ -181,6 +188,8 @@ func stageCacheKey(in keyInput) (string, error) {
 			string(argsJSON),
 			string(inputsJSON),
 		), nil
+	case StageTypeRender:
+		return cache.HashStrings("render", in.RenderedPrompt), nil
 	default:
 		// Non-cacheable types should never reach here — stageCacheable
 		// gates that upstream. Return an empty key as a defensive no-op so
@@ -253,6 +262,14 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 		if err != nil {
 			return "", fmt.Errorf("cache key: render prompt: %w", err)
 		}
+		// Image bytes attached via image_dir contribute to the model's
+		// output as much as the prompt does; fold a hash of each one into
+		// the key so edits to an SVG or PNG in a lesson dir invalidate
+		// just that lesson's cached output. Empty when ImageDir is unset.
+		imageHashes, err := e.hashStageImages(st, extra)
+		if err != nil {
+			return "", err
+		}
 		// We hash the chat-completion model id alongside the rendered prompt
 		// + params so a profile candidate-fallback (e.g. 27B → 14B due to
 		// VRAM) produces a different key and the smaller model's output
@@ -264,6 +281,7 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 			ModelID:        e.cachedKeyModelID(),
 			Params:         st.Params,
 			OutputFormat:   st.OutputFormat,
+			ImageHashes:    imageHashes,
 		})
 	case StageTypeComfyUI:
 		workflow, err := loadWorkflow(st.Workflow, e.PipelineDir)
@@ -365,9 +383,70 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 			FFmpegArgs:   args,
 			FFmpegInputs: inputs,
 		})
+	case StageTypeRender:
+		prompt, err := renderPrompt(st, e.PipelineDir, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+		if err != nil {
+			return "", fmt.Errorf("cache key: render prompt: %w", err)
+		}
+		return cache.HashStrings("render", prompt), nil
 	default:
 		return "", nil
 	}
+}
+
+// hashStageImages resolves the stage's ImageDir against the current template
+// binding (so foreach stages get per-item dirs), lists the supported image
+// files inside, and returns one sha256 per file in sorted path order. SVGs
+// hash against their source bytes (not the rasterized PNG) so the cache key
+// stays stable across rsvg-convert version bumps. Returns nil when ImageDir
+// is empty so the keyInput slice marshals to a stable empty representation.
+func (e *Executor) hashStageImages(st *Stage, extra map[string]any) ([]string, error) {
+	if st == nil || st.ImageDir == "" {
+		return nil, nil
+	}
+	resolved, err := renderTemplate(st.ID+":image_dir", st.ImageDir, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+	if err != nil {
+		return nil, fmt.Errorf("cache key: render image_dir: %w", err)
+	}
+	dir := expandTilde(resolved)
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(e.PipelineDir, dir)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		// A missing image_dir is not a cache-key error: the live executor
+		// will surface the same os.ReadDir failure with a clearer message
+		// from collectImages. Returning an empty slice here keeps the key
+		// composition deterministic and lets the failure happen once, in
+		// the executor.
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("cache key: read image_dir %s: %w", dir, err)
+	}
+	allowed := map[string]bool{
+		".png": true, ".jpg": true, ".jpeg": true, ".gif": true,
+		".webp": true, ".bmp": true, ".svg": true,
+	}
+	var paths []string
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		if allowed[strings.ToLower(filepath.Ext(ent.Name()))] {
+			paths = append(paths, filepath.Join(dir, ent.Name()))
+		}
+	}
+	sort.Strings(paths)
+	hashes := make([]string, 0, len(paths))
+	for _, p := range paths {
+		h, err := cache.HashFile(p)
+		if err != nil {
+			return nil, fmt.Errorf("cache key: hash image %s: %w", p, err)
+		}
+		hashes = append(hashes, h)
+	}
+	return hashes, nil
 }
 
 // cachedKeyModelID returns the resolved chat-completion model id for the

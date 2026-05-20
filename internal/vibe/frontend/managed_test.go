@@ -141,7 +141,6 @@ func TestManaged_Activate_BuildsArgvAndEnv(t *testing.T) {
 		Name: "openwebui",
 		Frontend: profile.Frontend{
 			Kind:   profile.FrontendManaged,
-			App:    "open-webui",
 			Binary: bin,
 			Args: []string{
 				"--listen", "127.0.0.1",
@@ -215,7 +214,6 @@ func TestManaged_Activate_NoArgsNoEnvNoWorkdir(t *testing.T) {
 		Name: "minimal",
 		Frontend: profile.Frontend{
 			Kind:   profile.FrontendManaged,
-			App:    "x",
 			Binary: bin,
 		},
 	}

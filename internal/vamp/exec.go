@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -72,6 +73,13 @@ const (
 	// "rejected" into the stage's output file. Like other subprocess-only
 	// types it does not activate a vibe profile.
 	StageTypeConfirm StageType = "confirm"
+	// StageTypeRender renders a template (prompt or prompt_file) against the
+	// current binding and writes the result directly to the output file without
+	// invoking an LLM. Useful for data transformation stages where the output
+	// is purely deterministic — e.g. enumerating lesson directories,
+	// concatenating JSON, or producing intermediate config. Does not activate
+	// a vibe profile.
+	StageTypeRender StageType = "render"
 )
 
 // StageExecutor implements the run of a single stage instance. The receiver
@@ -182,14 +190,15 @@ const defaultMaxForeachConcurrency = 4
 
 // Executor runs a Pipeline end-to-end against vibe.
 type Executor struct {
-	Pipeline     *Pipeline
-	PipelineDir  string // for resolving prompt_file relative paths
-	Capabilities *Capabilities
-	Vibe         *vibeclient.Client
-	Inputs       map[string]string
-	RunDir       string
-	Inference    InferenceFunc // defaults to a real chat-completion client
-	Log          io.Writer
+	Pipeline            *Pipeline
+	PipelineDir         string // for resolving prompt_file relative paths
+	Capabilities        *Capabilities
+	Vibe                *vibeclient.Client
+	Inputs              map[string]string
+	RunDir              string
+	Inference           InferenceFunc // defaults to a real chat-completion client
+	MultimodalInference func(ctx context.Context, baseURL, model, prompt string, images []string, params map[string]any, onToken StreamFunc) (string, error)
+	Log                 io.Writer
 
 	// PipelineSource is the raw bytes of the pipeline YAML file the caller
 	// loaded. It powers two run-dir artifacts: pipeline.yaml.snapshot
@@ -281,11 +290,6 @@ type Executor struct {
 	timing *Tracker
 }
 
-func defaultInference() InferenceFunc {
-	cc := &ChatCompletion{}
-	return cc.Call
-}
-
 // Run executes the pipeline as a DAG. Stages whose dependencies are satisfied
 // run in waves; within each wave they are grouped by capability so each group
 // shares a single profile activation, and stages in a group execute
@@ -293,7 +297,9 @@ func defaultInference() InferenceFunc {
 // .stages.<id>.output in their templates.
 func (e *Executor) Run(ctx context.Context) (runErr error) {
 	if e.Inference == nil {
-		e.Inference = defaultInference()
+		cc := &ChatCompletion{}
+		e.Inference = cc.Call
+		e.MultimodalInference = cc.CallMultimodal
 	}
 	// Capture wall-clock start before any I/O so pipeline.json reflects
 	// "when the user kicked off the run".
@@ -348,13 +354,14 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 	// Stage.Type (empty defaults to text); the executor's per-call deps travel
 	// via StageInput.
 	e.registry = map[StageType]StageExecutor{
-		StageTypeText:    &textExecutor{inference: e.Inference},
+		StageTypeText:    &visionExecutor{inference: e.Inference, multimodal: e.MultimodalInference},
 		StageTypeComfyUI: &comfyuiExecutor{pollInterval: time.Second},
 		StageTypeAudio:   &audioExecutor{},
 		StageTypeFFmpeg:  &ffmpegExecutor{},
 		StageTypeYouTube: &youtubeExecutor{},
 		StageTypeWebhook: &webhookExecutor{},
 		StageTypeConfirm: newConfirmExecutor(),
+		StageTypeRender:  &renderExecutor{},
 	}
 
 	// Stage lookup and dependency counts for wave-based scheduling.
@@ -799,7 +806,7 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 		e.logf("  -> subprocess group (%d stage(s)): no profile activation", len(group))
 		if len(group) == 1 {
 			st := group[0]
-			if err := e.executeStage(ctx, st, "", "", "", nil); err != nil {
+			if err := e.executeStage(ctx, st, "", "", "", 0, nil); err != nil {
 				return fmt.Errorf("stage %s: %w", st.ID, err)
 			}
 			return nil
@@ -814,7 +821,7 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 			go func() {
 				defer wg.Done()
 				buf := &bytes.Buffer{}
-				err := e.executeStage(groupCtx, st, "", "", "", buf)
+				err := e.executeStage(groupCtx, st, "", "", "", 0, buf)
 				e.flushStageLog(st.ID, buf.Bytes())
 				if err != nil {
 					errs[i] = fmt.Errorf("stage %s: %w", st.ID, err)
@@ -892,12 +899,24 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 	baseURL := strings.TrimSuffix(status.ProxyAddr, "/v1")
 	backendAddr := status.BackendAddr
 
+	// profileParallel is the active profile's llama_server `parallel` slot
+	// count (Status.Parallel, populated by the daemon). For text/foreach
+	// stages we cap fan-out concurrency at this value — spawning more
+	// goroutines than the backend can run in parallel just inflates the
+	// queue without actually accelerating anything, and obscures real
+	// back-pressure in logs / progress. Zero means "no cap from this
+	// source" (e.g. a ComfyUI-backed profile, or a daemon that predates
+	// the field). The cap is applied per-foreach inside executeForeachStage
+	// because non-text stage types don't have an LLM-backed parallel
+	// constraint.
+	profileParallel := int(status.GetParallel())
+
 	// Single-stage group: preserve the live-token UX by streaming directly
 	// to Log, exactly as the sequential path used to. (A foreach stage with
 	// more than one item still buffers per-item internally — see executeStage.)
 	if len(group) == 1 {
 		st := group[0]
-		if err := e.executeStage(ctx, st, baseURL, modelID, backendAddr, nil); err != nil {
+		if err := e.executeStage(ctx, st, baseURL, modelID, backendAddr, profileParallel, nil); err != nil {
 			return fmt.Errorf("stage %s: %w", st.ID, err)
 		}
 		return nil
@@ -915,7 +934,7 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 		go func() {
 			defer wg.Done()
 			buf := &bytes.Buffer{}
-			err := e.executeStage(groupCtx, st, baseURL, modelID, backendAddr, buf)
+			err := e.executeStage(groupCtx, st, baseURL, modelID, backendAddr, profileParallel, buf)
 			// Emit the buffered output as a contiguous block under a
 			// stage header so concurrent streams don't interleave.
 			e.flushStageLog(st.ID, buf.Bytes())
@@ -939,7 +958,7 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 // Resume skipping happens upstream in runGroup (so an all-resumed group can
 // skip profile activation entirely); by the time we get here, every stage in
 // the group needs a real executor call.
-func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID, backendAddr string, tokenSink io.Writer) (stageErr error) {
+func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID, backendAddr string, profileParallel int, tokenSink io.Writer) (stageErr error) {
 	// Capture per-stage wall-clock duration for pipeline.json. The defer
 	// records the StageRecord regardless of which return path we take so
 	// failure stages still show up in `vamp runs show` with status=error
@@ -970,7 +989,7 @@ func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID
 	if st.Foreach != nil {
 		recordTiming = false
 		e.timing.StageStart(st.ID, stageType)
-		err := e.executeForeachStage(ctx, st, exec, baseURL, modelID, backendAddr, tokenSink)
+		err := e.executeForeachStage(ctx, st, exec, baseURL, modelID, backendAddr, profileParallel, tokenSink)
 		status := "ok"
 		if err != nil {
 			status = "error"
@@ -999,6 +1018,7 @@ func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID
 		notes := e.stageNotes(st)
 		notes["files"] = len(out.Files)
 		e.timing.StageEnd(st.ID, "ok", notes)
+		e.runStageCleanup(st)
 		return nil
 	}
 
@@ -1017,6 +1037,7 @@ func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID
 	notes := e.stageNotes(st)
 	notes["chars_out"] = len(out.Text)
 	e.timing.StageEnd(st.ID, "ok", notes)
+	e.runStageCleanup(st)
 	return nil
 }
 
@@ -1031,7 +1052,7 @@ func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID
 // are loaded straight from disk into the outputs slice at their original
 // index so the final stageResult.Outputs stays in input-array order
 // regardless of which items ran in this invocation.
-func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec StageExecutor, baseURL, modelID, backendAddr string, tokenSink io.Writer) (stageErr error) {
+func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec StageExecutor, baseURL, modelID, backendAddr string, profileParallel int, tokenSink io.Writer) (stageErr error) {
 	// Mirror executeStage's per-stage timing: the foreach stage's
 	// "duration" is the elapsed wall-clock for the whole fan-out
 	// (resolve + render + run-all-items), which is the user-visible cost.
@@ -1155,6 +1176,21 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 	if maxConc <= 0 {
 		maxConc = defaultMaxForeachConcurrency
 	}
+	// LLM-backed cap: for text foreach stages, the llama_server profile's
+	// `parallel` slot count is the actual back-pressure point. Spawning more
+	// goroutines than parallel slots just queues them at the inference layer
+	// without speeding anything up — and inflates the apparent in-flight
+	// count in logs / progress. Cap maxConc at profileParallel when the
+	// caller supplied a value AND this is a text stage. Non-text foreach
+	// stage types (comfyui, audio, ffmpeg) don't share the llama-server
+	// parallel constraint so we leave their concurrency unchanged. We log
+	// when the cap actually narrows things — silent capping is a
+	// debuggability hole on the day someone tunes the configured concurrency
+	// and can't see why it didn't take effect.
+	if stageTypeOrDefault(st) == StageTypeText && profileParallel > 0 && profileParallel < maxConc {
+		e.logf("  -> foreach stage %q: concurrency capped to profile parallel %d (was %d)", st.ID, profileParallel, maxConc)
+		maxConc = profileParallel
+	}
 	if maxConc > len(runIndices) {
 		maxConc = len(runIndices)
 	}
@@ -1220,11 +1256,9 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 			if runErr != nil {
 				errs[i] = fmt.Errorf("item %d: %w", i, runErr)
 				e.timing.ItemEnd(st.ID, i, "error", nil)
-				// Cancel siblings so in-flight items observe ctx.Done()
-				// promptly and pending acquirers above bail out of the
-				// semaphore wait. We do NOT cancel the outer ctx — the DAG
-				// scheduler owns whether other stages keep running.
-				cancel()
+				// Don't cancel siblings — a single item failure shouldn't
+				// abort the entire batch. Downstream stages get partial
+				// output and can decide how to handle missing items.
 				return
 			}
 			// Binary-output stages (comfyui today) already wrote their file(s)
@@ -1240,7 +1274,6 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 				if err := writeFile(filepath.Join(e.RunDir, outPaths[i]), out.Text); err != nil {
 					errs[i] = fmt.Errorf("item %d: write output: %w", i, err)
 					e.timing.ItemEnd(st.ID, i, "error", nil)
-					cancel()
 					return
 				}
 				outputs[i] = out.Text
@@ -1261,6 +1294,7 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 	e.mu.Lock()
 	e.stageOutputs[st.ID] = &stageResult{Output: combined, Outputs: outputs}
 	e.mu.Unlock()
+	e.runStageCleanup(st)
 	return nil
 }
 
@@ -1356,15 +1390,36 @@ func (e *Executor) runWithRetryInner(ctx context.Context, st *Stage, exec StageE
 		if !isRetryable(err, policy) {
 			return nil, err
 		}
-		e.logf("  -> stage %q%s attempt %d failed; retrying in %s: %v", st.ID, itemTag, attempt, backoff, err)
+		// Effective sleep for THIS attempt's wait: by default the current
+		// exponential-backoff `backoff`. When the executor returned a
+		// transientHTTPError that carries a server-supplied Retry-After
+		// (e.g. a 429 with a "wait 30 seconds" header), prefer the server's
+		// hint — that's the API saying when it'll have capacity again, and
+		// retrying earlier just wastes work. We still cap at
+		// policy.MaxBackoff so a misconfigured server can't make us sleep
+		// for an hour, logging a warning when the cap kicks in so it's
+		// visible to operators tuning the policy.
+		wait := backoff
+		if th := asTransientHTTPError(err); th != nil && th.RetryAfter > 0 {
+			wait = th.RetryAfter
+			if wait > policy.MaxBackoff {
+				e.logf("  -> stage %q%s Retry-After %s exceeds max_backoff %s; capping at max_backoff", st.ID, itemTag, th.RetryAfter, policy.MaxBackoff)
+				wait = policy.MaxBackoff
+			}
+		}
+		e.logf("  -> stage %q%s attempt %d failed; retrying in %s: %v", st.ID, itemTag, attempt, wait, err)
 		select {
-		case <-time.After(backoff):
+		case <-time.After(wait):
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
-		// Grow backoff with the configured multiplier, capped at MaxBackoff.
-		// time.Duration is int64 nanoseconds; multiplying by a float is
-		// fine here because MaxBackoff is on the order of seconds.
+		// Grow exponential backoff with the configured multiplier, capped at
+		// MaxBackoff. time.Duration is int64 nanoseconds; multiplying by a
+		// float is fine here because MaxBackoff is on the order of seconds.
+		// Retry-After-driven waits do NOT advance the exponential backoff
+		// state: the server told us when it's ready, we used that, and the
+		// next attempt should still escalate from the previous exponential
+		// position if the server stops sending hints.
 		next := time.Duration(float64(backoff) * policy.Multiplier)
 		if next > policy.MaxBackoff || next <= 0 {
 			next = policy.MaxBackoff
@@ -1430,11 +1485,21 @@ func isRetryable(err error, policy *RetryPolicy) bool {
 		// Only "timeout" was requested and the error isn't a timeout.
 		return false
 	}
-	// Transient-mode classification by substring + 5xx-status regex.
+	// Typed-error fast path: a transientHTTPError IS transient by
+	// construction (the executor only emits it for 429 / 5xx, the cases we
+	// want retried). Checking the type first keeps the classifier robust
+	// against future status codes that don't match the substring patterns
+	// below (e.g. a hypothetical "HTTP 599 Network Connect Timeout").
+	if asTransientHTTPError(err) != nil {
+		return true
+	}
+	// Transient-mode classification by substring + status-code regexes.
 	// Lower-case the haystack once so each substring matcher can be
-	// ASCII-lowercase; the 5xx regex is digit-only so case doesn't matter.
+	// ASCII-lowercase; the digit regexes ignore case anyway. Both 5xx and
+	// 429 (rate-limited) are classified as transient because real APIs
+	// return either shape under burst load.
 	msg := strings.ToLower(err.Error())
-	if http5xxRE.MatchString(msg) {
+	if http5xxRE.MatchString(msg) || http429RE.MatchString(msg) {
 		return true
 	}
 	for _, m := range transientErrorMatchers {
@@ -1477,6 +1542,14 @@ var transientErrorMatchers = []string{
 // numeric substrings like "5039" or "1503ms" that are not status codes.
 // Compiled once at init so the per-error check is O(len(msg)).
 var http5xxRE = regexp.MustCompile(`(?:^|\D)5[0-9]{2}(?:\D|$)`)
+
+// http429RE matches HTTP 429 (Too Many Requests) in an error string. Same
+// non-digit anchoring as http5xxRE so we don't false-positive on a stage
+// id that happens to contain "429" or a number like 1429ms. Real-world
+// search / LLM APIs return 429 under burst load; the transient classifier
+// retries them so an in-flight foreach doesn't fail the whole pipeline on
+// a momentary rate-limit blip.
+var http429RE = regexp.MustCompile(`(?:^|\D)429(?:\D|$)`)
 
 // makeStageInput assembles a StageInput for one invocation. tokenSink is the
 // caller-provided buffer for token streaming, or nil to stream directly to
@@ -1540,7 +1613,7 @@ func stageTypeOrDefault(st *Stage) StageType {
 // scheduler skips EnsureActive for groups consisting entirely of these stages.
 func stageRequiresVibeProfile(st *Stage) bool {
 	switch stageTypeOrDefault(st) {
-	case StageTypeAudio, StageTypeFFmpeg, StageTypeYouTube, StageTypeWebhook, StageTypeConfirm:
+	case StageTypeAudio, StageTypeFFmpeg, StageTypeYouTube, StageTypeWebhook, StageTypeConfirm, StageTypeRender:
 		return false
 	default:
 		return true
@@ -1744,7 +1817,7 @@ func (e *Executor) tryResumeStage(st *Stage) (bool, error) {
 	// wrote to disk, and downstream stages expect the URL string itself —
 	// same shape as text.
 	t := stageTypeOrDefault(st)
-	if t != StageTypeText && t != StageTypeYouTube {
+	if t != StageTypeText && t != StageTypeYouTube && t != StageTypeRender {
 		e.mu.Lock()
 		e.stageOutputs[st.ID] = &stageResult{Output: full}
 		e.mu.Unlock()
@@ -2048,30 +2121,267 @@ func renderTemplate(name, raw string, deps []string, cliInputs map[string]string
 //   - toJSON: re-marshals a value to its JSON representation. Needed
 //     to take a parseJSON result (a Go slice / map) and emit it as a
 //     valid JSON fragment in a webhook body.
+//   - urlencode: percent-encodes a value for safe use in a URL query
+//     component (wraps net/url.QueryEscape). Intended for webhook
+//     stages whose URL interpolates user / upstream-derived strings
+//     into the query — e.g. `url: ".../search?q={{ .topic | urlencode }}"`
+//     so a topic containing `&`, `+`, `%`, or spaces doesn't corrupt
+//     the request. Non-string values are stringified via fmt.Sprint
+//     first to match slugify's tolerance for foreach items that
+//     surface as map / number shapes.
 func templateFuncs() template.FuncMap {
 	return template.FuncMap{
-		"slugify":   slugify,
-		"contains":  func(haystack, needle string) bool { return strings.Contains(haystack, needle) },
-		"hasPrefix": func(s, prefix string) bool { return strings.HasPrefix(s, prefix) },
-		"hasSuffix": func(s, suffix string) bool { return strings.HasSuffix(s, suffix) },
-		"lower":     strings.ToLower,
-		"upper":     strings.ToUpper,
-		"trim":      strings.TrimSpace,
-		"readFile":  readFileTemplate,
-		"parseJSON": parseJSONTemplate,
-		"toJSON":    toJSONTemplate,
+		"slugify":          slugify,
+		"contains":         func(haystack, needle string) bool { return strings.Contains(haystack, needle) },
+		"hasPrefix":        func(s, prefix string) bool { return strings.HasPrefix(s, prefix) },
+		"hasSuffix":        func(s, suffix string) bool { return strings.HasSuffix(s, suffix) },
+		"lower":            strings.ToLower,
+		"upper":            strings.ToUpper,
+		"trim":             strings.TrimSpace,
+		"joinPath":         func(parts ...string) string { return filepath.Join(parts...) },
+		"readFile":         readFileTemplate,
+		"readFiles":        readFilesTemplate,
+		"readLessons":      readLessonsTemplate,
+		"enumerateLessons": enumerateLessonsTemplate,
+		"mergeJSON":        mergeJSONTemplate,
+		"parseJSON":        parseJSONTemplate,
+		"toJSON":           toJSONTemplate,
+		"urlencode":        urlencodeTemplate,
 	}
 }
 
+// urlencodeTemplate percent-encodes v for safe use in a URL query
+// component. Accepts any value (stringified via fmt.Sprint) so foreach
+// items that arrive as maps or numbers Just Work in the obvious
+// position. Wraps net/url.QueryEscape so reserved characters
+// (& + % space etc.) cannot corrupt the request.
+func urlencodeTemplate(v any) string {
+	return url.QueryEscape(fmt.Sprint(v))
+}
+
 // readFileTemplate reads the file at path and returns its contents as a
-// string. Surfaces a wrapped error on miss so the template engine reports
-// the failing stage clearly.
+// string. Expands a leading "~" to the user's home directory. Surfaces a
+// wrapped error on miss so the template engine reports the failing stage
+// clearly.
 func readFileTemplate(path string) (string, error) {
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("readFile %s: cannot resolve home dir: %w", path, err)
+		}
+		path = filepath.Join(home, path[2:])
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("readFile %s: %w", path, err)
 	}
 	return string(b), nil
+}
+
+// readFilesTemplate reads all files matching a glob pattern and returns
+// them concatenated with "--- <path> ---" headers. Paths are sorted for
+// determinism. Expands a leading "~" to the user's home directory.
+func readFilesTemplate(pattern string) (string, error) {
+	if strings.HasPrefix(pattern, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("readFiles %s: cannot resolve home dir: %w", pattern, err)
+		}
+		pattern = filepath.Join(home, pattern[2:])
+	}
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return "", fmt.Errorf("readFiles %s: %w", pattern, err)
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("readFiles %s: no files matched", pattern)
+	}
+	sort.Strings(matches)
+	// Skip files > 200 KB (textbooks, binaries) to avoid blowing past
+	// context windows with non-lesson material.
+	var filtered []string
+	for _, m := range matches {
+		info, statErr := os.Stat(m)
+		if statErr != nil || info.IsDir() || info.Size() > 200*1024 {
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+	if len(filtered) == 0 {
+		return "", fmt.Errorf("readFiles %s: no files after filtering oversized files", pattern)
+	}
+	return readFilesFromMatches(filtered)
+}
+
+// readLessonsTemplate paginates sorted lesson files from a module into batches.
+// Args: path (glob pattern), batch (1-indexed), total (number of batches).
+// Skips files > 200 KB (math textbooks, etc.). Returns files for the
+// requested batch so a 128-token context window isn't exceeded.
+func readLessonsTemplate(args ...any) (string, error) {
+	if len(args) < 3 {
+		return "", fmt.Errorf("readLessons requires 3 args: path, batch, total")
+	}
+	pattern, ok := args[0].(string)
+	if !ok {
+		return "", fmt.Errorf("readLessons: path must be a string")
+	}
+	batch, ok := args[1].(int)
+	if !ok {
+		return "", fmt.Errorf("readLessons: batch must be an integer")
+	}
+	total, ok := args[2].(int)
+	if !ok {
+		return "", fmt.Errorf("readLessons: total must be an integer")
+	}
+	if batch < 1 || batch > total || total < 1 {
+		return "", fmt.Errorf("readLessons: batch %d out of range [1, %d]", batch, total)
+	}
+	if strings.HasPrefix(pattern, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("readLessons %s: cannot resolve home dir: %w", pattern, err)
+		}
+		pattern = filepath.Join(home, pattern[2:])
+	}
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return "", fmt.Errorf("readLessons %s: %w", pattern, err)
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("readLessons %s: no files matched", pattern)
+	}
+	sort.Strings(matches)
+
+	// Skip oversized files (math textbooks, etc.)
+	const maxFileSize = 200 * 1024
+	var filtered []string
+	for _, m := range matches {
+		info, statErr := os.Stat(m)
+		if statErr != nil || info.IsDir() {
+			continue
+		}
+		if info.Size() > maxFileSize {
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+	if len(filtered) == 0 {
+		return "", fmt.Errorf("readLessons %s: no files after filtering (all exceeded %d bytes)", pattern, maxFileSize)
+	}
+
+	// Split into batches
+	chunk := (len(filtered) + total - 1) / total
+	start := (batch - 1) * chunk
+	end := start + chunk
+	if start >= len(filtered) {
+		return "", fmt.Errorf("readLessons: batch %d has no files (only %d files, %d batches)", batch, len(filtered), total)
+	}
+	if end > len(filtered) {
+		end = len(filtered)
+	}
+	return readFilesFromMatches(filtered[start:end])
+}
+
+// readFilesFromMatches reads and concatenates matched files with headers.
+func readFilesFromMatches(matches []string) (string, error) {
+	var b strings.Builder
+	for _, m := range matches {
+		content, err := os.ReadFile(m)
+		if err != nil {
+			return "", fmt.Errorf("read file %s: %w", m, err)
+		}
+		fmt.Fprintf(&b, "--- %s ---\n%s\n\n", filepath.Base(m), string(content))
+	}
+	return b.String(), nil
+}
+
+// enumerateLessonsTemplate glob-matches lesson directories and returns them
+// as a JSON array of relative directory names. Used as the source for
+// foreach stages that process lessons individually:
+//
+//	{{ enumerateLessons "~/path/to/Module_1/Lesson_*" }}
+//
+// Filters out directories whose lesson.md exceeds 1 MB (textbooks).
+func enumerateLessonsTemplate(pattern string) (string, error) {
+	if strings.HasPrefix(pattern, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("enumerateLessons %s: cannot resolve home dir: %w", pattern, err)
+		}
+		pattern = filepath.Join(home, pattern[2:])
+	}
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return "", fmt.Errorf("enumerateLessons %s: %w", pattern, err)
+	}
+	sort.Strings(matches)
+	const maxLessonSize = 1024 * 1024
+	var dirs []string
+	for _, m := range matches {
+		info, statErr := os.Stat(m)
+		if statErr != nil || !info.IsDir() {
+			continue
+		}
+		lessonFile := filepath.Join(m, "lesson.md")
+		fi, err := os.Stat(lessonFile)
+		if err != nil || fi.Size() > maxLessonSize {
+			continue
+		}
+		dirs = append(dirs, filepath.Base(m))
+	}
+	b, err := json.Marshal(dirs)
+	if err != nil {
+		return "", fmt.Errorf("enumerateLessons: marshal: %w", err)
+	}
+	return string(b), nil
+}
+
+// mergeJSONTemplate takes a string of concatenated JSON objects (the format
+// foreach stages produce when per-item outputs are joined with blank-line
+// separators) and merges them into a single JSON array. The input is
+// permissive: per-item objects may be compact or pretty-printed, surrounded
+// by markdown ```json fences (a common LLM artifact even when prompts forbid
+// them), and separated by arbitrary whitespace. The function strips fence
+// markers, then uses json.Decoder to stream successive top-level JSON values
+// from the cleaned input. Parse errors are surfaced (rather than silently
+// skipped) so a malformed per-item output fails the render stage with a
+// pointer at the offending position rather than dropping content downstream.
+func mergeJSONTemplate(raw string) (string, error) {
+	// Strip markdown code-fence markers anywhere in the input. We match the
+	// opening "```json" / "```" lines and closing "```" lines on a per-line
+	// basis so a fence that wraps one item doesn't accidentally consume the
+	// next. Inline-fence forms ("``` foo ```") aren't an LLM artifact we
+	// expect from JSON-output stages, so we don't try to handle them.
+	var b strings.Builder
+	for _, line := range strings.Split(raw, "\n") {
+		trim := strings.TrimSpace(line)
+		if trim == "```json" || trim == "```JSON" || trim == "```" {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	dec := json.NewDecoder(strings.NewReader(b.String()))
+	var merged []any
+	for {
+		var v any
+		err := dec.Decode(&v)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("mergeJSON: decode at offset %d: %w", dec.InputOffset(), err)
+		}
+		merged = append(merged, v)
+	}
+	if merged == nil {
+		merged = []any{}
+	}
+	out, err := json.Marshal(merged)
+	if err != nil {
+		return "", fmt.Errorf("mergeJSON: marshal: %w", err)
+	}
+	return string(out), nil
 }
 
 // parseJSONTemplate decodes the given JSON string. Returns the natural
@@ -2227,9 +2537,96 @@ func (e *Executor) logf(format string, args ...any) {
 	fmt.Fprintf(e.Log, time.Now().Format("15:04:05")+" "+format+"\n", args...)
 }
 
+// runStageCleanup is the best-effort post-success disk-scrubber for stages
+// that declare a cleanup: list. Patterns are evaluated as filepath.Glob
+// against the run dir and every match is os.Remove'd. Failures (glob
+// errors, individual removal errors) are logged via e.logf and never bubble
+// up — the stage already produced its output and we don't want to fail a
+// successful run because a cleanup pattern matched nothing or hit a
+// permissions issue.
+//
+// Cleanup runs ONLY from the success exit paths of executeStage /
+// executeForeachStage. It does NOT run on error, on cancel, or on the
+// resume "skip because output is already on disk" path. This is by
+// design: cleanup is opt-in and the user is opting into "re-run from
+// scratch if I want intermediates back".
+//
+// Safety: validateCleanupPatterns has already rejected absolute paths and
+// `..` traversal at load time, so by the time we get here every pattern
+// is guaranteed to be a relative path under runDir.
+func (e *Executor) runStageCleanup(st *Stage) {
+	if len(st.Cleanup) == 0 {
+		return
+	}
+	seen := make(map[string]bool)
+	var removed []string
+	for _, pattern := range st.Cleanup {
+		// Defence-in-depth: re-check that the pattern doesn't escape the
+		// run dir even though Validate already enforced this. Mirrors the
+		// LoadPipeline rule so a programmatically-constructed Pipeline
+		// (i.e. one that bypassed LoadPipeline) still can't wipe the
+		// filesystem outside its run dir.
+		cleaned := filepath.Clean(pattern)
+		if filepath.IsAbs(cleaned) || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) || cleaned == "." || cleaned == "" {
+			e.logf("  -> stage %q: cleanup skipping unsafe pattern %q", st.ID, pattern)
+			continue
+		}
+		full := filepath.Join(e.RunDir, cleaned)
+		matches, err := filepath.Glob(full)
+		if err != nil {
+			e.logf("  -> stage %q: cleanup glob %q failed: %v", st.ID, pattern, err)
+			continue
+		}
+		for _, m := range matches {
+			if seen[m] {
+				continue
+			}
+			seen[m] = true
+			// One more defensive check: the matched path must remain
+			// under e.RunDir. filepath.Glob shouldn't escape via the
+			// patterns we accepted, but a symlink under the run dir could
+			// in principle resolve elsewhere; we don't follow symlinks in
+			// the removal (os.Remove unlinks the symlink itself), so this
+			// is mostly belt-and-braces.
+			rel, err := filepath.Rel(e.RunDir, m)
+			if err != nil || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+				e.logf("  -> stage %q: cleanup skipping %q (outside run dir)", st.ID, m)
+				continue
+			}
+			if err := os.Remove(m); err != nil {
+				// A non-existent file is fine (the user may have listed a
+				// pattern that didn't match anything this time); other
+				// errors are logged and skipped.
+				if !os.IsNotExist(err) {
+					e.logf("  -> stage %q: cleanup remove %q failed: %v", st.ID, rel, err)
+				}
+				continue
+			}
+			removed = append(removed, rel)
+		}
+	}
+	if len(removed) > 0 {
+		e.logf("  -> stage %q: cleanup removed %d file(s)", st.ID, len(removed))
+	}
+}
+
 func validateJSON(s string) error {
 	var v any
-	return json.Unmarshal([]byte(s), &v)
+	return json.Unmarshal([]byte(stripMarkdownFences(s)), &v)
+}
+
+// stripMarkdownFences removes surrounding ```json / ``` markdown code fence
+// wrappers from LLM output so validateJSON can parse the inner JSON.
+func stripMarkdownFences(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "```json") {
+		s = strings.TrimPrefix(s, "```json")
+		s = strings.TrimPrefix(s, "```")
+	} else if strings.HasPrefix(s, "```") {
+		s = strings.TrimPrefix(s, "```")
+	}
+	s = strings.TrimSuffix(s, "```")
+	return strings.TrimSpace(s)
 }
 
 // recordStageFinish writes one StageRecord to the per-run timing map.

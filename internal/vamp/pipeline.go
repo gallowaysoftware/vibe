@@ -3,9 +3,12 @@ package vamp
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"text/template"
 	"time"
@@ -46,6 +49,17 @@ type Stage struct {
 	Output       string         `yaml:"output"`
 	OutputFormat string         `yaml:"output_format,omitempty"` // "" | "json"
 	Params       map[string]any `yaml:"params,omitempty"`        // merged into the chat-completion body (text stages only)
+	// ImageDir, when non-empty on a text stage, instructs the executor to
+	// read all image files from the directory (expanded relative to
+	// PipelineDir), base64-encode them, and attach them as multimodal
+	// content alongside the prompt. Requires a vision-capable backend
+	// (Gemma 3 + mmproj) to be meaningful; a non-vision backend will
+	// ignore the images. The directory is scanned for common raster
+	// extensions (.png, .jpg, .jpeg, .gif, .webp, .bmp); SVGs are
+	// rasterized through rsvg-convert into a content-addressed PNG cache
+	// before being attached, since vision encoders consume pixels, not
+	// vector markup.
+	ImageDir string `yaml:"image_dir,omitempty"`
 
 	// Audio-stage fields. Audio stages shell out to a Piper TTS binary to
 	// synthesize speech from a rendered text template. Voice names the voice
@@ -81,6 +95,12 @@ type Stage struct {
 	// the user-supplied args so users don't manage the destination path
 	// themselves. Binary (shared with audio) defaults to "ffmpeg" on $PATH.
 	FFmpegArgs []string `yaml:"ffmpeg_args,omitempty"`
+	// ConcatWavs, when true on an ffmpeg stage, auto-globs all "*.wav" files
+	// in the run dir, creates a concat file list, and runs ffmpeg to merge
+	// them into the output MP3. The stage's ffmpeg_args are ignored when this
+	// is true; the executor constructs the argv internally. Designed for
+	// concatenating foreach audio stage outputs into a single podcast file.
+	ConcatWavs bool `yaml:"concat_wavs,omitempty"`
 
 	// YouTube-stage fields. Video is a template path to the MP4 to upload
 	// (typically the output of an upstream ffmpeg stage). Title/Description
@@ -109,13 +129,26 @@ type Stage struct {
 	// (resolved relative to PipelineDir) whose contents are rendered as a
 	// single template and sent verbatim as the request body — mutually
 	// exclusive with Body. Headers is a flat map of header name -> templated
-	// value. RetryOn5xx defaults to true; when set together with a stage-
-	// level retry: block of its own the stage's explicit policy wins.
+	// value.
+	//
+	// RetryOnTransient defaults to true and is the modern, honestly-named
+	// switch for synthesising a transient-error retry policy. Transient now
+	// covers BOTH HTTP 5xx AND HTTP 429 (rate limited) — the latter being the
+	// shape real-world search/LLM APIs return under burst load. When set
+	// together with a stage-level retry: block of its own the stage's explicit
+	// policy wins.
+	//
+	// RetryOn5xx is the deprecated alias kept for back-compat: pipelines that
+	// already set retry_on_5xx continue to work unchanged (the loader emits a
+	// one-shot deprecation warning when it sees the field). Setting both
+	// names at once is rejected at validate time so users don't end up with
+	// one true and one false silently.
 	URL              string            `yaml:"url,omitempty"`
 	Method           string            `yaml:"method,omitempty"`
 	Body             map[string]any    `yaml:"body,omitempty"`
 	BodyTemplateFile string            `yaml:"body_template_file,omitempty"`
 	Headers          map[string]string `yaml:"headers,omitempty"`
+	RetryOnTransient *bool             `yaml:"retry_on_transient,omitempty"`
 	RetryOn5xx       *bool             `yaml:"retry_on_5xx,omitempty"`
 	// Assert, when non-nil, turns a webhook stage into a smoke-test
 	// probe: the executor runs the request, then validates the response
@@ -169,6 +202,19 @@ type Stage struct {
 	// wait for the operator to respond before auto-rejecting. Zero (the
 	// default) means "wait forever". Rejected on every other stage type.
 	Timeout time.Duration `yaml:"timeout,omitempty"`
+
+	// Cleanup is an optional list of glob patterns (relative to the run
+	// dir) that the runner removes from disk after the stage's success
+	// path completes. Designed for stages that consume large intermediate
+	// files (e.g. an ffmpeg stage that concatenates a directory of wavs
+	// into a single mp3) and want to free that disk after producing their
+	// own output. Patterns must NOT escape the run dir: `..` segments and
+	// absolute paths are rejected at load time. Cleanup runs ONLY on
+	// success (not on error, not on cancel, not on cache-hit/resume
+	// skip), and is best-effort — failures log a warning and continue.
+	// Only valid on stage types that produce a stable on-disk output
+	// (text/comfyui/audio/ffmpeg); rejected on webhook/youtube/confirm.
+	Cleanup []string `yaml:"cleanup,omitempty"`
 }
 
 // RetryPolicy controls per-stage retry behaviour for transient executor
@@ -417,13 +463,21 @@ func (p *Pipeline) Validate() error {
 		// (youtube, webhook), which talk to a third-party API and never
 		// activate a vibe profile. Confirm stages are pure local I/O —
 		// stdin or a marker file — and also don't activate a profile.
-		if stageType != StageTypeAudio && stageType != StageTypeFFmpeg && stageType != StageTypeYouTube && stageType != StageTypeWebhook && stageType != StageTypeConfirm && s.Capability == "" {
+		if stageType != StageTypeAudio && stageType != StageTypeFFmpeg && stageType != StageTypeYouTube && stageType != StageTypeWebhook && stageType != StageTypeConfirm && stageType != StageTypeRender && s.Capability == "" {
 			return fmt.Errorf("%s: capability is required", ctx)
 		}
 		switch stageType {
 		case StageTypeText:
 			if (s.Prompt == "") == (s.PromptFile == "") {
 				return fmt.Errorf("%s: exactly one of prompt or prompt_file is required", ctx)
+			}
+			if err := validateParamsKeys(ctx, s.Params); err != nil {
+				return err
+			}
+			if s.Prompt != "" {
+				if _, err := template.New(s.ID + ":prompt").Funcs(templateFuncs()).Parse(s.Prompt); err != nil {
+					return fmt.Errorf("%s: parse prompt template: %w", ctx, err)
+				}
 			}
 			if s.Workflow != "" {
 				return fmt.Errorf("%s: workflow is only valid on type: comfyui stages", ctx)
@@ -447,14 +501,17 @@ func (p *Pipeline) Validate() error {
 				return err
 			}
 		case StageTypeAudio:
+			if s.ImageDir != "" {
+				return fmt.Errorf("%s: image_dir is only valid on type: text stages", ctx)
+			}
 			if s.Voice == "" {
 				return fmt.Errorf("%s: voice is required for type: audio stages", ctx)
 			}
 			if s.Text == "" {
 				return fmt.Errorf("%s: text is required for type: audio stages", ctx)
 			}
-			if !strings.HasSuffix(s.Output, ".wav") {
-				return fmt.Errorf("%s: output %q must end in .wav for type: audio stages", ctx, s.Output)
+			if !hasAudioExtension(s.Output) {
+				return fmt.Errorf("%s: output %q must end in a supported audio extension for type: audio stages (allowed: %s)", ctx, s.Output, strings.Join(audioOutputExtensions, ", "))
 			}
 			if s.Prompt != "" {
 				return fmt.Errorf("%s: prompt is only valid on type: text stages", ctx)
@@ -487,13 +544,11 @@ func (p *Pipeline) Validate() error {
 				return err
 			}
 		case StageTypeFFmpeg:
-			// ffmpeg stages drive a local subprocess to assemble media
-			// from prior stage outputs. The only required schema is the
-			// rendered argv list (FFmpegArgs) and the output path; the
-			// executor appends `-y <output>` after the user args so users
-			// don't manage the destination themselves.
-			if len(s.FFmpegArgs) == 0 {
-				return fmt.Errorf("%s: ffmpeg_args is required for type: ffmpeg stages", ctx)
+			if s.ConcatWavs && len(s.FFmpegArgs) > 0 {
+				return fmt.Errorf("%s: concat_wavs and ffmpeg_args are mutually exclusive (concat_wavs constructs argv internally)", ctx)
+			}
+			if !s.ConcatWavs && len(s.FFmpegArgs) == 0 {
+				return fmt.Errorf("%s: ffmpeg_args is required for type: ffmpeg stages (unless concat_wavs is true)", ctx)
 			}
 			if s.Capability != "" {
 				return fmt.Errorf("%s: capability is only valid on stage types that activate a vibe profile (ffmpeg runs as a local subprocess)", ctx)
@@ -518,6 +573,9 @@ func (p *Pipeline) Validate() error {
 			}
 			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" {
 				return fmt.Errorf("%s: voice/text/voices_dir are only valid on type: audio stages", ctx)
+			}
+			if s.ImageDir != "" {
+				return fmt.Errorf("%s: image_dir is only valid on type: text stages", ctx)
 			}
 			if err := rejectYouTubeFields(ctx, s); err != nil {
 				return err
@@ -557,6 +615,9 @@ func (p *Pipeline) Validate() error {
 			}
 			if len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
+			}
+			if s.ImageDir != "" {
+				return fmt.Errorf("%s: image_dir is only valid on type: text stages", ctx)
 			}
 			if err := rejectYouTubeFields(ctx, s); err != nil {
 				return err
@@ -607,6 +668,9 @@ func (p *Pipeline) Validate() error {
 			if len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
 			}
+			if s.ImageDir != "" {
+				return fmt.Errorf("%s: image_dir is only valid on type: text stages", ctx)
+			}
 			if err := rejectWebhookFields(ctx, s); err != nil {
 				return err
 			}
@@ -615,17 +679,32 @@ func (p *Pipeline) Validate() error {
 			}
 			// (youtube fields are valid here — already checked above)
 		case StageTypeWebhook:
-			// retry_on_5xx defaults to true (per the documented schema). The
-			// transient-error classifier already picks up the
-			// "webhook returned HTTP 5xx" error string the executor
-			// produces; we just need to ensure a retry policy exists so the
-			// classifier is consulted at all. If the user supplied their own
-			// retry: block we respect it (their explicit choice wins). When
-			// retry_on_5xx is explicitly false we leave Retry alone.
+			// retry_on_transient defaults to true (per the documented schema).
+			// The transient-error classifier picks up the literal HTTP 429 /
+			// 5xx status forms the webhook executor returns; we just need to
+			// ensure a retry policy exists so the classifier is consulted at
+			// all. If the user supplied their own retry: block we respect it
+			// (their explicit choice wins). When retry_on_transient (or its
+			// deprecated alias retry_on_5xx) is explicitly false we leave
+			// Retry alone.
 			if s.URL == "" {
 				return fmt.Errorf("%s: url is required for type: webhook stages", ctx)
 			}
-			wantsRetry := s.RetryOn5xx == nil || *s.RetryOn5xx
+			if s.RetryOnTransient != nil && s.RetryOn5xx != nil {
+				return fmt.Errorf("%s: retry_on_transient and retry_on_5xx are mutually exclusive (retry_on_5xx is deprecated; prefer retry_on_transient)", ctx)
+			}
+			if s.RetryOn5xx != nil {
+				// One-shot deprecation log on Validate so users see it once
+				// per LoadPipeline call rather than once per stage execution.
+				slog.Warn("retry_on_5xx is deprecated, use retry_on_transient (transient now covers HTTP 429 and 5xx)", "stage", s.ID)
+			}
+			wantsRetry := true
+			switch {
+			case s.RetryOnTransient != nil:
+				wantsRetry = *s.RetryOnTransient
+			case s.RetryOn5xx != nil:
+				wantsRetry = *s.RetryOn5xx
+			}
 			if wantsRetry && p.Stages[i].Retry == nil {
 				p.Stages[i].Retry = &RetryPolicy{
 					MaxAttempts: defaultWebhookRetryAttempts,
@@ -678,9 +757,6 @@ func (p *Pipeline) Validate() error {
 			if len(s.Params) > 0 {
 				return fmt.Errorf("%s: params is only valid on type: text stages", ctx)
 			}
-			if s.OutputFormat != "" {
-				return fmt.Errorf("%s: output_format is only valid on type: text stages", ctx)
-			}
 			if s.Workflow != "" {
 				return fmt.Errorf("%s: workflow is only valid on type: comfyui stages", ctx)
 			}
@@ -692,6 +768,9 @@ func (p *Pipeline) Validate() error {
 			}
 			if len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
+			}
+			if s.ImageDir != "" {
+				return fmt.Errorf("%s: image_dir is only valid on type: text stages", ctx)
 			}
 			if err := rejectYouTubeFields(ctx, s); err != nil {
 				return err
@@ -737,6 +816,48 @@ func (p *Pipeline) Validate() error {
 			if len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
 			}
+			if s.ImageDir != "" {
+				return fmt.Errorf("%s: image_dir is only valid on type: text stages", ctx)
+			}
+			if err := rejectYouTubeFields(ctx, s); err != nil {
+				return err
+			}
+			if err := rejectWebhookFields(ctx, s); err != nil {
+				return err
+			}
+		case StageTypeRender:
+			// Render stages are pure template → text: render a prompt or
+			// prompt_file against the current binding and write the result.
+			// No LLM call, no profile activation, no params.
+			if (s.Prompt == "") == (s.PromptFile == "") {
+				return fmt.Errorf("%s: exactly one of prompt or prompt_file is required", ctx)
+			}
+			if s.Prompt != "" {
+				if _, err := template.New(s.ID + ":prompt").Funcs(templateFuncs()).Parse(s.Prompt); err != nil {
+					return fmt.Errorf("%s: parse prompt template: %w", ctx, err)
+				}
+			}
+			if s.Capability != "" {
+				return fmt.Errorf("%s: capability is only valid on stage types that activate a vibe profile (render is pure template execution)", ctx)
+			}
+			if len(s.Params) > 0 {
+				return fmt.Errorf("%s: params is only valid on type: text stages (render is template-only)", ctx)
+			}
+			if s.Workflow != "" {
+				return fmt.Errorf("%s: workflow is only valid on type: comfyui stages", ctx)
+			}
+			if len(s.Parameters) > 0 {
+				return fmt.Errorf("%s: parameters is only valid on type: comfyui stages", ctx)
+			}
+			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" {
+				return fmt.Errorf("%s: voice/text/voices_dir/binary are only valid on type: audio stages", ctx)
+			}
+			if len(s.FFmpegArgs) > 0 {
+				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
+			}
+			if s.ImageDir != "" {
+				return fmt.Errorf("%s: image_dir is only valid on type: text stages", ctx)
+			}
 			if err := rejectYouTubeFields(ctx, s); err != nil {
 				return err
 			}
@@ -744,10 +865,27 @@ func (p *Pipeline) Validate() error {
 				return err
 			}
 		default:
-			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio, ffmpeg, youtube, webhook, confirm)", ctx, s.Type)
+			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio, ffmpeg, youtube, webhook, confirm, render)", ctx, s.Type)
 		}
 		if s.OutputFormat != "" && s.OutputFormat != "json" {
 			return fmt.Errorf("%s: output_format %q is not supported (allowed: \"\", json)", ctx, s.OutputFormat)
+		}
+		// Cleanup: optional list of glob patterns scrubbed after the stage's
+		// success path completes. Restricted to stage types that produce a
+		// stable on-disk output and own a meaningful chunk of intermediate
+		// work (text/comfyui/audio/ffmpeg). webhook/youtube/confirm stages
+		// talk to remote services or are pure markers — letting them clean
+		// up files is most likely a misuse so we reject the field outright.
+		if len(s.Cleanup) > 0 {
+			switch stageType {
+			case StageTypeText, StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg:
+				// ok
+			default:
+				return fmt.Errorf("%s: cleanup is only valid on type: text/comfyui/audio/ffmpeg stages (got %q)", ctx, stageType)
+			}
+			if err := validateCleanupPatterns(ctx, s.Cleanup); err != nil {
+				return err
+			}
 		}
 		// Retry policy: validate user-supplied fields, then normalize so
 		// the executor sees defaults filled in. Validation runs against
@@ -927,10 +1065,35 @@ func rejectWebhookFields(ctx string, s Stage) error {
 	if s.RetryOn5xx != nil {
 		return fmt.Errorf("%s: retry_on_5xx is only valid on type: webhook stages", ctx)
 	}
+	if s.RetryOnTransient != nil {
+		return fmt.Errorf("%s: retry_on_transient is only valid on type: webhook stages", ctx)
+	}
 	if s.Assert != nil {
 		return fmt.Errorf("%s: assert is only valid on type: webhook stages", ctx)
 	}
 	return nil
+}
+
+// audioOutputExtensions is the canonical allowlist of file extensions a
+// type: audio stage may write to. Piper itself only emits WAV, but the
+// validator accepts every common lossless / lossy container so a future
+// TTS swap (or a wrapper that transcodes Piper's WAV in place) isn't
+// blocked at load time. The runtime executor still produces whatever bytes
+// the underlying TTS binary writes — the extension here is a declarative
+// contract for downstream stages (ffmpeg/youtube/etc.) that read the file.
+var audioOutputExtensions = []string{".wav", ".mp3", ".opus", ".flac", ".ogg"}
+
+// hasAudioExtension reports whether path ends with any extension in
+// audioOutputExtensions. Comparison is case-insensitive on the suffix so a
+// macOS user typing `.WAV` still validates.
+func hasAudioExtension(path string) bool {
+	lower := strings.ToLower(path)
+	for _, ext := range audioOutputExtensions {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+	return false
 }
 
 // looksLikeTemplate reports whether s is plausibly a Go text/template
@@ -945,6 +1108,135 @@ func rejectWebhookFields(ctx string, s Stage) error {
 // parse error from a flat string.
 func looksLikeTemplate(s string) bool {
 	return strings.Contains(s, "{{")
+}
+
+// knownTextParamKeys is the canonical allowlist of chat-completion params we
+// recognise on a text stage's params: map. The list mirrors the OpenAI-shape
+// fields every backend vamp speaks to today actually understands plus the
+// llama.cpp grammar/sampling extensions (top_k, min_p, repetition_penalty)
+// that the inference proxy forwards. Any other key is most likely a typo
+// (e.g. "temperture") which historically slipped through verbatim and was
+// silently ignored by the backend; Validate now rejects unknowns up-front
+// with a "did you mean" hint computed against this list.
+var knownTextParamKeys = []string{
+	"temperature",
+	"top_p",
+	"top_k",
+	"min_p",
+	"max_tokens",
+	"presence_penalty",
+	"frequency_penalty",
+	"repetition_penalty",
+	"seed",
+	"stop",
+	"stream",
+	"response_format",
+	"n",
+	"logprobs",
+	"top_logprobs",
+	"tools",
+	"tool_choice",
+	"parallel_tool_calls",
+	"user",
+}
+
+// validateParamsKeys rejects any key in params that is not a member of the
+// canonical allowlist. The first unknown key seen wins and the error
+// includes a "did you mean: X, Y" hint when a near-match exists. Validation
+// is intentionally strict-mode-only: silently ignoring unknown keys is what
+// historically let `temperture: 0.7` reach the wire as a no-op.
+func validateParamsKeys(ctx string, params map[string]any) error {
+	if len(params) == 0 {
+		return nil
+	}
+	allowed := make(map[string]bool, len(knownTextParamKeys))
+	for _, k := range knownTextParamKeys {
+		allowed[k] = true
+	}
+	// Iterate in sorted key order so the error we return for a pipeline
+	// with multiple typos is deterministic across map-iteration runs.
+	keys := make([]string, 0, len(params))
+	for k := range params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if allowed[k] {
+			continue
+		}
+		if suggestions := suggestFrom(k, knownTextParamKeys); len(suggestions) > 0 {
+			return fmt.Errorf("%s: params key %q is not a known chat-completion parameter (did you mean: %s?)", ctx, k, strings.Join(suggestions, ", "))
+		}
+		return fmt.Errorf("%s: params key %q is not a known chat-completion parameter", ctx, k)
+	}
+	return nil
+}
+
+// suggestFrom returns up to three candidates from `candidates` that are
+// within Levenshtein edit distance <= 2 of `want`, sorted by distance
+// ascending (ties broken by lexicographic order). Designed for the
+// "did you mean:" hint in error messages; an empty return means no close
+// match exists. Generalised so callers (params validation today, future
+// run_when keyword typos) can reuse a single fuzzy-match helper.
+func suggestFrom(want string, candidates []string) []string {
+	type scored struct {
+		s string
+		d int
+	}
+	const maxDist = 2
+	var hits []scored
+	for _, c := range candidates {
+		d := editDistance(want, c)
+		if d <= maxDist {
+			hits = append(hits, scored{s: c, d: d})
+		}
+	}
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].d != hits[j].d {
+			return hits[i].d < hits[j].d
+		}
+		return hits[i].s < hits[j].s
+	})
+	if len(hits) > 3 {
+		hits = hits[:3]
+	}
+	out := make([]string, len(hits))
+	for i, h := range hits {
+		out[i] = h.s
+	}
+	return out
+}
+
+// validateCleanupPatterns rejects glob patterns that escape the run dir.
+// Each pattern is filepath.Clean'd and the cleaned form must:
+//   - not be absolute (no leading /),
+//   - not be the parent-traversal token "..",
+//   - not start with "../" (or backslash equivalent on Windows),
+//   - not equal "" or "." (a pattern that cleans to "." would match the
+//     run dir itself; not useful and most likely a mistake).
+//
+// We do NOT expand globs here — that happens at runtime against the actual
+// run dir. The point is to refuse patterns that COULD resolve outside the
+// run dir under any expansion. The check runs at load time so a typoed
+// cleanup pattern fails `vamp validate` instead of silently nuking files
+// outside the run dir on first success.
+func validateCleanupPatterns(ctx string, patterns []string) error {
+	for _, p := range patterns {
+		if p == "" {
+			return fmt.Errorf("%s: cleanup pattern must not be empty", ctx)
+		}
+		if filepath.IsAbs(p) {
+			return fmt.Errorf("%s: cleanup pattern %q must be relative to the run dir (absolute paths are rejected)", ctx, p)
+		}
+		cleaned := filepath.Clean(p)
+		if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("%s: cleanup pattern %q escapes the run dir (parent-traversal segments are rejected)", ctx, p)
+		}
+		if cleaned == "." || cleaned == "" {
+			return fmt.Errorf("%s: cleanup pattern %q resolves to the run dir itself (refusing to wipe the run dir)", ctx, p)
+		}
+	}
+	return nil
 }
 
 // findCycle returns the participating stage ids if the dependency graph

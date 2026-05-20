@@ -3,6 +3,7 @@ package vamp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,7 +11,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/vibeclient"
 )
 
 // recordedWebhookRequest captures one webhook POST for assertions. We snapshot
@@ -603,6 +608,219 @@ stages:
 	}
 	if !strings.Contains(err.Error(), "assert is only valid on type: webhook stages") {
 		t.Errorf("error: %v", err)
+	}
+}
+
+// TestWebhookExecutor_Returns429AsTransient verifies an HTTP 429 response
+// surfaces as a typed transientHTTPError so the retry loop classifies it as
+// transient (and not a permanent 4xx). The error string still embeds the
+// digits "429" so the legacy substring-based classifier matches even when
+// future wrapping strips the typed form.
+func TestWebhookExecutor_Returns429AsTransient(t *testing.T) {
+	srv := newWebhookTestServer(t)
+	srv.status = http.StatusTooManyRequests
+	srv.respBody = `{"detail":"rate limited"}`
+
+	stage := &Stage{
+		ID:     "search",
+		Type:   StageTypeWebhook,
+		URL:    srv.URL(),
+		Body:   map[string]any{"q": "foo"},
+		Output: "resp.txt",
+	}
+	in := StageInput{Stage: stage, RunDir: t.TempDir()}
+
+	exec := &webhookExecutor{}
+	_, err := exec.Execute(context.Background(), in)
+	if err == nil {
+		t.Fatal("expected 429 to surface an error")
+	}
+	th := asTransientHTTPError(err)
+	if th == nil {
+		t.Fatalf("expected *transientHTTPError, got %T: %v", err, err)
+	}
+	if th.StatusCode != 429 {
+		t.Errorf("StatusCode = %d, want 429", th.StatusCode)
+	}
+	if !strings.Contains(err.Error(), "429") {
+		t.Errorf("error string should contain 429, got: %v", err)
+	}
+	// And the runtime classifier must agree it's retryable under the
+	// "transient" mode (default for webhook stages).
+	policy := &RetryPolicy{RetryOn: []string{retryOnTransient}}
+	if !isRetryable(err, policy) {
+		t.Errorf("isRetryable(429, transient) = false, want true")
+	}
+}
+
+// TestWebhookExecutor_429ParsesRetryAfterSeconds verifies the integer-seconds
+// form of the Retry-After header is parsed into transientHTTPError.RetryAfter
+// so the retry loop can honor the server's hint instead of using its own
+// exponential backoff.
+func TestWebhookExecutor_429ParsesRetryAfterSeconds(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "12")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("slow down"))
+	}))
+	defer srv.Close()
+
+	stage := &Stage{
+		ID:     "search",
+		Type:   StageTypeWebhook,
+		URL:    srv.URL,
+		Body:   map[string]any{"q": "foo"},
+		Output: "resp.txt",
+	}
+	in := StageInput{Stage: stage, RunDir: t.TempDir()}
+
+	_, err := (&webhookExecutor{}).Execute(context.Background(), in)
+	th := asTransientHTTPError(err)
+	if th == nil {
+		t.Fatalf("expected transientHTTPError, got: %v", err)
+	}
+	if th.RetryAfter != 12*time.Second {
+		t.Errorf("RetryAfter = %s, want 12s", th.RetryAfter)
+	}
+}
+
+// TestWebhookExecutor_429ParsesRetryAfterHTTPDate verifies the RFC-7231
+// HTTP-date form of Retry-After is parsed. We feed in a date a few seconds
+// in the future and assert RetryAfter rounds to roughly that gap.
+func TestWebhookExecutor_429ParsesRetryAfterHTTPDate(t *testing.T) {
+	// Time the response advertises as "come back at". Six seconds ahead of
+	// "now" is enough to keep the assertion stable across CI clock jitter.
+	const ahead = 6 * time.Second
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		future := time.Now().Add(ahead).UTC().Format(http.TimeFormat)
+		w.Header().Set("Retry-After", future)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("come back later"))
+	}))
+	defer srv.Close()
+
+	stage := &Stage{
+		ID:     "search",
+		Type:   StageTypeWebhook,
+		URL:    srv.URL,
+		Body:   map[string]any{"q": "x"},
+		Output: "resp.txt",
+	}
+	in := StageInput{Stage: stage, RunDir: t.TempDir()}
+
+	_, err := (&webhookExecutor{}).Execute(context.Background(), in)
+	th := asTransientHTTPError(err)
+	if th == nil {
+		t.Fatalf("expected transientHTTPError, got: %v", err)
+	}
+	// HTTP-date has 1-second resolution, so we accept any value within
+	// [0, ahead+1s]. The bound rejects "didn't parse at all" (zero) and
+	// guards against a parser that double-counts.
+	if th.RetryAfter <= 0 || th.RetryAfter > ahead+2*time.Second {
+		t.Errorf("RetryAfter = %s, want roughly %s", th.RetryAfter, ahead)
+	}
+}
+
+// TestParseRetryAfter_Forms unit-tests parseRetryAfter directly with every
+// form the spec defines plus a few garbage inputs. Keeps the parser
+// independent of the HTTP plumbing — failures here point at the parser
+// rather than the executor.
+func TestParseRetryAfter_Forms(t *testing.T) {
+	// Anchor "now" so HTTP-date math is deterministic.
+	now := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name    string
+		input   string
+		want    time.Duration
+		wantOK  bool
+		approx  bool // when true, allow ±1s slack (HTTP-date precision)
+		zeroVal bool
+	}{
+		{name: "empty", input: "", wantOK: false, zeroVal: true},
+		{name: "integer-seconds", input: "30", want: 30 * time.Second, wantOK: true},
+		{name: "zero-seconds", input: "0", want: 0, wantOK: true},
+		{name: "negative-rejected", input: "-5", wantOK: false, zeroVal: true},
+		{name: "http-date-future", input: now.Add(45 * time.Second).Format(http.TimeFormat), want: 45 * time.Second, wantOK: true, approx: true},
+		{name: "http-date-past", input: now.Add(-10 * time.Second).Format(http.TimeFormat), wantOK: false, zeroVal: true},
+		{name: "garbage", input: "nope", wantOK: false, zeroVal: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := parseRetryAfter(tc.input, now)
+			if ok != tc.wantOK {
+				t.Errorf("ok = %v, want %v (got=%s)", ok, tc.wantOK, got)
+			}
+			if tc.zeroVal && got != 0 {
+				t.Errorf("expected zero duration on parse failure, got %s", got)
+			}
+			if tc.wantOK && !tc.zeroVal {
+				diff := got - tc.want
+				if diff < 0 {
+					diff = -diff
+				}
+				if tc.approx {
+					if diff > time.Second {
+						t.Errorf("got = %s, want approximately %s", got, tc.want)
+					}
+				} else if got != tc.want {
+					t.Errorf("got = %s, want %s", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// TestWebhookExecutor_429ThenSuccess_RetriesOnce is the integration-shape
+// test the original ask explicitly called for: spin up an httptest.Server
+// that returns 429 on the first request and 200 on the second, run the
+// stage through the full retry loop, and assert exactly two attempts
+// landed at the server. Mirrors the real "rate-limited search API"
+// shape that motivated the change.
+func TestWebhookExecutor_429ThenSuccess_RetriesOnce(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&hits, 1)
+		if n == 1 {
+			w.Header().Set("Retry-After", "0") // ask for an immediate retry to keep the test fast
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("burst"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	yaml := fmt.Sprintf(`
+name: rl
+stages:
+  - id: search
+    type: webhook
+    url: %q
+    body:
+      q: hello
+    output: resp.txt
+`, srv.URL)
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatalf("LoadPipeline: %v", err)
+	}
+	// Force tiny backoff so the retry isn't gated on the default 1s sleep.
+	p.Stages[0].Retry.InitialBackoff = time.Millisecond
+	p.Stages[0].Retry.MaxBackoff = 10 * time.Millisecond
+
+	runDir := t.TempDir()
+	ex := &Executor{
+		Pipeline:     p,
+		Capabilities: &Capabilities{Mapping: map[string]CapabilityBinding{}},
+		Vibe:         vibeclient.NewWithHTTPClient("http://127.0.0.1:1", http.DefaultClient, ""),
+		RunDir:       runDir,
+	}
+	if err := ex.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v (expected the second attempt to succeed)", err)
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Errorf("server hits = %d, want 2 (one 429 + one 200)", got)
 	}
 }
 

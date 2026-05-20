@@ -91,6 +91,16 @@ func runCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Fail-fast before vibe is involved: unmapped capabilities,
+			// missing prompt_files, and broken template syntax all surface
+			// here rather than after the daemon has spent seconds activating
+			// a profile. Inline prompt parsing is already covered by
+			// Pipeline.Validate; CheckRunnable adds the cross-cutting checks
+			// that need either the pipeline dir (for prompt_file resolution)
+			// or the capabilities config (for the mapping check).
+			if err := vamp.CheckRunnable(p, filepath.Dir(pipelinePath), caps); err != nil {
+				return err
+			}
 			inputs, err := parseInputs(inputFlags, p)
 			if err != nil {
 				return err

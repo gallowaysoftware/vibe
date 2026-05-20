@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -132,7 +134,16 @@ func (c *Capabilities) Profiles(capability string) ([]string, error) {
 		for k := range c.Mapping {
 			have = append(have, k)
 		}
-		return nil, fmt.Errorf("capability %q is not mapped in %s (have: %v)", capability, CapabilitiesFile(), have)
+		// Sort so the error message is deterministic across runs. A bare
+		// map walk would print a different order every time and make a
+		// failing test or a CI diff harder to read.
+		sort.Strings(have)
+		suggestions := SuggestCapability(c, capability)
+		hint := ""
+		if len(suggestions) > 0 {
+			hint = fmt.Sprintf(" (did you mean: %s)", strings.Join(suggestions, ", "))
+		}
+		return nil, fmt.Errorf("capability %q is not mapped in %s%s; available: %s", capability, CapabilitiesFile(), hint, strings.Join(have, ", "))
 	}
 	if len(b.Candidates) > 0 {
 		// Defensive copy: callers shouldn't be able to mutate the cached

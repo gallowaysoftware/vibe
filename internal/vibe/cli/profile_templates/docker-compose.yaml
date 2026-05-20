@@ -27,8 +27,6 @@ backend:
 
 frontend:
   kind: docker-compose
-  # REPLACE: human-readable name of the frontend app (perplexica, open-webui, ...).
-  app: REPLACE-app-name
 
   # REPLACE: path to the docker-compose.yaml that defines your stack.
   # ${VIBE_STATE_DIR} expands to $XDG_STATE_HOME/vibe.

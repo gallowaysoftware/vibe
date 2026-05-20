@@ -16,9 +16,15 @@ Two binaries from one Go module (`github.com/gallowaysoftware/vibe`):
   optional `127.0.0.1:9001` (bearer-token-authed).
 - **`vamp`** (`cmd/vamp`, `internal/vamp/`): pipeline orchestrator that
   drives `vibe`. A YAML pipeline declares stages (`text`, `comfyui`,
-  `audio`, `ffmpeg`, `youtube`, `webhook`, `confirm`) with a DAG of
-  inputs; capability → profile mapping lives in
+  `audio`, `ffmpeg`, `youtube`, `webhook`, `confirm`, `render`) with a
+  DAG of inputs; capability → profile mapping lives in
   `$XDG_CONFIG_HOME/vamp/capabilities.yaml`.
+
+**`render` stage type.** Pure template → text without LLM invocation.
+Does not activate a vibe profile. Use for deterministic data
+transformation: enumerating directories, building JSON arrays, etc.
+Validated in `pipeline.go:Validate`, executor in
+`vision_executor.go:renderExecutor`.
 
 Generated code: `proto/vibe/v1/control.pb.go` and
 `proto/vibe/v1/vibev1connect/`. Regenerate with `buf generate` (see
@@ -99,12 +105,18 @@ them before pushing.
   (`webhook`, `youtube`, `confirm`). Side-effect stages must not be
   cached — replaying a "success" would skip the side effect that gave
   the pipeline its reason for existing.
-- **Output is always a path.** `.stages.X.output` in templates renders
-  the absolute path of the stage's output file, not its contents.
-  Template chains that need the *contents* (e.g. extracting a field
-  from a webhook response) use the registered `readFile` helper:
-  `{{ readFile .stages.X.output | parseJSON | <accessor> | toJSON }}`.
-  See `examples/rag-eval-pipeline/` for the canonical pattern.
+- **`.stages.X.output` semantics depend on stage type.** For text /
+  render / webhook stages (including their foreach variants — the
+  per-item content is `\n\n`-joined) it renders the **content**
+  produced by the stage, so templates can inline it directly:
+  `{{ .stages.merge_lessons.output }}` drops the merged JSON into
+  the next prompt verbatim. For binary stages (comfyui / audio /
+  ffmpeg / youtube) it renders the **absolute path(s)** to the
+  output file, since those bytes are not text. When a downstream
+  stage needs a field out of a text-stage's JSON, use `readFile`
+  only if the path-shaped form is needed; otherwise pipe directly:
+  `{{ .stages.X.output | parseJSON | <accessor> | toJSON }}`.
+  See `examples/rag-eval-pipeline/` for the canonical chain.
 - **Stage executors take injectable runners.** Every executor accepts
   a runner / httpDoer / process spawner that tests can swap. Don't
   hard-code `exec.Command` or `http.DefaultClient` at the executor
@@ -120,6 +132,33 @@ them before pushing.
   require one to avoid silent empty notifications). The
   `examples/profiles/chat-with-search/smoke.yaml` pipeline is the
   canonical use.
+- **Vision (image_dir).** `Stage.ImageDir` on a `type: text` stage
+  instructs the executor to scan the directory for image files
+  (png/jpg/jpeg/gif/webp/bmp), base64-encode them, and send via
+  `CallMultimodal`. SVGs in the directory are rasterized through
+  `rsvg-convert` into a content-addressed PNG cache under
+  `$XDG_CACHE_HOME/vamp/svg-rasterized/` and attached as the resulting
+  PNG — mmproj-backed vision models read pixels, not vector markup, so
+  the stage would otherwise drop the diagrams the lesson author
+  authored as SVG. The field renders as a template so foreach stages
+  can set per-item directories. Requires `rsvg-convert` on `$PATH`
+  when SVGs are present, and a vision-capable backend (Gemma 3 +
+  mmproj) to actually consume the images.
+- **Foreach items run independently.** A failing item no longer cancels
+  sibling items via the per-stage context. Each item completes or fails
+  on its own; the stage aggregates partial output from successes and
+  reports joined errors. See `exec_test.go:TestExecutor_ParallelForeach_IndependentItems`.
+- **Template functions.** Registered in `exec.go:makeTemplate`:
+  `readFile` (tilde-expanded), `readFiles(pattern)` (glob, 200KB max
+  per file, sorted), `readLessons(path, batch, total)` (paginated
+  lesson reading), `enumerateLessons(glob)` (JSON array of lesson dirs,
+  filters files >200KB), `mergeJSON(ndjson)` (newline-delimited JSON
+  merge), `joinPath(parts...)` (filepath.Join).
+- **Concat WAVs.** `Stage.ConcatWavs` on an `ffmpeg` stage auto-globs
+  all `*.wav` files, creates a concat list, and merges into the output
+  MP3. Implemented in `ffmpeg_executor.go:executeConcatWavs`.
+- **InputSpec requires struct form.** Bare strings like
+  `lesson_root: "~/path"` are rejected. Use `lesson_root: {default: "~/path"}`.
 
 ## Detach / job lifecycle
 

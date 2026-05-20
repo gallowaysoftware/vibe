@@ -237,6 +237,9 @@ func runChecks(ctx context.Context, env *doctorEnv) []checkResult {
 	results = append(results, checkFrontendState())
 	results = append(results, checkCommonPorts())
 	results = append(results, checkMCPs())
+	if r, ok := checkRSVGForVision(env, paths.ProfilesDir()); ok {
+		results = append(results, r)
+	}
 
 	if st.daemonOnControl {
 		msg := "running, no active profile"
@@ -626,6 +629,67 @@ func checkMCPsAt(dir string) checkResult {
 		}
 	}
 	return checkResult{Name: name, Status: statusInfo, Message: fmt.Sprintf("%d definitions", n)}
+}
+
+// checkRSVGForVision warns when a vision-capable (mmproj-bearing) profile is
+// installed but `rsvg-convert` is missing from $PATH. The vamp side
+// rasterizes SVGs found under a pipeline's `image_dir` to PNG via this
+// binary before sending them to llama-server, so an mmproj profile + an
+// image_dir pipeline + no rsvg-convert is a runtime-only failure that we
+// can catch proactively here.
+//
+// The second return value is false when there's nothing to report at all —
+// the runner skips appending the result in that case so users without a
+// vision profile don't see noise. Returning (_, false) covers "no profiles
+// dir" / "no mmproj profile" / "we couldn't read the dir at all" because
+// the check is informational and shouldn't FAIL the overall doctor run.
+func checkRSVGForVision(env *doctorEnv, profilesDir string) (checkResult, bool) {
+	const name = "rsvg-convert (vision)"
+	visionProfiles := scanMMProjProfiles(profilesDir)
+	if len(visionProfiles) == 0 {
+		return checkResult{}, false
+	}
+	if _, err := env.lookPath("rsvg-convert"); err == nil {
+		return checkResult{
+			Name:    name,
+			Status:  statusOK,
+			Message: "found (needed for SVG inputs to mmproj profiles: " + strings.Join(visionProfiles, ", ") + ")",
+		}, true
+	}
+	return checkResult{
+		Name:   name,
+		Status: statusWarn,
+		Message: "not on $PATH — vamp pipelines with image_dir feeding " +
+			"mmproj profiles (" + strings.Join(visionProfiles, ", ") +
+			") rasterize SVGs via rsvg-convert. Install `librsvg2-bin` " +
+			"(Debian/Ubuntu) / `librsvg` (Arch, macOS Homebrew).",
+	}, true
+}
+
+// scanMMProjProfiles returns the names of profiles under dir that declare an
+// mmproj path (vision-capable llama-server profiles). YAML parse failures
+// are tolerated silently — the broader `profiles` check already surfaces
+// those — so a single malformed file doesn't blank out the rsvg warning.
+func scanMMProjProfiles(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
+			continue
+		}
+		p, err := profile.Load(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		if p.Backend.LlamaServer != nil && p.Backend.LlamaServer.MMProj != "" {
+			out = append(out, p.Name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func checkGPU(ctx context.Context, env *doctorEnv) checkResult {

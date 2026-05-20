@@ -88,7 +88,15 @@ type Status struct {
 	Pid         int32                  `protobuf:"varint,7,opt,name=pid,proto3" json:"pid,omitempty"`
 	// frontend_env carries the env vars the user should set when launching the
 	// external frontend, so `vibe env` can echo them after the fact.
-	FrontendEnv   map[string]string `protobuf:"bytes,8,rep,name=frontend_env,json=frontendEnv,proto3" json:"frontend_env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	FrontendEnv map[string]string `protobuf:"bytes,8,rep,name=frontend_env,json=frontendEnv,proto3" json:"frontend_env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// parallel reports the active profile's llama_server `parallel` setting:
+	// the number of concurrent inference slots the backend exposes. Zero when
+	// no profile is active or the active profile uses a non-llama_server
+	// backend (the parallel concept is llama-server-specific). Clients use
+	// this to cap their own foreach/fan-out concurrency to the actual
+	// back-pressure point instead of spinning N goroutines that all queue
+	// on the same serialized inference slot.
+	Parallel      int32 `protobuf:"varint,9,opt,name=parallel,proto3" json:"parallel,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -179,6 +187,13 @@ func (x *Status) GetFrontendEnv() map[string]string {
 	return nil
 }
 
+func (x *Status) GetParallel() int32 {
+	if x != nil {
+		return x.Parallel
+	}
+	return 0
+}
+
 type Profile struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
@@ -241,7 +256,6 @@ func (x *Profile) GetPath() string {
 
 type FrontendInfo struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
-	App             string                 `protobuf:"bytes,1,opt,name=app,proto3" json:"app,omitempty"`
 	WroteFile       string                 `protobuf:"bytes,2,opt,name=wrote_file,json=wroteFile,proto3" json:"wrote_file,omitempty"`
 	RestartRequired bool                   `protobuf:"varint,3,opt,name=restart_required,json=restartRequired,proto3" json:"restart_required,omitempty"`
 	// env_vars the user should set when launching the external frontend.
@@ -288,13 +302,6 @@ func (x *FrontendInfo) ProtoReflect() protoreflect.Message {
 // Deprecated: Use FrontendInfo.ProtoReflect.Descriptor instead.
 func (*FrontendInfo) Descriptor() ([]byte, []int) {
 	return file_vibe_v1_control_proto_rawDescGZIP(), []int{2}
-}
-
-func (x *FrontendInfo) GetApp() string {
-	if x != nil {
-		return x.App
-	}
-	return ""
 }
 
 func (x *FrontendInfo) GetWroteFile() string {
@@ -962,7 +969,7 @@ var File_vibe_v1_control_proto protoreflect.FileDescriptor
 
 const file_vibe_v1_control_proto_rawDesc = "" +
 	"\n" +
-	"\x15vibe/v1/control.proto\x12\avibe.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xe6\x02\n" +
+	"\x15vibe/v1/control.proto\x12\avibe.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\x82\x03\n" +
 	"\x06Status\x12\x18\n" +
 	"\arunning\x18\x01 \x01(\bR\arunning\x12\x14\n" +
 	"\x05ready\x18\x02 \x01(\bR\x05ready\x12\x18\n" +
@@ -973,16 +980,16 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\n" +
 	"proxy_addr\x18\x06 \x01(\tR\tproxyAddr\x12\x10\n" +
 	"\x03pid\x18\a \x01(\x05R\x03pid\x12C\n" +
-	"\ffrontend_env\x18\b \x03(\v2 .vibe.v1.Status.FrontendEnvEntryR\vfrontendEnv\x1a>\n" +
+	"\ffrontend_env\x18\b \x03(\v2 .vibe.v1.Status.FrontendEnvEntryR\vfrontendEnv\x12\x1a\n" +
+	"\bparallel\x18\t \x01(\x05R\bparallel\x1a>\n" +
 	"\x10FrontendEnvEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"S\n" +
 	"\aProfile\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12 \n" +
 	"\vdescription\x18\x02 \x01(\tR\vdescription\x12\x12\n" +
-	"\x04path\x18\x03 \x01(\tR\x04path\"\x8b\x02\n" +
-	"\fFrontendInfo\x12\x10\n" +
-	"\x03app\x18\x01 \x01(\tR\x03app\x12\x1d\n" +
+	"\x04path\x18\x03 \x01(\tR\x04path\"\x84\x02\n" +
+	"\fFrontendInfo\x12\x1d\n" +
 	"\n" +
 	"wrote_file\x18\x02 \x01(\tR\twroteFile\x12)\n" +
 	"\x10restart_required\x18\x03 \x01(\bR\x0frestartRequired\x12=\n" +
@@ -991,7 +998,7 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\x03url\x18\x06 \x01(\tR\x03url\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x0f\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x01\x10\x02R\x03app\"\x0f\n" +
 	"\rStatusRequest\"9\n" +
 	"\x0eStatusResponse\x12'\n" +
 	"\x06status\x18\x01 \x01(\v2\x0f.vibe.v1.StatusR\x06status\"\x15\n" +

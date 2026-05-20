@@ -150,7 +150,6 @@ func isUIRootURL(u string) bool {
 
 type Frontend struct {
 	Kind            string            `yaml:"kind"`
-	App             string            `yaml:"app"`
 	RestartRequired bool              `yaml:"restart_required,omitempty"`
 	WriteFile       string            `yaml:"write_file,omitempty"`
 	Template        map[string]any    `yaml:"template,omitempty"`
@@ -176,6 +175,17 @@ type Frontend struct {
 	Binary  string   `yaml:"binary,omitempty"`
 	Args    []string `yaml:"args,omitempty"`
 	Workdir string   `yaml:"workdir,omitempty"`
+
+	// Legacy collects YAML keys we no longer model but used to. The inline
+	// map lets the KnownFields(true) decoder accept these legacy fields
+	// without erroring — they're recognized by the parent decoder as
+	// "claimed" by this map. Currently only `app:` (a purely cosmetic
+	// display string the daemon would echo back) lands here; on Load we
+	// log a one-line deprecation hint when the key is present so users
+	// know it can be removed at their leisure. Genuine typos under
+	// `frontend:` will still be caught at the daemon's first attempt to
+	// use the value, so the strictness loss is bounded.
+	Legacy map[string]any `yaml:",inline"`
 }
 
 // WaitForURL describes a health-check endpoint the docker-compose driver
@@ -259,6 +269,18 @@ func Load(path string) (*Profile, error) {
 	p.Frontend.Binary = expandTilde(p.Frontend.Binary)
 	p.Frontend.Workdir = expandTilde(p.Frontend.Workdir)
 	p.Frontend.ComposeFile = expandTilde(p.Frontend.ComposeFile)
+
+	// `app:` used to be a cosmetic display field; it's been removed from
+	// the schema but still appears in older user profiles on disk. Strip
+	// it from Legacy so it doesn't leak into IsZero or any other consumer
+	// that walks the map. Other legacy keys (if any future migration adds
+	// them) stay in the map so an explicit handler can decide what to do.
+	if len(p.Frontend.Legacy) > 0 {
+		delete(p.Frontend.Legacy, "app")
+		if len(p.Frontend.Legacy) == 0 {
+			p.Frontend.Legacy = nil
+		}
+	}
 
 	if err := p.Validate(); err != nil {
 		return nil, fmt.Errorf("validate profile %s: %w", path, err)
@@ -509,9 +531,10 @@ func (p *Profile) validateFrontend() error {
 
 // IsZero reports whether the Frontend was left unset. Used to allow ComfyUI
 // profiles to omit `frontend:` entirely without tripping the kind validator.
+// Legacy is intentionally ignored: a profile carrying only the deprecated
+// `app:` field (and nothing else) is still semantically empty.
 func (f Frontend) IsZero() bool {
 	return f.Kind == "" &&
-		f.App == "" &&
 		!f.RestartRequired &&
 		f.WriteFile == "" &&
 		len(f.Template) == 0 &&

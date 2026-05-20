@@ -100,7 +100,6 @@ func TestCompose_Activate_BuildsArgv_WithServicesAndProjectName(t *testing.T) {
 		Name: "perplexica",
 		Frontend: profile.Frontend{
 			Kind:        profile.FrontendDockerCompose,
-			App:         "perplexica",
 			ComposeFile: composeFile,
 			ProjectName: "vibe-perplexica",
 			Services:    []string{"searxng", "perplexica"},
@@ -148,7 +147,6 @@ func TestCompose_Activate_DefaultsProjectName(t *testing.T) {
 		Name: "research",
 		Frontend: profile.Frontend{
 			Kind:        profile.FrontendDockerCompose,
-			App:         "perplexica",
 			ComposeFile: composeFile,
 		},
 	}

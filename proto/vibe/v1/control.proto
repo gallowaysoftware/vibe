@@ -47,6 +47,14 @@ message Status {
   // frontend_env carries the env vars the user should set when launching the
   // external frontend, so `vibe env` can echo them after the fact.
   map<string, string> frontend_env = 8;
+  // parallel reports the active profile's llama_server `parallel` setting:
+  // the number of concurrent inference slots the backend exposes. Zero when
+  // no profile is active or the active profile uses a non-llama_server
+  // backend (the parallel concept is llama-server-specific). Clients use
+  // this to cap their own foreach/fan-out concurrency to the actual
+  // back-pressure point instead of spinning N goroutines that all queue
+  // on the same serialized inference slot.
+  int32 parallel = 9;
 }
 
 message Profile {
@@ -56,7 +64,13 @@ message Profile {
 }
 
 message FrontendInfo {
-  string app = 1;
+  // Tag 1 used to carry `app` — a cosmetic display string echoed by the
+  // CLI ("frontend: opencode (running)"). It was removed; the profile name
+  // serves that role instead. The reserved declaration keeps the tag
+  // permanently unused so a future field doesn't accidentally collide
+  // with a stale on-the-wire `app` value.
+  reserved 1;
+  reserved "app";
   string wrote_file = 2;
   bool restart_required = 3;
   // env_vars the user should set when launching the external frontend.

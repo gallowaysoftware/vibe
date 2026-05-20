@@ -435,7 +435,6 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 	if fr != nil {
 		slog.Info("profile started", "profile", p.Name, "backend", st.Addr, "wrote", fr.WroteFile)
 		resp.Frontend = &vibev1.FrontendInfo{
-			App:             p.Frontend.App,
 			WroteFile:       fr.WroteFile,
 			RestartRequired: fr.RestartRequired,
 			EnvVars:         fr.Env,
@@ -621,6 +620,13 @@ func (d *Daemon) protoStatus() *vibev1.Status {
 	if d.active != nil {
 		s.Profile = d.active.Name
 		s.StartedAt = timestamppb.New(d.startTime)
+		// Surface the llama_server `parallel` value so clients (notably vamp)
+		// can cap their own foreach concurrency at the actual back-pressure
+		// point. ComfyUI-backed profiles leave Parallel at its zero value:
+		// the parallel concept is llama-server-specific.
+		if ls := d.active.Backend.LlamaServer; ls != nil {
+			s.Parallel = int32(ls.Parallel)
+		}
 	}
 	if d.frontend != nil {
 		s.FrontendEnv = d.frontend.Env

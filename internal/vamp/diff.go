@@ -591,6 +591,24 @@ func renderStagePromptForDiff(r *diffRun, stageID string) string {
 			render("thumbnail", st.Thumbnail)
 		}
 		return b.String()
+	case StageTypeRender:
+		// Render stages are pure template → text. Same path as text
+		// stages but without LLM involvement.
+		raw := st.Prompt
+		if raw == "" && st.PromptFile != "" {
+			path := st.PromptFile
+			if !filepath.IsAbs(path) {
+				path = filepath.Join(r.path, path)
+			}
+			if data, err := os.ReadFile(path); err == nil {
+				raw = string(data)
+			}
+		}
+		out, err := renderTemplate(stageID+":prompt", raw, st.Inputs, r.inputs, prior, r.path, nil)
+		if err != nil {
+			return raw
+		}
+		return out
 	}
 	return ""
 }

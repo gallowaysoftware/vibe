@@ -5,6 +5,10 @@
   "type": "object",
   "description": "A vamp pipeline definition: name, optional inputs, and a list of stages forming a DAG.",
   "properties": {
+    "cache": {
+      "type": "boolean",
+      "description": "Pipeline-level opt-out: explicit false disables the content-addressed cache for every stage in the pipeline."
+    },
     "description": {
       "type": "string",
       "description": "Free-form human description."
@@ -48,6 +52,35 @@
         "type": "object",
         "description": "A single stage in the pipeline DAG.",
         "properties": {
+          "assert": {
+            "type": "object",
+            "description": "Optional response checks (webhook stages). Turns a webhook into a smoke-test probe: status_code, body_contains, body_not_contains, min_body_length are all validated against the response. Setting status_code overrides the default 2xx-required behaviour so tests can confirm a 401/4xx.",
+            "properties": {
+              "body_contains": {
+                "type": "array",
+                "description": "Substrings that ALL must appear in the response body.",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "body_not_contains": {
+                "type": "array",
+                "description": "Substrings that must NOT appear in the response body.",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "min_body_length": {
+                "type": "integer",
+                "description": "Minimum response body length in bytes. Catches 200 + empty body."
+              },
+              "status_code": {
+                "type": "integer",
+                "description": "Exact HTTP status code required. Overrides the default 2xx check."
+              }
+            },
+            "additionalProperties": false
+          },
           "binary": {
             "type": "string",
             "description": "Override the path to the piper or ffmpeg binary on $PATH."
@@ -60,6 +93,10 @@
           "body_template_file": {
             "type": "string",
             "description": "Path to a body template file; rendered verbatim and sent as the request body."
+          },
+          "cache": {
+            "type": "boolean",
+            "description": "Per-stage opt-out: explicit false disables the content-addressed cache for this stage; absent inherits the pipeline default."
           },
           "capability": {
             "type": "string",
@@ -120,6 +157,10 @@
             "items": {
               "type": "string"
             }
+          },
+          "message": {
+            "type": "string",
+            "description": "Approval prompt rendered to the operator (confirm stages)."
           },
           "method": {
             "type": "string",
@@ -215,17 +256,15 @@
           },
           "retry_on_5xx": {
             "type": "boolean",
-            "description": "When true (the default) a 5xx response triggers the transient-error retry path."
+            "description": "Deprecated alias for retry_on_transient. When true (the default) a 5xx response triggers the transient-error retry path. New pipelines should use retry_on_transient — it covers HTTP 429 too."
+          },
+          "retry_on_transient": {
+            "type": "boolean",
+            "description": "When true (the default) HTTP 429 (rate-limited) and HTTP 5xx responses trigger the transient-error retry path with exponential backoff. Replaces retry_on_5xx; mutually exclusive with that deprecated alias."
           },
           "run_when": {
             "type": "string",
-            "description": "Gate the stage on prior outcome: success (default), failure, or always.",
-            "enum": [
-              "",
-              "success",
-              "failure",
-              "always"
-            ],
+            "description": "Gate the stage. Reserved keywords success (default) / failure / always inspect upstream status; any other value is a Go text/template expression that must render to one of true/yes/1 (run) or false/no/0/\"\" (skip).",
             "default": "success"
           },
           "tags": {
@@ -243,6 +282,11 @@
             "type": "string",
             "description": "Optional template path to a thumbnail image (youtube stages)."
           },
+          "timeout": {
+            "type": "string",
+            "description": "Go time.ParseDuration form, e.g. \"500ms\", \"5s\", \"1m\".",
+            "pattern": "^[0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h)$"
+          },
           "title": {
             "type": "string",
             "description": "Templated video title (youtube stages)."
@@ -257,7 +301,8 @@
               "audio",
               "ffmpeg",
               "youtube",
-              "webhook"
+              "webhook",
+              "confirm"
             ]
           },
           "url": {
@@ -378,6 +423,35 @@
       "type": "object",
       "description": "A single stage in the pipeline DAG.",
       "properties": {
+        "assert": {
+          "type": "object",
+          "description": "Optional response checks (webhook stages). Turns a webhook into a smoke-test probe: status_code, body_contains, body_not_contains, min_body_length are all validated against the response. Setting status_code overrides the default 2xx-required behaviour so tests can confirm a 401/4xx.",
+          "properties": {
+            "body_contains": {
+              "type": "array",
+              "description": "Substrings that ALL must appear in the response body.",
+              "items": {
+                "type": "string"
+              }
+            },
+            "body_not_contains": {
+              "type": "array",
+              "description": "Substrings that must NOT appear in the response body.",
+              "items": {
+                "type": "string"
+              }
+            },
+            "min_body_length": {
+              "type": "integer",
+              "description": "Minimum response body length in bytes. Catches 200 + empty body."
+            },
+            "status_code": {
+              "type": "integer",
+              "description": "Exact HTTP status code required. Overrides the default 2xx check."
+            }
+          },
+          "additionalProperties": false
+        },
         "binary": {
           "type": "string",
           "description": "Override the path to the piper or ffmpeg binary on $PATH."
@@ -390,6 +464,10 @@
         "body_template_file": {
           "type": "string",
           "description": "Path to a body template file; rendered verbatim and sent as the request body."
+        },
+        "cache": {
+          "type": "boolean",
+          "description": "Per-stage opt-out: explicit false disables the content-addressed cache for this stage; absent inherits the pipeline default."
         },
         "capability": {
           "type": "string",
@@ -450,6 +528,10 @@
           "items": {
             "type": "string"
           }
+        },
+        "message": {
+          "type": "string",
+          "description": "Approval prompt rendered to the operator (confirm stages)."
         },
         "method": {
           "type": "string",
@@ -545,17 +627,15 @@
         },
         "retry_on_5xx": {
           "type": "boolean",
-          "description": "When true (the default) a 5xx response triggers the transient-error retry path."
+          "description": "Deprecated alias for retry_on_transient. When true (the default) a 5xx response triggers the transient-error retry path. New pipelines should use retry_on_transient — it covers HTTP 429 too."
+        },
+        "retry_on_transient": {
+          "type": "boolean",
+          "description": "When true (the default) HTTP 429 (rate-limited) and HTTP 5xx responses trigger the transient-error retry path with exponential backoff. Replaces retry_on_5xx; mutually exclusive with that deprecated alias."
         },
         "run_when": {
           "type": "string",
-          "description": "Gate the stage on prior outcome: success (default), failure, or always.",
-          "enum": [
-            "",
-            "success",
-            "failure",
-            "always"
-          ],
+          "description": "Gate the stage. Reserved keywords success (default) / failure / always inspect upstream status; any other value is a Go text/template expression that must render to one of true/yes/1 (run) or false/no/0/\"\" (skip).",
           "default": "success"
         },
         "tags": {
@@ -573,6 +653,11 @@
           "type": "string",
           "description": "Optional template path to a thumbnail image (youtube stages)."
         },
+        "timeout": {
+          "type": "string",
+          "description": "Go time.ParseDuration form, e.g. \"500ms\", \"5s\", \"1m\".",
+          "pattern": "^[0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h)$"
+        },
         "title": {
           "type": "string",
           "description": "Templated video title (youtube stages)."
@@ -587,7 +672,8 @@
             "audio",
             "ffmpeg",
             "youtube",
-            "webhook"
+            "webhook",
+            "confirm"
           ]
         },
         "url": {

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 )
 
@@ -149,7 +151,6 @@ func fillReplacements(t *testing.T, body, kind string) string {
 		model := writeModelStub(t)
 		body = strings.ReplaceAll(body, "~/models/REPLACE-model.gguf", model)
 		body = strings.ReplaceAll(body, "REPLACE-model-alias", "test-alias")
-		body = strings.ReplaceAll(body, "REPLACE-app-name", "test-app")
 		// wait_for.url's REPLACE-port: just give it a port number.
 		body = strings.ReplaceAll(body, "REPLACE-port", "3000")
 	default:
@@ -355,6 +356,195 @@ func TestProfileInit_TemplateFilesReadable(t *testing.T) {
 	}
 	if len(got) == 0 {
 		t.Fatal("embed FS resolved profile_templates/ but it has no entries")
+	}
+}
+
+// ─── `vibe profile new` ─────────────────────────────────────────────────────
+
+// TestProfileNew_DefaultsLlamaServerExternal asserts that `vibe profile new
+// <name>` with no flags drops a kind=llama-server + frontend=external
+// template at <profiles-dir>/<name>.yaml. The defaults match what a
+// first-time user is most likely to want (opencode-style external frontend
+// against a llama-server backend).
+func TestProfileNew_DefaultsLlamaServerExternal(t *testing.T) {
+	profilesDir := stubProfileEnv(t)
+	cmd := profileCmd()
+	cmd.SetArgs([]string{"new", "myprof"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	dest := filepath.Join(profilesDir, "myprof.yaml")
+	body, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read dropped file: %v", err)
+	}
+	got := string(body)
+	if !strings.Contains(got, "name: myprof") {
+		t.Errorf("rendered template missing `name: myprof`:\n%s", got)
+	}
+	if !strings.Contains(got, "llama_server:") {
+		t.Errorf("rendered template missing llama_server backend (default --kind)")
+	}
+	if !strings.Contains(got, "kind: external") {
+		t.Errorf("rendered template missing kind: external (default --frontend)")
+	}
+}
+
+// TestProfileNew_KindComfyUI verifies the --kind=comfyui flag selects the
+// ComfyUI starter template, irrespective of --frontend (since ComfyUI
+// ships its own UI).
+func TestProfileNew_KindComfyUI(t *testing.T) {
+	profilesDir := stubProfileEnv(t)
+	cmd := profileCmd()
+	cmd.SetArgs([]string{"new", "imgs", "--kind", "comfyui"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(profilesDir, "imgs.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	if !strings.Contains(got, "comfyui:") {
+		t.Errorf("rendered template missing comfyui backend:\n%s", got)
+	}
+	// Walk the rendered file line-by-line and assert no line at column 0
+	// declares `frontend:` — the only occurrences should be inside `#`
+	// comment lines (the template's "no frontend block needed" prose).
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(strings.TrimRight(line, " \t"), "frontend:") {
+			t.Errorf("comfyui template should not declare a top-level frontend block; offending line: %q", line)
+		}
+	}
+}
+
+// TestProfileNew_FrontendDockerCompose asserts --frontend=docker-compose
+// selects the docker-compose template under kind=llama-server.
+func TestProfileNew_FrontendDockerCompose(t *testing.T) {
+	profilesDir := stubProfileEnv(t)
+	cmd := profileCmd()
+	cmd.SetArgs([]string{"new", "stack", "--frontend", "docker-compose"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(profilesDir, "stack.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "kind: docker-compose") {
+		t.Errorf("rendered template missing docker-compose frontend kind")
+	}
+}
+
+// TestProfileNew_RefusesOverwrite asserts the create-then-create flow
+// without --force fails with a helpful message, and that --force fixes it.
+func TestProfileNew_RefusesOverwrite(t *testing.T) {
+	profilesDir := stubProfileEnv(t)
+
+	first := profileCmd()
+	first.SetArgs([]string{"new", "dup"})
+	first.SetOut(io.Discard)
+	first.SetErr(io.Discard)
+	if err := first.Execute(); err != nil {
+		t.Fatalf("first new: %v", err)
+	}
+
+	second := profileCmd()
+	second.SetArgs([]string{"new", "dup"})
+	second.SetOut(io.Discard)
+	var errOut bytes.Buffer
+	second.SetErr(&errOut)
+	err := second.Execute()
+	if err == nil {
+		t.Fatal("expected error on overwrite without --force")
+	}
+	if !strings.Contains(err.Error(), "refusing to overwrite") {
+		t.Errorf("wrong error: %v", err)
+	}
+
+	third := profileCmd()
+	third.SetArgs([]string{"new", "dup", "--force"})
+	third.SetOut(io.Discard)
+	third.SetErr(io.Discard)
+	if err := third.Execute(); err != nil {
+		t.Fatalf("--force overwrite: %v", err)
+	}
+	// Sanity: file still exists.
+	if _, err := os.Stat(filepath.Join(profilesDir, "dup.yaml")); err != nil {
+		t.Fatalf("post-force file missing: %v", err)
+	}
+}
+
+// TestProfileNew_UnknownKindRejected guards the enum validation on
+// --kind, since cobra's default behavior is to accept any string for
+// StringVar flags.
+func TestProfileNew_UnknownKindRejected(t *testing.T) {
+	stubProfileEnv(t)
+	cmd := profileCmd()
+	cmd.SetArgs([]string{"new", "x", "--kind", "stable-diffusion"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error on unknown --kind")
+	}
+	if !strings.Contains(err.Error(), "unknown") {
+		t.Errorf("wrong error: %v", err)
+	}
+}
+
+// TestProfileNew_UnknownFrontendRejected guards the enum validation on
+// --frontend for kind=llama-server.
+func TestProfileNew_UnknownFrontendRejected(t *testing.T) {
+	stubProfileEnv(t)
+	cmd := profileCmd()
+	cmd.SetArgs([]string{"new", "x", "--frontend", "headless"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error on unknown --frontend")
+	}
+	if !strings.Contains(err.Error(), "unknown") {
+		t.Errorf("wrong error: %v", err)
+	}
+}
+
+// TestProfileNew_TabCompletionEnums asserts cobra's flag completion
+// surfaces the enum values for --kind and --frontend, so users can
+// discover the valid set via `<TAB>` without consulting --help.
+func TestProfileNew_TabCompletionEnums(t *testing.T) {
+	cmd := profileCmd()
+	// Find the "new" subcommand on the parent. cobra wires completion
+	// per-flag, so we exercise the registered functions directly.
+	var newSub *cobra.Command
+	for _, c := range cmd.Commands() {
+		if c.Name() == "new" {
+			newSub = c
+			break
+		}
+	}
+	if newSub == nil {
+		t.Fatal("profileCmd missing `new` subcommand")
+	}
+	// Drive the registered completion functions for both flags. cobra
+	// stores them keyed by flag name; pull them out via the public API.
+	for _, flag := range []string{"kind", "frontend"} {
+		fn, ok := newSub.GetFlagCompletionFunc(flag)
+		if !ok || fn == nil {
+			t.Errorf("flag %q missing a completion function", flag)
+			continue
+		}
+		vals, _ := fn(newSub, nil, "")
+		if len(vals) == 0 {
+			t.Errorf("flag %q completion returned no values", flag)
+		}
 	}
 }
 
