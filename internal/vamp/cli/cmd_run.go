@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"text/template"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -347,7 +349,17 @@ func parseInputs(flags []string, p *vamp.Pipeline) (map[string]string, error) {
 			continue
 		}
 		if spec.Default != "" {
-			inputs[name] = spec.Default
+			// Defaults are template-rendered against the inputs collected so
+			// far so an input can substitute another (e.g.
+			// `lesson_root: { default: "~/.../Module_{{ .inputs.module_num }}" }`
+			// where module_num is a separate required input). Single-pass:
+			// defaults that depend on OTHER defaults aren't supported yet —
+			// add a topological-sort pass here if a pipeline ever needs it.
+			rendered, err := renderInputDefault(name, spec.Default, inputs)
+			if err != nil {
+				return nil, err
+			}
+			inputs[name] = rendered
 			continue
 		}
 		if spec.Required {
@@ -355,4 +367,23 @@ func parseInputs(flags []string, p *vamp.Pipeline) (map[string]string, error) {
 		}
 	}
 	return inputs, nil
+}
+
+// renderInputDefault evaluates an InputSpec.Default as a Go text/template
+// against the inputs already resolved. Empty / non-templated defaults short-
+// circuit (no rendering overhead). The template binding mirrors what every
+// stage's prompt template sees: `.inputs.<name>` for other inputs.
+func renderInputDefault(name, raw string, resolved map[string]string) (string, error) {
+	if !strings.Contains(raw, "{{") {
+		return raw, nil
+	}
+	tmpl, err := template.New("input:" + name).Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("input %q: parse default template: %w", name, err)
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, map[string]any{"inputs": resolved}); err != nil {
+		return "", fmt.Errorf("input %q: render default: %w", name, err)
+	}
+	return buf.String(), nil
 }

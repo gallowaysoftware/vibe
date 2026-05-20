@@ -80,6 +80,14 @@ const (
 	// concatenating JSON, or producing intermediate config. Does not activate
 	// a vibe profile.
 	StageTypeRender StageType = "render"
+	// StageTypeCompact summarizes oversized text via LLM calls so the result
+	// fits a target size. Use when a downstream stage's prompt would exceed
+	// the model's context window: instead of truncating (which silently
+	// drops content), compact iteratively chunks the source, runs an LLM
+	// pass over each chunk preserving facts the user declares important,
+	// and concatenates the compressed chunks. Recurses if the first pass
+	// still overshoots the target.
+	StageTypeCompact StageType = "compact"
 )
 
 // StageExecutor implements the run of a single stage instance. The receiver
@@ -362,6 +370,7 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 		StageTypeWebhook: &webhookExecutor{},
 		StageTypeConfirm: newConfirmExecutor(),
 		StageTypeRender:  &renderExecutor{},
+		StageTypeCompact: &compactExecutor{inference: e.Inference},
 	}
 
 	// Stage lookup and dependency counts for wave-based scheduling.
@@ -2147,8 +2156,138 @@ func templateFuncs() template.FuncMap {
 		"parseJSON":        parseJSONTemplate,
 		"toJSON":           toJSONTemplate,
 		"urlencode":        urlencodeTemplate,
+		"stripDataURIs":    stripDataURIsTemplate,
+		"truncate":         truncateTemplate,
+		"flattenItems":     flattenItemsTemplate,
 	}
 }
+
+// flattenItemsTemplate takes the concatenated foreach output of a stage
+// whose per-item JSON is shaped as {"items":[...], <other fields>} and
+// produces a single flat JSON array of all the items, with the per-item
+// object's other top-level fields propagated onto each emitted item so
+// downstream foreach iterations can read them.
+//
+// Concrete use case: a per-unit script generator emits
+// {"unit_id":"cereals","items":[{"text":"...","topic":"..."},...]}
+// once per unit. The foreach stage's combined .output is several such
+// objects blank-line-separated. Flattening produces
+// [{"unit_id":"cereals","text":"...","topic":"..."}, ...] so an audio
+// foreach can iterate over individual segments and access their owning
+// unit's id (e.g. for an audio/{{.segment.unit_id}}/ subdir output path).
+//
+// Markdown fences are tolerated (same as mergeJSONTemplate). Objects
+// without an "items" key are passed through verbatim (treated as a
+// single-element items array of themselves) so callers don't have to
+// special-case the no-items shape.
+func flattenItemsTemplate(raw string) (string, error) {
+	var b strings.Builder
+	for _, line := range strings.Split(raw, "\n") {
+		trim := strings.TrimSpace(line)
+		if trim == "```json" || trim == "```JSON" || trim == "```" {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	dec := json.NewDecoder(strings.NewReader(b.String()))
+	var out []any
+	for {
+		var v any
+		err := dec.Decode(&v)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("flattenItems: decode at offset %d: %w", dec.InputOffset(), err)
+		}
+		obj, ok := v.(map[string]any)
+		if !ok {
+			out = append(out, v)
+			continue
+		}
+		items, hasItems := obj["items"].([]any)
+		if !hasItems {
+			out = append(out, obj)
+			continue
+		}
+		// Copy every non-"items" field onto each item so the downstream
+		// foreach iteration sees them on its per-item binding.
+		extras := make(map[string]any, len(obj)-1)
+		for k, val := range obj {
+			if k == "items" {
+				continue
+			}
+			extras[k] = val
+		}
+		for _, it := range items {
+			itObj, ok := it.(map[string]any)
+			if !ok {
+				out = append(out, it)
+				continue
+			}
+			for k, val := range extras {
+				if _, present := itObj[k]; !present {
+					itObj[k] = val
+				}
+			}
+			out = append(out, itObj)
+		}
+	}
+	if out == nil {
+		out = []any{}
+	}
+	res, err := json.Marshal(out)
+	if err != nil {
+		return "", fmt.Errorf("flattenItems: marshal: %w", err)
+	}
+	return string(res), nil
+}
+
+// truncateTemplate clips s to at most n bytes (UTF-8 boundary aware) and
+// appends a visible marker so the LLM knows content was elided. Intended
+// for oversized inputs that would otherwise blow past a model's context
+// window — e.g. a single curriculum lesson whose markdown is large enough
+// to push the prompt past the GGUF's compiled-in context size.
+//
+// The pipe form reads cleanly:
+//
+//	{{ readFile ... | stripDataURIs | truncate 200000 }}
+//
+// Trims to a rune boundary so a 4-byte glyph at the boundary isn't sliced
+// in half, producing invalid UTF-8 in the prompt.
+func truncateTemplate(n int, s string) string {
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	cut := n
+	for cut > 0 && (s[cut]&0xC0) == 0x80 {
+		cut--
+	}
+	return s[:cut] + "\n\n... [content truncated to fit model context]"
+}
+
+// stripDataURIsTemplate removes inline `data:` image references from a
+// markdown document while preserving the surrounding alt-text bracket.
+//
+// Some source markdown (e.g. exported from rendering toolchains like MathJax
+// or pandoc) embeds math formulas as `![alt](data:image/svg+xml;...)` with
+// URL-encoded SVG markup inline — a single lesson can carry 30+ such
+// references for ~10KB each, ballooning the prompt past a model's context
+// window even though the alt text already encodes the math in plain language.
+// File-backed images (`![alt](images/foo.svg)`) are left alone since they
+// resolve via image_dir multimodal attachment.
+//
+// Each `![alt](data:...)` is rewritten to `[alt]` so the description survives
+// for the LLM to read; the broken-once-stripped image link is dropped. We
+// match through to the next `)` only when no `)` can appear inside the data
+// URI body (URL-encoded form uses %29 for literal close-paren), which is the
+// common case.
+func stripDataURIsTemplate(s string) string {
+	return mdDataURIRE.ReplaceAllString(s, "[$1]")
+}
+
+var mdDataURIRE = regexp.MustCompile(`!\[([^\]]*)\]\(data:[^)]*\)`)
 
 // urlencodeTemplate percent-encodes v for safe use in a URL query
 // component. Accepts any value (stringified via fmt.Sprint) so foreach
@@ -2612,13 +2751,22 @@ func (e *Executor) runStageCleanup(st *Stage) {
 
 func validateJSON(s string) error {
 	var v any
-	return json.Unmarshal([]byte(stripMarkdownFences(s)), &v)
+	return json.Unmarshal([]byte(stripModelArtifacts(s)), &v)
 }
 
-// stripMarkdownFences removes surrounding ```json / ``` markdown code fence
-// wrappers from LLM output so validateJSON can parse the inner JSON.
-func stripMarkdownFences(s string) string {
+// stripModelArtifacts removes LLM-side wrappers that aren't part of the
+// intended JSON payload before parsing: Qwen3-style `<think>...</think>`
+// reasoning preambles and surrounding ```json / ``` markdown code fences.
+// Designed to be conservative — only the documented artefact shapes are
+// recognised, so a literal `<think>` token inside the user's data isn't
+// inadvertently scrubbed.
+func stripModelArtifacts(s string) string {
 	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "<think>") {
+		if end := strings.Index(s, "</think>"); end >= 0 {
+			s = strings.TrimSpace(s[end+len("</think>"):])
+		}
+	}
 	if strings.HasPrefix(s, "```json") {
 		s = strings.TrimPrefix(s, "```json")
 		s = strings.TrimPrefix(s, "```")

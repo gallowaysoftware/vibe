@@ -135,6 +135,50 @@ func TestReadFilesTemplate(t *testing.T) {
 	}
 }
 
+// TestFlattenItemsTemplate covers the per-unit-script → flat-segments
+// transform: concatenated `{unit_id, items}` objects in, flat array of
+// items-with-unit_id-stamped out. Markdown fences and items-less objects
+// are tolerated.
+func TestFlattenItemsTemplate(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "two units flatten with stamped extras",
+			in:   `{"unit_id":"a","items":[{"t":"1"},{"t":"2"}]}` + "\n\n" + `{"unit_id":"b","items":[{"t":"3"}]}`,
+			want: `[{"t":"1","unit_id":"a"},{"t":"2","unit_id":"a"},{"t":"3","unit_id":"b"}]`,
+		},
+		{
+			name: "no items key passes through",
+			in:   `{"x":1}`,
+			want: `[{"x":1}]`,
+		},
+		{
+			name: "fenced",
+			in:   "```json\n" + `{"unit_id":"a","items":[{"k":1}]}` + "\n```",
+			want: `[{"k":1,"unit_id":"a"}]`,
+		},
+		{
+			name: "empty",
+			in:   "",
+			want: `[]`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := flattenItemsTemplate(tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestStageCacheKey_ImageHashesInvalidate locks down that text-stage cache
 // keys differ when the attached image bytes differ. Without this, a lesson
 // dir with an updated SVG (e.g. a corrected diagram) would serve the

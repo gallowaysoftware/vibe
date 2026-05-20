@@ -101,6 +101,15 @@ type Stage struct {
 	// is true; the executor constructs the argv internally. Designed for
 	// concatenating foreach audio stage outputs into a single podcast file.
 	ConcatWavs bool `yaml:"concat_wavs,omitempty"`
+	// ConcatWavsDir, when non-empty on a concat_wavs ffmpeg stage, scopes
+	// the WAV walk to a specific subdirectory of the run dir instead of
+	// the whole run dir. Template-rendered so a foreach mp3 stage can
+	// concat per-item subdirectories (e.g. `audio/{{.unit.unit_id}}` —
+	// one MP3 per unit when generate_script emits unit-tagged segments
+	// to per-unit audio subdirs). Path must resolve to a path relative
+	// to the run dir; absolute paths are rejected to keep cleanup +
+	// resume sane.
+	ConcatWavsDir string `yaml:"concat_wavs_dir,omitempty"`
 
 	// YouTube-stage fields. Video is a template path to the MP4 to upload
 	// (typically the output of an upstream ffmpeg stage). Title/Description
@@ -192,6 +201,33 @@ type Stage struct {
 	// for upstream-status gating: the template fires only after the deps
 	// have all succeeded.
 	RunWhen string `yaml:"run_when,omitempty"`
+
+	// Compact-stage fields. A `type: compact` stage replaces the brittle
+	// `| truncate N` template pattern: when an upstream's text would
+	// overflow a downstream LLM's context window, route it through a
+	// compact stage instead so an LLM call produces a summary that fits,
+	// rather than silently dropping the tail of the content.
+	//
+	// Source is the template that renders the text to compress (typically
+	// `{{ .stages.<upstream>.output }}`).
+	//
+	// TargetChars is the approximate ceiling on the compacted output's
+	// length in characters. The executor recursively re-compacts when a
+	// first pass still overshoots.
+	//
+	// ChunkChars caps how much of Source is sent to the model per LLM
+	// call. Default is TargetChars * 4 (lets a single chunk fit a
+	// 131K-context model comfortably with room for output). When Source
+	// is shorter than ChunkChars, exactly one LLM call runs.
+	//
+	// Preserve is a free-form directive describing what MUST be retained
+	// across the compaction (e.g. "every numerical value, temperature,
+	// pH, equipment name"). It is interpolated into the built-in
+	// compaction prompt template.
+	Source      string `yaml:"source,omitempty"`
+	TargetChars int    `yaml:"target_chars,omitempty"`
+	ChunkChars  int    `yaml:"chunk_chars,omitempty"`
+	Preserve    string `yaml:"preserve,omitempty"`
 
 	// Message is the rendered prompt a `type: confirm` stage prints to the
 	// operator (and writes into the marker file) when asking for approval.
@@ -550,6 +586,15 @@ func (p *Pipeline) Validate() error {
 			if !s.ConcatWavs && len(s.FFmpegArgs) == 0 {
 				return fmt.Errorf("%s: ffmpeg_args is required for type: ffmpeg stages (unless concat_wavs is true)", ctx)
 			}
+			if s.ConcatWavsDir != "" && !s.ConcatWavs {
+				return fmt.Errorf("%s: concat_wavs_dir is only valid when concat_wavs is true", ctx)
+			}
+			if s.ConcatWavsDir != "" {
+				cleaned := filepath.Clean(s.ConcatWavsDir)
+				if filepath.IsAbs(cleaned) || strings.HasPrefix(cleaned, "..") {
+					return fmt.Errorf("%s: concat_wavs_dir %q must be a relative path inside the run dir", ctx, s.ConcatWavsDir)
+				}
+			}
 			if s.Capability != "" {
 				return fmt.Errorf("%s: capability is only valid on stage types that activate a vibe profile (ffmpeg runs as a local subprocess)", ctx)
 			}
@@ -864,8 +909,49 @@ func (p *Pipeline) Validate() error {
 			if err := rejectWebhookFields(ctx, s); err != nil {
 				return err
 			}
+		case StageTypeCompact:
+			// Compact stages summarize an oversized upstream via LLM calls so
+			// downstream prompts fit a model's context window. Required:
+			// source (template), target_chars (> 0), capability (LLM to call).
+			// preserve and chunk_chars are optional.
+			if s.Source == "" {
+				return fmt.Errorf("%s: source template is required for type: compact", ctx)
+			}
+			if _, err := template.New(s.ID + ":source").Funcs(templateFuncs()).Parse(s.Source); err != nil {
+				return fmt.Errorf("%s: parse source template: %w", ctx, err)
+			}
+			if s.TargetChars <= 0 {
+				return fmt.Errorf("%s: target_chars must be > 0 for type: compact", ctx)
+			}
+			if s.ChunkChars < 0 {
+				return fmt.Errorf("%s: chunk_chars must be >= 0 (0 = pick automatically) for type: compact", ctx)
+			}
+			if s.Prompt != "" || s.PromptFile != "" {
+				return fmt.Errorf("%s: prompt/prompt_file are not valid on type: compact (use source + preserve instead)", ctx)
+			}
+			if s.Workflow != "" {
+				return fmt.Errorf("%s: workflow is only valid on type: comfyui stages", ctx)
+			}
+			if len(s.Parameters) > 0 {
+				return fmt.Errorf("%s: parameters is only valid on type: comfyui stages", ctx)
+			}
+			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" {
+				return fmt.Errorf("%s: voice/text/voices_dir are only valid on type: audio stages", ctx)
+			}
+			if len(s.FFmpegArgs) > 0 {
+				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
+			}
+			if s.ImageDir != "" {
+				return fmt.Errorf("%s: image_dir is only valid on type: text stages", ctx)
+			}
+			if err := rejectYouTubeFields(ctx, s); err != nil {
+				return err
+			}
+			if err := rejectWebhookFields(ctx, s); err != nil {
+				return err
+			}
 		default:
-			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio, ffmpeg, youtube, webhook, confirm, render)", ctx, s.Type)
+			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio, ffmpeg, youtube, webhook, confirm, render, compact)", ctx, s.Type)
 		}
 		if s.OutputFormat != "" && s.OutputFormat != "json" {
 			return fmt.Errorf("%s: output_format %q is not supported (allowed: \"\", json)", ctx, s.OutputFormat)

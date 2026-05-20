@@ -47,7 +47,7 @@ type schemaProperty struct {
 // trips the generated schema and re-validates the example pipelines against
 // it so the two stay in sync.
 func Schema() *schemaProperty {
-	stageTypeEnum := []any{"", "text", "comfyui", "audio", "ffmpeg", "youtube", "webhook", "confirm"}
+	stageTypeEnum := []any{"", "text", "comfyui", "audio", "ffmpeg", "youtube", "webhook", "confirm", "render", "compact"}
 	// runWhenEnum captures the keyword forms only; template-form run_when
 	// values can be any Go text/template expression and are validated at
 	// LoadPipeline time. Leaving the field as `type: string` (no enum
@@ -214,6 +214,28 @@ func Schema() *schemaProperty {
 				Type:        "array",
 				Description: "Literal argv passed to ffmpeg (each entry template-rendered).",
 				Items:       &schemaProperty{Type: "string"},
+			},
+			"concat_wavs_dir": {
+				Type:        "string",
+				Description: "Subdirectory (template-rendered, relative to the run dir) to scope the *.wav walk when concat_wavs is true. Defaults to the whole run dir.",
+			},
+			"source": {
+				Type:        "string",
+				Description: "Template rendering the text to compact (compact stages). Typically `{{ .stages.<upstream>.output }}`.",
+			},
+			"target_chars": {
+				Type:        "integer",
+				Description: "Approximate ceiling on the compacted output's length in characters (compact stages). Must be > 0.",
+				Minimum:     float64Ptr(1),
+			},
+			"chunk_chars": {
+				Type:        "integer",
+				Description: "Max characters of source sent per LLM call (compact stages). 0 = pick automatically (target_chars × 4).",
+				Minimum:     float64Ptr(0),
+			},
+			"preserve": {
+				Type:        "string",
+				Description: "Free-form directive describing what MUST be preserved in the compaction (compact stages). E.g. `every numerical value, equipment name, process step`.",
 			},
 			"video": {
 				Type:        "string",

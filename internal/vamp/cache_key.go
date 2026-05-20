@@ -35,7 +35,7 @@ func EnvCacheDisabled() bool {
 // CLI/docs all agree on the same allow-list.
 func stageCacheable(st *Stage) bool {
 	switch stageTypeOrDefault(st) {
-	case StageTypeText, StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg, StageTypeRender:
+	case StageTypeText, StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg, StageTypeRender, StageTypeCompact:
 		return true
 	default:
 		return false
@@ -190,6 +190,8 @@ func stageCacheKey(in keyInput) (string, error) {
 		), nil
 	case StageTypeRender:
 		return cache.HashStrings("render", in.RenderedPrompt), nil
+	case StageTypeCompact:
+		return cache.HashStrings("compact", in.RenderedPrompt, in.ModelID), nil
 	default:
 		// Non-cacheable types should never reach here — stageCacheable
 		// gates that upstream. Return an empty key as a defensive no-op so
@@ -377,6 +379,51 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 				inputs = append(inputs, a)
 			}
 		}
+		// For concat_wavs stages the per-iteration context lives in fields
+		// the user-args heuristic above can't see (st.FFmpegArgs is empty,
+		// the WAVs are walked by the executor, not named on argv). Without
+		// the supplemental fields below, every foreach iteration of an
+		// `mp3` stage with `concat_wavs: true` produces an identical cache
+		// key and serves the first iteration's output to all iterations.
+		// Fold in: the rendered output path, the rendered concat_wavs_dir,
+		// and the sha of every WAV that walk would pick up.
+		if st.ConcatWavs {
+			outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+			if err != nil {
+				return "", fmt.Errorf("cache key: render output: %w", err)
+			}
+			args = append(args, "concat_wavs:output:"+outRel)
+			walkRoot := e.RunDir
+			if st.ConcatWavsDir != "" {
+				dir, err := renderTemplate(st.ID+":concat_wavs_dir", st.ConcatWavsDir, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+				if err != nil {
+					return "", fmt.Errorf("cache key: render concat_wavs_dir: %w", err)
+				}
+				args = append(args, "concat_wavs:dir:"+dir)
+				walkRoot = filepath.Join(e.RunDir, dir)
+			}
+			// Add every WAV under walkRoot to FFmpegInputs so the cache
+			// key reflects the actual bytes that ffmpeg will glue together.
+			err = filepath.WalkDir(walkRoot, func(path string, d os.DirEntry, walkErr error) error {
+				if walkErr != nil {
+					if os.IsNotExist(walkErr) {
+						return nil
+					}
+					return walkErr
+				}
+				if d.IsDir() {
+					return nil
+				}
+				if strings.EqualFold(filepath.Ext(d.Name()), ".wav") {
+					inputs = append(inputs, path)
+				}
+				return nil
+			})
+			if err != nil {
+				return "", fmt.Errorf("cache key: walk %s: %w", walkRoot, err)
+			}
+			sort.Strings(inputs)
+		}
 		return stageCacheKey(keyInput{
 			StageType:    StageTypeFFmpeg,
 			Binary:       st.Binary,
@@ -389,6 +436,21 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 			return "", fmt.Errorf("cache key: render prompt: %w", err)
 		}
 		return cache.HashStrings("render", prompt), nil
+	case StageTypeCompact:
+		// Cache key reflects the source + target_chars + chunk_chars + preserve
+		// directive; identical inputs and parameters yield identical compaction.
+		source, err := renderTemplate(st.ID+":source", st.Source, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+		if err != nil {
+			return "", fmt.Errorf("cache key: render compact source: %w", err)
+		}
+		return cache.HashStrings("compact",
+			st.Capability,
+			source,
+			fmt.Sprintf("%d", st.TargetChars),
+			fmt.Sprintf("%d", st.ChunkChars),
+			st.Preserve,
+			e.cachedKeyModelID(),
+		), nil
 	default:
 		return "", nil
 	}

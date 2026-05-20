@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -136,19 +137,58 @@ func (f *ffmpegExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 	return &StageOutput{Files: []string{outAbs}}, nil
 }
 
-// executeConcatWavs globs all "*.wav" files in the run dir, sorts them
+// executeConcatWavs walks the run dir for all "*.wav" files, sorts them
 // numerically (segment_0.wav, segment_1.wav, ...), creates a concat file
-// list, and runs ffmpeg to merge them into the output MP3.
+// list, and runs ffmpeg to merge them into the output MP3. The walk is
+// recursive so audio stages that write to a per-stage subdirectory (e.g.
+// `output: "audio/segment_{{.i}}.wav"`) are still picked up — a flat
+// `filepath.Glob` of `*.wav` would miss those.
 func (f *ffmpegExecutor) executeConcatWavs(ctx context.Context, in StageInput, st *Stage, extra map[string]any) (*StageOutput, error) {
-	wavs, err := filepath.Glob(filepath.Join(in.RunDir, "*.wav"))
+	// concat_wavs_dir, when set, scopes the walk to a specific subdirectory
+	// (template-rendered so a foreach stage can use a per-item subdir like
+	// `audio/{{.unit.unit_id}}`). Default — empty — walks the whole run dir
+	// the way the original concat_wavs always did.
+	walkRoot := in.RunDir
+	if st.ConcatWavsDir != "" {
+		rel, err := renderTemplate(st.ID+":concat_wavs_dir", st.ConcatWavsDir, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
+		if err != nil {
+			return nil, fmt.Errorf("stage %s: render concat_wavs_dir: %w", st.ID, err)
+		}
+		if filepath.IsAbs(rel) {
+			return nil, fmt.Errorf("stage %s: concat_wavs_dir %q must be relative to the run dir", st.ID, rel)
+		}
+		walkRoot = filepath.Join(in.RunDir, rel)
+	}
+	var wavs []string
+	err := filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.EqualFold(filepath.Ext(d.Name()), ".wav") {
+			wavs = append(wavs, path)
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("stage %s: glob *.wav: %w", st.ID, err)
+		return nil, fmt.Errorf("stage %s: walk for *.wav: %w", st.ID, err)
 	}
 	if len(wavs) == 0 {
-		return nil, fmt.Errorf("stage %s: no .wav files found in run dir", st.ID)
+		return nil, fmt.Errorf("stage %s: no .wav files found under %s", st.ID, walkRoot)
 	}
-	// Sort numerically: segment_0.wav before segment_10.wav.
+	// Sort by trailing integer in the filename — segment_0.wav before
+	// segment_10.wav before segment_100.wav — so `audio/<unit>/segment_<i>.wav`
+	// concatenates in the order the script generator emitted them. A plain
+	// lexicographic sort puts segment_10 before segment_2; that bug
+	// previously concatenated WAVs out of order.
 	sort.Slice(wavs, func(i, j int) bool {
+		ai, ok1 := trailingInt(wavs[i])
+		bj, ok2 := trailingInt(wavs[j])
+		if ok1 && ok2 && ai != bj {
+			return ai < bj
+		}
 		return wavs[i] < wavs[j]
 	})
 
@@ -342,6 +382,31 @@ func scanCRLF(data []byte, atEOF bool) (advance int, token []byte, err error) {
 		return len(data), data, nil
 	}
 	return 0, nil, nil
+}
+
+// trailingInt extracts the integer suffix from p's basename (after the last
+// non-digit character, before the extension). Returns (n, true) on a clean
+// match and (0, false) when the name has no numeric tail. Used by the
+// concat_wavs walker to sort `segment_<i>.wav` files by numeric `i` rather
+// than lexicographically (which would put segment_10 before segment_2).
+func trailingInt(p string) (int, bool) {
+	base := filepath.Base(p)
+	if ext := filepath.Ext(base); ext != "" {
+		base = strings.TrimSuffix(base, ext)
+	}
+	end := len(base)
+	start := end
+	for start > 0 && base[start-1] >= '0' && base[start-1] <= '9' {
+		start--
+	}
+	if start == end {
+		return 0, false
+	}
+	n := 0
+	for i := start; i < end; i++ {
+		n = n*10 + int(base[i]-'0')
+	}
+	return n, true
 }
 
 // lastDelim returns the index of the last '\n' or '\r' in p, or -1 if neither

@@ -116,9 +116,19 @@ func expandTilde(p string) string {
 // under $XDG_CACHE_HOME/vamp/svg-rasterized/ so vision models (Gemma 3,
 // Qwen-VL, etc.) — which see only bitmap pixel data, not vector markup —
 // can read diagrams that were authored as SVG.
+//
+// A missing dir is treated as "no images here" (returns nil, nil) rather than
+// an error. Foreach pipelines routinely point image_dir at a per-item path
+// that legitimately doesn't exist on every item (e.g. SAQ-only lessons in
+// the cibd curriculum carry no images/ subdir); failing the stage on the
+// missing-dir case would refuse to do text-only inference on those items,
+// which is what the vision-capable backend cleanly degrades to.
 func collectImages(dir string) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("read dir %s: %w", dir, err)
 	}
 	raster := map[string]bool{
