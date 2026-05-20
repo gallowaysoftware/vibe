@@ -392,7 +392,13 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 			if err != nil {
 				return "", fmt.Errorf("cache key: render output: %w", err)
 			}
-			args = append(args, "concat_wavs:output:"+outRel)
+			// The "v2" tag invalidates concat_wavs cache entries from the
+			// pre-per-iteration-concat-list-path era. Those entries were
+			// keyed correctly on inputs but produced wrong output because
+			// parallel foreach mp3 iterations raced on a shared
+			// .ffmpeg-concat.txt. Bump this tag if a future executor fix
+			// makes existing cached MP3s invalid again.
+			args = append(args, "concat_wavs:v2:output:"+outRel)
 			walkRoot := e.RunDir
 			if st.ConcatWavsDir != "" {
 				dir, err := renderTemplate(st.ID+":concat_wavs_dir", st.ConcatWavsDir, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)

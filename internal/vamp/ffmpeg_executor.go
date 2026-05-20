@@ -202,8 +202,16 @@ func (f *ffmpegExecutor) executeConcatWavs(ctx context.Context, in StageInput, s
 		return nil, fmt.Errorf("stage %s: create output dir: %w", st.ID, err)
 	}
 
-	// Create concat file list.
-	listPath := filepath.Join(in.RunDir, ".ffmpeg-concat.txt")
+	// Create concat file list. Path is per-iteration so parallel foreach
+	// iterations don't race on a shared `.ffmpeg-concat.txt`; the prior
+	// shared-path implementation caused per-unit mp3 stages to read each
+	// other's lists and produce bit-identical MP3s for the iterations
+	// that started ffmpeg after a sibling's overwrite.
+	listName := ".ffmpeg-concat.txt"
+	if st.Foreach != nil {
+		listName = fmt.Sprintf(".ffmpeg-concat.%s-%d.txt", st.ID, in.ItemIdx)
+	}
+	listPath := filepath.Join(in.RunDir, listName)
 	listContent := strings.Builder{}
 	for _, w := range wavs {
 		fmt.Fprintf(&listContent, "file '%s'\n", w)
