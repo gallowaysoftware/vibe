@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -58,7 +57,7 @@ func (e *comfyuiExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 
 	// Load the workflow JSON. UseNumber preserves int seeds as exact
 	// integers — important because ComfyUI rejects 42.0 for an int input.
-	workflow, err := loadWorkflow(st.Workflow, in.PipelineDir)
+	workflow, err := loadWorkflow(st, in.PipelineDir)
 	if err != nil {
 		return nil, fmt.Errorf("stage %s: %w", st.ID, err)
 	}
@@ -130,29 +129,26 @@ func (e *comfyuiExecutor) clientFor(baseURL string) *comfyui.Client {
 	return comfyui.New(baseURL, http.DefaultClient)
 }
 
-// loadWorkflow reads workflowPath (relative to pipelineDir when not absolute)
-// and parses it as a ComfyUI workflow map (node_id -> node definition).
-func loadWorkflow(workflowPath, pipelineDir string) (map[string]any, error) {
-	if workflowPath == "" {
+// loadWorkflow reads st.Workflow (relative to pipelineDir when not absolute,
+// or from st.AssetFS when set) and parses it as a ComfyUI workflow map
+// (node_id -> node definition).
+func loadWorkflow(st *Stage, pipelineDir string) (map[string]any, error) {
+	if st == nil || st.Workflow == "" {
 		return nil, errors.New("workflow path is empty")
 	}
-	path := workflowPath
-	if !filepath.IsAbs(path) {
-		path = filepath.Join(pipelineDir, path)
-	}
-	data, err := os.ReadFile(path)
+	data, err := readStageAsset(st, pipelineDir, st.Workflow)
 	if err != nil {
-		return nil, fmt.Errorf("read workflow %s: %w", path, err)
+		return nil, fmt.Errorf("read workflow %s: %w", st.Workflow, err)
 	}
 	dec := json.NewDecoder(strings.NewReader(string(data)))
 	dec.UseNumber()
 	var raw any
 	if err := dec.Decode(&raw); err != nil {
-		return nil, fmt.Errorf("parse workflow %s: %w", path, err)
+		return nil, fmt.Errorf("parse workflow %s: %w", st.Workflow, err)
 	}
 	m, ok := raw.(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("workflow %s: top-level must be a JSON object, got %T", path, raw)
+		return nil, fmt.Errorf("workflow %s: top-level must be a JSON object, got %T", st.Workflow, raw)
 	}
 	return m, nil
 }

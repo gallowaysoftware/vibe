@@ -3,8 +3,6 @@ package vamp
 import (
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"text/template"
@@ -42,11 +40,7 @@ func CheckRunnable(p *Pipeline, pipelineDir string, caps *Capabilities) error {
 			}
 		}
 		if s.PromptFile != "" {
-			path := s.PromptFile
-			if !filepath.IsAbs(path) {
-				path = filepath.Join(pipelineDir, path)
-			}
-			data, err := os.ReadFile(path)
+			data, err := readStageAsset(s, pipelineDir, s.PromptFile)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("%s: prompt_file %q: %w", ctx, s.PromptFile, err))
 				continue

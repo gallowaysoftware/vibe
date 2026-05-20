@@ -1,0 +1,31 @@
+You are summarizing a RAG retrieval-quality evaluation. Each of the
+per-query judge records below is a single JSON object with fields:
+query, retrieved_count, relevant_count, top_chunk_relevant,
+precision_at_5, comment.
+
+Raw judge records:
+{{ range .stages.judge.outputs -}}
+--- {{.}} ---
+{{ readFile . }}
+
+{{ end }}
+
+Produce a concise Markdown report with these sections:
+
+## Summary
+A 2-3 line lead with mean precision_at_5, count of queries where the
+top chunk was off-topic, and overall verdict (good / mixed / poor).
+
+## Per-query results
+A Markdown table with columns: query | precision_at_5 | top_chunk_relevant | comment.
+
+## Failure patterns
+Identify recurring weaknesses across the failed queries (e.g.
+"queries about acronyms consistently retrieve unrelated chunks").
+Skip this section if no failures.
+
+## Recommendations
+1-3 concrete adjustments to try (e.g. shrink CHUNK_SIZE to 500;
+re-ingest with smaller overlap; raise top_k).
+
+Output the Markdown only. No preamble, no closing remarks.

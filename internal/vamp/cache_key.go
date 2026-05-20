@@ -286,7 +286,7 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 			ImageHashes:    imageHashes,
 		})
 	case StageTypeComfyUI:
-		workflow, err := loadWorkflow(st.Workflow, e.PipelineDir)
+		workflow, err := loadWorkflow(st, e.PipelineDir)
 		if err != nil {
 			return "", fmt.Errorf("cache key: load workflow: %w", err)
 		}

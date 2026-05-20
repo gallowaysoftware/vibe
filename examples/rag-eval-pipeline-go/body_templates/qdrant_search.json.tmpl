@@ -1,0 +1,1 @@
+{"vector": {{ index (index (index (readFile (printf "%s/embed_%d.json" .runDir .i) | parseJSON) "data") 0) "embedding" | toJSON }}, "limit": 5, "with_payload": true}

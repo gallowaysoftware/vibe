@@ -330,7 +330,7 @@ func (s *dryRunState) dryRunRenderPerType(st *Stage, stageType StageType, prior 
 		s.executor.dryRunLogf("%sprompt (%d chars):", indent, len(prompt))
 		s.dryRunWriteIndented(indent+"  ", prompt)
 	case StageTypeComfyUI:
-		workflow, err := loadWorkflow(st.Workflow, s.executor.PipelineDir)
+		workflow, err := loadWorkflow(st, s.executor.PipelineDir)
 		if err != nil {
 			return fmt.Errorf("stage %s: %w", st.ID, err)
 		}

@@ -2041,13 +2041,9 @@ func (e *Executor) flushStageLog(id string, body []byte) {
 func renderPrompt(st *Stage, pipelineDir string, cliInputs map[string]string, prior map[string]*stageResult, runDir string, extra map[string]any) (string, error) {
 	raw := st.Prompt
 	if raw == "" && st.PromptFile != "" {
-		path := st.PromptFile
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(pipelineDir, path)
-		}
-		data, err := os.ReadFile(path)
+		data, err := readStageAsset(st, pipelineDir, st.PromptFile)
 		if err != nil {
-			return "", fmt.Errorf("read prompt_file %s: %w", path, err)
+			return "", fmt.Errorf("read prompt_file %s: %w", st.PromptFile, err)
 		}
 		raw = string(data)
 	}

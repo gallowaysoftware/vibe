@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -45,64 +44,11 @@ func renderCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			stageID := args[1]
 			p, err := vamp.LoadPipeline(pipelinePath)
 			if err != nil {
 				return err
 			}
-			// Find the requested stage. Validation has already ensured ids
-			// are unique, so a linear scan is fine and the error message
-			// can enumerate the valid ids for users who typo'd.
-			var stage *vamp.Stage
-			for i := range p.Stages {
-				if p.Stages[i].ID == stageID {
-					stage = &p.Stages[i]
-					break
-				}
-			}
-			if stage == nil {
-				ids := make([]string, 0, len(p.Stages))
-				for i := range p.Stages {
-					ids = append(ids, p.Stages[i].ID)
-				}
-				return fmt.Errorf("stage %q not found in %s (have: %s)", stageID, pipelinePath, strings.Join(ids, ", "))
-			}
-			inputs, err := parseInputs(inputFlags, p)
-			if err != nil {
-				return err
-			}
-			absRunDir := ""
-			if runDirFlag != "" {
-				absRunDir, err = filepath.Abs(runDirFlag)
-				if err != nil {
-					return err
-				}
-				if info, err := os.Stat(absRunDir); err != nil {
-					return fmt.Errorf("run-dir %s: %w", absRunDir, err)
-				} else if !info.IsDir() {
-					return fmt.Errorf("run-dir %s: not a directory", absRunDir)
-				}
-			}
-			// Build the prior-stage output map the prompt template will see.
-			// Two paths:
-			//   - --run-dir set: load each declared dep's output from disk
-			//     by rendering its own Output template against the same
-			//     inputs (no foreach support; render's whole point is
-			//     non-foreach prompt iteration).
-			//   - --run-dir unset: synthesise placeholder strings so an
-			//     iteration loop with no prior outputs still produces a
-			//     fully-rendered prompt the user can eyeball.
-			prior, err := buildRenderPrior(p, stage, inputs, absRunDir)
-			if err != nil {
-				return err
-			}
-			pipelineDir := filepath.Dir(pipelinePath)
-			rendered, err := vamp.RenderStagePrompt(stage, pipelineDir, inputs, prior, absRunDir)
-			if err != nil {
-				return err
-			}
-			_, err = fmt.Fprint(cmd.OutOrStdout(), rendered)
-			return err
+			return RenderStageForPipeline(p, filepath.Dir(pipelinePath), args[1], RenderStageOptions{Inputs: inputFlags, RunDir: runDirFlag}, cmd.OutOrStdout())
 		},
 	}
 	cmd.Flags().StringArrayVar(&inputFlags, "input", nil, "Pipeline input as KEY=VALUE; can repeat. Same shape as `vamp run --input`.")
@@ -145,10 +91,6 @@ func buildRenderPrior(p *vamp.Pipeline, target *vamp.Stage, inputs map[string]st
 		}
 		return prior, nil
 	}
-	// Build a quick stage lookup so we can resolve each dep's Output
-	// template. Validate has already guaranteed every declared dep id
-	// matches a real stage, so a miss here would indicate the pipeline
-	// drifted between resolve and now — flag it loudly.
 	byID := make(map[string]*vamp.Stage, len(p.Stages))
 	for i := range p.Stages {
 		byID[p.Stages[i].ID] = &p.Stages[i]
@@ -158,13 +100,6 @@ func buildRenderPrior(p *vamp.Pipeline, target *vamp.Stage, inputs map[string]st
 		if !ok {
 			return nil, fmt.Errorf("dependency %q referenced by stage %q does not exist (pipeline drift)", dep, target.ID)
 		}
-		// Render the dep's output path against the same CLI inputs. The
-		// dep's *own* deps render as empty placeholders because we only
-		// need the path, not the nested template's resolved content; the
-		// dep's Output template only references inputs / its own id in
-		// practice. If a dep's Output references a transitive stage that
-		// hasn't been resolved we surface that as a clear error rather
-		// than silently substituting empty.
 		depPriorEmpty := make(map[string]*vamp.StageResult, len(depStage.Inputs))
 		for _, inner := range depStage.Inputs {
 			depPriorEmpty[inner] = &vamp.StageResult{Output: ""}

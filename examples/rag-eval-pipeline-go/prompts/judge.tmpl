@@ -1,0 +1,19 @@
+You are evaluating a RAG retrieval system. Given a user query and the
+top-5 chunks the retriever returned, score the retrieval quality.
+
+Query: {{.query}}
+
+Retrieved chunks (Qdrant raw JSON response):
+{{ readFile (printf "%s/retrieve_%d.json" .runDir .i) }}
+
+Output ONLY a JSON object with these fields, no preamble and no
+Markdown formatting:
+
+{
+  "query": "<the query>",
+  "retrieved_count": <integer count of chunks returned>,
+  "relevant_count": <integer count of chunks that are actually relevant to the query>,
+  "top_chunk_relevant": <true if the highest-score chunk is on-topic, else false>,
+  "precision_at_5": <relevant_count / retrieved_count, as a float>,
+  "comment": "<one short sentence summarizing why retrieval was good or bad>"
+}

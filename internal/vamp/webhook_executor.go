@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"text/template"
@@ -184,13 +183,9 @@ func (w *webhookExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 		}
 		bodyBytes = marshaled
 	case st.BodyTemplateFile != "":
-		path := st.BodyTemplateFile
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(in.PipelineDir, path)
-		}
-		raw, err := os.ReadFile(path)
+		raw, err := readStageAsset(st, in.PipelineDir, st.BodyTemplateFile)
 		if err != nil {
-			return nil, fmt.Errorf("stage %s: read body_template_file %s: %w", st.ID, path, err)
+			return nil, fmt.Errorf("stage %s: read body_template_file %s: %w", st.ID, st.BodyTemplateFile, err)
 		}
 		rendered, err := renderWebhookTemplate(st, "body_template_file", string(raw), in, extra)
 		if err != nil {

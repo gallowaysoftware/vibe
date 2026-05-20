@@ -3,6 +3,7 @@ package vamp
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -251,6 +252,17 @@ type Stage struct {
 	// Only valid on stage types that produce a stable on-disk output
 	// (text/comfyui/audio/ffmpeg); rejected on webhook/youtube/confirm.
 	Cleanup []string `yaml:"cleanup,omitempty"`
+
+	// AssetFS, when non-nil, replaces PipelineDir as the root for resolving
+	// PromptFile / BodyTemplateFile / Workflow / similar pipeline-shipped
+	// asset references on this stage. YAML pipelines leave it nil and
+	// continue resolving against PipelineDir on disk; Go-DSL pipelines set
+	// it via the *Stage builder's PromptFS / BodyTemplateFS / WorkflowFS
+	// methods so the user can ship a pipeline's templates inside an
+	// embed.FS (or any other fs.FS) alongside the binary. The field is
+	// tagged yaml:"-" so it never round-trips through pipeline.yaml.snapshot
+	// or any other YAML serialization path.
+	AssetFS fs.FS `yaml:"-"`
 }
 
 // RetryPolicy controls per-stage retry behaviour for transient executor
