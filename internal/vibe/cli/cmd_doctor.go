@@ -124,6 +124,7 @@ func doctorCmd() *cobra.Command {
 		installYes    bool
 		installCUDA   bool
 		installMethod string
+		installUpdate bool
 	)
 	cmd := &cobra.Command{
 		Use:   "doctor",
@@ -145,7 +146,7 @@ func doctorCmd() *cobra.Command {
 				ctx = context.Background()
 			}
 			if installName != "" {
-				return runInstall(cmd, installName, installYes, installCUDA, installMethod)
+				return runInstall(cmd, installName, installYes, installCUDA, installMethod, installUpdate)
 			}
 			env := defaultDoctorEnv()
 			results := runChecks(ctx, env)
@@ -178,19 +179,29 @@ func doctorCmd() *cobra.Command {
 			"a method directly: distro | release | source. Source builds "+
 			"from upstream master so you get features (e.g. MTP) before "+
 			"they reach a release tag.")
+	cmd.Flags().BoolVar(&installUpdate, "update", false,
+		"refresh an existing install instead of short-circuiting on the "+
+			"\"already present\" check. With --method release: re-fetches "+
+			"the latest GitHub release tarball and re-extracts. With "+
+			"--method source: git fetch + reset --hard origin/master + "+
+			"incremental cmake build (already idempotent, but the flag "+
+			"makes intent explicit).")
 	return cmd
 }
 
 // runInstall dispatches to the named installer. New installers plug in here
 // without touching the diagnostic path.
-func runInstall(cmd *cobra.Command, name string, yes, cuda bool, method string) error {
+func runInstall(cmd *cobra.Command, name string, yes, cuda bool, method string, update bool) error {
 	out := cmd.OutOrStdout()
 	errOut := cmd.ErrOrStderr()
 	switch name {
 	case "comfyui":
+		if update {
+			fmt.Fprintln(errOut, "[warn] --update has no effect for comfyui; ignored")
+		}
 		return installComfyUI(defaultInstallerEnv(out, errOut, yes))
 	case "llama-cpp":
-		env := defaultLlamaInstallerEnv(out, errOut, yes, cuda)
+		env := defaultLlamaInstallerEnv(out, errOut, yes, cuda, update)
 		switch method {
 		case "":
 			// honor the interactive prompt (or default to release when --yes)

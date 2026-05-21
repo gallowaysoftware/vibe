@@ -67,12 +67,16 @@ type llamaInstallerEnv struct {
 	// forcedMethod, when non-empty, skips the interactive prompt and
 	// pins the install method. Set by the CLI's --method flag.
 	forcedMethod llamaInstallMethod
+	// update bypasses the "symlink already present" short-circuit so
+	// the install path actually refreshes an existing installation
+	// (re-fetches latest release / re-pulls + rebuilds source).
+	update bool
 }
 
 // defaultLlamaInstallerEnv constructs an env with real implementations of
 // every external. Tests should NOT use this — they should hand-build an env
 // with stubs.
-func defaultLlamaInstallerEnv(stdout, stderr io.Writer, yes, cuda bool) *llamaInstallerEnv {
+func defaultLlamaInstallerEnv(stdout, stderr io.Writer, yes, cuda, update bool) *llamaInstallerEnv {
 	home, _ := os.UserHomeDir()
 	return &llamaInstallerEnv{
 		home:          home,
@@ -86,6 +90,7 @@ func defaultLlamaInstallerEnv(stdout, stderr io.Writer, yes, cuda bool) *llamaIn
 		getEnv:        os.Getenv,
 		yes:           yes,
 		cuda:          cuda,
+		update:        update,
 	}
 }
 
@@ -305,12 +310,17 @@ func installLlamaCppRelease(env *llamaInstallerEnv) error {
 	binDir := filepath.Join(env.home, ".local", "bin")
 	symlink := filepath.Join(binDir, "llama-server")
 
-	// Idempotency: if the symlink already points to a real file, skip.
+	// Idempotency: if the symlink already points to a real file, skip —
+	// unless --update was passed, in which case the caller wants us to
+	// fetch the latest release and refresh the install regardless.
 	if target, err := os.Readlink(symlink); err == nil {
 		if _, statErr := os.Stat(target); statErr == nil {
-			fmt.Fprintf(env.stdout, "[skip] symlink: %s -> %s already present\n", symlink, target)
-			pathWarning(env, binDir)
-			return nil
+			if !env.update {
+				fmt.Fprintf(env.stdout, "[skip] symlink: %s -> %s already present (pass --update to refresh)\n", symlink, target)
+				pathWarning(env, binDir)
+				return nil
+			}
+			fmt.Fprintf(env.stdout, "[info] --update: existing install at %s will be refreshed\n", target)
 		}
 	}
 
