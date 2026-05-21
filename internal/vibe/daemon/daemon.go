@@ -481,10 +481,15 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 
 const (
 	// maxBackendRespawns is the cap on automatic restarts of a crashed
-	// backend within respawnWindow. Three is enough to survive an
-	// intermittent driver hiccup without papering over a real config
-	// problem (which would crash deterministically on every restart).
-	maxBackendRespawns = 3
+	// backend within respawnWindow. We size it for a worst-case 4-5 h
+	// pipeline (cibd-distilling Module 3 vision phase) where the
+	// llama.cpp flash-attn pool-VMM kernel SIGABRTs every ~3-4 min on
+	// the current 595.71.05 / kernel 7.0.9 combo. 60 respawns / 30 min
+	// = roughly one respawn every 30 s before the budget trips, which
+	// still catches a deterministic-on-every-restart crash (would burn
+	// the budget in seconds) while surviving the flaky CUDA hiccup
+	// case. Lower this once the upstream FA kernel is fixed.
+	maxBackendRespawns = 60
 	respawnWindow      = 30 * time.Minute
 )
 
