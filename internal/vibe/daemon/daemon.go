@@ -398,18 +398,23 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 
 	st := d.sup.Status()
 
-	// Wire the proxy and frontend only for llama-server. ComfyUI is reached
-	// directly via Status.BackendAddr by vamp / external tools, and ComfyUI
-	// already ships its own UI so there's no frontend to activate.
+	// Wire the proxy for llama_server and http_server backends — both
+	// front a generic HTTP API that vamp / external tools reach through
+	// the proxy. ComfyUI is reached directly via Status.BackendAddr
+	// (workflow API is one big POST, no streaming, no profile-managed
+	// state worth proxying) and ships its own UI so there's no frontend.
 	var fr *frontend.Result
-	if p.Backend.LlamaServer != nil {
+	if p.Backend.LlamaServer != nil || p.Backend.HTTPServer != nil {
 		backendURL, err := url.Parse(st.Addr)
 		if err != nil {
 			_ = d.sup.Stop(context.Background())
 			return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("parse backend url: %w", err))
 		}
 		d.prx.SetBackend(backendURL)
-
+	}
+	// Frontend activation is llama-server-only: only those profiles have
+	// a separate UI/client process to launch.
+	if p.Backend.LlamaServer != nil {
 		if p.Frontend.Kind != "" {
 			// Pre-create the per-profile frontend state dir so docker-compose
 			// bind mounts (and any other path the profile points inside it)
@@ -509,6 +514,15 @@ func (d *Daemon) Pull(ctx context.Context, req *connect.Request[vibev1.PullReque
 		return stream.Send(&vibev1.PullProgress{
 			Phase:   vibev1.PullProgress_PHASE_DONE,
 			Message: "no model file to pull (ComfyUI manages its own model assets)",
+		})
+	}
+	// http_server backends bring their own model artefacts (baked into the
+	// image or mounted via volumes — kokoro-fastapi pulls weights at first
+	// run into the kokoro-models volume). Nothing for vibe to pull.
+	if p.Backend.HTTPServer != nil {
+		return stream.Send(&vibev1.PullProgress{
+			Phase:   vibev1.PullProgress_PHASE_DONE,
+			Message: "no model file to pull (http_server backends manage their own artefacts)",
 		})
 	}
 	if p.Backend.LlamaServer == nil {

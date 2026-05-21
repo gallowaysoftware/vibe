@@ -510,6 +510,17 @@ func (p *Profile) validateFrontend() error {
 		return nil
 	}
 
+	// http_server backends are wrapped HTTP services (TTS, embedding servers,
+	// third-party inference) consumed directly via the vibe proxy. There's
+	// no "frontend" to launch separately, so reject any frontend block and
+	// short-circuit.
+	if p.Backend.HTTPServer != nil {
+		if !p.Frontend.IsZero() {
+			return errors.New("frontend is not supported for http_server backends (the HTTP server is the deliverable; consume it via the vibe proxy)")
+		}
+		return nil
+	}
+
 	// Llama-server profiles still require a frontend block (Phase 1 behavior).
 	switch p.Frontend.Kind {
 	case FrontendExternal:
