@@ -192,11 +192,15 @@ func collectImages(dir string) ([]string, error) {
 	return out, nil
 }
 
-// svgRasterWidth is the pixel width passed to rsvg-convert. Gemma 3 normalizes
-// inputs to 896x896 (with optional pan-and-scan tiling on larger images); 1024
-// gives the encoder enough resolution to read diagram labels without
-// over-shooting into pan-scan territory on simple charts.
-const svgRasterWidth = 1024
+// svgRasterMaxDim is the bounding-box dimension passed to rsvg-convert.
+// Gemma 3's vision encoder normalizes inputs to a single 896x896 tile;
+// images that exceed that in either dimension are split into multiple
+// pan-and-scan tiles, multiplying the per-image token cost (256 tokens
+// per tile). We fit-within 896x896 so every rasterized SVG lands as
+// exactly one tile, keeping the per-image cost predictable. Aspect
+// ratio is preserved, so the actual PNG is at most 896×896 with the
+// other dimension scaled down.
+const svgRasterMaxDim = 896
 
 // rasterizeSVG runs rsvg-convert on svgPath and returns the cached PNG path.
 // Cache keys are sha256(svg bytes) so identical SVGs across lessons (common
@@ -217,7 +221,8 @@ func rasterizeSVG(svgPath string) (string, error) {
 	if info, err := os.Stat(pngPath); err == nil && info.Size() > 0 {
 		return pngPath, nil
 	}
-	cmd := exec.Command("rsvg-convert", "--width", fmt.Sprintf("%d", svgRasterWidth), "--keep-aspect-ratio", "-o", pngPath, svgPath)
+	dim := fmt.Sprintf("%d", svgRasterMaxDim)
+	cmd := exec.Command("rsvg-convert", "--width", dim, "--height", dim, "--keep-aspect-ratio", "-o", pngPath, svgPath)
 	if out, runErr := cmd.CombinedOutput(); runErr != nil {
 		_ = os.Remove(pngPath)
 		return "", fmt.Errorf("rsvg-convert: %w: %s", runErr, strings.TrimSpace(string(out)))

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -2167,27 +2168,31 @@ func renderTemplate(name, raw string, deps []string, cliInputs map[string]string
 //     surface as map / number shapes.
 func templateFuncs() template.FuncMap {
 	return template.FuncMap{
-		"slugify":             slugify,
-		"contains":            func(haystack, needle string) bool { return strings.Contains(haystack, needle) },
-		"hasPrefix":           func(s, prefix string) bool { return strings.HasPrefix(s, prefix) },
-		"hasSuffix":           func(s, suffix string) bool { return strings.HasSuffix(s, suffix) },
-		"lower":               strings.ToLower,
-		"upper":               strings.ToUpper,
-		"trim":                strings.TrimSpace,
-		"joinPath":            func(parts ...string) string { return filepath.Join(parts...) },
-		"readFile":            readFileTemplate,
-		"readFiles":           readFilesTemplate,
-		"readLessons":         readLessonsTemplate,
-		"enumerateLessons":    enumerateLessonsTemplate,
-		"mergeJSON":           mergeJSONTemplate,
-		"parseJSON":           parseJSONTemplate,
-		"toJSON":              toJSONTemplate,
-		"urlencode":           urlencodeTemplate,
-		"stripDataURIs":       stripDataURIsTemplate,
-		"truncate":            truncateTemplate,
-		"flattenItems":        flattenItemsTemplate,
-		"uniqueByKey":         uniqueByKeyTemplate,
-		"enumerateImagePairs": enumerateImagePairsTemplate,
+		"slugify":                    slugify,
+		"contains":                   func(haystack, needle string) bool { return strings.Contains(haystack, needle) },
+		"hasPrefix":                  func(s, prefix string) bool { return strings.HasPrefix(s, prefix) },
+		"hasSuffix":                  func(s, suffix string) bool { return strings.HasSuffix(s, suffix) },
+		"lower":                      strings.ToLower,
+		"upper":                      strings.ToUpper,
+		"trim":                       strings.TrimSpace,
+		"joinPath":                   func(parts ...string) string { return filepath.Join(parts...) },
+		"readFile":                   readFileTemplate,
+		"readFiles":                  readFilesTemplate,
+		"readFilesOrEmpty":           readFilesOrEmptyTemplate,
+		"readLessons":                readLessonsTemplate,
+		"enumerateLessons":           enumerateLessonsTemplate,
+		"mergeJSON":                  mergeJSONTemplate,
+		"parseJSON":                  parseJSONTemplate,
+		"toJSON":                     toJSONTemplate,
+		"urlencode":                  urlencodeTemplate,
+		"stripDataURIs":              stripDataURIsTemplate,
+		"truncate":                   truncateTemplate,
+		"flattenItems":               flattenItemsTemplate,
+		"uniqueByKey":                uniqueByKeyTemplate,
+		"enumerateImagePairs":        enumerateImagePairsTemplate,
+		"enumerateUniqueImages":      enumerateUniqueImagesTemplate,
+		"imageDescriptionsForLesson": imageDescriptionsForLessonTemplate,
+		"extractSVGText":             extractSVGTextTemplate,
 	}
 }
 
@@ -2586,6 +2591,287 @@ func enumerateLessonsTemplate(pattern string) (string, error) {
 		return "", fmt.Errorf("enumerateLessons: marshal: %w", err)
 	}
 	return string(b), nil
+}
+
+// extractSVGTextTemplate parses an SVG file as XML and returns every
+// `<text>` element's content joined by " | " (preserving document
+// order, after trimming and collapsing whitespace inside each label).
+// Tspans inside text elements are flattened. Returns "" for non-SVG
+// inputs or when the SVG has no inline text. Errors only on truly
+// unreadable input — a malformed-but-parseable SVG produces what we
+// can extract.
+//
+// Used as a sidecar to vision inference: even with the image
+// rasterised down to 896×896 (single Gemma 3 tile), a model can mis-
+// read small fonts or rotated callouts. Feeding the original XML
+// labels alongside the pixels gives the model ground truth for every
+// number/word the SVG author put on the page.
+func extractSVGTextTemplate(path string) (string, error) {
+	if !strings.EqualFold(filepath.Ext(path), ".svg") {
+		return "", nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("extractSVGText %s: %w", path, err)
+	}
+	labels, err := parseSVGTextLabels(data)
+	if err != nil {
+		return "", fmt.Errorf("extractSVGText %s: %w", path, err)
+	}
+	return strings.Join(labels, " | "), nil
+}
+
+// parseSVGTextLabels walks an SVG XML stream collecting the textual
+// content of every <text> element (including nested <tspan>s). Each
+// label is trimmed and internal whitespace collapsed; the order of
+// the result matches the document order so spatial reasoning
+// downstream (e.g. "top-left → bottom-right" reading order) survives.
+func parseSVGTextLabels(data []byte) ([]string, error) {
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	dec.Strict = false
+	dec.Entity = xml.HTMLEntity
+	var labels []string
+	var inText int
+	var cur strings.Builder
+	flush := func() {
+		s := strings.TrimSpace(cur.String())
+		if s != "" {
+			labels = append(labels, collapseWhitespace(s))
+		}
+		cur.Reset()
+	}
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			if err.Error() == "EOF" {
+				break
+			}
+			// Permissive: stop on first parse error and return what we have.
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "text" {
+				if inText == 0 {
+					cur.Reset()
+				}
+				inText++
+			}
+		case xml.EndElement:
+			if t.Name.Local == "text" && inText > 0 {
+				inText--
+				if inText == 0 {
+					flush()
+				}
+			}
+		case xml.CharData:
+			if inText > 0 {
+				cur.Write(t)
+			}
+		}
+	}
+	return labels, nil
+}
+
+// collapseWhitespace squashes runs of whitespace into single spaces.
+func collapseWhitespace(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	prevSpace := false
+	for _, r := range s {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			if !prevSpace && b.Len() > 0 {
+				b.WriteByte(' ')
+			}
+			prevSpace = true
+			continue
+		}
+		b.WriteRune(r)
+		prevSpace = false
+	}
+	out := b.String()
+	return strings.TrimRight(out, " ")
+}
+
+// enumerateUniqueImagesTemplate walks every image referenced by the
+// given lessons (under `<lessonRoot>/<lesson>/images/`), hashes each
+// file's raw bytes, and returns one entry per unique content hash.
+// The output drives a foreach where describe_image is called exactly
+// once per distinct diagram regardless of how many lessons cite it.
+//
+//	{{ enumerateUniqueImages .inputs.lesson_root .stages.list_lessons.output }}
+//
+// Output: JSON array of {"hash": "<sha256>", "path": "<abs path>",
+// "ext": ".svg"|...}, ordered by hash for determinism. The path is a
+// sample (the first lesson seen for that hash); identical SVGs across
+// lessons collapse to one entry.
+func enumerateUniqueImagesTemplate(lessonRoot, lessonsJSON string) (string, error) {
+	root := lessonRoot
+	if strings.HasPrefix(root, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("enumerateUniqueImages: home dir: %w", err)
+		}
+		root = filepath.Join(home, root[2:])
+	}
+	var lessons []string
+	if err := json.Unmarshal([]byte(lessonsJSON), &lessons); err != nil {
+		return "", fmt.Errorf("enumerateUniqueImages: parse lessons array: %w", err)
+	}
+	allowed := map[string]bool{
+		".png": true, ".jpg": true, ".jpeg": true, ".gif": true,
+		".webp": true, ".bmp": true, ".svg": true,
+	}
+	type entry struct {
+		Hash string `json:"hash"`
+		Path string `json:"path"`
+		Ext  string `json:"ext"`
+	}
+	seen := make(map[string]entry)
+	for _, lesson := range lessons {
+		imgDir := filepath.Join(root, lesson, "images")
+		entries, err := os.ReadDir(imgDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return "", fmt.Errorf("enumerateUniqueImages: read %s: %w", imgDir, err)
+		}
+		var names []string
+		for _, ent := range entries {
+			if ent.IsDir() {
+				continue
+			}
+			if allowed[strings.ToLower(filepath.Ext(ent.Name()))] {
+				names = append(names, ent.Name())
+			}
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			path := filepath.Join(imgDir, name)
+			h, err := cache.HashFile(path)
+			if err != nil {
+				return "", fmt.Errorf("enumerateUniqueImages: hash %s: %w", path, err)
+			}
+			if _, ok := seen[h]; ok {
+				continue
+			}
+			seen[h] = entry{Hash: h, Path: path, Ext: strings.ToLower(filepath.Ext(name))}
+		}
+	}
+	out := make([]entry, 0, len(seen))
+	for _, e := range seen {
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Hash < out[j].Hash })
+	b, err := json.Marshal(out)
+	if err != nil {
+		return "", fmt.Errorf("enumerateUniqueImages: marshal: %w", err)
+	}
+	return string(b), nil
+}
+
+// imageDescriptionsForLessonTemplate walks the images for the given
+// lesson, hashes each, and reads the corresponding per-hash
+// description JSON file from <runDir>/image_desc/<hash>.json (the
+// output path describe_image writes to in the dedup'd pipeline).
+// Returns concatenated JSON descriptions for THIS lesson's diagrams
+// only, even when the underlying describe_image was called once
+// across many lessons that share the diagram.
+//
+//	{{ imageDescriptionsForLesson .runDir .inputs.lesson_root .lesson }}
+//
+// Empty result when the lesson has no images (or no descriptions
+// have been written yet). Errors only on truly unreadable state —
+// missing description files are skipped silently so a partial
+// resume still composes a usable prompt.
+func imageDescriptionsForLessonTemplate(runDir, lessonRoot, lesson string) (string, error) {
+	root := lessonRoot
+	if strings.HasPrefix(root, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("imageDescriptionsForLesson: home dir: %w", err)
+		}
+		root = filepath.Join(home, root[2:])
+	}
+	allowed := map[string]bool{
+		".png": true, ".jpg": true, ".jpeg": true, ".gif": true,
+		".webp": true, ".bmp": true, ".svg": true,
+	}
+	imgDir := filepath.Join(root, lesson, "images")
+	entries, err := os.ReadDir(imgDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("imageDescriptionsForLesson: read %s: %w", imgDir, err)
+	}
+	var names []string
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		if allowed[strings.ToLower(filepath.Ext(ent.Name()))] {
+			names = append(names, ent.Name())
+		}
+	}
+	sort.Strings(names)
+	var blocks []string
+	for _, name := range names {
+		path := filepath.Join(imgDir, name)
+		h, err := cache.HashFile(path)
+		if err != nil {
+			return "", fmt.Errorf("imageDescriptionsForLesson: hash %s: %w", path, err)
+		}
+		descPath := filepath.Join(runDir, "image_desc", h+".json")
+		data, err := os.ReadFile(descPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return "", fmt.Errorf("imageDescriptionsForLesson: read %s: %w", descPath, err)
+		}
+		blocks = append(blocks, fmt.Sprintf("--- %s (%s) ---\n%s", name, h[:12], strings.TrimSpace(string(data))))
+	}
+	return strings.Join(blocks, "\n\n"), nil
+}
+
+// readFilesOrEmptyTemplate is readFiles with a permissive contract: no
+// matches returns "" instead of an error. Used by foreach stages whose
+// per-item glob may be empty for some items (e.g. lessons that have no
+// diagrams → no per-image description files for that lesson). All other
+// behavior (sort, 200 KB cap, "--- <path> ---" headers) mirrors readFiles.
+func readFilesOrEmptyTemplate(pattern string) (string, error) {
+	if strings.HasPrefix(pattern, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("readFilesOrEmpty %s: home dir: %w", pattern, err)
+		}
+		pattern = filepath.Join(home, pattern[2:])
+	}
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return "", fmt.Errorf("readFilesOrEmpty %s: %w", pattern, err)
+	}
+	if len(matches) == 0 {
+		return "", nil
+	}
+	sort.Strings(matches)
+	var filtered []string
+	for _, m := range matches {
+		info, statErr := os.Stat(m)
+		if statErr != nil || info.IsDir() || info.Size() > 200*1024 {
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+	if len(filtered) == 0 {
+		return "", nil
+	}
+	return readFilesFromMatches(filtered)
 }
 
 // enumerateImagePairsTemplate flattens a JSON array of lesson directory
