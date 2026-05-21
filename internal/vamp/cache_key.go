@@ -532,15 +532,52 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 	}
 }
 
-// hashStageImages resolves the stage's ImageDir against the current template
-// binding (so foreach stages get per-item dirs), lists the supported image
-// files inside, and returns one sha256 per file in sorted path order. SVGs
-// hash against their source bytes (not the rasterized PNG) so the cache key
-// stays stable across rsvg-convert version bumps. Returns nil when ImageDir
-// is empty so the keyInput slice marshals to a stable empty representation.
+// hashStageImages resolves the stage's image inputs against the current
+// template binding and returns one sha256 per file in sorted path order.
+// Two modes:
+//   - ImageDir: scan a directory for supported extensions.
+//   - ImageFiles: render each templated path and hash the resolved file.
+//
+// SVGs hash against their source bytes (not the rasterized PNG) so the cache
+// key stays stable across rsvg-convert version bumps. Returns nil when
+// neither field is set so the keyInput slice marshals to a stable empty
+// representation.
 func (e *Executor) hashStageImages(st *Stage, extra map[string]any) ([]string, error) {
-	if st == nil || st.ImageDir == "" {
+	if st == nil {
 		return nil, nil
+	}
+	if st.ImageDir == "" && len(st.ImageFiles) == 0 {
+		return nil, nil
+	}
+	if len(st.ImageFiles) > 0 {
+		paths := make([]string, 0, len(st.ImageFiles))
+		for idx, tmpl := range st.ImageFiles {
+			resolved, err := renderTemplate(fmt.Sprintf("%s:image_files[%d]", st.ID, idx), tmpl, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+			if err != nil {
+				return nil, fmt.Errorf("cache key: render image_files[%d]: %w", idx, err)
+			}
+			p := expandTilde(strings.TrimSpace(resolved))
+			if p == "" {
+				continue
+			}
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(e.PipelineDir, p)
+			}
+			paths = append(paths, p)
+		}
+		sort.Strings(paths)
+		hashes := make([]string, 0, len(paths))
+		for _, p := range paths {
+			h, err := cache.HashFile(p)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return nil, nil
+				}
+				return nil, fmt.Errorf("cache key: hash image %s: %w", p, err)
+			}
+			hashes = append(hashes, h)
+		}
+		return hashes, nil
 	}
 	resolved, err := renderTemplate(st.ID+":image_dir", st.ImageDir, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
 	if err != nil {

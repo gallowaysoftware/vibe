@@ -62,6 +62,15 @@ type Stage struct {
 	// vector markup.
 	ImageDir string `yaml:"image_dir,omitempty"`
 
+	// ImageFiles is the explicit-list alternative to ImageDir: each entry
+	// is a templated path to a single image file (rendered against the
+	// foreach binding so per-iteration single-image stages are
+	// expressible). Use this when a multimodal pipeline needs to fan out
+	// over images one-at-a-time — e.g. lessons whose 6+ diagrams blow
+	// past the model's context when sent together. Mutually exclusive
+	// with ImageDir.
+	ImageFiles []string `yaml:"image_files,omitempty"`
+
 	// Audio-stage fields. Audio stages shell out to a Piper TTS binary to
 	// synthesize speech from a rendered text template. Voice names the voice
 	// model (resolved to <VoicesDir>/<Voice>.onnx). Text is the template
@@ -583,6 +592,17 @@ func (p *Pipeline) Validate() error {
 			if (s.Prompt == "") == (s.PromptFile == "") {
 				return fmt.Errorf("%s: exactly one of prompt or prompt_file is required", ctx)
 			}
+			if s.ImageDir != "" && len(s.ImageFiles) > 0 {
+				return fmt.Errorf("%s: image_dir and image_files are mutually exclusive", ctx)
+			}
+			for idx, tmpl := range s.ImageFiles {
+				if tmpl == "" {
+					return fmt.Errorf("%s: image_files[%d] is empty", ctx, idx)
+				}
+				if _, err := template.New(fmt.Sprintf("%s:image_files[%d]", s.ID, idx)).Funcs(templateFuncs()).Parse(tmpl); err != nil {
+					return fmt.Errorf("%s: parse image_files[%d] template: %w", ctx, idx, err)
+				}
+			}
 			if err := validateParamsKeys(ctx, s.Params); err != nil {
 				return err
 			}
@@ -615,6 +635,9 @@ func (p *Pipeline) Validate() error {
 		case StageTypeAudio:
 			if s.ImageDir != "" {
 				return fmt.Errorf("%s: image_dir is only valid on type: text stages", ctx)
+			}
+			if len(s.ImageFiles) > 0 {
+				return fmt.Errorf("%s: image_files is only valid on type: text stages", ctx)
 			}
 			if s.Voice == "" {
 				return fmt.Errorf("%s: voice is required for type: audio stages", ctx)
@@ -765,6 +788,9 @@ func (p *Pipeline) Validate() error {
 			if s.ImageDir != "" {
 				return fmt.Errorf("%s: image_dir is only valid on type: text stages", ctx)
 			}
+			if len(s.ImageFiles) > 0 {
+				return fmt.Errorf("%s: image_files is only valid on type: text stages", ctx)
+			}
 			if err := rejectYouTubeFields(ctx, s); err != nil {
 				return err
 			}
@@ -806,6 +832,9 @@ func (p *Pipeline) Validate() error {
 			}
 			if s.ImageDir != "" {
 				return fmt.Errorf("%s: image_dir is only valid on type: text stages", ctx)
+			}
+			if len(s.ImageFiles) > 0 {
+				return fmt.Errorf("%s: image_files is only valid on type: text stages", ctx)
 			}
 			if err := rejectYouTubeFields(ctx, s); err != nil {
 				return err
@@ -858,6 +887,9 @@ func (p *Pipeline) Validate() error {
 			}
 			if s.ImageDir != "" {
 				return fmt.Errorf("%s: image_dir is only valid on type: text stages", ctx)
+			}
+			if len(s.ImageFiles) > 0 {
+				return fmt.Errorf("%s: image_files is only valid on type: text stages", ctx)
 			}
 			if err := rejectWebhookFields(ctx, s); err != nil {
 				return err
@@ -960,6 +992,9 @@ func (p *Pipeline) Validate() error {
 			if s.ImageDir != "" {
 				return fmt.Errorf("%s: image_dir is only valid on type: text stages", ctx)
 			}
+			if len(s.ImageFiles) > 0 {
+				return fmt.Errorf("%s: image_files is only valid on type: text stages", ctx)
+			}
 			if err := rejectYouTubeFields(ctx, s); err != nil {
 				return err
 			}
@@ -1007,6 +1042,9 @@ func (p *Pipeline) Validate() error {
 			if s.ImageDir != "" {
 				return fmt.Errorf("%s: image_dir is only valid on type: text stages", ctx)
 			}
+			if len(s.ImageFiles) > 0 {
+				return fmt.Errorf("%s: image_files is only valid on type: text stages", ctx)
+			}
 			if err := rejectYouTubeFields(ctx, s); err != nil {
 				return err
 			}
@@ -1045,6 +1083,9 @@ func (p *Pipeline) Validate() error {
 			}
 			if s.ImageDir != "" {
 				return fmt.Errorf("%s: image_dir is only valid on type: text stages", ctx)
+			}
+			if len(s.ImageFiles) > 0 {
+				return fmt.Errorf("%s: image_files is only valid on type: text stages", ctx)
 			}
 			if err := rejectYouTubeFields(ctx, s); err != nil {
 				return err
@@ -1086,6 +1127,9 @@ func (p *Pipeline) Validate() error {
 			}
 			if s.ImageDir != "" {
 				return fmt.Errorf("%s: image_dir is only valid on type: text stages", ctx)
+			}
+			if len(s.ImageFiles) > 0 {
+				return fmt.Errorf("%s: image_files is only valid on type: text stages", ctx)
 			}
 			if err := rejectYouTubeFields(ctx, s); err != nil {
 				return err

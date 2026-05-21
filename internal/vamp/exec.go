@@ -2167,26 +2167,27 @@ func renderTemplate(name, raw string, deps []string, cliInputs map[string]string
 //     surface as map / number shapes.
 func templateFuncs() template.FuncMap {
 	return template.FuncMap{
-		"slugify":          slugify,
-		"contains":         func(haystack, needle string) bool { return strings.Contains(haystack, needle) },
-		"hasPrefix":        func(s, prefix string) bool { return strings.HasPrefix(s, prefix) },
-		"hasSuffix":        func(s, suffix string) bool { return strings.HasSuffix(s, suffix) },
-		"lower":            strings.ToLower,
-		"upper":            strings.ToUpper,
-		"trim":             strings.TrimSpace,
-		"joinPath":         func(parts ...string) string { return filepath.Join(parts...) },
-		"readFile":         readFileTemplate,
-		"readFiles":        readFilesTemplate,
-		"readLessons":      readLessonsTemplate,
-		"enumerateLessons": enumerateLessonsTemplate,
-		"mergeJSON":        mergeJSONTemplate,
-		"parseJSON":        parseJSONTemplate,
-		"toJSON":           toJSONTemplate,
-		"urlencode":        urlencodeTemplate,
-		"stripDataURIs":    stripDataURIsTemplate,
-		"truncate":         truncateTemplate,
-		"flattenItems":     flattenItemsTemplate,
-		"uniqueByKey":      uniqueByKeyTemplate,
+		"slugify":             slugify,
+		"contains":            func(haystack, needle string) bool { return strings.Contains(haystack, needle) },
+		"hasPrefix":           func(s, prefix string) bool { return strings.HasPrefix(s, prefix) },
+		"hasSuffix":           func(s, suffix string) bool { return strings.HasSuffix(s, suffix) },
+		"lower":               strings.ToLower,
+		"upper":               strings.ToUpper,
+		"trim":                strings.TrimSpace,
+		"joinPath":            func(parts ...string) string { return filepath.Join(parts...) },
+		"readFile":            readFileTemplate,
+		"readFiles":           readFilesTemplate,
+		"readLessons":         readLessonsTemplate,
+		"enumerateLessons":    enumerateLessonsTemplate,
+		"mergeJSON":           mergeJSONTemplate,
+		"parseJSON":           parseJSONTemplate,
+		"toJSON":              toJSONTemplate,
+		"urlencode":           urlencodeTemplate,
+		"stripDataURIs":       stripDataURIsTemplate,
+		"truncate":            truncateTemplate,
+		"flattenItems":        flattenItemsTemplate,
+		"uniqueByKey":         uniqueByKeyTemplate,
+		"enumerateImagePairs": enumerateImagePairsTemplate,
 	}
 }
 
@@ -2583,6 +2584,78 @@ func enumerateLessonsTemplate(pattern string) (string, error) {
 	b, err := json.Marshal(dirs)
 	if err != nil {
 		return "", fmt.Errorf("enumerateLessons: marshal: %w", err)
+	}
+	return string(b), nil
+}
+
+// enumerateImagePairsTemplate flattens a JSON array of lesson directory
+// names into a per-image fan-out list. For each lesson under
+// `<lessonRoot>/<lesson>/images/`, emit one object per supported image
+// file (.png .jpg .jpeg .gif .webp .bmp .svg). Used by pipelines that
+// process images one-at-a-time to avoid blowing the multimodal model's
+// context on lessons with many or large diagrams:
+//
+//	{{ enumerateImagePairs .inputs.lesson_root .stages.list_lessons.output }}
+//
+// Output: JSON array of {"lesson": "<dir>", "image": "<basename>",
+// "image_path": "<abs path>"}, ordered by (lesson, image) sort.
+//
+// Lessons without an images/ dir contribute nothing. Errors (unreadable
+// directory, etc.) surface as a render-stage failure so the pipeline
+// stops before any vision stage sees a bad fan-out.
+func enumerateImagePairsTemplate(lessonRoot, lessonsJSON string) (string, error) {
+	root := lessonRoot
+	if strings.HasPrefix(root, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("enumerateImagePairs: home dir: %w", err)
+		}
+		root = filepath.Join(home, root[2:])
+	}
+	var lessons []string
+	if err := json.Unmarshal([]byte(lessonsJSON), &lessons); err != nil {
+		return "", fmt.Errorf("enumerateImagePairs: parse lessons array: %w", err)
+	}
+	allowed := map[string]bool{
+		".png": true, ".jpg": true, ".jpeg": true, ".gif": true,
+		".webp": true, ".bmp": true, ".svg": true,
+	}
+	type pair struct {
+		Lesson    string `json:"lesson"`
+		Image     string `json:"image"`
+		ImagePath string `json:"image_path"`
+	}
+	var pairs []pair
+	for _, lesson := range lessons {
+		imgDir := filepath.Join(root, lesson, "images")
+		entries, err := os.ReadDir(imgDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return "", fmt.Errorf("enumerateImagePairs: read %s: %w", imgDir, err)
+		}
+		var names []string
+		for _, ent := range entries {
+			if ent.IsDir() {
+				continue
+			}
+			if allowed[strings.ToLower(filepath.Ext(ent.Name()))] {
+				names = append(names, ent.Name())
+			}
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			pairs = append(pairs, pair{
+				Lesson:    lesson,
+				Image:     name,
+				ImagePath: filepath.Join(imgDir, name),
+			})
+		}
+	}
+	b, err := json.Marshal(pairs)
+	if err != nil {
+		return "", fmt.Errorf("enumerateImagePairs: marshal: %w", err)
 	}
 	return string(b), nil
 }

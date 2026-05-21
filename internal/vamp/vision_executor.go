@@ -51,8 +51,12 @@ func (v *visionExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 		}
 	}
 
-	// Collect images when ImageDir is set. Resolves the field as a template
-	// so foreach stages can set per-item directories (e.g. "{{.lesson.dir}}/images").
+	// Collect images. Two modes:
+	//   - image_dir: scan a directory for raster/SVG files.
+	//   - image_files: explicit templated list (one rendered path per
+	//     entry). Used for per-iteration single-image stages where
+	//     directory globbing is too coarse.
+	// Mutually exclusive at validate time.
 	var imagePaths []string
 	if st.ImageDir != "" {
 		resolvedDir, renderErr := renderTemplate(st.ID+":image_dir", st.ImageDir, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
@@ -66,6 +70,29 @@ func (v *visionExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 		imagePaths, err = collectImages(imgDir)
 		if err != nil {
 			return nil, fmt.Errorf("collect images from %s: %w", resolvedDir, err)
+		}
+	} else if len(st.ImageFiles) > 0 {
+		for idx, tmpl := range st.ImageFiles {
+			resolved, renderErr := renderTemplate(fmt.Sprintf("%s:image_files[%d]", st.ID, idx), tmpl, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
+			if renderErr != nil {
+				return nil, fmt.Errorf("render image_files[%d]: %w", idx, renderErr)
+			}
+			p := expandTilde(strings.TrimSpace(resolved))
+			if p == "" {
+				continue
+			}
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(in.PipelineDir, p)
+			}
+			// SVGs get the same rsvg-convert path as collectImages does.
+			if strings.EqualFold(filepath.Ext(p), ".svg") {
+				png, rasterErr := rasterizeSVG(p)
+				if rasterErr != nil {
+					return nil, fmt.Errorf("rasterize %s: %w", p, rasterErr)
+				}
+				p = png
+			}
+			imagePaths = append(imagePaths, p)
 		}
 	}
 
