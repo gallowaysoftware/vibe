@@ -10,15 +10,18 @@ that fit.
 Two binaries from one Go module (`github.com/gallowaysoftware/vibe`):
 
 - **`vibe`** (`cmd/vibe`, `internal/vibe/`): task launcher. One YAML
-  profile activates a backend (`llama_server` | `comfyui`) and an
-  optional frontend (`external` | `docker-compose` | `managed`). The
-  daemon owns a Connect/protobuf control plane on a unix socket plus
-  optional `127.0.0.1:9001` (bearer-token-authed).
+  profile activates a backend (`llama_server` | `comfyui` | `http_server`)
+  and an optional frontend (`external` | `docker-compose` | `managed`).
+  The daemon owns a Connect/protobuf control plane on a unix socket
+  plus optional `127.0.0.1:9001` (bearer-token-authed). The supervisor
+  auto-respawns a backend that exits unexpectedly mid-life (up to 60
+  restarts per 30 min) so a flaky CUDA kernel mid-foreach doesn't kill
+  a long pipeline — see `internal/vibe/daemon/daemon.go:watchBackendForRespawn`.
 - **`vamp`** (`cmd/vamp`, `internal/vamp/`): pipeline orchestrator that
   drives `vibe`. A YAML pipeline declares stages (`text`, `comfyui`,
-  `audio`, `ffmpeg`, `youtube`, `webhook`, `confirm`, `render`) with a
-  DAG of inputs; capability → profile mapping lives in
-  `$XDG_CONFIG_HOME/vamp/capabilities.yaml`.
+  `audio`, `ffmpeg`, `youtube`, `webhook`, `confirm`, `render`,
+  `compact`, `pandoc`) with a DAG of inputs; capability → profile
+  mapping lives in `$XDG_CONFIG_HOME/vamp/capabilities.yaml`.
 
 **`render` stage type.** Pure template → text without LLM invocation.
 Does not activate a vibe profile. Use for deterministic data
@@ -64,9 +67,20 @@ them before pushing.
 ## vibe profile schema rules
 
 - Backend is a **discriminated union by sub-block presence** — exactly
-  one of `backend.llama_server` or `backend.comfyui` must be set. We
-  deliberately do NOT use a `kind:` field; the sub-block IS the
-  discriminator. If you add a third backend, follow the same pattern.
+  one of `backend.llama_server`, `backend.comfyui`, or
+  `backend.http_server` must be set. We deliberately do NOT use a
+  `kind:` field; the sub-block IS the discriminator. If you add a
+  fourth backend, follow the same pattern.
+- **`http_server` backend.** Wraps any HTTP-serving inference engine
+  (TTS daemons, embedding servers, third-party inference). Two
+  modes, mutually exclusive: docker (`image:` + optional `volumes`,
+  `gpu`, `container_port`) or bare binary (`binary:`). Common
+  fields: `port` (required, daemon proxies here), `args`, `env`,
+  `health_path` (defaults to `/health`). The daemon synthesizes a
+  `docker run --rm --name vibe-<profile> -p 127.0.0.1:N:M ...`
+  invocation in docker mode. Used today for Kokoro-FastAPI TTS
+  serving the audio stage's `capability: tts` capability. Frontend
+  block is rejected — the HTTP server IS the deliverable.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.
@@ -101,10 +115,10 @@ them before pushing.
 - **Cache invariants.** `stageCacheable` (in
   `internal/vamp/cache_key.go`) is the single source of truth for "can
   this stage type be cached?". Today it returns true for `text`,
-  `comfyui`, `audio`, `ffmpeg` and false for everything else
-  (`webhook`, `youtube`, `confirm`). Side-effect stages must not be
-  cached — replaying a "success" would skip the side effect that gave
-  the pipeline its reason for existing.
+  `comfyui`, `audio`, `ffmpeg`, `render`, `compact`, `pandoc` and
+  false for everything else (`webhook`, `youtube`, `confirm`). Side-
+  effect stages must not be cached — replaying a "success" would skip
+  the side effect that gave the pipeline its reason for existing.
 - **`.stages.X.output` semantics depend on stage type.** For text /
   render / webhook stages (including their foreach variants — the
   per-item content is `\n\n`-joined) it renders the **content**
@@ -132,31 +146,60 @@ them before pushing.
   require one to avoid silent empty notifications). The
   `examples/profiles/chat-with-search/smoke.yaml` pipeline is the
   canonical use.
-- **Vision (image_dir).** `Stage.ImageDir` on a `type: text` stage
-  instructs the executor to scan the directory for image files
-  (png/jpg/jpeg/gif/webp/bmp), base64-encode them, and send via
-  `CallMultimodal`. SVGs in the directory are rasterized through
-  `rsvg-convert` into a content-addressed PNG cache under
-  `$XDG_CACHE_HOME/vamp/svg-rasterized/` and attached as the resulting
-  PNG — mmproj-backed vision models read pixels, not vector markup, so
-  the stage would otherwise drop the diagrams the lesson author
-  authored as SVG. The field renders as a template so foreach stages
-  can set per-item directories. Requires `rsvg-convert` on `$PATH`
-  when SVGs are present, and a vision-capable backend (Gemma 3 +
-  mmproj) to actually consume the images.
+- **Vision (image_dir / image_files).** Two ways to attach images to
+  a `type: text` stage: `image_dir` (scan a directory, glob all
+  supported files) or `image_files` (explicit templated list, one
+  rendered path per entry, single-image-per-iteration fan-out).
+  Mutually exclusive; same downstream encoding. SVGs get rasterised
+  via `rsvg-convert` into a content-addressed PNG cache under
+  `$XDG_CACHE_HOME/vamp/svg-rasterized/`. Rasterisation fits the
+  output within 896×896 (`--width 896 --height 896 --keep-aspect-ratio`)
+  so the result is a single Gemma 3 vision tile (~256 image tokens);
+  exceeding 896 in either dimension triggers pan-and-scan and balloons
+  token count. Requires `rsvg-convert` on `$PATH` when SVGs are present,
+  and a vision-capable backend (Gemma 3 + mmproj) to actually consume
+  the images.
 - **Foreach items run independently.** A failing item no longer cancels
   sibling items via the per-stage context. Each item completes or fails
   on its own; the stage aggregates partial output from successes and
   reports joined errors. See `exec_test.go:TestExecutor_ParallelForeach_IndependentItems`.
-- **Template functions.** Registered in `exec.go:makeTemplate`:
+- **Template functions.** Registered in `exec.go:templateFuncs`:
   `readFile` (tilde-expanded), `readFiles(pattern)` (glob, 200KB max
-  per file, sorted), `readLessons(path, batch, total)` (paginated
-  lesson reading), `enumerateLessons(glob)` (JSON array of lesson dirs,
-  filters files >200KB), `mergeJSON(ndjson)` (newline-delimited JSON
-  merge), `joinPath(parts...)` (filepath.Join).
+  per file, sorted, errors on no-match), `readFilesOrEmpty(pattern)`
+  (same but returns "" on no-match — for foreach prompts that may
+  have empty per-item globs), `readLessons(path, batch, total)`
+  (paginated lesson reading), `enumerateLessons(glob)` (JSON array of
+  lesson dirs, filters files >200KB), `enumerateImagePairs(root, lessonsJSON)`
+  (flatten lesson list to per-image `{lesson, image, image_path}`
+  entries), `enumerateUniqueImages(root, lessonsJSON)`
+  (content-hash-deduped variant returning `{hash, path, ext}`),
+  `imageDescriptionsForLesson(runDir, root, lesson)` (per-lesson
+  reverse-lookup against `runDir/image_desc/<hash>.json` files),
+  `extractSVGText(path)` (parse SVG XML, return `<text>` labels
+  joined by `|` — sidecar for vision prompts so the model sees
+  ground-truth strings even when small fonts in the raster blur),
+  `mergeJSON(ndjson)`, `parseJSON`, `toJSON`, `urlencode`,
+  `stripDataURIs`, `truncate`, `flattenItems`, `uniqueByKey`,
+  `joinPath(parts...)`.
 - **Concat WAVs.** `Stage.ConcatWavs` on an `ffmpeg` stage auto-globs
   all `*.wav` files, creates a concat list, and merges into the output
   MP3. Implemented in `ffmpeg_executor.go:executeConcatWavs`.
+- **M4B audiobook mode.** `Stage.M4BFrom` / `M4BVar` / `M4BFile` /
+  `M4BChapter` on an `ffmpeg` stage drive a chapterised audiobook
+  build: read the upstream JSON-array stage to determine chapter
+  order, ffprobe each per-chapter MP3 for duration, write an
+  FFMETADATA chapter table + concat list, and run one ffmpeg
+  invocation producing an Apple-Books-readable `.m4b` with embedded
+  chapter navigation. `CoverImage` (also valid on `pandoc` stages)
+  embeds the audiobook art / EPUB cover. Cache key folds in the
+  chapter file template, chapter titles, and cover bytes so an M4B
+  with empty FFmpegArgs doesn't collide with a concat_wavs entry.
+- **Pandoc stage.** `type: pandoc` shells out to pandoc (docker
+  `pandoc/core` image by default, override with `binary:`). Fields:
+  `source_file`, `pandoc_from`, `pandoc_to`, `pandoc_metadata`
+  (map of `--metadata key=value`), `pandoc_args` (raw extra args),
+  `cover_image` (rendered as `--epub-cover-image`). Used today for
+  markdown → EPUB study-guide generation.
 - **InputSpec requires struct form.** Bare strings like
   `lesson_root: "~/path"` are rejected. Use `lesson_root: {default: "~/path"}`.
 

@@ -57,6 +57,22 @@ sub-block must be set:
 - `comfyui` — supervises a [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
   python process for image/video generation. ComfyUI ships its own UI,
   so these profiles carry no `frontend:` block.
+- `http_server` — wraps any HTTP-serving inference engine vibe doesn't
+  have a first-class backend for: TTS daemons, embedding servers,
+  third-party inference. Two modes (mutually exclusive): docker
+  (`image:` + optional `volumes`, `gpu`, `container_port`) or bare
+  binary (`binary:`). Vibe synthesizes the launch invocation, polls
+  `health_path` until ready, and proxies traffic through `:9000`.
+  Used today for Kokoro-FastAPI TTS behind a vamp `capability: tts`.
+  No `frontend:` block — the HTTP server is the deliverable.
+
+**Auto-respawn.** The supervisor watches each backend after it
+reaches ready; an unexpected mid-life exit (e.g. a flaky CUDA kernel
+SIGABRT'ing under load) triggers a same-port re-launch with the same
+spec. Budget: 60 respawns per 30 min before the daemon clears
+`d.active` and lets the next `EnsureActive` start fresh. Tune in
+`internal/vibe/daemon/daemon.go:maxBackendRespawns` if you regularly
+hit it on stable hardware.
 
 **Frontends.** Only applicable to `backend.llama_server` profiles:
 
@@ -102,10 +118,13 @@ anything else is a pipeline error).
 
 | Stage type | What it does |
 | --- | --- |
-| `text`    | LLM chat completion. `output_format: json` validates the model's output. SSE-streamed when the frontend asks for it. |
+| `text`    | LLM chat completion. `output_format: json` validates the model's output. SSE-streamed when the frontend asks for it. Multimodal via `image_dir:` (scan a directory) or `image_files:` (explicit list, one image per foreach item). |
+| `render`  | Pure template render — no LLM, no profile activation. For enumerating directories, building JSON arrays, transforming prior outputs. |
+| `compact` | LLM-summarised, length-targeted compaction. Chunks the source, summarises each, concatenates; recurses if still over target. |
 | `comfyui` | Runs a ComfyUI workflow JSON. WebSocket progress (RFC 6455, polling fallback); collects images, videos, and gifs. |
-| `audio`   | Piper TTS. Picks the voice ONNX from `~/.local/share/piper-voices/`. |
-| `ffmpeg`  | Shells out to `ffmpeg` with templated args; tail-rings stderr for diagnostics. |
+| `audio`   | TTS. `engine: piper` runs Piper on a voice ONNX from `~/.local/share/piper-voices/`; `engine: kokoro` POSTs to a Kokoro-FastAPI server (declare `capability: tts` to let vibe manage its lifecycle). |
+| `ffmpeg`  | Shells out to `ffmpeg` with templated args; tail-rings stderr for diagnostics. Three modes: explicit `ffmpeg_args:`, auto `concat_wavs:`, or M4B chapterised audiobook via `m4b_from:` / `m4b_file:` / `m4b_chapter:` (+ optional `cover_image:`). |
+| `pandoc`  | Document conversion via pandoc (docker `pandoc/core` by default, override with `binary:`). Used for markdown → EPUB study guides with `cover_image:`. |
 | `youtube` | Uploads a finished video via the YouTube Data API (OAuth token cache under XDG). |
 | `webhook` | Slack/Discord/Mattermost-style JSON POST. Honors `run_when: failure` so a failed pipeline still pings. |
 | `confirm` | Human-in-the-loop gate: prompts on stdin (TTY) or writes a marker file the operator clears with `vamp confirm <run-dir> <stage-id> [--reject]` (detach mode). Optional `timeout: 30m` auto-rejects. |
@@ -116,10 +135,13 @@ otherwise-successful foreach stage re-runs only that item). Snapshot
 drift aborts unless `--resume-force` is set.
 
 **Content-addressed cache.** Cacheable stages (`text`, `comfyui`,
-`audio`, `ffmpeg`) hash their full input — prompt/params/model for
-text, post-substitution workflow JSON for ComfyUI, rendered text +
-voice-model size for audio, rendered argv + per-input-file sha256 for
-ffmpeg — and store outputs under `$XDG_CACHE_HOME/vamp/sha256/<2>/<full>`.
+`audio`, `ffmpeg`, `render`, `compact`, `pandoc`) hash their full
+input — prompt/params/model for text, post-substitution workflow
+JSON for ComfyUI, rendered text + voice-model size for audio,
+rendered argv + per-input-file sha256 for ffmpeg, full template
+output for render, source + target length for compact, source bytes
++ pandoc flags for pandoc — and store outputs under
+`$XDG_CACHE_HOME/vamp/sha256/<2>/<full>`.
 Across runs, unchanged stages short-circuit to a cache hit; a single
 tweaked prompt reruns only that stage (plus everything downstream).
 Foreach is per-item: changing 3 items of a 50-item foreach reuses 47.
