@@ -453,6 +453,16 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 	d.frontend = fr
 	d.mu.Unlock()
 
+	// Auto-respawn watcher: when the supervised process exits mid-life
+	// (after reaching Ready) without an operator-initiated Stop, the
+	// backend probably crashed (e.g. llama-server SIGABRT from a flaky
+	// CUDA kernel mid-foreach). Without this, the daemon stays in
+	// "Running but !Ready" forever and every vamp retry returns 502.
+	// We try up to maxBackendRespawns within respawnWindow; on the last
+	// failed restart we clear d.active so the next vamp EnsureActive
+	// goes through a clean start path.
+	go d.watchBackendForRespawn(p.Name, spec, port)
+
 	resp := &vibev1.StartResponse{Status: d.protoStatus()}
 	if fr != nil {
 		slog.Info("profile started", "profile", p.Name, "backend", st.Addr, "wrote", fr.WroteFile)
@@ -467,6 +477,73 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 		slog.Info("profile started", "profile", p.Name, "backend", st.Addr)
 	}
 	return connect.NewResponse(resp), nil
+}
+
+const (
+	// maxBackendRespawns is the cap on automatic restarts of a crashed
+	// backend within respawnWindow. Three is enough to survive an
+	// intermittent driver hiccup without papering over a real config
+	// problem (which would crash deterministically on every restart).
+	maxBackendRespawns = 3
+	respawnWindow      = 30 * time.Minute
+)
+
+// watchBackendForRespawn watches the active supervisor for unexpected
+// exits and re-launches the same spec on the same port if the operator
+// hasn't manually stopped the profile. Exits on:
+//   - clean Stop (d.active cleared)
+//   - profile change (d.active.Name != name)
+//   - respawn budget exhausted
+func (d *Daemon) watchBackendForRespawn(name string, spec supervisor.LaunchSpec, port int) {
+	respawns := 0
+	windowStart := time.Now()
+	for {
+		stopped := d.sup.Stopped()
+		if stopped == nil {
+			return
+		}
+		<-stopped
+
+		d.mu.Lock()
+		stillActive := d.active != nil && d.active.Name == name
+		d.mu.Unlock()
+		if !stillActive {
+			// Operator-initiated Stop or profile switch: nothing to do.
+			return
+		}
+		if time.Since(windowStart) > respawnWindow {
+			respawns = 0
+			windowStart = time.Now()
+		}
+		if respawns >= maxBackendRespawns {
+			slog.Error("backend respawn budget exhausted; giving up",
+				"profile", name, "respawns", respawns, "window", respawnWindow)
+			d.mu.Lock()
+			d.active = nil
+			d.mu.Unlock()
+			d.prx.SetBackend(nil)
+			return
+		}
+		respawns++
+		slog.Warn("backend exited unexpectedly; auto-respawning",
+			"profile", name, "attempt", respawns, "of", maxBackendRespawns)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		err := d.sup.Start(ctx, spec, port)
+		cancel()
+		if err != nil {
+			slog.Error("backend respawn failed", "profile", name, "attempt", respawns, "err", err)
+			continue
+		}
+		// Re-wire the proxy at the same backend URL — Supervisor.Start
+		// reuses the same port (we pass it in), so the URL is identical
+		// to the original, but SetBackend is cheap and avoids any
+		// staleness if the proxy was cleared during a transient.
+		backendURL, perr := url.Parse(d.sup.Status().Addr)
+		if perr == nil && backendURL != nil {
+			d.prx.SetBackend(backendURL)
+		}
+		slog.Info("backend respawned", "profile", name, "addr", d.sup.Status().Addr)
+	}
 }
 
 func (d *Daemon) Stop(ctx context.Context, _ *connect.Request[vibev1.StopRequest]) (*connect.Response[vibev1.StopResponse], error) {

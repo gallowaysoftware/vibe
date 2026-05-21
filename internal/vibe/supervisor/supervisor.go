@@ -186,6 +186,20 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 	}
 }
 
+// Stopped returns a channel that closes when the supervised process
+// exits (whether from a Stop call or from the process dying on its own).
+// Callers wanting to react to an unexpected crash watch this channel and
+// then call Status() to decide whether the exit was a clean Stop or a
+// crash mid-life (StateExited after StateReady ⇒ crash).
+//
+// Returns nil if the supervisor has never been started; callers should
+// guard for that.
+func (s *Supervisor) Stopped() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stopped
+}
+
 func (s *Supervisor) Status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
