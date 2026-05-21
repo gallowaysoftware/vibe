@@ -691,6 +691,15 @@ func (d *Daemon) stopActive(ctx context.Context) error {
 	d.mu.Lock()
 	active := d.active
 	fr := d.frontend
+	// Clear d.active up-front so the watchBackendForRespawn goroutine
+	// — which fires the moment the supervisor exits — sees no active
+	// profile and bails out instead of respawning the backend right
+	// out from under our Stop call. Without this, an EnsureActive
+	// switch (Stop A, then Start B) races: the watcher restarts A on
+	// the same port before Start B can grab the supervisor, and the
+	// switch fails with "supervisor: already running".
+	d.active = nil
+	d.frontend = nil
 	d.mu.Unlock()
 	if active == nil {
 		return nil
@@ -712,10 +721,6 @@ func (d *Daemon) stopActive(ctx context.Context) error {
 		return err
 	}
 	d.prx.SetBackend(nil)
-	d.mu.Lock()
-	d.active = nil
-	d.frontend = nil
-	d.mu.Unlock()
 	return nil
 }
 
