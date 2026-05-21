@@ -228,6 +228,48 @@ func Schema() *schemaProperty {
 				Type:        "string",
 				Description: "Subdirectory (template-rendered, relative to the run dir) to scope the *.wav walk when concat_wavs is true. Defaults to the whole run dir.",
 			},
+			"m4b_from": {
+				Type:        "string",
+				Description: "Upstream stage whose JSON array drives M4B chapter order (ffmpeg stages). Setting any m4b_* field requires m4b_from + m4b_file + m4b_chapter; m4b_var defaults to \"item\".",
+			},
+			"m4b_var": {
+				Type:        "string",
+				Description: "Template variable bound to each upstream item when rendering m4b_file/m4b_chapter. Defaults to \"item\".",
+			},
+			"m4b_file": {
+				Type:        "string",
+				Description: "Template rendering per-item MP3 file path (absolute or relative to run dir).",
+			},
+			"m4b_chapter": {
+				Type:        "string",
+				Description: "Template rendering per-item chapter title embedded in M4B metadata.",
+			},
+			"cover_image": {
+				Type:        "string",
+				Description: "Optional path (template-rendered, absolute or relative to run dir) to a PNG/JPEG cover image embedded in the output (M4B audiobook art or EPUB cover).",
+			},
+			"source_file": {
+				Type:        "string",
+				Description: "Template rendering input file path for pandoc stages.",
+			},
+			"pandoc_from": {
+				Type:        "string",
+				Description: "Pandoc --from format (e.g. \"markdown\") for pandoc stages.",
+			},
+			"pandoc_to": {
+				Type:        "string",
+				Description: "Pandoc --to format (e.g. \"epub\") for pandoc stages.",
+			},
+			"pandoc_metadata": {
+				Type:                 "object",
+				Description:          "Map of pandoc --metadata key=value pairs (title, author, etc.) for pandoc stages.",
+				AdditionalProperties: &schemaProperty{Type: "string"},
+			},
+			"pandoc_args": {
+				Type:        "array",
+				Description: "Extra raw pandoc args, appended after the generated ones.",
+				Items:       &schemaProperty{Type: "string"},
+			},
 			"source": {
 				Type:        "string",
 				Description: "Template rendering the text to compact (compact stages). Typically `{{ .stages.<upstream>.output }}`.",

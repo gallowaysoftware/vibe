@@ -184,20 +184,73 @@ func Schema() *schemaProperty {
 		},
 	}
 
+	httpServer := &schemaProperty{
+		Type:                 "object",
+		Description:          "Generic HTTP-server backend. Supervises a docker container (image set) or bare binary (binary set) exposing an HTTP endpoint, polls health, and proxies traffic through vibe's reverse proxy. Designed for engines vibe doesn't have a first-class backend type for (TTS servers, embedding daemons, third-party inference). Docker mode and binary mode are mutually exclusive.",
+		AdditionalProperties: false,
+		Required:             []string{"port"},
+		Properties: map[string]*schemaProperty{
+			"image": {
+				Type:        "string",
+				Description: "Docker image reference (e.g. \"ghcr.io/remsky/kokoro-fastapi-gpu:latest\"). Mutually exclusive with binary.",
+			},
+			"container_port": {
+				Type:        "integer",
+				Description: "Port exposed inside the container. Defaults to port.",
+				Minimum:     float64Ptr(0),
+			},
+			"volumes": {
+				Type:        "array",
+				Description: "host:container[:ro] mount mappings (docker mode only). Host paths are tilde-expanded.",
+				Items:       &schemaProperty{Type: "string"},
+			},
+			"gpu": {
+				Type:        "boolean",
+				Description: "Pass --gpus all to docker (docker mode only). Requires NVIDIA container toolkit.",
+			},
+			"binary": {
+				Type:        "string",
+				Description: "Path to a binary serving HTTP. Mutually exclusive with image.",
+			},
+			"port": {
+				Type:        "integer",
+				Description: "Host TCP port the daemon proxies to. Required (> 0).",
+				Minimum:     float64Ptr(1),
+			},
+			"args": {
+				Type:        "array",
+				Description: "Argv passed to binary (binary mode) or appended after the image name as the container's command override (docker mode).",
+				Items:       &schemaProperty{Type: "string"},
+			},
+			"env": {
+				Type:                 "object",
+				Description:          "KEY=VALUE pairs forwarded as the process env (binary mode) or as `docker run -e` flags (docker mode).",
+				AdditionalProperties: &schemaProperty{Type: "string"},
+			},
+			"health_path": {
+				Type:        "string",
+				Description: "Path appended to http://127.0.0.1:port for the readiness check. Defaults to /health.",
+			},
+		},
+	}
+
 	backend := &schemaProperty{
 		Type:                 "object",
-		Description:          "Backend configuration. Exactly one of llama_server or comfyui must be set (discriminated union).",
+		Description:          "Backend configuration. Exactly one of llama_server, comfyui, or http_server must be set (discriminated union).",
 		AdditionalProperties: false,
 		Properties: map[string]*schemaProperty{
 			"llama_server": llamaServer,
 			"comfyui":      comfyui,
+			"http_server":  httpServer,
 		},
 		// Discriminated-union XOR: exactly one sub-block. Each oneOf
-		// branch requires one of the two keys; the loader rejects "both
-		// set" and "neither set" at runtime, matching this constraint.
+		// branch requires one of the three keys; the loader rejects
+		// "more than one set" and "none set" at runtime, matching this
+		// constraint.
 		OneOf: []*schemaProperty{
 			{Required: []string{"llama_server"}},
 			{Required: []string{"comfyui"}},
+			{Required: []string{"http_server"}},
 		},
 	}
 

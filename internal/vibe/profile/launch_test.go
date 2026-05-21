@@ -169,3 +169,132 @@ func TestComfyUISpec_WrongBackendErrors(t *testing.T) {
 		t.Errorf("expected error when comfyui is nil")
 	}
 }
+
+// TestHTTPServerSpec_DockerMode covers the docker run argv synthesis: image,
+// host:container port publish (loopback-scoped), GPU passthrough, sorted
+// env, deterministic volume order. A failing assertion here means a profile
+// using engine: kokoro would not spawn the same docker invocation a user
+// would write by hand.
+func TestHTTPServerSpec_DockerMode(t *testing.T) {
+	p := &Profile{
+		Name: "tts_kokoro",
+		Backend: Backend{HTTPServer: &HTTPServerBackend{
+			Image:         "ghcr.io/remsky/kokoro-fastapi-gpu:latest",
+			Port:          8880,
+			ContainerPort: 8880,
+			Volumes:       []string{"/host/cache:/data"},
+			Env:           map[string]string{"HF_HOME": "/data/hf", "DEBUG": "1"},
+			GPU:           true,
+			HealthPath:    "/health",
+		}},
+	}
+	spec, err := HTTPServerSpec(p, p.Name)
+	if err != nil {
+		t.Fatalf("HTTPServerSpec: %v", err)
+	}
+	if spec.Binary != "docker" {
+		t.Errorf("Binary = %q, want docker", spec.Binary)
+	}
+	got := strings.Join(spec.Args, " ")
+	for _, want := range []string{
+		"run --rm",
+		"--name vibe-tts_kokoro",
+		"-p 127.0.0.1:8880:8880",
+		"--gpus all",
+		"-v /host/cache:/data",
+		"-e DEBUG=1",
+		"-e HF_HOME=/data/hf",
+		"ghcr.io/remsky/kokoro-fastapi-gpu:latest",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("docker argv missing %q\nargv: %s", want, got)
+		}
+	}
+	if spec.HealthURL != "http://127.0.0.1:8880/health" {
+		t.Errorf("HealthURL = %q", spec.HealthURL)
+	}
+	// Env-flag order must be sorted (DEBUG before HF_HOME alphabetically).
+	if strings.Index(got, "-e DEBUG=") > strings.Index(got, "-e HF_HOME=") {
+		t.Errorf("env-flag order is not sorted: %s", got)
+	}
+}
+
+// TestHTTPServerSpec_BinaryMode covers the bare-process path: Binary + Args
+// + sorted env, no docker.
+func TestHTTPServerSpec_BinaryMode(t *testing.T) {
+	p := &Profile{
+		Name: "embedding_server",
+		Backend: Backend{HTTPServer: &HTTPServerBackend{
+			Binary: "/usr/local/bin/text-embeddings-inference",
+			Args:   []string{"--model-id", "BAAI/bge-m3", "--port", "8090"},
+			Env:    map[string]string{"RUST_LOG": "info"},
+			Port:   8090,
+		}},
+	}
+	spec, err := HTTPServerSpec(p, p.Name)
+	if err != nil {
+		t.Fatalf("HTTPServerSpec: %v", err)
+	}
+	if spec.Binary != "/usr/local/bin/text-embeddings-inference" {
+		t.Errorf("Binary = %q", spec.Binary)
+	}
+	if strings.Join(spec.Args, " ") != "--model-id BAAI/bge-m3 --port 8090" {
+		t.Errorf("Args = %v", spec.Args)
+	}
+	if len(spec.Env) != 1 || spec.Env[0] != "RUST_LOG=info" {
+		t.Errorf("Env = %v", spec.Env)
+	}
+	if spec.HealthURL != "http://127.0.0.1:8090/health" {
+		t.Errorf("HealthURL = %q", spec.HealthURL)
+	}
+}
+
+func TestHTTPServerSpec_CustomHealthPath(t *testing.T) {
+	p := &Profile{
+		Name: "x",
+		Backend: Backend{HTTPServer: &HTTPServerBackend{
+			Image:      "foo:latest",
+			Port:       9000,
+			HealthPath: "v1/status",
+		}},
+	}
+	spec, err := HTTPServerSpec(p, p.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.HealthURL != "http://127.0.0.1:9000/v1/status" {
+		t.Errorf("HealthURL = %q (leading slash should be added)", spec.HealthURL)
+	}
+}
+
+func TestHTTPServerSpec_WrongBackendErrors(t *testing.T) {
+	p := &Profile{Backend: Backend{}}
+	if _, err := HTTPServerSpec(p, "x"); err == nil {
+		t.Errorf("expected error when http_server is nil")
+	}
+}
+
+func TestValidateHTTPServer_ImageBinaryXOR(t *testing.T) {
+	cases := []struct {
+		name    string
+		h       HTTPServerBackend
+		wantErr string
+	}{
+		{name: "neither", h: HTTPServerBackend{Port: 1}, wantErr: "image (docker mode) or binary"},
+		{name: "both", h: HTTPServerBackend{Image: "i", Binary: "b", Port: 1}, wantErr: "mutually exclusive"},
+		{name: "port_zero", h: HTTPServerBackend{Image: "i", Port: 0}, wantErr: "port must be > 0"},
+		{name: "volumes_in_binary_mode", h: HTTPServerBackend{Binary: "b", Port: 1, Volumes: []string{"a:b"}}, wantErr: "volumes is only valid in docker mode"},
+		{name: "gpu_in_binary_mode", h: HTTPServerBackend{Binary: "b", Port: 1, GPU: true}, wantErr: "gpu is only valid in docker mode"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateHTTPServer(&tc.h)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error %q does not contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}

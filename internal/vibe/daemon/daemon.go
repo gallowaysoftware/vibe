@@ -369,9 +369,26 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 		}
 		slog.Info("starting profile (comfyui)",
 			"profile", p.Name, "dir", p.Backend.ComfyUI.Dir, "port", port)
+	case p.Backend.HTTPServer != nil:
+		// http_server backends pin their port up-front (the docker
+		// publish mapping or the binary's --port flag); the daemon
+		// doesn't pick a free one.
+		port = p.Backend.HTTPServer.Port
+		spec, err = profile.HTTPServerSpec(p, p.Name)
+		if err != nil {
+			return nil, connect.NewError(connect.CodeInternal, err)
+		}
+		mode := "docker"
+		if p.Backend.HTTPServer.Image == "" {
+			mode = "binary"
+		}
+		slog.Info("starting profile (http_server)",
+			"profile", p.Name, "mode", mode,
+			"image_or_binary", firstNonEmpty(p.Backend.HTTPServer.Image, p.Backend.HTTPServer.Binary),
+			"port", port)
 	default:
 		return nil, connect.NewError(connect.CodeFailedPrecondition,
-			errors.New("profile has no backend (set backend.llama_server or backend.comfyui)"))
+			errors.New("profile has no backend (set backend.llama_server, backend.comfyui, or backend.http_server)"))
 	}
 
 	if err := d.sup.Start(startCtx, spec, port); err != nil {
@@ -632,6 +649,19 @@ func (d *Daemon) protoStatus() *vibev1.Status {
 		s.FrontendEnv = d.frontend.Env
 	}
 	return s
+}
+
+// firstNonEmpty returns the first non-"" string from its arguments.
+// Used by the http_server start logging path so the same slog field can
+// surface either the docker image or the bare-binary path without two
+// separate log lines per mode.
+func firstNonEmpty(s ...string) string {
+	for _, v := range s {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func loadProfileByName(name string) (*profile.Profile, error) {

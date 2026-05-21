@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -63,8 +65,9 @@ func (f *ffmpegExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 	if st == nil {
 		return nil, errors.New("ffmpeg: missing stage")
 	}
-	if !st.ConcatWavs && len(st.FFmpegArgs) == 0 {
-		return nil, fmt.Errorf("stage %s: ffmpeg_args is required for type: ffmpeg (unless concat_wavs is true)", st.ID)
+	isM4B := st.M4BFrom != ""
+	if !st.ConcatWavs && !isM4B && len(st.FFmpegArgs) == 0 {
+		return nil, fmt.Errorf("stage %s: ffmpeg_args is required for type: ffmpeg (unless concat_wavs or m4b_from is set)", st.ID)
 	}
 
 	// Foreach binding goes into argv-template rendering and the output-path
@@ -77,6 +80,11 @@ func (f *ffmpegExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 	// concat_wavs mode: auto-glob all WAVs in run dir and concatenate them.
 	if st.ConcatWavs {
 		return f.executeConcatWavs(ctx, in, st, extra)
+	}
+	// m4b mode: build a chapterized audiobook by concatenating per-item
+	// MP3s with embedded chapter metadata.
+	if isM4B {
+		return f.executeM4B(ctx, in, st, extra)
 	}
 
 	// Render each argv entry independently. We name each template with its
@@ -390,6 +398,236 @@ func scanCRLF(data []byte, atEOF bool) (advance int, token []byte, err error) {
 		return len(data), data, nil
 	}
 	return 0, nil, nil
+}
+
+// executeM4B builds a chapterized M4B audiobook by:
+//
+//  1. Reading st.M4BFrom's JSON-array output to determine chapter order
+//     and binding each item under st.M4BVar.
+//  2. For each item: rendering st.M4BFile to an MP3 path (resolved
+//     relative to the run dir when not absolute) and st.M4BChapter to
+//     a chapter title string.
+//  3. Probing each MP3's duration via ffprobe and building cumulative
+//     start/end timestamps for the FFMETADATA chapter table.
+//  4. Writing a concat list and a metadata file under the run dir.
+//  5. Invoking ffmpeg once: `-f concat -safe 0 -i list -i metadata
+//     -map_metadata 1 -c:a aac -b:a 96k -movflags +faststart output`.
+//
+// The result is an Apple-Books / Audiobookshelf / VLC-readable M4B
+// with proper chapter navigation. Stage.Output must end in .m4b
+// (validator enforces). No cover-art embed in this pass — that's a
+// follow-up.
+func (f *ffmpegExecutor) executeM4B(ctx context.Context, in StageInput, st *Stage, extra map[string]any) (*StageOutput, error) {
+	srcResult, ok := in.Prior[st.M4BFrom]
+	if !ok || srcResult == nil {
+		return nil, fmt.Errorf("stage %s: m4b_from %q has no upstream output", st.ID, st.M4BFrom)
+	}
+	var items []any
+	srcRaw := strings.TrimSpace(stripModelArtifacts(srcResult.Output))
+	if srcRaw == "" {
+		return nil, fmt.Errorf("stage %s: m4b_from %q produced empty output", st.ID, st.M4BFrom)
+	}
+	var asObj map[string]any
+	if err := json.Unmarshal([]byte(srcRaw), &asObj); err == nil {
+		if arr, isArr := asObj["items"].([]any); isArr {
+			items = arr
+		} else {
+			items = []any{asObj}
+		}
+	} else if err := json.Unmarshal([]byte(srcRaw), &items); err != nil {
+		return nil, fmt.Errorf("stage %s: parse m4b_from %q output: %w", st.ID, st.M4BFrom, err)
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("stage %s: m4b_from %q produced zero items", st.ID, st.M4BFrom)
+	}
+
+	type chapter struct {
+		File    string
+		Title   string
+		Millis  int64
+		StartMs int64
+		EndMs   int64
+	}
+	chapters := make([]chapter, 0, len(items))
+	var cumMs int64
+	for i, raw := range items {
+		itemExtra := map[string]any{st.M4BVar: raw, "i": i}
+		for k, v := range extra {
+			itemExtra[k] = v
+		}
+		filePath, err := renderTemplate(fmt.Sprintf("%s:m4b_file[%d]", st.ID, i), st.M4BFile, st.Inputs, in.Inputs, in.Prior, in.RunDir, itemExtra)
+		if err != nil {
+			return nil, fmt.Errorf("stage %s: render m4b_file[%d]: %w", st.ID, i, err)
+		}
+		title, err := renderTemplate(fmt.Sprintf("%s:m4b_chapter[%d]", st.ID, i), st.M4BChapter, st.Inputs, in.Inputs, in.Prior, in.RunDir, itemExtra)
+		if err != nil {
+			return nil, fmt.Errorf("stage %s: render m4b_chapter[%d]: %w", st.ID, i, err)
+		}
+		absFile := filePath
+		if !filepath.IsAbs(absFile) {
+			absFile = filepath.Join(in.RunDir, absFile)
+		}
+		dur, err := probeDurationMs(ctx, absFile)
+		if err != nil {
+			return nil, fmt.Errorf("stage %s: ffprobe chapter[%d] %s: %w", st.ID, i, absFile, err)
+		}
+		ch := chapter{
+			File:    absFile,
+			Title:   title,
+			Millis:  dur,
+			StartMs: cumMs,
+			EndMs:   cumMs + dur,
+		}
+		chapters = append(chapters, ch)
+		cumMs += dur
+	}
+
+	outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
+	if err != nil {
+		return nil, fmt.Errorf("stage %s: render output path: %w", st.ID, err)
+	}
+	outAbs := filepath.Join(in.RunDir, outRel)
+	if err := os.MkdirAll(filepath.Dir(outAbs), 0o755); err != nil {
+		return nil, fmt.Errorf("stage %s: create output dir: %w", st.ID, err)
+	}
+
+	listPath := filepath.Join(in.RunDir, fmt.Sprintf(".ffmpeg-m4b-concat.%s.txt", st.ID))
+	var listBuf strings.Builder
+	for _, ch := range chapters {
+		fmt.Fprintf(&listBuf, "file '%s'\n", ch.File)
+	}
+	if err := os.WriteFile(listPath, []byte(listBuf.String()), 0o644); err != nil {
+		return nil, fmt.Errorf("stage %s: write concat list: %w", st.ID, err)
+	}
+
+	metaPath := filepath.Join(in.RunDir, fmt.Sprintf(".ffmpeg-m4b-meta.%s.txt", st.ID))
+	var metaBuf strings.Builder
+	metaBuf.WriteString(";FFMETADATA1\n")
+	for _, ch := range chapters {
+		fmt.Fprintf(&metaBuf, "[CHAPTER]\nTIMEBASE=1/1000\nSTART=%d\nEND=%d\ntitle=%s\n", ch.StartMs, ch.EndMs, m4bEscapeMeta(ch.Title))
+	}
+	if err := os.WriteFile(metaPath, []byte(metaBuf.String()), 0o644); err != nil {
+		return nil, fmt.Errorf("stage %s: write metadata: %w", st.ID, err)
+	}
+
+	binary := st.Binary
+	if binary == "" {
+		binary = f.defaultBinary
+	}
+	if binary == "" {
+		binary = "ffmpeg"
+	}
+
+	// Optional cover-art embed: passes the cover PNG as a second
+	// input stream and tags it as the attached-picture so Apple Books,
+	// Audiobookshelf, VLC etc. display it as the book cover.
+	var coverAbs string
+	if st.CoverImage != "" {
+		coverRel, err := renderTemplate(st.ID+":cover_image", st.CoverImage, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
+		if err != nil {
+			return nil, fmt.Errorf("stage %s: render cover_image: %w", st.ID, err)
+		}
+		coverAbs = coverRel
+		if !filepath.IsAbs(coverAbs) {
+			coverAbs = filepath.Join(in.RunDir, coverRel)
+		}
+		if _, err := os.Stat(coverAbs); err != nil {
+			return nil, fmt.Errorf("stage %s: cover_image %s: %w", st.ID, coverAbs, err)
+		}
+	}
+
+	args := []string{"-f", "concat", "-safe", "0", "-i", listPath, "-i", metaPath}
+	if coverAbs != "" {
+		args = append(args, "-i", coverAbs)
+		// 0:a is the concatenated audio; 2:v is the cover image
+		// (input 1 carries no streams, just FFMETADATA chapters).
+		args = append(args,
+			"-map", "0:a",
+			"-map", "2:v",
+			"-map_metadata", "1",
+			"-disposition:v:0", "attached_pic",
+			"-c:a", "aac", "-b:a", "96k",
+			"-c:v", "copy",
+		)
+	} else {
+		args = append(args,
+			"-map", "0:a",
+			"-map_metadata", "1",
+			"-c:a", "aac", "-b:a", "96k",
+		)
+	}
+	args = append(args, "-movflags", "+faststart", "-y", outAbs)
+	runner := f.runner
+	if runner == nil {
+		runner = ffmpegCommandRunner{}
+	}
+	if in.Log != nil {
+		fmt.Fprintf(in.Log, "ffmpeg m4b: %s (%d chapter(s), %s total)\n", outRel, len(chapters), formatM4BDuration(cumMs))
+	}
+	if err := runner.Run(ctx, binary, args, in.Log); err != nil {
+		return nil, fmt.Errorf("stage %s: ffmpeg m4b: %w", st.ID, err)
+	}
+	return &StageOutput{Files: []string{outAbs}}, nil
+}
+
+// probeDurationMs shells out to ffprobe to read a file's duration in
+// milliseconds. ffprobe's -show_entries form returns a float seconds
+// value; we round to ms to match the FFMETADATA TIMEBASE=1/1000.
+func probeDurationMs(ctx context.Context, path string) (int64, error) {
+	cmd := exec.CommandContext(ctx, "ffprobe",
+		"-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		path,
+	)
+	var out, errBuf bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(errBuf.String())
+		if msg != "" {
+			return 0, fmt.Errorf("%w: %s", err, msg)
+		}
+		return 0, err
+	}
+	s := strings.TrimSpace(out.String())
+	if s == "" {
+		return 0, fmt.Errorf("ffprobe returned empty duration for %s", path)
+	}
+	secs, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse duration %q: %w", s, err)
+	}
+	if secs < 0 {
+		return 0, fmt.Errorf("negative duration %g from %s", secs, path)
+	}
+	return int64(secs*1000 + 0.5), nil
+}
+
+// m4bEscapeMeta escapes characters that have special meaning in FFMETADATA1
+// (`=`, `;`, `#`, `\`, newlines) per ffmpeg's metadata-file format. Chapter
+// titles routinely include `:` which is fine; the listed characters are
+// the ones that break the parser.
+func m4bEscapeMeta(s string) string {
+	repl := strings.NewReplacer(
+		`\`, `\\`,
+		`=`, `\=`,
+		`;`, `\;`,
+		`#`, `\#`,
+		"\n", `\n`,
+	)
+	return repl.Replace(s)
+}
+
+// formatM4BDuration renders a millisecond count as H:MM:SS for the M4B
+// status line. Distinct from timing.go's formatDuration which formats
+// time.Duration values for the per-stage timing report.
+func formatM4BDuration(ms int64) string {
+	totalSec := ms / 1000
+	h := totalSec / 3600
+	m := (totalSec % 3600) / 60
+	s := totalSec % 60
+	return fmt.Sprintf("%d:%02d:%02d", h, m, s)
 }
 
 // trailingInt extracts the integer suffix from p's basename (after the last

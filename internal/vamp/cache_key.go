@@ -35,7 +35,7 @@ func EnvCacheDisabled() bool {
 // CLI/docs all agree on the same allow-list.
 func stageCacheable(st *Stage) bool {
 	switch stageTypeOrDefault(st) {
-	case StageTypeText, StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg, StageTypeRender, StageTypeCompact:
+	case StageTypeText, StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg, StageTypeRender, StageTypeCompact, StageTypePandoc:
 		return true
 	default:
 		return false
@@ -464,6 +464,41 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 				return "", fmt.Errorf("cache key: walk %s: %w", walkRoot, err)
 			}
 			sort.Strings(inputs)
+		}
+		// M4B mode keys on the rendered per-chapter file list + chapter
+		// titles + cover image bytes. Without this, an m4b stage with
+		// empty FFmpegArgs collides in cache with any other empty-args
+		// ffmpeg stage (e.g. an older concat_wavs entry from a prior
+		// run) and serves bytes from the wrong file. Mirrors the
+		// concat_wavs:v2 fix.
+		if st.M4BFrom != "" {
+			args = append(args, "m4b:v1:from:"+st.M4BFrom)
+			outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+			if err != nil {
+				return "", fmt.Errorf("cache key: render m4b output: %w", err)
+			}
+			args = append(args, "m4b:output:"+outRel)
+			args = append(args, "m4b:file_template:"+st.M4BFile)
+			args = append(args, "m4b:chapter_template:"+st.M4BChapter)
+			if st.CoverImage != "" {
+				coverRel, err := renderTemplate(st.ID+":cover_image", st.CoverImage, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+				if err != nil {
+					return "", fmt.Errorf("cache key: render cover_image: %w", err)
+				}
+				args = append(args, "m4b:cover:"+coverRel)
+				coverAbs := coverRel
+				if !filepath.IsAbs(coverAbs) {
+					coverAbs = filepath.Join(e.RunDir, coverRel)
+				}
+				if _, err := os.Stat(coverAbs); err == nil {
+					inputs = append(inputs, coverAbs)
+				}
+			}
+			// Fold the upstream stage's output (the chapter list source)
+			// into the key so a different parent list invalidates.
+			if upstream, ok := e.snapshotPrior(st.Inputs)[st.M4BFrom]; ok && upstream != nil {
+				args = append(args, "m4b:from_output:"+upstream.Output)
+			}
 		}
 		return stageCacheKey(keyInput{
 			StageType:    StageTypeFFmpeg,

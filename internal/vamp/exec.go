@@ -88,6 +88,14 @@ const (
 	// and concatenates the compressed chunks. Recurses if the first pass
 	// still overshoots the target.
 	StageTypeCompact StageType = "compact"
+	// StageTypePandoc shells out to pandoc to convert documents between
+	// formats — primarily markdown -> EPUB for the cibd study guide so a
+	// reader can drop the result into Apple Books and get reflowable
+	// text, table of contents, position sync, and dark mode. Pandoc is
+	// invoked via docker (pandoc/core image) by default so the host
+	// doesn't need a pandoc install; set binary: "pandoc" to use a
+	// locally-installed one.
+	StageTypePandoc StageType = "pandoc"
 )
 
 // StageExecutor implements the run of a single stage instance. The receiver
@@ -371,6 +379,7 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 		StageTypeConfirm: newConfirmExecutor(),
 		StageTypeRender:  &renderExecutor{},
 		StageTypeCompact: &compactExecutor{inference: e.Inference},
+		StageTypePandoc:  &pandocExecutor{},
 	}
 
 	// Stage lookup and dependency counts for wave-based scheduling.
@@ -1635,7 +1644,16 @@ func stageTypeOrDefault(st *Stage) StageType {
 // scheduler skips EnsureActive for groups consisting entirely of these stages.
 func stageRequiresVibeProfile(st *Stage) bool {
 	switch stageTypeOrDefault(st) {
-	case StageTypeAudio, StageTypeFFmpeg, StageTypeYouTube, StageTypeWebhook, StageTypeConfirm, StageTypeRender:
+	case StageTypeAudio:
+		// Audio stages historically didn't activate a vibe profile
+		// (piper engine is a local subprocess on the host). The kokoro
+		// engine talks to an HTTP TTS server — when the stage declares
+		// a capability, that's our signal to route through vibe so the
+		// daemon manages the backing http_server profile's lifecycle
+		// like every other LLM stage. No capability set ⇒ pure piper
+		// (or kokoro with an explicit engine_url) ⇒ no profile.
+		return st.Capability != ""
+	case StageTypeFFmpeg, StageTypeYouTube, StageTypeWebhook, StageTypeConfirm, StageTypeRender, StageTypePandoc:
 		return false
 	default:
 		return true

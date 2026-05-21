@@ -124,6 +124,51 @@ type Stage struct {
 	// to the run dir; absolute paths are rejected to keep cleanup +
 	// resume sane.
 	ConcatWavsDir string `yaml:"concat_wavs_dir,omitempty"`
+	// Pandoc-stage fields. SourceFile is the template rendering the input
+	// file path (relative to run dir or absolute). PandocFrom / PandocTo
+	// are the --from / --to format flags. PandocMetadata is a map of
+	// pandoc --metadata key=value pairs (title/author/date). PandocArgs
+	// is appended raw after the generated args.
+	SourceFile     string            `yaml:"source_file,omitempty"`
+	PandocFrom     string            `yaml:"pandoc_from,omitempty"`
+	PandocTo       string            `yaml:"pandoc_to,omitempty"`
+	PandocMetadata map[string]string `yaml:"pandoc_metadata,omitempty"`
+	PandocArgs     []string          `yaml:"pandoc_args,omitempty"`
+	// CoverImage is an optional template rendering a path to a PNG/JPEG
+	// cover image. Embedded as audiobook art when set on an M4B ffmpeg
+	// stage, as --epub-cover-image when set on a pandoc EPUB stage.
+	CoverImage string `yaml:"cover_image,omitempty"`
+
+	// M4B* fields, when set together on a `type: ffmpeg` stage, switch the
+	// executor into "build a chapterized M4B audiobook" mode. Designed to
+	// take an upstream JSON-array stage (typically the dedup'd parent list
+	// from a unique_parents render stage), look up the corresponding MP3
+	// file per item, ffprobe each for duration, and concat them into one
+	// AAC-encoded .m4b with embedded chapter metadata. Apple Books, every
+	// audiobook player, and Audiobookshelf all read the resulting file
+	// directly — proper chapter navigation, position sync, speed control.
+	//
+	// All four fields are required as a set; setting one without the
+	// others is a validation error. Mutually exclusive with concat_wavs
+	// + ffmpeg_args.
+	//
+	// M4BFrom names the upstream stage whose JSON-array output drives
+	// the chapter list (and chapter ORDER — the executor preserves the
+	// upstream's emit order, NOT lexical filename sort, so a unit
+	// list like [cereals, cereal_wort_production, ...] stays in that
+	// natural order rather than going alphabetical).
+	M4BFrom string `yaml:"m4b_from,omitempty"`
+	// M4BVar is the template variable name bound to each upstream item
+	// while rendering M4BFile and M4BChapter. Defaults to "item".
+	M4BVar string `yaml:"m4b_var,omitempty"`
+	// M4BFile is a template rendered per upstream item to the absolute
+	// or run-dir-relative path of the MP3 file for that chapter. Each
+	// rendered file must exist when the stage runs.
+	M4BFile string `yaml:"m4b_file,omitempty"`
+	// M4BChapter is a template rendered per upstream item to the human-
+	// readable chapter title embedded in the M4B metadata. Shows up as
+	// the chapter name in Apple Books / Audiobookshelf / VLC.
+	M4BChapter string `yaml:"m4b_chapter,omitempty"`
 
 	// YouTube-stage fields. Video is a template path to the MP4 to upload
 	// (typically the output of an upstream ffmpeg stage). Title/Description
@@ -530,7 +575,7 @@ func (p *Pipeline) Validate() error {
 		// (youtube, webhook), which talk to a third-party API and never
 		// activate a vibe profile. Confirm stages are pure local I/O —
 		// stdin or a marker file — and also don't activate a profile.
-		if stageType != StageTypeAudio && stageType != StageTypeFFmpeg && stageType != StageTypeYouTube && stageType != StageTypeWebhook && stageType != StageTypeConfirm && stageType != StageTypeRender && s.Capability == "" {
+		if stageType != StageTypeAudio && stageType != StageTypeFFmpeg && stageType != StageTypeYouTube && stageType != StageTypeWebhook && stageType != StageTypeConfirm && stageType != StageTypeRender && stageType != StageTypePandoc && s.Capability == "" {
 			return fmt.Errorf("%s: capability is required", ctx)
 		}
 		switch stageType {
@@ -630,11 +675,22 @@ func (p *Pipeline) Validate() error {
 				return err
 			}
 		case StageTypeFFmpeg:
+			// An ffmpeg stage selects exactly one mode: explicit
+			// ffmpeg_args, auto concat_wavs (with optional dir scope),
+			// or auto M4B chapterized concat (with explicit per-chapter
+			// inputs). The three modes are mutually exclusive.
+			isM4B := s.M4BFrom != "" || s.M4BVar != "" || s.M4BFile != "" || s.M4BChapter != ""
 			if s.ConcatWavs && len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: concat_wavs and ffmpeg_args are mutually exclusive (concat_wavs constructs argv internally)", ctx)
 			}
-			if !s.ConcatWavs && len(s.FFmpegArgs) == 0 {
-				return fmt.Errorf("%s: ffmpeg_args is required for type: ffmpeg stages (unless concat_wavs is true)", ctx)
+			if s.ConcatWavs && isM4B {
+				return fmt.Errorf("%s: concat_wavs and m4b_* are mutually exclusive (pick one concat mode)", ctx)
+			}
+			if isM4B && len(s.FFmpegArgs) > 0 {
+				return fmt.Errorf("%s: m4b_* and ffmpeg_args are mutually exclusive (m4b mode constructs argv internally)", ctx)
+			}
+			if !s.ConcatWavs && !isM4B && len(s.FFmpegArgs) == 0 {
+				return fmt.Errorf("%s: ffmpeg_args is required for type: ffmpeg stages (unless concat_wavs or m4b_from is set)", ctx)
 			}
 			if s.ConcatWavsDir != "" && !s.ConcatWavs {
 				return fmt.Errorf("%s: concat_wavs_dir is only valid when concat_wavs is true", ctx)
@@ -643,6 +699,43 @@ func (p *Pipeline) Validate() error {
 				cleaned := filepath.Clean(s.ConcatWavsDir)
 				if filepath.IsAbs(cleaned) || strings.HasPrefix(cleaned, "..") {
 					return fmt.Errorf("%s: concat_wavs_dir %q must be a relative path inside the run dir", ctx, s.ConcatWavsDir)
+				}
+			}
+			if isM4B {
+				if s.M4BFrom == "" {
+					return fmt.Errorf("%s: m4b_from is required when any m4b_* field is set", ctx)
+				}
+				if s.M4BFile == "" {
+					return fmt.Errorf("%s: m4b_file is required when m4b_from is set", ctx)
+				}
+				if s.M4BChapter == "" {
+					return fmt.Errorf("%s: m4b_chapter is required when m4b_from is set", ctx)
+				}
+				if _, err := template.New(s.ID + ":m4b_file").Funcs(templateFuncs()).Parse(s.M4BFile); err != nil {
+					return fmt.Errorf("%s: parse m4b_file template: %w", ctx, err)
+				}
+				if _, err := template.New(s.ID + ":m4b_chapter").Funcs(templateFuncs()).Parse(s.M4BChapter); err != nil {
+					return fmt.Errorf("%s: parse m4b_chapter template: %w", ctx, err)
+				}
+				// M4BFrom must be declared in Inputs so the cross-cutting
+				// dependency is honest, matching foreach.from's rule.
+				declared := false
+				for _, dep := range s.Inputs {
+					if dep == s.M4BFrom {
+						declared = true
+						break
+					}
+				}
+				if !declared {
+					return fmt.Errorf("%s: m4b_from %q must also appear in inputs", ctx, s.M4BFrom)
+				}
+				// Default M4BVar to "item" so the executor can rely on it
+				// always being set.
+				if s.M4BVar == "" {
+					p.Stages[i].M4BVar = DefaultForeachVar
+				}
+				if !strings.HasSuffix(s.Output, ".m4b") {
+					return fmt.Errorf("%s: output %q must end in .m4b when m4b_from is set", ctx, s.Output)
 				}
 			}
 			if s.Capability != "" {
@@ -1000,8 +1093,32 @@ func (p *Pipeline) Validate() error {
 			if err := rejectWebhookFields(ctx, s); err != nil {
 				return err
 			}
+		case StageTypePandoc:
+			if s.SourceFile == "" {
+				return fmt.Errorf("%s: source_file is required for type: pandoc", ctx)
+			}
+			if _, err := template.New(s.ID + ":source_file").Funcs(templateFuncs()).Parse(s.SourceFile); err != nil {
+				return fmt.Errorf("%s: parse source_file template: %w", ctx, err)
+			}
+			if s.PandocTo == "" {
+				return fmt.Errorf("%s: pandoc_to is required for type: pandoc (e.g. \"epub\")", ctx)
+			}
+			if ext := pandocOutputExtension(s.PandocTo); ext != "" && !strings.HasSuffix(strings.ToLower(s.Output), ext) {
+				return fmt.Errorf("%s: output %q should end in %s for pandoc_to: %s", ctx, s.Output, ext, s.PandocTo)
+			}
+			if s.CoverImage != "" {
+				if _, err := template.New(s.ID + ":cover_image").Funcs(templateFuncs()).Parse(s.CoverImage); err != nil {
+					return fmt.Errorf("%s: parse cover_image template: %w", ctx, err)
+				}
+			}
+			if s.Capability != "" {
+				return fmt.Errorf("%s: capability is only valid on stage types that activate a vibe profile (pandoc shells out to a binary)", ctx)
+			}
+			if s.Prompt != "" || s.PromptFile != "" {
+				return fmt.Errorf("%s: prompt/prompt_file are not valid on type: pandoc", ctx)
+			}
 		default:
-			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio, ffmpeg, youtube, webhook, confirm, render, compact)", ctx, s.Type)
+			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio, ffmpeg, youtube, webhook, confirm, render, compact, pandoc)", ctx, s.Type)
 		}
 		if s.OutputFormat != "" && s.OutputFormat != "json" {
 			return fmt.Errorf("%s: output_format %q is not supported (allowed: \"\", json)", ctx, s.OutputFormat)

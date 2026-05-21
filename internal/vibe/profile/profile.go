@@ -35,6 +35,7 @@ type Profile struct {
 type Backend struct {
 	LlamaServer *LlamaServerBackend `yaml:"llama_server,omitempty"`
 	ComfyUI     *ComfyUIBackend     `yaml:"comfyui,omitempty"`
+	HTTPServer  *HTTPServerBackend  `yaml:"http_server,omitempty"`
 }
 
 // LlamaServerBackend supervises a llama-server child process exposing an
@@ -70,6 +71,69 @@ type LlamaServerBackend struct {
 	// affecting the others. Tilde-expanded at load; validated to exist
 	// and be executable.
 	Binary string `yaml:"binary,omitempty"`
+}
+
+// HTTPServerBackend supervises any HTTP-serving inference engine — typically
+// shipped as a docker container, but the same backend can wrap a bare binary.
+// The daemon spawns the configured process (or `docker run` invocation),
+// polls HealthURL until ready, and proxies vamp's API traffic through the
+// vibe proxy like any other backend. Designed for things vibe doesn't have
+// a first-class backend type for: TTS engines (Kokoro-FastAPI), embedding
+// servers, third-party inference daemons, etc.
+//
+// Two modes, mutually exclusive:
+//
+//   - **docker mode** (Image set): daemon shells out to `docker run --rm
+//     --name <slug> -p <Port>:<ContainerPort> [...env, volumes, gpu...]
+//     <Image>`. The supervisor inherits the docker client's lifecycle (SIGINT
+//     to docker → graceful container stop).
+//
+//   - **binary mode** (Binary set): daemon execs Binary with Args directly,
+//     identical lifecycle to llama_server/comfyui.
+//
+// Port is the host port the daemon publishes / the binary listens on; the
+// proxy points at it.
+type HTTPServerBackend struct {
+	// Docker-mode fields. Image is the container reference (e.g.
+	// "ghcr.io/remsky/kokoro-fastapi-gpu:latest"). When non-empty the
+	// daemon launches via docker run.
+	Image string `yaml:"image,omitempty"`
+	// ContainerPort is the port exposed inside the container. Defaults
+	// to Port when unset, which fits the common case where the container
+	// listens on the same port number it's published as.
+	ContainerPort int `yaml:"container_port,omitempty"`
+	// Volumes are "host:container[:ro]" mappings passed to `docker run -v`.
+	Volumes []string `yaml:"volumes,omitempty"`
+	// GPU, when true, adds `--gpus all` to the docker invocation (NVIDIA
+	// container toolkit must be installed). Required for VRAM-resident
+	// engines like Kokoro-FastAPI's GPU build.
+	GPU bool `yaml:"gpu,omitempty"`
+
+	// Binary-mode field. Set instead of Image to wrap a bare process.
+	Binary string `yaml:"binary,omitempty"`
+
+	// Common fields.
+	// Port is the host TCP port the daemon points its proxy at. Required.
+	// Set to 0 to ask the daemon to pick a free port — only viable in
+	// binary mode where Args can reference the port via a template
+	// placeholder (NOT supported in this MVP; pin Port explicitly).
+	Port int `yaml:"port"`
+	// Args is the argv passed to Binary (binary mode) or appended after
+	// the image name (docker mode — runs as the container's command
+	// override). Empty in the common case where the image's default
+	// CMD is what you want.
+	Args []string `yaml:"args,omitempty"`
+	// Env is forwarded as KEY=VALUE either to the binary's environment
+	// (binary mode) or as `docker run -e KEY=VALUE` flags (docker mode).
+	Env map[string]string `yaml:"env,omitempty"`
+	// HealthPath is appended to http://127.0.0.1:Port to form the URL
+	// the supervisor polls until the backend reports ready. Defaults
+	// to "/health" when unset — common convention; override for
+	// servers that don't expose /health (e.g. "/v1/audio/speech" for
+	// Kokoro-FastAPI, which doesn't have a dedicated health endpoint
+	// — a non-2xx response without a body is fine, it just proves the
+	// process is up).
+	HealthPath string `yaml:"health_path,omitempty"`
 }
 
 // ComfyUIBackend supervises a ComfyUI python entrypoint. ComfyUI manages its
@@ -261,6 +325,19 @@ func Load(path string) (*Profile, error) {
 		p.Backend.LlamaServer.Binary = expandTilde(p.Backend.LlamaServer.Binary)
 		p.Backend.LlamaServer.MMProj = expandTilde(p.Backend.LlamaServer.MMProj)
 	}
+	if p.Backend.HTTPServer != nil {
+		// Volumes' host paths get tilde-expanded so a profile can
+		// reference ~/cache without exporting HOME to the daemon's
+		// docker invocation.
+		for i, v := range p.Backend.HTTPServer.Volumes {
+			parts := strings.SplitN(v, ":", 2)
+			if len(parts) == 2 {
+				parts[0] = expandTilde(parts[0])
+				p.Backend.HTTPServer.Volumes[i] = strings.Join(parts, ":")
+			}
+		}
+		p.Backend.HTTPServer.Binary = expandTilde(p.Backend.HTTPServer.Binary)
+	}
 	if p.Backend.ComfyUI != nil {
 		p.Backend.ComfyUI.Dir = expandTilde(p.Backend.ComfyUI.Dir)
 		p.Backend.ComfyUI.Python = expandTilde(p.Backend.ComfyUI.Python)
@@ -307,15 +384,49 @@ func (p *Profile) Validate() error {
 func (p *Profile) validateBackend() error {
 	llama := p.Backend.LlamaServer
 	comfy := p.Backend.ComfyUI
+	http := p.Backend.HTTPServer
+	set := 0
+	for _, b := range []bool{llama != nil, comfy != nil, http != nil} {
+		if b {
+			set++
+		}
+	}
 	switch {
-	case llama == nil && comfy == nil:
-		return errors.New("backend is required: set exactly one of backend.llama_server or backend.comfyui")
-	case llama != nil && comfy != nil:
-		return errors.New("backend: only one of backend.llama_server or backend.comfyui may be set")
+	case set == 0:
+		return errors.New("backend is required: set exactly one of backend.llama_server, backend.comfyui, or backend.http_server")
+	case set > 1:
+		return errors.New("backend: only one of backend.llama_server, backend.comfyui, or backend.http_server may be set")
 	case llama != nil:
 		return validateLlamaServer(llama)
 	case comfy != nil:
 		return validateComfyUI(comfy)
+	case http != nil:
+		return validateHTTPServer(http)
+	}
+	return nil
+}
+
+// validateHTTPServer enforces the docker-mode vs binary-mode XOR plus the
+// always-required Port field. Image OR Binary must be set; Port must be > 0
+// (this MVP doesn't support daemon-picked ports for http_server backends).
+func validateHTTPServer(h *HTTPServerBackend) error {
+	if h.Image == "" && h.Binary == "" {
+		return errors.New("backend.http_server: exactly one of image (docker mode) or binary (process mode) is required")
+	}
+	if h.Image != "" && h.Binary != "" {
+		return errors.New("backend.http_server: image and binary are mutually exclusive")
+	}
+	if h.Port <= 0 {
+		return errors.New("backend.http_server.port must be > 0 (daemon-picked ports are not supported for this backend type)")
+	}
+	if h.Image == "" {
+		// Binary mode: Volumes / GPU are docker-only.
+		if len(h.Volumes) > 0 {
+			return errors.New("backend.http_server.volumes is only valid in docker mode (image: set)")
+		}
+		if h.GPU {
+			return errors.New("backend.http_server.gpu is only valid in docker mode (image: set)")
+		}
 	}
 	return nil
 }

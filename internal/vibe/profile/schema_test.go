@@ -52,8 +52,8 @@ func TestSchemaJSON_RoundTrip(t *testing.T) {
 	props, _ := doc["properties"].(map[string]any)
 	backend, _ := props["backend"].(map[string]any)
 	oneOf, _ := backend["oneOf"].([]any)
-	if len(oneOf) != 2 {
-		t.Errorf("backend.oneOf length = %d, want 2 (llama_server XOR comfyui)", len(oneOf))
+	if len(oneOf) != 3 {
+		t.Errorf("backend.oneOf length = %d, want 3 (llama_server XOR comfyui XOR http_server)", len(oneOf))
 	}
 
 	// llama_server required keys: path, alias, context. Catches drift

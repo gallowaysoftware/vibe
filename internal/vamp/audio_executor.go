@@ -205,7 +205,17 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 // raw WAV bytes back in the response body. Server timeout is generous (2 min
 // per chunk) to tolerate startup latency on cold starts.
 func (a *audioExecutor) executeKokoro(ctx context.Context, in StageInput, st *Stage, text, outAbs, outRel string) (*StageOutput, error) {
+	// Precedence: explicit engine_url > active vibe profile's proxy URL
+	// (when the stage declares a capability) > the localhost
+	// Kokoro-FastAPI default. The capability path is the right answer for
+	// the vamp+vibe co-managed setup — vibe activates the tts_kokoro
+	// http_server backend before this stage runs and points its proxy at
+	// the container, so in.BaseURL routes here without the pipeline
+	// hardcoding the container's port.
 	base := strings.TrimRight(st.EngineURL, "/")
+	if base == "" && st.Capability != "" && in.BaseURL != "" {
+		base = strings.TrimRight(in.BaseURL, "/")
+	}
 	if base == "" {
 		base = defaultKokoroURL
 	}

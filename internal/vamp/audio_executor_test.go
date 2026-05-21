@@ -520,7 +520,6 @@ func runWithAudioRunner(e *Executor, runner audioRunner) error {
 	return nil
 }
 
-
 // TestAudioExecutor_KokoroEngine_PostsToEndpointAndWritesWAV covers the
 // kokoro audio path: the executor posts a JSON body matching the OpenAI
 // /v1/audio/speech shape to EngineURL and writes the response body as the
@@ -613,4 +612,3 @@ func TestAudioExecutor_KokoroEngine_400IsAStageError(t *testing.T) {
 		t.Errorf("error should surface server body: %v", err)
 	}
 }
-
