@@ -259,5 +259,14 @@ func (r *renderExecutor) Execute(_ context.Context, in StageInput) (*StageOutput
 	if err != nil {
 		return nil, fmt.Errorf("render prompt: %w", err)
 	}
+	// Empty render result is plausible (conditional template that elides
+	// everything). Emit a newline rather than an empty string so the
+	// resulting file has non-zero size: vamp's resume layer treats
+	// zero-byte stage outputs as "stage crashed mid-write" and re-runs
+	// them, which would loop forever on a genuinely-empty render. Same
+	// rationale as the compact stage's empty-source path.
+	if text == "" {
+		text = "\n"
+	}
 	return &StageOutput{Text: text}, nil
 }
