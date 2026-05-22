@@ -228,6 +228,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// requests at the (now-dead) proxy.
 	d.mu.Lock()
 	fr := d.frontend
+	// Clear d.active BEFORE stopping the supervisor — same rationale
+	// as stopActive does for a per-profile stop. The
+	// watchBackendForRespawn goroutine wakes the instant the
+	// supervisor's `stopped` channel closes; if d.active still names
+	// the about-to-be-killed profile, the watcher fires a respawn
+	// against the shutting-down process and we spawn an orphan
+	// backend during shutdown.
+	d.active = nil
+	d.frontend = nil
 	d.mu.Unlock()
 	if fr != nil {
 		if err := frontend.Deactivate(shCtx, fr); err != nil {
