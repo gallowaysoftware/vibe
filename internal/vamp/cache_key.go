@@ -581,11 +581,24 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 			}
 			hdr = append(hdr, k+"="+rv)
 		}
+		// Fold the assert spec into the key so changing it (e.g.
+		// status_code 200 → 4xx) invalidates the cache. Without this,
+		// a cached "passing" response would continue to be served
+		// silently even after the user changed the assertion contract.
+		assertJSON := ""
+		if st.Assert != nil {
+			b, err := cache.CanonicalJSON(st.Assert)
+			if err != nil {
+				return "", fmt.Errorf("cache key: marshal assert: %w", err)
+			}
+			assertJSON = string(b)
+		}
 		return cache.HashStrings("webhook",
 			strings.ToUpper(st.Method),
 			url,
 			bodyJSON,
 			strings.Join(hdr, "\n"),
+			assertJSON,
 		), nil
 	default:
 		return "", nil
