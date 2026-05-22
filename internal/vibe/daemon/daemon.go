@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -765,7 +766,17 @@ func firstNonEmpty(s ...string) string {
 	return ""
 }
 
+// validProfileName matches the same shape `vibe profile init` enforces:
+// alphanumerics, underscore, and hyphen only. Rejecting "/" / "." /
+// non-printable characters here means the daemon's control plane can't
+// be tricked into reading arbitrary YAML files via path traversal in
+// a Start/Pull/Status RPC's profile-name field.
+var validProfileName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
 func loadProfileByName(name string) (*profile.Profile, error) {
+	if !validProfileName.MatchString(name) {
+		return nil, fmt.Errorf("profile name %q is invalid (allowed: [a-zA-Z0-9_-]+)", name)
+	}
 	path := filepath.Join(paths.ProfilesDir(), name+".yaml")
 	if _, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("profile %q not found at %s", name, path)
