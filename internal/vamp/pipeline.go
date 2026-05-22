@@ -243,12 +243,22 @@ type Stage struct {
 	// is returned verbatim, matching pre-retry behaviour.
 	Retry *RetryPolicy `yaml:"retry,omitempty"`
 
-	// Cache, when explicitly false, disables the content-addressed cache
-	// for this stage even when the pipeline-level default is on. A nil
-	// pointer falls through to the pipeline-level setting, which in turn
-	// defaults to "on" for cacheable stage types when both layers are
-	// nil. Non-cacheable stage types (webhook/youtube) are never cached
-	// regardless of this field's value.
+	// Cache controls per-stage opt-out (for default-cacheable types) and
+	// per-stage opt-IN (for webhook stages):
+	//   - text/comfyui/audio/ffmpeg/render/compact/pandoc: cached by
+	//     default. Set `cache: false` to bypass when you need a fresh
+	//     run regardless of the inputs hashing to the same key.
+	//   - webhook: NOT cached by default (most are side-effecting POSTs).
+	//     Set `cache: true` for idempotent reads (e.g. a SearXNG GET
+	//     where re-issuing across runs would force every downstream
+	//     stage to re-compute on the non-determinism of search results).
+	//     Cache key folds URL + method + canonicalised body + sorted
+	//     headers.
+	//   - youtube/confirm: never cached regardless of this field — they
+	//     own side effects (uploads, human-in-the-loop gates) that
+	//     replay would skip.
+	// A nil pointer falls through to the pipeline-level Pipeline.Cache,
+	// which in turn defaults to "on" for cacheable stage types.
 	Cache *bool `yaml:"cache,omitempty"`
 
 	// RunWhen controls whether the stage runs based on the status of its
