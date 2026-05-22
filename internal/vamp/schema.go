@@ -388,7 +388,7 @@ func Schema() *schemaProperty {
 			},
 			"cache": {
 				Type:        "boolean",
-				Description: "Per-stage opt-out: explicit false disables the content-addressed cache for this stage; absent inherits the pipeline default.",
+				Description: "Per-stage cache control. For default-cacheable types (text/comfyui/audio/ffmpeg/render/compact/pandoc) `false` opts out, absent inherits the pipeline default. For `webhook` stages this is opt-IN: `true` caches the rendered URL/method/body/headers (use for idempotent reads like SearXNG queries); absent or false skips the cache (the default — most webhooks are side-effecting POSTs).",
 			},
 			"message": {
 				Type:        "string",
