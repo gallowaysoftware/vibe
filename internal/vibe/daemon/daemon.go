@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -391,6 +392,19 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 		mode := "docker"
 		if p.Backend.HTTPServer.Image == "" {
 			mode = "binary"
+		}
+		// If the daemon previously crashed while a docker-mode profile
+		// was up, the container survived reparenting to init and a
+		// fresh `docker run --name vibe-<profile>` will fail with
+		// "container name already in use". Best-effort `docker rm -f`
+		// before the supervisor's run; ignored when the container
+		// doesn't exist (the common case) or docker isn't installed
+		// (binary mode).
+		if mode == "docker" {
+			rm := exec.Command("docker", "rm", "-f", "vibe-"+p.Name)
+			rm.Stdout = nil
+			rm.Stderr = nil
+			_ = rm.Run()
 		}
 		slog.Info("starting profile (http_server)",
 			"profile", p.Name, "mode", mode,
