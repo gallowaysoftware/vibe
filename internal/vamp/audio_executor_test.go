@@ -576,8 +576,24 @@ func TestAudioExecutor_KokoroEngine_PostsToEndpointAndWritesWAV(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != "RIFF....WAVEsentinel" {
-		t.Errorf("WAV bytes not written verbatim: %q", got)
+	// The body is written through patchRIFFSize, which rewrites bytes
+	// 4..8 to the actual (total - 8) size. RIFF magic, WAVE tag, and
+	// payload must round-trip verbatim. The original kokoro response
+	// in this test was 20 bytes long ("RIFF....WAVEsentinel"); the
+	// expected RIFF size is therefore 12 (little-endian u32).
+	if string(got[0:4]) != "RIFF" {
+		t.Errorf("RIFF magic clobbered: %q", string(got[0:4]))
+	}
+	if string(got[8:12]) != "WAVE" {
+		t.Errorf("WAVE tag clobbered: %q", string(got[8:12]))
+	}
+	if string(got[12:]) != "sentinel" {
+		t.Errorf("payload modified: %q", string(got[12:]))
+	}
+	wantSize := uint32(len(got) - 8)
+	gotSize := uint32(got[4]) | uint32(got[5])<<8 | uint32(got[6])<<16 | uint32(got[7])<<24
+	if gotSize != wantSize {
+		t.Errorf("RIFF size = %d, want %d (patchRIFFSize should rewrite)", gotSize, wantSize)
 	}
 }
 
@@ -610,5 +626,94 @@ func TestAudioExecutor_KokoroEngine_400IsAStageError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unknown voice") {
 		t.Errorf("error should surface server body: %v", err)
+	}
+}
+
+// TestValidateWAVResponse covers the WAV-envelope sanity check used by
+// the kokoro path to detect intermittent empty-body / truncated-header
+// responses. The classifier in exec.go promotes any error containing
+// audioInvalidOutputTag to a retry under retry_on: [invalid_output],
+// so these failure modes must produce errors carrying that tag.
+func TestValidateWAVResponse(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    []byte
+		wantErr bool
+	}{
+		{"empty", nil, true},
+		{"too_short", []byte("RIFF"), true},
+		{"missing_riff_magic", []byte("XXXX....WAVE"), true},
+		{"missing_wave_tag", []byte("RIFF....XXXX"), true},
+		{"valid_header_minimum", []byte("RIFF....WAVE"), false},
+		{"valid_header_with_payload", []byte("RIFF....WAVEfmt extra payload"), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateWAVResponse(c.body)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("validateWAVResponse(%q): got err=%v, wantErr=%v", c.body, err, c.wantErr)
+			}
+		})
+	}
+}
+
+// TestAudioExecutor_KokoroEngine_EmptyBodyTaggedForRetry verifies that
+// a 200-OK with an empty body produces an error carrying the
+// audioInvalidOutputTag, which is the substring the retry classifier
+// matches under retry_on: [invalid_output]. Without this, the empty-
+// body race that bit Module 3 (one chunk out of 1500+ during kokoro
+// warm-up) would still fail the whole foreach.
+func TestAudioExecutor_KokoroEngine_EmptyBodyTaggedForRetry(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// Intentionally write nothing — repro of the kokoro warm-up
+		// race condition.
+	}))
+	defer srv.Close()
+	runDir := t.TempDir()
+	exec := &audioExecutor{}
+	_, err := exec.Execute(context.Background(), StageInput{
+		Stage: &Stage{
+			ID:        "audio",
+			Type:      StageTypeAudio,
+			Voice:     "af_bella",
+			Text:      "x",
+			Output:    "out.wav",
+			Engine:    AudioEngineKokoro,
+			EngineURL: srv.URL,
+		},
+		RunDir: runDir,
+	})
+	if err == nil {
+		t.Fatal("expected error on empty-body response")
+	}
+	if !strings.Contains(err.Error(), audioInvalidOutputTag) {
+		t.Errorf("error %q must contain audioInvalidOutputTag (%q) so retry classifier picks it up", err.Error(), audioInvalidOutputTag)
+	}
+}
+
+// TestPatchRIFFSize verifies the RIFF header normalisation that silences
+// ffmpeg "Ignoring maximum wav data size, file may be invalid" warnings
+// during downstream concat. Kokoro-FastAPI writes a header whose RIFF
+// size doesn't match the streamed body; we rewrite it in place to be
+// (total_len - 8) so file inspectors agree with reality.
+func TestPatchRIFFSize(t *testing.T) {
+	// Craft a 32-byte synthetic WAV with a deliberately-wrong RIFF size.
+	wav := make([]byte, 32)
+	copy(wav[0:4], "RIFF")
+	wav[4], wav[5], wav[6], wav[7] = 0xFF, 0xFF, 0xFF, 0x7F // bogus
+	copy(wav[8:12], "WAVE")
+	patchRIFFSize(wav)
+	want := uint32(len(wav) - 8) // 24
+	got := uint32(wav[4]) | uint32(wav[5])<<8 | uint32(wav[6])<<16 | uint32(wav[7])<<24
+	if got != want {
+		t.Errorf("RIFF size = %d, want %d", got, want)
+	}
+	// Magic words must be preserved.
+	if string(wav[0:4]) != "RIFF" {
+		t.Errorf("RIFF magic clobbered: %q", string(wav[0:4]))
+	}
+	if string(wav[8:12]) != "WAVE" {
+		t.Errorf("WAVE tag clobbered: %q", string(wav[8:12]))
 	}
 }

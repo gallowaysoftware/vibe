@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -176,10 +177,67 @@ func spawnDetached(cmd *cobra.Command, runDirFlag, resumeFlag, pipelineName stri
 	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	c.Stdin = nil
 	c.Stdout = nil
-	c.Stderr = nil
+	// Capture stderr to a pipe so a fast-exit failure (the child errors
+	// out before it can write to vamp.log) surfaces to the operator
+	// instead of vanishing into /dev/null. The pipe is drained into a
+	// bounded buffer and either reported on early exit OR discarded
+	// once the child has clearly survived past the verification window.
+	stderrPipe, err := c.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("attach child stderr: %w", err)
+	}
 	if err := c.Start(); err != nil {
 		return fmt.Errorf("spawn worker: %w", err)
 	}
+	stderrBuf := &bytes.Buffer{}
+	stderrDone := make(chan struct{})
+	go func() {
+		// Cap at 8 KiB so a chatty child doesn't bloat parent memory.
+		_, _ = io.CopyN(stderrBuf, stderrPipe, 8192)
+		_, _ = io.Copy(io.Discard, stderrPipe)
+		close(stderrDone)
+	}()
+	// Verify the child actually got past argv parsing / pre-flight and
+	// is running the long-lived worker loop. The signal we wait on is
+	// vamp.pid: the worker writes it in RunPipeline after opening the
+	// log file, so its appearance proves the child reached a known-
+	// good state. If the process exits before that — or doesn't write
+	// the pid within the timeout — surface the captured stderr to the
+	// operator so the failure isn't silent.
+	pidPath := filepath.Join(runDir, vamp.PidFileName)
+	startupDeadline := time.Now().Add(2 * time.Second)
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- c.Wait() }()
+	pidReady := false
+	for time.Now().Before(startupDeadline) {
+		if _, err := os.Stat(pidPath); err == nil {
+			pidReady = true
+			break
+		}
+		select {
+		case werr := <-waitDone:
+			<-stderrDone
+			msg := strings.TrimSpace(stderrBuf.String())
+			if msg == "" && werr != nil {
+				msg = werr.Error()
+			}
+			if msg == "" {
+				msg = "worker exited with no output"
+			}
+			return fmt.Errorf("detached worker exited before startup: %s", msg)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if !pidReady {
+		// Worker is still alive but slow to write the pid file. Warn
+		// instead of failing — slow disk / heavy fork can take longer
+		// than 2s — but the operator should know to check.
+		fmt.Fprintf(cmd.ErrOrStderr(), "[warn] detached worker did not write %s within 2s; check `vamp jobs ls` shortly\n", vamp.PidFileName)
+	}
+	// Releasing detaches the process from the parent's reaper so the
+	// worker survives parent exit. After this, the goroutine that
+	// called Wait() will see the child as "released" and unblock with
+	// an error we deliberately ignore (process.Release semantics).
 	_ = c.Process.Release()
 	out := cmd.OutOrStdout()
 	fmt.Fprintln(out, filepath.Base(runDir))

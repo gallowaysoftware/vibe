@@ -68,6 +68,18 @@ func (c *compactExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 	if len(source) <= st.TargetChars {
 		// Already fits — pass through verbatim. The whole point of compact
 		// is to avoid lossy work when it isn't needed.
+		//
+		// Empty source is a legit case (e.g. an LLM was asked to compact
+		// "this lesson has no diagrams" content): we emit a single
+		// newline rather than an empty string so the on-disk output
+		// file has non-zero size. vamp's resume logic treats zero-byte
+		// files as "never written" / "stage crashed mid-write" — a
+		// genuinely-empty result then gets re-run on every resume
+		// instead of being recognised as done. Downstream consumers
+		// invariably `readFile | trim` so an extra newline is invisible.
+		if source == "" {
+			return &StageOutput{Text: "\n"}, nil
+		}
 		return &StageOutput{Text: source}, nil
 	}
 

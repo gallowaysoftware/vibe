@@ -1493,13 +1493,24 @@ func isRetryable(err error, policy *RetryPolicy) bool {
 	}
 	// invalid_output: classified by error-string substring because the
 	// executor emits validateJSON failures via fmt.Errorf("stage output
-	// is not valid JSON: ...") and we don't want to thread a typed error
-	// through every stage type just for this one retry class. Re-rolling
-	// a text-stage call with the same prompt usually succeeds (LLM
-	// sampling chose a slightly different path on the first attempt and
-	// produced a parse error).
-	if hasInvalidOutputMode && strings.Contains(err.Error(), "stage output is not valid JSON") {
-		return true
+	// is not valid JSON: ...") and we don't want to thread a typed
+	// error through every stage type just for this one retry class.
+	// Two patterns trigger this mode:
+	//   - text stages with a malformed JSON body (model sampled a
+	//     non-parseable response)
+	//   - audio stages whose backend (kokoro) returned an empty or
+	//     truncated WAV body (audioInvalidOutputTag from the audio
+	//     executor)
+	// Re-rolling the same call usually succeeds — these failures are
+	// race conditions on the backend, not deterministic input problems.
+	if hasInvalidOutputMode {
+		msg := err.Error()
+		if strings.Contains(msg, "stage output is not valid JSON") {
+			return true
+		}
+		if strings.Contains(msg, audioInvalidOutputTag) {
+			return true
+		}
 	}
 	// Timeout detection: works for both "timeout" and "transient" modes
 	// because every timeout is also a transient by definition.

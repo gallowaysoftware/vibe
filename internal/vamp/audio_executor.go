@@ -253,13 +253,88 @@ func (a *audioExecutor) executeKokoro(ctx context.Context, in StageInput, st *St
 	if err != nil {
 		return nil, fmt.Errorf("stage %s: read kokoro response: %w", st.ID, err)
 	}
-	if len(wav) == 0 {
-		return nil, fmt.Errorf("stage %s: kokoro returned empty body", st.ID)
+	// Validate the WAV envelope: kokoro intermittently 200-OKs with an
+	// empty body or a truncated header during model-warmup races. Any
+	// of these conditions should be retryable, not treated as a
+	// success-with-zero-bytes by downstream concat. We tag the error
+	// with audioInvalidOutputTag so the retry classifier's
+	// invalid_output mode picks it up — same path as text stages with
+	// malformed JSON.
+	if invalidErr := validateWAVResponse(wav); invalidErr != nil {
+		return nil, fmt.Errorf("stage %s: %s: %s", st.ID, audioInvalidOutputTag, invalidErr.Error())
 	}
+	// Kokoro-FastAPI writes a RIFF size field that doesn't match the
+	// streamed body length (it likely sets the field when starting the
+	// response and never patches it after streaming completes). ffmpeg
+	// flags this with "Packet corrupt (stream = 0, dts = NOPTS)" and
+	// "Ignoring maximum wav data size, file may be invalid" warnings
+	// during the downstream concat — the file still concatenates fine
+	// because ffmpeg falls back to bitrate-derived duration, but the
+	// warning noise drowns useful errors and makes log scanning
+	// painful. Patch the RIFF size in-place so the header agrees with
+	// reality before we land the bytes.
+	patchRIFFSize(wav)
 	if err := os.WriteFile(outAbs, wav, 0o644); err != nil {
 		return nil, fmt.Errorf("stage %s: write %s: %w", st.ID, outAbs, err)
 	}
 	return &StageOutput{Files: []string{outAbs}}, nil
+}
+
+// patchRIFFSize rewrites the RIFF size field (bytes 4..8) so the WAV
+// header matches the actual body length. The field is the total file
+// size minus 8 bytes (the "RIFF" magic + the size field itself). This
+// is a no-op when wav is shorter than 8 bytes (validateWAVResponse
+// rejects that case upstream); we still guard the slice to keep this
+// helper safe to call unconditionally.
+//
+// Kokoro-FastAPI gets this wrong on every response we've inspected;
+// rather than wait for an upstream fix, we normalise here so downstream
+// tooling (ffmpeg, audacity, file inspectors) reads a clean header.
+func patchRIFFSize(wav []byte) {
+	if len(wav) < 8 {
+		return
+	}
+	size := uint32(len(wav) - 8)
+	wav[4] = byte(size)
+	wav[5] = byte(size >> 8)
+	wav[6] = byte(size >> 16)
+	wav[7] = byte(size >> 24)
+}
+
+// audioInvalidOutputTag is the error-string substring the retry
+// classifier matches to fire `retry_on: [invalid_output]` for audio
+// stages. Kept as a constant so the audio executor and the classifier
+// stay in sync if either side ever needs to change wording.
+const audioInvalidOutputTag = "audio output invalid"
+
+// validateWAVResponse returns nil if `wav` looks like a plausible RIFF
+// WAVE payload, otherwise a descriptive error explaining what failed.
+// Used to distinguish a real-but-tiny WAV (single-word TTS) from a
+// truncated / empty / mis-typed response that should be retried.
+//
+// Checks (cheap, no allocation):
+//   - non-empty body
+//   - "RIFF" magic at offset 0
+//   - "WAVE" tag at offset 8
+//
+// We deliberately stop here — full chunk validation belongs in ffmpeg/
+// audio toolkits, not vamp. A header that lies about data-chunk size
+// is recoverable by downstream concat (ffmpeg warns + estimates); a
+// missing header is not.
+func validateWAVResponse(wav []byte) error {
+	if len(wav) == 0 {
+		return fmt.Errorf("server returned an empty body")
+	}
+	if len(wav) < 12 {
+		return fmt.Errorf("server returned %d bytes, too short for a WAV header", len(wav))
+	}
+	if string(wav[0:4]) != "RIFF" {
+		return fmt.Errorf("server response missing RIFF magic (got %q)", string(wav[0:4]))
+	}
+	if string(wav[8:12]) != "WAVE" {
+		return fmt.Errorf("server response missing WAVE tag (got %q at offset 8)", string(wav[8:12]))
+	}
+	return nil
 }
 
 // execCommandRunner is the production audioRunner. It spawns the piper binary
