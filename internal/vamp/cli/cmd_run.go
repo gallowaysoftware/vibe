@@ -216,8 +216,21 @@ func spawnDetached(cmd *cobra.Command, runDirFlag, resumeFlag, pipelineName stri
 		}
 		select {
 		case werr := <-waitDone:
+			// Child exited before the pid file appeared. Two cases:
+			//   - werr == nil (exit status 0): the run completed
+			//     successfully within the 2s window AND between
+			//     writing+removing its pid file. Treat as success;
+			//     the operator should `vamp logs` / `vamp runs show`
+			//     to inspect the (fast) result.
+			//   - werr != nil OR stderr captured: a real startup
+			//     failure (bad argv, missing file, etc.) — surface
+			//     so the failure isn't silent.
 			<-stderrDone
 			msg := strings.TrimSpace(stderrBuf.String())
+			if werr == nil && msg == "" {
+				pidReady = true // treat as success
+				break
+			}
 			if msg == "" && werr != nil {
 				msg = werr.Error()
 			}
@@ -226,6 +239,9 @@ func spawnDetached(cmd *cobra.Command, runDirFlag, resumeFlag, pipelineName stri
 			}
 			return fmt.Errorf("detached worker exited before startup: %s", msg)
 		case <-time.After(100 * time.Millisecond):
+		}
+		if pidReady {
+			break
 		}
 	}
 	if !pidReady {
