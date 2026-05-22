@@ -125,6 +125,7 @@ func doctorCmd() *cobra.Command {
 		installCUDA   bool
 		installMethod string
 		installUpdate bool
+		pipelinePath  string
 	)
 	cmd := &cobra.Command{
 		Use:   "doctor",
@@ -138,7 +139,11 @@ func doctorCmd() *cobra.Command {
 			"already satisfied; big-disk steps prompt for confirmation unless " +
 			"--yes is passed. With --install llama-cpp --cuda, prefers a " +
 			"CUDA-flavoured release asset (and points at the CUDA source " +
-			"build command in the [s]ource menu).",
+			"build command in the [s]ource menu).\n\n" +
+			"With --pipeline <binary>, switches to pipeline-preflight mode: " +
+			"execs the binary's `requirements --format json` subcommand and " +
+			"verifies every declared external service is reachable, printing " +
+			"the pipeline-author-supplied setup command for any that fail.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -147,6 +152,15 @@ func doctorCmd() *cobra.Command {
 			}
 			if installName != "" {
 				return runInstall(cmd, installName, installYes, installCUDA, installMethod, installUpdate)
+			}
+			if pipelinePath != "" {
+				if err := runPipelineDoctor(ctx, pipelinePath, cmd.OutOrStdout()); err != nil {
+					if errors.Is(err, errDoctorFailed) {
+						cmd.SilenceErrors = true
+					}
+					return err
+				}
+				return nil
 			}
 			env := defaultDoctorEnv()
 			results := runChecks(ctx, env)
@@ -168,6 +182,8 @@ func doctorCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&pipelinePath, "pipeline", "",
+		"preflight-check a pipeline binary's declared services + capabilities (path to the binary). Mutually exclusive with --install.")
 	cmd.Flags().StringVar(&installName, "install", "",
 		"install a component (supported: comfyui, llama-cpp) instead of running diagnostics")
 	cmd.Flags().BoolVar(&installYes, "yes", false,
