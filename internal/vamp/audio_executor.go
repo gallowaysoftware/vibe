@@ -118,6 +118,18 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 	if err != nil {
 		return nil, fmt.Errorf("stage %s: render text: %w", st.ID, err)
 	}
+	// Empty rendered text is almost always a bug upstream — a foreach
+	// item with no `.text` field, a missing template var, etc. — and
+	// both piper and kokoro behave badly on it (piper writes a 44-byte
+	// WAV header and exits, kokoro returns an empty body which the
+	// validator already rejects). Fail loudly with the item context so
+	// the operator can find the upstream item that produced no text.
+	if strings.TrimSpace(text) == "" {
+		if st.Foreach != nil {
+			return nil, fmt.Errorf("stage %s: rendered text is empty (item %d under %q) — check upstream %q output", st.ID, in.ItemIdx, st.Foreach.Var, st.Foreach.From)
+		}
+		return nil, fmt.Errorf("stage %s: rendered text is empty — st.Text template produced no content", st.ID)
+	}
 
 	// Render the output path. Audio stages own their own output write so
 	// we render here and pass the absolute path to whichever engine writes
