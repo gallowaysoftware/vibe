@@ -38,6 +38,28 @@ type RetryPolicy = internalvamp.RetryPolicy
 // descriptive error when any check fails.
 type AssertSpec = internalvamp.AssertSpec
 
+// Requirements is the runtime contract a pipeline declares: capabilities,
+// services, GPU/disk hints, and notes. Pipeline binaries surface this via
+// the `requirements` subcommand so tooling (vibe doctor) can preflight
+// the host before kicking off a multi-hour run.
+type Requirements = internalvamp.Requirements
+
+// CapabilityRequirement names a vibe capability slot, the stages that
+// depend on it, and an optional model hint.
+type CapabilityRequirement = internalvamp.CapabilityRequirement
+
+// ModelHint advertises what the prompts behind a capability assume of
+// the underlying model.
+type ModelHint = internalvamp.ModelHint
+
+// ServiceRequirement names a non-vibe HTTP service the pipeline expects
+// reachable on the host.
+type ServiceRequirement = internalvamp.ServiceRequirement
+
+// InputRequirement is the JSON-friendly view of an InputSpec emitted by
+// the `requirements` subcommand.
+type InputRequirement = internalvamp.InputRequirement
+
 const (
 	StageTypeText    = internalvamp.StageTypeText
 	StageTypeComfyUI = internalvamp.StageTypeComfyUI
@@ -48,6 +70,17 @@ const (
 	StageTypeConfirm = internalvamp.StageTypeConfirm
 	StageTypeRender  = internalvamp.StageTypeRender
 	StageTypeCompact = internalvamp.StageTypeCompact
+	StageTypePandoc  = internalvamp.StageTypePandoc
+)
+
+// AudioEngine* names the TTS backends an audio stage can select. Default
+// is AudioEnginePiper (subprocess + .onnx voices on disk). Kokoro routes
+// through an OpenAI-compatible HTTP endpoint — markedly more natural
+// long-form narration; activated as a vibe profile so the daemon
+// supervises the container.
+const (
+	AudioEnginePiper  = internalvamp.AudioEnginePiper
+	AudioEngineKokoro = internalvamp.AudioEngineKokoro
 )
 
 const (

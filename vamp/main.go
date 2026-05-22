@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/spf13/cobra"
+
 	internalvamp "github.com/gallowaysoftware/vibe/internal/vamp"
 	"github.com/gallowaysoftware/vibe/internal/vamp/cli"
 )
@@ -34,8 +36,28 @@ func Main(factory Factory) {
 // executed; any error (subcommand failure, factory error, etc.) is
 // returned for the caller to handle.
 func MainE(factory Factory) error {
+	root, err := BuildRoot(factory)
+	if err != nil {
+		return err
+	}
+	return root.Execute()
+}
+
+// BuildRoot returns the cobra root the standalone vamp.Main wraps,
+// without executing it. Distributable pipeline binaries that want to
+// register their own top-level flags (and feed them into the factory
+// closure) call BuildRoot, attach flags via root.PersistentFlags(),
+// then root.Execute() themselves. The factory still drives every
+// subcommand the binary exposes — run / validate / requirements /
+// viz / render / list / logs / cache / jobs / runs / capabilities /
+// schema / confirm / diff / cancel.
+//
+// The factory is called once per subcommand invocation (post Cobra
+// flag parsing) so a closure that reads from package-level flag-
+// bound variables sees the user-supplied values.
+func BuildRoot(factory Factory) (*cobra.Command, error) {
 	if factory == nil {
-		return fmt.Errorf("vamp.Main: factory is nil")
+		return nil, fmt.Errorf("vamp: factory is nil")
 	}
 	name := "vamp-pipeline"
 	if exe, err := os.Executable(); err == nil {
@@ -49,15 +71,12 @@ func MainE(factory Factory) error {
 		if p == nil {
 			return nil, fmt.Errorf("pipeline factory returned nil")
 		}
-		// Validate again here even though Build typically already did:
-		// LoadPipeline-returned pipelines are validated, hand-rolled ones
-		// may have skipped Build. Idempotent + cheap.
 		if err := p.inner.Validate(); err != nil {
 			return nil, err
 		}
 		return p.inner, nil
 	})
-	return root.Execute()
+	return root, nil
 }
 
 // baseName is a tiny filepath.Base wrapper that strips a leading directory

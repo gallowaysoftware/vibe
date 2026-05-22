@@ -152,6 +152,11 @@ func WithDefault(v string) InputOption { return func(s *InputSpec) { s.Default =
 // without an API churn.
 func WithType(t string) InputOption { return func(s *InputSpec) { s.Type = t } }
 
+// Describe attaches a one-line description to the input. Surfaced in
+// Pipeline.Requirements() and used by pipeline binaries that expose
+// first-class Cobra flags to populate --help.
+func Describe(text string) InputOption { return func(s *InputSpec) { s.Description = text } }
+
 // Input declares a pipeline-level input. The name is what `--input <name>=…`
 // expects on the CLI; the options configure required-ness, defaults, type.
 func (p *Pipeline) Input(name string, opts ...InputOption) *Pipeline {
@@ -171,6 +176,63 @@ func (p *Pipeline) Input(name string, opts ...InputOption) *Pipeline {
 func (p *Pipeline) Cache(enabled bool) *Pipeline {
 	p.inner.Cache = &enabled
 	return p
+}
+
+// RequireService declares a non-vibe HTTP service the pipeline needs
+// reachable at run time. setupHint is a one-line shell command surfaced
+// verbatim by tooling when the service is unreachable (e.g.
+// "docker compose -f ~/.config/vibe/compose/searxng/docker-compose.yaml up -d").
+// Pass "" for setupHint when no command applies.
+func (p *Pipeline) RequireService(name, url, description, setupHint string) *Pipeline {
+	p.inner.RequiredServices = append(p.inner.RequiredServices, ServiceRequirement{
+		Name:        name,
+		URL:         url,
+		Description: description,
+		SetupHint:   setupHint,
+	})
+	return p
+}
+
+// RequireGPUMemory records a human-readable hint for the GPU footprint
+// the run will draw (e.g. "32GB"). Informational; no enforcement.
+func (p *Pipeline) RequireGPUMemory(amount string) *Pipeline {
+	p.inner.RequiredGPUMemory = amount
+	return p
+}
+
+// RequireDiskSpace records a human-readable hint for the disk footprint
+// intermediate artefacts will draw.
+func (p *Pipeline) RequireDiskSpace(amount string) *Pipeline {
+	p.inner.RequiredDiskSpace = amount
+	return p
+}
+
+// Note appends a free-form string to the pipeline's requirements report
+// — used for things that don't fit the structured fields (e.g.
+// "first-run downloads ~30GB of models" or "expect ~5h wall time on a
+// single RTX 5090").
+func (p *Pipeline) Note(text string) *Pipeline {
+	p.inner.RequirementNotes = append(p.inner.RequirementNotes, text)
+	return p
+}
+
+// CapabilityModel attaches a model hint to a capability slot — recorded
+// in Pipeline.Requirements() so tooling can warn before wiring the
+// capability up to a model that obviously can't satisfy the prompts.
+func (p *Pipeline) CapabilityModel(capability string, hint ModelHint) *Pipeline {
+	if p.inner.CapabilityModelHints == nil {
+		p.inner.CapabilityModelHints = map[string]ModelHint{}
+	}
+	p.inner.CapabilityModelHints[capability] = hint
+	return p
+}
+
+// Requirements returns the pipeline's runtime contract: capabilities
+// auto-derived from each stage, services + GPU/disk/notes from the
+// builder methods above. Safe to call on an unbuilt pipeline; the
+// returned value is a snapshot, not a live view.
+func (p *Pipeline) Requirements() Requirements {
+	return p.inner.Requirements()
 }
 
 // Build runs the same validation the YAML loader applies and returns the
@@ -264,6 +326,15 @@ func (t *TextStage) Param(key string, value any) *TextStage {
 // + mmproj) at run time.
 func (t *TextStage) ImageDir(dir string) *TextStage { t.s.ImageDir = dir; return t }
 
+// ImageFile appends an explicit (templated) image path to the stage's
+// multimodal payload. Use for per-iteration single-image fan-out where
+// ImageDir's globbing would be too coarse (e.g. one diagram per
+// foreach item). Mutually exclusive with ImageDir at validate time.
+func (t *TextStage) ImageFile(tmpl string) *TextStage {
+	t.s.ImageFiles = append(t.s.ImageFiles, tmpl)
+	return t
+}
+
 // ---- Render stages ----
 
 // RenderStage is a deterministic template-only stage (no LLM call).
@@ -285,6 +356,20 @@ func (r *RenderStage) PromptFile(path string) *RenderStage { r.s.PromptFile = pa
 func (r *RenderStage) PromptFS(fsys fs.FS, name string) *RenderStage {
 	r.s.PromptFile = name
 	r.s.AssetFS = fsys
+	return r
+}
+
+// OutputFormat sets the format hint on the stage's output. Today only
+// "json" has runtime semantics (validation + downstream foreach
+// consumption).
+func (r *RenderStage) OutputFormat(format string) *RenderStage {
+	r.s.OutputFormat = format
+	return r
+}
+
+// OutputFormatJSON is the canonical shorthand for OutputFormat("json").
+func (r *RenderStage) OutputFormatJSON() *RenderStage {
+	r.s.OutputFormat = "json"
 	return r
 }
 
@@ -332,6 +417,20 @@ func (a *AudioStage) TextTemplate(t string) *AudioStage { a.s.Text = t; return a
 func (a *AudioStage) VoicesDir(dir string) *AudioStage  { a.s.VoicesDir = dir; return a }
 func (a *AudioStage) Binary(bin string) *AudioStage     { a.s.Binary = bin; return a }
 
+// Capability names the capability slot a kokoro-engined audio stage
+// activates (so vibe brings the kokoro-fastapi container up as a
+// profile). Piper-engined stages don't activate a profile (subprocess
+// + on-disk voice), so this is a no-op for the piper path.
+func (a *AudioStage) Capability(c string) *AudioStage { a.s.Capability = c; return a }
+
+// Engine selects the TTS backend: AudioEnginePiper (default, subprocess
+// + .onnx) or AudioEngineKokoro (HTTP-backed Kokoro-FastAPI).
+func (a *AudioStage) Engine(name string) *AudioStage { a.s.Engine = name; return a }
+
+// EngineURL overrides the kokoro endpoint base. Empty falls back to
+// the active vibe profile's proxy URL.
+func (a *AudioStage) EngineURL(url string) *AudioStage { a.s.EngineURL = url; return a }
+
 // ---- FFmpeg stages ----
 
 // FFmpegStage invokes ffmpeg locally.
@@ -365,6 +464,88 @@ func (f *FFmpegStage) ConcatWavsDir(dir string) *FFmpegStage { f.s.ConcatWavsDir
 
 // Binary overrides the ffmpeg binary location (default: "ffmpeg" on $PATH).
 func (f *FFmpegStage) Binary(bin string) *FFmpegStage { f.s.Binary = bin; return f }
+
+// M4BFrom switches the stage into chapterised-M4B mode: chapters are
+// driven by the upstream's JSON array (preserving its emit order so
+// natural unit order survives), one chapter per array element.
+func (f *FFmpegStage) M4BFrom(from Ref) *FFmpegStage {
+	f.s.M4BFrom = from.ID()
+	seen := false
+	for _, dep := range f.s.Inputs {
+		if dep == from.ID() {
+			seen = true
+			break
+		}
+	}
+	if !seen {
+		f.s.Inputs = append(f.s.Inputs, from.ID())
+	}
+	return f
+}
+
+// M4BVar sets the template variable name bound to each upstream item
+// during M4BFile / M4BChapter rendering. Defaults to DefaultForeachVar.
+func (f *FFmpegStage) M4BVar(name string) *FFmpegStage { f.s.M4BVar = name; return f }
+
+// M4BFile is a template rendered per upstream item to the per-chapter
+// MP3 path (relative to run dir, or absolute).
+func (f *FFmpegStage) M4BFile(tmpl string) *FFmpegStage { f.s.M4BFile = tmpl; return f }
+
+// M4BChapter is a template rendered per upstream item to the chapter
+// title embedded in the M4B metadata.
+func (f *FFmpegStage) M4BChapter(tmpl string) *FFmpegStage { f.s.M4BChapter = tmpl; return f }
+
+// CoverImage attaches a cover-art file (template-rendered path).
+// Meaningful on M4B ffmpeg stages (embedded as audiobook art) and on
+// pandoc EPUB stages (passed as --epub-cover-image).
+func (f *FFmpegStage) CoverImage(path string) *FFmpegStage { f.s.CoverImage = path; return f }
+
+// ---- Pandoc stages ----
+
+// PandocStage runs pandoc to convert one document format to another
+// (markdown → EPUB, markdown → PDF, etc.). Inside vibe the executor
+// shells out to a docker pandoc/core image so users don't have to
+// install pandoc on the host.
+type PandocStage struct {
+	*stageBase[*PandocStage]
+}
+
+// Pandoc appends a pandoc stage.
+func (p *Pipeline) Pandoc(id string) *PandocStage {
+	s := p.appendStage(id, StageTypePandoc)
+	ps := &PandocStage{}
+	ps.stageBase = &stageBase[*PandocStage]{s: s}
+	ps.stageBase.self = ps
+	return ps
+}
+
+// SourceFile is a template rendering the input document path.
+func (p *PandocStage) SourceFile(tmpl string) *PandocStage { p.s.SourceFile = tmpl; return p }
+
+// From sets the --from format flag (e.g. "markdown").
+func (p *PandocStage) From(format string) *PandocStage { p.s.PandocFrom = format; return p }
+
+// To sets the --to format flag (e.g. "epub", "pdf").
+func (p *PandocStage) To(format string) *PandocStage { p.s.PandocTo = format; return p }
+
+// Metadata adds a single --metadata KEY=VALUE pair.
+func (p *PandocStage) Metadata(key, value string) *PandocStage {
+	if p.s.PandocMetadata == nil {
+		p.s.PandocMetadata = map[string]string{}
+	}
+	p.s.PandocMetadata[key] = value
+	return p
+}
+
+// Args appends raw arguments forwarded verbatim to pandoc.
+func (p *PandocStage) Args(args ...string) *PandocStage {
+	p.s.PandocArgs = append(p.s.PandocArgs, args...)
+	return p
+}
+
+// CoverImage attaches an EPUB cover image (template-rendered path,
+// relative to the run dir or absolute).
+func (p *PandocStage) CoverImage(path string) *PandocStage { p.s.CoverImage = path; return p }
 
 // ---- ComfyUI stages ----
 
