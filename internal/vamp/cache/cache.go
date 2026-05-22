@@ -276,8 +276,13 @@ func (s *Store) Put(in PutInput) error {
 	if in.Hash == "" {
 		return errors.New("cache: Put: hash is required")
 	}
-	if (len(in.Text) == 0) == (len(in.Bytes) == 0) {
-		return errors.New("cache: Put: exactly one of Text or Bytes must be set")
+	// Text and Bytes are mutually exclusive; both being empty is fine
+	// (an intentional empty text output, e.g. a compact stage whose
+	// source had no content). The mode is determined by which slice is
+	// non-nil — Bytes set ⇒ binary output, otherwise text. An empty
+	// text output writes a zero-byte output.txt so Get can round-trip it.
+	if len(in.Text) > 0 && len(in.Bytes) > 0 {
+		return errors.New("cache: Put: Text and Bytes are mutually exclusive")
 	}
 	dir := s.entryDir(in.Hash)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -287,7 +292,7 @@ func (s *Store) Put(in PutInput) error {
 		outName string
 		body    []byte
 	)
-	if len(in.Bytes) > 0 {
+	if in.Bytes != nil {
 		outName = "output.bin"
 		body = in.Bytes
 	} else {

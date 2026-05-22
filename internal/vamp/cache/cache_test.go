@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -294,13 +295,40 @@ func TestStore_Put_RejectsAmbiguousInput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Both text and bytes set: error.
+	// Both text and bytes set: error (ambiguous mode).
 	if err := s.Put(PutInput{Hash: "abc", Text: "x", Bytes: []byte{1}}); err == nil {
 		t.Fatal("expected error when both Text and Bytes set")
 	}
-	// Neither set: also error.
-	if err := s.Put(PutInput{Hash: "abc"}); err == nil {
-		t.Fatal("expected error when neither Text nor Bytes set")
+}
+
+// TestStore_Put_EmptyTextRoundTrips verifies that an intentional empty
+// text output (e.g. a compact stage whose source had no content) stores
+// and reads back as an empty string rather than erroring at Put time.
+// Regression: previously the XOR validator rejected empty-on-both,
+// killing the cache write for genuinely empty compact outputs and
+// leaving 0-byte files in the run dir whose later resume falsely
+// reported "missing" outputs.
+func TestStore_Put_EmptyTextRoundTrips(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := strings.Repeat("a", 64)
+	if err := s.Put(PutInput{Hash: hash, StageType: "compact", Text: ""}); err != nil {
+		t.Fatalf("Put(empty text): %v", err)
+	}
+	e, err := s.Get(hash)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if e == nil {
+		t.Fatal("Get reported miss for cached empty text")
+	}
+	if len(e.Output) != 0 {
+		t.Errorf("Get returned %d bytes, want 0", len(e.Output))
+	}
+	if e.IsBinary {
+		t.Errorf("IsBinary = true, want false for empty text entry")
 	}
 }
 

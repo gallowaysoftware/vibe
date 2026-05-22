@@ -380,6 +380,15 @@ const (
 // order of magnitude.
 const defaultWebhookRetryAttempts = 3
 
+// defaultAudioRetryAttempts is the synthesised retry count for audio
+// stages with no explicit retry: block. Kokoro-FastAPI occasionally
+// returns an empty body (model warmup races, internal scheduling) and
+// piper subprocesses can flake on a tight binary path; without retry
+// one bad item in a 1500+-chunk foreach kills hours of upstream work.
+// Four attempts mirrors what the existing cibd-distilling pipelines
+// configure by hand.
+const defaultAudioRetryAttempts = 4
+
 func (r *RetryPolicy) Normalize() {
 	if r == nil {
 		return
@@ -696,6 +705,16 @@ func (p *Pipeline) Validate() error {
 			}
 			if err := rejectConfirmFields(ctx, s); err != nil {
 				return err
+			}
+			// Synthesise a retry policy when none is set. Audio
+			// backends (kokoro especially) flake on a small fraction
+			// of items in long foreach runs; one empty response in
+			// 1500+ chunks shouldn't kill the stage.
+			if p.Stages[i].Retry == nil {
+				p.Stages[i].Retry = &RetryPolicy{
+					MaxAttempts: defaultAudioRetryAttempts,
+					RetryOn:     []string{retryOnTransient, retryOnInvalidOutput},
+				}
 			}
 		case StageTypeFFmpeg:
 			// An ffmpeg stage selects exactly one mode: explicit

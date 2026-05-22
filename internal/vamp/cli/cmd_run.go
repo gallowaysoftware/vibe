@@ -157,7 +157,14 @@ func spawnDetached(cmd *cobra.Command, runDirFlag, resumeFlag, pipelineName stri
 			childArgs = append(childArgs, a)
 		}
 	}
-	if !hasRunDir {
+	// Only inject --run-dir when there's no --resume — they're mutually
+	// exclusive at the RunPipeline level. Without this guard a
+	// `vamp run --detach --resume <dir>` invocation spawns a child whose
+	// argv contains BOTH flags; the child immediately errors with
+	// "--resume and --run-dir are mutually exclusive" and exits before
+	// touching vamp.log or vamp.pid — silently, because the detached
+	// worker's stderr is /dev/null.
+	if !hasRunDir && resumeFlag == "" {
 		childArgs = append(childArgs, "--run-dir", runDir)
 	}
 	childArgs = append(childArgs, "--"+internalRunJobFlag)

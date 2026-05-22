@@ -37,6 +37,15 @@ func stageCacheable(st *Stage) bool {
 	switch stageTypeOrDefault(st) {
 	case StageTypeText, StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg, StageTypeRender, StageTypeCompact, StageTypePandoc:
 		return true
+	case StageTypeWebhook:
+		// Webhook stages are NOT cacheable by default — most are
+		// side-effecting POSTs (notifications) where serving a cached
+		// "success" would skip the side effect that gave the pipeline
+		// its reason for existing. Opt in with `cache: true` on the
+		// stage for idempotent reads (e.g. SearXNG queries) where
+		// re-serving the same response across runs is the entire
+		// point of having a cache.
+		return st != nil && st.Cache != nil && *st.Cache
 	default:
 		return false
 	}
@@ -526,6 +535,57 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 			fmt.Sprintf("%d", st.ChunkChars),
 			st.Preserve,
 			e.cachedKeyModelID(),
+		), nil
+	case StageTypeWebhook:
+		// Only reached when the stage opts in via `cache: true`.
+		// Key folds in the rendered URL, method, headers, and body —
+		// everything that determines the response. Two runs hitting
+		// the same opt-in webhook with identical inputs serve the
+		// cached response without re-issuing the HTTP call.
+		url, err := renderTemplate(st.ID+":url", st.URL, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+		if err != nil {
+			return "", fmt.Errorf("cache key: render url: %w", err)
+		}
+		// Body is a YAML map; serialise canonically so reordered keys
+		// don't change the hash. BodyTemplateFile (if set) is hashed
+		// via its rendered content.
+		bodyJSON := ""
+		if len(st.Body) > 0 {
+			b, err := cache.CanonicalJSON(st.Body)
+			if err != nil {
+				return "", fmt.Errorf("cache key: marshal body: %w", err)
+			}
+			bodyJSON = string(b)
+		}
+		if st.BodyTemplateFile != "" {
+			bf, err := os.ReadFile(filepath.Join(e.PipelineDir, st.BodyTemplateFile))
+			if err != nil {
+				return "", fmt.Errorf("cache key: read body_template_file: %w", err)
+			}
+			rendered, err := renderTemplate(st.ID+":body_file", string(bf), st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+			if err != nil {
+				return "", fmt.Errorf("cache key: render body_file: %w", err)
+			}
+			bodyJSON = rendered
+		}
+		hdrKeys := make([]string, 0, len(st.Headers))
+		for k := range st.Headers {
+			hdrKeys = append(hdrKeys, k)
+		}
+		sort.Strings(hdrKeys)
+		hdr := make([]string, 0, len(hdrKeys))
+		for _, k := range hdrKeys {
+			rv, err := renderTemplate(st.ID+":header:"+k, st.Headers[k], st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+			if err != nil {
+				return "", fmt.Errorf("cache key: render header %s: %w", k, err)
+			}
+			hdr = append(hdr, k+"="+rv)
+		}
+		return cache.HashStrings("webhook",
+			strings.ToUpper(st.Method),
+			url,
+			bodyJSON,
+			strings.Join(hdr, "\n"),
 		), nil
 	default:
 		return "", nil
