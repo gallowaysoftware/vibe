@@ -30,6 +30,26 @@ type Pipeline struct {
 	// rather than a plain bool. Individual stages can override the
 	// pipeline default via Stage.Cache.
 	Cache *bool `yaml:"cache,omitempty"`
+
+	// RequiredServices declares non-vibe HTTP services the pipeline needs
+	// reachable at run time (SearXNG, Kokoro-FastAPI, etc.). Surfaced via
+	// Pipeline.Requirements() so vibe doctor can preflight-check them.
+	RequiredServices []ServiceRequirement `yaml:"required_services,omitempty"`
+	// RequiredGPUMemory is a human-readable hint for the GPU footprint
+	// the run will draw (e.g. "32GB"). Informational; no enforcement.
+	RequiredGPUMemory string `yaml:"required_gpu_memory,omitempty"`
+	// RequiredDiskSpace is a human-readable hint for the disk footprint
+	// intermediate artefacts will draw.
+	RequiredDiskSpace string `yaml:"required_disk_space,omitempty"`
+	// RequirementNotes is free-form text surfaced alongside the
+	// machine-readable requirements (e.g. "first-run downloads ~30GB
+	// of models").
+	RequirementNotes []string `yaml:"requirement_notes,omitempty"`
+	// CapabilityModelHints attaches a per-capability model hint
+	// (min_params, min_context, suggested_model) so vibe doctor can
+	// refuse to wire a capability up to a model that obviously can't
+	// satisfy the prompts.
+	CapabilityModelHints map[string]ModelHint `yaml:"capability_model_hints,omitempty"`
 }
 
 // InputSpec declares a pipeline-level input passed on the CLI as --input.
@@ -37,6 +57,10 @@ type InputSpec struct {
 	Type     string `yaml:"type,omitempty"` // informational; only "string" supported in Phase 1
 	Required bool   `yaml:"required,omitempty"`
 	Default  string `yaml:"default,omitempty"`
+	// Description is a one-line human-readable summary of what this input
+	// is for; surfaced in Pipeline.Requirements() and used by pipeline
+	// binaries that expose first-class Cobra flags to populate --help.
+	Description string `yaml:"description,omitempty"`
 }
 
 // Stage is a single step in the pipeline.
