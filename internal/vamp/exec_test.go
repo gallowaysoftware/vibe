@@ -2927,3 +2927,55 @@ func TestExecutor_ForeachConcurrency_RespectsExplicitOverrideUnderCap(t *testing
 		t.Errorf("max observed concurrency = %d, want 2 (explicit override wins over higher profile.parallel)", got)
 	}
 }
+
+// TestStageCacheable_WebhookOptIn verifies the opt-in caching contract
+// for webhook stages: cacheable only when the stage explicitly sets
+// `cache: true`. Other non-cacheable types (youtube/confirm) remain
+// uncached even if the field is set.
+func TestStageCacheable_WebhookOptIn(t *testing.T) {
+	trueVal, falseVal := true, false
+	cases := []struct {
+		name string
+		st   *Stage
+		want bool
+	}{
+		{
+			name: "webhook_default_off",
+			st:   &Stage{Type: StageTypeWebhook},
+			want: false,
+		},
+		{
+			name: "webhook_cache_false",
+			st:   &Stage{Type: StageTypeWebhook, Cache: &falseVal},
+			want: false,
+		},
+		{
+			name: "webhook_cache_true",
+			st:   &Stage{Type: StageTypeWebhook, Cache: &trueVal},
+			want: true,
+		},
+		{
+			name: "youtube_cache_true_still_uncached",
+			st:   &Stage{Type: StageTypeYouTube, Cache: &trueVal},
+			want: false,
+		},
+		{
+			name: "confirm_cache_true_still_uncached",
+			st:   &Stage{Type: StageTypeConfirm, Cache: &trueVal},
+			want: false,
+		},
+		{
+			name: "text_default_on",
+			st:   &Stage{Type: StageTypeText},
+			want: true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := stageCacheable(c.st)
+			if got != c.want {
+				t.Errorf("stageCacheable(%+v) = %v, want %v", c.st, got, c.want)
+			}
+		})
+	}
+}
