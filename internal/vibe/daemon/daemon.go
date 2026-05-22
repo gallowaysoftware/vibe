@@ -561,6 +561,14 @@ func (d *Daemon) watchBackendForRespawn(name string, spec supervisor.LaunchSpec,
 		cancel()
 		if err != nil {
 			slog.Error("backend respawn failed", "profile", name, "attempt", respawns, "err", err)
+			// A failed Start leaves supervisor in StateExited with its
+			// `stopped` channel already closed; the next loop iteration
+			// would unblock instantly and we'd burn the entire respawn
+			// budget in <1 s on a deterministic config error
+			// (typo in model path, missing binary, etc.). Sleep a beat
+			// so the operator has time to spot the recurring failure
+			// in the log before the budget trips.
+			time.Sleep(2 * time.Second)
 			continue
 		}
 		// Re-wire the proxy at the same backend URL — Supervisor.Start
