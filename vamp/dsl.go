@@ -80,10 +80,39 @@ func (b *stageBase[T]) Cleanup(patterns ...string) T {
 // Retry attaches a retry policy. Pass nil to disable retries explicitly;
 // otherwise the policy's zero-value fields get filled in by Normalize at
 // Validate time.
+//
+// Most pipelines want the same shape ("3 attempts, exponential backoff,
+// retry on transient + invalid_output"), which is what TextStage's
+// implicit default applies when no Retry call is made. Call Retry only
+// when overriding the default; for stages that want NO retries pass
+// `vamp.NoRetry`.
 func (b *stageBase[T]) Retry(policy *RetryPolicy) T {
 	b.s.Retry = policy
 	return b.self
 }
+
+// DefaultTextRetry is the retry policy applied to text stages when
+// they don't call Retry themselves. Tuned for LLM calls behind a
+// supervised backend: 3 attempts (one initial + two retries),
+// exponential backoff starting at 10s and capping at 60s, retries
+// on both transient network failures and invalid LLM output (e.g.
+// JSON that fails the stage's output_format contract).
+//
+// Pipelines that want the default explicitly can pass this to Retry
+// for documentation; pipelines that want a custom shape construct
+// their own *RetryPolicy.
+var DefaultTextRetry = &RetryPolicy{
+	MaxAttempts:    3,
+	InitialBackoff: 10 * time.Second,
+	MaxBackoff:     60 * time.Second,
+	RetryOn:        []string{"transient", "invalid_output"},
+}
+
+// NoRetry is the explicit "do not retry" sentinel. Same semantics as
+// calling Retry(nil) but reads better at the call site:
+//
+//	p.Text("idempotent_thing").Retry(vamp.NoRetry)
+var NoRetry *RetryPolicy = nil
 
 // Foreach turns the stage into a fan-out: it runs once per element of the
 // JSON-array output produced by `from`. `from` must also be passed to
@@ -279,8 +308,13 @@ type TextStage struct {
 }
 
 // Text appends a text stage to the pipeline and returns its builder.
+// The stage starts with DefaultTextRetry preconfigured — call .Retry
+// to override (or NoRetry to disable). Previously every text stage
+// in every pipeline open-coded the same 3-attempt / 10-60s exponential
+// backoff policy; the new default folds that boilerplate.
 func (p *Pipeline) Text(id string) *TextStage {
 	s := p.appendStage(id, StageTypeText)
+	s.Retry = DefaultTextRetry
 	t := &TextStage{}
 	t.stageBase = &stageBase[*TextStage]{s: s, self: nil}
 	t.stageBase.self = t
