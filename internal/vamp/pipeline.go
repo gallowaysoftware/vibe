@@ -304,6 +304,28 @@ type Stage struct {
 	// have all succeeded.
 	RunWhen string `yaml:"run_when,omitempty"`
 
+	// Mix-stage fields. A `type: mix` stage renders a structured
+	// script JSON file into a single chapterised m4b. The script
+	// (typically produced by an LLM "showrunner" stage upstream)
+	// lists voice segments in order plus optional music cues / SFX
+	// cues / chapters. v1 implementation: linear concat of voices
+	// with optional intro/outro music + loudnorm. v2 (future) adds
+	// sidechain ducking and SFX punch-ins. All fields are
+	// template-rendered against the standard binding.
+	//
+	// ScriptFile is the path to the script JSON (relative to run dir).
+	ScriptFile string `yaml:"script_file,omitempty"`
+	// IntroMusic is an optional audio file prepended before the
+	// first voice segment.
+	IntroMusic string `yaml:"intro_music,omitempty"`
+	// OutroMusic is an optional audio file appended after the last
+	// voice segment.
+	OutroMusic string `yaml:"outro_music,omitempty"`
+	// LoudnessTarget is the target integrated loudness in LUFS for
+	// the final encode (ffmpeg loudnorm I=). Default -16, the
+	// AES/EBU R128 podcast standard.
+	LoudnessTarget float64 `yaml:"loudness_target,omitempty"`
+
 	// Compact-stage fields. A `type: compact` stage replaces the brittle
 	// `| truncate N` template pattern: when an upstream's text would
 	// overflow a downstream LLM's context window, route it through a
@@ -627,7 +649,7 @@ func (p *Pipeline) Validate() error {
 		// (youtube, webhook), which talk to a third-party API and never
 		// activate a vibe profile. Confirm stages are pure local I/O —
 		// stdin or a marker file — and also don't activate a profile.
-		if stageType != StageTypeAudio && stageType != StageTypeFFmpeg && stageType != StageTypeYouTube && stageType != StageTypeWebhook && stageType != StageTypeConfirm && stageType != StageTypeRender && stageType != StageTypePandoc && s.Capability == "" {
+		if stageType != StageTypeAudio && stageType != StageTypeFFmpeg && stageType != StageTypeYouTube && stageType != StageTypeWebhook && stageType != StageTypeConfirm && stageType != StageTypeRender && stageType != StageTypePandoc && stageType != StageTypeMix && s.Capability == "" {
 			return fmt.Errorf("%s: capability is required", ctx)
 		}
 		switch stageType {
@@ -1214,8 +1236,46 @@ func (p *Pipeline) Validate() error {
 			if s.Prompt != "" || s.PromptFile != "" {
 				return fmt.Errorf("%s: prompt/prompt_file are not valid on type: pandoc", ctx)
 			}
+		case StageTypeMix:
+			// Mix stages read a script JSON file produced by an
+			// upstream stage (typically an LLM "showrunner") and
+			// render it into an m4b via ffmpeg. The script supplies
+			// the voice segments in order; everything else is
+			// optional per-stage configuration.
+			if s.ScriptFile == "" {
+				return fmt.Errorf("%s: script_file is required for type: mix", ctx)
+			}
+			if _, err := template.New(s.ID + ":script_file").Funcs(templateFuncs()).Parse(s.ScriptFile); err != nil {
+				return fmt.Errorf("%s: parse script_file template: %w", ctx, err)
+			}
+			for _, field := range []struct{ name, tmpl string }{
+				{"intro_music", s.IntroMusic},
+				{"outro_music", s.OutroMusic},
+				{"cover_image", s.CoverImage},
+			} {
+				if field.tmpl == "" {
+					continue
+				}
+				if _, err := template.New(s.ID + ":" + field.name).Funcs(templateFuncs()).Parse(field.tmpl); err != nil {
+					return fmt.Errorf("%s: parse %s template: %w", ctx, field.name, err)
+				}
+			}
+			if !strings.HasSuffix(strings.ToLower(s.Output), ".m4b") &&
+				!strings.HasSuffix(strings.ToLower(s.Output), ".m4a") &&
+				!strings.HasSuffix(strings.ToLower(s.Output), ".mp3") {
+				return fmt.Errorf("%s: output %q should end in .m4b / .m4a / .mp3 for type: mix", ctx, s.Output)
+			}
+			if s.LoudnessTarget != 0 && (s.LoudnessTarget < -70 || s.LoudnessTarget > 0) {
+				return fmt.Errorf("%s: loudness_target %g is out of plausible range (-70 .. 0 LUFS; default -16)", ctx, s.LoudnessTarget)
+			}
+			if s.Capability != "" {
+				return fmt.Errorf("%s: capability is only valid on stage types that activate a vibe profile (mix shells out to ffmpeg)", ctx)
+			}
+			if s.Prompt != "" || s.PromptFile != "" {
+				return fmt.Errorf("%s: prompt/prompt_file are not valid on type: mix", ctx)
+			}
 		default:
-			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio, ffmpeg, youtube, webhook, confirm, render, compact, pandoc)", ctx, s.Type)
+			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio, ffmpeg, youtube, webhook, confirm, render, compact, pandoc, mix)", ctx, s.Type)
 		}
 		if s.OutputFormat != "" && s.OutputFormat != "json" {
 			return fmt.Errorf("%s: output_format %q is not supported (allowed: \"\", json)", ctx, s.OutputFormat)

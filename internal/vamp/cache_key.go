@@ -35,7 +35,7 @@ func EnvCacheDisabled() bool {
 // CLI/docs all agree on the same allow-list.
 func stageCacheable(st *Stage) bool {
 	switch stageTypeOrDefault(st) {
-	case StageTypeText, StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg, StageTypeRender, StageTypeCompact, StageTypePandoc:
+	case StageTypeText, StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg, StageTypeRender, StageTypeCompact, StageTypePandoc, StageTypeMix:
 		return true
 	case StageTypeWebhook:
 		// Webhook stages are NOT cacheable by default — most are

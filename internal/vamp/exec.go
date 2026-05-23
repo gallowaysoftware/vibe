@@ -97,6 +97,16 @@ const (
 	// doesn't need a pandoc install; set binary: "pandoc" to use a
 	// locally-installed one.
 	StageTypePandoc StageType = "pandoc"
+	// StageTypeMix renders a structured-script JSON into a single
+	// chapterised audiobook / podcast m4b. The script describes voice
+	// segments (in order), optional intro/outro music, and a target
+	// loudness; the executor builds the ffmpeg filtergraph that
+	// concatenates the voices, prepends/appends music with crossfade,
+	// applies loudnorm to podcast-standard levels (-16 LUFS), and
+	// optionally embeds a cover image. Designed for the fake-crime
+	// podcast pipeline's showrunner-output → final-episode bridge,
+	// but generic across any voice-over-music production.
+	StageTypeMix StageType = "mix"
 )
 
 // StageExecutor implements the run of a single stage instance. The receiver
@@ -381,6 +391,7 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 		StageTypeRender:  &renderExecutor{},
 		StageTypeCompact: &compactExecutor{inference: e.Inference},
 		StageTypePandoc:  &pandocExecutor{},
+		StageTypeMix:     &mixExecutor{},
 	}
 
 	// Stage lookup and dependency counts for wave-based scheduling.
@@ -1665,7 +1676,7 @@ func stageRequiresVibeProfile(st *Stage) bool {
 		// like every other LLM stage. No capability set ⇒ pure piper
 		// (or kokoro with an explicit engine_url) ⇒ no profile.
 		return st.Capability != ""
-	case StageTypeFFmpeg, StageTypeYouTube, StageTypeWebhook, StageTypeConfirm, StageTypeRender, StageTypePandoc:
+	case StageTypeFFmpeg, StageTypeYouTube, StageTypeWebhook, StageTypeConfirm, StageTypeRender, StageTypePandoc, StageTypeMix:
 		return false
 	default:
 		return true

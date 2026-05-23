@@ -547,6 +547,48 @@ func (p *PandocStage) Args(args ...string) *PandocStage {
 // relative to the run dir or absolute).
 func (p *PandocStage) CoverImage(path string) *PandocStage { p.s.CoverImage = path; return p }
 
+// ---- Mix stages ----
+
+// MixStage renders a structured-script JSON file into a chapterised
+// audiobook / podcast m4b via ffmpeg. The script lists voice
+// segments in order plus optional music/SFX cues; the executor
+// builds the filtergraph (concat + loudnorm in v1, with sidechain
+// ducking and SFX punch-ins planned for v2).
+type MixStage struct {
+	*stageBase[*MixStage]
+}
+
+// Mix appends a mix stage.
+func (p *Pipeline) Mix(id string) *MixStage {
+	s := p.appendStage(id, StageTypeMix)
+	m := &MixStage{}
+	m.stageBase = &stageBase[*MixStage]{s: s}
+	m.stageBase.self = m
+	return m
+}
+
+// ScriptFile is the path (template-rendered) to the showrunner's
+// script JSON the mix executor consumes. Required.
+func (m *MixStage) ScriptFile(path string) *MixStage { m.s.ScriptFile = path; return m }
+
+// IntroMusic is an optional audio file prepended before the first
+// voice segment.
+func (m *MixStage) IntroMusic(path string) *MixStage { m.s.IntroMusic = path; return m }
+
+// OutroMusic is an optional audio file appended after the last
+// voice segment.
+func (m *MixStage) OutroMusic(path string) *MixStage { m.s.OutroMusic = path; return m }
+
+// LoudnessTarget sets the integrated loudness target in LUFS
+// (ffmpeg loudnorm I=). Default -16, the podcast standard.
+func (m *MixStage) LoudnessTarget(lufs float64) *MixStage { m.s.LoudnessTarget = lufs; return m }
+
+// CoverImage attaches a cover image embedded in the resulting m4b.
+func (m *MixStage) CoverImage(path string) *MixStage { m.s.CoverImage = path; return m }
+
+// Binary overrides the ffmpeg binary (default "ffmpeg" on $PATH).
+func (m *MixStage) Binary(bin string) *MixStage { m.s.Binary = bin; return m }
+
 // ---- ComfyUI stages ----
 
 // ComfyUIStage submits a ComfyUI workflow.
