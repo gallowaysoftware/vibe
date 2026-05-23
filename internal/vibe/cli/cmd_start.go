@@ -42,7 +42,13 @@ func startCmd() *cobra.Command {
 			}
 			fmt.Printf("started %s\n", r.Status.Profile)
 			fmt.Printf("  backend: %s\n", r.Status.BackendAddr)
-			fmt.Printf("  proxy:   %s\n", r.Status.ProxyAddr)
+			// Service-mode profiles don't go through the proxy — the
+			// daemon returns ProxyAddr empty in that case. Skip the
+			// line to avoid surfacing a misleading "proxy: " line for
+			// a sidecar that callers reach via BackendAddr directly.
+			if r.Status.ProxyAddr != "" {
+				fmt.Printf("  proxy:   %s\n", r.Status.ProxyAddr)
+			}
 			if r.Frontend != nil {
 				// external = config rendered, user launches the binary;
 				// managed / docker-compose = vibe also launched the binary.

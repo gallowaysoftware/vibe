@@ -134,6 +134,17 @@ func (c *Client) Status(ctx context.Context) (*vibev1.Status, error) {
 	return resp.Msg.Status, nil
 }
 
+// StatusFull returns the active-profile Status plus every running
+// service. Used by `vibe ps` to render the whole picture; callers
+// that only care about the active profile can keep using Status().
+func (c *Client) StatusFull(ctx context.Context) (active *vibev1.Status, services []*vibev1.Status, err error) {
+	resp, err := c.rpc.Status(ctx, connect.NewRequest(&vibev1.StatusRequest{}))
+	if err != nil {
+		return nil, nil, err
+	}
+	return resp.Msg.Status, resp.Msg.Services, nil
+}
+
 func (c *Client) ListProfiles(ctx context.Context) ([]*vibev1.Profile, error) {
 	resp, err := c.rpc.ListProfiles(ctx, connect.NewRequest(&vibev1.ListProfilesRequest{}))
 	if err != nil {
@@ -177,7 +188,15 @@ func (c *Client) StartWithOptions(ctx context.Context, profile string, opts Star
 }
 
 func (c *Client) Stop(ctx context.Context) (*vibev1.Status, error) {
-	resp, err := c.rpc.Stop(ctx, connect.NewRequest(&vibev1.StopRequest{}))
+	return c.StopByName(ctx, "")
+}
+
+// StopByName stops a specific profile or service. Empty name targets
+// the active profile (legacy Stop behavior). The special value "all"
+// stops the active profile and every running service. Anything else
+// is treated as a service name.
+func (c *Client) StopByName(ctx context.Context, name string) (*vibev1.Status, error) {
+	resp, err := c.rpc.Stop(ctx, connect.NewRequest(&vibev1.StopRequest{Profile: name}))
 	if err != nil {
 		return nil, err
 	}

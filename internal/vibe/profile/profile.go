@@ -28,6 +28,36 @@ type Profile struct {
 	Backend         Backend  `yaml:"backend"`
 	Frontend        Frontend `yaml:"frontend,omitempty"`
 	EstimatedVRAMGB float64  `yaml:"estimated_vram_gb,omitempty"`
+	// Mode controls whether this profile takes the daemon's single
+	// "active" slot or runs as a background service alongside other
+	// services and an active profile. Default (empty / "active") is
+	// the historical single-active-profile behavior — backward compat
+	// for every profile that existed before mode was introduced.
+	//
+	// "service" mode is for stateless sidecars (searxng, embedding
+	// servers, TTS engines, image-gen daemons) that pipelines call by
+	// well-known port. Multiple service-mode profiles can run
+	// concurrently with each other and with one active-mode profile.
+	// They bypass the proxy (callers use the service's published
+	// port directly) and the frontend activation path.
+	Mode string `yaml:"mode,omitempty"`
+}
+
+// Profile modes. Default-empty maps to ModeActive so existing
+// profiles keep their behavior without YAML edits.
+const (
+	ModeActive  = "active"
+	ModeService = "service"
+)
+
+// ResolvedMode returns Mode with the historical default ("active")
+// substituted for empty. Centralised so every caller agrees on the
+// default.
+func (p *Profile) ResolvedMode() string {
+	if p.Mode == "" {
+		return ModeActive
+	}
+	return p.Mode
 }
 
 // Backend is a discriminated union of supported local-AI backends. Exactly
@@ -374,11 +404,32 @@ func (p *Profile) Validate() error {
 	if !nameRE.MatchString(p.Name) {
 		return fmt.Errorf("name %q must match [a-zA-Z0-9_-]+", p.Name)
 	}
+	if err := p.validateMode(); err != nil {
+		return err
+	}
 
 	if err := p.validateBackend(); err != nil {
 		return err
 	}
 	return p.validateFrontend()
+}
+
+// validateMode checks the Mode field. Empty (= ModeActive) and the
+// two named modes are accepted; anything else is a typo.
+// Service-mode profiles also reject a frontend block — frontends are
+// the active-profile path (proxy wiring + browser URL); a sidecar
+// service has no frontend to launch.
+func (p *Profile) validateMode() error {
+	switch p.ResolvedMode() {
+	case ModeActive, ModeService:
+		// ok
+	default:
+		return fmt.Errorf("mode %q is not recognised (expected %q or %q)", p.Mode, ModeActive, ModeService)
+	}
+	if p.ResolvedMode() == ModeService && !p.Frontend.IsZero() {
+		return errors.New("mode: service profiles cannot declare a frontend block (services are sidecars; the frontend path is for active-mode profiles only)")
+	}
+	return nil
 }
 
 func (p *Profile) validateBackend() error {

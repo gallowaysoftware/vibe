@@ -376,8 +376,15 @@ func (*StatusRequest) Descriptor() ([]byte, []int) {
 }
 
 type StatusResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Status        *Status                `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// status describes the currently-active profile (empty Status block
+	// when no active profile is running). Backward-compatible with
+	// pre-services clients that only knew about the single active slot.
+	Status *Status `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	// services lists every running service-mode profile. Service-mode
+	// profiles run alongside one another and alongside the active
+	// profile (each has its own supervisor instance + published port).
+	Services      []*Status `protobuf:"bytes,2,rep,name=services,proto3" json:"services,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -415,6 +422,13 @@ func (*StatusResponse) Descriptor() ([]byte, []int) {
 func (x *StatusResponse) GetStatus() *Status {
 	if x != nil {
 		return x.Status
+	}
+	return nil
+}
+
+func (x *StatusResponse) GetServices() []*Status {
+	if x != nil {
+		return x.Services
 	}
 	return nil
 }
@@ -621,7 +635,15 @@ func (x *StartResponse) GetFrontend() *FrontendInfo {
 }
 
 type StopRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// profile, if set, names the specific profile to stop. Service-mode
+	// profiles must be addressed by name (e.g. `vibe stop searxng`)
+	// since multiple can run concurrently. If empty, the daemon stops
+	// the active profile (legacy single-profile behavior).
+	//
+	// The special value "all" stops the active profile and every
+	// running service in one call — useful in shutdown / reset paths.
+	Profile       string `protobuf:"bytes,1,opt,name=profile,proto3" json:"profile,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -654,6 +676,13 @@ func (x *StopRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use StopRequest.ProtoReflect.Descriptor instead.
 func (*StopRequest) Descriptor() ([]byte, []int) {
 	return file_vibe_v1_control_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *StopRequest) GetProfile() string {
+	if x != nil {
+		return x.Profile
+	}
+	return ""
 }
 
 type StopResponse struct {
@@ -999,9 +1028,10 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x01\x10\x02R\x03app\"\x0f\n" +
-	"\rStatusRequest\"9\n" +
+	"\rStatusRequest\"f\n" +
 	"\x0eStatusResponse\x12'\n" +
-	"\x06status\x18\x01 \x01(\v2\x0f.vibe.v1.StatusR\x06status\"\x15\n" +
+	"\x06status\x18\x01 \x01(\v2\x0f.vibe.v1.StatusR\x06status\x12+\n" +
+	"\bservices\x18\x02 \x03(\v2\x0f.vibe.v1.StatusR\bservices\"\x15\n" +
 	"\x13ListProfilesRequest\"D\n" +
 	"\x14ListProfilesResponse\x12,\n" +
 	"\bprofiles\x18\x01 \x03(\v2\x10.vibe.v1.ProfileR\bprofiles\"l\n" +
@@ -1013,8 +1043,9 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"foreground\"k\n" +
 	"\rStartResponse\x12'\n" +
 	"\x06status\x18\x01 \x01(\v2\x0f.vibe.v1.StatusR\x06status\x121\n" +
-	"\bfrontend\x18\x02 \x01(\v2\x15.vibe.v1.FrontendInfoR\bfrontend\"\r\n" +
-	"\vStopRequest\"7\n" +
+	"\bfrontend\x18\x02 \x01(\v2\x15.vibe.v1.FrontendInfoR\bfrontend\"'\n" +
+	"\vStopRequest\x12\x18\n" +
+	"\aprofile\x18\x01 \x01(\tR\aprofile\"7\n" +
 	"\fStopResponse\x12'\n" +
 	"\x06status\x18\x01 \x01(\v2\x0f.vibe.v1.StatusR\x06status\"\x11\n" +
 	"\x0fShutdownRequest\"\x12\n" +
@@ -1088,30 +1119,31 @@ var file_vibe_v1_control_proto_depIdxs = []int32{
 	18, // 1: vibe.v1.Status.frontend_env:type_name -> vibe.v1.Status.FrontendEnvEntry
 	19, // 2: vibe.v1.FrontendInfo.env_vars:type_name -> vibe.v1.FrontendInfo.EnvVarsEntry
 	1,  // 3: vibe.v1.StatusResponse.status:type_name -> vibe.v1.Status
-	2,  // 4: vibe.v1.ListProfilesResponse.profiles:type_name -> vibe.v1.Profile
-	1,  // 5: vibe.v1.StartResponse.status:type_name -> vibe.v1.Status
-	3,  // 6: vibe.v1.StartResponse.frontend:type_name -> vibe.v1.FrontendInfo
-	1,  // 7: vibe.v1.StopResponse.status:type_name -> vibe.v1.Status
-	0,  // 8: vibe.v1.PullProgress.phase:type_name -> vibe.v1.PullProgress.Phase
-	4,  // 9: vibe.v1.ControlService.Status:input_type -> vibe.v1.StatusRequest
-	6,  // 10: vibe.v1.ControlService.ListProfiles:input_type -> vibe.v1.ListProfilesRequest
-	8,  // 11: vibe.v1.ControlService.Start:input_type -> vibe.v1.StartRequest
-	10, // 12: vibe.v1.ControlService.Stop:input_type -> vibe.v1.StopRequest
-	12, // 13: vibe.v1.ControlService.Shutdown:input_type -> vibe.v1.ShutdownRequest
-	14, // 14: vibe.v1.ControlService.Logs:input_type -> vibe.v1.LogsRequest
-	16, // 15: vibe.v1.ControlService.Pull:input_type -> vibe.v1.PullRequest
-	5,  // 16: vibe.v1.ControlService.Status:output_type -> vibe.v1.StatusResponse
-	7,  // 17: vibe.v1.ControlService.ListProfiles:output_type -> vibe.v1.ListProfilesResponse
-	9,  // 18: vibe.v1.ControlService.Start:output_type -> vibe.v1.StartResponse
-	11, // 19: vibe.v1.ControlService.Stop:output_type -> vibe.v1.StopResponse
-	13, // 20: vibe.v1.ControlService.Shutdown:output_type -> vibe.v1.ShutdownResponse
-	15, // 21: vibe.v1.ControlService.Logs:output_type -> vibe.v1.LogsResponse
-	17, // 22: vibe.v1.ControlService.Pull:output_type -> vibe.v1.PullProgress
-	16, // [16:23] is the sub-list for method output_type
-	9,  // [9:16] is the sub-list for method input_type
-	9,  // [9:9] is the sub-list for extension type_name
-	9,  // [9:9] is the sub-list for extension extendee
-	0,  // [0:9] is the sub-list for field type_name
+	1,  // 4: vibe.v1.StatusResponse.services:type_name -> vibe.v1.Status
+	2,  // 5: vibe.v1.ListProfilesResponse.profiles:type_name -> vibe.v1.Profile
+	1,  // 6: vibe.v1.StartResponse.status:type_name -> vibe.v1.Status
+	3,  // 7: vibe.v1.StartResponse.frontend:type_name -> vibe.v1.FrontendInfo
+	1,  // 8: vibe.v1.StopResponse.status:type_name -> vibe.v1.Status
+	0,  // 9: vibe.v1.PullProgress.phase:type_name -> vibe.v1.PullProgress.Phase
+	4,  // 10: vibe.v1.ControlService.Status:input_type -> vibe.v1.StatusRequest
+	6,  // 11: vibe.v1.ControlService.ListProfiles:input_type -> vibe.v1.ListProfilesRequest
+	8,  // 12: vibe.v1.ControlService.Start:input_type -> vibe.v1.StartRequest
+	10, // 13: vibe.v1.ControlService.Stop:input_type -> vibe.v1.StopRequest
+	12, // 14: vibe.v1.ControlService.Shutdown:input_type -> vibe.v1.ShutdownRequest
+	14, // 15: vibe.v1.ControlService.Logs:input_type -> vibe.v1.LogsRequest
+	16, // 16: vibe.v1.ControlService.Pull:input_type -> vibe.v1.PullRequest
+	5,  // 17: vibe.v1.ControlService.Status:output_type -> vibe.v1.StatusResponse
+	7,  // 18: vibe.v1.ControlService.ListProfiles:output_type -> vibe.v1.ListProfilesResponse
+	9,  // 19: vibe.v1.ControlService.Start:output_type -> vibe.v1.StartResponse
+	11, // 20: vibe.v1.ControlService.Stop:output_type -> vibe.v1.StopResponse
+	13, // 21: vibe.v1.ControlService.Shutdown:output_type -> vibe.v1.ShutdownResponse
+	15, // 22: vibe.v1.ControlService.Logs:output_type -> vibe.v1.LogsResponse
+	17, // 23: vibe.v1.ControlService.Pull:output_type -> vibe.v1.PullProgress
+	17, // [17:24] is the sub-list for method output_type
+	10, // [10:17] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_vibe_v1_control_proto_init() }

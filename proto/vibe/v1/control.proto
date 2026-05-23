@@ -89,7 +89,14 @@ message FrontendInfo {
 
 message StatusRequest {}
 message StatusResponse {
+  // status describes the currently-active profile (empty Status block
+  // when no active profile is running). Backward-compatible with
+  // pre-services clients that only knew about the single active slot.
   Status status = 1;
+  // services lists every running service-mode profile. Service-mode
+  // profiles run alongside one another and alongside the active
+  // profile (each has its own supervisor instance + published port).
+  repeated Status services = 2;
 }
 
 message ListProfilesRequest {}
@@ -116,7 +123,16 @@ message StartResponse {
   FrontendInfo frontend = 2;
 }
 
-message StopRequest {}
+message StopRequest {
+  // profile, if set, names the specific profile to stop. Service-mode
+  // profiles must be addressed by name (e.g. `vibe stop searxng`)
+  // since multiple can run concurrently. If empty, the daemon stops
+  // the active profile (legacy single-profile behavior).
+  //
+  // The special value "all" stops the active profile and every
+  // running service in one call — useful in shutdown / reset paths.
+  string profile = 1;
+}
 message StopResponse {
   Status status = 1;
 }

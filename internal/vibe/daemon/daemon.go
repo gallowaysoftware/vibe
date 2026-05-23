@@ -93,6 +93,17 @@ func (c Config) resolveHTTPAddr() Config {
 	return c
 }
 
+// serviceInstance bundles the per-service state for one running
+// service-mode profile. Services run alongside each other and
+// alongside the active profile; each has its own supervisor so a
+// crash + auto-respawn in one service doesn't perturb the others.
+type serviceInstance struct {
+	profile   *profile.Profile
+	sup       *supervisor.Supervisor
+	startTime time.Time
+	port      int
+}
+
 type Daemon struct {
 	cfg Config
 	sup *supervisor.Supervisor
@@ -113,6 +124,13 @@ type Daemon struct {
 	active    *profile.Profile
 	startTime time.Time
 	frontend  *frontend.Result
+	// services is the map of running service-mode profiles, keyed by
+	// profile name. Empty in the legacy single-active-profile case.
+	// Each entry has its own supervisor so crashes don't cross-
+	// contaminate. The map itself is protected by mu; entries are
+	// otherwise immutable once stored (callers read pointers, never
+	// mutate).
+	services map[string]*serviceInstance
 
 	shutdown     chan struct{}
 	shutdownOnce sync.Once
@@ -128,6 +146,7 @@ func New(cfg Config) *Daemon {
 		prx:         proxy.New(fmt.Sprintf("127.0.0.1:%d", cfg.ProxyPort)),
 		nvidiaSMI:   vram.NvidiaSMIProbe,
 		vramSlopGiB: vram.DefaultSlopGiB,
+		services:    map[string]*serviceInstance{},
 		shutdown:    make(chan struct{}),
 	}
 }
@@ -256,7 +275,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 // ─── Connect handler methods ────────────────────────────────────────────────
 
 func (d *Daemon) Status(_ context.Context, _ *connect.Request[vibev1.StatusRequest]) (*connect.Response[vibev1.StatusResponse], error) {
-	return connect.NewResponse(&vibev1.StatusResponse{Status: d.protoStatus()}), nil
+	return connect.NewResponse(&vibev1.StatusResponse{
+		Status:   d.protoStatus(),
+		Services: d.servicesStatus(),
+	}), nil
 }
 
 func (d *Daemon) ListProfiles(_ context.Context, _ *connect.Request[vibev1.ListProfilesRequest]) (*connect.Response[vibev1.ListProfilesResponse], error) {
@@ -292,14 +314,6 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("profile name required"))
 	}
 
-	d.mu.Lock()
-	if d.active != nil {
-		name := d.active.Name
-		d.mu.Unlock()
-		return nil, connect.NewError(connect.CodeAlreadyExists, fmt.Errorf("profile %q is already running; stop first", name))
-	}
-	d.mu.Unlock()
-
 	p, err := loadProfileByName(profileName)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeNotFound, err)
@@ -307,6 +321,22 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 
 	startCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+
+	// Service-mode profiles run as background sidecars: their own
+	// supervisor instance, no proxy / frontend wiring, no contention
+	// for the daemon's single "active" slot. Branch off the active
+	// path here so the existing code below stays untouched.
+	if p.ResolvedMode() == profile.ModeService {
+		return d.startService(startCtx, p)
+	}
+
+	d.mu.Lock()
+	if d.active != nil {
+		name := d.active.Name
+		d.mu.Unlock()
+		return nil, connect.NewError(connect.CodeAlreadyExists, fmt.Errorf("profile %q is already running; stop first", name))
+	}
+	d.mu.Unlock()
 
 	// Pre-flight VRAM check. We only run this when the profile declares an
 	// estimate (otherwise the older zero-VRAM profiles would all skip
@@ -337,82 +367,10 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 		}
 	}
 
-	// Dispatch by backend kind. Each branch fully populates `spec` and the
-	// chosen `port`, then the shared tail starts the supervisor.
-	var (
-		spec supervisor.LaunchSpec
-		port int
-	)
-	switch {
-	case p.Backend.LlamaServer != nil:
-		port, err = supervisor.PickFreePort()
-		if err != nil {
-			return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("pick port: %w", err))
-		}
-		// Per-profile binary override beats the daemon-wide default.
-		// Empty falls through to d.cfg.LlamaBinary (which is itself
-		// empty by default, so spawning resolves "llama-server" via
-		// $PATH — the usual symlink-at-~/.local/bin/llama-server case).
-		llamaBin := d.cfg.LlamaBinary
-		if p.Backend.LlamaServer.Binary != "" {
-			llamaBin = p.Backend.LlamaServer.Binary
-		}
-		spec, err = profile.LlamaServerSpec(p, llamaBin, port)
-		if err != nil {
-			return nil, connect.NewError(connect.CodeInternal, err)
-		}
-		slog.Info("starting profile (llama_server)",
-			"profile", p.Name, "alias", p.Backend.LlamaServer.Alias,
-			"model_file", filepath.Base(p.Backend.LlamaServer.Path),
-			"context", p.Backend.LlamaServer.Context, "port", port,
-			"binary", llamaBin)
-	case p.Backend.ComfyUI != nil:
-		port = p.Backend.ComfyUI.Port
-		if port == 0 {
-			port, err = supervisor.PickFreePort()
-			if err != nil {
-				return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("pick port: %w", err))
-			}
-		}
-		spec, err = profile.ComfyUISpec(p, port)
-		if err != nil {
-			return nil, connect.NewError(connect.CodeInternal, err)
-		}
-		slog.Info("starting profile (comfyui)",
-			"profile", p.Name, "dir", p.Backend.ComfyUI.Dir, "port", port)
-	case p.Backend.HTTPServer != nil:
-		// http_server backends pin their port up-front (the docker
-		// publish mapping or the binary's --port flag); the daemon
-		// doesn't pick a free one.
-		port = p.Backend.HTTPServer.Port
-		spec, err = profile.HTTPServerSpec(p, p.Name)
-		if err != nil {
-			return nil, connect.NewError(connect.CodeInternal, err)
-		}
-		mode := "docker"
-		if p.Backend.HTTPServer.Image == "" {
-			mode = "binary"
-		}
-		// If the daemon previously crashed while a docker-mode profile
-		// was up, the container survived reparenting to init and a
-		// fresh `docker run --name vibe-<profile>` will fail with
-		// "container name already in use". Best-effort `docker rm -f`
-		// before the supervisor's run; ignored when the container
-		// doesn't exist (the common case) or docker isn't installed
-		// (binary mode).
-		if mode == "docker" {
-			rm := exec.Command("docker", "rm", "-f", "vibe-"+p.Name)
-			rm.Stdout = nil
-			rm.Stderr = nil
-			_ = rm.Run()
-		}
-		slog.Info("starting profile (http_server)",
-			"profile", p.Name, "mode", mode,
-			"image_or_binary", firstNonEmpty(p.Backend.HTTPServer.Image, p.Backend.HTTPServer.Binary),
-			"port", port)
-	default:
-		return nil, connect.NewError(connect.CodeFailedPrecondition,
-			errors.New("profile has no backend (set backend.llama_server, backend.comfyui, or backend.http_server)"))
+	// Dispatch by backend kind to build the launch spec + pick a port.
+	spec, port, err := d.buildLaunchSpec(p)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := d.sup.Start(startCtx, spec, port); err != nil {
@@ -583,15 +541,81 @@ func (d *Daemon) watchBackendForRespawn(name string, spec supervisor.LaunchSpec,
 	}
 }
 
-func (d *Daemon) Stop(ctx context.Context, _ *connect.Request[vibev1.StopRequest]) (*connect.Response[vibev1.StopResponse], error) {
+func (d *Daemon) Stop(ctx context.Context, req *connect.Request[vibev1.StopRequest]) (*connect.Response[vibev1.StopResponse], error) {
 	if !d.startMu.TryLock() {
 		return nil, connect.NewError(connect.CodeAborted, errors.New("another start/stop is in progress"))
 	}
 	defer d.startMu.Unlock()
-	if err := d.stopActive(ctx); err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+
+	name := strings.TrimSpace(req.Msg.GetProfile())
+	switch {
+	case name == "" || (d.active != nil && d.active.Name == name):
+		// Empty or active-name targets the active profile (legacy
+		// behavior). The active-name path lets callers be explicit
+		// without having to know which mode the profile is in.
+		if err := d.stopActive(ctx); err != nil {
+			return nil, connect.NewError(connect.CodeInternal, err)
+		}
+	case name == "all":
+		// Best-effort stop everything. The first error gets surfaced
+		// but every entry is attempted so a partial failure doesn't
+		// leave half the stack up. Active goes last so a service stop
+		// failure doesn't dangle the frontend.
+		var firstErr error
+		d.mu.Lock()
+		names := make([]string, 0, len(d.services))
+		for n := range d.services {
+			names = append(names, n)
+		}
+		d.mu.Unlock()
+		for _, n := range names {
+			if err := d.stopService(ctx, n); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		if err := d.stopActive(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		if firstErr != nil {
+			return nil, connect.NewError(connect.CodeInternal, firstErr)
+		}
+	default:
+		// Anything else is a service name.
+		if err := d.stopService(ctx, name); err != nil {
+			if errors.Is(err, errServiceNotFound) {
+				return nil, connect.NewError(connect.CodeNotFound, err)
+			}
+			return nil, connect.NewError(connect.CodeInternal, err)
+		}
 	}
 	return connect.NewResponse(&vibev1.StopResponse{Status: d.protoStatus()}), nil
+}
+
+// errServiceNotFound is returned by stopService when the named
+// service isn't registered. Stop converts this to CodeNotFound so
+// CLI callers can distinguish "wrong name" from "stop genuinely
+// failed".
+var errServiceNotFound = errors.New("service not found")
+
+// stopService tears down a single service-mode profile. The entry
+// is removed from d.services BEFORE stopping the supervisor so the
+// per-service respawn watcher sees no registration and bails out
+// cleanly (same pattern stopActive uses for d.active).
+func (d *Daemon) stopService(ctx context.Context, name string) error {
+	d.mu.Lock()
+	svc, ok := d.services[name]
+	if !ok {
+		d.mu.Unlock()
+		return fmt.Errorf("%w: %q", errServiceNotFound, name)
+	}
+	delete(d.services, name)
+	d.mu.Unlock()
+
+	slog.Info("stopping service", "profile", name)
+	if err := svc.sup.Stop(ctx); err != nil {
+		return fmt.Errorf("stop service %q: %w", name, err)
+	}
+	return nil
 }
 
 func (d *Daemon) Shutdown(_ context.Context, _ *connect.Request[vibev1.ShutdownRequest]) (*connect.Response[vibev1.ShutdownResponse], error) {
@@ -784,6 +808,45 @@ func (d *Daemon) protoStatus() *vibev1.Status {
 	return s
 }
 
+// servicesStatus snapshots every running service into a list of
+// vibev1.Status entries — one per service. Sorted by name so CLI
+// output is stable across calls. Returned with the daemon lock NOT
+// held; caller must not race against starts/stops. Status RPC is
+// the only caller today.
+func (d *Daemon) servicesStatus() []*vibev1.Status {
+	d.mu.Lock()
+	names := make([]string, 0, len(d.services))
+	for n := range d.services {
+		names = append(names, n)
+	}
+	d.mu.Unlock()
+	sort.Strings(names)
+
+	out := make([]*vibev1.Status, 0, len(names))
+	for _, n := range names {
+		d.mu.Lock()
+		svc, ok := d.services[n]
+		d.mu.Unlock()
+		if !ok {
+			continue // raced with a Stop; skip
+		}
+		st := svc.sup.Status()
+		s := &vibev1.Status{
+			Running:     true,
+			Ready:       st.State == supervisor.StateReady,
+			Profile:     svc.profile.Name,
+			StartedAt:   timestamppb.New(svc.startTime),
+			BackendAddr: st.Addr,
+			// ProxyAddr intentionally empty: services don't go through
+			// the daemon's reverse proxy. Callers reach them by their
+			// published port (BackendAddr).
+			Pid: int32(st.PID),
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
 // firstNonEmpty returns the first non-"" string from its arguments.
 // Used by the http_server start logging path so the same slog field can
 // surface either the docker image or the bare-binary path without two
@@ -837,4 +900,199 @@ func ensureSingleInstance() error {
 	}
 	_ = os.Remove(paths.PIDFile())
 	return nil
+}
+
+// buildLaunchSpec dispatches a Profile to its backend-specific spec
+// builder. Returns the supervisor.LaunchSpec ready to hand to
+// Supervisor.Start, the host port the proxy / external callers should
+// target, and a Connect-coded error on failure. Shared between
+// active-mode (the main Start path) and service-mode (startService)
+// so both paths construct identical specs from the same profile.
+func (d *Daemon) buildLaunchSpec(p *profile.Profile) (supervisor.LaunchSpec, int, error) {
+	var (
+		spec supervisor.LaunchSpec
+		port int
+		err  error
+	)
+	switch {
+	case p.Backend.LlamaServer != nil:
+		port, err = supervisor.PickFreePort()
+		if err != nil {
+			return spec, 0, connect.NewError(connect.CodeInternal, fmt.Errorf("pick port: %w", err))
+		}
+		llamaBin := d.cfg.LlamaBinary
+		if p.Backend.LlamaServer.Binary != "" {
+			llamaBin = p.Backend.LlamaServer.Binary
+		}
+		spec, err = profile.LlamaServerSpec(p, llamaBin, port)
+		if err != nil {
+			return spec, 0, connect.NewError(connect.CodeInternal, err)
+		}
+		slog.Info("starting profile (llama_server)",
+			"profile", p.Name, "mode", p.ResolvedMode(),
+			"alias", p.Backend.LlamaServer.Alias,
+			"model_file", filepath.Base(p.Backend.LlamaServer.Path),
+			"context", p.Backend.LlamaServer.Context, "port", port,
+			"binary", llamaBin)
+	case p.Backend.ComfyUI != nil:
+		port = p.Backend.ComfyUI.Port
+		if port == 0 {
+			port, err = supervisor.PickFreePort()
+			if err != nil {
+				return spec, 0, connect.NewError(connect.CodeInternal, fmt.Errorf("pick port: %w", err))
+			}
+		}
+		spec, err = profile.ComfyUISpec(p, port)
+		if err != nil {
+			return spec, 0, connect.NewError(connect.CodeInternal, err)
+		}
+		slog.Info("starting profile (comfyui)",
+			"profile", p.Name, "mode", p.ResolvedMode(),
+			"dir", p.Backend.ComfyUI.Dir, "port", port)
+	case p.Backend.HTTPServer != nil:
+		port = p.Backend.HTTPServer.Port
+		spec, err = profile.HTTPServerSpec(p, p.Name)
+		if err != nil {
+			return spec, 0, connect.NewError(connect.CodeInternal, err)
+		}
+		mode := "docker"
+		if p.Backend.HTTPServer.Image == "" {
+			mode = "binary"
+		}
+		// Same stale-container cleanup the original inline switch did:
+		// if a previous run left a `vibe-<name>` container behind, a
+		// fresh `docker run --name` collision aborts the start.
+		if mode == "docker" {
+			rm := exec.Command("docker", "rm", "-f", "vibe-"+p.Name)
+			rm.Stdout = nil
+			rm.Stderr = nil
+			_ = rm.Run()
+		}
+		slog.Info("starting profile (http_server)",
+			"profile", p.Name, "mode", p.ResolvedMode(),
+			"docker_or_binary", mode,
+			"image_or_binary", firstNonEmpty(p.Backend.HTTPServer.Image, p.Backend.HTTPServer.Binary),
+			"port", port)
+	default:
+		return spec, 0, connect.NewError(connect.CodeFailedPrecondition,
+			errors.New("profile has no backend (set backend.llama_server, backend.comfyui, or backend.http_server)"))
+	}
+	return spec, port, nil
+}
+
+// startService runs a service-mode profile alongside the daemon's
+// other services and (optionally) an active profile. Each service
+// gets its own supervisor instance so a crash + auto-respawn in one
+// service doesn't disturb the others.
+//
+// Service-mode profiles bypass:
+//   - the d.active "already running" check (services don't compete for the active slot),
+//   - the VRAM pre-flight (services are typically CPU-bound; if a service genuinely needs GPU, the caller bears responsibility for sizing),
+//   - proxy backend wiring (callers reach services via the published port directly),
+//   - frontend activation (a sidecar has no UI to launch).
+//
+// Returns a StartResponse populated from the per-service supervisor
+// status; the StatusResponse's `services` list will pick up the new
+// entry on subsequent Status calls.
+func (d *Daemon) startService(ctx context.Context, p *profile.Profile) (*connect.Response[vibev1.StartResponse], error) {
+	d.mu.Lock()
+	if _, exists := d.services[p.Name]; exists {
+		d.mu.Unlock()
+		return nil, connect.NewError(connect.CodeAlreadyExists,
+			fmt.Errorf("service %q is already running; stop it first with `vibe stop %s`", p.Name, p.Name))
+	}
+	d.mu.Unlock()
+
+	spec, port, err := d.buildLaunchSpec(p)
+	if err != nil {
+		return nil, err
+	}
+
+	sup := supervisor.New()
+	if err := sup.Start(ctx, spec, port); err != nil {
+		slog.Error("service supervisor start failed", "profile", p.Name, "err", err)
+		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("start service: %w", err))
+	}
+
+	svc := &serviceInstance{
+		profile:   p,
+		sup:       sup,
+		startTime: time.Now(),
+		port:      port,
+	}
+	d.mu.Lock()
+	d.services[p.Name] = svc
+	d.mu.Unlock()
+
+	// Service-specific auto-respawn watcher: same shape as the active
+	// watcher, but parameterised on the service's own supervisor +
+	// its slot in d.services. Crash in one service doesn't tear down
+	// the others (each has its own supervisor; the active is on yet
+	// a third).
+	go d.watchServiceForRespawn(p.Name, sup, spec, port)
+
+	// Return the SERVICE's status, not the active-profile status —
+	// d.protoStatus() would surface the active slot (empty in this
+	// case) and confuse the CLI. The Profile / BackendAddr fields
+	// in StartResponse are how `vibe start` decides what to print.
+	st := sup.Status()
+	resp := &vibev1.StartResponse{Status: &vibev1.Status{
+		Running:     true,
+		Ready:       st.State == supervisor.StateReady,
+		Profile:     p.Name,
+		StartedAt:   timestamppb.New(svc.startTime),
+		BackendAddr: st.Addr,
+		// ProxyAddr left empty: services don't go through the proxy.
+		Pid: int32(st.PID),
+	}}
+	slog.Info("service started", "profile", p.Name, "backend", st.Addr)
+	return connect.NewResponse(resp), nil
+}
+
+// watchServiceForRespawn parallels watchBackendForRespawn but is
+// scoped to a single service's supervisor and slot in d.services.
+// Exits when the service is stopped by name (entry removed) or when
+// the respawn budget is exhausted (entry cleared).
+func (d *Daemon) watchServiceForRespawn(name string, sup *supervisor.Supervisor, spec supervisor.LaunchSpec, port int) {
+	respawns := 0
+	windowStart := time.Now()
+	for {
+		stopped := sup.Stopped()
+		if stopped == nil {
+			return
+		}
+		<-stopped
+
+		d.mu.Lock()
+		_, stillRegistered := d.services[name]
+		d.mu.Unlock()
+		if !stillRegistered {
+			return // operator-initiated stop
+		}
+		if time.Since(windowStart) > respawnWindow {
+			respawns = 0
+			windowStart = time.Now()
+		}
+		if respawns >= maxBackendRespawns {
+			slog.Error("service respawn budget exhausted; deregistering",
+				"profile", name, "respawns", respawns, "window", respawnWindow)
+			d.mu.Lock()
+			delete(d.services, name)
+			d.mu.Unlock()
+			return
+		}
+		respawns++
+		slog.Warn("service exited unexpectedly; auto-respawning",
+			"profile", name, "attempt", respawns)
+		startCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		if err := sup.Start(startCtx, spec, port); err != nil {
+			slog.Error("service respawn failed", "profile", name, "err", err)
+			d.mu.Lock()
+			delete(d.services, name)
+			d.mu.Unlock()
+			cancel()
+			return
+		}
+		cancel()
+	}
 }
