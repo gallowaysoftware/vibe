@@ -2201,6 +2201,7 @@ func templateFuncs() template.FuncMap {
 		"flattenItems":               flattenItemsTemplate,
 		"uniqueByKey":                uniqueByKeyTemplate,
 		"filterByField":              filterByFieldTemplate,
+		"joinByField":                joinByFieldTemplate,
 		"parseSearXNG":               parseSearXNGTemplate,
 		"parseWikipediaExtract":      parseWikipediaExtractTemplate,
 		"parseWikipediaSearch":       parseWikipediaSearchTemplate,
@@ -2392,6 +2393,113 @@ func isTruthy(v any) bool {
 	default:
 		return true
 	}
+}
+
+// joinByFieldTemplate merges two parallel `{"items":[...]}` arrays
+// on a shared field, returning the LEFT side's items decorated with
+// the matched RIGHT-side fields. Items from left that lack a match
+// in right are passed through unchanged.
+//
+// Concrete use case: a filter foreach emits per-item
+// {"keep":bool,"id":"X"}; a separate render stage has the full
+// candidate set with snippets. Joining the filter output (kept
+// subset) against the candidate set by "id" gives the kept items
+// with their full payload restored — without forcing the filter
+// LLM to echo the snippet (which blew the JSON budget on long
+// snippets).
+//
+// Left wins on field-name collisions: a left item that already has
+// the joined field keeps its value.
+func joinByFieldTemplate(field, leftRaw, rightRaw string) (string, error) {
+	if field == "" {
+		return "", fmt.Errorf("joinByField: field is required")
+	}
+	left, err := jsonItems(leftRaw)
+	if err != nil {
+		return "", fmt.Errorf("joinByField: left: %w", err)
+	}
+	right, err := jsonItems(rightRaw)
+	if err != nil {
+		return "", fmt.Errorf("joinByField: right: %w", err)
+	}
+	index := make(map[string]map[string]any, len(right))
+	for _, item := range right {
+		if obj, ok := item.(map[string]any); ok {
+			if val, has := obj[field]; has {
+				index[fmt.Sprint(val)] = obj
+			}
+		}
+	}
+	out := []map[string]any{}
+	for _, item := range left {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		key, has := obj[field]
+		if !has {
+			out = append(out, obj)
+			continue
+		}
+		merged := make(map[string]any, len(obj)+4)
+		if match, found := index[fmt.Sprint(key)]; found {
+			for k, v := range match {
+				merged[k] = v
+			}
+		}
+		for k, v := range obj {
+			merged[k] = v // left wins on collision
+		}
+		out = append(out, merged)
+	}
+	wrapped := map[string]any{"items": out}
+	res, err := json.Marshal(wrapped)
+	if err != nil {
+		return "", fmt.Errorf("joinByField: marshal: %w", err)
+	}
+	return string(res), nil
+}
+
+// jsonItems decodes the same input shapes flattenItems /
+// uniqueByKey / filterByField accept (bare JSON array, wrapped
+// object, foreach-concatenated stream with optional markdown
+// fences) into a flat []any. Centralised so each helper that
+// accepts foreach output reads it consistently.
+func jsonItems(raw string) ([]any, error) {
+	var b strings.Builder
+	for _, line := range strings.Split(raw, "\n") {
+		trim := strings.TrimSpace(line)
+		if trim == "```json" || trim == "```JSON" || trim == "```" {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	dec := json.NewDecoder(strings.NewReader(b.String()))
+	var out []any
+	for {
+		var v any
+		err := dec.Decode(&v)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("decode at offset %d: %w", dec.InputOffset(), err)
+		}
+		switch t := v.(type) {
+		case []any:
+			out = append(out, t...)
+		case map[string]any:
+			if items, ok := t["items"].([]any); ok {
+				out = append(out, items...)
+			} else {
+				out = append(out, t)
+			}
+		default:
+			out = append(out, t)
+		}
+	}
+	return out, nil
 }
 
 // parseSearXNGTemplate decodes the raw output of a SearXNG foreach
