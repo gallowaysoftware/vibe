@@ -83,6 +83,13 @@ type LlamaServerBackend struct {
 	CacheTypeV  string       `yaml:"cache_type_v,omitempty"`
 	Jinja       bool         `yaml:"jinja,omitempty"`
 	ExtraArgs   []string     `yaml:"extra_args,omitempty"`
+	// Port pins the host port llama-server publishes on. When set,
+	// the daemon uses this exact port instead of PickFreePort. Useful
+	// for service-mode profiles that pipelines reach by a stable
+	// well-known address — otherwise each daemon restart hands the
+	// service a different ephemeral port. Zero / unset falls back to
+	// the historical "pick a free port" behavior.
+	Port int `yaml:"port,omitempty"`
 	// MMProj is the multimodal projector GGUF that llama-server loads
 	// via --mmproj to enable image input on vision-capable models
 	// (Gemma 3, Qwen2.5-VL, LLaVA, etc.). The accompanying weights file

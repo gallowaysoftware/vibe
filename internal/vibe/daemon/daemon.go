@@ -916,9 +916,17 @@ func (d *Daemon) buildLaunchSpec(p *profile.Profile) (supervisor.LaunchSpec, int
 	)
 	switch {
 	case p.Backend.LlamaServer != nil:
-		port, err = supervisor.PickFreePort()
-		if err != nil {
-			return spec, 0, connect.NewError(connect.CodeInternal, fmt.Errorf("pick port: %w", err))
+		// Honor the profile's pinned port if set — service-mode
+		// profiles that pipelines reach by well-known address need
+		// the port to survive daemon restarts. Otherwise fall back
+		// to PickFreePort (the legacy behavior for active profiles).
+		if p.Backend.LlamaServer.Port > 0 {
+			port = p.Backend.LlamaServer.Port
+		} else {
+			port, err = supervisor.PickFreePort()
+			if err != nil {
+				return spec, 0, connect.NewError(connect.CodeInternal, fmt.Errorf("pick port: %w", err))
+			}
 		}
 		llamaBin := d.cfg.LlamaBinary
 		if p.Backend.LlamaServer.Binary != "" {
