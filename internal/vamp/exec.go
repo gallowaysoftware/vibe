@@ -2222,7 +2222,64 @@ func templateFuncs() template.FuncMap {
 		"enumerateUniqueImages":      enumerateUniqueImagesTemplate,
 		"imageDescriptionsForLesson": imageDescriptionsForLessonTemplate,
 		"extractSVGText":             extractSVGTextTemplate,
+		"chunkParagraphs":            chunkParagraphsTemplate,
 	}
+}
+
+// chunkParagraphsTemplate splits text into JSON-encoded chunks
+// respecting paragraph boundaries (double-newline). Greedily packs
+// paragraphs into chunks of up to maxChars; emits a new chunk when
+// the next paragraph would overflow. A single paragraph longer than
+// maxChars is emitted as its own chunk (no sub-paragraph splitting).
+//
+// Returns a JSON array of objects `[{"idx": N, "text": "..."}, ...]`
+// suitable for direct use as a foreach source after wrapping in an
+// `{"items": ...}` shell. Used by the textbook-to-audiobook RAG
+// chunker: lecture_content → ~600-token chunks → embed each chunk.
+//
+// Empty / whitespace-only input returns `[]`. Negative or zero
+// maxChars defaults to 2400 (≈ 600 tokens at 4 chars/token).
+func chunkParagraphsTemplate(text string, maxChars int) (string, error) {
+	if maxChars <= 0 {
+		maxChars = 2400
+	}
+	type chunk struct {
+		Idx  int    `json:"idx"`
+		Text string `json:"text"`
+	}
+	var out []chunk
+	var cur strings.Builder
+	flush := func() {
+		s := strings.TrimSpace(cur.String())
+		if s == "" {
+			return
+		}
+		out = append(out, chunk{Idx: len(out), Text: s})
+		cur.Reset()
+	}
+	for _, para := range strings.Split(strings.TrimSpace(text), "\n\n") {
+		para = strings.TrimSpace(para)
+		if para == "" {
+			continue
+		}
+		// If adding this paragraph would push us over the budget AND
+		// the current chunk is non-empty, flush first. A single
+		// over-budget paragraph is emitted alone (we don't sub-split
+		// to avoid breaking sentences across chunks).
+		if cur.Len() > 0 && cur.Len()+len(para)+2 > maxChars {
+			flush()
+		}
+		if cur.Len() > 0 {
+			cur.WriteString("\n\n")
+		}
+		cur.WriteString(para)
+	}
+	flush()
+	b, err := json.Marshal(out)
+	if err != nil {
+		return "", fmt.Errorf("chunkParagraphs: marshal: %w", err)
+	}
+	return string(b), nil
 }
 
 // uniqueByKeyTemplate dedupes a JSON array of objects by the named key,
