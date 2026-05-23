@@ -1,6 +1,13 @@
 name: searxng
 description: SearXNG metasearch — web search backend for vamp pipelines that fetch headlines, run topic enrichment, or hit a search API. Docker-managed via the http_server backend; uses host port 14002.
 
+# mode: service marks this as a background sidecar — it runs
+# alongside other services and an active profile without competing
+# for the daemon's single "active" slot. Pipelines that depend on
+# searxng can declare `vibe start searxng` in their setup hint
+# without having to also stop whatever else the user has running.
+mode: service
+
 # Why this profile exists:
 #   Several example pipelines (it-is-important-to-note, textbook-to-audiobook,
 #   chat-with-search) require SearXNG. Before this profile existed each
