@@ -210,6 +210,47 @@ func TestParseArxivTemplate(t *testing.T) {
 	}
 }
 
+// TestParseWikipediaSearchTemplate decodes the MediaWiki list=search
+// response shape (the action=query&list=search&srsearch=... wire
+// format) and strips the <span class="searchmatch"> tags Wikipedia
+// wraps matched terms in. URLs are reconstructed from title via the
+// canonical /wiki/<Title-underscored> path.
+func TestParseWikipediaSearchTemplate(t *testing.T) {
+	in := `{"query":{"search":[
+		{"title":"Transformer (deep learning)","snippet":"the <span class=\"searchmatch\">transformer</span> architecture..."},
+		{"title":"Attention Is All You Need","snippet":"a paper introducing <span class=\"searchmatch\">attention</span>"}
+	]}}`
+	got, err := parseWikipediaSearchTemplate(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, `"source_type":"wikipedia"`) {
+		t.Errorf("missing source_type in %s", got)
+	}
+	if !strings.Contains(got, `"title":"Transformer (deep learning)"`) {
+		t.Errorf("missing title in %s", got)
+	}
+	if !strings.Contains(got, "the transformer architecture") {
+		t.Errorf("snippet tags not stripped: %s", got)
+	}
+	if !strings.Contains(got, "Transformer_(deep_learning)") {
+		t.Errorf("URL not built from title: %s", got)
+	}
+	if strings.Contains(got, "<span") {
+		t.Errorf("HTML tags leaked: %s", got)
+	}
+}
+
+func TestParseWikipediaSearchTemplate_NoResults(t *testing.T) {
+	got, err := parseWikipediaSearchTemplate(`{"query":{"search":[]}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != `{"items":[]}` {
+		t.Errorf("want empty items, got %s", got)
+	}
+}
+
 func TestParseArxivTemplate_Empty(t *testing.T) {
 	in := `<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom"></feed>`
 	got, err := parseArxivTemplate(in)

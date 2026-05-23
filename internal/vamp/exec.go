@@ -2203,6 +2203,7 @@ func templateFuncs() template.FuncMap {
 		"filterByField":              filterByFieldTemplate,
 		"parseSearXNG":               parseSearXNGTemplate,
 		"parseWikipediaExtract":      parseWikipediaExtractTemplate,
+		"parseWikipediaSearch":       parseWikipediaSearchTemplate,
 		"parseArxiv":                 parseArxivTemplate,
 		"enumerateImagePairs":        enumerateImagePairsTemplate,
 		"enumerateUniqueImages":      enumerateUniqueImagesTemplate,
@@ -2457,6 +2458,62 @@ func parseSearXNGTemplate(raw string) (string, error) {
 	res, err := json.Marshal(wrapped)
 	if err != nil {
 		return "", fmt.Errorf("parseSearXNG: marshal: %w", err)
+	}
+	return string(res), nil
+}
+
+// parseWikipediaSearchTemplate decodes a MediaWiki API list=search
+// response (the action=query&list=search&srsearch=... shape) into
+// the same item shape as parseSearXNG / parseWikipediaExtract.
+// Designed for topic-as-search-query workflows where the literal
+// title isn't a Wikipedia article title — the search endpoint
+// returns the best-matching N pages with their snippets.
+//
+// snippet is the search snippet HTML-stripped (Wikipedia wraps
+// matched terms in <span class="searchmatch">…</span>); url is
+// constructed from the title via the canonical
+// en.wikipedia.org/wiki/<Title> shape.
+func parseWikipediaSearchTemplate(raw string) (string, error) {
+	var resp map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &resp); err != nil {
+		return "", fmt.Errorf("parseWikipediaSearch: decode: %w", err)
+	}
+	query, ok := resp["query"].(map[string]any)
+	if !ok {
+		return `{"items":[]}`, nil
+	}
+	hits, ok := query["search"].([]any)
+	if !ok {
+		return `{"items":[]}`, nil
+	}
+	out := []map[string]any{}
+	tagRe := regexp.MustCompile(`<[^>]*>`)
+	for _, raw := range hits {
+		hit, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		title, _ := hit["title"].(string)
+		if title == "" {
+			continue
+		}
+		snippet, _ := hit["snippet"].(string)
+		snippet = strings.TrimSpace(tagRe.ReplaceAllString(snippet, ""))
+		url := "https://en.wikipedia.org/wiki/" + strings.ReplaceAll(title, " ", "_")
+		h := sha256.Sum256([]byte(url))
+		id := hex.EncodeToString(h[:6])
+		out = append(out, map[string]any{
+			"id":          id,
+			"source_type": "wikipedia",
+			"title":       title,
+			"url":         url,
+			"snippet":     snippet,
+		})
+	}
+	wrapped := map[string]any{"items": out}
+	res, err := json.Marshal(wrapped)
+	if err != nil {
+		return "", fmt.Errorf("parseWikipediaSearch: marshal: %w", err)
 	}
 	return string(res), nil
 }
