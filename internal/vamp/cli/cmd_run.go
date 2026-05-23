@@ -274,17 +274,27 @@ func parseInputs(flags []string, p *vamp.Pipeline) (map[string]string, error) {
 		if _, ok := inputs[name]; ok {
 			continue
 		}
-		if spec.Default != "" {
-			rendered, err := renderInputDefault(name, spec.Default, inputs)
-			if err != nil {
-				return nil, err
-			}
-			inputs[name] = rendered
-			continue
-		}
-		if spec.Required {
+		// Required inputs need a value from the CLI or a non-empty
+		// default. Empty-string default + Required is treated as
+		// "user must supply" — empty default doesn't satisfy the
+		// requirement.
+		if spec.Required && spec.Default == "" {
 			return nil, fmt.Errorf("input %q is required (--input %s=...)", name, name)
 		}
+		// Even an empty default registers the input as "" in the
+		// map, so prompt templates can safely reference
+		// `.inputs.<name>` without tripping the missingkey=error
+		// safety net. Optional inputs with no caller-supplied value
+		// and no default land here too: declared, present, empty.
+		if spec.Default == "" {
+			inputs[name] = ""
+			continue
+		}
+		rendered, err := renderInputDefault(name, spec.Default, inputs)
+		if err != nil {
+			return nil, err
+		}
+		inputs[name] = rendered
 	}
 	return inputs, nil
 }
