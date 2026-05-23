@@ -356,6 +356,9 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 			if e.RunDir != "" {
 				fmt.Fprintf(e.Log, "outputs: %s\n", e.RunDir)
 			}
+			// Failure summary — pattern-matched "what likely went
+			// wrong + try X" panel. Renders nothing on success.
+			writeFailureSummary(e.Log, e.Pipeline.Name, runErr, e)
 		}
 	}()
 	// Resume mode: the run dir already exists, snapshot drift is checked
