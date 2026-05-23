@@ -173,11 +173,11 @@ capabilities:
 | --- | --- |
 | `vibe doctor` | One-shot diagnostic; `--install comfyui\|llama-cpp` runs the bring-up steps. |
 | `vibe profile init <kind>` | Drop a starter YAML; `--hf <repo>[:<file>]` for gated llama-server. |
-| `vibe start <profile>` | Activate backend + frontend; pulls missing weights; `--no-vram-check` to bypass. |
-| `vibe stop` | Tear it all down. |
-| `vibe ps` | What's running. |
+| `vibe start <profile>` | Activate backend + frontend; pulls missing weights; `--no-vram-check` to bypass. Service-mode profiles run concurrently with each other and one active profile. |
+| `vibe stop [name]` | Stop the active profile (no arg), a specific service (`vibe stop searxng`), or everything (`vibe stop all`). |
+| `vibe ps` | Show the active profile + every running service. |
 | `vibe list` | List profiles. |
-| `vibe logs` | Tail backend/frontend logs. |
+| `vibe logs [name]` | Tail backend logs from the active profile (no arg) or a named service. |
 | `vibe tui` | Bubbletea dashboard (start/stop, status, logs). |
 | `vibe token` | Print the bearer token; `--regenerate` rotates. |
 | `vibe env` | Print env vars for the active profile's frontend. |
@@ -200,7 +200,15 @@ capabilities:
 | `vamp cancel <id>` | SIGTERM a detached worker (same as `jobs cancel`). |
 | `vamp viz <pipeline.yaml>` | Mermaid `flowchart TD` of the DAG; `--show-inputs` for the input block. |
 | `vamp schema` | Emit the pipeline JSON Schema (draft-07); `--out <file>` to write. |
-| `vamp cache ls/size/prune/clean` | Inspect and manage the content-addressed cache under `$XDG_CACHE_HOME/vamp/`. |
+| `vamp cache ls/size/prune/clean/info` | Inspect and manage the content-addressed cache. `info <run-dir>` reports per-stage cache hit/miss for one run. |
+
+Pipeline binaries built with `vamp.BuildRoot` automatically inherit
+the vamp subcommands above plus two pipeline-aware lifecycle helpers:
+
+| Command | Purpose |
+| --- | --- |
+| `<pipeline> activate` | Read the pipeline's `RequireProfile` + `RequireService` declarations and bring up every required profile via vibe; health-check each declared URL. `--skip-active` for sidecars-only. |
+| `<pipeline> doctor` | Read-only — report which required profiles are up, which are missing, with each service's setup hint inline. Exits non-zero so CI can use it as a gate. |
 
 ## Remote access
 
