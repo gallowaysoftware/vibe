@@ -332,6 +332,13 @@ type Stage struct {
 	// the final encode (ffmpeg loudnorm I=). Default -16, the
 	// AES/EBU R128 podcast standard.
 	LoudnessTarget float64 `yaml:"loudness_target,omitempty"`
+	// Metadata is a map of container-level tag → value that the mix
+	// executor passes to ffmpeg as `-metadata key=value` pairs. Used
+	// for title / album / artist / track / date / genre tags that
+	// downstream players (Audiobookshelf, Plex, Apple Books) read.
+	// Values are template-rendered so a pipeline can pull the
+	// episode topic / number from inputs / prior stages.
+	Metadata map[string]string `yaml:"metadata,omitempty"`
 
 	// Compact-stage fields. A `type: compact` stage replaces the brittle
 	// `| truncate N` template pattern: when an upstream's text would

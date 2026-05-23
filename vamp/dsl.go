@@ -634,6 +634,33 @@ func (m *MixStage) CoverImage(path string) *MixStage { m.s.CoverImage = path; re
 // Binary overrides the ffmpeg binary (default "ffmpeg" on $PATH).
 func (m *MixStage) Binary(bin string) *MixStage { m.s.Binary = bin; return m }
 
+// Metadata sets a container-level metadata tag the executor passes to
+// ffmpeg as `-metadata key=value`. Each call adds (or overrides) one
+// key. Templates rendered against the standard binding, so a pipeline
+// can declare `Metadata("title", "{{ .inputs.topic }}")` to land the
+// episode topic into the file's title tag.
+//
+// Common tags Audiobookshelf / Plex / Apple Books look for:
+//
+//	title    — episode / book title
+//	album    — show / series name (e.g. "It's Important to Note")
+//	artist   — author / cast (e.g. "Aria & Atlas")
+//	track    — episode number (NN)
+//	date     — release date (YYYY or YYYY-MM-DD)
+//	genre    — typically "Podcast" or "Audiobook"
+//	comment  — long description / show notes
+//
+// Audiobookshelf's podcast scanner falls back to filename parsing
+// when these tags are missing; setting them explicitly removes the
+// "is this episode 1 or 10?" ambiguity.
+func (m *MixStage) Metadata(key, value string) *MixStage {
+	if m.s.Metadata == nil {
+		m.s.Metadata = map[string]string{}
+	}
+	m.s.Metadata[key] = value
+	return m
+}
+
 // ---- ComfyUI stages ----
 
 // ComfyUIStage submits a ComfyUI workflow.

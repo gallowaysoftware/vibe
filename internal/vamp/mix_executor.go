@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -191,6 +192,28 @@ func (m *mixExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput,
 		args = append(args, "-c:a", "aac", "-b:a", "96k")
 		args = append(args, "-movflags", "+faststart")
 	}
+
+	// Container-level metadata tags. The map's values are template-
+	// rendered against the stage's standard binding so a pipeline can
+	// declare `Metadata("title", "{{ .inputs.topic }}")` and get the
+	// per-run topic baked into the file. Keys ordered alphabetically
+	// so two runs with the same metadata produce identical ffmpeg
+	// invocations (and identical bytes for the mp4 muxer's output).
+	if len(st.Metadata) > 0 {
+		keys := make([]string, 0, len(st.Metadata))
+		for k := range st.Metadata {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			rendered, err := renderTemplate(st.ID+":metadata:"+k, st.Metadata[k], st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
+			if err != nil {
+				return nil, fmt.Errorf("render metadata %s: %w", k, err)
+			}
+			args = append(args, "-metadata", fmt.Sprintf("%s=%s", k, rendered))
+		}
+	}
+
 	args = append(args, outputPath)
 
 	cmd := exec.CommandContext(ctx, binary, args...)
