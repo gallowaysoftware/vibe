@@ -166,15 +166,31 @@ func (m *mixExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput,
 
 	args = append(args, "-filter_complex", fg.String())
 	args = append(args, "-map", "[out]")
-	if coverIdx >= 0 {
-		args = append(args,
-			"-map", fmt.Sprintf("%d:v", coverIdx),
-			"-c:v", "mjpeg",
-			"-disposition:v:0", "attached_pic",
-		)
+
+	// Codec choice + cover handling differ by container:
+	//
+	//   .m4b / .m4a → AAC + attached_pic + faststart (Apple
+	//                  Books / Audiobookshelf treat this as a true
+	//                  audiobook with chapters + embedded cover).
+	//   .mp3        → libmp3lame; ffmpeg's mp3 muxer accepts only
+	//                  a single audio stream, so we drop the
+	//                  cover here (mp3 ID3 cover is doable but
+	//                  needs a different filtergraph shape; v2).
+	ext := strings.ToLower(filepath.Ext(outputPath))
+	switch ext {
+	case ".mp3":
+		args = append(args, "-c:a", "libmp3lame", "-b:a", "96k")
+	default: // .m4b / .m4a
+		if coverIdx >= 0 {
+			args = append(args,
+				"-map", fmt.Sprintf("%d:v", coverIdx),
+				"-c:v", "mjpeg",
+				"-disposition:v:0", "attached_pic",
+			)
+		}
+		args = append(args, "-c:a", "aac", "-b:a", "96k")
+		args = append(args, "-movflags", "+faststart")
 	}
-	args = append(args, "-c:a", "aac", "-b:a", "96k")
-	args = append(args, "-movflags", "+faststart")
 	args = append(args, outputPath)
 
 	cmd := exec.CommandContext(ctx, binary, args...)
@@ -185,7 +201,18 @@ func (m *mixExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput,
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("ffmpeg mix: %w", err)
 	}
-	return &StageOutput{}, nil
+	// Verify the m4b/mp3 actually has content. ffmpeg occasionally
+	// exits 0 with a 0-byte output (filtergraph errors that don't
+	// propagate to exit status); without this check vamp would cache
+	// the empty result and replay it forever.
+	info, err := os.Stat(outputPath)
+	if err != nil {
+		return nil, fmt.Errorf("mix: stat output: %w", err)
+	}
+	if info.Size() == 0 {
+		return nil, fmt.Errorf("mix: ffmpeg produced 0-byte output at %s (likely a filtergraph error swallowed by ffmpeg exit code)", outputPath)
+	}
+	return &StageOutput{Files: []string{outputPath}}, nil
 }
 
 // renderOptionalPath template-renders a possibly-empty path field
