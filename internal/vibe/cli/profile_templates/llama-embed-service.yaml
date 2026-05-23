@@ -1,0 +1,63 @@
+# Starter profile: llama-server in --embeddings mode, run as a service.
+#
+# This file was dropped by `vibe profile init llama-embed-service`. Edit
+# the REPLACE-marked lines below, then `vibe start __PROFILE_NAME__`.
+#
+# Why llama-server in service mode instead of TEI:
+#   TEI ships only as a docker image; running it on Blackwell+ requires
+#   nvidia-container-toolkit + CDI plumbing. llama-server is a host
+#   binary that links libcuda directly — sidesteps docker GPU entirely
+#   AND reuses the same backend shape vibe already supervises. Trade-off:
+#   fewer embedding-specific features (no native reranker, no concurrent
+#   batched inference), in exchange for a setup that just works.
+#
+# The default model below is BAAI/bge-large-en-v1.5 in Q8 — strong
+# retrieval quality at ~340MB of weights + ~500MB runtime VRAM.
+
+name: __PROFILE_NAME__
+description: __PROFILE_NAME__ (llama-server in embeddings mode)
+mode: service
+
+backend:
+  llama_server:
+    # REPLACE: local path the model file lands at; vibe pulls it on
+    # first start via the huggingface block below.
+    path: ~/models/bge-large-en-v1.5-gguf/bge-large-en-v1.5-q8_0.gguf
+    huggingface:
+      repo: CompendiumLabs/bge-large-en-v1.5-gguf
+      file: bge-large-en-v1.5-q8_0.gguf
+    alias: bge-large-en-v1.5-q8
+    # bge-large is trained at 512-token sequence length. Override the
+    # llama-server default so the server doesn't promise context it
+    # can't honor.
+    context: 512
+    # REPLACE: pinned host port pipelines reach this service at.
+    # Examples: 14004 (the convention used by the example
+    # embed_bge_large profile).
+    port: 14004
+    gpu_layers: 999
+    flash_attn: true
+    extra_args:
+      # Switch llama-server to embedding mode. /v1/embeddings works;
+      # /v1/chat/completions is rejected (this profile is embedding-only).
+      - "--embeddings"
+      # bge-* models use mean pooling per their sentence-transformers
+      # config.
+      - "--pooling"
+      - "mean"
+      # L2-normalise so vectors are unit-length and downstream cosine
+      # similarity becomes a dot product. Matches what TEI ships by default.
+      - "--embd-normalize"
+      - "2"
+      # Lift the physical batch above the model's 512-token limit so a
+      # chunk that sits at the edge doesn't trip "input too large to
+      # process".
+      - "--ubatch-size"
+      - "1024"
+      - "--batch-size"
+      - "1024"
+
+# Embedding models are small; bge-large needs ~500 MB during inference.
+# Set to a more conservative number if you swap the model for something
+# bigger (bge-m3 needs ~2 GB).
+estimated_vram_gb: 2
