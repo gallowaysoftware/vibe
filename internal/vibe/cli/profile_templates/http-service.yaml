@@ -1,0 +1,51 @@
+# Starter profile: http_server backend running in service mode.
+#
+# This file was dropped by `vibe profile init http-service`. Edit the
+# REPLACE-marked lines below, then `vibe start __PROFILE_NAME__`.
+#
+# Service-mode profiles run alongside other services AND alongside one
+# active LLM profile. Use this template for stateless HTTP sidecars
+# pipelines depend on — TTS engines (Kokoro-FastAPI), embedding servers
+# (TEI), search backends (SearXNG), image generation (ComfyUI's HTTP API),
+# anything the daemon should keep up without competing for the active slot.
+
+name: __PROFILE_NAME__
+description: __PROFILE_NAME__ (http_server sidecar)
+mode: service
+
+backend:
+  http_server:
+    # REPLACE: container image reference (or set `binary:` instead for a
+    # host-installed daemon — both fields are mutually exclusive).
+    image: REPLACE-org/REPLACE-image:tag
+    # REPLACE: published host port. Pipelines that depend on this service
+    # reach it at http://127.0.0.1:<port>/.
+    port: 14005
+    # container_port defaults to `port` when unset — set explicitly when the
+    # container listens on something different and `port` is the host publish
+    # mapping.
+    # container_port: 8080
+
+    # gpu: true requires `nvidia-ctk cdi generate` on the host. Leave false
+    # if your daemon's CDI plumbing isn't set up (most rootless podman
+    # installs); the container will fall back to CPU.
+    gpu: false
+
+    # Volumes are "host:container[:ro]" mappings passed to `docker run -v`.
+    # Bind-mount config files / model caches here.
+    # volumes:
+    #   - ~/.config/vibe/compose/__PROFILE_NAME__/settings.yml:/etc/REPLACE/settings.yml:ro
+
+    # Environment variables. REPLACE with what your service expects.
+    # env:
+    #   PORT: "14005"
+    #   LOG_LEVEL: info
+
+    # Endpoint vibe polls until ready. Defaults to /health; override if your
+    # service uses a different liveness path (most don't expose one, in
+    # which case `/` and a 200 are fine).
+    health_path: /
+
+# REPLACE: approximate VRAM if any (most service sidecars are CPU; omit when
+# unsure, the daemon will skip the pre-flight check).
+# estimated_vram_gb: 2
