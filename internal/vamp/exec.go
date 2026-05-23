@@ -2200,6 +2200,9 @@ func templateFuncs() template.FuncMap {
 		"truncate":                   truncateTemplate,
 		"flattenItems":               flattenItemsTemplate,
 		"uniqueByKey":                uniqueByKeyTemplate,
+		"filterByField":              filterByFieldTemplate,
+		"parseSearXNG":               parseSearXNGTemplate,
+		"parseWikipediaExtract":      parseWikipediaExtractTemplate,
 		"enumerateImagePairs":        enumerateImagePairsTemplate,
 		"enumerateUniqueImages":      enumerateUniqueImagesTemplate,
 		"imageDescriptionsForLesson": imageDescriptionsForLessonTemplate,
@@ -2287,6 +2290,229 @@ func uniqueByKeyTemplate(key, raw string) (string, error) {
 	res, err := json.Marshal(wrapped)
 	if err != nil {
 		return "", fmt.Errorf("uniqueByKey: marshal: %w", err)
+	}
+	return string(res), nil
+}
+
+// filterByFieldTemplate keeps only the items whose named field is
+// truthy (bool true, non-zero number, non-empty string). Useful as a
+// generic filter step after a foreach quality-check stage emits a
+// {"kept": bool, ...candidate-payload} per item — the downstream
+// stage iterates only the kept ones without an LLM round-trip to
+// re-emit them.
+//
+// Accepts the same input shapes as flattenItemsTemplate /
+// uniqueByKeyTemplate / mergeJSONTemplate (bare array, wrapped
+// object, foreach-concatenated stream). Output is always
+// `{"items":[...]}` so it drives a foreach cleanly.
+//
+// Items that don't carry the field at all are DROPPED — a missing
+// field is treated as "rejected", matching the "kept items advertise
+// themselves" mental model.
+func filterByFieldTemplate(field, raw string) (string, error) {
+	if field == "" {
+		return "", fmt.Errorf("filterByField: field is required")
+	}
+	var b strings.Builder
+	for _, line := range strings.Split(raw, "\n") {
+		trim := strings.TrimSpace(line)
+		if trim == "```json" || trim == "```JSON" || trim == "```" {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	dec := json.NewDecoder(strings.NewReader(b.String()))
+	var flat []any
+	for {
+		var v any
+		err := dec.Decode(&v)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("filterByField: decode at offset %d: %w", dec.InputOffset(), err)
+		}
+		switch t := v.(type) {
+		case []any:
+			flat = append(flat, t...)
+		case map[string]any:
+			if items, ok := t["items"].([]any); ok {
+				flat = append(flat, items...)
+			} else {
+				flat = append(flat, t)
+			}
+		default:
+			flat = append(flat, t)
+		}
+	}
+	out := []any{}
+	for _, item := range flat {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		val, has := obj[field]
+		if !has {
+			continue
+		}
+		if isTruthy(val) {
+			out = append(out, obj)
+		}
+	}
+	wrapped := map[string]any{"items": out}
+	res, err := json.Marshal(wrapped)
+	if err != nil {
+		return "", fmt.Errorf("filterByField: marshal: %w", err)
+	}
+	return string(res), nil
+}
+
+// isTruthy mirrors Go template's truthiness rules (text/template
+// {{if .X}}) for the kinds of JSON-decoded values we see: bool, all
+// numeric forms, string, slice, map.
+func isTruthy(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		return t != ""
+	case float64:
+		return t != 0
+	case int, int64:
+		return t != 0
+	case []any:
+		return len(t) > 0
+	case map[string]any:
+		return len(t) > 0
+	case nil:
+		return false
+	default:
+		return true
+	}
+}
+
+// parseSearXNGTemplate decodes the raw output of a SearXNG foreach
+// (each item: one query → one /search?format=json response) into a
+// flat `{"items":[{id, source_type:"web", title, url, snippet}]}`
+// array suitable for downstream foreach iteration. Tolerates
+// markdown fences (the LLM filter prompts sometimes echo wrapped
+// JSON back). id is sha256(url) truncated to 12 chars so downstream
+// per-source filenames are stable across runs.
+//
+// Designed to be a thin parser, not a transformer: it doesn't filter
+// by quality, doesn't dedup by url (use uniqueByKey on the output for
+// that), doesn't fetch full content. Single responsibility: the wire
+// format of SearXNG responses → vamp's foreach-array shape.
+func parseSearXNGTemplate(raw string) (string, error) {
+	var b strings.Builder
+	for _, line := range strings.Split(raw, "\n") {
+		trim := strings.TrimSpace(line)
+		if trim == "```json" || trim == "```JSON" || trim == "```" {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	dec := json.NewDecoder(strings.NewReader(b.String()))
+	var out []map[string]any
+	for {
+		var resp map[string]any
+		err := dec.Decode(&resp)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("parseSearXNG: decode at offset %d: %w", dec.InputOffset(), err)
+		}
+		results, ok := resp["results"].([]any)
+		if !ok {
+			continue
+		}
+		for _, r := range results {
+			obj, ok := r.(map[string]any)
+			if !ok {
+				continue
+			}
+			url, _ := obj["url"].(string)
+			if url == "" {
+				continue
+			}
+			h := sha256.Sum256([]byte(url))
+			id := hex.EncodeToString(h[:6])
+			out = append(out, map[string]any{
+				"id":          id,
+				"source_type": "web",
+				"title":       obj["title"],
+				"url":         url,
+				"snippet":     obj["content"],
+			})
+		}
+	}
+	if out == nil {
+		out = []map[string]any{}
+	}
+	wrapped := map[string]any{"items": out}
+	res, err := json.Marshal(wrapped)
+	if err != nil {
+		return "", fmt.Errorf("parseSearXNG: marshal: %w", err)
+	}
+	return string(res), nil
+}
+
+// parseWikipediaExtractTemplate decodes a single MediaWiki API
+// query response (with prop=extracts|info, explaintext=true) into a
+// flat one-item `{"items":[{id, source_type:"wikipedia", title, url,
+// snippet}]}` array. snippet is the full plaintext extract (NOT
+// truncated; downstream stages handle context-window sizing).
+//
+// Single-page assumption: titles= queries always resolve to one
+// page (or one redirect target). Multi-page responses return only
+// the first page; if a pipeline needs multi-page fan-out it should
+// query each title separately.
+func parseWikipediaExtractTemplate(raw string) (string, error) {
+	var resp map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &resp); err != nil {
+		return "", fmt.Errorf("parseWikipediaExtract: decode: %w", err)
+	}
+	query, ok := resp["query"].(map[string]any)
+	if !ok {
+		return `{"items":[]}`, nil
+	}
+	pages, ok := query["pages"].(map[string]any)
+	if !ok {
+		return `{"items":[]}`, nil
+	}
+	out := []map[string]any{}
+	for _, raw := range pages {
+		page, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		// pageid -1 means "page does not exist" — skip.
+		if pid, ok := page["pageid"].(float64); ok && pid < 0 {
+			continue
+		}
+		title, _ := page["title"].(string)
+		url, _ := page["fullurl"].(string)
+		extract, _ := page["extract"].(string)
+		if title == "" || extract == "" {
+			continue
+		}
+		h := sha256.Sum256([]byte(url))
+		id := hex.EncodeToString(h[:6])
+		out = append(out, map[string]any{
+			"id":          id,
+			"source_type": "wikipedia",
+			"title":       title,
+			"url":         url,
+			"snippet":     extract,
+		})
+	}
+	wrapped := map[string]any{"items": out}
+	res, err := json.Marshal(wrapped)
+	if err != nil {
+		return "", fmt.Errorf("parseWikipediaExtract: marshal: %w", err)
 	}
 	return string(res), nil
 }
