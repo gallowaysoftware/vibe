@@ -2203,6 +2203,7 @@ func templateFuncs() template.FuncMap {
 		"filterByField":              filterByFieldTemplate,
 		"parseSearXNG":               parseSearXNGTemplate,
 		"parseWikipediaExtract":      parseWikipediaExtractTemplate,
+		"parseArxiv":                 parseArxivTemplate,
 		"enumerateImagePairs":        enumerateImagePairsTemplate,
 		"enumerateUniqueImages":      enumerateUniqueImagesTemplate,
 		"imageDescriptionsForLesson": imageDescriptionsForLessonTemplate,
@@ -2456,6 +2457,60 @@ func parseSearXNGTemplate(raw string) (string, error) {
 	res, err := json.Marshal(wrapped)
 	if err != nil {
 		return "", fmt.Errorf("parseSearXNG: marshal: %w", err)
+	}
+	return string(res), nil
+}
+
+// parseArxivTemplate decodes a single arXiv API Atom feed response
+// (the shape returned by http://export.arxiv.org/api/query) into the
+// same {id, source_type:"arxiv", title, url, snippet} item shape as
+// parseSearXNG / parseWikipediaExtract, so the downstream
+// flatten_candidates stage can consume all three sources uniformly.
+//
+// snippet is the paper abstract (the <summary> field), title is
+// trimmed of newlines + repeated whitespace (arXiv likes to wrap),
+// url is the abs/ page URL, and id is sha256(arxiv-id) truncated to
+// 12 chars — stable across re-fetches.
+func parseArxivTemplate(raw string) (string, error) {
+	type arxivAuthor struct {
+		Name string `xml:"name"`
+	}
+	type arxivEntry struct {
+		ID      string        `xml:"id"`
+		Title   string        `xml:"title"`
+		Summary string        `xml:"summary"`
+		Authors []arxivAuthor `xml:"author"`
+	}
+	type arxivFeed struct {
+		XMLName xml.Name     `xml:"feed"`
+		Entries []arxivEntry `xml:"entry"`
+	}
+	var feed arxivFeed
+	if err := xml.Unmarshal([]byte(raw), &feed); err != nil {
+		return "", fmt.Errorf("parseArxiv: decode: %w", err)
+	}
+	out := []map[string]any{}
+	for _, e := range feed.Entries {
+		url := strings.TrimSpace(e.ID)
+		if url == "" {
+			continue
+		}
+		title := strings.Join(strings.Fields(e.Title), " ")
+		summary := strings.Join(strings.Fields(e.Summary), " ")
+		h := sha256.Sum256([]byte(url))
+		id := hex.EncodeToString(h[:6])
+		out = append(out, map[string]any{
+			"id":          id,
+			"source_type": "arxiv",
+			"title":       title,
+			"url":         url,
+			"snippet":     summary,
+		})
+	}
+	wrapped := map[string]any{"items": out}
+	res, err := json.Marshal(wrapped)
+	if err != nil {
+		return "", fmt.Errorf("parseArxiv: marshal: %w", err)
 	}
 	return string(res), nil
 }
