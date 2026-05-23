@@ -1,0 +1,44 @@
+name: searxng
+description: SearXNG metasearch — web search backend for vamp pipelines that fetch headlines, run topic enrichment, or hit a search API. Docker-managed via the http_server backend; uses host port 14002.
+
+# Why this profile exists:
+#   Several example pipelines (it-is-important-to-note, textbook-to-audiobook,
+#   chat-with-search) require SearXNG. Before this profile existed each
+#   pipeline shipped a setup hint pointing at a raw `docker compose up` of
+#   ~/.config/vibe/compose/searxng/. That worked, but left lifecycle
+#   management outside vibe — pipelines couldn't ask vibe to bring it up,
+#   the user had to remember to start it, and stopping it required a
+#   separate `docker compose down`. Wrapping it as an http_server profile
+#   gives SearXNG the same start/stop/health-check lifecycle as Kokoro,
+#   Open WebUI, and the LLM backends.
+#
+# Usage:
+#   vibe start searxng
+#   curl http://127.0.0.1:14002/search?q=today+news&format=json
+#   vibe stop
+#
+# Pipelines that depend on it should declare the requirement via
+# `p.RequireService("searxng", "http://127.0.0.1:14002", ..., "vibe start searxng")`.
+
+backend:
+  http_server:
+    image: searxng/searxng:latest
+    port: 14002
+    container_port: 14002
+    # The settings.yml mount keeps the production-tuned engine list
+    # (Google/Bing/DuckDuckGo enabled, JSON format on, sane rate limits).
+    # REPLACE: change the host path to wherever you keep your settings.yml.
+    # The convention this repo follows is ~/.config/vibe/compose/searxng/.
+    volumes:
+      - ~/.config/vibe/compose/searxng/settings.yml:/etc/searxng/settings.yml:ro
+    env:
+      # SearXNG's entrypoint reads SEARXNG_PORT and binds Granian to it.
+      # Keep aligned with container_port above so health-check + host
+      # publish target the same port the process is listening on.
+      SEARXNG_PORT: "14002"
+      SEARXNG_BASE_URL: "http://127.0.0.1:14002/"
+    # SearXNG has no /health endpoint; the root path returns 200 once
+    # the server is ready. Same fallback pattern as tts_kokoro's /web/.
+    health_path: /
+
+# No GPU, no VRAM. CPU service.
