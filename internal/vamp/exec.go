@@ -2223,6 +2223,7 @@ func templateFuncs() template.FuncMap {
 		"imageDescriptionsForLesson": imageDescriptionsForLessonTemplate,
 		"extractSVGText":             extractSVGTextTemplate,
 		"chunkParagraphs":            chunkParagraphsTemplate,
+		"ttsNormalize":               ttsNormalizeTemplate,
 	}
 }
 

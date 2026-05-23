@@ -1,0 +1,100 @@
+# Default TTS pronunciation rules — applied to every script before
+# the audio stage submits text to Kokoro / Chatterbox. Rules execute
+# top-to-bottom; later regexes match against text that earlier rules
+# may have rewritten.
+#
+# Two rule kinds:
+#   pattern    — literal substring match (case-sensitive)
+#   regex      — Go-flavor regex; $1 $2 ... reference capture groups
+#
+# Adding a rule:
+#   1. Read the script line that mispronounces.
+#   2. Determine the minimum invariant — what's the surface form
+#      Kokoro mis-reads? Anchor your regex on that, not on
+#      neighboring words.
+#   3. Test mentally: would your rule fire on intended cases (good)
+#      AND on something it shouldn't (bad)? If the latter, narrow.
+#
+# Per-pipeline overrides go in each pipeline's tts_rules.yaml and
+# layer on top of these defaults.
+
+rules:
+  # ---- Hyphenated alphanumerics (Kokoro reads "-" as "minus") ----
+
+  - regex: '\b([A-Za-z])-([0-9]+)\b'
+    replacement: '$1 $2'
+    note: |
+      "F-150" -> "F 150" (heard "eff minus one fifty"). Catches model
+      numbers, vehicle designations, single-letter labels. Doesn't
+      touch "Lesson 10 - SAQ" because the hyphen has spaces.
+
+  - regex: '\b([A-Za-z]{2,})-([0-9]+)\b'
+    replacement: '$1 $2'
+    note: |
+      Multi-letter prefix variant: "B-12", "S-class", "PMID-12345".
+      Same fix as the single-letter rule.
+
+  # ---- Fractions / ratios that Kokoro reads letter-by-letter ----
+
+  - regex: '\bd([a-zA-Z])/d([a-zA-Z0-9])\b'
+    replacement: 'd $1 over d $2'
+    note: |
+      "di/d0" -> "d i over d 0" (heard "dye over doe"). Catches
+      differential / ratio notation common in chemistry + physics
+      textbooks. Lowercase 'd' anchored.
+
+  - regex: '\b([0-9]+)/([0-9]+)\b'
+    replacement: '$1 over $2'
+    note: |
+      "1/2", "3/4" -> "1 over 2", "3 over 4". Skips dates with
+      slashes (those have 3+ digit groups and are caught elsewhere
+      OR not worth fixing in v1).
+
+  # ---- Units / abbreviations the TTS doesn't speak naturally ----
+
+  - pattern: 'mg/L'
+    replacement: 'milligrams per litre'
+    note: 'Concentration units.'
+
+  - pattern: 'L/kg'
+    replacement: 'litres per kilogram'
+
+  - pattern: 'kg/m³'
+    replacement: 'kilograms per cubic metre'
+
+  - pattern: 'g/L'
+    replacement: 'grams per litre'
+
+  - pattern: 'm/s'
+    replacement: 'metres per second'
+
+  - regex: '\b([0-9.]+)°([CFK])\b'
+    replacement: '$1 degrees $2'
+    note: |
+      "70°C" -> "70 degrees C". Numeric prefix anchors so the rule
+      doesn't fire on a bare "°C" (which Kokoro generally handles).
+
+  - regex: '\b([0-9.]+)%'
+    replacement: '$1 percent'
+    note: |
+      "12.5%" -> "12.5 percent". `%` is not a word character so a
+      trailing \b doesn't work (would require a word char after);
+      we accept the no-anchor form here.
+
+  # ---- Acronyms Kokoro mangles ----
+
+  - pattern: 'CRA'
+    replacement: 'C R A'
+    note: 'Canada Revenue Agency — heard as "krah" otherwise.'
+
+  - pattern: 'LAA'
+    replacement: 'L A A'
+    note: 'Litres of absolute alcohol — common in CIBD content.'
+
+  - pattern: 'ABV'
+    replacement: 'A B V'
+    note: 'Alcohol by volume.'
+
+  - pattern: 'SAQ'
+    replacement: 'S A Q'
+    note: 'Self-assessment question — appears in CIBD lesson titles.'
