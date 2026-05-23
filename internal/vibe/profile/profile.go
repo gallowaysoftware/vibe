@@ -572,6 +572,15 @@ func (p *Profile) validateFrontend() error {
 		return nil
 	}
 
+	// Service-mode llama_server backends are sidecar embedding /
+	// inference servers — they're consumed directly via the published
+	// port, never via a launched UI. validateMode already rejected a
+	// frontend block on service profiles; reaching here with an empty
+	// frontend on a service-mode llama_server is the supported shape.
+	if p.ResolvedMode() == ModeService {
+		return nil
+	}
+
 	// Llama-server profiles still require a frontend block (Phase 1 behavior).
 	switch p.Frontend.Kind {
 	case FrontendExternal:
