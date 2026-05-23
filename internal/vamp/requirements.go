@@ -22,6 +22,11 @@ type Requirements struct {
 	GPUMemory    string                  `json:"gpu_memory,omitempty"`
 	DiskSpace    string                  `json:"disk_space,omitempty"`
 	Notes        []string                `json:"notes,omitempty"`
+	// Profile names the vibe profile the pipeline expects to hold
+	// the active slot during a run (its text stages talk to that
+	// profile's LLM via the proxy). Empty when the pipeline is
+	// profile-agnostic. Consumed by the `activate` CLI subcommand.
+	Profile string `json:"profile,omitempty"`
 }
 
 // CapabilityRequirement names a vibe capability slot the pipeline needs
@@ -82,6 +87,7 @@ func (p *Pipeline) Requirements() Requirements {
 		GPUMemory:   p.RequiredGPUMemory,
 		DiskSpace:   p.RequiredDiskSpace,
 		Notes:       append([]string(nil), p.RequirementNotes...),
+		Profile:     p.RequiredProfile,
 	}
 
 	caps := make(map[string][]string)

@@ -35,6 +35,13 @@ type Pipeline struct {
 	// reachable at run time (SearXNG, Kokoro-FastAPI, etc.). Surfaced via
 	// Pipeline.Requirements() so vibe doctor can preflight-check them.
 	RequiredServices []ServiceRequirement `yaml:"required_services,omitempty"`
+	// RequiredProfile names the vibe profile that should hold the
+	// daemon's active slot (the LLM-bearing profile the pipeline's
+	// text stages talk to via the proxy). The auto-generated
+	// `activate` subcommand starts this profile alongside every
+	// service-mode profile declared in RequiredServices. Empty
+	// means the operator picks any compatible profile manually.
+	RequiredProfile string `yaml:"required_profile,omitempty"`
 	// RequiredGPUMemory is a human-readable hint for the GPU footprint
 	// the run will draw (e.g. "32GB"). Informational; no enforcement.
 	RequiredGPUMemory string `yaml:"required_gpu_memory,omitempty"`

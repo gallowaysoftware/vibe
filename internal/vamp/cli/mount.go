@@ -41,6 +41,7 @@ func BuildRoot(name string, factory PipelineFactory) *cobra.Command {
 		vizCmdInMemory(factory),
 		renderCmdInMemory(factory),
 		requirementsCmdInMemory(factory),
+		activateCmdInMemory(factory),
 		listCmd(),
 		capabilitiesCmd(),
 		runsCmd(),

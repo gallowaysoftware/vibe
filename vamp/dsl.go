@@ -193,6 +193,17 @@ func (p *Pipeline) RequireService(name, url, description, setupHint string) *Pip
 	return p
 }
 
+// RequireProfile names the vibe profile that should hold the
+// daemon's active slot during this pipeline's run. The auto-
+// registered `activate` subcommand starts this profile alongside
+// every service-mode profile declared via RequireService. Empty
+// (no call) means the operator picks any compatible profile
+// manually — `activate` skips the active-profile step entirely.
+func (p *Pipeline) RequireProfile(name string) *Pipeline {
+	p.inner.RequiredProfile = name
+	return p
+}
+
 // RequireGPUMemory records a human-readable hint for the GPU footprint
 // the run will draw (e.g. "32GB"). Informational; no enforcement.
 func (p *Pipeline) RequireGPUMemory(amount string) *Pipeline {
