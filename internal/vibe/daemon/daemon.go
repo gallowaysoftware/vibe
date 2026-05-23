@@ -267,6 +267,31 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// child exists and SIGINT will unblock waitReady.
 	_ = d.sup.Stop(shCtx)
 	d.prx.SetBackend(nil)
+
+	// Tear down every service-mode supervisor — concurrent so a
+	// hung service doesn't block the others. Each is best-effort;
+	// log any failure but keep going (the daemon is exiting either
+	// way). Without this, services orphan after daemon shutdown
+	// and their ports stay held until the next OS-level reboot.
+	d.mu.Lock()
+	services := make([]*serviceInstance, 0, len(d.services))
+	for n, svc := range d.services {
+		services = append(services, svc)
+		delete(d.services, n)
+	}
+	d.mu.Unlock()
+	var wg sync.WaitGroup
+	for _, svc := range services {
+		wg.Add(1)
+		go func(s *serviceInstance) {
+			defer wg.Done()
+			if err := s.sup.Stop(shCtx); err != nil {
+				slog.Warn("service stop on shutdown failed", "profile", s.profile.Name, "err", err)
+			}
+		}(svc)
+	}
+	wg.Wait()
+
 	_ = unixSrv.Shutdown(shCtx)
 	_ = httpSrv.Shutdown(shCtx)
 	return nil
