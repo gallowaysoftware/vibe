@@ -2212,6 +2212,7 @@ func templateFuncs() template.FuncMap {
 		"flattenItems":               flattenItemsTemplate,
 		"uniqueByKey":                uniqueByKeyTemplate,
 		"filterByField":              filterByFieldTemplate,
+		"filterByValue":              filterByValueTemplate,
 		"joinByField":                joinByFieldTemplate,
 		"parseSearXNG":               parseSearXNGTemplate,
 		"parseWikipediaExtract":      parseWikipediaExtractTemplate,
@@ -2404,6 +2405,46 @@ func isTruthy(v any) bool {
 	default:
 		return true
 	}
+}
+
+// filterByValueTemplate keeps items where item[field] == value
+// (string-equality comparison). Pairs with showrunner stages that
+// tag each item with a category — e.g. "host":"aria" vs
+// "host":"atlas" — when the downstream pipeline wants to fan a
+// foreach over only one category at a time (because the audio
+// stage's Voice field is set per-stage, not per-iteration).
+//
+// Output shape: {"items":[<matching items>]}. Items lacking the
+// field are dropped. Numeric values are stringified before
+// comparison so the caller can use plain string literals.
+func filterByValueTemplate(field, want, raw string) (string, error) {
+	if field == "" {
+		return "", fmt.Errorf("filterByValue: field is required")
+	}
+	items, err := jsonItems(raw)
+	if err != nil {
+		return "", fmt.Errorf("filterByValue: %w", err)
+	}
+	out := []any{}
+	for _, item := range items {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		val, has := obj[field]
+		if !has {
+			continue
+		}
+		if fmt.Sprint(val) == want {
+			out = append(out, obj)
+		}
+	}
+	wrapped := map[string]any{"items": out}
+	res, err := json.Marshal(wrapped)
+	if err != nil {
+		return "", fmt.Errorf("filterByValue: marshal: %w", err)
+	}
+	return string(res), nil
 }
 
 // joinByFieldTemplate merges two parallel `{"items":[...]}` arrays
