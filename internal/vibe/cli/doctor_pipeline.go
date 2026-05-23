@@ -123,7 +123,7 @@ func checkServiceReachable(ctx context.Context, s vamp.ServiceRequirement) check
 	if s.URL == "" {
 		return checkResult{Name: name, Status: statusWarn, Message: "no URL declared; check manually"}
 	}
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.URL, nil)
 	if err != nil {
