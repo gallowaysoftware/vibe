@@ -295,6 +295,13 @@ type Executor struct {
 	// run_when scheduler can short-circuit without taking the lock just to
 	// check. Guarded by mu.
 	failedSoFar bool
+	// cacheHits records stages whose result came from the content-
+	// addressed cache. Surfaced via stageNotes("cache" → "hit"|"miss")
+	// so pipeline_timing.json captures the hit/miss decision per stage
+	// alongside duration. The vamp cache info CLI subcommand reads
+	// this to explain "why did stage X re-run on this attempt?"
+	// Guarded by mu.
+	cacheHits map[string]bool
 	// logMu serializes writes to Log from concurrent stages so buffered
 	// stage outputs land contiguously even when status lines from the
 	// scheduler are interleaved.
@@ -415,6 +422,7 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 
 	e.stageOutputs = make(map[string]*stageResult, len(e.Pipeline.Stages))
 	e.stageStatus = make(map[string]string, len(e.Pipeline.Stages))
+	e.cacheHits = make(map[string]bool, len(e.Pipeline.Stages))
 	e.stageErrors = make(map[string]error)
 	e.foreachResumes = make(map[string]*foreachResumeInfo)
 	remaining := len(e.Pipeline.Stages)
@@ -1369,6 +1377,11 @@ func (e *Executor) runWithRetry(ctx context.Context, st *Stage, exec StageExecut
 			slog.Warn("cache materialize failed; falling through to live execute", "stage", st.ID, "err", err)
 		} else {
 			e.logf("  -> stage %q: cache hit (%s)", st.ID, cacheKey[:12])
+			e.mu.Lock()
+			if e.cacheHits != nil {
+				e.cacheHits[st.ID] = true
+			}
+			e.mu.Unlock()
 			return out, nil
 		}
 	}
@@ -1650,6 +1663,22 @@ func (e *Executor) stageNotes(st *Stage) map[string]any {
 	if t == StageTypeText {
 		if mt, ok := st.Params["max_tokens"]; ok {
 			n["max_tokens"] = mt
+		}
+	}
+	// Cache status — present for every cacheable stage (text /
+	// comfyui / audio / ffmpeg / render / compact / pandoc / mix).
+	// "hit" means the result came from the content-addressed cache;
+	// "miss" means it was a fresh execution that wrote to cache.
+	// Stages whose type isn't cacheable (webhook by default) omit
+	// the key entirely.
+	if stageCacheable(st) {
+		e.mu.Lock()
+		hit := e.cacheHits != nil && e.cacheHits[st.ID]
+		e.mu.Unlock()
+		if hit {
+			n["cache"] = "hit"
+		} else {
+			n["cache"] = "miss"
 		}
 	}
 	return n

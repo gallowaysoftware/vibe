@@ -2,7 +2,10 @@ package cli
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -29,8 +32,92 @@ func cacheCmd() *cobra.Command {
 		cacheSizeCmd(),
 		cachePruneCmd(),
 		cacheCleanCmd(),
+		cacheInfoCmd(),
 	)
 	return cmd
+}
+
+func cacheInfoCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "info <run-dir>",
+		Short: "Show per-stage cache hit/miss for a specific pipeline run.",
+		Long: `info reads pipeline_timing.json from a finished run directory and
+prints, per stage: cache hit-or-miss, duration, and stage status.
+Useful for debugging "why did stage X re-run unexpectedly?" — the
+hit/miss field tells you whether the cache key matched.
+
+A "miss" means the executor recomputed the stage's output AND
+wrote it to the cache; the next run with the same key will hit.
+A "hit" means the cache key matched a prior run and the cached
+bytes were used directly.
+
+Foreach stages report the parent's cache state; per-item caching
+is not surfaced here (see vamp cache ls for raw per-key entries).
+`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runCacheInfo(cmd, args[0])
+		},
+	}
+}
+
+// runCacheInfo opens <run-dir>/pipeline_timing.json and renders a
+// human-readable per-stage cache report.
+func runCacheInfo(cmd *cobra.Command, runDir string) error {
+	path := filepath.Join(runDir, "pipeline_timing.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	var rep struct {
+		Pipeline string `json:"pipeline"`
+		Stages   []struct {
+			ID         string         `json:"id"`
+			Type       string         `json:"type,omitempty"`
+			Status     string         `json:"status"`
+			DurationMS int64          `json:"duration_ms"`
+			Notes      map[string]any `json:"notes,omitempty"`
+		} `json:"stages"`
+	}
+	if err := json.Unmarshal(raw, &rep); err != nil {
+		return fmt.Errorf("parse %s: %w", path, err)
+	}
+
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "pipeline:  %s\n", rep.Pipeline)
+	fmt.Fprintf(out, "run dir:   %s\n", runDir)
+	fmt.Fprintln(out)
+	fmt.Fprintf(out, "  %-32s  %-8s  %-9s  %-7s  status\n", "stage", "type", "cache", "duration")
+	fmt.Fprintf(out, "  %s\n", strings.Repeat("-", 78))
+
+	var hits, misses int
+	for _, s := range rep.Stages {
+		cacheState := "—"
+		if v, ok := s.Notes["cache"]; ok {
+			cacheState = fmt.Sprint(v)
+			switch cacheState {
+			case "hit":
+				hits++
+			case "miss":
+				misses++
+			}
+		}
+		dur := time.Duration(s.DurationMS) * time.Millisecond
+		fmt.Fprintf(out, "  %-32s  %-8s  %-9s  %-7s  %s\n",
+			truncate(s.ID, 32), s.Type, cacheState, dur.Round(time.Millisecond), s.Status)
+	}
+	fmt.Fprintln(out)
+	fmt.Fprintf(out, "summary: %d hits, %d misses, %d total stages\n",
+		hits, misses, len(rep.Stages))
+	return nil
+}
+
+// truncate keeps the table neat when stage ids are unusually long.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
 }
 
 func cacheLsCmd() *cobra.Command {
