@@ -140,7 +140,12 @@ message StopResponse {
 message ShutdownRequest {}
 message ShutdownResponse {}
 
-message LogsRequest {}
+message LogsRequest {
+  // profile, if set, requests logs for a specific service-mode
+  // profile (matching its profile.name). Empty / "active" → the
+  // active profile (legacy behavior).
+  string profile = 1;
+}
 message LogsResponse {
   repeated string lines = 1;
 }

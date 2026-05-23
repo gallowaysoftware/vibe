@@ -209,7 +209,14 @@ func (c *Client) Shutdown(ctx context.Context) error {
 }
 
 func (c *Client) Logs(ctx context.Context) ([]string, error) {
-	resp, err := c.rpc.Logs(ctx, connect.NewRequest(&vibev1.LogsRequest{}))
+	return c.LogsForProfile(ctx, "")
+}
+
+// LogsForProfile returns logs from a specific profile's supervisor.
+// Empty or "active" → the active profile (legacy behaviour); any
+// other name → a running service profile.
+func (c *Client) LogsForProfile(ctx context.Context, name string) ([]string, error) {
+	resp, err := c.rpc.Logs(ctx, connect.NewRequest(&vibev1.LogsRequest{Profile: name}))
 	if err != nil {
 		return nil, err
 	}

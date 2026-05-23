@@ -802,7 +802,11 @@ func (*ShutdownResponse) Descriptor() ([]byte, []int) {
 }
 
 type LogsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// profile, if set, requests logs for a specific service-mode
+	// profile (matching its profile.name). Empty / "active" → the
+	// active profile (legacy behavior).
+	Profile       string `protobuf:"bytes,1,opt,name=profile,proto3" json:"profile,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -835,6 +839,13 @@ func (x *LogsRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use LogsRequest.ProtoReflect.Descriptor instead.
 func (*LogsRequest) Descriptor() ([]byte, []int) {
 	return file_vibe_v1_control_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *LogsRequest) GetProfile() string {
+	if x != nil {
+		return x.Profile
+	}
+	return ""
 }
 
 type LogsResponse struct {
@@ -1049,8 +1060,9 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\fStopResponse\x12'\n" +
 	"\x06status\x18\x01 \x01(\v2\x0f.vibe.v1.StatusR\x06status\"\x11\n" +
 	"\x0fShutdownRequest\"\x12\n" +
-	"\x10ShutdownResponse\"\r\n" +
-	"\vLogsRequest\"$\n" +
+	"\x10ShutdownResponse\"'\n" +
+	"\vLogsRequest\x12\x18\n" +
+	"\aprofile\x18\x01 \x01(\tR\aprofile\"$\n" +
 	"\fLogsResponse\x12\x14\n" +
 	"\x05lines\x18\x01 \x03(\tR\x05lines\"'\n" +
 	"\vPullRequest\x12\x18\n" +

@@ -627,8 +627,21 @@ func (d *Daemon) Shutdown(_ context.Context, _ *connect.Request[vibev1.ShutdownR
 	return connect.NewResponse(&vibev1.ShutdownResponse{}), nil
 }
 
-func (d *Daemon) Logs(_ context.Context, _ *connect.Request[vibev1.LogsRequest]) (*connect.Response[vibev1.LogsResponse], error) {
-	return connect.NewResponse(&vibev1.LogsResponse{Lines: d.sup.Logs()}), nil
+func (d *Daemon) Logs(_ context.Context, req *connect.Request[vibev1.LogsRequest]) (*connect.Response[vibev1.LogsResponse], error) {
+	name := strings.TrimSpace(req.Msg.GetProfile())
+	// Empty / "active" → the active profile's supervisor (legacy
+	// behavior). Anything else → look up the named service.
+	if name == "" || name == "active" {
+		return connect.NewResponse(&vibev1.LogsResponse{Lines: d.sup.Logs()}), nil
+	}
+	d.mu.Lock()
+	svc, ok := d.services[name]
+	d.mu.Unlock()
+	if !ok {
+		return nil, connect.NewError(connect.CodeNotFound,
+			fmt.Errorf("no running service named %q (use `vibe ps` to list)", name))
+	}
+	return connect.NewResponse(&vibev1.LogsResponse{Lines: svc.sup.Logs()}), nil
 }
 
 func (d *Daemon) Pull(ctx context.Context, req *connect.Request[vibev1.PullRequest], stream *connect.ServerStream[vibev1.PullProgress]) error {
