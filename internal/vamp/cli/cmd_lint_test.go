@@ -127,6 +127,63 @@ func TestLintPipeline_JSONStageWithRetryOnlyTransientFlags(t *testing.T) {
 	}
 }
 
+func TestLintPipeline_TrivialRetry(t *testing.T) {
+	p := &vamp.Pipeline{
+		Name: "trivial-retry",
+		Stages: []vamp.Stage{
+			// MaxAttempts=1 means "try once then give up" — defining a
+			// retry block at all is misleading.
+			{ID: "fetch", Type: vamp.StageTypeWebhook, URL: "https://api.example.com/x",
+				Retry: &vamp.RetryPolicy{MaxAttempts: 1, RetryOn: []string{"transient"}}},
+		},
+	}
+	var buf bytes.Buffer
+	_ = LintPipeline(p, &buf)
+	got := buf.String()
+	if !strings.Contains(got, "fetch") || !strings.Contains(got, "MaxAttempts=1") {
+		t.Errorf("finding should name the stage + attempts count; got: %q", got)
+	}
+}
+
+func TestLintPipeline_MissingCapabilityHint(t *testing.T) {
+	p := &vamp.Pipeline{
+		Name: "no-hint",
+		Stages: []vamp.Stage{
+			{ID: "plan", Type: vamp.StageTypeText, Capability: "reasoning", Prompt: "hi"},
+			{ID: "plan2", Type: vamp.StageTypeText, Capability: "reasoning", Prompt: "hi"},
+		},
+		// CapabilityModelHints intentionally absent.
+	}
+	var buf bytes.Buffer
+	_ = LintPipeline(p, &buf)
+	got := buf.String()
+	if !strings.Contains(got, `"reasoning"`) {
+		t.Errorf("finding should name the capability; got: %q", got)
+	}
+	// Deduplicated: two stages share the capability but the finding fires once.
+	if strings.Count(got, `capability "reasoning"`) != 1 {
+		t.Errorf("missing-hint finding should be deduplicated per capability; got %d occurrences in %q",
+			strings.Count(got, `capability "reasoning"`), got)
+	}
+}
+
+func TestLintPipeline_CapabilityWithHintIsClean(t *testing.T) {
+	p := &vamp.Pipeline{
+		Name: "hinted",
+		Stages: []vamp.Stage{
+			{ID: "plan", Type: vamp.StageTypeText, Capability: "reasoning", Prompt: "hi"},
+		},
+		CapabilityModelHints: map[string]vamp.ModelHint{
+			"reasoning": {MinParams: "7B", MinContext: 8192},
+		},
+	}
+	var buf bytes.Buffer
+	_ = LintPipeline(p, &buf)
+	if strings.Contains(buf.String(), "no CapabilityModelHints") {
+		t.Errorf("documented capability should not trip the hint check; got: %q", buf.String())
+	}
+}
+
 func TestHostPortOf(t *testing.T) {
 	for _, tc := range []struct {
 		raw  string
