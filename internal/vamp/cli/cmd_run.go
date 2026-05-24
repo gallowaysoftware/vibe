@@ -43,6 +43,7 @@ func runCmd() *cobra.Command {
 		dryRunFlag      bool
 		detachFlag      bool
 		noCacheFlag     bool
+		noEnsureSvc     bool
 		internalRunJob  bool
 	)
 	cmd := &cobra.Command{
@@ -83,14 +84,15 @@ func runCmd() *cobra.Command {
 				return fmt.Errorf("read pipeline file: %w", err)
 			}
 			opts := RunOptions{
-				Inputs:         inputFlags,
-				RunDir:         runDirFlag,
-				APIURL:         apiFlag,
-				Resume:         resumeFlag,
-				ResumeForce:    resumeForceFlag,
-				DryRun:         dryRunFlag,
-				NoCache:        noCacheFlag,
-				InternalRunJob: internalRunJob,
+				Inputs:           inputFlags,
+				RunDir:           runDirFlag,
+				APIURL:           apiFlag,
+				Resume:           resumeFlag,
+				ResumeForce:      resumeForceFlag,
+				DryRun:           dryRunFlag,
+				NoCache:          noCacheFlag,
+				NoEnsureServices: noEnsureSvc,
+				InternalRunJob:   internalRunJob,
 			}
 			return RunPipeline(ctx, p, filepath.Dir(pipelinePath), pipelineBytes, opts, cmd.OutOrStdout(), cmd.ErrOrStderr())
 		},
@@ -103,6 +105,7 @@ func runCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&dryRunFlag, "dry-run", false, "Render templates and validate per-stage shape without contacting vibe, an LLM, ComfyUI, ffmpeg, Piper, or YouTube. Prints a per-stage plan and a final error/warning count.")
 	cmd.Flags().BoolVar(&detachFlag, "detach", false, "Fork the run into a background `vamp` worker and return immediately with a job id. Use `vamp jobs ls`, `vamp logs <id>`, `vamp cancel <id>` to drive it.")
 	cmd.Flags().BoolVar(&noCacheFlag, "no-cache", false, "Disable the content-addressed cache for this run; overrides per-pipeline / per-stage `cache: true` defaults.")
+	cmd.Flags().BoolVar(&noEnsureSvc, "no-ensure-services", false, "Skip the pre-flight probe + auto-start of declared RequireService URLs. Default behaviour auto-runs `vibe start <name>` for any unreachable service whose setup_hint matches that shape, sparing the operator a 3-second-retry-then-fail cascade in the first webhook stage.")
 	cmd.Flags().BoolVar(&internalRunJob, internalRunJobFlag, false, "Internal: marks this process as the detached worker spawned by --detach. Sets up vamp.log + vamp.pid in the run dir. Do not invoke manually.")
 	_ = cmd.Flags().MarkHidden(internalRunJobFlag)
 	return cmd

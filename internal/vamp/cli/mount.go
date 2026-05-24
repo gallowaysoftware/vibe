@@ -67,6 +67,7 @@ func runCmdInMemory(factory PipelineFactory) *cobra.Command {
 		dryRunFlag      bool
 		detachFlag      bool
 		noCacheFlag     bool
+		noEnsureSvc     bool
 		internalRunJob  bool
 	)
 	cmd := &cobra.Command{
@@ -96,14 +97,15 @@ func runCmdInMemory(factory PipelineFactory) *cobra.Command {
 				return err
 			}
 			opts := RunOptions{
-				Inputs:         inputFlags,
-				RunDir:         runDirFlag,
-				APIURL:         apiFlag,
-				Resume:         resumeFlag,
-				ResumeForce:    resumeForceFlag,
-				DryRun:         dryRunFlag,
-				NoCache:        noCacheFlag,
-				InternalRunJob: internalRunJob,
+				Inputs:           inputFlags,
+				RunDir:           runDirFlag,
+				APIURL:           apiFlag,
+				Resume:           resumeFlag,
+				ResumeForce:      resumeForceFlag,
+				DryRun:           dryRunFlag,
+				NoCache:          noCacheFlag,
+				NoEnsureServices: noEnsureSvc,
+				InternalRunJob:   internalRunJob,
 			}
 			// pipelineDir / pipelineSource left zero: the Go-DSL path
 			// resolves assets through Stage.AssetFS (Phase 3) and the
@@ -122,6 +124,7 @@ func runCmdInMemory(factory PipelineFactory) *cobra.Command {
 	cmd.Flags().BoolVar(&dryRunFlag, "dry-run", false, "Render templates and validate per-stage shape without contacting vibe / LLM / ComfyUI / ffmpeg / Piper / YouTube.")
 	cmd.Flags().BoolVar(&detachFlag, "detach", false, "Fork the run into a background worker and return a job id.")
 	cmd.Flags().BoolVar(&noCacheFlag, "no-cache", false, "Disable the content-addressed cache for this run.")
+	cmd.Flags().BoolVar(&noEnsureSvc, "no-ensure-services", false, "Skip the pre-flight probe + auto-start of declared RequireService URLs. Default behaviour auto-runs `vibe start <name>` for any unreachable service whose setup_hint matches that shape.")
 	cmd.Flags().BoolVar(&internalRunJob, internalRunJobFlag, false, "Internal: detached-worker marker; do not invoke manually.")
 	_ = cmd.Flags().MarkHidden(internalRunJobFlag)
 	return cmd

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -56,6 +57,15 @@ type RunOptions struct {
 	// vamp.log + vamp.pid + signal handling. Never set by end users
 	// directly; the spawnDetached helper injects it on re-exec.
 	InternalRunJob bool
+	// NoEnsureServices opts out of the pre-flight that probes each
+	// p.RequireService URL and auto-runs `vibe start <name>` for any
+	// that aren't reachable + have a parseable `vibe start ...` hint.
+	// Default behaviour (false / opt-in) saves the operator from a
+	// 3-second-retry-then-fail cascade when SearXNG / Kokoro / etc.
+	// just happen to be down. Set true when you want the pipeline to
+	// fail loudly without touching services (e.g. testing the
+	// retry policy itself).
+	NoEnsureServices bool
 }
 
 // RunPipeline executes an in-memory pipeline against vibe with the supplied
@@ -106,6 +116,11 @@ func RunPipeline(ctx context.Context, p *vamp.Pipeline, pipelineDir string, pipe
 	}
 	if opts.ResumeForce && opts.Resume == "" {
 		return fmt.Errorf("--resume-force requires --resume")
+	}
+	if !opts.DryRun && !opts.NoEnsureServices {
+		if err := ensureServicesUp(ctx, p, stdout); err != nil {
+			return err
+		}
 	}
 	runDir := opts.RunDir
 	if opts.Resume != "" {
@@ -171,6 +186,119 @@ func RunPipeline(ctx context.Context, p *vamp.Pipeline, pipelineDir string, pipe
 		return exec.DryRun(ctx)
 	}
 	return exec.Run(ctx)
+}
+
+// ensureServicesUp probes each p.RequireService URL once with a short
+// timeout. For any URL that doesn't answer, auto-runs `vibe start <name>`
+// when the service's SetupHint has the `vibe start <name>` shape, then
+// re-polls until the URL is reachable (or a 30s deadline expires).
+// Services without a parseable hint are surfaced verbatim and the run
+// fails — we can't guess how to start an arbitrary external service.
+//
+// Why: the alternative is a 3-second-retry-then-fail cascade in the
+// first webhook stage when SearXNG / Kokoro just happen to be down,
+// which forces the operator to learn the existence of `<pipeline>
+// activate` after a confusing failure. This makes "first iitn next of
+// the day" just work after a reboot.
+//
+// Cost: ~250ms per declared service when everything's already up
+// (one HTTP roundtrip per service, in parallel).
+func ensureServicesUp(ctx context.Context, p *vamp.Pipeline, stdout io.Writer) error {
+	req := p.Requirements()
+	if len(req.Services) == 0 {
+		return nil
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	type result struct {
+		idx       int
+		reachable bool
+	}
+	results := make(chan result, len(req.Services))
+	for i, svc := range req.Services {
+		if svc.URL == "" {
+			results <- result{idx: i, reachable: true}
+			continue
+		}
+		go func(i int, url string) {
+			results <- result{idx: i, reachable: probeServiceURL(probeCtx, url)}
+		}(i, svc.URL)
+	}
+	reachable := make([]bool, len(req.Services))
+	for range req.Services {
+		r := <-results
+		reachable[r.idx] = r.reachable
+	}
+
+	var missing []int
+	for i, ok := range reachable {
+		if !ok {
+			missing = append(missing, i)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	var unstartable []string
+	var startNames []string
+	for _, i := range missing {
+		svc := req.Services[i]
+		name := parseVibeStartHint(svc.SetupHint)
+		if name == "" {
+			unstartable = append(unstartable, fmt.Sprintf("%s — %s", svc.Name, svc.SetupHint))
+			continue
+		}
+		startNames = append(startNames, name)
+	}
+	if len(unstartable) > 0 {
+		return fmt.Errorf("required service(s) unreachable with no `vibe start ...` hint:\n  %s",
+			strings.Join(unstartable, "\n  "))
+	}
+
+	fmt.Fprintf(stdout, "ensure-services: %d service(s) not up — starting now\n", len(startNames))
+	for _, name := range startNames {
+		if err := vibeStart(stdout, name, false); err != nil {
+			return fmt.Errorf("ensure-services: %w", err)
+		}
+	}
+
+	readyCtx, readyCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer readyCancel()
+	var bad []string
+	for _, i := range missing {
+		svc := req.Services[i]
+		if svc.URL == "" {
+			continue
+		}
+		if err := waitForURL(readyCtx, svc.URL); err != nil {
+			bad = append(bad, fmt.Sprintf("%s (%s): %v", svc.Name, svc.URL, err))
+		}
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("ensure-services: %s", strings.Join(bad, "; "))
+	}
+	return nil
+}
+
+// probeServiceURL is the single-shot read-only counterpart to
+// waitForURL. Any non-5xx response (incl. 401 / 404) means the server
+// is up — we're testing that something answers, not that the URL is
+// semantically correct.
+func probeServiceURL(ctx context.Context, url string) bool {
+	client := &http.Client{Timeout: 2 * time.Second}
+	r, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(r)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode < 500
 }
 
 // ValidatePipeline runs the same shape / capability / cross-cutting checks
