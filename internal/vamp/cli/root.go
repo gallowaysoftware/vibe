@@ -23,6 +23,7 @@ func rootCmd() *cobra.Command {
 		runCmd(),
 		renderCmd(),
 		validateCmd(),
+		lintCmd(),
 		listCmd(),
 		capabilitiesCmd(),
 		runsCmd(),
