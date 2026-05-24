@@ -31,11 +31,34 @@
   pairing and JSON-output retry coverage; dogfood caught a missing
   retry policy on textbook-to-audiobook's `extract_topics`.
 
-- **Per-capability resolution summary** (2026-05-24). At end of run
-  vamp prints one line per capability naming the profile that actually
-  answered, with a `[fallback]` tag when the 1st-choice candidate was
-  skipped (typically VRAM rejection). Surfaces silent fall-throughs
-  that previously scrolled past mid-run in the skip log.
+- **Per-capability resolution summary + pipeline_timing.json
+  `capabilities` field** (2026-05-24, v0.6.0+v0.6.1). At end of run
+  vamp prints one line per capability naming the profile that
+  actually answered, with a `[fallback]` tag when the 1st-choice
+  candidate was skipped (typically VRAM rejection). v0.6.1 also
+  records the per-capability resolution in `pipeline_timing.json`'s
+  new `capabilities` map so downstream tools (e.g. `iitn timings
+  --summary`) can answer "which profile did this run land on?"
+  without grepping the live log.
+
+- **Two more `vamp lint` checks** (2026-05-24, v0.6.1). Trivial
+  Retry blocks (`MaxAttempts < 2` — a retry-block no-op) and
+  capabilities referenced but absent from `CapabilityModelHints`
+  (so `<pipeline> doctor` can sanity-check the resolved profile
+  against expected `min_params` / `min_context`). Brings the total
+  to four checks; dogfooding against the local pipeline catalog
+  flagged real gaps on dag-smoke + function-pipeline.
+
+- **End-to-end validation: 12 iitn episodes on EXL3** (2026-05-24,
+  EP19–EP30). FreeMemoryAfter + auto-ensure-services + per-
+  capability resolution all confirmed in production across 12
+  consecutive runs with zero VRAM-fallback regressions. Wall-clock
+  comparison: EXL3 mean 8m44s vs GGUF 5m15s on this workload —
+  EXL3's per-token speedup gets eaten by Qwen3.6's verbose CoT on
+  long-form stages. CoT-off via `chat_template_kwargs` is the
+  speed lever for strict-output stages; long-form stages keep CoT
+  on for quality. See the `exl3_sampler_defaults` memory for the
+  detailed when-to-pick guidance.
 
 - **Content-addressed cache** (`feat/content-cache`). Per-stage
   cache keys derived from rendered prompt/params/model (text),
