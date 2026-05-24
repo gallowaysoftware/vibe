@@ -50,6 +50,33 @@ func writeComfyDirStub(t *testing.T) string {
 	return dir
 }
 
+// writeTabbyModelStub mints an empty directory; validateTabbyAPI only
+// requires ModelDir be non-empty (file-existence checks happen at
+// launch time, not load time, because EXL3 snapshots are populated
+// lazily by `vibe pull`).
+func writeTabbyModelStub(t *testing.T) string {
+	t.Helper()
+	return t.TempDir()
+}
+
+// writeTabbyRepoStub mints a directory; validateTabbyAPI only requires
+// Repo be non-empty. Existence-of-start.py is the launch concern, not
+// the load concern.
+func writeTabbyRepoStub(t *testing.T) string {
+	t.Helper()
+	return t.TempDir()
+}
+
+// writeTabbyVenvStub mints a venv-shaped directory.
+func writeTabbyVenvStub(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 // TestProfileInit_Kinds drives `runProfileInit` for every embedded kind and
 // asserts: (a) the file is dropped at <profiles-dir>/<name>.yaml, (b) the
 // rendered content has the templated name substituted, (c) every kind
@@ -153,6 +180,28 @@ func fillReplacements(t *testing.T, body, kind string) string {
 		body = strings.ReplaceAll(body, "REPLACE-model-alias", "test-alias")
 		// wait_for.url's REPLACE-port: just give it a port number.
 		body = strings.ReplaceAll(body, "REPLACE-port", "3000")
+	case "http-service":
+		// http-service template's REPLACE markers; the validator just
+		// needs an image + a port, both already non-REPLACE in the
+		// template, so substitution is largely a no-op.
+		body = strings.ReplaceAll(body, "REPLACE-image", "ghcr.io/example/image:latest")
+		body = strings.ReplaceAll(body, "REPLACE-port", "14002")
+	case "llama-embed-service":
+		// llama-embed-service ships with concrete values; the only
+		// REPLACE-marked items are advisory ("REPLACE if you...").
+		// No-op fill is enough for the loader to accept it.
+	case "tabby-api":
+		// The tabby-api template requires several REPLACE markers be
+		// real-shaped. We stub a fake model dir + repo + venv so
+		// profile.Validate accepts the loaded form.
+		modelDir := writeTabbyModelStub(t)
+		repoDir := writeTabbyRepoStub(t)
+		venvDir := writeTabbyVenvStub(t)
+		body = strings.ReplaceAll(body, "~/models/exl3/REPLACE-model-name", modelDir)
+		body = strings.ReplaceAll(body, "REPLACE-org/REPLACE-repo", "example/exl3-model")
+		body = strings.ReplaceAll(body, "REPLACE-model-name", "test-alias")
+		body = strings.ReplaceAll(body, "~/.local/state/vibe/tabby-venv", venvDir)
+		body = strings.ReplaceAll(body, "~/src/tabbyAPI", repoDir)
 	default:
 		t.Fatalf("fillReplacements: unknown kind %q (extend this switch)", kind)
 	}

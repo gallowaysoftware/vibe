@@ -411,7 +411,7 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 	// (workflow API is one big POST, no streaming, no profile-managed
 	// state worth proxying) and ships its own UI so there's no frontend.
 	var fr *frontend.Result
-	if p.Backend.LlamaServer != nil || p.Backend.HTTPServer != nil {
+	if p.Backend.LlamaServer != nil || p.Backend.HTTPServer != nil || p.Backend.TabbyAPI != nil {
 		backendURL, err := url.Parse(st.Addr)
 		if err != nil {
 			_ = d.sup.Stop(context.Background())
@@ -699,6 +699,40 @@ func (d *Daemon) Pull(ctx context.Context, req *connect.Request[vibev1.PullReque
 		return stream.Send(&vibev1.PullProgress{
 			Phase:   vibev1.PullProgress_PHASE_DONE,
 			Message: "no model file to pull (http_server backends manage their own artefacts)",
+		})
+	}
+	// tabby_api models are HF snapshots (multi-shard directories), not
+	// single files. We shell out to the venv's `huggingface-cli` since
+	// it ships with exllamav3 anyway, dodging the need for a Go-side
+	// snapshot downloader. Skip when no huggingface block.
+	if p.Backend.TabbyAPI != nil {
+		t := p.Backend.TabbyAPI
+		if t.Huggingface == nil {
+			return stream.Send(&vibev1.PullProgress{
+				Phase:   vibev1.PullProgress_PHASE_DONE,
+				Message: "no huggingface block; nothing to pull (tabby_api: pre-place the EXL3 snapshot at model_dir)",
+			})
+		}
+		if err := stream.Send(&vibev1.PullProgress{Phase: vibev1.PullProgress_PHASE_RESOLVING}); err != nil {
+			return err
+		}
+		hfCli := filepath.Join(t.Venv, "bin", "huggingface-cli")
+		args := []string{"download", t.Huggingface.Repo, "--local-dir", t.ModelDir}
+		if t.Huggingface.Revision != "" {
+			args = append(args, "--revision", t.Huggingface.Revision)
+		}
+		slog.Info("pulling tabby_api snapshot", "profile", p.Name,
+			"repo", t.Huggingface.Repo, "revision", t.Huggingface.Revision,
+			"dest", t.ModelDir)
+		cmd := exec.CommandContext(ctx, hfCli, args...)
+		out, runErr := cmd.CombinedOutput()
+		if runErr != nil {
+			return connect.NewError(connect.CodeInternal,
+				fmt.Errorf("huggingface-cli download: %w (output: %s)", runErr, strings.TrimSpace(string(out))))
+		}
+		return stream.Send(&vibev1.PullProgress{
+			Phase:   vibev1.PullProgress_PHASE_DONE,
+			Message: fmt.Sprintf("downloaded snapshot to %s", t.ModelDir),
 		})
 	}
 	if p.Backend.LlamaServer == nil {
@@ -1019,9 +1053,21 @@ func (d *Daemon) buildLaunchSpec(p *profile.Profile) (supervisor.LaunchSpec, int
 			"docker_or_binary", mode,
 			"image_or_binary", firstNonEmpty(p.Backend.HTTPServer.Image, p.Backend.HTTPServer.Binary),
 			"port", port)
+	case p.Backend.TabbyAPI != nil:
+		port = p.Backend.TabbyAPI.Port
+		spec, err = profile.TabbyAPISpec(p)
+		if err != nil {
+			return spec, 0, connect.NewError(connect.CodeInternal, err)
+		}
+		slog.Info("starting profile (tabby_api)",
+			"profile", p.Name, "mode", p.ResolvedMode(),
+			"alias", p.Backend.TabbyAPI.Alias,
+			"model_dir", filepath.Base(p.Backend.TabbyAPI.ModelDir),
+			"context", p.Backend.TabbyAPI.Context, "port", port,
+			"cache_mode", firstNonEmpty(p.Backend.TabbyAPI.CacheMode, "FP16"))
 	default:
 		return spec, 0, connect.NewError(connect.CodeFailedPrecondition,
-			errors.New("profile has no backend (set backend.llama_server, backend.comfyui, or backend.http_server)"))
+			errors.New("profile has no backend (set backend.llama_server, backend.comfyui, backend.http_server, or backend.tabby_api)"))
 	}
 	return spec, port, nil
 }

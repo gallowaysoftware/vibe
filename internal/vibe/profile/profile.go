@@ -66,6 +66,7 @@ type Backend struct {
 	LlamaServer *LlamaServerBackend `yaml:"llama_server,omitempty"`
 	ComfyUI     *ComfyUIBackend     `yaml:"comfyui,omitempty"`
 	HTTPServer  *HTTPServerBackend  `yaml:"http_server,omitempty"`
+	TabbyAPI    *TabbyAPIBackend    `yaml:"tabby_api,omitempty"`
 }
 
 // LlamaServerBackend supervises a llama-server child process exposing an
@@ -171,6 +172,86 @@ type HTTPServerBackend struct {
 	// — a non-2xx response without a body is fine, it just proves the
 	// process is up).
 	HealthPath string `yaml:"health_path,omitempty"`
+}
+
+// TabbyAPIBackend supervises a tabbyAPI process serving an ExLlamaV3
+// (EXL3-format) model on NVIDIA hardware. tabbyAPI exposes the same
+// OpenAI-compatible /v1 surface as llama-server, so vamp text stages
+// switch profiles without any pipeline code changes — only the
+// profile YAML differs.
+//
+// **Why have this alongside llama_server**: EXL3 single-stream is
+// 1.5-2x faster than equivalent GGUF on Ampere / Ada / Blackwell, and
+// batch / parallel work (RAG enrichment, multi-segment TTS prompting)
+// is noticeably more. The trade-off is VRAM-only — no CPU offload,
+// no AMD/Apple — so this backend is for NVIDIA + "model fits in
+// VRAM" setups. For text-only stages on those rigs, prefer this
+// over llama_server.
+//
+// **Multimodal**: not supported on this backend. Vision-capable
+// models stay on llama_server.
+//
+// Launch model: tabbyAPI is a Python project; we exec its start.py
+// from a checkout (Repo) using a venv (Venv) that has the right
+// exllamav3 + tabbyAPI installed. Daemon writes a temporary
+// config.yml derived from this block before each launch so the
+// per-profile knobs (model dir, port, cache mode) come through
+// without the user maintaining a parallel config file.
+type TabbyAPIBackend struct {
+	// ModelDir is the path to the EXL3 model directory. Must contain
+	// the safetensors shards + config.json + tokenizer files. Required.
+	// Tilde-expanded at load.
+	ModelDir string `yaml:"model_dir"`
+	// Huggingface, when set, downloads the EXL3 model snapshot from
+	// HF into ModelDir on first launch / `vibe pull`. Mirrors
+	// LlamaServerBackend.Huggingface but pulls a directory not a
+	// single file.
+	Huggingface *HuggingfaceRepo `yaml:"huggingface,omitempty"`
+	// Alias is the model id reported on /v1/models and what vamp's
+	// OpenAI client uses as `model:` in completion requests. Required.
+	Alias string `yaml:"alias"`
+	// Context is the max sequence length tabbyAPI loads the model
+	// with. Required.
+	Context int `yaml:"context"`
+	// Port pins the host port tabbyAPI publishes on. Required —
+	// daemon-picked ports aren't supported here, matching the
+	// http_server backend's discipline (keeps service-mode profiles
+	// reachable at a stable address across daemon restarts).
+	Port int `yaml:"port"`
+	// CacheMode selects the KV cache quantisation tabbyAPI uses.
+	// One of FP16 (default — highest quality, most VRAM), Q8, Q6, Q4.
+	// Q4 roughly halves KV memory for ~negligible quality loss on
+	// reasonable models; useful when context > 32k.
+	CacheMode string `yaml:"cache_mode,omitempty"`
+	// Venv is the python venv that has exllamav3 + tabbyAPI installed.
+	// Daemon exec's <Venv>/bin/python directly so PATH / shell state
+	// doesn't matter. Required. Tilde-expanded.
+	Venv string `yaml:"venv"`
+	// Repo is the tabbyAPI checkout used as workdir + entrypoint
+	// source (we exec start.py from there). Required for now —
+	// running the installed package via `python -m tabbyAPI` could
+	// work but the upstream layout still prefers the checkout-with-
+	// start.py shape. Tilde-expanded.
+	Repo string `yaml:"repo"`
+	// DraftModelDir, when set, points at a smaller EXL3 model dir
+	// used for speculative decoding. Optional but a major throughput
+	// win for long_form profiles when the draft fits alongside the
+	// main model.
+	DraftModelDir string `yaml:"draft_model_dir,omitempty"`
+	// ExtraArgs are appended to the start.py argv after vibe's
+	// standard ones. Use for tabbyAPI-specific knobs vibe doesn't
+	// yet expose as first-class fields.
+	ExtraArgs []string `yaml:"extra_args,omitempty"`
+}
+
+// HuggingfaceRepo names an HF model snapshot to download as a
+// directory. Distinguishes from Huggingface (above), which names a
+// single file inside a repo — EXL3 models are multi-file snapshots
+// (safetensors shards + tokenizer + config + measurement.json), so
+// the pull is a full snapshot download.
+type HuggingfaceRepo struct {
+	Repo     string `yaml:"repo"`
+	Revision string `yaml:"revision,omitempty"`
 }
 
 // ComfyUIBackend supervises a ComfyUI python entrypoint. ComfyUI manages its
@@ -379,6 +460,12 @@ func Load(path string) (*Profile, error) {
 		p.Backend.ComfyUI.Dir = expandTilde(p.Backend.ComfyUI.Dir)
 		p.Backend.ComfyUI.Python = expandTilde(p.Backend.ComfyUI.Python)
 	}
+	if p.Backend.TabbyAPI != nil {
+		p.Backend.TabbyAPI.ModelDir = expandTilde(p.Backend.TabbyAPI.ModelDir)
+		p.Backend.TabbyAPI.Venv = expandTilde(p.Backend.TabbyAPI.Venv)
+		p.Backend.TabbyAPI.Repo = expandTilde(p.Backend.TabbyAPI.Repo)
+		p.Backend.TabbyAPI.DraftModelDir = expandTilde(p.Backend.TabbyAPI.DraftModelDir)
+	}
 	p.Frontend.WriteFile = expandTilde(p.Frontend.WriteFile)
 	p.Frontend.Binary = expandTilde(p.Frontend.Binary)
 	p.Frontend.Workdir = expandTilde(p.Frontend.Workdir)
@@ -443,23 +530,63 @@ func (p *Profile) validateBackend() error {
 	llama := p.Backend.LlamaServer
 	comfy := p.Backend.ComfyUI
 	http := p.Backend.HTTPServer
+	tabby := p.Backend.TabbyAPI
 	set := 0
-	for _, b := range []bool{llama != nil, comfy != nil, http != nil} {
+	for _, b := range []bool{llama != nil, comfy != nil, http != nil, tabby != nil} {
 		if b {
 			set++
 		}
 	}
 	switch {
 	case set == 0:
-		return errors.New("backend is required: set exactly one of backend.llama_server, backend.comfyui, or backend.http_server")
+		return errors.New("backend is required: set exactly one of backend.llama_server, backend.comfyui, backend.http_server, or backend.tabby_api")
 	case set > 1:
-		return errors.New("backend: only one of backend.llama_server, backend.comfyui, or backend.http_server may be set")
+		return errors.New("backend: only one of backend.llama_server, backend.comfyui, backend.http_server, or backend.tabby_api may be set")
 	case llama != nil:
 		return validateLlamaServer(llama)
 	case comfy != nil:
 		return validateComfyUI(comfy)
 	case http != nil:
 		return validateHTTPServer(http)
+	case tabby != nil:
+		return validateTabbyAPI(tabby)
+	}
+	return nil
+}
+
+// validateTabbyAPI enforces the required fields. EXL3 models are
+// directories not single files, so ModelDir (not a Path/File pair)
+// is the load-bearing pointer. Venv + Repo must both be set —
+// tabbyAPI's start.py needs its workdir to find adapter modules,
+// and we need the venv to find the right python+exllamav3.
+func validateTabbyAPI(t *TabbyAPIBackend) error {
+	if t.ModelDir == "" && t.Huggingface == nil {
+		return errors.New("backend.tabby_api: model_dir or huggingface is required")
+	}
+	if t.Huggingface != nil && t.Huggingface.Repo == "" {
+		return errors.New("backend.tabby_api.huggingface.repo is required when huggingface is set")
+	}
+	if t.Alias == "" {
+		return errors.New("backend.tabby_api.alias is required")
+	}
+	if t.Context <= 0 {
+		return errors.New("backend.tabby_api.context must be > 0")
+	}
+	if t.Port <= 0 {
+		return errors.New("backend.tabby_api.port must be > 0 (daemon-picked ports not supported for this backend)")
+	}
+	if t.Venv == "" {
+		return errors.New("backend.tabby_api.venv is required (python venv with exllamav3 + tabbyAPI installed)")
+	}
+	if t.Repo == "" {
+		return errors.New("backend.tabby_api.repo is required (path to tabbyAPI checkout)")
+	}
+	if t.CacheMode != "" {
+		switch t.CacheMode {
+		case "FP16", "Q8", "Q6", "Q4":
+		default:
+			return fmt.Errorf("backend.tabby_api.cache_mode %q: must be one of FP16, Q8, Q6, Q4", t.CacheMode)
+		}
 	}
 	return nil
 }
@@ -577,6 +704,21 @@ func (p *Profile) validateFrontend() error {
 			return errors.New("frontend is not supported for http_server backends (the HTTP server is the deliverable; consume it via the vibe proxy)")
 		}
 		return nil
+	}
+
+	// tabby_api backends are pipeline-driven by default — vamp text stages
+	// reach the OpenAI-compatible /v1 surface through the proxy without
+	// needing a UI. If a user wants OpenWebUI on top, they can add an
+	// explicit frontend block; otherwise an empty frontend is fine here.
+	// (Compare to llama_server, which still demands a frontend for Phase-1
+	// historical reasons — tabby_api shipped after that requirement was
+	// relaxed and follows the modern shape.)
+	if p.Backend.TabbyAPI != nil {
+		if p.Frontend.IsZero() {
+			return nil
+		}
+		// Fall through to the existing validation if the user did supply
+		// a frontend block — same shape rules apply.
 	}
 
 	// Service-mode llama_server backends are sidecar embedding /

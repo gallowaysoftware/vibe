@@ -154,6 +154,55 @@ func sortStrings(s []string) {
 	}
 }
 
+// TabbyAPISpec returns the LaunchSpec for a tabbyAPI-backed profile.
+//
+// argv: <venv>/bin/python start.py --model-dir <ModelDir> --port <Port>
+//       --max-seq-len <Context> [--cache-mode <CacheMode>]
+//       [--draft-model-dir <DraftModelDir>] [extra_args...]
+//       (run from <Repo> as workdir)
+//
+// HealthURL: /health — tabbyAPI exposes a small JSON readiness endpoint
+// once the model has finished loading. Health-check returns 503 during
+// load and 200 once ready, so the supervisor waiting on a 2xx is the
+// right gate even for slow EXL3 loads (~30-90s for a 32B).
+//
+// Note: tabbyAPI's start.py prefers a config file, but every knob we
+// expose also has a CLI flag. We use the CLI form because it stays
+// pure-stateless: no temp config files to write or clean up, the
+// argv is fully reproducible from the profile YAML alone.
+func TabbyAPISpec(p *Profile) (supervisor.LaunchSpec, error) {
+	if p == nil || p.Backend.TabbyAPI == nil {
+		return supervisor.LaunchSpec{}, errors.New("TabbyAPISpec: profile has no tabby_api backend")
+	}
+	t := p.Backend.TabbyAPI
+	if t.Port <= 0 {
+		return supervisor.LaunchSpec{}, errors.New("TabbyAPISpec: backend.tabby_api.port must be > 0")
+	}
+	args := []string{
+		"start.py",
+		"--host", "127.0.0.1",
+		"--port", strconv.Itoa(t.Port),
+		"--model-dir", t.ModelDir,
+		"--max-seq-len", strconv.Itoa(t.Context),
+		"--model-alias", t.Alias,
+	}
+	if t.CacheMode != "" {
+		args = append(args, "--cache-mode", t.CacheMode)
+	}
+	if t.DraftModelDir != "" {
+		args = append(args, "--draft-model-dir", t.DraftModelDir)
+	}
+	args = append(args, t.ExtraArgs...)
+
+	python := filepath.Join(t.Venv, "bin", "python")
+	return supervisor.LaunchSpec{
+		Binary:    python,
+		Args:      args,
+		Workdir:   filepath.Clean(t.Repo),
+		HealthURL: fmt.Sprintf("http://127.0.0.1:%d/health", t.Port),
+	}, nil
+}
+
 // ComfyUISpec returns the LaunchSpec for a ComfyUI-backed profile.
 //
 // argv: python main.py --listen <addr> --port <port> [extra_args...]

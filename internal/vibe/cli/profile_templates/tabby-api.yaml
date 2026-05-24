@@ -1,0 +1,75 @@
+# Starter profile: tabbyAPI serving an EXL3 (ExLlamaV3) model.
+#
+# This file was dropped by `vibe profile init tabby-api`. Edit the
+# REPLACE-marked lines below, set up the host prerequisites (see the
+# block below), then `vibe start __PROFILE_NAME__`.
+#
+# Why EXL3 instead of llama-server:
+#   On NVIDIA-only setups with the model fully in VRAM, EXL3 is 1.5-2x
+#   faster than equivalent GGUF for single-stream inference and more
+#   for batched / parallel work (RAG enrichment, multi-segment TTS
+#   prompting). The trade-off is VRAM-only — no CPU offload, no AMD /
+#   Apple. Multimodal is not supported here either; keep vision models
+#   on llama_server.
+#
+# Host prerequisites (one-time):
+#   1. Clone tabbyAPI:   git clone https://github.com/theroyallab/tabbyAPI ~/src/tabbyAPI
+#   2. Create a venv:    python -m venv ~/.local/state/vibe/tabby-venv
+#   3. Install deps:     ~/.local/state/vibe/tabby-venv/bin/pip install -r ~/src/tabbyAPI/requirements/exl3.txt
+#   4. Pull a model:     `vibe pull __PROFILE_NAME__`  (uses the huggingface
+#                         block below to snapshot-download the EXL3 dir)
+#
+# Switch the active LLM from a llama_server profile to this one with
+# `vibe start __PROFILE_NAME__` — any vamp text stage hits it through
+# the same /v1 surface, so no pipeline code changes.
+
+name: __PROFILE_NAME__
+description: __PROFILE_NAME__ (tabbyAPI / EXL3)
+mode: active
+
+backend:
+  tabby_api:
+    # REPLACE: path to the EXL3 model directory on disk. `vibe pull`
+    # populates this from the huggingface block; pre-place the snapshot
+    # yourself if you'd rather not pull through vibe.
+    model_dir: ~/models/exl3/REPLACE-model-name
+    huggingface:
+      # REPLACE: HF repo holding the EXL3 snapshot. Common quantiser
+      # accounts: turboderp / bartowski / intervitens / lmg-anon. Search
+      # huggingface.co for "<model> exl3" — the landscape changes fast,
+      # pick a recent one.
+      repo: REPLACE-org/REPLACE-repo
+      revision: main
+
+    # The model id reported on /v1/models. Pipelines reference this in
+    # their `model:` request field.
+    alias: REPLACE-model-name
+
+    # Max sequence length to load the model with. 32k is comfortable
+    # for most Qwen / Llama base models. Raise if your weights support
+    # it; KV cache memory scales linearly.
+    context: 32768
+
+    # REPLACE: pinned host port. The proxy points at this on activate.
+    # 14010 is the convention for tabby_api profiles.
+    port: 14010
+
+    # KV cache quantisation. FP16 is highest quality + most VRAM.
+    # Q8 / Q6 / Q4 roughly halve KV memory at each step for ~negligible
+    # quality loss on reasonable models — drop down to Q4 when you want
+    # larger contexts (64k+) without OOMing.
+    cache_mode: FP16
+
+    # REPLACE if your venv / repo live elsewhere.
+    venv: ~/.local/state/vibe/tabby-venv
+    repo: ~/src/tabbyAPI
+
+    # Optional: smaller draft model dir for speculative decoding. Big
+    # throughput win on long_form profiles when the draft fits beside
+    # the main weights.
+    # draft_model_dir: ~/models/exl3/REPLACE-draft-model
+
+# REPLACE: rough VRAM budget for this model + its KV cache. A 32B at
+# 6.0bpw with 32k FP16 KV runs ~25-28GB; a 72B at 4.25bpw with Q8 KV
+# runs ~38-44GB. `vibe doctor` warns if this exceeds the detected GPU.
+estimated_vram_gb: 28
