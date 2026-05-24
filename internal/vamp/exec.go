@@ -358,6 +358,16 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 	defer func() {
 		e.writePipelineJSON(runStart, time.Now(), runErr)
 		e.timing.Finish()
+		// Snapshot the per-capability resolutions so the timing report
+		// includes the answer to "which profile did this run land on?"
+		// without anyone having to grep the live log.
+		e.mu.Lock()
+		caps := make(map[string]string, len(e.resolvedCapabilities))
+		for k, v := range e.resolvedCapabilities {
+			caps[k] = v
+		}
+		e.mu.Unlock()
+		e.timing.SetCapabilities(caps)
 		if e.RunDir != "" {
 			if err := e.timing.WriteJSON(e.RunDir); err != nil {
 				slog.Warn("timing report: write json failed", "err", err)

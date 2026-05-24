@@ -30,6 +30,9 @@ type Tracker struct {
 	// order preserves first-seen ordering of stage ids so Report and
 	// FormatTable produce a deterministic layout independent of map iteration.
 	order []string
+	// capabilities records the per-capability profile resolution for the
+	// run; populated via SetCapabilities and surfaced under Report.Capabilities.
+	capabilities map[string]string
 }
 
 // stageTiming is the tracker-internal record for one stage. Items is non-nil
@@ -67,6 +70,14 @@ type Report struct {
 	EndedAt   time.Time     `json:"ended_at"`
 	TotalMS   int64         `json:"total_ms"`
 	Stages    []StageReport `json:"stages"`
+	// Capabilities records which vibe profile satisfied each capability
+	// during this run. Empty when the run touched no capability-bearing
+	// stages (Render-only pipelines) or when the executor ran without
+	// the capability resolver. Populated by Tracker.SetCapabilities at
+	// run end; downstream consumers (iitn timings, vamp runs show) use
+	// it to surface "this episode ran on long_form_exl3" vs "fell back
+	// to fast" without grepping the per-run log.
+	Capabilities map[string]string `json:"capabilities,omitempty"`
 }
 
 // StageReport is one stage's slice of the Report. DurationMS is the
@@ -302,7 +313,32 @@ func (t *Tracker) Report() Report {
 		}
 		rep.Stages = append(rep.Stages, sr)
 	}
+	if len(t.capabilities) > 0 {
+		rep.Capabilities = make(map[string]string, len(t.capabilities))
+		for k, v := range t.capabilities {
+			rep.Capabilities[k] = v
+		}
+	}
 	return rep
+}
+
+// SetCapabilities records the per-capability profile resolution for the
+// run. The executor calls this once near end-of-run after every wave has
+// completed; later calls overwrite earlier ones with the same key (the
+// LAST profile to serve a capability wins, mirroring the end-of-run
+// summary in the live log).
+func (t *Tracker) SetCapabilities(m map[string]string) {
+	if t == nil || len(m) == 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.capabilities == nil {
+		t.capabilities = make(map[string]string, len(m))
+	}
+	for k, v := range m {
+		t.capabilities[k] = v
+	}
 }
 
 // WriteJSON writes pipeline_timing.json into dir. The file is pretty-printed
