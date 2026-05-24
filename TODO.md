@@ -10,6 +10,33 @@
 
 ## Recently shipped
 
+- **EXL3 + tabbyAPI integration** (2026-05-24). New `tabby_api` backend
+  for vibe profiles, supervised alongside llama-server / comfyui /
+  http_server. Ships a `vibe_defaults` sampler preset (`min_p 0.05`,
+  `repetition_penalty 1.05`) so EXL3 backends don't degenerate into
+  repetition loops on stages that only set `temperature` +
+  `max_tokens`. The `chat_template_kwargs` passthrough on text stages
+  lets pipelines toggle Qwen3's verbose CoT off on strict-JSON stages
+  (`enable_thinking: false`) without forking the chat template.
+  Validated on iitn EP19 → m4b on long_form_exl3 + Qwen3.6-27B-6.0bpw.
+
+- **`free_memory_after` on ComfyUI stages** + **auto-ensure-services
+  preflight** + **`vamp lint`** (2026-05-24). Three small DX wins from
+  one runway. ComfyUI stages can now `POST /free` after a successful
+  workflow so SDXL/Flux weights don't squat in VRAM between iitn
+  episodes. `vamp run` auto-runs `vibe start <name>` for any
+  unreachable `RequireService` URL with a parseable setup hint, so
+  "first run of the day after reboot" just works without learning
+  `<pipeline> activate`. `vamp lint` checks webhook → RequireService
+  pairing and JSON-output retry coverage; dogfood caught a missing
+  retry policy on textbook-to-audiobook's `extract_topics`.
+
+- **Per-capability resolution summary** (2026-05-24). At end of run
+  vamp prints one line per capability naming the profile that actually
+  answered, with a `[fallback]` tag when the 1st-choice candidate was
+  skipped (typically VRAM rejection). Surfaces silent fall-throughs
+  that previously scrolled past mid-run in the skip log.
+
 - **Content-addressed cache** (`feat/content-cache`). Per-stage
   cache keys derived from rendered prompt/params/model (text),
   post-substitution workflow JSON (comfyui), rendered text + voice

@@ -121,7 +121,7 @@ anything else is a pipeline error).
 | `text`    | LLM chat completion. `output_format: json` validates the model's output. SSE-streamed when the frontend asks for it. Multimodal via `image_dir:` (scan a directory) or `image_files:` (explicit list, one image per foreach item). |
 | `render`  | Pure template render — no LLM, no profile activation. For enumerating directories, building JSON arrays, transforming prior outputs. |
 | `compact` | LLM-summarised, length-targeted compaction. Chunks the source, summarises each, concatenates; recurses if still over target. |
-| `comfyui` | Runs a ComfyUI workflow JSON. WebSocket progress (RFC 6455, polling fallback); collects images, videos, and gifs. |
+| `comfyui` | Runs a ComfyUI workflow JSON. WebSocket progress (RFC 6455, polling fallback); collects images, videos, and gifs. `free_memory_after: true` issues POST /free after a successful workflow so SDXL/Flux weights don't squat in VRAM between runs. |
 | `audio`   | TTS. `engine: piper` runs Piper on a voice ONNX from `~/.local/share/piper-voices/`; `engine: kokoro` POSTs to a Kokoro-FastAPI server (declare `capability: tts` to let vibe manage its lifecycle). |
 | `ffmpeg`  | Shells out to `ffmpeg` with templated args; tail-rings stderr for diagnostics. Three modes: explicit `ffmpeg_args:`, auto `concat_wavs:`, or M4B chapterised audiobook via `m4b_from:` / `m4b_file:` / `m4b_chapter:` (+ optional `cover_image:`). |
 | `pandoc`  | Document conversion via pandoc (docker `pandoc/core` by default, override with `binary:`). Used for markdown → EPUB study guides with `cover_image:`. |
@@ -189,8 +189,9 @@ capabilities:
 
 | Command | Purpose |
 | --- | --- |
-| `vamp run <pipeline.yaml>` | Execute. Flags: `--detach`, `--resume <dir>`, `--resume-force`, `--dry-run`, `--no-cache`, `--input k=v`. |
+| `vamp run <pipeline.yaml>` | Execute. Flags: `--detach`, `--resume <dir>`, `--resume-force`, `--dry-run`, `--no-cache`, `--no-ensure-services`, `--input k=v`. By default each `RequireService` URL is probed pre-run and auto-started via `vibe start <name>` when the setup hint matches that shape. |
 | `vamp validate <pipeline.yaml>` | Parse + schema-check without running. |
+| `vamp lint <pipeline.yaml>` | Advisory checks layered on validate: webhook URL → matching `RequireService`, `output_format: json` → `Retry.RetryOn` includes `"invalid_output"`. Findings only — exit 0. |
 | `vamp list` | List pipelines under `$XDG_CONFIG_HOME/vamp/pipelines/`. |
 | `vamp capabilities` | Print the resolved capability table. |
 | `vamp runs ls/show/cleanup` | History across run dirs under `$XDG_STATE_HOME/vamp/runs/`. |

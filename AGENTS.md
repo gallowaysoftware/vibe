@@ -202,6 +202,33 @@ them before pushing.
   markdown → EPUB study-guide generation.
 - **InputSpec requires struct form.** Bare strings like
   `lesson_root: "~/path"` are rejected. Use `lesson_root: {default: "~/path"}`.
+- **`chat_template_kwargs` passthrough.** Text-stage `params` accepts
+  `chat_template_kwargs` (typically `{enable_thinking: false}`),
+  forwarded by tabbyAPI / vLLM / SGLang to the model's chat template;
+  ignored by llama-server. Use to silence Qwen3's verbose CoT preamble
+  on strict-JSON stages — the model otherwise eats `max_tokens` before
+  emitting a single brace. Keep CoT *on* for stages whose quality
+  benefits (planning / editing). The allowlist is in
+  `pipeline.go:knownTextParamKeys`.
+- **`free_memory_after` on ComfyUI stages.** Set on the DSL with
+  `.FreeMemoryAfter()` (Go) or `free_memory_after: true` (YAML) to
+  POST /free after a successful workflow. Best-effort + non-fatal —
+  weights unload + VRAM reclaim happens before the next pipeline run.
+  Use on pipelines that issue a single image_gen stage per run and
+  need the GPU back for a downstream LLM activation (iitn cover →
+  next episode's long_form_exl3).
+- **Auto-ensure RequireService.** `vamp run` (and any binary that
+  mounts the same runCmd) probes every declared `RequireService` URL
+  pre-run and auto-runs `vibe start <name>` for any unreachable
+  service whose setup_hint matches that exact shape. Disable with
+  `--no-ensure-services`; the legacy 3-second-retry-then-fail-with-
+  hint path still works behind the flag.
+- **`vamp lint` is the advisory layer.** Two checks today: webhook
+  URLs on loopback hosts must have a matching `RequireService`
+  declaration; text stages with `output_format: json` must include
+  `"invalid_output"` in their `Retry.RetryOn` list. Exit code 0
+  regardless of findings — lint is editorial, not gating. New checks
+  go in `internal/vamp/cli/cmd_lint.go` next to the existing two.
 
 ## Detach / job lifecycle
 
