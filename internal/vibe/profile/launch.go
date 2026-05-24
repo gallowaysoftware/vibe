@@ -157,15 +157,16 @@ func sortStrings(s []string) {
 // TabbyAPISpec returns the LaunchSpec for a tabbyAPI-backed profile.
 //
 // argv: <venv>/bin/python main.py
-//       --host 127.0.0.1 --port <Port>
-//       --backend exllamav3
-//       --model-dir <parent-of-ModelDir>
-//       --model-name <basename-of-ModelDir>   (== Alias, validator-enforced)
-//       --max-seq-len <Context>
-//       [--cache-mode <CacheMode>]
-//       [--draft-model-dir <DraftModelDir-parent> --draft-model-name <...basename>]
-//       [extra_args...]
-//       (run from <Repo> as workdir)
+//
+//	--host 127.0.0.1 --port <Port>
+//	--backend exllamav3
+//	--model-dir <parent-of-ModelDir>
+//	--model-name <basename-of-ModelDir>   (== Alias, validator-enforced)
+//	--max-seq-len <Context>
+//	[--cache-mode <CacheMode>]
+//	[--draft-model-dir <DraftModelDir-parent> --draft-model-name <...basename>]
+//	[extra_args...]
+//	(run from <Repo> as workdir)
 //
 // **Why model-dir + model-name instead of a single path**: tabbyAPI
 // addresses a model as a *name* inside a *models directory* (mirroring
