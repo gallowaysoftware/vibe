@@ -1834,9 +1834,14 @@ func (t *textExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput
 	}
 
 	if st.OutputFormat == "json" {
-		if err := validateJSON(out); err != nil {
+		cleaned, err := extractCleanJSON(out)
+		if err != nil {
 			return nil, fmt.Errorf("stage output is not valid JSON: %w", err)
 		}
+		// Replace the raw output with the extracted JSON so downstream
+		// stages reading {{ .stages.<id>.output }} see clean JSON, not
+		// the verbose preamble the LLM emitted before it.
+		out = cleaned
 	}
 	return &StageOutput{Text: out}, nil
 }
@@ -3917,8 +3922,48 @@ func (e *Executor) runStageCleanup(st *Stage) {
 }
 
 func validateJSON(s string) error {
+	_, err := extractCleanJSON(s)
+	return err
+}
+
+// extractCleanJSON returns the JSON payload from an LLM-produced string,
+// peeling off the wrappers and prose preamble LLMs add. Returns the
+// cleaned JSON string + nil error when extraction + parse both succeed.
+// Used by both validateJSON (output_format: json gate) and executeText
+// (so downstream stages see clean JSON, not the raw verbose output).
+//
+// Handles, in order:
+//
+//  1. `<think>...</think>` reasoning blocks — Qwen3 / DeepSeek family
+//     uses these as explicit CoT markers.
+//  2. Surrounding ```json / ``` markdown code fences — most common
+//     output shape when the model hasn't seen the user's request as
+//     strict JSON-mode.
+//  3. Prose preamble — Qwen3.6 EXL3 emits "Here's a thinking process:"
+//     followed by bullets and analysis *before* the JSON object, even
+//     at low temperature. The fallback walks the string for the first
+//     balanced { … } or [ … ] block.
+func extractCleanJSON(s string) (string, error) {
+	cleaned := stripModelArtifacts(s)
 	var v any
-	return json.Unmarshal([]byte(stripModelArtifacts(s)), &v)
+	if err := json.Unmarshal([]byte(cleaned), &v); err == nil {
+		return cleaned, nil
+	}
+	// Fallback: pull the first balanced block out of whatever's left
+	// (after artifact-stripping) and try that. Caller decides whether
+	// to bubble the original error or the extraction failure.
+	if block, ok := extractFirstJSONBlock(cleaned); ok {
+		if err := json.Unmarshal([]byte(block), &v); err == nil {
+			return block, nil
+		}
+	}
+	// Report the post-strip parse error — closest to what the model
+	// emitted that the user can read.
+	var verr any
+	if err := json.Unmarshal([]byte(cleaned), &verr); err != nil {
+		return "", err
+	}
+	return cleaned, nil
 }
 
 // stripModelArtifacts removes LLM-side wrappers that aren't part of the
