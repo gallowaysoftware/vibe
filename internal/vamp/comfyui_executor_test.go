@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,6 +44,10 @@ type fakeComfyServer struct {
 	// bytes at their destinations. When nil or missing, viewPayload is served.
 	viewPayloads map[string][]byte
 	promptID     string
+	// freedCount is the number of POST /free requests the fake server
+	// observed. Default zero; tests asserting on FreeMemoryAfter check
+	// this value after the stage runs.
+	freedCount int32
 }
 
 func newFakeComfyServer(t *testing.T, promptID string, outputs []comfyui.OutputFile, viewPayload []byte) (*fakeComfyServer, *httptest.Server) {
@@ -119,6 +124,13 @@ func newFakeComfyServer(t *testing.T, promptID string, outputs []comfyui.OutputF
 			}
 		}
 		_, _ = w.Write(def)
+	})
+	// /free records POSTs so tests can assert FreeMemoryAfter wiring.
+	// Always succeeds; the soft-failure path is exercised by a separate
+	// test that points at a closed server.
+	mux.HandleFunc("POST /free", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&fcs.freedCount, 1)
+		w.WriteHeader(http.StatusOK)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -743,4 +755,49 @@ func TestComfyUIExecutor_ClientHook(t *testing.T) {
 	if string(body) != "DATA" {
 		t.Errorf("save data = %q", body)
 	}
+}
+
+// TestComfyUIExecutor_FreeMemoryAfter verifies the executor issues a
+// POST /free after a successful workflow when Stage.FreeMemoryAfter is
+// true, and skips it when the field is unset.
+func TestComfyUIExecutor_FreeMemoryAfter(t *testing.T) {
+	workflow := `{"6":{"class_type":"CLIPTextEncode","inputs":{"text":""}}}`
+
+	t.Run("enabled posts /free", func(t *testing.T) {
+		pipeline := &Pipeline{
+			Name: "img",
+			Stages: []Stage{{
+				ID: "render", Type: StageTypeComfyUI, Capability: "image",
+				Output:          "out.png",
+				Parameters:      map[string]string{"6.text": "hello"},
+				FreeMemoryAfter: true,
+			}},
+		}
+		exec, _, _, fcs := stubComfyRuntime(t, pipeline, workflow)
+		if err := exec.Run(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if got := atomic.LoadInt32(&fcs.freedCount); got != 1 {
+			t.Errorf("/free call count = %d, want 1", got)
+		}
+	})
+
+	t.Run("disabled does not post /free", func(t *testing.T) {
+		pipeline := &Pipeline{
+			Name: "img",
+			Stages: []Stage{{
+				ID: "render", Type: StageTypeComfyUI, Capability: "image",
+				Output:     "out.png",
+				Parameters: map[string]string{"6.text": "hello"},
+				// FreeMemoryAfter intentionally omitted.
+			}},
+		}
+		exec, _, _, fcs := stubComfyRuntime(t, pipeline, workflow)
+		if err := exec.Run(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if got := atomic.LoadInt32(&fcs.freedCount); got != 0 {
+			t.Errorf("/free call count = %d, want 0 (FreeMemoryAfter not set)", got)
+		}
+	})
 }

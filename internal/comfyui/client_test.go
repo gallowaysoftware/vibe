@@ -405,3 +405,51 @@ func TestClient_SaveOutputToFile(t *testing.T) {
 		t.Errorf("stray .tmp file: err = %v", err)
 	}
 }
+
+func TestClient_FreeMemory_OK(t *testing.T) {
+	var gotMethod, gotPath, gotBody, gotCT string
+	srv, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotCT = r.Header.Get("Content-Type")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusOK)
+	})
+	defer srv.Close()
+	if err := c.FreeMemory(context.Background()); err != nil {
+		t.Fatalf("FreeMemory: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotPath != "/free" {
+		t.Errorf("path = %q, want /free", gotPath)
+	}
+	if !strings.Contains(gotCT, "application/json") {
+		t.Errorf("content-type = %q, want json", gotCT)
+	}
+	// Both flags must be set; otherwise ComfyUI only unloads weights
+	// without releasing the cudaMallocAsync-cached VRAM.
+	if !strings.Contains(gotBody, `"unload_models":true`) {
+		t.Errorf("body missing unload_models=true: %q", gotBody)
+	}
+	if !strings.Contains(gotBody, `"free_memory":true`) {
+		t.Errorf("body missing free_memory=true: %q", gotBody)
+	}
+}
+
+func TestClient_FreeMemory_HTTPError(t *testing.T) {
+	srv, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("free not supported on this build"))
+	})
+	defer srv.Close()
+	err := c.FreeMemory(context.Background())
+	if err == nil {
+		t.Fatal("FreeMemory should propagate non-2xx; got nil")
+	}
+	if !strings.Contains(err.Error(), "free not supported") {
+		t.Errorf("error should surface server body verbatim; got %v", err)
+	}
+}

@@ -141,6 +141,14 @@ type Stage struct {
 	// to the vibe profile that supervises the ComfyUI backend.
 	Workflow   string            `yaml:"workflow,omitempty"`
 	Parameters map[string]string `yaml:"parameters,omitempty"`
+	// FreeMemoryAfter, when true on a ComfyUI stage, asks the ComfyUI
+	// server to unload models + release VRAM after the workflow
+	// succeeds. Best-effort + non-fatal — a failure is logged and the
+	// stage still completes successfully. Designed for pipelines that
+	// run a single image_gen stage per run and want to free GPU memory
+	// for downstream LLM activations (iitn's compose_cover → next
+	// episode's long_form_exl3 is the canonical case).
+	FreeMemoryAfter bool `yaml:"free_memory_after,omitempty"`
 
 	// FFmpeg-stage fields. FFmpegArgs is the literal argv passed to ffmpeg
 	// (in order) after the binary; each entry is rendered as a Go template

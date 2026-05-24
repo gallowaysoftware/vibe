@@ -437,6 +437,35 @@ func (c *Client) FetchView(ctx context.Context, file OutputFile) (io.ReadCloser,
 	return resp.Body, nil
 }
 
+// FreeMemory asks the ComfyUI server to unload all model weights and release
+// any cached VRAM, keeping the server process itself alive. Used between
+// pipeline runs to free GPU memory for non-ComfyUI profiles (e.g. a
+// long_form_exl3 activation that needs ~28 GiB) without paying the ComfyUI
+// cold-start cost again on the next image_gen stage.
+//
+// POST /free with both unload_models + free_memory true. ComfyUI returns
+// no body; any non-2xx is reported verbatim. Soft-failure semantics — the
+// caller (vamp's ComfyUI executor) treats an error from this call as
+// non-fatal and logs it, since the workflow already succeeded.
+func (c *Client) FreeMemory(ctx context.Context) error {
+	body := strings.NewReader(`{"unload_models":true,"free_memory":true}`)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/free", body)
+	if err != nil {
+		return fmt.Errorf("comfyui: build /free request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return fmt.Errorf("comfyui: POST /free: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("comfyui: POST /free: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	return nil
+}
+
 // SaveOutputToFile fetches the named file and writes it to destPath. The
 // write is atomic: bytes go to destPath+".tmp" and are renamed into place on
 // success. Parent directories are created as needed. Returns the absolute

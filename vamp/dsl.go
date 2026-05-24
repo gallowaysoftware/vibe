@@ -702,6 +702,17 @@ func (c *ComfyUIStage) Parameter(key, value string) *ComfyUIStage {
 	return c
 }
 
+// FreeMemoryAfter asks the ComfyUI server to unload its models and release
+// VRAM after the workflow succeeds. Use on pipelines that run a single
+// image_gen stage per run (cover art, thumbnail, illustration) and want
+// the GPU back for a downstream LLM activation that won't fit alongside
+// SDXL-resident-in-VRAM. Best-effort: a failed free is logged but doesn't
+// fail the stage.
+func (c *ComfyUIStage) FreeMemoryAfter() *ComfyUIStage {
+	c.s.FreeMemoryAfter = true
+	return c
+}
+
 // ---- YouTube stages ----
 
 // YouTubeStage uploads a video to YouTube.

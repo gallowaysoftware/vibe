@@ -114,6 +114,20 @@ func (e *comfyuiExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 	if _, err := client.SaveOutputToFile(ctx, files[0], dest); err != nil {
 		return nil, fmt.Errorf("stage %s: save output: %w", st.ID, err)
 	}
+
+	// Best-effort: drop ComfyUI's resident model weights so a downstream
+	// LLM activation (e.g. iitn's next-episode write_script needing
+	// long_form_exl3) doesn't get squeezed out of VRAM by the SDXL pipeline
+	// that already did its work. Failures here don't fail the stage —
+	// the workflow already produced its output, and the worst case is
+	// the operator pays the same VRAM contention they would have paid
+	// without the field set.
+	if st.FreeMemoryAfter {
+		if err := client.FreeMemory(ctx); err != nil && in.Log != nil {
+			fmt.Fprintf(in.Log, "stage %s: free_memory_after: %v (continuing)\n", st.ID, err)
+		}
+	}
+
 	// Report ABSOLUTE path: downstream {{ .stages.X.output(s) }} references
 	// land on argv strings consumed by ffmpeg/Piper subprocesses running
 	// from the daemon's CWD, which can't resolve a path relative to RunDir.
