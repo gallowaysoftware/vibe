@@ -507,9 +507,11 @@ func checkCommonPorts() checkResult {
 	}
 	probes := []p{
 		{8080, "Open WebUI"},
+		{8880, "Kokoro-FastAPI TTS (tts_kokoro)"},
 		{14001, "SearXNG (vibe-chat sidecar)"},
-		{14002, "TEI embeddings (vibe-rag sidecar)"},
-		{14003, "TEI Prometheus (vibe-rag sidecar)"},
+		{14002, "SearXNG (searxng profile)"},
+		{14003, "TEI embeddings (tei profile)"},
+		{14010, "tabbyAPI (long_form_exl3 profile)"},
 		{6333, "Qdrant REST"},
 		{6334, "Qdrant gRPC"},
 	}
@@ -521,7 +523,7 @@ func checkCommonPorts() checkResult {
 		}
 	}
 	if len(bound) == 0 {
-		return checkResult{Name: name, Status: statusOK, Message: "8080/14001/14002/14003/6333/6334 free"}
+		return checkResult{Name: name, Status: statusOK, Message: "8080/8880/14001/14002/14003/14010/6333/6334 free"}
 	}
 	return checkResult{
 		Name:    name,
