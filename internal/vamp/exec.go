@@ -3596,11 +3596,18 @@ func mergeJSONTemplate(raw string) (string, error) {
 // parseJSONTemplate decodes the given JSON string. Returns the natural
 // Go shape (map[string]any / []any / float64 / string / bool / nil).
 //
-// Strips a leading ```json (or bare ```) markdown code fence before
-// parsing — LLMs producing structured output frequently wrap their
-// JSON in a fence even when the prompt asks for raw JSON. Trying to
-// fight this through prompt engineering alone has historically lost;
-// peeling the fence is the pragmatic move.
+// Tolerates two common LLM-output messes:
+//
+//  1. Markdown code fences — ```json ... ``` or bare ``` — frequently
+//     wrap JSON even when the prompt asks for raw output. Stripped
+//     before parsing.
+//  2. Thinking-mode preamble — Qwen3.6 / GLM / similar models in
+//     verbose-CoT mode emit "Here's a thinking process:" followed by
+//     bullets before the actual JSON. Extracts the first {…} or […]
+//     block by brace/bracket matching and parses just that.
+//
+// Fighting LLM output shape via prompt engineering alone has
+// historically lost; pragmatic extraction here is the cheaper fix.
 func parseJSONTemplate(s string) (any, error) {
 	raw := strings.TrimSpace(s)
 	if strings.HasPrefix(raw, "```") {
@@ -3611,10 +3618,86 @@ func parseJSONTemplate(s string) (any, error) {
 		raw = strings.TrimSpace(raw)
 	}
 	var v any
-	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+	if err := json.Unmarshal([]byte(raw), &v); err == nil {
+		return v, nil
+	}
+	// Fallback: extract the first balanced { … } or [ … ] block. Handles
+	// the "Here's a thinking process: …\n\n{…}" shape Qwen3.6 emits in
+	// its default verbose mode.
+	if extracted, ok := extractFirstJSONBlock(raw); ok {
+		if err := json.Unmarshal([]byte(extracted), &v); err == nil {
+			return v, nil
+		}
+	}
+	// Best-effort error: report the original Unmarshal failure on the
+	// pre-extraction string so the user sees something close to what
+	// they tried to parse.
+	var verr any
+	if err := json.Unmarshal([]byte(raw), &verr); err != nil {
 		return nil, fmt.Errorf("parseJSON: %w", err)
 	}
-	return v, nil
+	return verr, nil
+}
+
+// extractFirstJSONBlock walks `s` looking for the first '{' or '['
+// outside a string literal, then scans forward tracking nesting depth
+// and string state until the matching close. Returns the inner block
+// and ok=true on success.
+//
+// Doesn't validate JSON itself — leaves that to the caller's Unmarshal.
+// Tolerates escaped quotes inside strings. Does NOT handle unicode
+// escapes that produce { or [ — extraordinarily rare in practice.
+func extractFirstJSONBlock(s string) (string, bool) {
+	// Find first opener.
+	open := -1
+	var openCh byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '{' || c == '[' {
+			open = i
+			openCh = c
+			break
+		}
+	}
+	if open < 0 {
+		return "", false
+	}
+	closeCh := byte('}')
+	if openCh == '[' {
+		closeCh = ']'
+	}
+	depth := 0
+	inStr := false
+	escaped := false
+	for i := open; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case openCh:
+			depth++
+		case closeCh:
+			depth--
+			if depth == 0 {
+				return s[open : i+1], true
+			}
+		}
+	}
+	return "", false
 }
 
 // toJSONTemplate marshals v to its JSON representation. Compact form
