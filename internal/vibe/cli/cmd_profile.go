@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
@@ -87,7 +88,95 @@ func profileCmd() *cobra.Command {
 	cmd.AddCommand(profileInitCmd())
 	cmd.AddCommand(profileNewCmd())
 	cmd.AddCommand(profileSchemaCmd())
+	cmd.AddCommand(profileShowCmd())
+	cmd.AddCommand(profileListCmd())
 	return cmd
+}
+
+// profileShowCmd prints the loaded + validated profile YAML for a given
+// name. Resolves the on-disk path via ProfilesDir() and runs the full
+// profile.Load pipeline so the output reflects any tilde-expansion,
+// default-filling, or sanity-rejection the daemon would apply at
+// activation time.
+//
+// Why this exists: during audits / debugging the user kept resorting
+// to `cat ~/.config/vibe/profiles/<name>.yaml`, which (a) misses
+// validation, and (b) doesn't surface expanded paths. A first-class
+// command is one less mental step.
+func profileShowCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "show <name>",
+		Short: "Print the loaded + validated profile YAML for <name>.",
+		Long: "show reads $XDG_CONFIG_HOME/vibe/profiles/<name>.yaml, " +
+			"runs it through profile.Load (tilde expansion, defaults, " +
+			"validation), and prints the result. Errors out on " +
+			"missing files or validation failures so it doubles as a " +
+			"lint check.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			path := filepath.Join(paths.ProfilesDir(), name+".yaml")
+			if _, err := os.Stat(path); err != nil {
+				return fmt.Errorf("profile %q not found at %s (run `vibe profile list` to see available)", name, path)
+			}
+			p, err := profile.Load(path)
+			if err != nil {
+				return fmt.Errorf("profile %q failed to load: %w", name, err)
+			}
+			raw, err := yaml.Marshal(p)
+			if err != nil {
+				return fmt.Errorf("marshal profile: %w", err)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "# %s\n# loaded from %s\n%s",
+				name, path, string(raw))
+			return nil
+		},
+	}
+}
+
+// profileListCmd prints every profile YAML under ProfilesDir() with
+// its name + description + backend kind + mode. Counterpart to
+// `vibe profile show` for the "which profiles do I have" question.
+func profileListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List every profile YAML with name + description + backend + mode.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dir := paths.ProfilesDir()
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				return fmt.Errorf("read %s: %w", dir, err)
+			}
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "%-22s  %-10s  %-12s  %s\n", "NAME", "MODE", "BACKEND", "DESCRIPTION")
+			for _, e := range entries {
+				if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
+					continue
+				}
+				p, err := profile.Load(filepath.Join(dir, e.Name()))
+				if err != nil {
+					fmt.Fprintf(out, "%-22s  %-10s  %-12s  %s\n",
+						strings.TrimSuffix(e.Name(), ".yaml"), "?", "?",
+						fmt.Sprintf("(invalid: %v)", err))
+					continue
+				}
+				backend := "?"
+				switch {
+				case p.Backend.LlamaServer != nil:
+					backend = "llama_server"
+				case p.Backend.TabbyAPI != nil:
+					backend = "tabby_api"
+				case p.Backend.HTTPServer != nil:
+					backend = "http_server"
+				case p.Backend.ComfyUI != nil:
+					backend = "comfyui"
+				}
+				fmt.Fprintf(out, "%-22s  %-10s  %-12s  %s\n",
+					p.Name, p.ResolvedMode(), backend, p.Description)
+			}
+			return nil
+		},
+	}
 }
 
 // profileKindEnum is the user-facing --kind values for `vibe profile new`.
