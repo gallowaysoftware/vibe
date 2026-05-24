@@ -210,6 +210,21 @@ func TabbyAPISpec(p *Profile) (supervisor.LaunchSpec, error) {
 		// friction without security value. Users who want auth can
 		// front the proxy with their own gate.
 		"--disable-auth", "True",
+		// vibe_defaults applies sane fallback sampler values
+		// (min_p 0.05, repetition_penalty 1.05, top_p 0.9, temp 0.7)
+		// when the client request omits them. Without these fallbacks,
+		// EXL3 at low temperature collapses into repetition loops on
+		// prompts that only send `temperature` + `max_tokens` (vamp's
+		// default request shape) — e.g. iitn's edit_script at temp
+		// 0.4 produced "kompil kompil kompil" infinite loops. GGUF /
+		// llama-server has its own defaults baked in; tabbyAPI does
+		// not, hence the explicit preset.
+		//
+		// The bundled `safe_defaults` preset only sets temperature +
+		// top_p, which doesn't address the actual repetition trigger
+		// (missing min_p / repetition_penalty). vibe_defaults.yml is
+		// a custom preset shipped to <Repo>/sampler_overrides/.
+		"--override-preset", "vibe_defaults",
 	}
 	if t.CacheMode != "" {
 		args = append(args, "--cache-mode", t.CacheMode)
