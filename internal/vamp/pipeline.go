@@ -1562,6 +1562,13 @@ var knownTextParamKeys = []string{
 	"tool_choice",
 	"parallel_tool_calls",
 	"user",
+	// chat_template_kwargs: forwarded by tabbyAPI / vLLM / SGLang to
+	// the model's chat-template renderer. The known consumer today is
+	// Qwen3's `enable_thinking` hard-switch
+	// (`{"enable_thinking": false}` skips the verbose CoT preamble on
+	// strict-JSON output stages). Ignored by llama-server, which
+	// makes it safe to set unconditionally on a stage.
+	"chat_template_kwargs",
 }
 
 // validateParamsKeys rejects any key in params that is not a member of the
