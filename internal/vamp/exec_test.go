@@ -2394,6 +2394,17 @@ func TestExecutor_VRAMFallbackPicksNextCandidate(t *testing.T) {
 	if !strings.Contains(logTxt, `activating profile "code_small"`) {
 		t.Errorf("log missing activation notice for 'code_small': %s", logTxt)
 	}
+
+	// End-of-run summary should name the capability + the profile that
+	// actually answered, AND flag that 1st-choice 'code' was skipped.
+	// Surfacing this at run end keeps the fallback visible after the
+	// scrolling skip lines drift past in long runs.
+	if !strings.Contains(logTxt, `capability "reasoning" resolved to profile "code_small"`) {
+		t.Errorf("log missing resolution summary line: %s", logTxt)
+	}
+	if !strings.Contains(logTxt, `fallback`) || !strings.Contains(logTxt, `"code"`) {
+		t.Errorf("log missing [fallback] marker naming the skipped 1st-choice: %s", logTxt)
+	}
 }
 
 // TestExecutor_VRAMFallbackAllCandidatesFail confirms that when EVERY

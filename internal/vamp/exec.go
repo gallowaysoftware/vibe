@@ -302,6 +302,13 @@ type Executor struct {
 	// this to explain "why did stage X re-run on this attempt?"
 	// Guarded by mu.
 	cacheHits map[string]bool
+	// resolvedCapabilities records which vibe profile satisfied each
+	// capability for this run. Updated on every successful candidate
+	// activation; if a capability is touched more than once the value
+	// reflects the LAST profile to win, which is the right answer for
+	// the end-of-run summary (the operator wants to know what their
+	// LLM stages most recently ran on). Guarded by mu.
+	resolvedCapabilities map[string]string
 	// logMu serializes writes to Log from concurrent stages so buffered
 	// stage outputs land contiguously even when status lines from the
 	// scheduler are interleaved.
@@ -559,6 +566,7 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 			}
 		}
 	}
+	e.logCapabilityResolutionSummary()
 	e.logf("pipeline %q finished, outputs in %s", e.Pipeline.Name, e.RunDir)
 	// If any stage errored over the course of the run, surface a single
 	// aggregated error so callers (including tests) still observe the
@@ -581,6 +589,48 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 	// log for backward compatibility with anything scanning Log for the
 	// "finished" sentinel (e.g. tests).
 	return nil
+}
+
+// logCapabilityResolutionSummary prints one log line per capability that
+// fired during the run, naming the profile that actually answered. When the
+// resolved profile wasn't the 1st-choice candidate from capabilities.yaml
+// the line is marked "[fallback]" so the operator sees, at the end of a long
+// run, that they got a smaller / different model than the pipeline author
+// intended — usually a VRAM-rejection during candidate walking.
+//
+// Best-effort: silent when there were no capability-bearing stages
+// (Render-only pipelines), and silent when Capabilities is nil (some
+// tests). Stable iteration order by capability name so output diffs cleanly.
+func (e *Executor) logCapabilityResolutionSummary() {
+	e.mu.Lock()
+	resolved := make(map[string]string, len(e.resolvedCapabilities))
+	for k, v := range e.resolvedCapabilities {
+		resolved[k] = v
+	}
+	e.mu.Unlock()
+	if len(resolved) == 0 {
+		return
+	}
+
+	caps := make([]string, 0, len(resolved))
+	for c := range resolved {
+		caps = append(caps, c)
+	}
+	sort.Strings(caps)
+
+	for _, capability := range caps {
+		profile := resolved[capability]
+		marker := ""
+		// Compare against the declared candidate list. The 1st entry is
+		// the pipeline author's preferred choice; anything else is a
+		// fallback worth surfacing loudly.
+		if e.Capabilities != nil {
+			if cands, err := e.Capabilities.Profiles(capability); err == nil && len(cands) > 0 && cands[0] != profile {
+				marker = fmt.Sprintf(" [fallback — 1st-choice %q skipped]", cands[0])
+			}
+		}
+		e.logf("capability %q resolved to profile %q%s", capability, profile, marker)
+	}
 }
 
 // shouldRunStage decides whether a freshly-ready stage should fire based
@@ -912,6 +962,12 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 		}
 		status = st
 		picked = true
+		e.mu.Lock()
+		if e.resolvedCapabilities == nil {
+			e.resolvedCapabilities = make(map[string]string)
+		}
+		e.resolvedCapabilities[capability] = cand
+		e.mu.Unlock()
 		break
 	}
 	if !picked {
