@@ -191,15 +191,19 @@ func fillReplacements(t *testing.T, body, kind string) string {
 		// REPLACE-marked items are advisory ("REPLACE if you...").
 		// No-op fill is enough for the loader to accept it.
 	case "tabby-api":
-		// The tabby-api template requires several REPLACE markers be
-		// real-shaped. We stub a fake model dir + repo + venv so
-		// profile.Validate accepts the loaded form.
-		modelDir := writeTabbyModelStub(t)
+		// The tabby-api template requires the model_dir basename to
+		// match the alias (validator enforces this). We name both
+		// "test-model".
+		modelParent := writeTabbyModelStub(t)
+		modelDir := filepath.Join(modelParent, "test-model")
+		if err := os.MkdirAll(modelDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
 		repoDir := writeTabbyRepoStub(t)
 		venvDir := writeTabbyVenvStub(t)
 		body = strings.ReplaceAll(body, "~/models/exl3/REPLACE-model-name", modelDir)
 		body = strings.ReplaceAll(body, "REPLACE-org/REPLACE-repo", "example/exl3-model")
-		body = strings.ReplaceAll(body, "REPLACE-model-name", "test-alias")
+		body = strings.ReplaceAll(body, "REPLACE-model-name", "test-model")
 		body = strings.ReplaceAll(body, "~/.local/state/vibe/tabby-venv", venvDir)
 		body = strings.ReplaceAll(body, "~/src/tabbyAPI", repoDir)
 	default:

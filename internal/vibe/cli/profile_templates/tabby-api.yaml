@@ -31,7 +31,9 @@ backend:
   tabby_api:
     # REPLACE: path to the EXL3 model directory on disk. `vibe pull`
     # populates this from the huggingface block; pre-place the snapshot
-    # yourself if you'd rather not pull through vibe.
+    # yourself if you'd rather not pull through vibe. NOTE: the basename
+    # of this path becomes the model id tabbyAPI exposes — must match
+    # `alias` below.
     model_dir: ~/models/exl3/REPLACE-model-name
     huggingface:
       # REPLACE: HF repo holding the EXL3 snapshot. Common quantiser

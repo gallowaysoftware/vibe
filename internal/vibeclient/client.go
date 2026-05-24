@@ -267,17 +267,43 @@ func IsVRAMRejection(err error) bool {
 	return strings.Contains(ce.Message(), "free VRAM")
 }
 
-// EnsureActive returns immediately if `profile` is already the active, ready
-// profile. Otherwise it stops any active profile and starts `profile`.
+// EnsureActive ensures `profile` is up and ready, regardless of whether
+// it's defined as active-mode or service-mode in its YAML.
+//
+// Resolution order:
+//
+//  1. If `profile` is already the active, ready profile → return it.
+//  2. If `profile` is already running as a service (e.g. tts_kokoro,
+//     searxng, embed_bge_large) → return that service's status. This
+//     is what makes vamp's capability resolver work transparently
+//     against service-mode sidecars: a stage can declare
+//     Capability("tts") and the runner will activate "tts_kokoro"
+//     without caring whether it's a single-slot active LLM or a
+//     long-running sidecar.
+//  3. Otherwise → stop the current active (if any) and start
+//     `profile` as the new active. (The daemon rejects starting a
+//     service-mode profile as active with a clear error, which is
+//     what we want for misconfigured pipelines.)
+//
+// Before this routing existed, every iitn episode failed because
+// cast_aria's Capability("tts") resolved to "tts_kokoro" and step 3
+// would unconditionally Stop+Start, only to have the daemon reject
+// the Start with already_exists.
 func (c *Client) EnsureActive(ctx context.Context, profile string) (*vibev1.Status, error) {
-	s, err := c.Status(ctx)
+	resp, err := c.rpc.Status(ctx, connect.NewRequest(&vibev1.StatusRequest{}))
 	if err != nil {
 		return nil, err
 	}
-	if s.Running && s.Ready && s.Profile == profile {
-		return s, nil
+	active := resp.Msg.Status
+	if active != nil && active.Running && active.Ready && active.Profile == profile {
+		return active, nil
 	}
-	if s.Running {
+	for _, svc := range resp.Msg.Services {
+		if svc != nil && svc.Profile == profile && svc.Ready {
+			return svc, nil
+		}
+	}
+	if active != nil && active.Running {
 		if _, err := c.Stop(ctx); err != nil {
 			return nil, err
 		}

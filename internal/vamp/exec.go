@@ -3595,9 +3595,23 @@ func mergeJSONTemplate(raw string) (string, error) {
 
 // parseJSONTemplate decodes the given JSON string. Returns the natural
 // Go shape (map[string]any / []any / float64 / string / bool / nil).
+//
+// Strips a leading ```json (or bare ```) markdown code fence before
+// parsing — LLMs producing structured output frequently wrap their
+// JSON in a fence even when the prompt asks for raw JSON. Trying to
+// fight this through prompt engineering alone has historically lost;
+// peeling the fence is the pragmatic move.
 func parseJSONTemplate(s string) (any, error) {
+	raw := strings.TrimSpace(s)
+	if strings.HasPrefix(raw, "```") {
+		raw = strings.TrimPrefix(raw, "```json")
+		raw = strings.TrimPrefix(raw, "```JSON")
+		raw = strings.TrimPrefix(raw, "```")
+		raw = strings.TrimSuffix(strings.TrimSpace(raw), "```")
+		raw = strings.TrimSpace(raw)
+	}
 	var v any
-	if err := json.Unmarshal([]byte(s), &v); err != nil {
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
 		return nil, fmt.Errorf("parseJSON: %w", err)
 	}
 	return v, nil

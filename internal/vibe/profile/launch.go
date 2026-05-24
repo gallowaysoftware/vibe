@@ -156,20 +156,34 @@ func sortStrings(s []string) {
 
 // TabbyAPISpec returns the LaunchSpec for a tabbyAPI-backed profile.
 //
-// argv: <venv>/bin/python start.py --model-dir <ModelDir> --port <Port>
-//       --max-seq-len <Context> [--cache-mode <CacheMode>]
-//       [--draft-model-dir <DraftModelDir>] [extra_args...]
+// argv: <venv>/bin/python main.py
+//       --host 127.0.0.1 --port <Port>
+//       --backend exllamav3
+//       --model-dir <parent-of-ModelDir>
+//       --model-name <basename-of-ModelDir>   (== Alias, validator-enforced)
+//       --max-seq-len <Context>
+//       [--cache-mode <CacheMode>]
+//       [--draft-model-dir <DraftModelDir-parent> --draft-model-name <...basename>]
+//       [extra_args...]
 //       (run from <Repo> as workdir)
 //
-// HealthURL: /health — tabbyAPI exposes a small JSON readiness endpoint
-// once the model has finished loading. Health-check returns 503 during
-// load and 200 once ready, so the supervisor waiting on a 2xx is the
-// right gate even for slow EXL3 loads (~30-90s for a 32B).
+// **Why model-dir + model-name instead of a single path**: tabbyAPI
+// addresses a model as a *name* inside a *models directory* (mirroring
+// how it works in the web UI). The basename of the EXL3 snapshot dir
+// becomes that name; the parent becomes --model-dir. The validator
+// enforces Alias === basename(ModelDir) so vamp's `model:` field
+// always lines up with what tabbyAPI loads.
 //
-// Note: tabbyAPI's start.py prefers a config file, but every knob we
-// expose also has a CLI flag. We use the CLI form because it stays
-// pure-stateless: no temp config files to write or clean up, the
-// argv is fully reproducible from the profile YAML alone.
+// HealthURL: /health — tabbyAPI's readiness endpoint returns 503
+// during model load and 200 once ready, so the supervisor waiting on
+// a 2xx is the right gate even for slow EXL3 loads (~30-90s for a 32B).
+//
+// **Why CLI args, not config.yml**: tabbyAPI looks for config.yml in
+// its current working directory at startup. We could write a temp
+// one, but every knob we need is exposed as a CLI arg derived from
+// the Pydantic schema, so the argv form stays pure-stateless: no
+// temp files to write or clean up, fully reproducible from the
+// profile YAML alone.
 func TabbyAPISpec(p *Profile) (supervisor.LaunchSpec, error) {
 	if p == nil || p.Backend.TabbyAPI == nil {
 		return supervisor.LaunchSpec{}, errors.New("TabbyAPISpec: profile has no tabby_api backend")
@@ -178,19 +192,33 @@ func TabbyAPISpec(p *Profile) (supervisor.LaunchSpec, error) {
 	if t.Port <= 0 {
 		return supervisor.LaunchSpec{}, errors.New("TabbyAPISpec: backend.tabby_api.port must be > 0")
 	}
+	if t.ModelDir == "" {
+		return supervisor.LaunchSpec{}, errors.New("TabbyAPISpec: backend.tabby_api.model_dir is required at launch time (pull the snapshot first)")
+	}
+	modelParent := filepath.Dir(t.ModelDir)
+	modelName := filepath.Base(t.ModelDir)
 	args := []string{
-		"start.py",
+		"main.py",
 		"--host", "127.0.0.1",
 		"--port", strconv.Itoa(t.Port),
-		"--model-dir", t.ModelDir,
+		"--backend", "exllamav3",
+		"--model-dir", modelParent,
+		"--model-name", modelName,
 		"--max-seq-len", strconv.Itoa(t.Context),
-		"--model-alias", t.Alias,
+		// vibe binds tabbyAPI to 127.0.0.1 and consumes it through the
+		// proxy on a different loopback port — auth at this layer adds
+		// friction without security value. Users who want auth can
+		// front the proxy with their own gate.
+		"--disable-auth", "True",
 	}
 	if t.CacheMode != "" {
 		args = append(args, "--cache-mode", t.CacheMode)
 	}
 	if t.DraftModelDir != "" {
-		args = append(args, "--draft-model-dir", t.DraftModelDir)
+		args = append(args,
+			"--draft-model-dir", filepath.Dir(t.DraftModelDir),
+			"--draft-model-name", filepath.Base(t.DraftModelDir),
+		)
 	}
 	args = append(args, t.ExtraArgs...)
 

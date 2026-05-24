@@ -588,6 +588,16 @@ func validateTabbyAPI(t *TabbyAPIBackend) error {
 			return fmt.Errorf("backend.tabby_api.cache_mode %q: must be one of FP16, Q8, Q6, Q4", t.CacheMode)
 		}
 	}
+	// tabbyAPI loads models by name from inside a models dir, so the
+	// alias vamp uses MUST match the on-disk dir basename. Enforce
+	// consistency at load time rather than letting a confused "no
+	// such model" error surface later.
+	if t.ModelDir != "" {
+		want := filepath.Base(t.ModelDir)
+		if t.Alias != want {
+			return fmt.Errorf("backend.tabby_api.alias %q must equal basename(model_dir) = %q (tabbyAPI addresses models by name inside their parent dir)", t.Alias, want)
+		}
+	}
 	return nil
 }
 

@@ -716,7 +716,10 @@ func (d *Daemon) Pull(ctx context.Context, req *connect.Request[vibev1.PullReque
 		if err := stream.Send(&vibev1.PullProgress{Phase: vibev1.PullProgress_PHASE_RESOLVING}); err != nil {
 			return err
 		}
-		hfCli := filepath.Join(t.Venv, "bin", "huggingface-cli")
+		// huggingface_hub renamed the CLI from `huggingface-cli` to `hf`
+		// — the venv ships the new name. Use it directly; the old name
+		// just prints a deprecation banner and exits non-zero.
+		hfCli := filepath.Join(t.Venv, "bin", "hf")
 		args := []string{"download", t.Huggingface.Repo, "--local-dir", t.ModelDir}
 		if t.Huggingface.Revision != "" {
 			args = append(args, "--revision", t.Huggingface.Revision)
