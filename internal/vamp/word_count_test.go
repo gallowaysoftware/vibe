@@ -30,6 +30,49 @@ func TestWordCount_Empty(t *testing.T) {
 	}
 }
 
+func TestSplitSentences_Short(t *testing.T) {
+	// Under threshold → returned as one chunk.
+	got := splitSentencesTemplate("She breathed in.", 300)
+	if got != `["She breathed in."]` {
+		t.Errorf("got %s", got)
+	}
+}
+
+func TestSplitSentences_MultiSentence(t *testing.T) {
+	// Greedy packs as many whole sentences as fit. First two combine
+	// to 29 chars (under 30); third starts a new chunk.
+	in := "She breathed in. She held it. She let it out."
+	got := splitSentencesTemplate(in, 30)
+	want := `["She breathed in. She held it.","She let it out."]`
+	if got != want {
+		t.Errorf("got %s\nwant %s", got, want)
+	}
+}
+
+func TestSplitSentences_GreedyPack(t *testing.T) {
+	// Threshold large enough to pack 2 sentences per chunk.
+	in := "One. Two. Three. Four."
+	got := splitSentencesTemplate(in, 10)
+	// "One. Two." = 9 chars, "Three." = 6, "Four." = 5
+	// Greedy: pack One+Two (9), then Three+Four (11 over budget, so Three alone then Four).
+	// Actually: "Three." = 6 + 1 + "Four." = 12, over 10 → split.
+	want := `["One. Two.","Three.","Four."]`
+	if got != want {
+		t.Errorf("got %s\nwant %s", got, want)
+	}
+}
+
+func TestSplitSentences_SingleLongSentence(t *testing.T) {
+	// A single 80-char sentence over a 30-char limit stays as one chunk —
+	// splitting mid-clause is worse than one long call.
+	in := "The room is a cube with rounded corners and a magnetic seal on the door."
+	got := splitSentencesTemplate(in, 30)
+	want := `["The room is a cube with rounded corners and a magnetic seal on the door."]`
+	if got != want {
+		t.Errorf("got %s\nwant %s", got, want)
+	}
+}
+
 func TestMulInt(t *testing.T) {
 	cases := []struct {
 		n    int

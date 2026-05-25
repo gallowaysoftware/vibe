@@ -2329,7 +2329,102 @@ func templateFuncs() template.FuncMap {
 		"ttsNormalize":               ttsNormalizeTemplate,
 		"wordCount":                  wordCountTemplate,
 		"mulInt":                     mulIntTemplate,
+		"addInt":                     addIntTemplate,
+		"splitSentences":             splitSentencesTemplate,
 	}
+}
+
+// addIntTemplate adds two integers. Use in prompts / pipelines that
+// need to accumulate a counter across nested template ranges (Go
+// text/template has no native arithmetic). Example: emitting
+// sequential IDs across nested foreach loops where the outer counter
+// must persist across inner iterations.
+func addIntTemplate(a, b int) int {
+	return a + b
+}
+
+// splitSentencesTemplate splits a string into chunks no larger than
+// maxChars, cutting only at sentence boundaries (period, question
+// mark, or exclamation followed by whitespace). Greedy: packs as many
+// whole sentences as fit, then starts a new chunk. A single sentence
+// longer than maxChars is emitted as its own chunk (no sub-sentence
+// splitting — splitting mid-clause produces worse TTS prosody than
+// one long sentence).
+//
+// Use case: TTS engines like Kokoro rush long multi-sentence
+// paragraphs, eliding interior comma pauses. Splitting at sentence
+// boundaries puts a natural inter-segment silence between sentences,
+// restoring prosodic structure that long-call rushing destroys.
+// Sub-300 character chunks render cleanly.
+//
+// Returns a JSON array of strings; the caller is responsible for
+// re-wrapping each chunk with its source segment's host/voice/id.
+// maxChars <= 0 defaults to 300.
+func splitSentencesTemplate(text string, maxChars int) string {
+	if maxChars <= 0 {
+		maxChars = 300
+	}
+	text = strings.TrimSpace(text)
+	if len(text) <= maxChars {
+		b, _ := json.Marshal([]string{text})
+		return string(b)
+	}
+
+	// Walk text, cutting at . ! ? followed by whitespace (or EOF).
+	var sentences []string
+	var cur strings.Builder
+	runes := []rune(text)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		cur.WriteRune(r)
+		if r == '.' || r == '!' || r == '?' {
+			// End-of-text or next char is whitespace → sentence boundary.
+			if i == len(runes)-1 || isSpaceRune(runes[i+1]) {
+				s := strings.TrimSpace(cur.String())
+				if s != "" {
+					sentences = append(sentences, s)
+				}
+				cur.Reset()
+			}
+		}
+	}
+	if tail := strings.TrimSpace(cur.String()); tail != "" {
+		sentences = append(sentences, tail)
+	}
+	if len(sentences) == 0 {
+		b, _ := json.Marshal([]string{text})
+		return string(b)
+	}
+
+	// Greedy pack sentences into chunks.
+	var chunks []string
+	var pack strings.Builder
+	for _, s := range sentences {
+		next := pack.Len()
+		if next > 0 {
+			next += 1 // space between sentences
+		}
+		next += len(s)
+		if pack.Len() == 0 || next <= maxChars {
+			if pack.Len() > 0 {
+				pack.WriteRune(' ')
+			}
+			pack.WriteString(s)
+		} else {
+			chunks = append(chunks, pack.String())
+			pack.Reset()
+			pack.WriteString(s)
+		}
+	}
+	if pack.Len() > 0 {
+		chunks = append(chunks, pack.String())
+	}
+	b, _ := json.Marshal(chunks)
+	return string(b)
+}
+
+func isSpaceRune(r rune) bool {
+	return r == ' ' || r == '\t' || r == '\n' || r == '\r'
 }
 
 // wordCountTemplate returns the whitespace-delimited word count of the
