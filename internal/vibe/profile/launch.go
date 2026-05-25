@@ -30,9 +30,9 @@ func LlamaServerSpec(p *Profile, binary string, port int) (supervisor.LaunchSpec
 		"--ctx-size", strconv.Itoa(m.Context),
 		"--parallel", strconv.Itoa(m.Parallel),
 	}
-	if m.GPULayers > 0 {
-		args = append(args, "--n-gpu-layers", strconv.Itoa(m.GPULayers))
-	}
+	// Always pass --n-gpu-layers so that `gpu_layers: 0` (force-CPU)
+	// is respected. Without this, llama-server defaults to using GPU.
+	args = append(args, "--n-gpu-layers", strconv.Itoa(m.GPULayers))
 	if m.FlashAttn {
 		args = append(args, "--flash-attn", "on")
 	}
