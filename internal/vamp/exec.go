@@ -2327,7 +2327,30 @@ func templateFuncs() template.FuncMap {
 		"extractSVGText":             extractSVGTextTemplate,
 		"chunkParagraphs":            chunkParagraphsTemplate,
 		"ttsNormalize":               ttsNormalizeTemplate,
+		"wordCount":                  wordCountTemplate,
+		"mulInt":                     mulIntTemplate,
 	}
+}
+
+// wordCountTemplate returns the whitespace-delimited word count of the
+// supplied text. Use when a downstream stage prompt needs the model
+// to know exactly how long the prior stage's output is (e.g.,
+// mode-switched edit passes that branch on draft length). The model's
+// own paragraph-proxy estimates are unreliable; passing in the
+// authoritative count removes that variable. Matches `wc -w`
+// semantics: split on runs of whitespace, ignore leading / trailing
+// blanks.
+func wordCountTemplate(text string) int {
+	return len(strings.Fields(text))
+}
+
+// mulIntTemplate multiplies an integer by a float multiplier and
+// returns the truncated integer result. Use in prompts that need to
+// state a derived target (e.g., "draft is N words → aim for N*1.5").
+// Truncation matches Go's int conversion; rounding is the caller's
+// concern when it matters.
+func mulIntTemplate(n int, mult float64) int {
+	return int(float64(n) * mult)
 }
 
 // chunkParagraphsTemplate splits text into JSON-encoded chunks
