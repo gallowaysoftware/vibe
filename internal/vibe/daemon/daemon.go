@@ -419,9 +419,9 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 		}
 		d.prx.SetBackend(backendURL)
 	}
-	// Frontend activation is llama-server-only: only those profiles have
-	// a separate UI/client process to launch.
-	if p.Backend.LlamaServer != nil {
+	// Frontend activation for llama_server and tabby_api — both may have
+	// a separate UI/client process to launch (e.g. Open WebUI via docker-compose).
+	if p.Backend.LlamaServer != nil || p.Backend.TabbyAPI != nil {
 		if p.Frontend.Kind != "" {
 			// Pre-create the per-profile frontend state dir so docker-compose
 			// bind mounts (and any other path the profile points inside it)
@@ -435,10 +435,16 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 			}
 
 			vibeAPI := fmt.Sprintf("http://127.0.0.1:%d/v1", d.cfg.ProxyPort)
+			alias := ""
+			ctxLen := 0
+			if p.Backend.LlamaServer != nil {
+				alias = p.Backend.LlamaServer.Alias
+				ctxLen = p.Backend.LlamaServer.Context
+			}
 			ectx := profile.ExpandContext{
 				VibeAPI:      vibeAPI,
-				ModelAlias:   p.Backend.LlamaServer.Alias,
-				ModelContext: p.Backend.LlamaServer.Context,
+				ModelAlias:   alias,
+				ModelContext: ctxLen,
 				VibeStateDir: paths.StateHome(),
 			}
 			if req.Msg.Foreground {
