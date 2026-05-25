@@ -180,7 +180,14 @@ them before pushing.
   ground-truth strings even when small fonts in the raster blur),
   `mergeJSON(ndjson)`, `parseJSON`, `toJSON`, `urlencode`,
   `stripDataURIs`, `truncate`, `flattenItems`, `uniqueByKey`,
-  `joinPath(parts...)`.
+  `joinPath(parts...)`, `wordCount(text)` (returns int — for prompts
+  that need authoritative word counts instead of model self-estimates,
+  e.g., mode-switched edit passes), `mulInt(n, mult)` (int × float →
+  int, for derived numeric targets in prompt prose), `addInt(a, b)`
+  (int arithmetic across nested template ranges; Go templates lack
+  native arithmetic), `splitSentences(text, maxChars)` (JSON array of
+  greedy-packed sentence chunks under maxChars — TTS-friendly chop
+  for long paragraphs that engines like Kokoro otherwise rush).
 - **Concat WAVs.** `Stage.ConcatWavs` on an `ffmpeg` stage auto-globs
   all `*.wav` files, creates a concat list, and merges into the output
   MP3. Implemented in `ffmpeg_executor.go:executeConcatWavs`.

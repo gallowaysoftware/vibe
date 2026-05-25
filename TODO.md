@@ -10,6 +10,26 @@
 
 ## Recently shipped
 
+- **Four new template helpers: `wordCount`, `mulInt`, `addInt`,
+  `splitSentences`** (2026-05-25). Mechanical-guarantee helpers for
+  pipelines that need deterministic shape from upstream LLM output.
+  `wordCount(text)` returns int — drives mode-switched stages that
+  branch on prior-stage length (e.g., worldsmith's edit_story EXPAND
+  / EXTEND / POLISH / TRIM dispatch). `mulInt(n, mult)` /
+  `addInt(a, b)` give Go templates the arithmetic the stdlib omits
+  (sequential counters across nested ranges, derived numeric
+  targets in prompt prose). `splitSentences(text, maxChars)` chops
+  long prose at sentence boundaries, greedy-packed under maxChars —
+  worldsmith uses it to cap Kokoro segments at 300 chars (Kokoro
+  rushes calls over that and elides interior comma pauses). All four
+  registered in `exec.go:templateFuncs` and documented in
+  `AGENTS.md`. Underlying pattern: when an LLM pipeline needs a
+  mechanical guarantee (mode dispatch, length cap, segment chopping,
+  distribution targets), do it at template-render time; models
+  treat prompt rules as advisory even when phrased as hard
+  requirements. Three real worldsmith failures validated this on
+  the apostolate-concord install 001 run.
+
 - **EXL3 + tabbyAPI integration** (2026-05-24). New `tabby_api` backend
   for vibe profiles, supervised alongside llama-server / comfyui /
   http_server. Ships a `vibe_defaults` sampler preset (`min_p 0.05`,
