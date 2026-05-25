@@ -358,6 +358,14 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 		if err != nil {
 			return "", fmt.Errorf("cache key: render audio text: %w", err)
 		}
+		// Voice is template-rendered too (mirroring audioExecutor.Execute)
+		// so per-item voice routing produces per-item cache keys. Static
+		// voice IDs (no `{{`) template-render to themselves so legacy
+		// audio stages hit the same key as before this change.
+		voice, err := renderTemplate(st.ID+":voice", st.Voice, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+		if err != nil {
+			return "", fmt.Errorf("cache key: render audio voice: %w", err)
+		}
 		engine := st.Engine
 		if engine == "" {
 			engine = AudioEnginePiper
@@ -369,7 +377,7 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 			}
 			return stageCacheKey(keyInput{
 				StageType:    StageTypeAudio,
-				Voice:        st.Voice,
+				Voice:        voice,
 				RenderedText: text,
 				AudioEngine:  AudioEngineKokoro,
 				AudioURL:     url,
@@ -385,7 +393,7 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 			voicesDir = defaultVoicesDirPath
 		}
 		voicesDir = expandAudioTilde(voicesDir)
-		voicePath := filepath.Join(voicesDir, st.Voice+".onnx")
+		voicePath := filepath.Join(voicesDir, voice+".onnx")
 		size, err := cache.FileSize(voicePath)
 		if err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
@@ -395,7 +403,7 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 		}
 		return stageCacheKey(keyInput{
 			StageType:      StageTypeAudio,
-			Voice:          st.Voice,
+			Voice:          voice,
 			RenderedText:   text,
 			Binary:         st.Binary,
 			VoiceModelSize: size,

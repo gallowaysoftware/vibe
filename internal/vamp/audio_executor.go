@@ -131,6 +131,24 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 		return nil, fmt.Errorf("stage %s: rendered text is empty — st.Text template produced no content", st.ID)
 	}
 
+	// Render Voice as a template so per-foreach-item voice routing
+	// works: a worldsmith-style "{{ .segment.voice_id }}" pattern picks
+	// up the speaker-specific Kokoro voice per segment, letting one
+	// audio stage narrate every named character in their own timbre
+	// without splitting the pipeline into N stages. Backward compatible:
+	// static voice IDs (the historical case) template-render to
+	// themselves.
+	voice, err := renderTemplate(st.ID+":voice", st.Voice, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
+	if err != nil {
+		return nil, fmt.Errorf("stage %s: render voice: %w", st.ID, err)
+	}
+	if strings.TrimSpace(voice) == "" {
+		if st.Foreach != nil {
+			return nil, fmt.Errorf("stage %s: rendered voice is empty (item %d under %q) — the upstream item is missing the voice field this stage templates against", st.ID, in.ItemIdx, st.Foreach.Var)
+		}
+		return nil, fmt.Errorf("stage %s: rendered voice is empty — st.Voice template produced no content", st.ID)
+	}
+
 	// Render the output path. Audio stages own their own output write so
 	// we render here and pass the absolute path to whichever engine writes
 	// the file (piper subprocess via --output-file, kokoro path via our
@@ -153,7 +171,7 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 	}
 	switch engine {
 	case AudioEngineKokoro:
-		return a.executeKokoro(ctx, in, st, text, outAbs, outRel)
+		return a.executeKokoro(ctx, in, st, text, voice, outAbs, outRel)
 	case AudioEnginePiper:
 		// fallthrough to legacy piper path below
 	default:
@@ -171,10 +189,10 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 		voicesDir = defaultVoicesDirPath
 	}
 	voicesDir = expandAudioTilde(voicesDir)
-	voicePath := filepath.Join(voicesDir, st.Voice+".onnx")
+	voicePath := filepath.Join(voicesDir, voice+".onnx")
 	if _, err := os.Stat(voicePath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("stage %s: voice model %q not found at %s (download Piper voices from %s and place the .onnx file in %s)", st.ID, st.Voice, voicePath, piperVoicesURL, voicesDir)
+			return nil, fmt.Errorf("stage %s: voice model %q not found at %s (download Piper voices from %s and place the .onnx file in %s)", st.ID, voice, voicePath, piperVoicesURL, voicesDir)
 		}
 		return nil, fmt.Errorf("stage %s: stat voice model %s: %w", st.ID, voicePath, err)
 	}
@@ -195,7 +213,7 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 	// Stream a status line for the live single-stage path so users see
 	// something happen between "queued" and "wav written".
 	if in.Log != nil {
-		fmt.Fprintf(in.Log, "piper: %s (voice=%s, %d chars)\n", outRel, st.Voice, len(text))
+		fmt.Fprintf(in.Log, "piper: %s (voice=%s, %d chars)\n", outRel, voice, len(text))
 	}
 	if err := runner.Run(ctx, binary, args, text); err != nil {
 		return nil, fmt.Errorf("stage %s: piper: %w", st.ID, err)
@@ -216,7 +234,7 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 // `{"model": "kokoro", "input": "<text>", "voice": "<voice>", "response_format": "wav"}`,
 // raw WAV bytes back in the response body. Server timeout is generous (2 min
 // per chunk) to tolerate startup latency on cold starts.
-func (a *audioExecutor) executeKokoro(ctx context.Context, in StageInput, st *Stage, text, outAbs, outRel string) (*StageOutput, error) {
+func (a *audioExecutor) executeKokoro(ctx context.Context, in StageInput, st *Stage, text, voice, outAbs, outRel string) (*StageOutput, error) {
 	// Precedence: explicit engine_url > active vibe profile's proxy URL
 	// (when the stage declares a capability) > the localhost
 	// Kokoro-FastAPI default. The capability path is the right answer for
@@ -234,7 +252,7 @@ func (a *audioExecutor) executeKokoro(ctx context.Context, in StageInput, st *St
 	body, err := json.Marshal(map[string]any{
 		"model":           "kokoro",
 		"input":           text,
-		"voice":           st.Voice,
+		"voice":           voice,
 		"response_format": "wav",
 	})
 	if err != nil {
@@ -250,7 +268,7 @@ func (a *audioExecutor) executeKokoro(ctx context.Context, in StageInput, st *St
 		client = &http.Client{Timeout: 2 * time.Minute}
 	}
 	if in.Log != nil {
-		fmt.Fprintf(in.Log, "kokoro: %s (voice=%s, %d chars) -> %s\n", outRel, st.Voice, len(text), base)
+		fmt.Fprintf(in.Log, "kokoro: %s (voice=%s, %d chars) -> %s\n", outRel, voice, len(text), base)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
