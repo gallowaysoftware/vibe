@@ -10,6 +10,31 @@
 
 ## Recently shipped
 
+- **CLI usability pass (good → great)** (2026-05-29). No new features —
+  streamlining and consistency across both binaries.
+  - vamp: merged `jobs` into `runs` (one noun; `runs ls` gains a `STATE`
+    column, `runs show` reports live pid/state, `runs cancel` added;
+    `jobs` is now a hidden deprecated alias). Every run-targeting command
+    (`runs show/cancel`, `logs`, `confirm`, `diff`, `cancel`) takes an
+    `<id-or-prefix>` with tab-completion (`completeRunIDs`) and shares
+    `renderLookupErr`; not-found errors point at `vamp runs ls`. `confirm`
+    no longer needs a full run-dir path. `viz` gained `filepath.Abs` +
+    completion and lost the dead `--format dot` flag and "Phase 1"
+    jargon. `--detach` prints copy-pasteable follow/cancel hints. Shared
+    `--input` usage string.
+  - vibe: `vibe stop --all` flag replaces the magic positional `all`
+    (kept as a deprecated alias). `vibe list` is a no-daemon alias of
+    `vibe profile list` (shared `renderProfileList`). `vibe profile new`
+    is canonical and its `--kind` now covers all 7 bundled templates
+    (derived from the embed FS); `profile init` is a hidden alias.
+    Read-only `ps`/`list`/`env` no longer auto-spawn the daemon.
+    `start`/`run` share the `--no-vram-check` string, sort env output,
+    and guard the empty `proxy:` line.
+  - errors: `profile.Validate` rejects unedited starters (any surviving
+    `REPLACE-` value) with one clear message; ffmpeg / docker missing-
+    binary failures now carry install hints instead of a raw
+    `exec: ... not found`.
+
 - **Four new template helpers: `wordCount`, `mulInt`, `addInt`,
   `splitSentences`** (2026-05-25). Mechanical-guarantee helpers for
   pipelines that need deterministic shape from upstream LLM output.

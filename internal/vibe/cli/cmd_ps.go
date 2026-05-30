@@ -18,8 +18,13 @@ func psCmd() *cobra.Command {
 			if ctx == nil {
 				ctx = context.Background()
 			}
-			if err := ensureDaemon(ctx); err != nil {
-				return err
+			// `ps` is a read-only status query, so it must not spawn a
+			// daemon as a side effect — that would make asking "is anything
+			// running?" itself start a background process. If the daemon
+			// isn't up, nothing is running, full stop.
+			if err := pingDaemon(500 * time.Millisecond); err != nil {
+				fmt.Fprintln(cmd.OutOrStdout(), "no active profile (daemon not running)")
+				return nil
 			}
 			active, services, err := newClient().StatusFull(ctx)
 			if err != nil {

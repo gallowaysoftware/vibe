@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -19,8 +20,11 @@ func envCmd() *cobra.Command {
 			if ctx == nil {
 				ctx = context.Background()
 			}
-			if err := ensureDaemon(ctx); err != nil {
-				return err
+			// Read-only: never spawn a daemon just to print env vars. With
+			// no daemon there's no active profile, so there's nothing to
+			// print — exactly the documented "prints nothing" behavior.
+			if err := pingDaemon(500 * time.Millisecond); err != nil {
+				return nil
 			}
 			s, err := newClient().Status(ctx)
 			if err != nil {
@@ -34,8 +38,9 @@ func envCmd() *cobra.Command {
 				keys = append(keys, k)
 			}
 			sort.Strings(keys)
+			out := cmd.OutOrStdout()
 			for _, k := range keys {
-				fmt.Printf("export %s=%q\n", k, s.FrontendEnv[k])
+				fmt.Fprintf(out, "export %s=%q\n", k, s.FrontendEnv[k])
 			}
 			return nil
 		},

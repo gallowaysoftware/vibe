@@ -131,6 +131,9 @@ func (f *ffmpegExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 
 	runner := f.runner
 	if runner == nil {
+		if err := ensureFFmpegOnPath(st.ID, binary); err != nil {
+			return nil, err
+		}
 		runner = ffmpegCommandRunner{}
 	}
 	// Stream a status line for the live single-stage path so users see
@@ -247,6 +250,9 @@ func (f *ffmpegExecutor) executeConcatWavs(ctx context.Context, in StageInput, s
 
 	runner := f.runner
 	if runner == nil {
+		if err := ensureFFmpegOnPath(st.ID, binary); err != nil {
+			return nil, err
+		}
 		runner = ffmpegCommandRunner{}
 	}
 	if in.Log != nil {
@@ -256,6 +262,18 @@ func (f *ffmpegExecutor) executeConcatWavs(ctx context.Context, in StageInput, s
 		return nil, fmt.Errorf("stage %s: ffmpeg concat: %w", st.ID, err)
 	}
 	return &StageOutput{Files: []string{outAbs}}, nil
+}
+
+// ensureFFmpegOnPath returns a stage-scoped, actionable error when the
+// ffmpeg binary isn't on $PATH, instead of letting os/exec surface a raw
+// `exec: "ffmpeg": executable file not found in $PATH`. Only called on the
+// production path (a nil injected runner) so tests with a fake runner don't
+// need ffmpeg installed.
+func ensureFFmpegOnPath(stageID, binary string) error {
+	if _, err := exec.LookPath(binary); err != nil {
+		return fmt.Errorf("stage %s: %q not found on $PATH; install ffmpeg (e.g. `apt install ffmpeg`, `brew install ffmpeg`, `pacman -S ffmpeg`)", stageID, binary)
+	}
+	return nil
 }
 
 // ffmpegCommandRunner is the production ffmpegRunner. It spawns ffmpeg via
@@ -559,6 +577,9 @@ func (f *ffmpegExecutor) executeM4B(ctx context.Context, in StageInput, st *Stag
 	args = append(args, "-movflags", "+faststart", "-y", outAbs)
 	runner := f.runner
 	if runner == nil {
+		if err := ensureFFmpegOnPath(st.ID, binary); err != nil {
+			return nil, err
+		}
 		runner = ffmpegCommandRunner{}
 	}
 	if in.Log != nil {

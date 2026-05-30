@@ -82,6 +82,27 @@ func pipelineCandidates(xdgDir, localDir string) []string {
 	return out
 }
 
+// completeRunIDs is a cobra ValidArgsFunction that suggests run-dir
+// basenames (newest first) for the commands that take an <id-or-prefix>:
+// `runs show`, `runs cancel`, `logs`, `confirm`, `diff`, `cancel`. It
+// keeps the run-targeting commands tab-completable from the same source,
+// so the id printed by `vamp run --detach` can be completed back without
+// the user hunting through $XDG_STATE_HOME.
+func completeRunIDs(_ *cobra.Command, args []string, _ string) ([]string, cobra.ShellCompDirective) {
+	if len(args) > 0 {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	runs, err := vamp.ListRuns(vamp.RunsDir())
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	ids := make([]string, 0, len(runs))
+	for _, r := range runs {
+		ids = append(ids, r.ID)
+	}
+	return ids, cobra.ShellCompDirectiveNoFileComp
+}
+
 // completeCapabilityKeys is a cobra ValidArgsFunction that suggests
 // capability names from $XDG_CONFIG_HOME/vamp/capabilities.yaml.
 //

@@ -320,7 +320,7 @@ type NotFoundError struct {
 }
 
 func (e *NotFoundError) Error() string {
-	return fmt.Sprintf("no run matches prefix %q under %s", e.ID, e.RunsDir)
+	return fmt.Sprintf("no run matches prefix %q under %s (run `vamp runs ls` to list)", e.ID, e.RunsDir)
 }
 
 // AmbiguousError is returned by FindRunByPrefix when more than one run dir

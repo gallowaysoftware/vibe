@@ -2,6 +2,7 @@ package frontend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -160,6 +161,9 @@ func (c *composeDriver) Activate(reqCtx context.Context, p *profile.Profile, ctx
 		"project", projectName,
 	)
 	if err := c.runCommand(reqCtx, "docker", upArgs, envSlice); err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return nil, fmt.Errorf("docker not found on $PATH; install Docker (https://docs.docker.com/get-docker/) to run a docker-compose frontend")
+		}
 		return nil, fmt.Errorf("docker compose up: %w", err)
 	}
 	slog.Info("frontend compose: up done", "profile", p.Name, "project", projectName)

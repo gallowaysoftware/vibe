@@ -334,22 +334,12 @@ func ValidatePipeline(p *vamp.Pipeline, pipelineDir string, skipCaps bool, stdou
 // VizOptions mirrors the cobra flag set for the `viz` subcommand.
 type VizOptions struct {
 	OutFile    string
-	Format     string
 	ShowInputs bool
 }
 
 // VizPipeline renders a pipeline's Mermaid flowchart, writing to OutFile if
-// non-empty or to stdout otherwise. Format is reserved for future formats;
-// only "mermaid" (or empty, treated as mermaid) is supported today.
+// non-empty or to stdout otherwise.
 func VizPipeline(p *vamp.Pipeline, opts VizOptions, stdout io.Writer) error {
-	switch opts.Format {
-	case "", "mermaid":
-		// ok
-	case "dot":
-		return fmt.Errorf("--format=dot is not implemented yet (Phase 1 supports only mermaid)")
-	default:
-		return fmt.Errorf("--format %q is not supported (allowed: mermaid)", opts.Format)
-	}
 	rendered := vamp.RenderMermaid(p, vamp.VizOptions{ShowInputs: opts.ShowInputs})
 	if opts.OutFile == "" {
 		_, err := fmt.Fprint(stdout, rendered)

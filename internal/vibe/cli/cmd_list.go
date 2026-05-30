@@ -1,41 +1,20 @@
 package cli
 
 import (
-	"context"
-	"fmt"
-
 	"github.com/spf13/cobra"
 )
 
+// listCmd is a top-level convenience alias for `vibe profile list`. It reads
+// the profile YAMLs straight off disk via renderProfileList, so it does not
+// touch (or spawn) the daemon — asking "which profiles exist" should never
+// start a background process.
 func listCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
-		Short: "List available profiles.",
+		Short: "List available profiles (alias of `vibe profile list`).",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx := cmd.Context()
-			if ctx == nil {
-				ctx = context.Background()
-			}
-			if err := ensureDaemon(ctx); err != nil {
-				return err
-			}
-			profs, err := newClient().ListProfiles(ctx)
-			if err != nil {
-				return err
-			}
-			if len(profs) == 0 {
-				fmt.Println("no profiles (drop YAML files in ~/.config/vibe/profiles/)")
-				return nil
-			}
-			for _, p := range profs {
-				if p.Description != "" {
-					fmt.Printf("%-20s %s\n", p.Name, p.Description)
-				} else {
-					fmt.Println(p.Name)
-				}
-			}
-			return nil
+			return renderProfileList(cmd.OutOrStdout())
 		},
 	}
 }

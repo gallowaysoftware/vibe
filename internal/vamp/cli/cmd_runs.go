@@ -16,18 +16,24 @@ import (
 	"github.com/gallowaysoftware/vibe/internal/vamp"
 )
 
-// runsCmd is the parent of `vamp runs {ls,show,cleanup}`. It is a no-op
-// when invoked without a sub-command (cobra prints the help text), which
-// matches the pattern used by `vibe profile` and avoids surprising the
-// user with `runs` deleting or listing without an explicit verb.
+// runsCmd is the parent of `vamp runs {ls,show,cancel,cleanup}`. It is a
+// no-op when invoked without a sub-command (cobra prints the help text),
+// which matches the pattern used by `vibe profile` and avoids surprising
+// the user with `runs` deleting or listing without an explicit verb.
+//
+// `runs` is the single noun for everything a pipeline run leaves behind:
+// history (ls / show / cleanup) and live control of detached runs
+// (the STATE column on ls, the state/pid lines on show, and cancel). The
+// older `vamp jobs` group is a hidden deprecated alias for the same verbs.
 func runsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "runs",
-		Short: "Inspect and manage vamp run history (under $XDG_STATE_HOME/vamp/runs/).",
+		Short: "Inspect and manage vamp runs (history + live detached jobs).",
 	}
 	cmd.AddCommand(
 		runsLsCmd(),
 		runsShowCmd(),
+		runsCancelCmd(),
 		runsCleanupCmd(),
 	)
 	return cmd
@@ -36,7 +42,7 @@ func runsCmd() *cobra.Command {
 func runsLsCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "ls",
-		Short: "List past vamp runs, newest first.",
+		Short: "List vamp runs, newest first (STATE marks live/crashed jobs).",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			runs, err := vamp.ListRuns(vamp.RunsDir())
@@ -47,18 +53,21 @@ func runsLsCmd() *cobra.Command {
 				fmt.Fprintf(cmd.OutOrStdout(), "no runs under %s\n", vamp.RunsDir())
 				return nil
 			}
-			// tabwriter columns: TIMESTAMP, PIPELINE, STAGES, DURATION,
-			// SIZE, STATUS, ID. We put the long ID last because it
-			// otherwise pushes the other columns out of alignment when
-			// the basename varies in length.
+			// tabwriter columns: STATE, TIMESTAMP, PIPELINE, STAGES,
+			// DURATION, SIZE, STATUS, ID. STATE leads so a running or
+			// crashed job jumps out; the long ID goes last because the
+			// basename varies and would push other columns out of
+			// alignment. STATE is derived per-dir from the pid file so a
+			// detached run shows "running" here without a second command.
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-			fmt.Fprintln(tw, "TIMESTAMP\tPIPELINE\tSTAGES\tDURATION\tSIZE\tSTATUS\tID")
+			fmt.Fprintln(tw, "STATE\tTIMESTAMP\tPIPELINE\tSTAGES\tDURATION\tSIZE\tSTATUS\tID")
 			for _, r := range runs {
 				name := r.Name
 				if name == "" {
 					name = "-"
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\t%s\n",
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n",
+					vamp.JobStateFor(r),
 					vamp.FormatTimestamp(r.Timestamp),
 					name,
 					r.NumStages,
@@ -75,23 +84,14 @@ func runsLsCmd() *cobra.Command {
 
 func runsShowCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "show <id-or-path>",
-		Short: "Print pipeline snapshot, inputs, and outputs for a run.",
-		Args:  cobra.ExactArgs(1),
+		Use:               "show <id-or-prefix>",
+		Short:             "Print state, snapshot, inputs, and outputs for a run.",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeRunIDs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			r, err := vamp.FindRunByPrefix(vamp.RunsDir(), args[0])
 			if err != nil {
-				// Friendly rendering of the two structured error types;
-				// fall back to the default Error() for anything else.
-				var amb *vamp.AmbiguousError
-				if errors.As(err, &amb) {
-					fmt.Fprintf(cmd.ErrOrStderr(), "ambiguous prefix %q; candidates:\n", amb.ID)
-					for _, c := range amb.Candidates {
-						fmt.Fprintf(cmd.ErrOrStderr(), "  %s\n", c)
-					}
-					return fmt.Errorf("ambiguous run prefix")
-				}
-				return err
+				return renderLookupErr(cmd, err)
 			}
 			out := cmd.OutOrStdout()
 			fmt.Fprintf(out, "=== run %s ===\n", r.ID)
@@ -102,6 +102,18 @@ func runsShowCmd() *cobra.Command {
 			fmt.Fprintf(out, "stages:    %d\n", r.NumStages)
 			fmt.Fprintf(out, "size:      %s\n", vamp.FormatSize(r.SizeBytes))
 			fmt.Fprintf(out, "status:    %s\n", r.Status)
+			// Live-job fields: only meaningful for detached runs. The pid
+			// and log lines are printed when present so `runs show` covers
+			// what `jobs show` used to, without a separate command.
+			if j, jerr := vamp.FindJobByPrefix(vamp.RunsDir(), r.ID); jerr == nil {
+				fmt.Fprintf(out, "state:     %s\n", j.State)
+				if j.PID > 0 {
+					fmt.Fprintf(out, "pid:       %d\n", j.PID)
+				}
+				if j.State == vamp.JobStateRunning {
+					fmt.Fprintf(out, "log:       %s\n", j.LogPath)
+				}
+			}
 			fmt.Fprintln(out)
 
 			dumpFile(out, "pipeline.yaml.snapshot", filepath.Join(r.Path, "pipeline.yaml.snapshot"))
@@ -139,6 +151,33 @@ func runsShowCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func runsCancelCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:               "cancel <id-or-prefix>",
+		Short:             "Send SIGTERM to a running detached run.",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeRunIDs,
+		RunE:              runCancel,
+	}
+}
+
+// renderLookupErr unwraps an *AmbiguousError into a friendly multi-line
+// list of candidates; any other error (including the not-found error,
+// which already carries a "run `vamp runs ls`" hint) is returned verbatim.
+// Shared by every command that resolves an <id-or-prefix> so the lookup
+// failure reads the same everywhere.
+func renderLookupErr(cmd *cobra.Command, err error) error {
+	var amb *vamp.AmbiguousError
+	if errors.As(err, &amb) {
+		fmt.Fprintf(cmd.ErrOrStderr(), "ambiguous prefix %q; candidates:\n", amb.ID)
+		for _, c := range amb.Candidates {
+			fmt.Fprintf(cmd.ErrOrStderr(), "  %s\n", c)
+		}
+		return fmt.Errorf("ambiguous run prefix")
+	}
+	return err
 }
 
 func runsCleanupCmd() *cobra.Command {

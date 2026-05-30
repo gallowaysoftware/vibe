@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -45,13 +46,13 @@ func runCmd() *cobra.Command {
 			pPath := filepath.Join(paths.ProfilesDir(), args[0]+".yaml")
 			p, err := profile.Load(pPath)
 			if err != nil {
-				return fmt.Errorf("load profile %s: %w", args[0], err)
+				return fmt.Errorf("load profile %q: %w (run `vibe profile list` to see available)", args[0], err)
 			}
 			if p.Frontend.Kind != profile.FrontendManaged {
 				return fmt.Errorf("`vibe run` requires kind=managed (got %q); use `vibe start` for kind=external profiles", p.Frontend.Kind)
 			}
 			if p.Frontend.Binary == "" {
-				return errors.New("profile is kind=managed but frontend.binary is unset")
+				return fmt.Errorf("profile %q is kind=managed but frontend.binary is unset; set frontend.binary in %s", args[0], pPath)
 			}
 
 			if err := ensureDaemon(ctx); err != nil {
@@ -87,7 +88,9 @@ func runCmd() *cobra.Command {
 
 			fmt.Printf("started %s (foreground)\n", r.Status.Profile)
 			fmt.Printf("  backend: %s\n", r.Status.BackendAddr)
-			fmt.Printf("  proxy:   %s\n", r.Status.ProxyAddr)
+			if r.Status.ProxyAddr != "" {
+				fmt.Printf("  proxy:   %s\n", r.Status.ProxyAddr)
+			}
 			if r.Frontend != nil && r.Frontend.WroteFile != "" {
 				fmt.Printf("  wrote:   %s\n", r.Frontend.WroteFile)
 			}
@@ -102,8 +105,13 @@ func runCmd() *cobra.Command {
 			}
 			if r.Frontend != nil && len(r.Frontend.EnvVars) > 0 {
 				env := append([]string(nil), os.Environ()...)
-				for k, v := range r.Frontend.EnvVars {
-					env = append(env, k+"="+v)
+				keys := make([]string, 0, len(r.Frontend.EnvVars))
+				for k := range r.Frontend.EnvVars {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				for _, k := range keys {
+					env = append(env, k+"="+r.Frontend.EnvVars[k])
 				}
 				child.Env = env
 			}
@@ -138,7 +146,6 @@ func runCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&noVRAMCheck, "no-vram-check", false,
-		"Skip the daemon's pre-flight VRAM check against the profile's estimated_vram_gb.")
+	cmd.Flags().BoolVar(&noVRAMCheck, "no-vram-check", false, noVRAMCheckUsage)
 	return cmd
 }

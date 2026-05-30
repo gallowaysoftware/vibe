@@ -23,13 +23,14 @@ import (
 func logsCmd() *cobra.Command {
 	var follow bool
 	cmd := &cobra.Command{
-		Use:   "logs <id-or-prefix>",
-		Short: "Print the vamp.log for a job (use -f to follow live).",
-		Args:  cobra.ExactArgs(1),
+		Use:               "logs <id-or-prefix>",
+		Short:             "Print a run's vamp.log (use -f to follow live).",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeRunIDs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			j, err := vamp.FindJobByPrefix(vamp.RunsDir(), args[0])
 			if err != nil {
-				return renderJobLookupErr(cmd, err)
+				return renderLookupErr(cmd, err)
 			}
 			// Set up ctx with signal handling so ctrl-C while
 			// following exits cleanly (and we don't leak the file

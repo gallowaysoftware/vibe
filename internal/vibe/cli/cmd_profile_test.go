@@ -181,10 +181,9 @@ func fillReplacements(t *testing.T, body, kind string) string {
 		// wait_for.url's REPLACE-port: just give it a port number.
 		body = strings.ReplaceAll(body, "REPLACE-port", "3000")
 	case "http-service":
-		// http-service template's REPLACE markers; the validator just
-		// needs an image + a port, both already non-REPLACE in the
-		// template, so substitution is largely a no-op.
-		body = strings.ReplaceAll(body, "REPLACE-image", "ghcr.io/example/image:latest")
+		// Replace the whole `REPLACE-org/REPLACE-image:tag` image value in
+		// one shot so no `REPLACE-` substring survives the fill.
+		body = strings.ReplaceAll(body, "REPLACE-org/REPLACE-image:tag", "ghcr.io/example/image:latest")
 		body = strings.ReplaceAll(body, "REPLACE-port", "14002")
 	case "llama-embed-service":
 		// llama-embed-service ships with concrete values; the only
@@ -339,12 +338,13 @@ func TestProfileInit_HFInjection(t *testing.T) {
 		t.Errorf("rendered yaml missing file line:\n%s", got)
 	}
 
-	// When huggingface.file is concrete, profile.Load accepts a missing
-	// model path (pull is responsible for fetching it). Fill the
-	// remaining alias REPLACE and confirm the loader is happy.
+	// When huggingface.file is concrete, profile.Load accepts a model path
+	// that doesn't exist on disk yet (pull fetches it). Fill the alias and
+	// the path placeholder — the path is the download destination, which
+	// the user still picks — then confirm the loader is happy without the
+	// file actually existing.
 	filled := strings.ReplaceAll(got, "REPLACE-model-alias", "test-alias")
-	// Leave path as ~/models/REPLACE-model.gguf — validate skips Stat
-	// when huggingface is set.
+	filled = strings.ReplaceAll(filled, "~/models/REPLACE-model.gguf", "~/models/qwen2.5-coder-7b.gguf")
 	fixture := filepath.Join(t.TempDir(), "codef.yaml")
 	if err := os.WriteFile(fixture, []byte(filled), 0o644); err != nil {
 		t.Fatal(err)

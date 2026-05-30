@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -137,54 +138,89 @@ func profileShowCmd() *cobra.Command {
 // profileListCmd prints every profile YAML under ProfilesDir() with
 // its name + description + backend kind + mode. Counterpart to
 // `vibe profile show` for the "which profiles do I have" question.
+// The top-level `vibe list` is a thin alias for this command — both
+// share renderProfileList so the two never drift in format.
 func profileListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
 		Short: "List every profile YAML with name + description + backend + mode.",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dir := paths.ProfilesDir()
-			entries, err := os.ReadDir(dir)
-			if err != nil {
-				return fmt.Errorf("read %s: %w", dir, err)
-			}
-			out := cmd.OutOrStdout()
-			fmt.Fprintf(out, "%-22s  %-10s  %-12s  %s\n", "NAME", "MODE", "BACKEND", "DESCRIPTION")
-			for _, e := range entries {
-				if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
-					continue
-				}
-				p, err := profile.Load(filepath.Join(dir, e.Name()))
-				if err != nil {
-					fmt.Fprintf(out, "%-22s  %-10s  %-12s  %s\n",
-						strings.TrimSuffix(e.Name(), ".yaml"), "?", "?",
-						fmt.Sprintf("(invalid: %v)", err))
-					continue
-				}
-				backend := "?"
-				switch {
-				case p.Backend.LlamaServer != nil:
-					backend = "llama_server"
-				case p.Backend.TabbyAPI != nil:
-					backend = "tabby_api"
-				case p.Backend.HTTPServer != nil:
-					backend = "http_server"
-				case p.Backend.ComfyUI != nil:
-					backend = "comfyui"
-				}
-				fmt.Fprintf(out, "%-22s  %-10s  %-12s  %s\n",
-					p.Name, p.ResolvedMode(), backend, p.Description)
-			}
-			return nil
+			return renderProfileList(cmd.OutOrStdout())
 		},
 	}
 }
 
-// profileKindEnum is the user-facing --kind values for `vibe profile new`.
-// It deliberately mirrors the backend discriminators in profile.Backend
-// (llama_server, comfyui) using kebab-case so the CLI matches `vibe`'s
-// flag-naming conventions; the internal mapping to template filenames
-// happens in templateForKindFrontend.
-var profileKindEnum = []string{"llama-server", "comfyui"}
+// renderProfileList scans ProfilesDir() and prints one aligned row per
+// profile YAML. Invalid files are listed with an `(invalid: ...)` note
+// rather than aborting the whole listing, so one broken file doesn't hide
+// the rest. A missing profiles directory is treated as "no profiles yet"
+// rather than an error — the dir is created lazily by `profile new`.
+func renderProfileList(out io.Writer) error {
+	dir := paths.ProfilesDir()
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintln(out, "no profiles yet (create one with `vibe profile new <name>`)")
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read %s: %w", dir, err)
+	}
+
+	type row struct{ name, mode, backend, desc string }
+	var rows []row
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
+			continue
+		}
+		p, err := profile.Load(filepath.Join(dir, e.Name()))
+		if err != nil {
+			rows = append(rows, row{
+				name:    strings.TrimSuffix(e.Name(), ".yaml"),
+				mode:    "?",
+				backend: "?",
+				desc:    fmt.Sprintf("(invalid: %v)", err),
+			})
+			continue
+		}
+		backend := "?"
+		switch {
+		case p.Backend.LlamaServer != nil:
+			backend = "llama_server"
+		case p.Backend.TabbyAPI != nil:
+			backend = "tabby_api"
+		case p.Backend.HTTPServer != nil:
+			backend = "http_server"
+		case p.Backend.ComfyUI != nil:
+			backend = "comfyui"
+		}
+		rows = append(rows, row{p.Name, p.ResolvedMode(), backend, p.Description})
+	}
+
+	if len(rows) == 0 {
+		fmt.Fprintln(out, "no profiles yet (create one with `vibe profile new <name>`)")
+		return nil
+	}
+
+	fmt.Fprintf(out, "%-22s  %-10s  %-12s  %s\n", "NAME", "MODE", "BACKEND", "DESCRIPTION")
+	for _, r := range rows {
+		fmt.Fprintf(out, "%-22s  %-10s  %-12s  %s\n", r.name, r.mode, r.backend, r.desc)
+	}
+	return nil
+}
+
+// profileKinds is the user-facing --kind values for `vibe profile new`,
+// derived from the bundled template filenames so every shipped starter is
+// discoverable via --help and tab-completion (not just llama-server /
+// comfyui). Falls back to those two if the embed read ever fails, which it
+// won't in a built binary.
+func profileKinds() []string {
+	kinds, err := validProfileKinds()
+	if err != nil || len(kinds) == 0 {
+		return []string{"llama-server", "comfyui"}
+	}
+	return kinds
+}
 
 // profileFrontendEnum is the user-facing --frontend values. Only meaningful
 // for kind=llama-server; ignored (with a friendly note) for kind=comfyui
@@ -197,16 +233,19 @@ var profileFrontendEnum = []string{
 }
 
 // templateForKindFrontend maps the (--kind, --frontend) pair onto a
-// concrete template filename under profile_templates/. The mapping
-// recognizes that the existing templates are organized by frontend kind
-// for llama-server (one template per frontend variant) but by backend
-// for comfyui (a single template, frontend ignored). Future kinds plug
-// in by extending this switch.
+// concrete template filename under profile_templates/.
+//
+// For kind=llama-server the --frontend flag is sugar that selects the
+// frontend-specific variant (external -> llama-server, docker-compose ->
+// docker-compose, managed -> managed). For every other kind --frontend is
+// ignored — those backends either ship their own UI (comfyui) or are
+// service-mode sidecars with no frontend (tabby-api, http-service,
+// llama-embed-service) — and the kind maps straight to the same-named
+// template. Any kind matching a bundled template filename is accepted.
 func templateForKindFrontend(kind, frontend string) (string, error) {
-	switch kind {
-	case "llama-server":
+	if kind == "llama-server" {
 		switch frontend {
-		case profile.FrontendExternal:
+		case profile.FrontendExternal, "":
 			return "llama-server", nil
 		case profile.FrontendDockerCompose:
 			return "docker-compose", nil
@@ -216,18 +255,12 @@ func templateForKindFrontend(kind, frontend string) (string, error) {
 			return "", fmt.Errorf("--frontend %q: unknown (allowed: %s)",
 				frontend, strings.Join(profileFrontendEnum, ", "))
 		}
-	case "comfyui":
-		// Frontend is irrelevant for comfyui (the backend ships its own UI),
-		// so we accept any value and route to the comfyui template. The
-		// alternative — erroring on --frontend != "" — would be surprising
-		// when users tab-complete the default. The validator in profile
-		// rejects frontend blocks for comfyui profiles, so there's no
-		// hidden risk in accepting the flag here.
-		return "comfyui", nil
-	default:
-		return "", fmt.Errorf("--kind %q: unknown (allowed: %s)",
-			kind, strings.Join(profileKindEnum, ", "))
 	}
+	if slices.Contains(profileKinds(), kind) {
+		return kind, nil
+	}
+	return "", fmt.Errorf("--kind %q: unknown (allowed: %s)",
+		kind, strings.Join(profileKinds(), ", "))
 }
 
 // profileSchemaCmd emits the JSON Schema (draft-07) describing profile YAML.
@@ -287,10 +320,11 @@ func profileNewCmd() *cobra.Command {
 		Short: "Create a new profile YAML under $XDG_CONFIG_HOME/vibe/profiles/.",
 		Long: "Generates a starter profile YAML at " +
 			"$XDG_CONFIG_HOME/vibe/profiles/<name>.yaml from the bundled " +
-			"templates. The --kind flag selects the backend " +
-			"(llama-server | comfyui); --frontend selects the rendering " +
-			"strategy for llama-server (external | docker-compose | " +
-			"managed) and is ignored for comfyui (which ships its own UI).\n\n" +
+			"templates. The --kind flag selects the backend (run with " +
+			"--help to see the full list); for kind=llama-server, " +
+			"--frontend selects the rendering strategy (external | " +
+			"docker-compose | managed). --frontend is ignored for every " +
+			"other kind.\n\n" +
 			"After the file is written, edit the REPLACE-marked lines, then " +
 			"`vibe start <name>`. Refuses to overwrite an existing file " +
 			"unless --force is passed.",
@@ -306,11 +340,11 @@ func profileNewCmd() *cobra.Command {
 		ValidArgsFunction: cobra.NoFileCompletions,
 	}
 	cmd.Flags().StringVar(&kind, "kind", "llama-server",
-		"backend kind: "+strings.Join(profileKindEnum, " | "))
+		"backend kind: "+strings.Join(profileKinds(), " | "))
 	cmd.Flags().StringVar(&frontend, "frontend", profile.FrontendExternal,
 		"frontend kind (llama-server only): "+strings.Join(profileFrontendEnum, " | "))
 	cmd.Flags().StringVar(&hfRef, "hf", "",
-		"add a HuggingFace block to a llama-server profile (format: <repo>[:<file>])")
+		"add a Hugging Face block to a llama-server profile (format: <repo>[:<file>])")
 	cmd.Flags().BoolVar(&force, "force", false,
 		"overwrite an existing profile file")
 
@@ -318,7 +352,7 @@ func profileNewCmd() *cobra.Command {
 	// without consulting --help.
 	_ = cmd.RegisterFlagCompletionFunc("kind",
 		func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
-			return profileKindEnum, cobra.ShellCompDirectiveNoFileComp
+			return profileKinds(), cobra.ShellCompDirectiveNoFileComp
 		})
 	_ = cmd.RegisterFlagCompletionFunc("frontend",
 		func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
@@ -335,14 +369,14 @@ func profileInitCmd() *cobra.Command {
 		force bool
 	)
 	cmd := &cobra.Command{
-		Use:   "init <kind>",
-		Short: "Drop a starter profile YAML in $XDG_CONFIG_HOME/vibe/profiles/.",
-		Long: "Drops a starter profile YAML in $XDG_CONFIG_HOME/vibe/profiles/ so " +
-			"new users don't have to copy-paste from the examples directory.\n\n" +
-			"The dropped file has `# REPLACE: ...` markers on fields the user must " +
-			"edit (model path, alias, ComfyUI directory, etc.). After editing those " +
-			"lines, `vibe start <name>` activates the profile.\n\n" +
-			"Refuses to overwrite an existing file unless --force is passed.",
+		Use:        "init <kind>",
+		Short:      "Deprecated alias for `vibe profile new` (kind as a positional).",
+		Deprecated: "use `vibe profile new <name> --kind <kind>` instead.",
+		Hidden:     true,
+		Long: "Deprecated alias for `vibe profile new`, kept so existing scripts " +
+			"keep working. It takes the kind as a positional argument and the " +
+			"name via --name; `vibe profile new` is the canonical form (name " +
+			"positional, kind via --kind, with tab-completion).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			kind := args[0]
