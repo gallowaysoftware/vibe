@@ -10,6 +10,24 @@
 
 ## Recently shipped
 
+- **Video content-mill primitives** (2026-05-30). Three vamp features +
+  a cache fix to drive image-to-video pipelines (worldsmith's `scene`):
+  - comfyui `input_images` map ("<node>.<input>" -> templated source path):
+    uploads an upstream still to ComfyUI (`POST /upload/image`) and binds the
+    returned filename to a LoadImage node — the i2v / ref-edit seam. Cache key
+    folds the source image sha256 (gated; parameters-only stages keep their key).
+  - ffmpeg `concat_video` mode: ordered N-clip concat from an upstream JSON
+    array, re-encoded through a normalizing scale/pad/setsar/fps filtergraph.
+  - `short` stage type (video analog of `mix`): assembly-script JSON of shots
+    (clip + voiceover + caption) -> one vertical MP4; per-shot freeze/trim to
+    the voiceover duration, scale/crop to vertical, captions burned via
+    drawtext `textfile=` (apostrophe-safe), concat, loudnorm, optional ducked
+    music. Real `computeStageCacheKey` branch.
+  - fix: `mix` was cacheable but had no cache-key branch (empty key / never
+    cached) — added a real branch. Added pandoc/mix/short to the schema enum.
+  - capability `video_gen -> comfyui`. Validated end-to-end on a 5090 with
+    Qwen-Image + Wan2.2-TI2V-5B i2v.
+
 - **CLI usability pass (good → great)** (2026-05-29). No new features —
   streamlining and consistency across both binaries.
   - vamp: merged `jobs` into `runs` (one noun; `runs ls` gains a `STATE`
