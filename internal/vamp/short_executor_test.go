@@ -42,7 +42,7 @@ func TestShortExecutor_BuildsFiltergraph(t *testing.T) {
 	runDir := t.TempDir()
 	script := shortScript{
 		Shots: []shortShot{
-			{Video: "clip_0.mp4", Audio: "vo_0.wav", Caption: "Hello: world"},
+			{Video: "clip_0.mp4", Audio: "vo_0.wav", Caption: "Don't touch: it's alive"},
 			{Video: "clip_1.mp4", Audio: "vo_1.wav"},
 		},
 	}
@@ -83,7 +83,7 @@ func TestShortExecutor_BuildsFiltergraph(t *testing.T) {
 		"concat=n=2:v=1:a=1[cv][ca]",
 		"loudnorm=I=-16",
 		"-map [cv]", "-map [na]", "-c:v libx264", "-c:a aac",
-		`drawtext=`, `Hello\: world`, // caption present + colon escaped
+		"drawtext=", "textfile=", "expansion=none", ".caption-0.txt",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("filtergraph/args missing %q in:\n%s", want, joined)
@@ -92,6 +92,15 @@ func TestShortExecutor_BuildsFiltergraph(t *testing.T) {
 	// Shot 1 has no caption → only one drawtext in the graph.
 	if n := strings.Count(joined, "drawtext="); n != 1 {
 		t.Errorf("expected exactly 1 drawtext, got %d", n)
+	}
+	// The caption (apostrophe-bearing here) is written verbatim to a file —
+	// no escaping, the bug that broke apostrophe captions inline.
+	capBytes, err := os.ReadFile(filepath.Join(runDir, ".caption-0.txt"))
+	if err != nil {
+		t.Fatalf("caption file: %v", err)
+	}
+	if !strings.Contains(string(capBytes), "Don't touch: it's alive") {
+		t.Errorf("caption file = %q, want the literal apostrophe-bearing caption", string(capBytes))
 	}
 }
 

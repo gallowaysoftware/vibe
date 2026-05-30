@@ -138,8 +138,16 @@ func (s *shortExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 		// the clip's native length; trim caps it either way.
 		fmt.Fprintf(&fg, "[%d:v]scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,setsar=1,fps=%d,tpad=stop_mode=clone:stop_duration=%.3f,trim=duration=%.3f,setpts=PTS-STARTPTS",
 			vi, w, h, w, h, fps, secs, secs)
-		if cap := strings.TrimSpace(shot.Caption); cap != "" {
-			fmt.Fprintf(&fg, ",%s", drawtextFilter(cap, w, fontFile))
+		if capt := strings.TrimSpace(shot.Caption); capt != "" {
+			// Write the (word-wrapped) caption to a file and reference it via
+			// drawtext's textfile= option. Inline text=... can't safely carry
+			// apostrophes/colons inside a single-quoted filtergraph value;
+			// textfile sidesteps all escaping.
+			capPath := filepath.Join(in.RunDir, fmt.Sprintf(".caption-%d.txt", i))
+			if err := os.WriteFile(capPath, []byte(wrapText(capt, captionMaxChars(w))), 0o644); err != nil {
+				return nil, fmt.Errorf("stage %s: write caption %d: %w", st.ID, i, err)
+			}
+			fmt.Fprintf(&fg, ",%s", drawtextFilter(capPath, w, fontFile))
 		}
 		fmt.Fprintf(&fg, "[v%d];", i)
 		// Audio: pad (in case the voiceover is a hair short) then trim to the
@@ -244,34 +252,42 @@ func firstNonZero(a, b int) int {
 	return b
 }
 
-// drawtextFilter builds a centered, bottom-third caption drawtext filter with
-// a semi-opaque box for legibility over busy footage. The caption is word-
-// wrapped to fit the frame width (drawtext does not auto-wrap, so a long line
-// would otherwise overflow and clip at the edges); each wrapped line is a real
-// newline, which drawtext renders as a line break. fontFile may be empty, in
-// which case fontconfig's default sans is used.
-func drawtextFilter(text string, width int, fontFile string) string {
-	fontSize := width / 26
-	if fontSize < 16 {
-		fontSize = 16
+// captionFontSize / captionMaxChars derive the caption type size and the
+// word-wrap width from the frame width, kept in one place so the filter and
+// the wrap agree.
+func captionFontSize(width int) int {
+	fs := width / 26
+	if fs < 16 {
+		fs = 16
 	}
+	return fs
+}
+
+func captionMaxChars(width int) int {
 	// Conservative chars-per-line for a bold face: ~0.6em average advance,
 	// kept to ~85% of the frame width so the box has margins.
-	maxChars := int(float64(width) * 0.85 / (float64(fontSize) * 0.6))
-	if maxChars < 12 {
-		maxChars = 12
+	mc := int(float64(width) * 0.85 / (float64(captionFontSize(width)) * 0.6))
+	if mc < 12 {
+		mc = 12
 	}
-	wrapped := wrapText(text, maxChars)
+	return mc
+}
 
+// drawtextFilter builds a centered, bottom-third caption drawtext filter that
+// reads the (already word-wrapped) caption from captionFile via textfile=, with
+// a semi-opaque box for legibility. textfile + expansion=none means the caption
+// text needs no escaping at all — apostrophes, colons, percent signs all pass
+// through literally. fontFile may be empty (fontconfig default sans).
+func drawtextFilter(captionFile string, width int, fontFile string) string {
 	var b strings.Builder
 	b.WriteString("drawtext=")
 	if fontFile != "" {
-		fmt.Fprintf(&b, "fontfile='%s':", drawtextEscape(fontFile))
+		fmt.Fprintf(&b, "fontfile='%s':", ffmpegPathEscape(fontFile))
 	} else {
 		b.WriteString("font='Sans':")
 	}
-	fmt.Fprintf(&b, "text='%s':", drawtextEscape(wrapped))
-	fmt.Fprintf(&b, "fontcolor=white:fontsize=%d:borderw=6:bordercolor=black@0.85:", fontSize)
+	fmt.Fprintf(&b, "textfile='%s':expansion=none:", ffmpegPathEscape(captionFile))
+	fmt.Fprintf(&b, "fontcolor=white:fontsize=%d:borderw=6:bordercolor=black@0.85:", captionFontSize(width))
 	b.WriteString("box=1:boxcolor=black@0.5:boxborderw=18:")
 	b.WriteString("x=(w-text_w)/2:y=h*0.70:line_spacing=12")
 	return b.String()
@@ -299,14 +315,12 @@ func wrapText(s string, maxChars int) string {
 	return strings.Join(lines, "\n")
 }
 
-// drawtextEscape escapes the characters ffmpeg's drawtext treats specially
-// inside a single-quoted text value. Real newlines are preserved — drawtext
-// renders them as line breaks (see drawtextFilter's word-wrapping).
-func drawtextEscape(s string) string {
+// ffmpegPathEscape escapes a filesystem path for use inside a single-quoted
+// drawtext option value (fontfile= / textfile=). Our paths live under the run
+// dir and contain no quotes; we escape backslashes and colons defensively.
+func ffmpegPathEscape(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `'`, `\'`)
 	s = strings.ReplaceAll(s, `:`, `\:`)
-	s = strings.ReplaceAll(s, `%`, `\%`)
 	return s
 }
 
