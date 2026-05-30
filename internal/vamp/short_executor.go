@@ -209,7 +209,11 @@ func (s *shortExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 		"-map", "[cv]", "-map", finalAudio,
 		"-r", fmt.Sprintf("%d", fps),
 		"-c:v", "libx264", "-pix_fmt", "yuv420p",
-		"-c:a", "aac", "-b:a", "192k",
+		// 48kHz stereo AAC is the universal delivery standard. Kokoro emits
+		// 24kHz mono and loudnorm passes through an unusual high rate (96kHz),
+		// which phones and social platforms (TikTok) silently refuse to play —
+		// so resample + upmix on encode.
+		"-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
 		"-movflags", "+faststart")
 	// Container metadata, alphabetical for deterministic argv (mirrors mix).
 	if len(st.Metadata) > 0 {

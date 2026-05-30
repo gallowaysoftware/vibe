@@ -83,6 +83,7 @@ func TestShortExecutor_BuildsFiltergraph(t *testing.T) {
 		"concat=n=2:v=1:a=1[cv][ca]",
 		"loudnorm=I=-16",
 		"-map [cv]", "-map [na]", "-c:v libx264", "-c:a aac",
+		"-ar 48000", "-ac 2", // 48kHz stereo for player/platform compatibility
 		"drawtext=", "textfile=", "expansion=none", ".caption-0.txt",
 	} {
 		if !strings.Contains(joined, want) {
