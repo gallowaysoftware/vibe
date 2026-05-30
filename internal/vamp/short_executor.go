@@ -245,13 +245,24 @@ func firstNonZero(a, b int) int {
 }
 
 // drawtextFilter builds a centered, bottom-third caption drawtext filter with
-// a semi-opaque box for legibility over busy footage. fontFile may be empty,
-// in which case fontconfig's default sans is used.
+// a semi-opaque box for legibility over busy footage. The caption is word-
+// wrapped to fit the frame width (drawtext does not auto-wrap, so a long line
+// would otherwise overflow and clip at the edges); each wrapped line is a real
+// newline, which drawtext renders as a line break. fontFile may be empty, in
+// which case fontconfig's default sans is used.
 func drawtextFilter(text string, width int, fontFile string) string {
-	fontSize := width / 22
+	fontSize := width / 26
 	if fontSize < 16 {
 		fontSize = 16
 	}
+	// Conservative chars-per-line for a bold face: ~0.6em average advance,
+	// kept to ~85% of the frame width so the box has margins.
+	maxChars := int(float64(width) * 0.85 / (float64(fontSize) * 0.6))
+	if maxChars < 12 {
+		maxChars = 12
+	}
+	wrapped := wrapText(text, maxChars)
+
 	var b strings.Builder
 	b.WriteString("drawtext=")
 	if fontFile != "" {
@@ -259,21 +270,43 @@ func drawtextFilter(text string, width int, fontFile string) string {
 	} else {
 		b.WriteString("font='Sans':")
 	}
-	fmt.Fprintf(&b, "text='%s':", drawtextEscape(text))
+	fmt.Fprintf(&b, "text='%s':", drawtextEscape(wrapped))
 	fmt.Fprintf(&b, "fontcolor=white:fontsize=%d:borderw=6:bordercolor=black@0.85:", fontSize)
-	b.WriteString("box=1:boxcolor=black@0.45:boxborderw=18:")
-	b.WriteString("x=(w-text_w)/2:y=h*0.78:line_spacing=10")
+	b.WriteString("box=1:boxcolor=black@0.5:boxborderw=18:")
+	b.WriteString("x=(w-text_w)/2:y=h*0.70:line_spacing=12")
 	return b.String()
 }
 
+// wrapText greedily wraps s on spaces so no line exceeds maxChars (a single
+// word longer than maxChars is left intact rather than split). Lines are
+// joined with newlines.
+func wrapText(s string, maxChars int) string {
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return s
+	}
+	var lines []string
+	cur := words[0]
+	for _, w := range words[1:] {
+		if len(cur)+1+len(w) > maxChars {
+			lines = append(lines, cur)
+			cur = w
+			continue
+		}
+		cur += " " + w
+	}
+	lines = append(lines, cur)
+	return strings.Join(lines, "\n")
+}
+
 // drawtextEscape escapes the characters ffmpeg's drawtext treats specially
-// inside a single-quoted text value.
+// inside a single-quoted text value. Real newlines are preserved — drawtext
+// renders them as line breaks (see drawtextFilter's word-wrapping).
 func drawtextEscape(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `'`, `\'`)
 	s = strings.ReplaceAll(s, `:`, `\:`)
 	s = strings.ReplaceAll(s, `%`, `\%`)
-	s = strings.ReplaceAll(s, "\n", " ")
 	return s
 }
 
