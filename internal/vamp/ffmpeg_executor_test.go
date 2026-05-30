@@ -3,9 +3,11 @@ package vamp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -228,6 +230,60 @@ func TestFFmpegExecutor_TemplateUsesPriorStageFiles(t *testing.T) {
 	}
 	if !equalStringSlices(call.Args, wantArgs) {
 		t.Errorf("args mismatch:\n got:  %v\n want: %v", call.Args, wantArgs)
+	}
+}
+
+// TestFFmpegExecutor_ConcatVideo verifies concat_video mode reads the
+// upstream JSON array, renders each clip path, and builds the normalizing
+// concat filtergraph in order.
+func TestFFmpegExecutor_ConcatVideo(t *testing.T) {
+	runDir := t.TempDir()
+	clips := []string{
+		filepath.Join(runDir, "shot_0.mp4"),
+		filepath.Join(runDir, "shot_1.mp4"),
+	}
+	for _, c := range clips {
+		if err := os.WriteFile(c, []byte("clipdata"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := &recordingFFmpegRunner{}
+	exec := &ffmpegExecutor{runner: runner}
+	stage := &Stage{
+		ID:              "stitch",
+		Type:            StageTypeFFmpeg,
+		Inputs:          []string{"clips_list"},
+		ConcatVideoFrom: "clips_list",
+		ConcatVideoVar:  "item",
+		ConcatVideoFile: "{{ .item }}",
+		Output:          "final.mp4",
+	}
+	listJSON, _ := json.Marshal(clips)
+	prior := map[string]*stageResult{"clips_list": {Output: string(listJSON)}}
+	in := StageInput{Stage: stage, Prior: prior, RunDir: runDir}
+	out, err := exec.Execute(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if want := filepath.Join(runDir, "final.mp4"); len(out.Files) != 1 || out.Files[0] != want {
+		t.Fatalf("output = %v, want [%s]", out.Files, want)
+	}
+	call := runner.call(0)
+	joined := strings.Join(call.Args, " ")
+	// Both clips fed as inputs in order.
+	if !strings.Contains(joined, "-i "+clips[0]+" -i "+clips[1]) {
+		t.Errorf("inputs not in order: %s", joined)
+	}
+	// Default vertical normalization + 2-way concat.
+	for _, want := range []string{
+		"scale=1080:1920:force_original_aspect_ratio=decrease",
+		"fps=30[v0]", "fps=30[v1]",
+		"concat=n=2:v=1:a=0[outv]",
+		"-map [outv]", "-c:v libx264", "-pix_fmt yuv420p",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("filtergraph missing %q in: %s", want, joined)
+		}
 	}
 }
 

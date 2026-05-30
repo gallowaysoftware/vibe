@@ -1661,6 +1661,31 @@ stages:
     retry_on: [bogus]`,
 			wantErr: "retry.retry_on entry \"bogus\"",
 		},
+		{
+			name: "input_images on text stage",
+			yaml: `name: x
+stages:
+- id: a
+  capability: r
+  prompt: hi
+  output: a.md
+  input_images:
+    "10.image": ref.png`,
+			wantErr: "input_images is only valid on type: comfyui",
+		},
+		{
+			name: "comfyui input_images bad key",
+			yaml: `name: x
+stages:
+- id: a
+  type: comfyui
+  capability: image
+  workflow: wf.json
+  output: a.png
+  input_images:
+    badkey: ref.png`,
+			wantErr: "input_images key",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

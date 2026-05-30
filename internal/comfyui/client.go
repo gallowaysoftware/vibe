@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -260,6 +261,83 @@ func (c *Client) Submit(ctx context.Context, workflow map[string]any) (string, e
 		return "", fmt.Errorf("comfyui: /prompt response missing prompt_id (body: %s)", strings.TrimSpace(string(respBody)))
 	}
 	return pr.PromptID, nil
+}
+
+// UploadedImage is ComfyUI's /upload/image response: the server-side
+// filename a LoadImage node should reference. Subfolder is normally empty
+// for inputs; Type is the storage area ("input").
+type UploadedImage struct {
+	Name      string `json:"name"`
+	Subfolder string `json:"subfolder"`
+	Type      string `json:"type"`
+}
+
+// InputValue is the string a LoadImage node's `image` input expects for this
+// upload: the bare filename, or "<subfolder>/<name>" when the server filed
+// it under a subfolder.
+func (u UploadedImage) InputValue() string {
+	if u.Subfolder == "" {
+		return u.Name
+	}
+	return u.Subfolder + "/" + u.Name
+}
+
+// UploadImage POSTs an image to ComfyUI's /upload/image endpoint (multipart
+// form) into the server's input area, returning the server-side filename to
+// bind into a LoadImage node — the mechanism behind feeding an
+// upstream-generated still into an image-to-video workflow. overwrite=true
+// keeps reruns idempotent (the same name maps to the same server file rather
+// than accreting "(1)", "(2)" suffixes).
+func (c *Client) UploadImage(ctx context.Context, name string, r io.Reader) (UploadedImage, error) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, err := mw.CreateFormFile("image", name)
+	if err != nil {
+		return UploadedImage{}, fmt.Errorf("comfyui: build upload form: %w", err)
+	}
+	if _, err := io.Copy(fw, r); err != nil {
+		return UploadedImage{}, fmt.Errorf("comfyui: buffer upload image: %w", err)
+	}
+	// type=input files the upload where LoadImage reads; overwrite avoids
+	// ComfyUI minting a uniquified name on a re-upload of the same source.
+	_ = mw.WriteField("overwrite", "true")
+	_ = mw.WriteField("type", "input")
+	if err := mw.Close(); err != nil {
+		return UploadedImage{}, fmt.Errorf("comfyui: finalize upload form: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/upload/image", &buf)
+	if err != nil {
+		return UploadedImage{}, fmt.Errorf("comfyui: build upload request: %w", err)
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return UploadedImage{}, fmt.Errorf("comfyui: POST /upload/image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return UploadedImage{}, fmt.Errorf("comfyui: read /upload/image response: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		snippet := strings.TrimSpace(string(respBody))
+		if len(snippet) > 512 {
+			snippet = snippet[:512] + "..."
+		}
+		return UploadedImage{}, fmt.Errorf("comfyui: POST /upload/image: %s: %s", resp.Status, snippet)
+	}
+
+	var ui UploadedImage
+	if err := json.Unmarshal(respBody, &ui); err != nil {
+		return UploadedImage{}, fmt.Errorf("comfyui: decode /upload/image response: %w", err)
+	}
+	if ui.Name == "" {
+		return UploadedImage{}, fmt.Errorf("comfyui: /upload/image response missing name (body: %s)", strings.TrimSpace(string(respBody)))
+	}
+	return ui, nil
 }
 
 // History is a minimally-modeled version of /history/{prompt_id}'s shape.

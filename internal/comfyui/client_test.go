@@ -24,6 +24,59 @@ func newTestServer(t *testing.T, h http.HandlerFunc) (*httptest.Server, *Client)
 	return srv, New(srv.URL, srv.Client())
 }
 
+func TestClient_UploadImage_OK(t *testing.T) {
+	var gotName string
+	var gotOverwrite, gotType string
+	srv, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/upload/image" {
+			t.Errorf("got %s %s, want POST /upload/image", r.Method, r.URL.Path)
+		}
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatalf("parse multipart: %v", err)
+		}
+		_, hdr, err := r.FormFile("image")
+		if err != nil {
+			t.Fatalf("form file: %v", err)
+		}
+		gotName = hdr.Filename
+		gotOverwrite = r.FormValue("overwrite")
+		gotType = r.FormValue("type")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"name":"scene_001.png","subfolder":"","type":"input"}`))
+	})
+	defer srv.Close()
+
+	ui, err := c.UploadImage(context.Background(), "scene_001.png", strings.NewReader("PNGBYTES"))
+	if err != nil {
+		t.Fatalf("UploadImage: %v", err)
+	}
+	if gotName != "scene_001.png" {
+		t.Errorf("uploaded filename = %q", gotName)
+	}
+	if gotOverwrite != "true" || gotType != "input" {
+		t.Errorf("form fields overwrite=%q type=%q", gotOverwrite, gotType)
+	}
+	if ui.Name != "scene_001.png" || ui.InputValue() != "scene_001.png" {
+		t.Errorf("UploadedImage = %+v, InputValue=%q", ui, ui.InputValue())
+	}
+}
+
+func TestClient_UploadImage_Subfolder(t *testing.T) {
+	if got := (UploadedImage{Name: "a.png", Subfolder: "sub"}).InputValue(); got != "sub/a.png" {
+		t.Errorf("InputValue = %q, want sub/a.png", got)
+	}
+}
+
+func TestClient_UploadImage_HTTPError(t *testing.T) {
+	srv, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	defer srv.Close()
+	if _, err := c.UploadImage(context.Background(), "x.png", strings.NewReader("x")); err == nil {
+		t.Fatal("expected error on 500")
+	}
+}
+
 func TestNew_GeneratesStableClientID(t *testing.T) {
 	c := New("http://x:1", nil)
 	if c.ClientID() == "" {

@@ -72,6 +72,7 @@ const (
 	StageTypeCompact = internalvamp.StageTypeCompact
 	StageTypePandoc  = internalvamp.StageTypePandoc
 	StageTypeMix     = internalvamp.StageTypeMix
+	StageTypeShort   = internalvamp.StageTypeShort
 )
 
 // AudioEngine* names the TTS backends an audio stage can select. Default

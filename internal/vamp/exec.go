@@ -107,6 +107,17 @@ const (
 	// podcast pipeline's showrunner-output → final-episode bridge,
 	// but generic across any voice-over-music production.
 	StageTypeMix StageType = "mix"
+
+	// StageTypeShort renders a structured-script JSON into a single vertical
+	// short-form video (the video analog of StageTypeMix). The script
+	// describes an ordered list of shots, each a video clip + a voiceover
+	// audio file + an optional caption; the executor fits each clip to its
+	// shot's audio duration (freeze-last-frame or trim), scales/crops to a
+	// vertical target (1080x1920 by default), burns the caption, muxes the
+	// shot audio, concatenates the shots, applies loudnorm, and optionally
+	// ducks a background-music bed under the voiceover. Built for the
+	// worldsmith `scene` (TikTok content-mill) pipeline.
+	StageTypeShort StageType = "short"
 )
 
 // StageExecutor implements the run of a single stage instance. The receiver
@@ -419,6 +430,7 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 		StageTypeCompact: &compactExecutor{inference: e.Inference},
 		StageTypePandoc:  &pandocExecutor{},
 		StageTypeMix:     &mixExecutor{},
+		StageTypeShort:   &shortExecutor{},
 	}
 
 	// Stage lookup and dependency counts for wave-based scheduling.
@@ -1774,7 +1786,7 @@ func stageRequiresVibeProfile(st *Stage) bool {
 		// like every other LLM stage. No capability set ⇒ pure piper
 		// (or kokoro with an explicit engine_url) ⇒ no profile.
 		return st.Capability != ""
-	case StageTypeFFmpeg, StageTypeYouTube, StageTypeWebhook, StageTypeConfirm, StageTypeRender, StageTypePandoc, StageTypeMix:
+	case StageTypeFFmpeg, StageTypeYouTube, StageTypeWebhook, StageTypeConfirm, StageTypeRender, StageTypePandoc, StageTypeMix, StageTypeShort:
 		return false
 	default:
 		return true

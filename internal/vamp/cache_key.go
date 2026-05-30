@@ -2,6 +2,7 @@ package vamp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -35,7 +36,7 @@ func EnvCacheDisabled() bool {
 // CLI/docs all agree on the same allow-list.
 func stageCacheable(st *Stage) bool {
 	switch stageTypeOrDefault(st) {
-	case StageTypeText, StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg, StageTypeRender, StageTypeCompact, StageTypePandoc, StageTypeMix:
+	case StageTypeText, StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg, StageTypeRender, StageTypeCompact, StageTypePandoc, StageTypeMix, StageTypeShort:
 		return true
 	case StageTypeWebhook:
 		// Webhook stages are NOT cacheable by default — most are
@@ -87,23 +88,24 @@ func stageCacheOptedOut(p *Pipeline, st *Stage) bool {
 // runner's template render path the single source of truth for rendered
 // values.
 type keyInput struct {
-	StageType      StageType
-	Capability     string
-	RenderedPrompt string            // text only
-	ModelID        string            // text only
-	Params         map[string]any    // text only
-	OutputFormat   string            // text only
-	ImageHashes    []string          // text/vision only — sha of each image attached via image_dir, sorted by source path
-	Workflow       map[string]any    // comfyui only — the pre-applied workflow JSON
-	WorkflowParams map[string]string // comfyui only — rendered parameter values
-	Voice          string            // audio only
-	RenderedText   string            // audio only
-	Binary         string            // audio/ffmpeg only
-	VoiceModelSize int64             // audio only — piper engine
-	AudioEngine    string            // audio only — "" / piper / kokoro
-	AudioURL       string            // audio only — kokoro endpoint base
-	FFmpegArgs     []string          // ffmpeg only — rendered argv
-	FFmpegInputs   []string          // ffmpeg only — absolute paths to inputs, sha-mixed below
+	StageType        StageType
+	Capability       string
+	RenderedPrompt   string            // text only
+	ModelID          string            // text only
+	Params           map[string]any    // text only
+	OutputFormat     string            // text only
+	ImageHashes      []string          // text/vision only — sha of each image attached via image_dir, sorted by source path
+	Workflow         map[string]any    // comfyui only — the pre-applied workflow JSON
+	WorkflowParams   map[string]string // comfyui only — rendered parameter values
+	InputImageHashes []string          // comfyui only — sha of each input_images source, sorted by node-input key
+	Voice            string            // audio only
+	RenderedText     string            // audio only
+	Binary           string            // audio/ffmpeg only
+	VoiceModelSize   int64             // audio only — piper engine
+	AudioEngine      string            // audio only — "" / piper / kokoro
+	AudioURL         string            // audio only — kokoro endpoint base
+	FFmpegArgs       []string          // ffmpeg only — rendered argv
+	FFmpegInputs     []string          // ffmpeg only — absolute paths to inputs, sha-mixed below
 }
 
 // stageCacheKey is the package-visible entry point used by the runner. It
@@ -148,10 +150,29 @@ func stageCacheKey(in keyInput) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("comfyui cache key: marshal params: %w", err)
 		}
+		// Gate the input_images element so a parameters-only stage keeps its
+		// historical key (cache.HashStrings is positional — appending an
+		// element unconditionally would invalidate every existing comfyui
+		// cache entry on upgrade). When input_images IS used we fold the
+		// source images' content hashes (NOT the transient uploaded
+		// filenames), so the key is content-addressed on the actual bytes fed
+		// into the workflow.
+		if len(in.InputImageHashes) == 0 {
+			return cache.HashStrings("comfyui",
+				in.Capability,
+				string(workflowJSON),
+				string(paramsJSON),
+			), nil
+		}
+		imagesJSON, err := cache.CanonicalJSON(stringSliceToAny(in.InputImageHashes))
+		if err != nil {
+			return "", fmt.Errorf("comfyui cache key: marshal input image hashes: %w", err)
+		}
 		return cache.HashStrings("comfyui",
 			in.Capability,
 			string(workflowJSON),
 			string(paramsJSON),
+			string(imagesJSON),
 		), nil
 	case StageTypeAudio:
 		engine := in.AudioEngine
@@ -347,11 +368,41 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 			}
 			inputs[parts[1]] = coerceParamValue(val)
 		}
+		// Fold each input_images source's content hash so a regenerated
+		// upstream image (same path, new bytes) misses cache. Sorted by
+		// node-input key to match applyInputImages' deterministic order.
+		var imgHashes []string
+		if len(st.InputImages) > 0 {
+			iiKeys := make([]string, 0, len(st.InputImages))
+			for k := range st.InputImages {
+				iiKeys = append(iiKeys, k)
+			}
+			sort.Strings(iiKeys)
+			for _, k := range iiKeys {
+				src, err := renderTemplate(st.ID+":input_image:"+k, st.InputImages[k], st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+				if err != nil {
+					return "", fmt.Errorf("cache key: render input_images %s: %w", k, err)
+				}
+				if !filepath.IsAbs(src) {
+					src = filepath.Join(e.RunDir, src)
+				}
+				h, err := cache.HashFile(src)
+				if err != nil {
+					if os.IsNotExist(err) {
+						imgHashes = append(imgHashes, "missing:"+src)
+						continue
+					}
+					return "", fmt.Errorf("cache key: hash input_images %s: %w", k, err)
+				}
+				imgHashes = append(imgHashes, h)
+			}
+		}
 		return stageCacheKey(keyInput{
-			StageType:      StageTypeComfyUI,
-			Capability:     st.Capability,
-			Workflow:       workflow,
-			WorkflowParams: rendered,
+			StageType:        StageTypeComfyUI,
+			Capability:       st.Capability,
+			Workflow:         workflow,
+			WorkflowParams:   rendered,
+			InputImageHashes: imgHashes,
 		})
 	case StageTypeAudio:
 		text, err := renderTemplate(st.ID+":text", st.Text, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
@@ -517,6 +568,46 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 				args = append(args, "m4b:from_output:"+upstream.Output)
 			}
 		}
+		// concat_video mode keys on the rendered clip list + each clip's
+		// bytes + the normalize dims, like m4b. Empty FFmpegArgs would
+		// otherwise collide with any other empty-args ffmpeg stage.
+		if st.ConcatVideoFrom != "" {
+			w, h, fps := normalizeVideoDims(st.ConcatVideoWidth, st.ConcatVideoHeight, st.ConcatVideoFPS)
+			outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+			if err != nil {
+				return "", fmt.Errorf("cache key: render concat_video output: %w", err)
+			}
+			args = append(args,
+				"concat_video:v1:from:"+st.ConcatVideoFrom,
+				"concat_video:output:"+outRel,
+				"concat_video:file_template:"+st.ConcatVideoFile,
+				fmt.Sprintf("concat_video:dims:%dx%d@%d", w, h, fps),
+			)
+			variable := st.ConcatVideoVar
+			if variable == "" {
+				variable = DefaultForeachVar
+			}
+			if upstream, ok := e.snapshotPrior(st.Inputs)[st.ConcatVideoFrom]; ok && upstream != nil {
+				args = append(args, "concat_video:from_output:"+upstream.Output)
+				items, derr := decodeUpstreamArray(stripModelArtifacts(upstream.Output))
+				if derr == nil {
+					for i, raw := range items {
+						itemExtra := map[string]any{variable: raw, "i": i}
+						for k, v := range extra {
+							itemExtra[k] = v
+						}
+						clip, rerr := renderTemplate(fmt.Sprintf("%s:concat_video_file[%d]", st.ID, i), st.ConcatVideoFile, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, itemExtra)
+						if rerr != nil {
+							return "", fmt.Errorf("cache key: render concat_video_file[%d]: %w", i, rerr)
+						}
+						if !filepath.IsAbs(clip) {
+							clip = filepath.Join(e.RunDir, clip)
+						}
+						inputs = append(inputs, clip)
+					}
+				}
+			}
+		}
 		return stageCacheKey(keyInput{
 			StageType:    StageTypeFFmpeg,
 			Binary:       st.Binary,
@@ -608,9 +699,129 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 			strings.Join(hdr, "\n"),
 			assertJSON,
 		), nil
+	case StageTypeMix:
+		// (Bug fix) mix was cacheable but had no key branch, so it fell
+		// through to default's empty key — silently never cached / collision
+		// risk. Key on the script bytes (segment order, chapters) + every
+		// referenced media file's content + the rendered output/metadata.
+		scriptBytes, mediaHashes, outRel, metaParts, err := e.scriptStageKeyParts(st, []string{st.IntroMusic, st.OutroMusic, st.CoverImage}, mixMediaPaths, extra)
+		if err != nil {
+			return "", fmt.Errorf("mix cache key: %w", err)
+		}
+		return cache.HashStrings("mix",
+			string(scriptBytes),
+			strings.Join(mediaHashes, "\n"),
+			outRel,
+			fmt.Sprintf("%g", st.LoudnessTarget),
+			strings.Join(metaParts, "\n"),
+		), nil
+	case StageTypeShort:
+		scriptBytes, mediaHashes, outRel, metaParts, err := e.scriptStageKeyParts(st, nil, shortMediaPaths, extra)
+		if err != nil {
+			return "", fmt.Errorf("short cache key: %w", err)
+		}
+		w, h, fps := normalizeVideoDims(firstNonZero(st.ShortWidth, 0), firstNonZero(st.ShortHeight, 0), firstNonZero(st.ShortFPS, 0))
+		return cache.HashStrings("short",
+			string(scriptBytes),
+			strings.Join(mediaHashes, "\n"),
+			outRel,
+			fmt.Sprintf("%dx%d@%d", w, h, fps),
+			fmt.Sprintf("%g", st.LoudnessTarget),
+			strings.Join(metaParts, "\n"),
+		), nil
 	default:
 		return "", nil
 	}
+}
+
+// scriptStageKeyParts assembles the shared cache-key inputs for the
+// script-driven binary stages (mix, short): the raw script bytes, the content
+// hashes of every media file the script + the stage's optional path fields
+// reference, the rendered output path, and the rendered metadata. mediaFromScript
+// extracts the script-relative media paths for the specific script shape.
+func (e *Executor) scriptStageKeyParts(st *Stage, optionalFields []string, mediaFromScript func([]byte) []string, extra map[string]any) (scriptBytes []byte, mediaHashes []string, outRel string, metaParts []string, err error) {
+	scriptPath, err := renderTemplate(st.ID+":script_file", st.ScriptFile, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+	if err != nil {
+		return nil, nil, "", nil, fmt.Errorf("render script_file: %w", err)
+	}
+	scriptPath = resolveInRunDir(scriptPath, e.RunDir)
+	scriptBytes, _ = os.ReadFile(scriptPath) // empty when absent — folds in as ""
+
+	media := mediaFromScript(scriptBytes)
+	for _, f := range optionalFields {
+		if f == "" {
+			continue
+		}
+		r, rerr := renderTemplate(st.ID+":optfield", f, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+		if rerr == nil && strings.TrimSpace(r) != "" {
+			media = append(media, r)
+		}
+	}
+	mediaHashes = e.hashMediaFiles(media)
+
+	outRel, err = renderTemplate(st.ID+":output", st.Output, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+	if err != nil {
+		return nil, nil, "", nil, fmt.Errorf("render output: %w", err)
+	}
+
+	if len(st.Metadata) > 0 {
+		keys := make([]string, 0, len(st.Metadata))
+		for k := range st.Metadata {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			rv, rerr := renderTemplate(st.ID+":metadata:"+k, st.Metadata[k], st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+			if rerr != nil {
+				return nil, nil, "", nil, fmt.Errorf("render metadata %s: %w", k, rerr)
+			}
+			metaParts = append(metaParts, k+"="+rv)
+		}
+	}
+	return scriptBytes, mediaHashes, outRel, metaParts, nil
+}
+
+// hashMediaFiles content-hashes each path (resolved against the run dir),
+// folding an absent file in as a stable "missing:" marker so its later
+// appearance still changes the key.
+func (e *Executor) hashMediaFiles(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		ap := resolveInRunDir(strings.TrimSpace(p), e.RunDir)
+		h, err := cache.HashFile(ap)
+		if err != nil {
+			out = append(out, "missing:"+ap)
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
+// mixMediaPaths / shortMediaPaths pull the media file references out of each
+// script shape for cache keying. Parse failures yield no paths (the raw
+// script bytes already differ, so the key still changes).
+func mixMediaPaths(b []byte) []string {
+	var sc mixScript
+	if json.Unmarshal(b, &sc) != nil {
+		return nil
+	}
+	return sc.VoiceSegments
+}
+
+func shortMediaPaths(b []byte) []string {
+	var sc shortScript
+	if json.Unmarshal(b, &sc) != nil {
+		return nil
+	}
+	paths := make([]string, 0, len(sc.Shots)*2+1)
+	for _, s := range sc.Shots {
+		paths = append(paths, s.Video, s.Audio)
+	}
+	if sc.BackgroundMusic != "" {
+		paths = append(paths, sc.BackgroundMusic)
+	}
+	return paths
 }
 
 // hashStageImages resolves the stage's image inputs against the current
