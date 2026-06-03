@@ -1759,6 +1759,22 @@ func stageTypeOrDefault(st *Stage) StageType {
 	return st.Type
 }
 
+// producesFileOutput reports whether a stage type writes a binary/asset file
+// that downstream stages consume by PATH (via .stages.X.output), as opposed to
+// a text-content stage whose .output IS the content. This is the single source
+// of truth the resume pre-pass uses to decide whether to seed stageOutputs with
+// a file path or the file's bytes — and it must mirror the cache's IsBinary
+// split (set from StageOutput.Files vs .Text at Put time). Anything not listed
+// here is content-bearing (text, render, youtube, webhook, confirm, compact).
+func producesFileOutput(t StageType) bool {
+	switch t {
+	case StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg, StageTypePandoc:
+		return true
+	default:
+		return false
+	}
+}
+
 // stageRequiresVibeProfile reports whether the stage's executor needs a vibe
 // profile activated before Execute. Subprocess-only types (audio, ffmpeg) and
 // the network-only youtube type don't talk to a vibe-managed backend, so the
@@ -1975,15 +1991,25 @@ func (e *Executor) tryResumeStage(st *Stage) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	// Binary stages (comfyui/audio/ffmpeg) record an ABSOLUTE path in
-	// stageResult.Output so downstream subprocesses (ffmpeg/Piper running
-	// from the daemon's CWD) can open it without re-prefixing RunDir. This
-	// matches the live-run path (executors return absolute paths in
-	// out.Files). YouTube is the exception: its "output" is the watch URL we
-	// wrote to disk, and downstream stages expect the URL string itself —
-	// same shape as text.
+	// Binary/asset stages (comfyui/audio/ffmpeg/pandoc) record an ABSOLUTE
+	// path in stageResult.Output so downstream subprocesses (ffmpeg/Piper
+	// running from the daemon's CWD) can open it without re-prefixing RunDir.
+	// This matches the live-run path (executors return absolute paths in
+	// out.Files) and the cache's IsBinary contract.
+	//
+	// EVERY OTHER stage type produces TEXT content that downstream consumes as
+	// `.stages.X.output` content — text, render, youtube (a URL string),
+	// webhook (a response body), confirm, and COMPACT (a summary injected into
+	// a prompt). These must resume with the file's CONTENT, not its path.
+	// Resume is otherwise an existence check (the file is present, non-empty)
+	// that hands the path forward; for a content-consumed stage that silently
+	// feeds the consumer a path where it expects the bytes. Compact stages hit
+	// exactly this: a study-guide/podcast prompt got the literal path
+	// "/…/compact_lessons.txt" instead of the lesson summary, so the model
+	// generated from memory. Classify by output kind, not an allowlist that
+	// forgot compact.
 	t := stageTypeOrDefault(st)
-	if t != StageTypeText && t != StageTypeYouTube && t != StageTypeRender {
+	if producesFileOutput(t) {
 		e.mu.Lock()
 		e.stageOutputs[st.ID] = &stageResult{Output: full}
 		e.mu.Unlock()
@@ -2302,6 +2328,7 @@ func templateFuncs() template.FuncMap {
 		"trim":                       strings.TrimSpace,
 		"joinPath":                   func(parts ...string) string { return filepath.Join(parts...) },
 		"readFile":                   readFileTemplate,
+		"stripToHeading":             stripToHeadingTemplate,
 		"readFiles":                  readFilesTemplate,
 		"readFilesOrEmpty":           readFilesOrEmptyTemplate,
 		"readLessons":                readLessonsTemplate,
@@ -3202,6 +3229,22 @@ var mdDataURIRE = regexp.MustCompile(`!\[([^\]]*)\]\(data:[^)]*\)`)
 // (& + % space etc.) cannot corrupt the request.
 func urlencodeTemplate(v any) string {
 	return url.QueryEscape(fmt.Sprint(v))
+}
+
+// stripToHeadingTemplate returns text from the first line that starts with
+// prefix onward, dropping any preamble before it. Used by the study-guide merge
+// to discard reasoning-model "thinking" that some backends emit before the
+// section's "## " heading (when the backend isn't splitting <think> into
+// reasoning_content). If no such line exists the original text is returned
+// unchanged, so it never silently drops a whole section.
+func stripToHeadingTemplate(text, prefix string) string {
+	lines := strings.Split(text, "\n")
+	for i, ln := range lines {
+		if strings.HasPrefix(ln, prefix) {
+			return strings.Join(lines[i:], "\n")
+		}
+	}
+	return text
 }
 
 // readFileTemplate reads the file at path and returns its contents as a
