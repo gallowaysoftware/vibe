@@ -28,6 +28,7 @@ import (
 // exec; kind=docker-compose is inherently supervised by compose itself.
 func runCmd() *cobra.Command {
 	var noVRAMCheck bool
+	var session string
 	cmd := &cobra.Command{
 		Use:               "run <profile>",
 		Short:             "Start a profile, exec its frontend in the foreground, and stop the profile when the frontend exits.",
@@ -96,7 +97,16 @@ func runCmd() *cobra.Command {
 			}
 			fmt.Printf("launching %s — Ctrl+D / quit the frontend to stop the profile\n", p.Name)
 
-			child := exec.Command(p.Frontend.Binary, p.Frontend.Args...)
+			// Resume a specific frontend session when requested. Both managed
+			// coding frontends we ship (pi, opencode) accept `--session <id>`
+			// to continue an existing session by id; append it after the
+			// profile's static args so a profile-level arg can't clobber it.
+			childArgs := append([]string(nil), p.Frontend.Args...)
+			if session != "" {
+				childArgs = append(childArgs, "--session", session)
+			}
+
+			child := exec.Command(p.Frontend.Binary, childArgs...)
 			child.Stdin = os.Stdin
 			child.Stdout = os.Stdout
 			child.Stderr = os.Stderr
@@ -147,5 +157,6 @@ func runCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&noVRAMCheck, "no-vram-check", false, noVRAMCheckUsage)
+	cmd.Flags().StringVar(&session, "session", "", "resume a specific frontend session by id (passed to pi/opencode as --session <id>)")
 	return cmd
 }
