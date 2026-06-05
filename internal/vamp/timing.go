@@ -47,6 +47,8 @@ type stageTiming struct {
 	status    string
 	notes     map[string]any
 	items     []*itemTiming
+	// metrics is set via StageThroughput for LLM (text) stages; nil otherwise.
+	metrics *InferenceMetrics
 }
 
 // itemTiming records one foreach item's slice of wall time. index is the
@@ -59,6 +61,7 @@ type itemTiming struct {
 	endedAt   time.Time
 	status    string
 	notes     map[string]any
+	metrics   *InferenceMetrics
 }
 
 // Report is the externally consumable view of a run's timing. It is what
@@ -93,16 +96,20 @@ type StageReport struct {
 	Status     string         `json:"status"`
 	Notes      map[string]any `json:"notes,omitempty"`
 	Items      []ItemReport   `json:"items,omitempty"`
+	// Throughput carries inference tokens/sec + TTFT for LLM stages; nil for
+	// non-LLM stages (ffmpeg, comfyui, …). Surfaced as table columns + JSON.
+	Throughput *InferenceMetrics `json:"throughput,omitempty"`
 }
 
 // ItemReport is one foreach item's contribution to a stage's report. Items
 // appear in input-array order (sorted by Index) regardless of the order
 // goroutines completed.
 type ItemReport struct {
-	Index      int            `json:"index"`
-	DurationMS int64          `json:"duration_ms"`
-	Status     string         `json:"status"`
-	Notes      map[string]any `json:"notes,omitempty"`
+	Index      int               `json:"index"`
+	DurationMS int64             `json:"duration_ms"`
+	Status     string            `json:"status"`
+	Notes      map[string]any    `json:"notes,omitempty"`
+	Throughput *InferenceMetrics `json:"throughput,omitempty"`
 }
 
 // NewTracker creates a Tracker for a run. The returned tracker's start time
@@ -145,6 +152,41 @@ func (t *Tracker) StageStart(id, stageType string) {
 		notes:     map[string]any{},
 	}
 	t.order = append(t.order, id)
+}
+
+// StageThroughput attaches inference metrics (tokens/sec, TTFT) to a stage,
+// recorded by the scheduler after a text stage's LLM call returns. No-op when
+// m is nil or carries no completion tokens (non-LLM stages never populate it).
+func (t *Tracker) StageThroughput(id string, m *InferenceMetrics) {
+	if t == nil || m == nil || m.CompletionTokens == 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if st := t.stages[id]; st != nil {
+		st.metrics = m
+	}
+}
+
+// ItemThroughput attaches inference metrics to a foreach item, matched by the
+// caller-supplied index (the item record already exists from ItemStart). No-op
+// for nil/empty metrics or an unknown stage/item.
+func (t *Tracker) ItemThroughput(stageID string, index int, m *InferenceMetrics) {
+	if t == nil || m == nil || m.CompletionTokens == 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st := t.stages[stageID]
+	if st == nil {
+		return
+	}
+	for _, it := range st.items {
+		if it.index == index {
+			it.metrics = m
+			return
+		}
+	}
 }
 
 // StageEnd records the moment a stage completed and merges any per-stage
@@ -292,6 +334,7 @@ func (t *Tracker) Report() Report {
 			StartedAt:  st.startedAt,
 			DurationMS: stEnd.Sub(st.startedAt).Milliseconds(),
 			Status:     st.status,
+			Throughput: st.metrics,
 			Notes:      copyNotes(st.notes),
 		}
 		if len(st.items) > 0 {
@@ -306,10 +349,17 @@ func (t *Tracker) Report() Report {
 					DurationMS: itEnd.Sub(it.startedAt).Milliseconds(),
 					Status:     it.status,
 					Notes:      copyNotes(it.notes),
+					Throughput: it.metrics,
 				}
 			}
 			sort.Slice(items, func(i, j int) bool { return items[i].Index < items[j].Index })
 			sr.Items = items
+			// A foreach parent makes no LLM call itself; surface an aggregate
+			// of its items' throughput in the stage row so the table column is
+			// meaningful for foreach stages too.
+			if sr.Throughput == nil {
+				sr.Throughput = aggregateItemMetrics(st.items)
+			}
 		}
 		rep.Stages = append(rep.Stages, sr)
 	}
@@ -320,6 +370,49 @@ func (t *Tracker) Report() Report {
 		}
 	}
 	return rep
+}
+
+// aggregateItemMetrics folds foreach item metrics into one stage-level view:
+// tokens summed, gen/prefill throughput as token-weighted aggregates (total
+// tokens / total seconds), TTFT averaged. Returns nil when no item carried
+// metrics.
+func aggregateItemMetrics(items []*itemTiming) *InferenceMetrics {
+	agg := &InferenceMetrics{Source: "aggregate"}
+	var genSecs, prefillSecs, ttftSum float64
+	var n, ttftN int
+	for _, it := range items {
+		m := it.metrics
+		if m == nil {
+			continue
+		}
+		n++
+		agg.CompletionTokens += m.CompletionTokens
+		agg.PromptTokens += m.PromptTokens
+		if m.GenTPS > 0 && m.CompletionTokens > 1 {
+			genSecs += float64(m.CompletionTokens-1) / m.GenTPS
+		}
+		if m.PrefillTPS > 0 && m.PromptTokens > 0 {
+			prefillSecs += float64(m.PromptTokens) / m.PrefillTPS
+		}
+		if m.TTFTms > 0 {
+			ttftSum += float64(m.TTFTms)
+			ttftN++
+		}
+	}
+	if n == 0 {
+		return nil
+	}
+	if genSecs > 0 {
+		// total decode tokens (one token per item is prefill, not decode).
+		agg.GenTPS = float64(agg.CompletionTokens-n) / genSecs
+	}
+	if prefillSecs > 0 {
+		agg.PrefillTPS = float64(agg.PromptTokens) / prefillSecs
+	}
+	if ttftN > 0 {
+		agg.TTFTms = int64(ttftSum / float64(ttftN))
+	}
+	return agg
 }
 
 // SetCapabilities records the per-capability profile resolution for the
@@ -394,12 +487,28 @@ func (t *Tracker) FormatTable(w io.Writer) error {
 	idW := len("stage")
 	typeW := len("type")
 	durW := len("duration")
+	tpsW := len("tok/s")
+	tokW := len("tokens")
+	ttftW := len("ttft")
 	var stageMS int64
-	rows := make([][4]string, 0, len(rep.Stages))
+	// row columns: id, type, duration, tok/s, tokens, ttft, notes.
+	rows := make([][7]string, 0, len(rep.Stages))
 	for _, s := range rep.Stages {
 		dur := time.Duration(s.DurationMS) * time.Millisecond
+		tps, tok, ttft := "", "", ""
+		if m := s.Throughput; m != nil {
+			if m.GenTPS > 0 {
+				tps = fmt.Sprintf("%.0f", m.GenTPS)
+			}
+			if m.CompletionTokens > 0 {
+				tok = fmt.Sprintf("%d", m.CompletionTokens)
+			}
+			if m.TTFTms > 0 {
+				ttft = formatDuration(time.Duration(m.TTFTms) * time.Millisecond)
+			}
+		}
 		notes := formatNotes(s)
-		row := [4]string{s.ID, s.Type, formatDuration(dur), notes}
+		row := [7]string{s.ID, s.Type, formatDuration(dur), tps, tok, ttft, notes}
 		rows = append(rows, row)
 		if len(s.ID) > idW {
 			idW = len(s.ID)
@@ -410,16 +519,28 @@ func (t *Tracker) FormatTable(w io.Writer) error {
 		if len(row[2]) > durW {
 			durW = len(row[2])
 		}
+		if len(tps) > tpsW {
+			tpsW = len(tps)
+		}
+		if len(tok) > tokW {
+			tokW = len(tok)
+		}
+		if len(ttft) > ttftW {
+			ttftW = len(ttft)
+		}
 		stageMS += s.DurationMS
 	}
-	// Header.
-	fmt.Fprintf(w, "  %-*s  %-*s  %*s  notes\n", idW, "stage", typeW, "type", durW, "duration")
+	// Header. Numeric throughput columns are right-aligned like duration;
+	// they render blank for non-LLM stages.
+	fmt.Fprintf(w, "  %-*s  %-*s  %*s  %*s  %*s  %*s  notes\n",
+		idW, "stage", typeW, "type", durW, "duration", tpsW, "tok/s", tokW, "tokens", ttftW, "ttft")
 	for _, r := range rows {
-		if r[3] == "" {
-			fmt.Fprintf(w, "  %-*s  %-*s  %*s\n", idW, r[0], typeW, r[1], durW, r[2])
-		} else {
-			fmt.Fprintf(w, "  %-*s  %-*s  %*s  %s\n", idW, r[0], typeW, r[1], durW, r[2], r[3])
+		line := fmt.Sprintf("  %-*s  %-*s  %*s  %*s  %*s  %*s",
+			idW, r[0], typeW, r[1], durW, r[2], tpsW, r[3], tokW, r[4], ttftW, r[5])
+		if r[6] != "" {
+			line += "  " + r[6]
 		}
+		fmt.Fprintln(w, line)
 	}
 
 	stageDur := time.Duration(stageMS) * time.Millisecond

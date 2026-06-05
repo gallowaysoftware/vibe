@@ -1119,11 +1119,17 @@ func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID
 
 	e.timing.StageStart(st.ID, stageType)
 	in := e.makeStageInput(st, baseURL, modelID, backendAddr, tokenSink, nil, 0)
-	out, err := e.runWithRetry(ctx, st, exec, in)
+	// Carry an inference-metrics collector through ctx; text stages' LLM call
+	// fills it (other stage types leave it empty), and we attach it to the
+	// stage's timing record for the tok/s column. Threading via ctx keeps the
+	// executor/InferenceFunc signatures untouched.
+	mctx, metrics := WithMetrics(ctx)
+	out, err := e.runWithRetry(mctx, st, exec, in)
 	if err != nil {
 		e.timing.StageEnd(st.ID, "error", e.stageNotes(st))
 		return err
 	}
+	e.timing.StageThroughput(st.ID, metrics)
 
 	// ComfyUI stages own their own output-path rendering + writing because
 	// the executor copies a binary file (or files) to disk inside Execute and
@@ -1360,7 +1366,8 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 			// item N does not re-run items 0..N-1. The wrapper respects
 			// groupCtx so an erroring sibling that calls cancel() aborts
 			// any in-progress backoff sleeps immediately.
-			out, runErr := e.runWithRetry(groupCtx, st, exec, in)
+			itemCtx, itemMetrics := WithMetrics(groupCtx)
+			out, runErr := e.runWithRetry(itemCtx, st, exec, in)
 			if buf != nil {
 				if tokenSink != nil {
 					sinkMu.Lock()
@@ -1398,6 +1405,7 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 				outputs[i] = out.Text
 				itemNotes["chars_out"] = len(out.Text)
 			}
+			e.timing.ItemThroughput(st.ID, i, itemMetrics)
 			e.timing.ItemEnd(st.ID, i, "ok", itemNotes)
 		}()
 	}
