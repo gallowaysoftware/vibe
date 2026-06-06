@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // ChatCompletion calls an OpenAI-compatible /v1/chat/completions endpoint
@@ -27,6 +28,90 @@ type ChatCompletion struct {
 // must not block on I/O for long; the caller is expected to write to a fast
 // sink (e.g. stdout).
 type StreamFunc func(delta string)
+
+// InferenceMetrics captures per-call throughput. It is populated by Call only
+// when a collector is present in the context (see WithMetrics); the zero value
+// means "not measured" (e.g. a non-text stage that never hits the LLM).
+type InferenceMetrics struct {
+	PromptTokens     int     `json:"prompt_tokens"`
+	CompletionTokens int     `json:"completion_tokens"`
+	TTFTms           int64   `json:"ttft_ms"`
+	TotalMs          int64   `json:"total_ms"`
+	GenTPS           float64 `json:"gen_tps"`     // completion tokens / decode seconds
+	PrefillTPS       float64 `json:"prefill_tps"` // prompt tokens / prefill seconds
+	Source           string  `json:"source"`      // "timings" (llama-server exact) | "usage" (derived)
+}
+
+type metricsCtxKey struct{}
+
+// WithMetrics returns a context carrying a fresh metrics collector plus the
+// collector itself. The scheduler attaches one around each text stage; Call
+// fills it in, and the scheduler reads it back after the call returns. Threading
+// it through context keeps InferenceFunc's signature (and its many call sites)
+// untouched.
+func WithMetrics(ctx context.Context) (context.Context, *InferenceMetrics) {
+	m := &InferenceMetrics{}
+	return context.WithValue(ctx, metricsCtxKey{}, m), m
+}
+
+func metricsFrom(ctx context.Context) *InferenceMetrics {
+	m, _ := ctx.Value(metricsCtxKey{}).(*InferenceMetrics)
+	return m
+}
+
+// usageJSON / timingsJSON mirror the OpenAI `usage` block (portable; both
+// llama-server and tabbyAPI emit it) and llama-server's `timings` extension
+// (exact prefill/decode split; absent on tabbyAPI).
+type usageJSON struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+}
+
+type timingsJSON struct {
+	PromptN     int     `json:"prompt_n"`
+	PromptMS    float64 `json:"prompt_ms"`
+	PredictedN  int     `json:"predicted_n"`
+	PredictedMS float64 `json:"predicted_ms"`
+}
+
+// finalizeMetrics computes throughput into m from whatever the server returned.
+// Prefers llama-server's exact `timings`; otherwise derives from `usage` token
+// counts plus measured TTFT/total wall-clock.
+func finalizeMetrics(m *InferenceMetrics, u *usageJSON, tg *timingsJSON, ttftMS, totalMS int64) {
+	if m == nil {
+		return
+	}
+	m.TotalMs = totalMS
+	m.TTFTms = ttftMS
+	if u != nil {
+		m.PromptTokens = u.PromptTokens
+		m.CompletionTokens = u.CompletionTokens
+	}
+	if tg != nil && tg.PredictedMS > 0 {
+		m.Source = "timings"
+		if tg.PredictedN > 0 {
+			m.CompletionTokens = tg.PredictedN
+		}
+		if tg.PromptN > 0 {
+			m.PromptTokens = tg.PromptN
+		}
+		m.GenTPS = float64(tg.PredictedN) / (tg.PredictedMS / 1000)
+		if tg.PromptMS > 0 {
+			m.PrefillTPS = float64(tg.PromptN) / (tg.PromptMS / 1000)
+		}
+		return
+	}
+	m.Source = "usage"
+	// Decode time = total - prefill(≈TTFT). The -1 excludes the first token,
+	// whose latency is prefill, not decode.
+	decodeMS := totalMS - ttftMS
+	if m.CompletionTokens > 1 && decodeMS > 0 {
+		m.GenTPS = float64(m.CompletionTokens-1) / (float64(decodeMS) / 1000)
+	}
+	if m.PromptTokens > 0 && ttftMS > 0 {
+		m.PrefillTPS = float64(m.PromptTokens) / (float64(ttftMS) / 1000)
+	}
+}
 
 // Call invokes the chat completion endpoint. When onToken is nil the server is
 // asked for a single non-streaming JSON response and the full content is
@@ -66,6 +151,14 @@ func (c *ChatCompletion) CallMultimodal(ctx context.Context, baseURL, model, pro
 	for k, v := range params {
 		body[k] = v
 	}
+	if stream {
+		// Ask for a usage block in the final SSE chunk so we can record
+		// per-stage throughput. Standard OpenAI stream option; honoured by
+		// both llama-server and tabbyAPI. Don't clobber a caller override.
+		if _, ok := body["stream_options"]; !ok {
+			body["stream_options"] = map[string]any{"include_usage": true}
+		}
+	}
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return "", err
@@ -78,6 +171,7 @@ func (c *ChatCompletion) CallMultimodal(ctx context.Context, baseURL, model, pro
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	}
+	start := time.Now()
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return "", err
@@ -95,6 +189,8 @@ func (c *ChatCompletion) CallMultimodal(ctx context.Context, baseURL, model, pro
 					Content string `json:"content"`
 				} `json:"message"`
 			} `json:"choices"`
+			Usage   *usageJSON   `json:"usage"`
+			Timings *timingsJSON `json:"timings"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
 			return "", err
@@ -102,17 +198,20 @@ func (c *ChatCompletion) CallMultimodal(ctx context.Context, baseURL, model, pro
 		if len(r.Choices) == 0 {
 			return "", errors.New("chat completion: no choices in response")
 		}
+		// No TTFT for a non-streamed call; pass 0 so prefill/decode fall back
+		// to total wall-clock unless exact server timings are present.
+		finalizeMetrics(metricsFrom(ctx), r.Usage, r.Timings, 0, time.Since(start).Milliseconds())
 		return r.Choices[0].Message.Content, nil
 	}
 
-	return parseSSEStream(ctx, resp.Body, onToken)
+	return parseSSEStream(ctx, resp.Body, onToken, start, metricsFrom(ctx))
 }
 
 // parseSSEStream reads an OpenAI-compatible Server-Sent Events stream from r.
 // It accumulates content deltas, invoking onToken for each non-empty one, and
 // returns the full concatenated content once it sees the [DONE] sentinel or
 // EOF.
-func parseSSEStream(ctx context.Context, r io.Reader, onToken StreamFunc) (string, error) {
+func parseSSEStream(ctx context.Context, r io.Reader, onToken StreamFunc, start time.Time, m *InferenceMetrics) (string, error) {
 	scanner := bufio.NewScanner(r)
 	// Reasoning models can emit large single-chunk JSON; bump well above the
 	// 64KB default so we don't choke mid-stream.
@@ -120,6 +219,21 @@ func parseSSEStream(ctx context.Context, r io.Reader, onToken StreamFunc) (strin
 	scanner.Buffer(make([]byte, 0, 64*1024), maxLine)
 
 	var acc strings.Builder
+	var firstAt time.Time
+	var lastUsage *usageJSON
+	var lastTimings *timingsJSON
+	// finalize folds whatever the stream reported into the metrics collector.
+	// Called on every return path so a mid-stream error still records partials.
+	finalize := func() {
+		if m == nil {
+			return
+		}
+		var ttftMS int64
+		if !firstAt.IsZero() {
+			ttftMS = firstAt.Sub(start).Milliseconds()
+		}
+		finalizeMetrics(m, lastUsage, lastTimings, ttftMS, time.Since(start).Milliseconds())
+	}
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
@@ -140,6 +254,7 @@ func parseSSEStream(ctx context.Context, r io.Reader, onToken StreamFunc) (strin
 			continue
 		}
 		if payload == "[DONE]" {
+			finalize()
 			return acc.String(), nil
 		}
 		var chunk struct {
@@ -148,9 +263,19 @@ func parseSSEStream(ctx context.Context, r io.Reader, onToken StreamFunc) (strin
 					Content string `json:"content"`
 				} `json:"delta"`
 			} `json:"choices"`
+			Usage   *usageJSON   `json:"usage"`
+			Timings *timingsJSON `json:"timings"`
 		}
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			return "", fmt.Errorf("decode SSE chunk: %w", err)
+		}
+		// The include_usage final chunk carries usage (and, on llama-server,
+		// timings) with an empty choices array — capture before the skip below.
+		if chunk.Usage != nil {
+			lastUsage = chunk.Usage
+		}
+		if chunk.Timings != nil {
+			lastTimings = chunk.Timings
 		}
 		if len(chunk.Choices) == 0 {
 			continue
@@ -160,6 +285,9 @@ func parseSSEStream(ctx context.Context, r io.Reader, onToken StreamFunc) (strin
 			// First event (role-only) and final stop event both arrive with
 			// empty content; skip them silently.
 			continue
+		}
+		if firstAt.IsZero() {
+			firstAt = time.Now()
 		}
 		acc.WriteString(delta)
 		onToken(delta)
@@ -176,6 +304,7 @@ func parseSSEStream(ctx context.Context, r io.Reader, onToken StreamFunc) (strin
 		return "", fmt.Errorf("read SSE stream: %w", err)
 	}
 	// Stream ended without [DONE]; return what we have.
+	finalize()
 	return acc.String(), nil
 }
 

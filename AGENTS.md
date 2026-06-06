@@ -246,6 +246,38 @@ them before pushing.
   character device. Do not use `info.Mode() & os.ModeCharDevice` to
   detect a TTY — use `isatty.IsTerminal(os.Stdin.Fd())`. (Bug fixed in
   86db9b8 because of this trap.)
+- **`runs` is the single run noun.** History and live detached jobs are
+  one surface: `vamp runs {ls,show,cancel,cleanup}`. `runs ls` derives a
+  `STATE` column per dir from the pid file (`vamp.JobStatus`); `runs
+  show` overlays live pid/state via `FindJobByPrefix`; `runs cancel`
+  reuses `runCancel`. `vamp jobs` is a hidden deprecated alias whose
+  subcommands delegate to the same `runs*Cmd` constructors — don't add
+  new behavior under `jobs`. The data layer (`jobs.go`: `ListJobs`,
+  `FindJobByPrefix`, `JobStatus`, `JobState`) is unchanged.
+- **Run-targeting commands take an `<id-or-prefix>`.** `runs show`,
+  `runs cancel`, `logs`, `confirm`, `diff`, and top-level `cancel` all
+  resolve via `FindRunByPrefix`/`FindJobByPrefix` (path-shaped args work
+  too) and render lookup failures through the shared `renderLookupErr`;
+  they tab-complete via `completeRunIDs`. Keep new run-targeting
+  commands on that path rather than taking a raw run-dir.
+
+## Profile authoring / first-run guards
+
+- **`vibe profile new` is canonical** (name positional, `--kind` via
+  flag with completion over every bundled template, `--frontend` sugar
+  for llama-server). `vibe profile init` is a hidden deprecated alias.
+  `--kind` values are derived from `profile_templates/*.yaml` via
+  `profileKinds()` — add a template file and it shows up automatically.
+- **`REPLACE-` is a hard gate.** `profile.Validate` re-marshals the
+  parsed profile (dropping `# REPLACE:` comments) and rejects any
+  surviving `REPLACE-` value, so an unedited starter fails to load with
+  a clear message instead of a downstream file-not-found. Template
+  placeholder VALUES must use the `REPLACE-...` form (with hyphen);
+  explanatory comments use `# REPLACE: ...` and are exempt.
+- **Read-only commands never spawn the daemon.** `vibe list` reads the
+  profiles dir directly; `vibe ps` / `vibe env` ping the daemon and
+  report "not running" rather than `ensureDaemon`. Only `start` / `run`
+  / `pull` / `stop` / `logs` may auto-spawn.
 
 ## Things to never do
 

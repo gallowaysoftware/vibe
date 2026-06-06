@@ -117,7 +117,7 @@ func runCmdInMemory(factory PipelineFactory) *cobra.Command {
 			return RunPipeline(ctx, p, "", nil, opts, cmd.OutOrStdout(), cmd.ErrOrStderr())
 		},
 	}
-	cmd.Flags().StringArrayVar(&inputFlags, "input", nil, "Pipeline input as KEY=VALUE; can repeat. Commas inside the value are NOT split.")
+	cmd.Flags().StringArrayVar(&inputFlags, "input", nil, inputFlagUsage)
 	cmd.Flags().StringVar(&runDirFlag, "run-dir", "", "Override run directory (default: timestamped under $XDG_STATE_HOME/vamp/runs/).")
 	cmd.Flags().StringVar(&apiFlag, "api", "", "vibe control-plane URL (default: $VIBE_API or http://127.0.0.1:9001).")
 	cmd.Flags().StringVar(&resumeFlag, "resume", "", "Resume a previous run from <dir>.")
@@ -152,7 +152,6 @@ func validateCmdInMemory(factory PipelineFactory) *cobra.Command {
 func vizCmdInMemory(factory PipelineFactory) *cobra.Command {
 	var (
 		outFlag        string
-		formatFlag     string
 		showInputsFlag bool
 	)
 	cmd := &cobra.Command{
@@ -164,11 +163,10 @@ func vizCmdInMemory(factory PipelineFactory) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return VizPipeline(p, VizOptions{OutFile: outFlag, Format: formatFlag, ShowInputs: showInputsFlag}, cmd.OutOrStdout())
+			return VizPipeline(p, VizOptions{OutFile: outFlag, ShowInputs: showInputsFlag}, cmd.OutOrStdout())
 		},
 	}
 	cmd.Flags().StringVar(&outFlag, "out", "", "Write rendered Mermaid to this file instead of stdout.")
-	cmd.Flags().StringVar(&formatFlag, "format", "mermaid", "Output format. Only \"mermaid\" is supported.")
 	cmd.Flags().BoolVar(&showInputsFlag, "show-inputs", false, "Include declared inputs as a subgraph block.")
 	return cmd
 }
@@ -191,7 +189,7 @@ func renderCmdInMemory(factory PipelineFactory) *cobra.Command {
 			return RenderStageForPipeline(p, "", args[0], RenderStageOptions{Inputs: inputFlags, RunDir: runDirFlag}, cmd.OutOrStdout())
 		},
 	}
-	cmd.Flags().StringArrayVar(&inputFlags, "input", nil, "Pipeline input as KEY=VALUE; can repeat.")
+	cmd.Flags().StringArrayVar(&inputFlags, "input", nil, inputFlagUsage)
 	cmd.Flags().StringVar(&runDirFlag, "run-dir", "", "Optional: prior run directory whose stage outputs should seed the template.")
 	return cmd
 }

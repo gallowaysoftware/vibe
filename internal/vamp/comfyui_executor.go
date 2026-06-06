@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -74,6 +75,9 @@ func (e *comfyuiExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 	}
 
 	client := e.clientFor(in.BackendAddr)
+	if err := applyInputImages(ctx, client, workflow, st, in, extra); err != nil {
+		return nil, fmt.Errorf("stage %s: %w", st.ID, err)
+	}
 	promptID, err := client.Submit(ctx, workflow)
 	if err != nil {
 		return nil, fmt.Errorf("stage %s: submit workflow: %w", st.ID, err)
@@ -190,22 +194,73 @@ func applyParameters(workflow map[string]any, st *Stage, in StageInput, extra ma
 		if err != nil {
 			return fmt.Errorf("render parameter %s: %w", key, err)
 		}
-		node, ok := workflow[nodeID].(map[string]any)
+		if err := setWorkflowInput(workflow, nodeID, inputName, coerceParamValue(rendered)); err != nil {
+			return fmt.Errorf("parameter %s: %w", key, err)
+		}
+	}
+	return nil
+}
+
+// setWorkflowInput writes value into workflow[nodeID]["inputs"][inputName],
+// returning a precise error when the node is missing, isn't executable, or
+// lacks the named input. Shared by applyParameters and applyInputImages so
+// the three "node missing / no inputs / input missing" diagnostics stay in
+// one place.
+func setWorkflowInput(workflow map[string]any, nodeID, inputName string, value any) error {
+	node, ok := workflow[nodeID].(map[string]any)
+	if !ok {
+		return fmt.Errorf("node %q does not exist in workflow (or is not an object)", nodeID)
+	}
+	inputs, ok := node["inputs"].(map[string]any)
+	if !ok {
+		// ComfyUI workflows always declare inputs as an object; a missing
+		// inputs key means the user pointed at the wrong node (a Note
+		// node or similar), which is worth surfacing distinctly from
+		// "node doesn't exist".
+		return fmt.Errorf("node %q has no inputs object (is it a Note / non-executable node?)", nodeID)
+	}
+	if _, exists := inputs[inputName]; !exists {
+		return fmt.Errorf("input %q does not exist on node %q", inputName, nodeID)
+	}
+	inputs[inputName] = value
+	return nil
+}
+
+// applyInputImages renders each Stage.InputImages source-path template,
+// uploads the file to ComfyUI, and binds the returned server-side filename
+// into the target node input (typically a LoadImage `image`). Sorted
+// iteration keeps upload order (and any error) deterministic.
+func applyInputImages(ctx context.Context, client *comfyui.Client, workflow map[string]any, st *Stage, in StageInput, extra map[string]any) error {
+	keys := make([]string, 0, len(st.InputImages))
+	for k := range st.InputImages {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		nodeID, inputName, ok := strings.Cut(key, ".")
 		if !ok {
-			return fmt.Errorf("parameter %s: node %q does not exist in workflow (or is not an object)", key, nodeID)
+			return fmt.Errorf("input_images key %q is malformed (want \"<node_id>.<input_name>\")", key)
 		}
-		inputs, ok := node["inputs"].(map[string]any)
-		if !ok {
-			// ComfyUI workflows always declare inputs as an object; a missing
-			// inputs key means the user pointed at the wrong node (a Note
-			// node or similar), which is worth surfacing distinctly from
-			// "node doesn't exist".
-			return fmt.Errorf("parameter %s: node %q has no inputs object (is it a Note / non-executable node?)", key, nodeID)
+		rendered, err := renderTemplate(st.ID+":input_image:"+key, st.InputImages[key], st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
+		if err != nil {
+			return fmt.Errorf("render input_images %s: %w", key, err)
 		}
-		if _, exists := inputs[inputName]; !exists {
-			return fmt.Errorf("parameter %s: input %q does not exist on node %q", key, inputName, nodeID)
+		src := rendered
+		if !filepath.IsAbs(src) {
+			src = filepath.Join(in.RunDir, src)
 		}
-		inputs[inputName] = coerceParamValue(rendered)
+		f, err := os.Open(src)
+		if err != nil {
+			return fmt.Errorf("input_images %s: source %s: %w", key, src, err)
+		}
+		uploaded, upErr := client.UploadImage(ctx, filepath.Base(src), f)
+		_ = f.Close()
+		if upErr != nil {
+			return fmt.Errorf("input_images %s: upload %s: %w", key, src, upErr)
+		}
+		if err := setWorkflowInput(workflow, nodeID, inputName, uploaded.InputValue()); err != nil {
+			return fmt.Errorf("input_images %s: %w", key, err)
+		}
 	}
 	return nil
 }

@@ -66,8 +66,9 @@ func (f *ffmpegExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 		return nil, errors.New("ffmpeg: missing stage")
 	}
 	isM4B := st.M4BFrom != ""
-	if !st.ConcatWavs && !isM4B && len(st.FFmpegArgs) == 0 {
-		return nil, fmt.Errorf("stage %s: ffmpeg_args is required for type: ffmpeg (unless concat_wavs or m4b_from is set)", st.ID)
+	isConcatVideo := st.ConcatVideoFrom != ""
+	if !st.ConcatWavs && !isM4B && !isConcatVideo && len(st.FFmpegArgs) == 0 {
+		return nil, fmt.Errorf("stage %s: ffmpeg_args is required for type: ffmpeg (unless concat_wavs, m4b_from, or concat_video_from is set)", st.ID)
 	}
 
 	// Foreach binding goes into argv-template rendering and the output-path
@@ -85,6 +86,10 @@ func (f *ffmpegExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 	// MP3s with embedded chapter metadata.
 	if isM4B {
 		return f.executeM4B(ctx, in, st, extra)
+	}
+	// concat_video mode: re-encode + concatenate N clips into one MP4.
+	if isConcatVideo {
+		return f.executeConcatVideo(ctx, in, st, extra)
 	}
 
 	// Render each argv entry independently. We name each template with its
@@ -131,6 +136,9 @@ func (f *ffmpegExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 
 	runner := f.runner
 	if runner == nil {
+		if err := ensureFFmpegOnPath(st.ID, binary); err != nil {
+			return nil, err
+		}
 		runner = ffmpegCommandRunner{}
 	}
 	// Stream a status line for the live single-stage path so users see
@@ -247,6 +255,9 @@ func (f *ffmpegExecutor) executeConcatWavs(ctx context.Context, in StageInput, s
 
 	runner := f.runner
 	if runner == nil {
+		if err := ensureFFmpegOnPath(st.ID, binary); err != nil {
+			return nil, err
+		}
 		runner = ffmpegCommandRunner{}
 	}
 	if in.Log != nil {
@@ -256,6 +267,18 @@ func (f *ffmpegExecutor) executeConcatWavs(ctx context.Context, in StageInput, s
 		return nil, fmt.Errorf("stage %s: ffmpeg concat: %w", st.ID, err)
 	}
 	return &StageOutput{Files: []string{outAbs}}, nil
+}
+
+// ensureFFmpegOnPath returns a stage-scoped, actionable error when the
+// ffmpeg binary isn't on $PATH, instead of letting os/exec surface a raw
+// `exec: "ffmpeg": executable file not found in $PATH`. Only called on the
+// production path (a nil injected runner) so tests with a fake runner don't
+// need ffmpeg installed.
+func ensureFFmpegOnPath(stageID, binary string) error {
+	if _, err := exec.LookPath(binary); err != nil {
+		return fmt.Errorf("stage %s: %q not found on $PATH; install ffmpeg (e.g. `apt install ffmpeg`, `brew install ffmpeg`, `pacman -S ffmpeg`)", stageID, binary)
+	}
+	return nil
 }
 
 // ffmpegCommandRunner is the production ffmpegRunner. It spawns ffmpeg via
@@ -417,6 +440,138 @@ func scanCRLF(data []byte, atEOF bool) (advance int, token []byte, err error) {
 // with proper chapter navigation. Stage.Output must end in .m4b
 // (validator enforces). No cover-art embed in this pass — that's a
 // follow-up.
+// decodeUpstreamArray parses an upstream stage's JSON output into a slice of
+// items. It accepts a bare JSON array or a {"items":[...]} wrapper (the same
+// shapes foreach and m4b accept), so any list-producing text/render stage can
+// drive a fan-out.
+func decodeUpstreamArray(srcRaw string) ([]any, error) {
+	srcRaw = strings.TrimSpace(srcRaw)
+	var asObj map[string]any
+	if err := json.Unmarshal([]byte(srcRaw), &asObj); err == nil {
+		if arr, ok := asObj["items"].([]any); ok {
+			return arr, nil
+		}
+		return []any{asObj}, nil
+	}
+	var items []any
+	if err := json.Unmarshal([]byte(srcRaw), &items); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// executeConcatVideo renders the ordered clip list from ConcatVideoFrom's JSON
+// array, normalizes each clip (scale-to-fit + center pad + setsar + fps) and
+// concatenates them into one MP4. Re-encoding rather than -c copy is
+// deliberate: clips from a video model carry heterogeneous SAR/pixfmt/timebase
+// /fps that would desync a stream-copy concat.
+func (f *ffmpegExecutor) executeConcatVideo(ctx context.Context, in StageInput, st *Stage, extra map[string]any) (*StageOutput, error) {
+	srcResult, ok := in.Prior[st.ConcatVideoFrom]
+	if !ok || srcResult == nil {
+		return nil, fmt.Errorf("stage %s: concat_video_from %q has no upstream output", st.ID, st.ConcatVideoFrom)
+	}
+	items, err := decodeUpstreamArray(stripModelArtifacts(srcResult.Output))
+	if err != nil {
+		return nil, fmt.Errorf("stage %s: parse concat_video_from %q output: %w", st.ID, st.ConcatVideoFrom, err)
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("stage %s: concat_video_from %q produced zero items", st.ID, st.ConcatVideoFrom)
+	}
+	variable := st.ConcatVideoVar
+	if variable == "" {
+		variable = DefaultForeachVar
+	}
+	clips := make([]string, 0, len(items))
+	for i, raw := range items {
+		itemExtra := map[string]any{variable: raw, "i": i}
+		for k, v := range extra {
+			itemExtra[k] = v
+		}
+		clip, err := renderTemplate(fmt.Sprintf("%s:concat_video_file[%d]", st.ID, i), st.ConcatVideoFile, st.Inputs, in.Inputs, in.Prior, in.RunDir, itemExtra)
+		if err != nil {
+			return nil, fmt.Errorf("stage %s: render concat_video_file[%d]: %w", st.ID, i, err)
+		}
+		if !filepath.IsAbs(clip) {
+			clip = filepath.Join(in.RunDir, clip)
+		}
+		if _, err := os.Stat(clip); err != nil {
+			return nil, fmt.Errorf("stage %s: concat_video clip[%d] %s: %w", st.ID, i, clip, err)
+		}
+		clips = append(clips, clip)
+	}
+
+	w, h, fps := normalizeVideoDims(st.ConcatVideoWidth, st.ConcatVideoHeight, st.ConcatVideoFPS)
+
+	outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
+	if err != nil {
+		return nil, fmt.Errorf("stage %s: render output path: %w", st.ID, err)
+	}
+	outAbs := filepath.Join(in.RunDir, outRel)
+	if err := os.MkdirAll(filepath.Dir(outAbs), 0o755); err != nil {
+		return nil, fmt.Errorf("stage %s: create output dir: %w", st.ID, err)
+	}
+
+	binary := st.Binary
+	if binary == "" {
+		binary = f.defaultBinary
+	}
+	if binary == "" {
+		binary = "ffmpeg"
+	}
+	runner := f.runner
+	if runner == nil {
+		if err := ensureFFmpegOnPath(st.ID, binary); err != nil {
+			return nil, err
+		}
+		runner = ffmpegCommandRunner{}
+	}
+	args := append(concatVideoArgs(clips, w, h, fps), "-y", outAbs)
+	if in.Log != nil {
+		fmt.Fprintf(in.Log, "ffmpeg concat_video: %s (%d clip(s), %dx%d@%d)\n", outRel, len(clips), w, h, fps)
+	}
+	if err := runner.Run(ctx, binary, args, in.Log); err != nil {
+		return nil, fmt.Errorf("stage %s: ffmpeg concat_video: %w", st.ID, err)
+	}
+	return &StageOutput{Files: []string{outAbs}}, nil
+}
+
+// normalizeVideoDims fills vertical-short defaults (1080x1920@30) for any
+// non-positive dimension. Shared by concat_video and the short stage.
+func normalizeVideoDims(w, h, fps int) (int, int, int) {
+	if w <= 0 {
+		w = 1080
+	}
+	if h <= 0 {
+		h = 1920
+	}
+	if fps <= 0 {
+		fps = 30
+	}
+	return w, h, fps
+}
+
+// concatVideoArgs builds the ffmpeg argv (sans the trailing -y output) that
+// normalizes each input clip to w x h @ fps and concatenates them. Each input
+// gets a scale(fit)+pad(center)+setsar+fps chain feeding a single concat
+// filter; audio is dropped (model clips are silent — the short stage muxes
+// voiceover).
+func concatVideoArgs(clips []string, w, h, fps int) []string {
+	args := make([]string, 0, len(clips)*2+8)
+	for _, c := range clips {
+		args = append(args, "-i", c)
+	}
+	var fc strings.Builder
+	for i := range clips {
+		fmt.Fprintf(&fc, "[%d:v]scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=%d[v%d];", i, w, h, w, h, fps, i)
+	}
+	for i := range clips {
+		fmt.Fprintf(&fc, "[v%d]", i)
+	}
+	fmt.Fprintf(&fc, "concat=n=%d:v=1:a=0[outv]", len(clips))
+	args = append(args, "-filter_complex", fc.String(), "-map", "[outv]", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart")
+	return args
+}
+
 func (f *ffmpegExecutor) executeM4B(ctx context.Context, in StageInput, st *Stage, extra map[string]any) (*StageOutput, error) {
 	srcResult, ok := in.Prior[st.M4BFrom]
 	if !ok || srcResult == nil {
@@ -559,6 +714,9 @@ func (f *ffmpegExecutor) executeM4B(ctx context.Context, in StageInput, st *Stag
 	args = append(args, "-movflags", "+faststart", "-y", outAbs)
 	runner := f.runner
 	if runner == nil {
+		if err := ensureFFmpegOnPath(st.ID, binary); err != nil {
+			return nil, err
+		}
 		runner = ffmpegCommandRunner{}
 	}
 	if in.Log != nil {

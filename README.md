@@ -24,25 +24,27 @@ pass `--dry-run` to preview. To build from source: `go install
 ## Hello world
 
 ```
-vibe doctor                                # verify the machine is set up
-vibe profile init llama-server --name code # drop a starter profile to edit
-vibe start code                            # llama-server + opencode wired up
+vibe doctor                              # verify the machine is set up
+vibe profile new code --kind llama-server # drop a starter profile
+# edit ~/.config/vibe/profiles/code.yaml: fill in the REPLACE-marked lines
+vibe start code                          # llama-server + opencode wired up
 ```
 
 The profile is written to `$XDG_CONFIG_HOME/vibe/profiles/code.yaml` with
-`# REPLACE: ...` markers on fields you must fill in (model path, alias,
-frontend app). `vibe start` validates, runs the pre-flight VRAM check,
-launches both backend and frontend, and exits with the env vars to set
-in the calling shell.
+`REPLACE-...` markers on fields you must fill in (model path, alias).
+`vibe start` refuses to launch while any `REPLACE-` placeholder remains,
+then validates, runs the pre-flight VRAM check, launches both backend and
+frontend, and exits with the env vars to set in the calling shell.
 
 ## How it works
 
 **Profiles.** A YAML file under `$XDG_CONFIG_HOME/vibe/profiles/` bundling
 a backend spec, an optional frontend integration, and template variables
-that wire them together. `vibe profile init <kind> [--name <name>]` drops
-a starter (`llama-server`, `comfyui`, `docker-compose`, `managed`); pass
-`--hf <repo>[:<file>]` on the `llama-server` kind to inject a
-`huggingface:` block so `vibe pull` can fetch the weights.
+that wire them together. `vibe profile new <name> --kind <kind>` drops a
+starter; run it with `--help` for the full kind list (`llama-server`,
+`comfyui`, `docker-compose`, `managed`, `tabby-api`, `http-service`,
+`llama-embed-service`). Pass `--hf <repo>[:<file>]` on the `llama-server`
+kind to inject a `huggingface:` block so `vibe pull` can fetch the weights.
 
 **Backends.** A discriminated union under `backend:` — exactly one
 sub-block must be set:
@@ -65,6 +67,17 @@ sub-block must be set:
   `health_path` until ready, and proxies traffic through `:9000`.
   Used today for Kokoro-FastAPI TTS behind a vamp `capability: tts`.
   No `frontend:` block — the HTTP server is the deliverable.
+- `tabby_api` — supervises [tabbyAPI](https://github.com/theroyallab/tabbyAPI)
+  for EXL3/EXL2 models on NVIDIA, giving an OpenAI-compatible API for
+  ExLlamaV3 quants. Ships a `vibe_defaults` sampler preset (`min_p`,
+  `repetition_penalty`) so EXL3 backends don't degenerate into repetition
+  loops on stages that set only `temperature` + `max_tokens`. See
+  `vibe profile new <name> --kind tabby-api`.
+
+Service-mode profiles (`mode: service`) run as concurrent sidecars
+addressed by name rather than as the single "active" profile — used for
+embedding servers, TTS engines, and SearXNG that a pipeline depends on
+while a different model holds the foreground.
 
 **Auto-respawn.** The supervisor watches each backend after it
 reaches ready; an unexpected mid-life exit (e.g. a flaky CUDA kernel
@@ -127,7 +140,7 @@ anything else is a pipeline error).
 | `pandoc`  | Document conversion via pandoc (docker `pandoc/core` by default, override with `binary:`). Used for markdown → EPUB study guides with `cover_image:`. |
 | `youtube` | Uploads a finished video via the YouTube Data API (OAuth token cache under XDG). |
 | `webhook` | Slack/Discord/Mattermost-style JSON POST. Honors `run_when: failure` so a failed pipeline still pings. |
-| `confirm` | Human-in-the-loop gate: prompts on stdin (TTY) or writes a marker file the operator clears with `vamp confirm <run-dir> <stage-id> [--reject]` (detach mode). Optional `timeout: 30m` auto-rejects. |
+| `confirm` | Human-in-the-loop gate: prompts on stdin (TTY) or writes a marker file the operator clears with `vamp confirm <id-or-prefix> <stage-id> [--reject]` (detach mode). Optional `timeout: 30m` auto-rejects. |
 
 **Resumes.** `vamp run --resume <run-dir>` re-uses outputs already on
 disk, including per-foreach-item granularity (a failed item in an
@@ -150,8 +163,10 @@ Disable with `cache: false` on the pipeline or stage, `--no-cache`, or
 side effects). Inspect with `vamp cache {ls,size,prune,clean}`.
 
 **Detach.** `vamp run --detach` forks a setsid'd worker, writes
-`vamp.pid` + `vamp.log` into the run dir, and returns the job id. Drive
-it with `vamp jobs ls/show/cancel` and `vamp logs <id> [-f]`.
+`vamp.pid` + `vamp.log` into the run dir, and returns the run id (plus
+copy-pasteable `follow` / `cancel` hints). Drive it with `vamp runs
+ls/show/cancel` and `vamp logs <id> [-f]` — a detached run shows up as
+`running` in the `STATE` column of `vamp runs ls`.
 
 **Capability fallback.** `$XDG_CONFIG_HOME/vamp/capabilities.yaml` maps
 each capability to a profile, or to an ordered list of candidates
@@ -172,11 +187,11 @@ capabilities:
 | Command | Purpose |
 | --- | --- |
 | `vibe doctor` | One-shot diagnostic; `--install comfyui\|llama-cpp` runs the bring-up steps. |
-| `vibe profile init <kind>` | Drop a starter YAML; `--hf <repo>[:<file>]` for gated llama-server. |
+| `vibe profile new <name> --kind <kind>` | Drop a starter YAML (run with `--help` for the kind list); `--hf <repo>[:<file>]` for gated llama-server. |
 | `vibe start <profile>` | Activate backend + frontend; pulls missing weights; `--no-vram-check` to bypass. Service-mode profiles run concurrently with each other and one active profile. |
-| `vibe stop [name]` | Stop the active profile (no arg), a specific service (`vibe stop searxng`), or everything (`vibe stop all`). |
+| `vibe stop [name]` | Stop the active profile (no arg), a specific service (`vibe stop searxng`), or everything (`vibe stop --all`). |
 | `vibe ps` | Show the active profile + every running service. |
-| `vibe list` | List profiles. |
+| `vibe list` | List profiles (alias of `vibe profile list`; no daemon needed). |
 | `vibe logs [name]` | Tail backend logs from the active profile (no arg) or a named service. |
 | `vibe tui` | Bubbletea dashboard (start/stop, status, logs). |
 | `vibe token` | Print the bearer token; `--regenerate` rotates. |
@@ -194,11 +209,10 @@ capabilities:
 | `vamp lint <pipeline.yaml>` | Advisory checks layered on validate: webhook URL → matching `RequireService`, `output_format: json` → `Retry.RetryOn` includes `"invalid_output"`. Findings only — exit 0. |
 | `vamp list` | List pipelines under `$XDG_CONFIG_HOME/vamp/pipelines/`. |
 | `vamp capabilities` | Print the resolved capability table. |
-| `vamp runs ls/show/cleanup` | History across run dirs under `$XDG_STATE_HOME/vamp/runs/`. |
+| `vamp runs ls/show/cancel/cleanup` | One noun for everything a run leaves behind: history + live detached jobs. `ls` has a `STATE` column (running/finished/crashed); `show` reports live pid/state; `cancel` SIGTERMs a running detached run. (`vamp jobs` is a hidden deprecated alias.) |
 | `vamp diff <run-a> <run-b>` | Side-by-side comparison of two runs: pipeline YAML, inputs, per-stage prompt / output / status / duration. `--json` for a machine-readable shape, `--stage <id>` to narrow, `--no-content` for metadata only. Honors `NO_COLOR`. |
-| `vamp jobs ls/show/cancel` | Detached-run management. |
-| `vamp logs <id> [-f]` | Cat or follow the detached worker's log. |
-| `vamp cancel <id>` | SIGTERM a detached worker (same as `jobs cancel`). |
+| `vamp logs <id> [-f]` | Cat or follow a run's worker log (id-or-prefix). |
+| `vamp cancel <id>` | SIGTERM a detached worker (alias of `runs cancel`). |
 | `vamp viz <pipeline.yaml>` | Mermaid `flowchart TD` of the DAG; `--show-inputs` for the input block. |
 | `vamp schema` | Emit the pipeline JSON Schema (draft-07); `--out <file>` to write. |
 | `vamp cache ls/size/prune/clean/info` | Inspect and manage the content-addressed cache. `info <run-dir>` reports per-stage cache hit/miss for one run. |

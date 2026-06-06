@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,6 +17,54 @@ import (
 // hfCLIName is the modern huggingface_hub command. The older `huggingface-cli`
 // is deprecated and refuses to work in recent huggingface_hub versions.
 const hfCLIName = "hf"
+
+// hfXetHighPerfMinRAMGiB is the RAM floor below which we do NOT auto-enable Xet
+// high-performance mode. HF recommends it for high-bandwidth boxes (~64GB+); on
+// smaller machines the bumped concurrency/buffers can DEGRADE throughput, so we
+// gate on it. Vibe hosts are GPU workstations, which clear this comfortably.
+const hfXetHighPerfMinRAMGiB = 48
+
+// hfDownloadEnv builds the environment for the `hf` download subprocess. It
+// inherits the daemon env (so HF_TOKEN / stored `hf auth` creds and any operator
+// HF_XET_* tuning flow through), and on a box with enough RAM opts into Xet
+// high-performance transfer.
+//
+// Xet itself — parallel content-defined chunking with global dedup — is the fast
+// path for large GGUFs (observed ~60+ MB/s vs ~1-2 MB/s on the throttled legacy
+// HTTP path) and is ON BY DEFAULT when the `hf_xet` package is present (bundled
+// with huggingface_hub >= 0.32). HF_XET_HIGH_PERFORMANCE additionally raises
+// concurrency/buffer bounds and is only worthwhile on high-RAM machines, so we
+// gate it and never override an operator who set it explicitly. The deprecated
+// HF_HUB_ENABLE_HF_TRANSFER is a no-op in current huggingface_hub and is
+// intentionally NOT set.
+func hfDownloadEnv() []string {
+	env := os.Environ()
+	if _, set := os.LookupEnv("HF_XET_HIGH_PERFORMANCE"); !set && systemRAMGiB() >= hfXetHighPerfMinRAMGiB {
+		env = append(env, "HF_XET_HIGH_PERFORMANCE=1")
+	}
+	return env
+}
+
+// systemRAMGiB returns total system memory in GiB on Linux, or 0 if it can't be
+// determined (so high-performance mode stays off by default off-Linux / on error).
+func systemRAMGiB() float64 {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			if kb, err := strconv.ParseFloat(fields[1], 64); err == nil {
+				return kb / 1024 / 1024
+			}
+		}
+	}
+	return 0
+}
 
 // LookupHFCLI returns the absolute path to the `hf` binary if it's on $PATH.
 func LookupHFCLI() (string, bool) {
@@ -46,6 +95,7 @@ func downloadViaHFCLI(ctx context.Context, hfBin string, spec Spec, destPath str
 		args = append(args, "--revision", spec.Revision)
 	}
 	cmd := exec.CommandContext(ctx, hfBin, args...)
+	cmd.Env = hfDownloadEnv()
 	// Capture stderr so error messages (e.g. "Not logged in") survive.
 	var stderr bytes.Buffer
 	cmd.Stdout = io.Discard

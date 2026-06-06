@@ -3,7 +3,6 @@ package cli
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 
@@ -26,26 +25,23 @@ import (
 func confirmCmd() *cobra.Command {
 	var reject bool
 	cmd := &cobra.Command{
-		Use:   "confirm <run-dir> <stage-id>",
-		Short: "Accept (default) or reject (--reject) a `type: confirm` stage waiting in <run-dir>.",
+		Use:   "confirm <id-or-prefix> <stage-id>",
+		Short: "Accept (default) or reject (--reject) a `type: confirm` stage in a run.",
 		Long: "Clears a `type: confirm` stage gate by writing its response file. " +
 			"Use this from outside the run (typically when the run was started with --detach) " +
-			"to approve or reject a stage that's blocking on operator input.",
-		Args: cobra.ExactArgs(2),
+			"to approve or reject a stage that's blocking on operator input.\n\n" +
+			"The run is named by id-or-prefix (the id `vamp run --detach` printed, " +
+			"resolved against $XDG_STATE_HOME/vamp/runs/) or a directory path — the " +
+			"same addressing as `vamp runs show` / `vamp logs`.",
+		Args:              cobra.ExactArgs(2),
+		ValidArgsFunction: completeRunIDs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			runDir, stageID := args[0], args[1]
-			abs, err := filepath.Abs(runDir)
+			stageID := args[1]
+			r, err := vamp.FindRunByPrefix(vamp.RunsDir(), args[0])
 			if err != nil {
-				return fmt.Errorf("resolve run-dir: %w", err)
+				return renderLookupErr(cmd, err)
 			}
-			info, err := os.Stat(abs)
-			if err != nil {
-				return fmt.Errorf("stat run-dir %s: %w", abs, err)
-			}
-			if !info.IsDir() {
-				return fmt.Errorf("%s is not a directory", abs)
-			}
-			path := vamp.ResponseFilePath(abs, stageID)
+			path := vamp.ResponseFilePath(r.Path, stageID)
 			body := "accepted"
 			if reject {
 				body = "rejected"
@@ -59,7 +55,7 @@ func confirmCmd() *cobra.Command {
 			if err := os.WriteFile(path, []byte(body+"\n"), 0o644); err != nil {
 				return fmt.Errorf("write response file %s: %w", path, err)
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "wrote %s (%s)\n", path, body)
+			fmt.Fprintf(cmd.OutOrStdout(), "stage %s %s (run %s)\n", stageID, body, r.ID)
 			return nil
 		},
 	}

@@ -47,7 +47,7 @@ type schemaProperty struct {
 // trips the generated schema and re-validates the example pipelines against
 // it so the two stay in sync.
 func Schema() *schemaProperty {
-	stageTypeEnum := []any{"", "text", "comfyui", "audio", "ffmpeg", "youtube", "webhook", "confirm", "render", "compact"}
+	stageTypeEnum := []any{"", "text", "comfyui", "audio", "ffmpeg", "youtube", "webhook", "confirm", "render", "compact", "pandoc", "mix", "short"}
 	// runWhenEnum captures the keyword forms only; template-form run_when
 	// values can be any Go text/template expression and are validated at
 	// LoadPipeline time. Leaving the field as `type: string` (no enum
@@ -219,6 +219,13 @@ func Schema() *schemaProperty {
 					Type: "string",
 				},
 			},
+			"input_images": {
+				Type:        "object",
+				Description: "Map of \"<node_id>.<input_name>\" -> templated source image path; uploaded to ComfyUI at run time and bound as the node's image (image-to-video / ref-conditioned edit).",
+				AdditionalProperties: &schemaProperty{
+					Type: "string",
+				},
+			},
 			"ffmpeg_args": {
 				Type:        "array",
 				Description: "Literal argv passed to ffmpeg (each entry template-rendered).",
@@ -228,6 +235,24 @@ func Schema() *schemaProperty {
 				Type:        "string",
 				Description: "Subdirectory (template-rendered, relative to the run dir) to scope the *.wav walk when concat_wavs is true. Defaults to the whole run dir.",
 			},
+			"concat_video_from": {
+				Type:        "string",
+				Description: "Upstream stage whose JSON array drives an ordered video-clip concat (ffmpeg stages). Re-encodes each clip to a normalized vertical profile.",
+			},
+			"concat_video_var": {
+				Type:        "string",
+				Description: "Per-item template var bound while rendering concat_video_file (default \"item\").",
+			},
+			"concat_video_file": {
+				Type:        "string",
+				Description: "Template rendered per upstream item to each clip path (concat_video mode).",
+			},
+			"concat_video_width":  {Type: "integer", Description: "Normalized output width for concat_video (default 1080)."},
+			"concat_video_height": {Type: "integer", Description: "Normalized output height for concat_video (default 1920)."},
+			"concat_video_fps":    {Type: "integer", Description: "Normalized output fps for concat_video (default 30)."},
+			"short_width":         {Type: "integer", Description: "Vertical output width for type: short (default 1080)."},
+			"short_height":        {Type: "integer", Description: "Vertical output height for type: short (default 1920)."},
+			"short_fps":           {Type: "integer", Description: "Output fps for type: short (default 30)."},
 			"m4b_from": {
 				Type:        "string",
 				Description: "Upstream stage whose JSON array drives M4B chapter order (ffmpeg stages). Setting any m4b_* field requires m4b_from + m4b_file + m4b_chapter; m4b_var defaults to \"item\".",

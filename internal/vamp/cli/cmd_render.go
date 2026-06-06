@@ -51,7 +51,7 @@ func renderCmd() *cobra.Command {
 			return RenderStageForPipeline(p, filepath.Dir(pipelinePath), args[1], RenderStageOptions{Inputs: inputFlags, RunDir: runDirFlag}, cmd.OutOrStdout())
 		},
 	}
-	cmd.Flags().StringArrayVar(&inputFlags, "input", nil, "Pipeline input as KEY=VALUE; can repeat. Same shape as `vamp run --input`.")
+	cmd.Flags().StringArrayVar(&inputFlags, "input", nil, inputFlagUsage)
 	cmd.Flags().StringVar(&runDirFlag, "run-dir", "", "Optional: prior run directory whose stage outputs (`.stages.<id>.output`) should seed the template. Without this, prior outputs render as `<stage>-output-placeholder` strings.")
 	return cmd
 }

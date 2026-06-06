@@ -36,6 +36,7 @@ type stubControl struct {
 	profile  string
 	proxyURL string
 	parallel int32
+	stops    int32 // count of Stop calls (FreeProfileAfter assertions)
 }
 
 func (s *stubControl) Status(_ context.Context, _ *connect.Request[vibev1.StatusRequest]) (*connect.Response[vibev1.StatusResponse], error) {
@@ -55,8 +56,15 @@ func (s *stubControl) Start(_ context.Context, req *connect.Request[vibev1.Start
 func (s *stubControl) Stop(_ context.Context, _ *connect.Request[vibev1.StopRequest]) (*connect.Response[vibev1.StopResponse], error) {
 	s.mu.Lock()
 	s.profile = ""
+	s.stops++
 	s.mu.Unlock()
 	return connect.NewResponse(&vibev1.StopResponse{Status: &vibev1.Status{}}), nil
+}
+
+func (s *stubControl) stopCount() int32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stops
 }
 func (s *stubControl) ListProfiles(context.Context, *connect.Request[vibev1.ListProfilesRequest]) (*connect.Response[vibev1.ListProfilesResponse], error) {
 	return connect.NewResponse(&vibev1.ListProfilesResponse{}), nil
@@ -121,6 +129,62 @@ func TestExecutor_SequentialStagesShareOutputs(t *testing.T) {
 	script, _ := os.ReadFile(filepath.Join(runDir, "script.txt"))
 	if !strings.Contains(string(script), "ECHO[from plan: ECHO[topic: robots]]") {
 		t.Errorf("script = %q", script)
+	}
+}
+
+// TestExecutor_FreeProfileAfter verifies that a text stage marked
+// FreeProfileAfter causes the runner to Stop the active profile after that
+// stage's capability group completes — and that an unmarked pipeline never
+// stops the profile mid-run. This is the LLM analogue of the ComfyUI
+// FreeMemoryAfter wiring: the lever that keeps a big LLM from staying
+// resident while a downstream non-LLM GPU phase (TTS, image gen) runs.
+func TestExecutor_FreeProfileAfter(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		freeAfter bool
+		wantStops int32
+	}{
+		{"marked frees profile", true, 1},
+		{"unmarked leaves profile", false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := &stubControl{}
+			mux := http.NewServeMux()
+			path, handler := vibev1connect.NewControlServiceHandler(stub)
+			mux.Handle(path, handler)
+			mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(map[string]any{"data": []map[string]string{{"id": "stub-model"}}})
+			})
+			mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(map[string]any{
+					"choices": []map[string]any{{"message": map[string]string{"content": "ok"}}},
+				})
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+			stub.proxyURL = srv.URL
+
+			// plan -> script (script depends on plan, so each is its own
+			// single-stage group). The LAST stage carries the marker.
+			exec := &Executor{
+				Pipeline: &Pipeline{
+					Name: "test",
+					Stages: []Stage{
+						{ID: "plan", Capability: "reasoning", Prompt: "x", Output: "plan.txt"},
+						{ID: "script", Capability: "reasoning", Prompt: "y", Inputs: []string{"plan"}, Output: "script.txt", FreeProfileAfter: tc.freeAfter},
+					},
+				},
+				Capabilities: &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}},
+				Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client(), ""),
+				RunDir:       t.TempDir(),
+			}
+			if err := exec.Run(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if got := stub.stopCount(); got != tc.wantStops {
+				t.Errorf("Stop calls = %d, want %d", got, tc.wantStops)
+			}
+		})
 	}
 }
 

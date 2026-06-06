@@ -48,6 +48,9 @@ type fakeComfyServer struct {
 	// observed. Default zero; tests asserting on FreeMemoryAfter check
 	// this value after the stage runs.
 	freedCount int32
+	// uploaded records the filename of every POST /upload/image, in order,
+	// so input_images tests can assert what was uploaded.
+	uploaded []string
 }
 
 func newFakeComfyServer(t *testing.T, promptID string, outputs []comfyui.OutputFile, viewPayload []byte) (*fakeComfyServer, *httptest.Server) {
@@ -131,6 +134,27 @@ func newFakeComfyServer(t *testing.T, promptID string, outputs []comfyui.OutputF
 	mux.HandleFunc("POST /free", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&fcs.freedCount, 1)
 		w.WriteHeader(http.StatusOK)
+	})
+	// /upload/image records the uploaded filename and echoes it back as the
+	// server-side name, mirroring ComfyUI's real response shape.
+	mux.HandleFunc("POST /upload/image", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		f, hdr, err := r.FormFile("image")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		_ = f.Close()
+		fcs.mu.Lock()
+		fcs.uploaded = append(fcs.uploaded, hdr.Filename)
+		fcs.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"name": hdr.Filename, "subfolder": "", "type": "input",
+		})
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -285,6 +309,45 @@ func TestComfyUIExecutor_RendersAndSubmits(t *testing.T) {
 	}
 	if got := inputs["text"]; got != "rendered_robots" {
 		t.Errorf("node 6 text = %v, want %q", got, "rendered_robots")
+	}
+}
+
+// TestComfyUIExecutor_InputImages uploads an upstream image and binds the
+// returned server filename into a LoadImage node — the image-to-video seam.
+func TestComfyUIExecutor_InputImages(t *testing.T) {
+	workflow := `{"10":{"class_type":"LoadImage","inputs":{"image":"placeholder.png"}},"6":{"class_type":"CLIPTextEncode","inputs":{"text":"x"}}}`
+	pipeline := &Pipeline{
+		Name: "i2v",
+		Stages: []Stage{{
+			ID:          "animate",
+			Type:        StageTypeComfyUI,
+			Capability:  "image",
+			Output:      "clip.mp4",
+			Parameters:  map[string]string{"6.text": "a moody scene"},
+			InputImages: map[string]string{"10.image": "ref.png"},
+		}},
+	}
+	exec, runDir, _, fcs := stubComfyRuntime(t, pipeline, workflow)
+	// The stage produces a video; point the fake server's output bucket at one.
+	fcs.videos = []comfyui.OutputFile{{Filename: "clip.mp4", Type: "output"}}
+	fcs.outputs = nil
+	// Source image lives in the run dir; input_images joins relative paths to it.
+	if err := os.WriteFile(filepath.Join(runDir, "ref.png"), []byte("\x89PNGref-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fcs.mu.Lock()
+	uploaded := append([]string(nil), fcs.uploaded...)
+	fcs.mu.Unlock()
+	if len(uploaded) != 1 || uploaded[0] != "ref.png" {
+		t.Fatalf("uploaded = %v, want [ref.png]", uploaded)
+	}
+	body := fcs.submittedAt(0)
+	node10 := body["10"].(map[string]any)["inputs"].(map[string]any)
+	if got := node10["image"]; got != "ref.png" {
+		t.Errorf("node 10 image = %v, want server filename %q", got, "ref.png")
 	}
 }
 

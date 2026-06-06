@@ -94,12 +94,27 @@ func TestLlamaServerSpec_OmitsZeroValueFlags(t *testing.T) {
 	if spec.Binary != "llama-server" {
 		t.Errorf("binary = %q (empty should default to llama-server)", spec.Binary)
 	}
-	mustNotContain := []string{"--flash-attn", "--jinja", "--cache-type-k", "--cache-type-v", "--n-gpu-layers", "--mmproj"}
+	mustNotContain := []string{"--flash-attn", "--jinja", "--cache-type-k", "--cache-type-v", "--mmproj"}
 	for _, bad := range mustNotContain {
 		for _, a := range spec.Args {
 			if a == bad {
 				t.Errorf("unexpected flag %s in %v", bad, spec.Args)
 			}
+		}
+	}
+	// --n-gpu-layers is always included (even when 0) so that gpu_layers: 0
+	// explicitly forces CPU mode instead of letting llama-server auto-detect GPU.
+	mustContain := []string{"--n-gpu-layers", "0"}
+	for _, good := range mustContain {
+		found := false
+		for _, a := range spec.Args {
+			if a == good {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("missing expected flag %s in %v", good, spec.Args)
 		}
 	}
 }

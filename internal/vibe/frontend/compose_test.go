@@ -115,10 +115,10 @@ func TestCompose_Activate_BuildsArgv_WithServicesAndProjectName(t *testing.T) {
 	if r.Kind != profile.FrontendDockerCompose {
 		t.Errorf("Kind = %q, want %q", r.Kind, profile.FrontendDockerCompose)
 	}
-	if len(*calls) != 1 {
-		t.Fatalf("got %d runner calls, want 1: %+v", len(*calls), *calls)
+	if len(*calls) != 2 {
+		t.Fatalf("got %d runner calls, want 2 (pre-flight down + up): %+v", len(*calls), *calls)
 	}
-	got := (*calls)[0]
+	got := (*calls)[1] // up call (index 0 is pre-flight down)
 	if got.name != "docker" {
 		t.Errorf("cmd = %q, want docker", got.name)
 	}
@@ -153,11 +153,11 @@ func TestCompose_Activate_DefaultsProjectName(t *testing.T) {
 	if _, err := d.Activate(context.Background(), p, profile.ExpandContext{}); err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
-	if len(*calls) != 1 {
-		t.Fatalf("got %d calls, want 1", len(*calls))
+	if len(*calls) != 2 {
+		t.Fatalf("got %d calls, want 2 (pre-flight down + up)", len(*calls))
 	}
 	// `-p` should be present and follow it with "vibe-<profile-name>".
-	args := (*calls)[0].args
+	args := (*calls)[1].args // up call
 	for i := 0; i < len(args)-1; i++ {
 		if args[i] == "-p" {
 			if args[i+1] != "vibe-research" {
@@ -193,7 +193,7 @@ func TestCompose_Activate_NoWaitFor_NoServices(t *testing.T) {
 		t.Fatalf("Activate: %v", err)
 	}
 	wantArgs := []string{"compose", "-f", composeFile, "-p", "vibe-p", "up", "-d"}
-	if !reflect.DeepEqual((*calls)[0].args, wantArgs) {
+	if !reflect.DeepEqual((*calls)[1].args, wantArgs) {
 		t.Errorf("argv = %v\nwant %v", (*calls)[0].args, wantArgs)
 	}
 }
@@ -231,7 +231,7 @@ func TestCompose_Activate_PassesEnvSorted(t *testing.T) {
 	if got, want := r.Env["OLLAMA_API_URL"], "http://127.0.0.1:9000/v1"; got != want {
 		t.Errorf("expanded env OLLAMA_API_URL = %q, want %q", got, want)
 	}
-	gotEnv := (*calls)[0].env
+	gotEnv := (*calls)[1].env // up call
 	wantEnv := []string{
 		"OLLAMA_API_URL=http://127.0.0.1:9000/v1",
 		"PORT=3001",
@@ -314,11 +314,11 @@ func TestCompose_Activate_WaitForTimeoutTearsDown(t *testing.T) {
 	if !strings.Contains(err.Error(), "wait_for") {
 		t.Errorf("err = %v, want mention of wait_for", err)
 	}
-	// First call is `up`, second should be `down`.
-	if len(*calls) != 2 {
-		t.Fatalf("got %d runner calls, want 2 (up + teardown down): %+v", len(*calls), *calls)
+	// First call is pre-flight `down`, second is `up`, third is teardown `down`.
+	if len(*calls) != 3 {
+		t.Fatalf("got %d runner calls, want 3 (pre-flight down + up + teardown down): %+v", len(*calls), *calls)
 	}
-	down := (*calls)[1]
+	down := (*calls)[2]
 	wantDown := []string{"compose", "-f", composeFile, "-p", "vibe-p", "down"}
 	if !reflect.DeepEqual(down.args, wantDown) {
 		t.Errorf("teardown argv = %v, want %v", down.args, wantDown)
@@ -328,7 +328,8 @@ func TestCompose_Activate_WaitForTimeoutTearsDown(t *testing.T) {
 func TestCompose_Activate_UpFailureReturnsError(t *testing.T) {
 	composeFile := writeComposeFile(t)
 	upErr := errors.New("boom")
-	calls, runner := fakeRunner(upErr)
+	// fakeRunner returns errors in order: pre-flight down (nil) + up (boom)
+	calls, runner := fakeRunner(nil, upErr)
 
 	d := &composeDriver{
 		runCommand:     runner,
@@ -349,10 +350,10 @@ func TestCompose_Activate_UpFailureReturnsError(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("Activate: err = %v, want wrapping of boom", err)
 	}
-	// Only one call (the failing `up`); we do not run `down` if `up`
-	// itself failed.
-	if len(*calls) != 1 {
-		t.Errorf("got %d calls, want 1 (no teardown on up failure)", len(*calls))
+	// Two calls: pre-flight `down` (best-effort) + failing `up`.
+	// We do not run teardown `down` if `up` itself failed.
+	if len(*calls) != 2 {
+		t.Errorf("got %d calls, want 2 (pre-flight down + up, no teardown)", len(*calls))
 	}
 }
 
@@ -411,11 +412,11 @@ func TestCompose_Deactivate_RunsDown(t *testing.T) {
 	if err := Deactivate(context.Background(), r); err != nil {
 		t.Fatalf("Deactivate: %v", err)
 	}
-	if len(*calls) != 2 {
-		t.Fatalf("got %d calls, want 2: %+v", len(*calls), *calls)
+	if len(*calls) != 3 {
+		t.Fatalf("got %d calls, want 3 (pre-flight down + up + deactivate down): %+v", len(*calls), *calls)
 	}
 	wantDown := []string{"compose", "-f", composeFile, "-p", "vibe-p", "down"}
-	if !reflect.DeepEqual((*calls)[1].args, wantDown) {
+	if !reflect.DeepEqual((*calls)[2].args, wantDown) {
 		t.Errorf("down argv = %v\nwant %v", (*calls)[1].args, wantDown)
 	}
 }
@@ -455,8 +456,8 @@ func TestCompose_ExpandsComposeFilePath(t *testing.T) {
 	if r.WroteFile != composeFile {
 		t.Errorf("WroteFile = %q, want %q", r.WroteFile, composeFile)
 	}
-	// Make sure the expanded path made it into the argv.
-	if !strings.Contains(strings.Join((*calls)[0].args, " "), composeFile) {
+	// Make sure the expanded path made it into the argv (up call at index 1).
+	if !strings.Contains(strings.Join((*calls)[1].args, " "), composeFile) {
 		t.Errorf("argv missing expanded compose path: %v", (*calls)[0].args)
 	}
 }

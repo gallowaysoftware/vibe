@@ -97,7 +97,7 @@ func runCmd() *cobra.Command {
 			return RunPipeline(ctx, p, filepath.Dir(pipelinePath), pipelineBytes, opts, cmd.OutOrStdout(), cmd.ErrOrStderr())
 		},
 	}
-	cmd.Flags().StringArrayVar(&inputFlags, "input", nil, "Pipeline input as KEY=VALUE; can repeat. Commas inside the value are NOT split.")
+	cmd.Flags().StringArrayVar(&inputFlags, "input", nil, inputFlagUsage)
 	cmd.Flags().StringVar(&runDirFlag, "run-dir", "", "Override run directory (default: timestamped under $XDG_STATE_HOME/vamp/runs/).")
 	cmd.Flags().StringVar(&apiFlag, "api", "", "vibe control-plane URL (default: $VIBE_API or http://127.0.0.1:9001).")
 	cmd.Flags().StringVar(&resumeFlag, "resume", "", "Resume a previous run from <dir>. Stages whose output files already exist with non-zero size are skipped; missing stages run as usual.")
@@ -251,7 +251,7 @@ func spawnDetached(cmd *cobra.Command, runDirFlag, resumeFlag, pipelineName stri
 		// Worker is still alive but slow to write the pid file. Warn
 		// instead of failing — slow disk / heavy fork can take longer
 		// than 2s — but the operator should know to check.
-		fmt.Fprintf(cmd.ErrOrStderr(), "[warn] detached worker did not write %s within 2s; check `vamp jobs ls` shortly\n", vamp.PidFileName)
+		fmt.Fprintf(cmd.ErrOrStderr(), "[warn] detached worker did not write %s within 2s; check `vamp runs ls` shortly\n", vamp.PidFileName)
 	}
 	// Releasing detaches the process from the parent's reaper so the
 	// worker survives parent exit. After this, the goroutine that
@@ -259,8 +259,13 @@ func spawnDetached(cmd *cobra.Command, runDirFlag, resumeFlag, pipelineName stri
 	// an error we deliberately ignore (process.Release semantics).
 	_ = c.Process.Release()
 	out := cmd.OutOrStdout()
-	fmt.Fprintln(out, filepath.Base(runDir))
+	id := filepath.Base(runDir)
+	// First line is the bare run id so `id=$(vamp run --detach ...)` style
+	// capture keeps working; the rest are copy-pasteable next steps.
+	fmt.Fprintln(out, id)
 	fmt.Fprintf(out, "run dir: %s\n", runDir)
+	fmt.Fprintf(out, "follow:  vamp logs %s -f\n", id)
+	fmt.Fprintf(out, "cancel:  vamp cancel %s\n", id)
 	return nil
 }
 

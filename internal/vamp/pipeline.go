@@ -125,6 +125,10 @@ type Stage struct {
 	// field on webhook stages so each stage type's validator can reject
 	// fields that don't apply.
 	EngineURL string `yaml:"engine_url,omitempty"`
+	// Effect is an optional ffmpeg `-af` filter chain applied in-place to the
+	// finished TTS WAV (e.g. a robotic/vocoder timbre for an "AI" narrator).
+	// Empty = no post-processing. Engine-agnostic.
+	Effect string `yaml:"effect,omitempty"`
 	// Foreach, when non-nil, makes this a fan-out stage. The upstream stage
 	// referenced by From must produce output_format: json and its output must
 	// parse as a JSON array (or {"items":[...]} convenience wrap). The stage
@@ -141,6 +145,15 @@ type Stage struct {
 	// to the vibe profile that supervises the ComfyUI backend.
 	Workflow   string            `yaml:"workflow,omitempty"`
 	Parameters map[string]string `yaml:"parameters,omitempty"`
+	// InputImages maps "<node_id>.<input_name>" -> a templated source path
+	// (typically {{ .stages.X.output }} or a foreach item). At Execute time
+	// each rendered path is uploaded to ComfyUI via POST /upload/image and the
+	// returned server-side filename is written into that node input — the
+	// seam that feeds an upstream-generated still into a LoadImage node for
+	// image-to-video (or a reference-conditioned image edit). Composes with
+	// Parameters (scalars) and Foreach (per-item image). Same key shape as
+	// Parameters.
+	InputImages map[string]string `yaml:"input_images,omitempty"`
 	// FreeMemoryAfter, when true on a ComfyUI stage, asks the ComfyUI
 	// server to unload models + release VRAM after the workflow
 	// succeeds. Best-effort + non-fatal — a failure is logged and the
@@ -149,6 +162,20 @@ type Stage struct {
 	// for downstream LLM activations (iitn's compose_cover → next
 	// episode's long_form_exl3 is the canonical case).
 	FreeMemoryAfter bool `yaml:"free_memory_after,omitempty"`
+	// FreeProfileAfter, when true on a profile-backed stage (today: a
+	// text/LLM stage), asks the runner to STOP the active vibe profile —
+	// unloading the LLM and releasing its VRAM — once the capability GROUP
+	// this stage belongs to finishes successfully. It is the LLM analogue
+	// of FreeMemoryAfter (which unloads a ComfyUI image model): mark the
+	// last LLM stage before a non-LLM GPU phase (TTS, image/video gen) so
+	// the big model isn't left resident — oversubscribing the card — while
+	// a downstream service does its work. Best-effort + non-fatal: a failed
+	// stop is logged and the run continues. Freeing is GROUP-level (not the
+	// instant the marked stage returns) on purpose — stages in a group run
+	// concurrently against the one shared activation, so an early free
+	// would pull the backend out from under a sibling still generating. A
+	// later text group simply re-activates the profile on demand.
+	FreeProfileAfter bool `yaml:"free_profile_after,omitempty"`
 
 	// FFmpeg-stage fields. FFmpegArgs is the literal argv passed to ffmpeg
 	// (in order) after the binary; each entry is rendered as a Go template
@@ -172,6 +199,23 @@ type Stage struct {
 	// to the run dir; absolute paths are rejected to keep cleanup +
 	// resume sane.
 	ConcatWavsDir string `yaml:"concat_wavs_dir,omitempty"`
+	// ConcatVideo* fields, when set on a `type: ffmpeg` stage, switch the
+	// executor into "concatenate N video clips into one MP4" mode — the
+	// video analog of concat_wavs, but driven by an explicit upstream
+	// JSON-array (deterministic ordering) rather than a glob. ConcatVideoFrom
+	// names the upstream stage whose JSON array drives the order;
+	// ConcatVideoFile is a per-item template rendering each clip path;
+	// ConcatVideoVar is the per-item binding (default "item"). The clips are
+	// re-encoded through a normalizing filtergraph (scale/pad/setsar/fps) so
+	// heterogeneous model output concatenates cleanly. Width/Height/FPS
+	// default to 1080x1920@30 (vertical short). Mutually exclusive with
+	// ffmpeg_args / concat_wavs / m4b_*.
+	ConcatVideoFrom   string `yaml:"concat_video_from,omitempty"`
+	ConcatVideoVar    string `yaml:"concat_video_var,omitempty"`
+	ConcatVideoFile   string `yaml:"concat_video_file,omitempty"`
+	ConcatVideoWidth  int    `yaml:"concat_video_width,omitempty"`
+	ConcatVideoHeight int    `yaml:"concat_video_height,omitempty"`
+	ConcatVideoFPS    int    `yaml:"concat_video_fps,omitempty"`
 	// Pandoc-stage fields. SourceFile is the template rendering the input
 	// file path (relative to run dir or absolute). PandocFrom / PandocTo
 	// are the --from / --to format flags. PandocMetadata is a map of
@@ -347,6 +391,19 @@ type Stage struct {
 	// Values are template-rendered so a pipeline can pull the
 	// episode topic / number from inputs / prior stages.
 	Metadata map[string]string `yaml:"metadata,omitempty"`
+
+	// Short-stage dimension overrides (type: short). Zero falls back to the
+	// script's value, then to the vertical default 1080x1920@30. Reuses
+	// ScriptFile / Output / Binary / Metadata / LoudnessTarget from the mix
+	// block above.
+	ShortWidth  int `yaml:"short_width,omitempty"`
+	ShortHeight int `yaml:"short_height,omitempty"`
+	ShortFPS    int `yaml:"short_fps,omitempty"`
+	// ShortStretchVideo time-stretches each shot's video clip to exactly match its
+	// (audio-governed) shot length, instead of freezing the last frame. A clip
+	// shorter than its voiceover plays as smooth slow motion (and a longer one
+	// speeds up) — no last-frame stall, no loop jump-cut. Default false.
+	ShortStretchVideo bool `yaml:"short_stretch_video,omitempty"`
 
 	// Compact-stage fields. A `type: compact` stage replaces the brittle
 	// `| truncate N` template pattern: when an upstream's text would
@@ -666,12 +723,17 @@ func (p *Pipeline) Validate() error {
 		if stageType == "" {
 			stageType = StageTypeText
 		}
+		// input_images is comfyui-only; reject it once here rather than in
+		// every other type's per-field guard block.
+		if stageType != StageTypeComfyUI && len(s.InputImages) > 0 {
+			return fmt.Errorf("%s: input_images is only valid on type: comfyui stages", ctx)
+		}
 		// Capability is required for every stage type except the
 		// subprocess-only ones (audio, ffmpeg) and the network-only types
 		// (youtube, webhook), which talk to a third-party API and never
 		// activate a vibe profile. Confirm stages are pure local I/O —
 		// stdin or a marker file — and also don't activate a profile.
-		if stageType != StageTypeAudio && stageType != StageTypeFFmpeg && stageType != StageTypeYouTube && stageType != StageTypeWebhook && stageType != StageTypeConfirm && stageType != StageTypeRender && stageType != StageTypePandoc && stageType != StageTypeMix && s.Capability == "" {
+		if stageType != StageTypeAudio && stageType != StageTypeFFmpeg && stageType != StageTypeYouTube && stageType != StageTypeWebhook && stageType != StageTypeConfirm && stageType != StageTypeRender && stageType != StageTypePandoc && stageType != StageTypeMix && stageType != StageTypeShort && s.Capability == "" {
 			return fmt.Errorf("%s: capability is required", ctx)
 		}
 		switch stageType {
@@ -704,8 +766,8 @@ func (p *Pipeline) Validate() error {
 			if len(s.Parameters) > 0 {
 				return fmt.Errorf("%s: parameters is only valid on type: comfyui stages (text stages use params)", ctx)
 			}
-			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" {
-				return fmt.Errorf("%s: voice/text/voices_dir/binary are only valid on type: audio stages", ctx)
+			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" || s.Effect != "" {
+				return fmt.Errorf("%s: voice/text/voices_dir/binary/effect are only valid on type: audio stages", ctx)
 			}
 			if len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
@@ -800,6 +862,8 @@ func (p *Pipeline) Validate() error {
 			// or auto M4B chapterized concat (with explicit per-chapter
 			// inputs). The three modes are mutually exclusive.
 			isM4B := s.M4BFrom != "" || s.M4BVar != "" || s.M4BFile != "" || s.M4BChapter != ""
+			isConcatVideo := s.ConcatVideoFrom != "" || s.ConcatVideoFile != "" || s.ConcatVideoVar != "" ||
+				s.ConcatVideoWidth != 0 || s.ConcatVideoHeight != 0 || s.ConcatVideoFPS != 0
 			if s.ConcatWavs && len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: concat_wavs and ffmpeg_args are mutually exclusive (concat_wavs constructs argv internally)", ctx)
 			}
@@ -809,8 +873,38 @@ func (p *Pipeline) Validate() error {
 			if isM4B && len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: m4b_* and ffmpeg_args are mutually exclusive (m4b mode constructs argv internally)", ctx)
 			}
-			if !s.ConcatWavs && !isM4B && len(s.FFmpegArgs) == 0 {
-				return fmt.Errorf("%s: ffmpeg_args is required for type: ffmpeg stages (unless concat_wavs or m4b_from is set)", ctx)
+			if isConcatVideo && (len(s.FFmpegArgs) > 0 || s.ConcatWavs || isM4B) {
+				return fmt.Errorf("%s: concat_video_* is mutually exclusive with ffmpeg_args / concat_wavs / m4b_* (pick one mode)", ctx)
+			}
+			if !s.ConcatWavs && !isM4B && !isConcatVideo && len(s.FFmpegArgs) == 0 {
+				return fmt.Errorf("%s: ffmpeg_args is required for type: ffmpeg stages (unless concat_wavs, m4b_from, or concat_video_from is set)", ctx)
+			}
+			if isConcatVideo {
+				if s.ConcatVideoFrom == "" {
+					return fmt.Errorf("%s: concat_video_from is required when any concat_video_* field is set", ctx)
+				}
+				if s.ConcatVideoFile == "" {
+					return fmt.Errorf("%s: concat_video_file is required when concat_video_from is set", ctx)
+				}
+				if _, err := template.New(s.ID + ":concat_video_file").Funcs(templateFuncs()).Parse(s.ConcatVideoFile); err != nil {
+					return fmt.Errorf("%s: parse concat_video_file template: %w", ctx, err)
+				}
+				declared := false
+				for _, dep := range s.Inputs {
+					if dep == s.ConcatVideoFrom {
+						declared = true
+						break
+					}
+				}
+				if !declared {
+					return fmt.Errorf("%s: concat_video_from %q must also appear in inputs", ctx, s.ConcatVideoFrom)
+				}
+				if s.ConcatVideoVar == "" {
+					p.Stages[i].ConcatVideoVar = DefaultForeachVar
+				}
+				if !strings.HasSuffix(s.Output, ".mp4") {
+					return fmt.Errorf("%s: output %q must end in .mp4 when concat_video_from is set", ctx, s.Output)
+				}
 			}
 			if s.ConcatWavsDir != "" && !s.ConcatWavs {
 				return fmt.Errorf("%s: concat_wavs_dir is only valid when concat_wavs is true", ctx)
@@ -901,12 +995,20 @@ func (p *Pipeline) Validate() error {
 			if s.Workflow == "" {
 				return fmt.Errorf("%s: workflow is required for type: comfyui stages", ctx)
 			}
-			if len(s.Parameters) == 0 {
-				return fmt.Errorf("%s: parameters must have at least one entry for type: comfyui stages", ctx)
+			if len(s.Parameters) == 0 && len(s.InputImages) == 0 {
+				return fmt.Errorf("%s: comfyui stages need at least one parameters or input_images entry", ctx)
 			}
 			for key := range s.Parameters {
 				if !comfyParamKeyRE.MatchString(key) {
 					return fmt.Errorf("%s: parameters key %q must match \"<node_id>.<input_name>\" (e.g. \"6.text\")", ctx, key)
+				}
+			}
+			for key, tmpl := range s.InputImages {
+				if !comfyParamKeyRE.MatchString(key) {
+					return fmt.Errorf("%s: input_images key %q must match \"<node_id>.<input_name>\" (e.g. \"10.image\")", ctx, key)
+				}
+				if _, err := template.New("ii").Funcs(templateFuncs()).Parse(tmpl); err != nil {
+					return fmt.Errorf("%s: input_images %q template: %w", ctx, key, err)
 				}
 			}
 			if s.Prompt != "" {
@@ -921,8 +1023,8 @@ func (p *Pipeline) Validate() error {
 			if s.OutputFormat != "" {
 				return fmt.Errorf("%s: output_format is only valid on type: text stages", ctx)
 			}
-			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" {
-				return fmt.Errorf("%s: voice/text/voices_dir/binary are only valid on type: audio stages", ctx)
+			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" || s.Effect != "" {
+				return fmt.Errorf("%s: voice/text/voices_dir/binary/effect are only valid on type: audio stages", ctx)
 			}
 			if len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
@@ -1130,8 +1232,8 @@ func (p *Pipeline) Validate() error {
 			if len(s.Parameters) > 0 {
 				return fmt.Errorf("%s: parameters is only valid on type: comfyui stages", ctx)
 			}
-			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" {
-				return fmt.Errorf("%s: voice/text/voices_dir/binary are only valid on type: audio stages", ctx)
+			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" || s.Effect != "" {
+				return fmt.Errorf("%s: voice/text/voices_dir/binary/effect are only valid on type: audio stages", ctx)
 			}
 			if len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
@@ -1172,8 +1274,8 @@ func (p *Pipeline) Validate() error {
 			if len(s.Parameters) > 0 {
 				return fmt.Errorf("%s: parameters is only valid on type: comfyui stages", ctx)
 			}
-			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" {
-				return fmt.Errorf("%s: voice/text/voices_dir/binary are only valid on type: audio stages", ctx)
+			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" || s.Effect != "" {
+				return fmt.Errorf("%s: voice/text/voices_dir/binary/effect are only valid on type: audio stages", ctx)
 			}
 			if len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
@@ -1296,8 +1398,33 @@ func (p *Pipeline) Validate() error {
 			if s.Prompt != "" || s.PromptFile != "" {
 				return fmt.Errorf("%s: prompt/prompt_file are not valid on type: mix", ctx)
 			}
+		case StageTypeShort:
+			// Short stages read a script JSON (an upstream stage's output)
+			// describing shots (clip + voiceover + caption) and render a
+			// single vertical MP4 via ffmpeg.
+			if s.ScriptFile == "" {
+				return fmt.Errorf("%s: script_file is required for type: short", ctx)
+			}
+			if _, err := template.New(s.ID + ":script_file").Funcs(templateFuncs()).Parse(s.ScriptFile); err != nil {
+				return fmt.Errorf("%s: parse script_file template: %w", ctx, err)
+			}
+			if !strings.HasSuffix(strings.ToLower(s.Output), ".mp4") {
+				return fmt.Errorf("%s: output %q must end in .mp4 for type: short", ctx, s.Output)
+			}
+			if s.ShortWidth < 0 || s.ShortHeight < 0 || s.ShortFPS < 0 {
+				return fmt.Errorf("%s: short_width/short_height/short_fps must be >= 0", ctx)
+			}
+			if s.LoudnessTarget != 0 && (s.LoudnessTarget < -70 || s.LoudnessTarget > 0) {
+				return fmt.Errorf("%s: loudness_target %g is out of plausible range (-70 .. 0 LUFS; default -16)", ctx, s.LoudnessTarget)
+			}
+			if s.Capability != "" {
+				return fmt.Errorf("%s: capability is only valid on stage types that activate a vibe profile (short shells out to ffmpeg)", ctx)
+			}
+			if s.Prompt != "" || s.PromptFile != "" {
+				return fmt.Errorf("%s: prompt/prompt_file are not valid on type: short", ctx)
+			}
 		default:
-			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio, ffmpeg, youtube, webhook, confirm, render, compact, pandoc, mix)", ctx, s.Type)
+			return fmt.Errorf("%s: type %q is not supported (allowed: \"\", text, comfyui, audio, ffmpeg, youtube, webhook, confirm, render, compact, pandoc, mix, short)", ctx, s.Type)
 		}
 		if s.OutputFormat != "" && s.OutputFormat != "json" {
 			return fmt.Errorf("%s: output_format %q is not supported (allowed: \"\", json)", ctx, s.OutputFormat)
@@ -1310,7 +1437,7 @@ func (p *Pipeline) Validate() error {
 		// up files is most likely a misuse so we reject the field outright.
 		if len(s.Cleanup) > 0 {
 			switch stageType {
-			case StageTypeText, StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg:
+			case StageTypeText, StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg, StageTypeShort:
 				// ok
 			default:
 				return fmt.Errorf("%s: cleanup is only valid on type: text/comfyui/audio/ffmpeg stages (got %q)", ctx, stageType)

@@ -2,6 +2,7 @@ package frontend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -61,11 +62,15 @@ func defaultCompose() *composeDriver {
 // teeReader-style buffer and wrapped into the returned error so the CLI
 // sees the real "failed to connect to podman socket" / "no such image"
 // detail instead of an opaque `exit status 1`.
+//
+// cmd.Env is ALWAYS set (even with an empty env slice) so the child
+// process gets a clean, predictable environment. Without this, Go leaves
+// cmd.Env as nil and the child inherits the process env implicitly —
+// which is fine until profile env vars need to be injected, at which
+// point a partial env list can shadow inherited shell vars.
 func execCommand(ctx context.Context, name string, args []string, env []string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
-	if len(env) > 0 {
-		cmd.Env = append(os.Environ(), env...)
-	}
+	cmd.Env = append(os.Environ(), env...)
 	cmd.Stdout = os.Stdout
 	stderrTail := &tailBuffer{max: 4096}
 	cmd.Stderr = io.MultiWriter(os.Stderr, stderrTail)
@@ -137,6 +142,18 @@ func (c *composeDriver) Activate(reqCtx context.Context, p *profile.Profile, ctx
 	}
 	envSlice := envMapToSlice(env)
 
+	// Pre-flight: tear down any stale containers from a previous run.
+	// Without this, a daemon restart or profile switch can leave old
+	// containers behind, and `compose up -d` fails with "container name
+	// already in use". Best-effort — a failure here doesn't abort the
+	// start, we just log a warning and continue (the up will handle it
+	// by recreating if needed).
+	downArgs := composeDownArgs(composeFile, projectName)
+	if err := c.runCommand(reqCtx, "docker", downArgs, envSlice); err != nil {
+		slog.Warn("frontend compose: stale teardown failed (continuing)",
+			"profile", p.Name, "err", err)
+	}
+
 	upArgs := composeUpArgs(composeFile, projectName, p.Frontend.Services)
 	slog.Info("frontend compose: up",
 		"profile", p.Name,
@@ -144,6 +161,9 @@ func (c *composeDriver) Activate(reqCtx context.Context, p *profile.Profile, ctx
 		"project", projectName,
 	)
 	if err := c.runCommand(reqCtx, "docker", upArgs, envSlice); err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return nil, fmt.Errorf("docker not found on $PATH; install Docker (https://docs.docker.com/get-docker/) to run a docker-compose frontend")
+		}
 		return nil, fmt.Errorf("docker compose up: %w", err)
 	}
 	slog.Info("frontend compose: up done", "profile", p.Name, "project", projectName)

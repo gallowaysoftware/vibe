@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -27,6 +28,7 @@ import (
 // exec; kind=docker-compose is inherently supervised by compose itself.
 func runCmd() *cobra.Command {
 	var noVRAMCheck bool
+	var session string
 	cmd := &cobra.Command{
 		Use:               "run <profile>",
 		Short:             "Start a profile, exec its frontend in the foreground, and stop the profile when the frontend exits.",
@@ -45,13 +47,13 @@ func runCmd() *cobra.Command {
 			pPath := filepath.Join(paths.ProfilesDir(), args[0]+".yaml")
 			p, err := profile.Load(pPath)
 			if err != nil {
-				return fmt.Errorf("load profile %s: %w", args[0], err)
+				return fmt.Errorf("load profile %q: %w (run `vibe profile list` to see available)", args[0], err)
 			}
 			if p.Frontend.Kind != profile.FrontendManaged {
 				return fmt.Errorf("`vibe run` requires kind=managed (got %q); use `vibe start` for kind=external profiles", p.Frontend.Kind)
 			}
 			if p.Frontend.Binary == "" {
-				return errors.New("profile is kind=managed but frontend.binary is unset")
+				return fmt.Errorf("profile %q is kind=managed but frontend.binary is unset; set frontend.binary in %s", args[0], pPath)
 			}
 
 			if err := ensureDaemon(ctx); err != nil {
@@ -87,13 +89,24 @@ func runCmd() *cobra.Command {
 
 			fmt.Printf("started %s (foreground)\n", r.Status.Profile)
 			fmt.Printf("  backend: %s\n", r.Status.BackendAddr)
-			fmt.Printf("  proxy:   %s\n", r.Status.ProxyAddr)
+			if r.Status.ProxyAddr != "" {
+				fmt.Printf("  proxy:   %s\n", r.Status.ProxyAddr)
+			}
 			if r.Frontend != nil && r.Frontend.WroteFile != "" {
 				fmt.Printf("  wrote:   %s\n", r.Frontend.WroteFile)
 			}
 			fmt.Printf("launching %s — Ctrl+D / quit the frontend to stop the profile\n", p.Name)
 
-			child := exec.Command(p.Frontend.Binary, p.Frontend.Args...)
+			// Resume a specific frontend session when requested. Both managed
+			// coding frontends we ship (pi, opencode) accept `--session <id>`
+			// to continue an existing session by id; append it after the
+			// profile's static args so a profile-level arg can't clobber it.
+			childArgs := append([]string(nil), p.Frontend.Args...)
+			if session != "" {
+				childArgs = append(childArgs, "--session", session)
+			}
+
+			child := exec.Command(p.Frontend.Binary, childArgs...)
 			child.Stdin = os.Stdin
 			child.Stdout = os.Stdout
 			child.Stderr = os.Stderr
@@ -102,8 +115,13 @@ func runCmd() *cobra.Command {
 			}
 			if r.Frontend != nil && len(r.Frontend.EnvVars) > 0 {
 				env := append([]string(nil), os.Environ()...)
-				for k, v := range r.Frontend.EnvVars {
-					env = append(env, k+"="+v)
+				keys := make([]string, 0, len(r.Frontend.EnvVars))
+				for k := range r.Frontend.EnvVars {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				for _, k := range keys {
+					env = append(env, k+"="+r.Frontend.EnvVars[k])
 				}
 				child.Env = env
 			}
@@ -138,7 +156,7 @@ func runCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&noVRAMCheck, "no-vram-check", false,
-		"Skip the daemon's pre-flight VRAM check against the profile's estimated_vram_gb.")
+	cmd.Flags().BoolVar(&noVRAMCheck, "no-vram-check", false, noVRAMCheckUsage)
+	cmd.Flags().StringVar(&session, "session", "", "resume a specific frontend session by id (passed to pi/opencode as --session <id>)")
 	return cmd
 }

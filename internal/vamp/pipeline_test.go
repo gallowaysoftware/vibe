@@ -1237,7 +1237,7 @@ stages:
   prompt: hi
   output: a.md
   voice: en_US-lessac-medium`,
-			wantErr: "voice/text/voices_dir/binary are only valid on type: audio",
+			wantErr: "voice/text/voices_dir/binary/effect are only valid on type: audio",
 		},
 		{
 			name: "text stage with text field (audio-only field)",
@@ -1248,7 +1248,7 @@ stages:
   prompt: hi
   output: a.md
   text: "nope"`,
-			wantErr: "voice/text/voices_dir/binary are only valid on type: audio",
+			wantErr: "voice/text/voices_dir/binary/effect are only valid on type: audio",
 		},
 		{
 			name: "comfyui with voice (audio-only field)",
@@ -1262,7 +1262,7 @@ stages:
   parameters:
     "6.text": hi
   voice: nope`,
-			wantErr: "voice/text/voices_dir/binary are only valid on type: audio",
+			wantErr: "voice/text/voices_dir/binary/effect are only valid on type: audio",
 		},
 		{
 			name: "ffmpeg without ffmpeg_args",
@@ -1660,6 +1660,31 @@ stages:
   retry:
     retry_on: [bogus]`,
 			wantErr: "retry.retry_on entry \"bogus\"",
+		},
+		{
+			name: "input_images on text stage",
+			yaml: `name: x
+stages:
+- id: a
+  capability: r
+  prompt: hi
+  output: a.md
+  input_images:
+    "10.image": ref.png`,
+			wantErr: "input_images is only valid on type: comfyui",
+		},
+		{
+			name: "comfyui input_images bad key",
+			yaml: `name: x
+stages:
+- id: a
+  type: comfyui
+  capability: image
+  workflow: wf.json
+  output: a.png
+  input_images:
+    badkey: ref.png`,
+			wantErr: "input_images key",
 		},
 	}
 	for _, tc := range cases {

@@ -449,3 +449,31 @@ func JobStatus(dir string) (JobState, error) {
 	}
 	return js.State, nil
 }
+
+// JobStateFor derives the JobState from an already-summarized run plus a
+// cheap pid-file read — without re-walking the run dir's file tree the way
+// JobStatus (via summarizeJob -> SummarizeRun) does. `vamp runs ls` calls
+// this once per run it already listed, so the listing stays O(runs) stats
+// instead of O(files) on every invocation. The state matrix matches
+// summarizeJob exactly; keep the two in lockstep.
+func JobStateFor(rs RunSummary) JobState {
+	terminal := rs.HasRecord && rs.Status != "" && rs.Status != "unknown"
+	pid, pidErr := readPidFile(filepath.Join(rs.Path, PidFileName))
+	switch {
+	case pidErr == nil && IsAlive(pid):
+		return JobStateRunning
+	case pidErr == nil:
+		if terminal {
+			return JobStateFinished
+		}
+		return JobStateCrashed
+	default:
+		// No pid file, or an unreadable one: a terminal record means the
+		// worker finished and cleaned up; otherwise we can't claim more
+		// than unknown.
+		if terminal {
+			return JobStateFinished
+		}
+		return JobStateUnknown
+	}
+}

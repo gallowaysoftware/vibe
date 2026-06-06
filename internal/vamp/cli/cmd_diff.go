@@ -1,8 +1,6 @@
 package cli
 
 import (
-	"errors"
-	"fmt"
 	"os"
 
 	"github.com/mattn/go-isatty"
@@ -38,7 +36,8 @@ func diffCmd() *cobra.Command {
 			"basename-prefix (resolved against $XDG_STATE_HOME/vamp/runs/) or an\n" +
 			"absolute / relative directory path. Honors NO_COLOR; ANSI colour\n" +
 			"otherwise lights up when stdout is a tty.",
-		Args: cobra.ExactArgs(2),
+		Args:              cobra.ExactArgs(2),
+		ValidArgsFunction: completeRunIDs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pathA, err := resolveRunPath(cmd, args[0])
 			if err != nil {
@@ -76,18 +75,10 @@ func diffCmd() *cobra.Command {
 // recognisable error to fix.
 func resolveRunPath(cmd *cobra.Command, arg string) (string, error) {
 	r, err := vamp.FindRunByPrefix(vamp.RunsDir(), arg)
-	if err == nil {
-		return r.Path, nil
+	if err != nil {
+		return "", renderLookupErr(cmd, err)
 	}
-	var amb *vamp.AmbiguousError
-	if errors.As(err, &amb) {
-		fmt.Fprintf(cmd.ErrOrStderr(), "ambiguous prefix %q; candidates:\n", amb.ID)
-		for _, c := range amb.Candidates {
-			fmt.Fprintf(cmd.ErrOrStderr(), "  %s\n", c)
-		}
-		return "", fmt.Errorf("ambiguous run prefix")
-	}
-	return "", err
+	return r.Path, nil
 }
 
 // wantColor returns true when ANSI colour should be emitted: stdout is

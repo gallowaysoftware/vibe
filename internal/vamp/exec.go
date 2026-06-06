@@ -107,6 +107,17 @@ const (
 	// podcast pipeline's showrunner-output → final-episode bridge,
 	// but generic across any voice-over-music production.
 	StageTypeMix StageType = "mix"
+
+	// StageTypeShort renders a structured-script JSON into a single vertical
+	// short-form video (the video analog of StageTypeMix). The script
+	// describes an ordered list of shots, each a video clip + a voiceover
+	// audio file + an optional caption; the executor fits each clip to its
+	// shot's audio duration (freeze-last-frame or trim), scales/crops to a
+	// vertical target (1080x1920 by default), burns the caption, muxes the
+	// shot audio, concatenates the shots, applies loudnorm, and optionally
+	// ducks a background-music bed under the voiceover. Built for the
+	// worldsmith `scene` (TikTok content-mill) pipeline.
+	StageTypeShort StageType = "short"
 )
 
 // StageExecutor implements the run of a single stage instance. The receiver
@@ -419,6 +430,7 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 		StageTypeCompact: &compactExecutor{inference: e.Inference},
 		StageTypePandoc:  &pandocExecutor{},
 		StageTypeMix:     &mixExecutor{},
+		StageTypeShort:   &shortExecutor{},
 	}
 
 	// Stage lookup and dependency counts for wave-based scheduling.
@@ -1026,6 +1038,7 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 		if err := e.executeStage(ctx, st, baseURL, modelID, backendAddr, profileParallel, nil); err != nil {
 			return fmt.Errorf("stage %s: %w", st.ID, err)
 		}
+		e.freeProfileIfRequested(ctx, group)
 		return nil
 	}
 
@@ -1054,7 +1067,52 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 		}()
 	}
 	wg.Wait()
-	return errors.Join(errs...)
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	e.freeProfileIfRequested(ctx, group)
+	return nil
+}
+
+// freeProfileIfRequested stops the active vibe profile (unloading the LLM and
+// releasing its VRAM) after a capability group completes, when any stage in
+// the group set FreeProfileAfter(). It is the LLM analogue of a ComfyUI
+// stage's FreeMemoryAfter: it hands the card back before the pipeline moves
+// to a phase that needs it for something else (TTS, image/video generation).
+//
+// Group-level, not per-stage, on purpose: stages in a group run concurrently
+// against the one shared activation, so freeing the instant a marked stage
+// returned would pull the backend out from under a sibling still generating.
+// By the time the group is done, every stage that shared the profile is
+// finished; a later text group simply re-activates it via EnsureActive.
+//
+// Best-effort: a nil client or a failed stop is logged and never fails the
+// run — worst case the operator pays the VRAM contention they would have paid
+// without the field set. The cached chat-model id is cleared so the next text
+// group re-resolves it against a freshly-activated profile.
+func (e *Executor) freeProfileIfRequested(ctx context.Context, group []*Stage) {
+	wants := false
+	for _, st := range group {
+		if st.FreeProfileAfter {
+			wants = true
+			break
+		}
+	}
+	if !wants {
+		return
+	}
+	if e.Vibe == nil {
+		return
+	}
+	e.logf("  -> free_profile_after: stopping active profile to release VRAM")
+	if _, err := e.Vibe.Stop(ctx); err != nil {
+		e.logf("  -> free_profile_after: stop active profile failed: %v (continuing)", err)
+		return
+	}
+	e.mu.Lock()
+	e.cachedModelID = ""
+	e.cachedModelProfile = ""
+	e.mu.Unlock()
 }
 
 // executeStage runs a single stage. For ordinary stages it invokes the
@@ -1107,11 +1165,17 @@ func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID
 
 	e.timing.StageStart(st.ID, stageType)
 	in := e.makeStageInput(st, baseURL, modelID, backendAddr, tokenSink, nil, 0)
-	out, err := e.runWithRetry(ctx, st, exec, in)
+	// Carry an inference-metrics collector through ctx; text stages' LLM call
+	// fills it (other stage types leave it empty), and we attach it to the
+	// stage's timing record for the tok/s column. Threading via ctx keeps the
+	// executor/InferenceFunc signatures untouched.
+	mctx, metrics := WithMetrics(ctx)
+	out, err := e.runWithRetry(mctx, st, exec, in)
 	if err != nil {
 		e.timing.StageEnd(st.ID, "error", e.stageNotes(st))
 		return err
 	}
+	e.timing.StageThroughput(st.ID, metrics)
 
 	// ComfyUI stages own their own output-path rendering + writing because
 	// the executor copies a binary file (or files) to disk inside Execute and
@@ -1348,7 +1412,8 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 			// item N does not re-run items 0..N-1. The wrapper respects
 			// groupCtx so an erroring sibling that calls cancel() aborts
 			// any in-progress backoff sleeps immediately.
-			out, runErr := e.runWithRetry(groupCtx, st, exec, in)
+			itemCtx, itemMetrics := WithMetrics(groupCtx)
+			out, runErr := e.runWithRetry(itemCtx, st, exec, in)
 			if buf != nil {
 				if tokenSink != nil {
 					sinkMu.Lock()
@@ -1386,6 +1451,7 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 				outputs[i] = out.Text
 				itemNotes["chars_out"] = len(out.Text)
 			}
+			e.timing.ItemThroughput(st.ID, i, itemMetrics)
 			e.timing.ItemEnd(st.ID, i, "ok", itemNotes)
 		}()
 	}
@@ -1790,7 +1856,7 @@ func stageRequiresVibeProfile(st *Stage) bool {
 		// like every other LLM stage. No capability set ⇒ pure piper
 		// (or kokoro with an explicit engine_url) ⇒ no profile.
 		return st.Capability != ""
-	case StageTypeFFmpeg, StageTypeYouTube, StageTypeWebhook, StageTypeConfirm, StageTypeRender, StageTypePandoc, StageTypeMix:
+	case StageTypeFFmpeg, StageTypeYouTube, StageTypeWebhook, StageTypeConfirm, StageTypeRender, StageTypePandoc, StageTypeMix, StageTypeShort:
 		return false
 	default:
 		return true

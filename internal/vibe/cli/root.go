@@ -8,6 +8,10 @@ import (
 	"github.com/gallowaysoftware/vibe/internal/buildinfo"
 )
 
+// noVRAMCheckUsage is the shared help string for the --no-vram-check flag,
+// which `start` and `run` both expose. Defined once so the two can't drift.
+const noVRAMCheckUsage = "skip the daemon's pre-flight VRAM check against the profile's estimated_vram_gb"
+
 func Execute() error {
 	return rootCmd().Execute()
 }

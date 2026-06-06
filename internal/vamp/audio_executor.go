@@ -218,6 +218,9 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 	if err := runner.Run(ctx, binary, args, text); err != nil {
 		return nil, fmt.Errorf("stage %s: piper: %w", st.ID, err)
 	}
+	if err := applyAudioEffect(ctx, outAbs, st.Effect); err != nil {
+		return nil, fmt.Errorf("stage %s: %w", st.ID, err)
+	}
 	// Report ABSOLUTE path: downstream {{ .stages.X.output(s) }} references
 	// land on argv strings consumed by ffmpeg/etc. subprocesses running from
 	// the daemon's CWD, which can't resolve a path relative to RunDir.
@@ -307,7 +310,30 @@ func (a *audioExecutor) executeKokoro(ctx context.Context, in StageInput, st *St
 	if err := os.WriteFile(outAbs, wav, 0o644); err != nil {
 		return nil, fmt.Errorf("stage %s: write %s: %w", st.ID, outAbs, err)
 	}
+	if err := applyAudioEffect(ctx, outAbs, st.Effect); err != nil {
+		return nil, fmt.Errorf("stage %s: %w", st.ID, err)
+	}
 	return &StageOutput{Files: []string{outAbs}}, nil
+}
+
+// applyAudioEffect runs an ffmpeg `-af` filter chain in-place over a finished
+// WAV — used to give TTS output a non-default timbre (e.g. a robotic
+// "malfunctioning AI" narrator) without changing the TTS engine. No-op when
+// effect is empty. Preserves the source sample rate.
+func applyAudioEffect(ctx context.Context, wavPath, effect string) error {
+	if strings.TrimSpace(effect) == "" {
+		return nil
+	}
+	tmp := wavPath + ".fx.wav"
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-loglevel", "error",
+		"-i", wavPath, "-af", effect, tmp)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("audio effect ffmpeg: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return os.Rename(tmp, wavPath)
 }
 
 // patchRIFFSize rewrites the RIFF size field (bytes 4..8) so the WAV

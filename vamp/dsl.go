@@ -476,6 +476,10 @@ func (a *AudioStage) Engine(name string) *AudioStage { a.s.Engine = name; return
 // the active vibe profile's proxy URL.
 func (a *AudioStage) EngineURL(url string) *AudioStage { a.s.EngineURL = url; return a }
 
+// Effect sets an ffmpeg `-af` filter chain applied in-place to the finished TTS
+// WAV — e.g. a robotic/vocoder timbre for an "AI" narrator. Empty = none.
+func (a *AudioStage) Effect(filter string) *AudioStage { a.s.Effect = filter; return a }
+
 // ---- FFmpeg stages ----
 
 // FFmpegStage invokes ffmpeg locally.
@@ -539,6 +543,43 @@ func (f *FFmpegStage) M4BFile(tmpl string) *FFmpegStage { f.s.M4BFile = tmpl; re
 // M4BChapter is a template rendered per upstream item to the chapter
 // title embedded in the M4B metadata.
 func (f *FFmpegStage) M4BChapter(tmpl string) *FFmpegStage { f.s.M4BChapter = tmpl; return f }
+
+// ConcatVideoFrom switches the stage into video-concat mode: clips are
+// ordered by the upstream's JSON array (one clip per element) and re-encoded
+// into a single MP4. Auto-adds the upstream to Inputs.
+func (f *FFmpegStage) ConcatVideoFrom(from Ref) *FFmpegStage {
+	f.s.ConcatVideoFrom = from.ID()
+	seen := false
+	for _, dep := range f.s.Inputs {
+		if dep == from.ID() {
+			seen = true
+			break
+		}
+	}
+	if !seen {
+		f.s.Inputs = append(f.s.Inputs, from.ID())
+	}
+	return f
+}
+
+// ConcatVideoVar sets the per-item template var (default DefaultForeachVar).
+func (f *FFmpegStage) ConcatVideoVar(name string) *FFmpegStage { f.s.ConcatVideoVar = name; return f }
+
+// ConcatVideoFile is a template rendered per upstream item to each clip path.
+func (f *FFmpegStage) ConcatVideoFile(tmpl string) *FFmpegStage {
+	f.s.ConcatVideoFile = tmpl
+	return f
+}
+
+// ConcatVideoSize sets the normalized output dimensions (default 1080x1920).
+func (f *FFmpegStage) ConcatVideoSize(w, h int) *FFmpegStage {
+	f.s.ConcatVideoWidth = w
+	f.s.ConcatVideoHeight = h
+	return f
+}
+
+// ConcatVideoFPS sets the normalized output frame rate (default 30).
+func (f *FFmpegStage) ConcatVideoFPS(fps int) *FFmpegStage { f.s.ConcatVideoFPS = fps; return f }
 
 // CoverImage attaches a cover-art file (template-rendered path).
 // Meaningful on M4B ffmpeg stages (embedded as audiobook art) and on
@@ -661,6 +702,59 @@ func (m *MixStage) Metadata(key, value string) *MixStage {
 	return m
 }
 
+// ShortStage builds a `type: short` stage — the video analog of Mix. It
+// renders an assembly-script JSON (shots of clip+voiceover+caption) into a
+// single vertical MP4.
+type ShortStage struct {
+	*stageBase[*ShortStage]
+}
+
+// Short appends a short (vertical-video assembly) stage.
+func (p *Pipeline) Short(id string) *ShortStage {
+	s := p.appendStage(id, StageTypeShort)
+	sh := &ShortStage{}
+	sh.stageBase = &stageBase[*ShortStage]{s: s}
+	sh.stageBase.self = sh
+	return sh
+}
+
+// ScriptFile is the path (template-rendered) to the assembly-script JSON the
+// short executor consumes. Required.
+func (sh *ShortStage) ScriptFile(path string) *ShortStage { sh.s.ScriptFile = path; return sh }
+
+// Size sets the vertical output dimensions (default 1080x1920).
+func (sh *ShortStage) Size(w, h int) *ShortStage {
+	sh.s.ShortWidth = w
+	sh.s.ShortHeight = h
+	return sh
+}
+
+// FPS sets the output frame rate (default 30).
+func (sh *ShortStage) FPS(fps int) *ShortStage { sh.s.ShortFPS = fps; return sh }
+
+// StretchToAudio time-stretches each shot's video to exactly match its (audio-
+// length) shot, instead of freezing the last frame — smooth slow-mo for a short
+// clip, no last-frame stall, no loop jump-cut.
+func (sh *ShortStage) StretchToAudio(v bool) *ShortStage { sh.s.ShortStretchVideo = v; return sh }
+
+// LoudnessTarget sets the integrated loudness target in LUFS (default -16).
+func (sh *ShortStage) LoudnessTarget(lufs float64) *ShortStage {
+	sh.s.LoudnessTarget = lufs
+	return sh
+}
+
+// Binary overrides the ffmpeg binary (default "ffmpeg" on $PATH).
+func (sh *ShortStage) Binary(bin string) *ShortStage { sh.s.Binary = bin; return sh }
+
+// Metadata sets a container-level metadata tag (see MixStage.Metadata).
+func (sh *ShortStage) Metadata(key, value string) *ShortStage {
+	if sh.s.Metadata == nil {
+		sh.s.Metadata = map[string]string{}
+	}
+	sh.s.Metadata[key] = value
+	return sh
+}
+
 // ---- ComfyUI stages ----
 
 // ComfyUIStage submits a ComfyUI workflow.
@@ -702,6 +796,20 @@ func (c *ComfyUIStage) Parameter(key, value string) *ComfyUIStage {
 	return c
 }
 
+// InputImage uploads the (templated) source image to ComfyUI at run time and
+// binds the returned server filename to the named node input — the
+// image-to-video / reference-conditioned-edit seam (feed an upstream still
+// into a LoadImage node). `key` must match "<node_id>.<input_name>" (e.g.
+// "10.image"); the value is rendered against the standard binding (and the
+// foreach item) before upload.
+func (c *ComfyUIStage) InputImage(key, sourceTemplate string) *ComfyUIStage {
+	if c.s.InputImages == nil {
+		c.s.InputImages = map[string]string{}
+	}
+	c.s.InputImages[key] = sourceTemplate
+	return c
+}
+
 // FreeMemoryAfter asks the ComfyUI server to unload its models and release
 // VRAM after the workflow succeeds. Use on pipelines that run a single
 // image_gen stage per run (cover art, thumbnail, illustration) and want
@@ -711,6 +819,19 @@ func (c *ComfyUIStage) Parameter(key, value string) *ComfyUIStage {
 func (c *ComfyUIStage) FreeMemoryAfter() *ComfyUIStage {
 	c.s.FreeMemoryAfter = true
 	return c
+}
+
+// FreeProfileAfter asks the runner to stop the active vibe profile —
+// unloading the LLM and releasing its VRAM — once the capability group this
+// stage belongs to finishes successfully. It is the LLM analogue of a
+// ComfyUI stage's FreeMemoryAfter: put it on the LAST LLM stage before a
+// non-LLM GPU phase (TTS, image/video generation) so the big model isn't
+// left resident, oversubscribing the card, while a downstream service runs.
+// A later text group re-activates the profile on demand. Best-effort: a
+// failed stop is logged and never fails the stage.
+func (t *TextStage) FreeProfileAfter() *TextStage {
+	t.s.FreeProfileAfter = true
+	return t
 }
 
 // ---- YouTube stages ----

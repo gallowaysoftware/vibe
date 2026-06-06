@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/spf13/cobra"
 
@@ -73,8 +74,13 @@ func startCmd() *cobra.Command {
 					} else {
 						fmt.Println("  env (already applied to the running frontend):")
 					}
-					for k, v := range r.Frontend.EnvVars {
-						fmt.Printf("    export %s=%q\n", k, v)
+					keys := make([]string, 0, len(r.Frontend.EnvVars))
+					for k := range r.Frontend.EnvVars {
+						keys = append(keys, k)
+					}
+					sort.Strings(keys)
+					for _, k := range keys {
+						fmt.Printf("    export %s=%q\n", k, r.Frontend.EnvVars[k])
 					}
 				}
 				if external && r.Frontend.RestartRequired {
@@ -84,7 +90,6 @@ func startCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&noVRAMCheck, "no-vram-check", false,
-		"Skip the daemon's pre-flight VRAM check against the profile's estimated_vram_gb.")
+	cmd.Flags().BoolVar(&noVRAMCheck, "no-vram-check", false, noVRAMCheckUsage)
 	return cmd
 }

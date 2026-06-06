@@ -7,6 +7,11 @@ import (
 	"github.com/gallowaysoftware/vibe/internal/buildinfo"
 )
 
+// inputFlagUsage is the shared help string for the repeatable `--input`
+// flag, which run / render (and their in-memory variants) all expose.
+// Defined once so the wording can't drift across the four definitions.
+const inputFlagUsage = "pipeline input as KEY=VALUE; can repeat (commas inside the value are NOT split)"
+
 func Execute() error { return rootCmd().Execute() }
 
 func rootCmd() *cobra.Command {
