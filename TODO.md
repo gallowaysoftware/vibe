@@ -11,7 +11,7 @@
 ## Recently shipped
 
 - **Video content-mill primitives** (2026-05-30). Three vamp features +
-  a cache fix to drive image-to-video pipelines (worldsmith's `scene`):
+  a cache fix to drive image-to-video pipelines:
   - comfyui `input_images` map ("<node>.<input>" -> templated source path):
     uploads an upstream still to ComfyUI (`POST /upload/image`) and binds the
     returned filename to a LoadImage node — the i2v / ref-edit seam. Cache key
@@ -57,21 +57,22 @@
   `splitSentences`** (2026-05-25). Mechanical-guarantee helpers for
   pipelines that need deterministic shape from upstream LLM output.
   `wordCount(text)` returns int — drives mode-switched stages that
-  branch on prior-stage length (e.g., worldsmith's edit_story EXPAND
-  / EXTEND / POLISH / TRIM dispatch). `mulInt(n, mult)` /
+  branch on prior-stage length (e.g., a long-form prose pipeline's
+  EXPAND / EXTEND / POLISH / TRIM edit dispatch). `mulInt(n, mult)` /
   `addInt(a, b)` give Go templates the arithmetic the stdlib omits
   (sequential counters across nested ranges, derived numeric
   targets in prompt prose). `splitSentences(text, maxChars)` chops
   long prose at sentence boundaries, greedy-packed under maxChars —
-  worldsmith uses it to cap Kokoro segments at 300 chars (Kokoro
-  rushes calls over that and elides interior comma pauses). All four
+  a prose-to-audio pipeline uses it to cap Kokoro segments at 300
+  chars (Kokoro rushes calls over that and elides interior comma
+  pauses). All four
   registered in `exec.go:templateFuncs` and documented in
   `AGENTS.md`. Underlying pattern: when an LLM pipeline needs a
   mechanical guarantee (mode dispatch, length cap, segment chopping,
   distribution targets), do it at template-render time; models
   treat prompt rules as advisory even when phrased as hard
-  requirements. Three real worldsmith failures validated this on
-  the apostolate-concord install 001 run.
+  requirements. Three real failures in a production pipeline run
+  validated this.
 
 - **EXL3 + tabbyAPI integration** (2026-05-24). New `tabby_api` backend
   for vibe profiles, supervised alongside llama-server / comfyui /
@@ -81,18 +82,20 @@
   `max_tokens`. The `chat_template_kwargs` passthrough on text stages
   lets pipelines toggle Qwen3's verbose CoT off on strict-JSON stages
   (`enable_thinking: false`) without forking the chat template.
-  Validated on iitn EP19 → m4b on long_form_exl3 + Qwen3.6-27B-6.0bpw.
+  Validated on a long-form episode → m4b run on an EXL3 long-form
+  profile + Qwen3.6-27B-6.0bpw.
 
 - **`free_memory_after` on ComfyUI stages** + **auto-ensure-services
   preflight** + **`vamp lint`** (2026-05-24). Three small DX wins from
   one runway. ComfyUI stages can now `POST /free` after a successful
-  workflow so SDXL/Flux weights don't squat in VRAM between iitn
-  episodes. `vamp run` auto-runs `vibe start <name>` for any
+  workflow so SDXL/Flux weights don't squat in VRAM between
+  episodes of an episodic pipeline. `vamp run` auto-runs
+  `vibe start <name>` for any
   unreachable `RequireService` URL with a parseable setup hint, so
   "first run of the day after reboot" just works without learning
   `<pipeline> activate`. `vamp lint` checks webhook → RequireService
   pairing and JSON-output retry coverage; dogfood caught a missing
-  retry policy on textbook-to-audiobook's `extract_topics`.
+  retry policy on a document-to-audiobook pipeline's `extract_topics`.
 
 - **Per-capability resolution summary + pipeline_timing.json
   `capabilities` field** (2026-05-24, v0.6.0+v0.6.1). At end of run
@@ -100,8 +103,8 @@
   actually answered, with a `[fallback]` tag when the 1st-choice
   candidate was skipped (typically VRAM rejection). v0.6.1 also
   records the per-capability resolution in `pipeline_timing.json`'s
-  new `capabilities` map so downstream tools (e.g. `iitn timings
-  --summary`) can answer "which profile did this run land on?"
+  new `capabilities` map so downstream tools (e.g. a per-pipeline
+  `timings --summary`) can answer "which profile did this run land on?"
   without grepping the live log.
 
 - **Two more `vamp lint` checks** (2026-05-24, v0.6.1). Trivial
@@ -112,16 +115,14 @@
   to four checks; dogfooding against the local pipeline catalog
   flagged real gaps on dag-smoke + function-pipeline.
 
-- **End-to-end validation: 12 iitn episodes on EXL3** (2026-05-24,
-  EP19–EP30). FreeMemoryAfter + auto-ensure-services + per-
-  capability resolution all confirmed in production across 12
-  consecutive runs with zero VRAM-fallback regressions. Wall-clock
-  comparison: EXL3 mean 8m44s vs GGUF 5m15s on this workload —
-  EXL3's per-token speedup gets eaten by Qwen3.6's verbose CoT on
-  long-form stages. CoT-off via `chat_template_kwargs` is the
-  speed lever for strict-output stages; long-form stages keep CoT
-  on for quality. See the `exl3_sampler_defaults` memory for the
-  detailed when-to-pick guidance.
+- **End-to-end validation: 12 episodic runs on EXL3** (2026-05-24).
+  FreeMemoryAfter + auto-ensure-services + per-capability resolution
+  all confirmed in production across 12 consecutive runs with zero
+  VRAM-fallback regressions. Wall-clock comparison: EXL3 mean 8m44s
+  vs GGUF 5m15s on this workload — EXL3's per-token speedup gets
+  eaten by Qwen3.6's verbose CoT on long-form stages. CoT-off via
+  `chat_template_kwargs` is the speed lever for strict-output stages;
+  long-form stages keep CoT on for quality.
 
 - **Content-addressed cache** (`feat/content-cache`). Per-stage
   cache keys derived from rendered prompt/params/model (text),

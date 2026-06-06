@@ -137,6 +137,8 @@ anything else is a pipeline error).
 | `comfyui` | Runs a ComfyUI workflow JSON. WebSocket progress (RFC 6455, polling fallback); collects images, videos, and gifs. `free_memory_after: true` issues POST /free after a successful workflow so SDXL/Flux weights don't squat in VRAM between runs. |
 | `audio`   | TTS. `engine: piper` runs Piper on a voice ONNX from `~/.local/share/piper-voices/`; `engine: kokoro` POSTs to a Kokoro-FastAPI server (declare `capability: tts` to let vibe manage its lifecycle). |
 | `ffmpeg`  | Shells out to `ffmpeg` with templated args; tail-rings stderr for diagnostics. Three modes: explicit `ffmpeg_args:`, auto `concat_wavs:`, or M4B chapterised audiobook via `m4b_from:` / `m4b_file:` / `m4b_chapter:` (+ optional `cover_image:`). |
+| `mix`     | Assembles a structured-script JSON (ordered voice segments + optional intro/outro music, chapters, cover) into one audiobook/podcast file via a single ffmpeg invocation: concat, loudnorm to -16 LUFS, encode as `.m4b`/`.m4a` (with embedded cover) or `.mp3`. |
+| `short`   | Assembles a structured-script JSON of shots (clip + voiceover + optional caption) into one vertical short-form MP4: per shot fits the clip to the voiceover duration, scales/crops to vertical, burns the caption, then concats, loudnorms, and optionally ducks a background-music bed under the voice. |
 | `pandoc`  | Document conversion via pandoc (docker `pandoc/core` by default, override with `binary:`). Used for markdown → EPUB study guides with `cover_image:`. |
 | `youtube` | Uploads a finished video via the YouTube Data API (OAuth token cache under XDG). |
 | `webhook` | Slack/Discord/Mattermost-style JSON POST. Honors `run_when: failure` so a failed pipeline still pings. |
@@ -148,7 +150,7 @@ otherwise-successful foreach stage re-runs only that item). Snapshot
 drift aborts unless `--resume-force` is set.
 
 **Content-addressed cache.** Cacheable stages (`text`, `comfyui`,
-`audio`, `ffmpeg`, `render`, `compact`, `pandoc`) hash their full
+`audio`, `ffmpeg`, `render`, `compact`, `pandoc`, `mix`, `short`) hash their full
 input — prompt/params/model for text, post-substitution workflow
 JSON for ComfyUI, rendered text + voice-model size for audio,
 rendered argv + per-input-file sha256 for ffmpeg, full template

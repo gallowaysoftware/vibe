@@ -7,7 +7,8 @@ papers, serialized fiction with years-deep canon, short-form video. The model is
 the same one everybody has. The quality comes from the **pipeline around it**.
 
 `contentkit` is the reusable distillation of these patterns; each app
-(worldsmith, brainrot, textbook-to-audiobook) supplies its own prompts and state.
+(a serialized-fiction pipeline, a short-form video pipeline, a document-to-audiobook
+pipeline) supplies its own prompts and state.
 
 The throughline: **a local LLM is a strong component and a weak author.** It drafts
 well, it diagnoses ruthlessly, it compares reliably — but left to "just write it
@@ -59,7 +60,8 @@ are going, deep interiority — distinct from the published bible and from canon
 (what's been shown). Generation draws on the private layer for subtext and
 foreshadowing under an explicit *reveal-control* rule: it may press on a scene from
 underneath but must never state what's sealed. This is what lets a story feel
-written by someone who knows the ending. (worldsmith's notebook.)
+written by someone who knows the ending. (The serialized-fiction pipeline's
+author's-notebook layer.)
 
 ### 7. Canon = what shipped, not what was extracted
 When you extract facts from a draft to feed future installments, the extraction

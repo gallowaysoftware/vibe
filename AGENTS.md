@@ -115,8 +115,9 @@ them before pushing.
 - **Cache invariants.** `stageCacheable` (in
   `internal/vamp/cache_key.go`) is the single source of truth for "can
   this stage type be cached?". Today it returns true for `text`,
-  `comfyui`, `audio`, `ffmpeg`, `render`, `compact`, `pandoc` and
-  false for everything else (`webhook`, `youtube`, `confirm`). Side-
+  `comfyui`, `audio`, `ffmpeg`, `render`, `compact`, `pandoc`, `mix`,
+  `short` and false for everything else (`webhook`, `youtube`,
+  `confirm`). Side-
   effect stages must not be cached — replaying a "success" would skip
   the side effect that gave the pipeline its reason for existing.
 - **`.stages.X.output` semantics depend on stage type.** For text /
@@ -207,6 +208,22 @@ them before pushing.
   (map of `--metadata key=value`), `pandoc_args` (raw extra args),
   `cover_image` (rendered as `--epub-cover-image`). Used today for
   markdown → EPUB study-guide generation.
+- **Mix stage.** `type: mix` reads a structured-script JSON
+  (`script_file`) of ordered voice-segment paths plus optional
+  `intro_music` / `outro_music` / `cover_image` / chapters, and runs
+  one ffmpeg invocation to concat the segments, loudnorm to -16 LUFS
+  (override with `loudness_target`), and encode an audiobook/podcast
+  file: `.m4b`/`.m4a` (AAC + attached-pic cover + faststart) or `.mp3`
+  (libmp3lame, no cover). `metadata` keys become container tags.
+- **Short stage.** `type: short` is the video analog of `mix`: a
+  `script_file` JSON of shots (clip + voiceover + optional caption)
+  becomes one vertical MP4 via a single ffmpeg invocation. Per shot it
+  fits the clip to the voiceover duration (freeze-last-frame `tpad` by
+  default, or `short_stretch_video` to time-stretch), scales/crops to
+  the vertical target (`short_width`/`short_height`/`short_fps`,
+  default 1080×1920@30), burns the caption via drawtext `textfile=`,
+  then concats every shot, loudnorms, and optionally ducks an optional
+  `background_music` bed under the voice.
 - **InputSpec requires struct form.** Bare strings like
   `lesson_root: "~/path"` are rejected. Use `lesson_root: {default: "~/path"}`.
 - **`chat_template_kwargs` passthrough.** Text-stage `params` accepts
@@ -222,8 +239,8 @@ them before pushing.
   POST /free after a successful workflow. Best-effort + non-fatal —
   weights unload + VRAM reclaim happens before the next pipeline run.
   Use on pipelines that issue a single image_gen stage per run and
-  need the GPU back for a downstream LLM activation (iitn cover →
-  next episode's long_form_exl3).
+  need the GPU back for a downstream LLM activation (e.g. a cover-image
+  stage freeing VRAM before the next long-form text stage).
 - **Auto-ensure RequireService.** `vamp run` (and any binary that
   mounts the same runCmd) probes every declared `RequireService` URL
   pre-run and auto-runs `vibe start <name>` for any unreachable
