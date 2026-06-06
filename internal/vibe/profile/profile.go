@@ -864,9 +864,9 @@ func (p *Profile) validateFrontend() error {
 	}
 
 	if len(p.Frontend.MCPs) > 0 {
-		if p.Frontend.Kind != FrontendExternal {
-			return fmt.Errorf("frontend.mcps requires frontend.kind=external (got %q)", p.Frontend.Kind)
-		}
+		// mcps are valid for kind=external and kind=managed (both render a
+		// config file the MCPs merge into). docker-compose already rejected
+		// them in its own branch above, so only those two kinds reach here.
 		seen := make(map[string]struct{}, len(p.Frontend.MCPs))
 		for _, name := range p.Frontend.MCPs {
 			if _, dup := seen[name]; dup {

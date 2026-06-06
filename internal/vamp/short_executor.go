@@ -132,12 +132,25 @@ func (s *shortExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 		ai := len(inputs) // audio input index
 		inputs = append(inputs, aud)
 
-		// Video: fill-crop to vertical, freeze-last-frame up to the shot
-		// length, then trim to exactly the shot length. tpad's stop_duration
-		// is the full shot length so it's always enough padding regardless of
-		// the clip's native length; trim caps it either way.
-		fmt.Fprintf(&fg, "[%d:v]scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,setsar=1,fps=%d,tpad=stop_mode=clone:stop_duration=%.3f,trim=duration=%.3f,setpts=PTS-STARTPTS",
-			vi, w, h, w, h, fps, secs, secs)
+		// Video: fill-crop to vertical, then fit to the (audio-governed) shot
+		// length. Default = freeze the last frame (tpad). With ShortStretchVideo,
+		// time-stretch the clip to exactly match the shot length instead (setpts)
+		// — smooth, with no last-frame freeze and no loop jump-cut — then resample
+		// to the output fps over the stretched timeline.
+		spatial := fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,setsar=1", w, h, w, h)
+		stretched := false
+		if st.ShortStretchVideo {
+			if clipMs, perr := probe(ctx, vid); perr == nil && clipMs > 0 {
+				ratio := secs / (float64(clipMs) / 1000.0)
+				fmt.Fprintf(&fg, "[%d:v]%s,setpts=%.6f*PTS,fps=%d,trim=duration=%.3f,setpts=PTS-STARTPTS",
+					vi, spatial, ratio, fps, secs)
+				stretched = true
+			}
+		}
+		if !stretched {
+			fmt.Fprintf(&fg, "[%d:v]%s,fps=%d,tpad=stop_mode=clone:stop_duration=%.3f,trim=duration=%.3f,setpts=PTS-STARTPTS",
+				vi, spatial, fps, secs, secs)
+		}
 		if capt := strings.TrimSpace(shot.Caption); capt != "" {
 			// Write the (word-wrapped) caption to a file and reference it via
 			// drawtext's textfile= option. Inline text=... can't safely carry

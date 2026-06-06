@@ -989,6 +989,7 @@ frontend:
   write_file: /tmp/opencode.json
   template:
     model: llama-local/m
+  mcps: [datadog]
   env:
     OPENCODE_CONFIG: ${WRITE_FILE}
 `
@@ -1004,6 +1005,9 @@ frontend:
 	}
 	if _, ok := p.Frontend.Template["model"]; !ok {
 		t.Errorf("template missing model key: %v", p.Frontend.Template)
+	}
+	if len(p.Frontend.MCPs) != 1 || p.Frontend.MCPs[0] != "datadog" {
+		t.Errorf("mcps = %v, want [datadog]", p.Frontend.MCPs)
 	}
 }
 

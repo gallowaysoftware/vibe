@@ -1038,6 +1038,7 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 		if err := e.executeStage(ctx, st, baseURL, modelID, backendAddr, profileParallel, nil); err != nil {
 			return fmt.Errorf("stage %s: %w", st.ID, err)
 		}
+		e.freeProfileIfRequested(ctx, group)
 		return nil
 	}
 
@@ -1066,7 +1067,52 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 		}()
 	}
 	wg.Wait()
-	return errors.Join(errs...)
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	e.freeProfileIfRequested(ctx, group)
+	return nil
+}
+
+// freeProfileIfRequested stops the active vibe profile (unloading the LLM and
+// releasing its VRAM) after a capability group completes, when any stage in
+// the group set FreeProfileAfter(). It is the LLM analogue of a ComfyUI
+// stage's FreeMemoryAfter: it hands the card back before the pipeline moves
+// to a phase that needs it for something else (TTS, image/video generation).
+//
+// Group-level, not per-stage, on purpose: stages in a group run concurrently
+// against the one shared activation, so freeing the instant a marked stage
+// returned would pull the backend out from under a sibling still generating.
+// By the time the group is done, every stage that shared the profile is
+// finished; a later text group simply re-activates it via EnsureActive.
+//
+// Best-effort: a nil client or a failed stop is logged and never fails the
+// run — worst case the operator pays the VRAM contention they would have paid
+// without the field set. The cached chat-model id is cleared so the next text
+// group re-resolves it against a freshly-activated profile.
+func (e *Executor) freeProfileIfRequested(ctx context.Context, group []*Stage) {
+	wants := false
+	for _, st := range group {
+		if st.FreeProfileAfter {
+			wants = true
+			break
+		}
+	}
+	if !wants {
+		return
+	}
+	if e.Vibe == nil {
+		return
+	}
+	e.logf("  -> free_profile_after: stopping active profile to release VRAM")
+	if _, err := e.Vibe.Stop(ctx); err != nil {
+		e.logf("  -> free_profile_after: stop active profile failed: %v (continuing)", err)
+		return
+	}
+	e.mu.Lock()
+	e.cachedModelID = ""
+	e.cachedModelProfile = ""
+	e.mu.Unlock()
 }
 
 // executeStage runs a single stage. For ordinary stages it invokes the

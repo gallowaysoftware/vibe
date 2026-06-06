@@ -125,6 +125,10 @@ type Stage struct {
 	// field on webhook stages so each stage type's validator can reject
 	// fields that don't apply.
 	EngineURL string `yaml:"engine_url,omitempty"`
+	// Effect is an optional ffmpeg `-af` filter chain applied in-place to the
+	// finished TTS WAV (e.g. a robotic/vocoder timbre for an "AI" narrator).
+	// Empty = no post-processing. Engine-agnostic.
+	Effect string `yaml:"effect,omitempty"`
 	// Foreach, when non-nil, makes this a fan-out stage. The upstream stage
 	// referenced by From must produce output_format: json and its output must
 	// parse as a JSON array (or {"items":[...]} convenience wrap). The stage
@@ -158,6 +162,20 @@ type Stage struct {
 	// for downstream LLM activations (iitn's compose_cover → next
 	// episode's long_form_exl3 is the canonical case).
 	FreeMemoryAfter bool `yaml:"free_memory_after,omitempty"`
+	// FreeProfileAfter, when true on a profile-backed stage (today: a
+	// text/LLM stage), asks the runner to STOP the active vibe profile —
+	// unloading the LLM and releasing its VRAM — once the capability GROUP
+	// this stage belongs to finishes successfully. It is the LLM analogue
+	// of FreeMemoryAfter (which unloads a ComfyUI image model): mark the
+	// last LLM stage before a non-LLM GPU phase (TTS, image/video gen) so
+	// the big model isn't left resident — oversubscribing the card — while
+	// a downstream service does its work. Best-effort + non-fatal: a failed
+	// stop is logged and the run continues. Freeing is GROUP-level (not the
+	// instant the marked stage returns) on purpose — stages in a group run
+	// concurrently against the one shared activation, so an early free
+	// would pull the backend out from under a sibling still generating. A
+	// later text group simply re-activates the profile on demand.
+	FreeProfileAfter bool `yaml:"free_profile_after,omitempty"`
 
 	// FFmpeg-stage fields. FFmpegArgs is the literal argv passed to ffmpeg
 	// (in order) after the binary; each entry is rendered as a Go template
@@ -381,6 +399,11 @@ type Stage struct {
 	ShortWidth  int `yaml:"short_width,omitempty"`
 	ShortHeight int `yaml:"short_height,omitempty"`
 	ShortFPS    int `yaml:"short_fps,omitempty"`
+	// ShortStretchVideo time-stretches each shot's video clip to exactly match its
+	// (audio-governed) shot length, instead of freezing the last frame. A clip
+	// shorter than its voiceover plays as smooth slow motion (and a longer one
+	// speeds up) — no last-frame stall, no loop jump-cut. Default false.
+	ShortStretchVideo bool `yaml:"short_stretch_video,omitempty"`
 
 	// Compact-stage fields. A `type: compact` stage replaces the brittle
 	// `| truncate N` template pattern: when an upstream's text would
@@ -743,8 +766,8 @@ func (p *Pipeline) Validate() error {
 			if len(s.Parameters) > 0 {
 				return fmt.Errorf("%s: parameters is only valid on type: comfyui stages (text stages use params)", ctx)
 			}
-			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" {
-				return fmt.Errorf("%s: voice/text/voices_dir/binary are only valid on type: audio stages", ctx)
+			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" || s.Effect != "" {
+				return fmt.Errorf("%s: voice/text/voices_dir/binary/effect are only valid on type: audio stages", ctx)
 			}
 			if len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
@@ -1000,8 +1023,8 @@ func (p *Pipeline) Validate() error {
 			if s.OutputFormat != "" {
 				return fmt.Errorf("%s: output_format is only valid on type: text stages", ctx)
 			}
-			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" {
-				return fmt.Errorf("%s: voice/text/voices_dir/binary are only valid on type: audio stages", ctx)
+			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" || s.Effect != "" {
+				return fmt.Errorf("%s: voice/text/voices_dir/binary/effect are only valid on type: audio stages", ctx)
 			}
 			if len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
@@ -1209,8 +1232,8 @@ func (p *Pipeline) Validate() error {
 			if len(s.Parameters) > 0 {
 				return fmt.Errorf("%s: parameters is only valid on type: comfyui stages", ctx)
 			}
-			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" {
-				return fmt.Errorf("%s: voice/text/voices_dir/binary are only valid on type: audio stages", ctx)
+			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" || s.Effect != "" {
+				return fmt.Errorf("%s: voice/text/voices_dir/binary/effect are only valid on type: audio stages", ctx)
 			}
 			if len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)
@@ -1251,8 +1274,8 @@ func (p *Pipeline) Validate() error {
 			if len(s.Parameters) > 0 {
 				return fmt.Errorf("%s: parameters is only valid on type: comfyui stages", ctx)
 			}
-			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" {
-				return fmt.Errorf("%s: voice/text/voices_dir/binary are only valid on type: audio stages", ctx)
+			if s.Voice != "" || s.Text != "" || s.VoicesDir != "" || s.Binary != "" || s.Effect != "" {
+				return fmt.Errorf("%s: voice/text/voices_dir/binary/effect are only valid on type: audio stages", ctx)
 			}
 			if len(s.FFmpegArgs) > 0 {
 				return fmt.Errorf("%s: ffmpeg_args is only valid on type: ffmpeg stages", ctx)

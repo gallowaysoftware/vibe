@@ -1237,7 +1237,7 @@ stages:
   prompt: hi
   output: a.md
   voice: en_US-lessac-medium`,
-			wantErr: "voice/text/voices_dir/binary are only valid on type: audio",
+			wantErr: "voice/text/voices_dir/binary/effect are only valid on type: audio",
 		},
 		{
 			name: "text stage with text field (audio-only field)",
@@ -1248,7 +1248,7 @@ stages:
   prompt: hi
   output: a.md
   text: "nope"`,
-			wantErr: "voice/text/voices_dir/binary are only valid on type: audio",
+			wantErr: "voice/text/voices_dir/binary/effect are only valid on type: audio",
 		},
 		{
 			name: "comfyui with voice (audio-only field)",
@@ -1262,7 +1262,7 @@ stages:
   parameters:
     "6.text": hi
   voice: nope`,
-			wantErr: "voice/text/voices_dir/binary are only valid on type: audio",
+			wantErr: "voice/text/voices_dir/binary/effect are only valid on type: audio",
 		},
 		{
 			name: "ffmpeg without ffmpeg_args",

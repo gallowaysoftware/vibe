@@ -476,6 +476,10 @@ func (a *AudioStage) Engine(name string) *AudioStage { a.s.Engine = name; return
 // the active vibe profile's proxy URL.
 func (a *AudioStage) EngineURL(url string) *AudioStage { a.s.EngineURL = url; return a }
 
+// Effect sets an ffmpeg `-af` filter chain applied in-place to the finished TTS
+// WAV — e.g. a robotic/vocoder timbre for an "AI" narrator. Empty = none.
+func (a *AudioStage) Effect(filter string) *AudioStage { a.s.Effect = filter; return a }
+
 // ---- FFmpeg stages ----
 
 // FFmpegStage invokes ffmpeg locally.
@@ -728,6 +732,11 @@ func (sh *ShortStage) Size(w, h int) *ShortStage {
 // FPS sets the output frame rate (default 30).
 func (sh *ShortStage) FPS(fps int) *ShortStage { sh.s.ShortFPS = fps; return sh }
 
+// StretchToAudio time-stretches each shot's video to exactly match its (audio-
+// length) shot, instead of freezing the last frame — smooth slow-mo for a short
+// clip, no last-frame stall, no loop jump-cut.
+func (sh *ShortStage) StretchToAudio(v bool) *ShortStage { sh.s.ShortStretchVideo = v; return sh }
+
 // LoudnessTarget sets the integrated loudness target in LUFS (default -16).
 func (sh *ShortStage) LoudnessTarget(lufs float64) *ShortStage {
 	sh.s.LoudnessTarget = lufs
@@ -810,6 +819,19 @@ func (c *ComfyUIStage) InputImage(key, sourceTemplate string) *ComfyUIStage {
 func (c *ComfyUIStage) FreeMemoryAfter() *ComfyUIStage {
 	c.s.FreeMemoryAfter = true
 	return c
+}
+
+// FreeProfileAfter asks the runner to stop the active vibe profile —
+// unloading the LLM and releasing its VRAM — once the capability group this
+// stage belongs to finishes successfully. It is the LLM analogue of a
+// ComfyUI stage's FreeMemoryAfter: put it on the LAST LLM stage before a
+// non-LLM GPU phase (TTS, image/video generation) so the big model isn't
+// left resident, oversubscribing the card, while a downstream service runs.
+// A later text group re-activates the profile on demand. Best-effort: a
+// failed stop is logged and never fails the stage.
+func (t *TextStage) FreeProfileAfter() *TextStage {
+	t.s.FreeProfileAfter = true
+	return t
 }
 
 // ---- YouTube stages ----
