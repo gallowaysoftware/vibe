@@ -326,7 +326,9 @@ func parseSSEStream(ctx context.Context, r io.Reader, onToken StreamFunc, start 
 // (e.g. http://127.0.0.1:9000); /v1/models is appended.
 func ResolveModelID(ctx context.Context, hc *http.Client, baseURL string) (string, error) {
 	if hc == nil {
-		hc = http.DefaultClient
+		// Same bounded client as the chat path: a dead backend that accepts
+		// the connection but never replies must not hang model resolution.
+		hc = defaultInferenceClient()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/models", nil)
 	if err != nil {
