@@ -147,7 +147,7 @@ func expandTilde(p string) string {
 // A missing dir is treated as "no images here" (returns nil, nil) rather than
 // an error. Foreach pipelines routinely point image_dir at a per-item path
 // that legitimately doesn't exist on every item (e.g. SAQ-only lessons in
-// the cibd curriculum carry no images/ subdir); failing the stage on the
+// a course curriculum carry no images/ subdir); failing the stage on the
 // missing-dir case would refuse to do text-only inference on those items,
 // which is what the vision-capable backend cleanly degrades to.
 func collectImages(dir string) ([]string, error) {

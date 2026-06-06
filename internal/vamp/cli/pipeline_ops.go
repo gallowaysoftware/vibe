@@ -198,7 +198,7 @@ func RunPipeline(ctx context.Context, p *vamp.Pipeline, pipelineDir string, pipe
 // Why: the alternative is a 3-second-retry-then-fail cascade in the
 // first webhook stage when SearXNG / Kokoro just happen to be down,
 // which forces the operator to learn the existence of `<pipeline>
-// activate` after a confusing failure. This makes "first iitn next of
+// activate` after a confusing failure. This makes "first episodic run of
 // the day" just work after a reboot.
 //
 // Cost: ~250ms per declared service when everything's already up

@@ -159,7 +159,7 @@ type Stage struct {
 	// succeeds. Best-effort + non-fatal — a failure is logged and the
 	// stage still completes successfully. Designed for pipelines that
 	// run a single image_gen stage per run and want to free GPU memory
-	// for downstream LLM activations (iitn's compose_cover → next
+	// for downstream LLM activations (an episodic pipeline's compose_cover → next
 	// episode's long_form_exl3 is the canonical case).
 	FreeMemoryAfter bool `yaml:"free_memory_after,omitempty"`
 	// FreeProfileAfter, when true on a profile-backed stage (today: a
@@ -520,7 +520,7 @@ const defaultWebhookRetryAttempts = 3
 // returns an empty body (model warmup races, internal scheduling) and
 // piper subprocesses can flake on a tight binary path; without retry
 // one bad item in a 1500+-chunk foreach kills hours of upstream work.
-// Four attempts mirrors what the existing cibd-distilling pipelines
+// Four attempts mirrors what the existing long-form-distilling pipelines
 // configure by hand.
 const defaultAudioRetryAttempts = 4
 

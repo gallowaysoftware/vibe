@@ -90,7 +90,7 @@ const (
 	// still overshoots the target.
 	StageTypeCompact StageType = "compact"
 	// StageTypePandoc shells out to pandoc to convert documents between
-	// formats — primarily markdown -> EPUB for the cibd study guide so a
+	// formats — primarily markdown -> EPUB for a study guide so a
 	// reader can drop the result into Apple Books and get reflowable
 	// text, table of contents, position sync, and dark mode. Pandoc is
 	// invoked via docker (pandoc/core image) by default so the host
@@ -116,7 +116,7 @@ const (
 	// vertical target (1080x1920 by default), burns the caption, muxes the
 	// shot audio, concatenates the shots, applies loudnorm, and optionally
 	// ducks a background-music bed under the voiceover. Built for the
-	// worldsmith `scene` (TikTok content-mill) pipeline.
+	// serialized-fiction `scene` (short-video content-mill) pipeline.
 	StageTypeShort StageType = "short"
 )
 

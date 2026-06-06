@@ -28,8 +28,8 @@ type ReviewActions struct {
 type ReviewResult struct{ Accepted, Discarded, Skipped int }
 
 // ReviewLoop runs the non-destructive a/e/r/s/q review over staged items: show
-// each, take a verdict, apply the matching action. This is worldsmith's
-// `expand review` loop, generalised so any "stage → human accept/discard"
+// each, take a verdict, apply the matching action. This is a fiction
+// pipeline's `expand review` loop, generalised so any "stage → human accept/discard"
 // workflow (notebook dossiers, timeline events, idea candidates) reuses it.
 // Non-interactive batch curation (accept-all etc.) is the caller's concern —
 // it just doesn't call this.

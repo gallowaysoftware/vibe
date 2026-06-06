@@ -37,9 +37,9 @@ type CritiqueReviseConfig struct {
 
 // CritiqueRevise wires the diagnose-then-fix cycle: a low-temperature stage that
 // NAMES a piece of content's problems, feeding a surgical rewrite that resolves
-// exactly those notes. This is the pattern worldsmith (prose_critique→edit_story,
-// expand_critique→expand_revise, continuity_precheck→edit) and brainrot
-// (critique→punchup, recheck→polish) each hand-wired. Returns both stages so the
+// exactly those notes. This is the pattern a fiction pipeline (prose_critique→edit_story,
+// expand_critique→expand_revise, continuity_precheck→edit) and a short-video
+// pipeline (critique→punchup, recheck→polish) each hand-wired. Returns both stages so the
 // caller can wire further downstream of the reviser.
 func CritiqueRevise(p *vamp.Pipeline, cfg CritiqueReviseConfig) (critique, revise *vamp.TextStage) {
 	if cfg.CritiqueTemp == 0 {

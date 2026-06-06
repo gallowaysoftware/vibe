@@ -24,8 +24,8 @@ func DefaultRetry() *vamp.RetryPolicy {
 
 // LongFormText starts a long_form text stage with the standard sampler shape
 // (the given temperature + token budget, chain-of-thought off) and the default
-// retry policy — the boilerplate every generative text stage in worldsmith,
-// brainrot, and textbook-to-audiobook repeats. The caller chains the rest
+// retry policy — the boilerplate every generative text stage in the
+// fiction, short-video, and textbook-to-audiobook pipelines repeats. The caller chains the rest
 // (.PromptFS / .After / .Output / .OutputFormatJSON / extra .Param).
 func LongFormText(p *vamp.Pipeline, name string, temp float64, maxTokens int) *vamp.TextStage {
 	return p.Text(name).

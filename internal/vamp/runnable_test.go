@@ -28,7 +28,7 @@ func TestCheckRunnable_CapabilityMissing(t *testing.T) {
 			{ID: "a", Type: StageTypeText, Capability: "not_a_thing", Output: "out.txt", Prompt: "hi"},
 		},
 	}
-	caps := mustCaps(t, "capabilities:\n  reasoning: code\n  long_form: cibd\n")
+	caps := mustCaps(t, "capabilities:\n  reasoning: code\n  long_form: longform\n")
 	err := CheckRunnable(p, t.TempDir(), caps)
 	if err == nil {
 		t.Fatal("expected error for unmapped capability")
@@ -121,7 +121,7 @@ func TestCheckRunnable_NoCapabilityRequired(t *testing.T) {
 // TestSuggestCapability_DidYouMean checks the typo-helper that powers the
 // runtime "did you mean: ..." hint in Capabilities.Profiles.
 func TestSuggestCapability_DidYouMean(t *testing.T) {
-	caps := mustCaps(t, "capabilities:\n  long_form: cibd\n  reasoning: code\n  vision: cibd-vision\n")
+	caps := mustCaps(t, "capabilities:\n  long_form: longform\n  reasoning: code\n  vision: longform-vision\n")
 	got := SuggestCapability(caps, "longform")
 	if len(got) == 0 || got[0] != "long_form" {
 		t.Errorf("got %v, want long_form first", got)

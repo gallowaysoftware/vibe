@@ -120,7 +120,7 @@ func (e *comfyuiExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 	}
 
 	// Best-effort: drop ComfyUI's resident model weights so a downstream
-	// LLM activation (e.g. iitn's next-episode write_script needing
+	// LLM activation (e.g. an episodic pipeline's next-episode write_script needing
 	// long_form_exl3) doesn't get squeezed out of VRAM by the SDXL pipeline
 	// that already did its work. Failures here don't fail the stage —
 	// the workflow already produced its output, and the worst case is

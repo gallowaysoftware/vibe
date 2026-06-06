@@ -285,7 +285,7 @@ func IsVRAMRejection(err error) bool {
 //     service-mode profile as active with a clear error, which is
 //     what we want for misconfigured pipelines.)
 //
-// Before this routing existed, every iitn episode failed because
+// Before this routing existed, every episodic-pipeline episode failed because
 // cast_aria's Capability("tts") resolved to "tts_kokoro" and step 3
 // would unconditionally Stop+Start, only to have the daemon reject
 // the Start with already_exists.

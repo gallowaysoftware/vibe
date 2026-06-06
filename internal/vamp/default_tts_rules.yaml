@@ -89,7 +89,7 @@ rules:
 
   - pattern: 'LAA'
     replacement: 'L A A'
-    note: 'Litres of absolute alcohol — common in CIBD content.'
+    note: 'Litres of absolute alcohol — common in course content.'
 
   - pattern: 'ABV'
     replacement: 'A B V'
@@ -97,4 +97,4 @@ rules:
 
   - pattern: 'SAQ'
     replacement: 'S A Q'
-    note: 'Self-assessment question — appears in CIBD lesson titles.'
+    note: 'Self-assessment question — appears in course lesson titles.'

@@ -77,7 +77,7 @@ type Report struct {
 	// during this run. Empty when the run touched no capability-bearing
 	// stages (Render-only pipelines) or when the executor ran without
 	// the capability resolver. Populated by Tracker.SetCapabilities at
-	// run end; downstream consumers (iitn timings, vamp runs show) use
+	// run end; downstream consumers (episodic-pipeline timings, vamp runs show) use
 	// it to surface "this episode ran on long_form_exl3" vs "fell back
 	// to fast" without grepping the per-run log.
 	Capabilities map[string]string `json:"capabilities,omitempty"`

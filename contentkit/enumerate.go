@@ -29,8 +29,9 @@ type EnumerateConfig struct {
 // and re-emits {"items":[{<IndexKey>:i, <field>:<value>, ...}]} — the shape a
 // downstream vamp Foreach consumes.
 //
-// This is the exact template worldsmith (scene shots, narration segments) and
-// brainrot (episode shots) each hand-rolled verbatim; this is now the one source.
+// This is the exact template a fiction pipeline (scene shots, narration
+// segments) and a short-video pipeline (episode shots) each hand-rolled
+// verbatim; this is now the one source.
 // It changes no behaviour — the emitted JSON matches the inline templates.
 func EnumerateItems(p *vamp.Pipeline, cfg EnumerateConfig) *vamp.RenderStage {
 	if cfg.IndexKey == "" {

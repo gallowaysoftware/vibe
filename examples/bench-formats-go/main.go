@@ -80,7 +80,7 @@ func pipeline() (*vamp.Pipeline, error) {
 		s := p.Text(id).
 			Capability(capability).
 			Prompt(depthPrompt(tok)).
-			Output(id + ".md").
+			Output(id+".md").
 			Param("max_tokens", 1024).
 			Param("temperature", 0.2).
 			Param("chat_template_kwargs", noThink)

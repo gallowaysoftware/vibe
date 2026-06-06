@@ -216,7 +216,7 @@ func TabbyAPISpec(p *Profile) (supervisor.LaunchSpec, error) {
 		// when the client request omits them. Without these fallbacks,
 		// EXL3 at low temperature collapses into repetition loops on
 		// prompts that only send `temperature` + `max_tokens` (vamp's
-		// default request shape) — e.g. iitn's edit_script at temp
+		// default request shape) — e.g. an episodic pipeline's edit_script at temp
 		// 0.4 produced "kompil kompil kompil" infinite loops. GGUF /
 		// llama-server has its own defaults baked in; tabbyAPI does
 		// not, hence the explicit preset.

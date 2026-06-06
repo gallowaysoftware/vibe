@@ -132,7 +132,7 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 	}
 
 	// Render Voice as a template so per-foreach-item voice routing
-	// works: a worldsmith-style "{{ .segment.voice_id }}" pattern picks
+	// works: a serialized-fiction-pipeline-style "{{ .segment.voice_id }}" pattern picks
 	// up the speaker-specific Kokoro voice per segment, letting one
 	// audio stage narrate every named character in their own timbre
 	// without splitting the pipeline into N stages. Backward compatible:

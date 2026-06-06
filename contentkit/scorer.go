@@ -3,9 +3,10 @@ package contentkit
 import "context"
 
 // Scorer evaluates a piece of generated content on a domain-specific rubric and
-// returns structured findings. It is the shared seam for MEASUREMENT: worldsmith's
-// prose metrics (slop density, not-x-but-y, repeated trigrams) and brainrot's
-// laugh audit both conform to this shape, so a per-installment scorecard and
+// returns structured findings. It is the shared seam for MEASUREMENT: a
+// fiction pipeline's prose metrics (slop density, not-x-but-y, repeated
+// trigrams) and a short-video pipeline's laugh audit both conform to this
+// shape, so a per-installment scorecard and
 // quality-over-time tracking can be built once, over any app's scorers.
 //
 // Implementations live in each app (the rubrics are domain-specific); contentkit

@@ -11,10 +11,10 @@ import (
 func TestFailureSummary_SingleConnectionRefused(t *testing.T) {
 	err := fmt.Errorf("stage write_script: HTTP request: dial tcp 127.0.0.1:9000: connect: connection refused")
 	var buf bytes.Buffer
-	writeFailureSummary(&buf, "iitn-episode", err, nil)
+	writeFailureSummary(&buf, "episodic-run", err, nil)
 	out := buf.String()
 	for _, want := range []string{
-		`FAILED — pipeline "iitn-episode" returned 1 stage error`,
+		`FAILED — pipeline "episodic-run" returned 1 stage error`,
 		`stage:  write_script`,
 		`reason:`,
 		`connection refused`,

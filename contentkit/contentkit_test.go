@@ -12,7 +12,7 @@ func TestEnumerateTemplate(t *testing.T) {
 
 	// Behaviour-critical pieces (whitespace-insensitive): the array source, the
 	// index stamp, and each field copied verbatim via toJSON — matching the
-	// hand-rolled templates this replaces in worldsmith + brainrot.
+	// hand-rolled templates this replaces in the fiction + short-video pipelines.
 	wants := []string{
 		`{{- $items := index (parseJSON .stages.polish.output) "shots" -}}`,
 		`{{- range $i, $it := $items -}}`,
