@@ -1834,7 +1834,7 @@ func stageTypeOrDefault(st *Stage) StageType {
 // here is content-bearing (text, render, youtube, webhook, confirm, compact).
 func producesFileOutput(t StageType) bool {
 	switch t {
-	case StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg, StageTypePandoc:
+	case StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg, StageTypePandoc, StageTypeMix, StageTypeShort:
 		return true
 	default:
 		return false
@@ -4039,13 +4039,40 @@ func slugify(v any) string {
 	return s
 }
 
-// writeFile creates the parent directory and writes content atomically enough
-// for our purposes (truncating write).
+// writeFile creates the parent directory and writes content atomically: a
+// temp file in the same dir is written, then renamed over the target. A kill
+// mid-write thus leaves either the old file or none — never a truncated file
+// that resume would mark complete on size-positive.
 func writeFile(path, content string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(content), 0o644)
+	tmp, err := os.CreateTemp(dir, ".vamp-write-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	// CreateTemp makes the file 0600; match the prior WriteFile mode so
+	// output files keep their conventional permissions.
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func (e *Executor) modelIDForCurrent(ctx context.Context, status *vibev1.Status) (string, error) {

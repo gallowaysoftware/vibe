@@ -23,6 +23,19 @@ type ChatCompletion struct {
 	HTTPClient *http.Client
 }
 
+// defaultInferenceClient bounds time-to-first-byte (and dial/TLS) so a stalled
+// or dead backend that accepts the connection but never replies fails with a
+// net.Error timeout instead of blocking the run forever. ResponseHeaderTimeout
+// (not Client.Timeout) is deliberate: it caps only the wait for response
+// headers, leaving long streaming generations free to keep the body open for
+// minutes. The resulting timeout satisfies isRetryable so retry_on: timeout
+// fires.
+func defaultInferenceClient() *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ResponseHeaderTimeout = 2 * time.Minute
+	return &http.Client{Transport: tr}
+}
+
 // StreamFunc receives incremental token deltas as they arrive from an SSE
 // chat-completion response. It is called once per non-empty content delta and
 // must not block on I/O for long; the caller is expected to write to a fast
@@ -129,7 +142,7 @@ func (c *ChatCompletion) Call(ctx context.Context, baseURL, model, prompt string
 // etc.) to include.
 func (c *ChatCompletion) CallMultimodal(ctx context.Context, baseURL, model, prompt string, imagePaths []string, params map[string]any, onToken StreamFunc) (string, error) {
 	if c.HTTPClient == nil {
-		c.HTTPClient = http.DefaultClient
+		c.HTTPClient = defaultInferenceClient()
 	}
 	stream := onToken != nil
 

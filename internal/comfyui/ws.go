@@ -120,6 +120,7 @@ func dialWebSocket(ctx context.Context, base string, clientID string, hc *http.C
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
+		conn.Close()
 		return nil, fmt.Errorf("comfyui ws: server refused upgrade: %s", resp.Status)
 	}
 	if !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") {

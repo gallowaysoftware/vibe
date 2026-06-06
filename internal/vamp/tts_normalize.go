@@ -42,9 +42,27 @@ type ttsRule struct {
 	// YAML round-trip; unused at runtime.
 	Note string `yaml:"note,omitempty"`
 
-	// compiled is the regexp instance for Regex rules; lazily
-	// populated on first apply per Rules.
+	// compiled is the regexp instance for Regex rules; populated by
+	// compileRules before the rule set is published so applyTTSRules
+	// (which runs concurrently across foreach goroutines) only reads it.
 	compiled *regexp.Regexp
+}
+
+// compileRules compiles every Regex rule in place. A rule with a bad regex
+// gets a never-matching pattern so one malformed entry can't kill the audio
+// stage. Called once per rule set before it's shared with concurrent readers.
+func compileRules(rules []ttsRule) {
+	for i := range rules {
+		r := &rules[i]
+		if r.Regex == "" {
+			continue
+		}
+		re, err := regexp.Compile(r.Regex)
+		if err != nil {
+			re = regexp.MustCompile(`$.^`) // never matches
+		}
+		r.compiled = re
+	}
 }
 
 // ttsRules wraps a slice of rules with the YAML wrapper struct so
@@ -81,6 +99,7 @@ func loadDefaults() {
 	if err := yaml.Unmarshal(defaultTTSRulesYAML, &f); err != nil {
 		panic(fmt.Sprintf("default_tts_rules.yaml is malformed: %v", err))
 	}
+	compileRules(f.Rules)
 	defaultRules = f.Rules
 }
 
@@ -109,16 +128,16 @@ func loadRulesFile(path string) ([]ttsRule, error) {
 	if err := yaml.Unmarshal(raw, &f); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
+	compileRules(f.Rules)
 	rulesCacheMu.Lock()
 	rulesCache[path] = rulesCacheEntry{mtime: info.ModTime(), rules: f.Rules}
 	rulesCacheMu.Unlock()
 	return f.Rules, nil
 }
 
-// applyTTSRules applies the supplied rules in order. For regex
-// rules the regexp is compiled on first use and cached on the rule
-// struct (rules are loaded once per file and shared across all
-// segments, so the compile cost is paid once).
+// applyTTSRules applies the supplied rules in order. Read-only: regex rules
+// are pre-compiled by compileRules before the set is published, so this is
+// safe to call from the parallel foreach goroutines that share a rule set.
 func applyTTSRules(text string, rules []ttsRule) string {
 	for i := range rules {
 		r := &rules[i]
@@ -128,19 +147,7 @@ func applyTTSRules(text string, rules []ttsRule) string {
 			// natural fit but cheaper to inline via Replacer for
 			// the multi-rule case. Single-rule case here.
 			text = literalReplaceAll(text, r.Pattern, r.Replacement)
-		case r.Regex != "":
-			if r.compiled == nil {
-				re, err := regexp.Compile(r.Regex)
-				if err != nil {
-					// Bad regex in a rules file — log and skip so
-					// one bad rule doesn't kill the whole audio
-					// stage. Compile-once means we won't keep
-					// retrying on every segment.
-					r.compiled = regexp.MustCompile(`$.^`) // never matches
-					continue
-				}
-				r.compiled = re
-			}
+		case r.compiled != nil:
 			text = r.compiled.ReplaceAllString(text, r.Replacement)
 		}
 	}

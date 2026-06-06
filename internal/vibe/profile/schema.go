@@ -234,23 +234,92 @@ func Schema() *schemaProperty {
 		},
 	}
 
+	huggingfaceRepo := &schemaProperty{
+		Type:                 "object",
+		Description:          "HuggingFace snapshot pull spec. When set, vibe downloads the full EXL3 model directory (safetensors shards + tokenizer + config) into model_dir on demand.",
+		AdditionalProperties: false,
+		Required:             []string{"repo"},
+		Properties: map[string]*schemaProperty{
+			"repo": {
+				Type:        "string",
+				Description: "HuggingFace repository holding the EXL3 snapshot.",
+			},
+			"revision": {
+				Type:        "string",
+				Description: "Git revision (branch / tag / commit). Defaults to \"main\".",
+			},
+		},
+	}
+
+	tabbyAPI := &schemaProperty{
+		Type:                 "object",
+		Description:          "tabbyAPI (ExLlamaV3 / EXL3) backend. Supervises a tabbyAPI process serving an EXL3-format model on NVIDIA hardware and proxies its OpenAI-compatible endpoint through vibe's reverse proxy.",
+		AdditionalProperties: false,
+		Required:             []string{"alias", "context", "port", "venv", "repo"},
+		Properties: map[string]*schemaProperty{
+			"model_dir": {
+				Type:        "string",
+				Description: "Path to the EXL3 model directory (safetensors shards + config.json + tokenizer files). Required unless huggingface is set; tilde-expanded. Its basename must equal alias.",
+			},
+			"huggingface": huggingfaceRepo,
+			"alias": {
+				Type:        "string",
+				Description: "Model id reported on /v1/models and sent as `model:` in completion requests. Must equal basename(model_dir).",
+			},
+			"context": {
+				Type:        "integer",
+				Description: "Max sequence length tabbyAPI loads the model with.",
+				Minimum:     float64Ptr(1),
+			},
+			"port": {
+				Type:        "integer",
+				Description: "Host TCP port tabbyAPI publishes on. Required (> 0); daemon-picked ports are not supported for this backend.",
+				Minimum:     float64Ptr(1),
+			},
+			"cache_mode": {
+				Type:        "string",
+				Enum:        []any{"FP16", "Q8", "Q6", "Q4"},
+				Description: "KV cache quantisation. One of FP16 (default), Q8, Q6, Q4.",
+			},
+			"venv": {
+				Type:        "string",
+				Description: "Python venv with exllamav3 + tabbyAPI installed. The daemon execs <venv>/bin/python directly. Tilde-expanded.",
+			},
+			"repo": {
+				Type:        "string",
+				Description: "tabbyAPI checkout used as workdir + entrypoint source (start.py). Tilde-expanded.",
+			},
+			"draft_model_dir": {
+				Type:        "string",
+				Description: "Optional smaller EXL3 model dir used for speculative decoding. Tilde-expanded.",
+			},
+			"extra_args": {
+				Type:        "array",
+				Description: "Extra flags appended to the start.py argv after vibe-managed flags. Each entry is one argv token.",
+				Items:       &schemaProperty{Type: "string"},
+			},
+		},
+	}
+
 	backend := &schemaProperty{
 		Type:                 "object",
-		Description:          "Backend configuration. Exactly one of llama_server, comfyui, or http_server must be set (discriminated union).",
+		Description:          "Backend configuration. Exactly one of llama_server, comfyui, http_server, or tabby_api must be set (discriminated union).",
 		AdditionalProperties: false,
 		Properties: map[string]*schemaProperty{
 			"llama_server": llamaServer,
 			"comfyui":      comfyui,
 			"http_server":  httpServer,
+			"tabby_api":    tabbyAPI,
 		},
 		// Discriminated-union XOR: exactly one sub-block. Each oneOf
-		// branch requires one of the three keys; the loader rejects
+		// branch requires one of the four keys; the loader rejects
 		// "more than one set" and "none set" at runtime, matching this
 		// constraint.
 		OneOf: []*schemaProperty{
 			{Required: []string{"llama_server"}},
 			{Required: []string{"comfyui"}},
 			{Required: []string{"http_server"}},
+			{Required: []string{"tabby_api"}},
 		},
 	}
 
@@ -353,7 +422,7 @@ func Schema() *schemaProperty {
 		ID:                   "https://github.com/gallowaysoftware/vibe/schemas/vibe.profile.schema.json",
 		Title:                "vibe profile",
 		Type:                 "object",
-		Description:          "A vibe profile definition: a named backend (llama_server or comfyui) plus an optional frontend renderer.",
+		Description:          "A vibe profile definition: a named backend (llama_server, comfyui, http_server, or tabby_api) plus an optional frontend renderer.",
 		Required:             []string{"name", "backend"},
 		AdditionalProperties: false,
 		Properties: map[string]*schemaProperty{
@@ -378,8 +447,11 @@ func Schema() *schemaProperty {
 			"Backend":            backend,
 			"LlamaServerBackend": llamaServer,
 			"ComfyUIBackend":     comfyui,
+			"HTTPServerBackend":  httpServer,
+			"TabbyAPIBackend":    tabbyAPI,
 			"Frontend":           frontend,
 			"Huggingface":        huggingface,
+			"HuggingfaceRepo":    huggingfaceRepo,
 			"WaitForURL":         waitForURL,
 		},
 	}

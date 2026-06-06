@@ -579,15 +579,29 @@ func (d *Daemon) Stop(ctx context.Context, req *connect.Request[vibev1.StopReque
 	defer d.startMu.Unlock()
 
 	name := strings.TrimSpace(req.Msg.GetProfile())
-	switch {
-	case name == "" || (d.active != nil && d.active.Name == name):
-		// Empty or active-name targets the active profile (legacy
-		// behavior). The active-name path lets callers be explicit
-		// without having to know which mode the profile is in.
+	// Snapshot the active profile name under the lock: the respawn watcher
+	// writes d.active (and nils it when the budget trips) under d.mu, so a
+	// bare read in the switch races it (CI runs -race).
+	d.mu.Lock()
+	activeName := ""
+	if d.active != nil {
+		activeName = d.active.Name
+	}
+	d.mu.Unlock()
+
+	// Empty or active-name targets the active profile (legacy behavior).
+	// The active-name path lets callers be explicit without having to know
+	// which mode the profile is in. Handled ahead of the name switch so the
+	// switch stays a simple tagged dispatch.
+	if name == "" || name == activeName {
 		if err := d.stopActive(ctx); err != nil {
 			return nil, connect.NewError(connect.CodeInternal, err)
 		}
-	case name == "all":
+		return connect.NewResponse(&vibev1.StopResponse{Status: d.protoStatus()}), nil
+	}
+
+	switch name {
+	case "all":
 		// Best-effort stop everything. The first error gets surfaced
 		// but every entry is attempted so a partial failure doesn't
 		// leave half the stack up. Active goes last so a service stop

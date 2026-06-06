@@ -305,7 +305,12 @@ type TextStage struct {
 // backoff policy; the new default folds that boilerplate.
 func (p *Pipeline) Text(id string) *TextStage {
 	s := p.appendStage(id, StageTypeText)
-	s.Retry = DefaultTextRetry
+	// Fresh copy (with a copied RetryOn slice) per stage: handing out the
+	// shared DefaultTextRetry pointer would let a later .Retry override or a
+	// slice mutation on one stage leak into every other text stage.
+	policy := *DefaultTextRetry
+	policy.RetryOn = append([]string(nil), DefaultTextRetry.RetryOn...)
+	s.Retry = &policy
 	t := &TextStage{}
 	t.stageBase = &stageBase[*TextStage]{s: s, self: nil}
 	t.self = t

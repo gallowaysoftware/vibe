@@ -46,14 +46,14 @@ func TestSchemaJSON_RoundTrip(t *testing.T) {
 		}
 	}
 
-	// Verify the discriminated-union shape on backend: schema must
-	// declare oneOf with two branches (llama_server / comfyui), matching
+	// Verify the discriminated-union shape on backend: schema must declare
+	// oneOf with one branch per backend sub-block, matching
 	// validateBackend's "exactly one of" check.
 	props, _ := doc["properties"].(map[string]any)
 	backend, _ := props["backend"].(map[string]any)
 	oneOf, _ := backend["oneOf"].([]any)
-	if len(oneOf) != 3 {
-		t.Errorf("backend.oneOf length = %d, want 3 (llama_server XOR comfyui XOR http_server)", len(oneOf))
+	if len(oneOf) != 4 {
+		t.Errorf("backend.oneOf length = %d, want 4 (llama_server XOR comfyui XOR http_server XOR tabby_api)", len(oneOf))
 	}
 
 	// llama_server required keys: path, alias, context. Catches drift
