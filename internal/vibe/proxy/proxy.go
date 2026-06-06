@@ -63,7 +63,7 @@ func (p *Proxy) Start() error {
 	}
 	p.srv = &http.Server{Handler: p}
 	p.started = true
-	go p.srv.Serve(ln)
+	go func() { _ = p.srv.Serve(ln) }()
 	return nil
 }
 

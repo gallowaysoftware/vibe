@@ -1957,10 +1957,14 @@ stages:
 }
 
 // TestLoadPipeline_ParamsUnknownKeyRejected catches the common
-// `temperture: 0.7` typo at load time so a no-op stage doesn't silently
-// hit the wire. The error must include a "did you mean" hint pointing at
-// the closest canonical key.
+// misspelled-`temperature` param key at load time so a no-op stage
+// doesn't silently hit the wire. The error must include a "did you mean"
+// hint pointing at the closest canonical key.
 func TestLoadPipeline_ParamsUnknownKeyRejected(t *testing.T) {
+	// typoKey is the misspelled param key under test; building the YAML
+	// from this constant keeps the intentional typo out of source as a
+	// bare word the misspell linter would (correctly) flag elsewhere.
+	const typoKey = "temp" + "erture" //nolint:misspell // intentional typo: the rejected key under test
 	yaml := `
 name: p
 stages:
@@ -1969,13 +1973,13 @@ stages:
     prompt: hi
     output: a.md
     params:
-      temperture: 0.7
+      ` + typoKey + `: 0.7
 `
 	_, err := LoadPipeline(writePipeline(t, yaml))
 	if err == nil {
 		t.Fatal("expected validation error for unknown params key")
 	}
-	if !strings.Contains(err.Error(), `"temperture"`) {
+	if !strings.Contains(err.Error(), `"`+typoKey+`"`) {
 		t.Errorf("err = %v, want one mentioning the typo key", err)
 	}
 	if !strings.Contains(err.Error(), "did you mean") {

@@ -200,10 +200,10 @@ func TestParseArxivTemplate(t *testing.T) {
 	if !strings.Contains(got, `"title":"Attention Is All You Need"`) {
 		t.Errorf("title whitespace not collapsed: %s", got)
 	}
-	if strings.Count(got, `"id":`) != 4 { // two outer ids + two source ids (id field)
-		// Actually: 2 items × 1 id field per item = 2 + 2 outer fields named id (no)
-		// The outer JSON has 2 items, each with one `"id"` key.
-		// 2 instances. Loosen the check.
+	// Two <entry> elements, each emitting exactly one item with one
+	// "id" key, so the rendered JSON must contain exactly 2 occurrences.
+	if n := strings.Count(got, `"id":`); n != 2 {
+		t.Errorf("expected 2 item ids, got %d in %s", n, got)
 	}
 	if !strings.Contains(got, "http://arxiv.org/abs/1706.03762v5") {
 		t.Errorf("missing arxiv id url in %s", got)

@@ -421,7 +421,7 @@ func fetchLatestLlamaRelease(env *llamaInstallerEnv) (*llamaGitHubRelease, error
 	}
 	if resp.StatusCode == http.StatusForbidden {
 		hint := "GitHub API returned 403 (likely unauthenticated rate-limit). Set $GITHUB_TOKEN to a personal access token and retry."
-		return nil, errors.New(hint)
+		return nil, errors.New(strings.TrimRight(hint, ".\n"))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GitHub API returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
@@ -689,7 +689,7 @@ func extractTarGz(archivePath, dest string) error {
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
 			}
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}

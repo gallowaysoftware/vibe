@@ -50,7 +50,7 @@ func (s *stubControl) Start(_ context.Context, req *connect.Request[vibev1.Start
 	s.mu.Lock()
 	s.profile = req.Msg.Profile
 	s.mu.Unlock()
-	r, _ := s.Status(nil, nil)
+	r, _ := s.Status(context.TODO(), nil)
 	return connect.NewResponse(&vibev1.StartResponse{Status: r.Msg.Status}), nil
 }
 func (s *stubControl) Stop(_ context.Context, _ *connect.Request[vibev1.StopRequest]) (*connect.Response[vibev1.StopResponse], error) {
@@ -467,7 +467,7 @@ func TestExecutor_ParallelGroupedByCapability(t *testing.T) {
 	}
 	rest := []string{activations[1], activations[2]}
 	wantB, wantC := "B ok:A", "C ok:A"
-	if !((rest[0] == wantB && rest[1] == wantC) || (rest[0] == wantC && rest[1] == wantB)) {
+	if (rest[0] != wantB || rest[1] != wantC) && (rest[0] != wantC || rest[1] != wantB) {
 		t.Errorf("wave 2 ordering = %v, expected some permutation of [%q,%q]", rest, wantB, wantC)
 	}
 	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
@@ -2370,7 +2370,7 @@ func (s *vramFallbackControl) Start(_ context.Context, req *connect.Request[vibe
 			fmt.Errorf(`profile %q needs ~24.0 GiB free VRAM but only 8.0 GiB is free`, req.Msg.Profile),
 		)
 	}
-	r, _ := s.Status(nil, nil)
+	r, _ := s.Status(context.TODO(), nil)
 	return connect.NewResponse(&vibev1.StartResponse{Status: r.Msg.Status}), nil
 }
 func (s *vramFallbackControl) Stop(_ context.Context, _ *connect.Request[vibev1.StopRequest]) (*connect.Response[vibev1.StopResponse], error) {

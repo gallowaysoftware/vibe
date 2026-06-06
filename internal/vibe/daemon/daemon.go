@@ -192,7 +192,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.prx.Start(); err != nil {
 		return fmt.Errorf("start proxy: %w", err)
 	}
-	defer d.prx.Stop(context.Background())
+	defer func() { _ = d.prx.Stop(context.Background()) }()
 
 	// Generate or load the bearer token before binding the TCP server.
 	// The unix socket reuses the same Connect handler but skips token

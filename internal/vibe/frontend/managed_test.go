@@ -26,7 +26,6 @@ type fakeProc struct {
 
 	mu             sync.Mutex
 	exited         bool
-	exitErr        error
 	signals        []os.Signal
 	killed         bool
 	ignoreSIGINT   bool // when true, SIGINT no longer triggers exit

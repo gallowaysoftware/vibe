@@ -79,10 +79,11 @@ func TestClient_UploadImage_HTTPError(t *testing.T) {
 
 func TestNew_GeneratesStableClientID(t *testing.T) {
 	c := New("http://x:1", nil)
-	if c.ClientID() == "" {
+	first := c.ClientID()
+	if first == "" {
 		t.Fatal("ClientID empty")
 	}
-	if c.ClientID() != c.ClientID() {
+	if c.ClientID() != first {
 		t.Fatal("ClientID changed between calls")
 	}
 	c2 := New("http://x:1", nil)

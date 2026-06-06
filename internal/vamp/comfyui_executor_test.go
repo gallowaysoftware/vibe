@@ -253,7 +253,7 @@ func (s *stubControlWithBackend) Start(_ context.Context, req *connect.Request[v
 	s.mu.Lock()
 	s.profile = req.Msg.Profile
 	s.mu.Unlock()
-	r, _ := s.Status(nil, nil)
+	r, _ := s.Status(context.TODO(), nil)
 	return connect.NewResponse(&vibev1.StartResponse{Status: r.Msg.Status}), nil
 }
 func (s *stubControlWithBackend) Stop(_ context.Context, _ *connect.Request[vibev1.StopRequest]) (*connect.Response[vibev1.StopResponse], error) {
@@ -698,7 +698,7 @@ func TestComfyUIExecutor_Foreach(t *testing.T) {
 	// Order is not guaranteed (per-item runs in parallel), so accept either
 	// permutation.
 	want1, want2 := "render a", "render b"
-	if !((seen[0] == want1 && seen[1] == want2) || (seen[0] == want2 && seen[1] == want1)) {
+	if (seen[0] != want1 || seen[1] != want2) && (seen[0] != want2 || seen[1] != want1) {
 		t.Errorf("rendered texts = %v, want some permutation of [%q,%q]", seen, want1, want2)
 	}
 }

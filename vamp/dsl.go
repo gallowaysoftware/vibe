@@ -28,10 +28,6 @@ type stageBase[T any] struct {
 // ID exposes the stage's id, satisfying the Ref interface.
 func (b *stageBase[T]) ID() string { return b.s.ID }
 
-// stage returns the wrapped *Stage. Exposed for tests + the Pipeline.Build
-// validation step; user code goes through the fluent methods.
-func (b *stageBase[T]) stage() *Stage { return b.s }
-
 // After declares this stage's dependencies — every dep must finish before
 // this stage runs. The stage builder accepts *TextStage / *WebhookStage /
 // … because they satisfy Ref; pass them as Go variables to keep cross-stage
@@ -286,11 +282,6 @@ func (p *Pipeline) Build() (*Pipeline, error) {
 	return p, nil
 }
 
-// internalPipeline returns the underlying *Pipeline so the cli helpers
-// (which take internalvamp.Pipeline) can drive it directly. Unexported
-// because external callers should treat the *Pipeline opaquely.
-func (p *Pipeline) internalPipeline() *internalvamp.Pipeline { return p.inner }
-
 // appendStage allocates a new Stage with the given id+type, appends it to
 // the pipeline's stage list, and returns a pointer the stage builder can
 // mutate. Centralising this keeps every per-type constructor honest about
@@ -317,7 +308,7 @@ func (p *Pipeline) Text(id string) *TextStage {
 	s.Retry = DefaultTextRetry
 	t := &TextStage{}
 	t.stageBase = &stageBase[*TextStage]{s: s, self: nil}
-	t.stageBase.self = t
+	t.self = t
 	return t
 }
 
@@ -392,7 +383,7 @@ func (p *Pipeline) Render(id string) *RenderStage {
 	s := p.appendStage(id, StageTypeRender)
 	r := &RenderStage{}
 	r.stageBase = &stageBase[*RenderStage]{s: s}
-	r.stageBase.self = r
+	r.self = r
 	return r
 }
 
@@ -431,7 +422,7 @@ func (p *Pipeline) Compact(id string) *CompactStage {
 	s := p.appendStage(id, StageTypeCompact)
 	c := &CompactStage{}
 	c.stageBase = &stageBase[*CompactStage]{s: s}
-	c.stageBase.self = c
+	c.self = c
 	return c
 }
 
@@ -453,7 +444,7 @@ func (p *Pipeline) Audio(id string) *AudioStage {
 	s := p.appendStage(id, StageTypeAudio)
 	a := &AudioStage{}
 	a.stageBase = &stageBase[*AudioStage]{s: s}
-	a.stageBase.self = a
+	a.self = a
 	return a
 }
 
@@ -492,7 +483,7 @@ func (p *Pipeline) FFmpeg(id string) *FFmpegStage {
 	s := p.appendStage(id, StageTypeFFmpeg)
 	f := &FFmpegStage{}
 	f.stageBase = &stageBase[*FFmpegStage]{s: s}
-	f.stageBase.self = f
+	f.self = f
 	return f
 }
 
@@ -601,7 +592,7 @@ func (p *Pipeline) Pandoc(id string) *PandocStage {
 	s := p.appendStage(id, StageTypePandoc)
 	ps := &PandocStage{}
 	ps.stageBase = &stageBase[*PandocStage]{s: s}
-	ps.stageBase.self = ps
+	ps.self = ps
 	return ps
 }
 
@@ -649,7 +640,7 @@ func (p *Pipeline) Mix(id string) *MixStage {
 	s := p.appendStage(id, StageTypeMix)
 	m := &MixStage{}
 	m.stageBase = &stageBase[*MixStage]{s: s}
-	m.stageBase.self = m
+	m.self = m
 	return m
 }
 
@@ -714,7 +705,7 @@ func (p *Pipeline) Short(id string) *ShortStage {
 	s := p.appendStage(id, StageTypeShort)
 	sh := &ShortStage{}
 	sh.stageBase = &stageBase[*ShortStage]{s: s}
-	sh.stageBase.self = sh
+	sh.self = sh
 	return sh
 }
 
@@ -767,7 +758,7 @@ func (p *Pipeline) ComfyUI(id string) *ComfyUIStage {
 	s := p.appendStage(id, StageTypeComfyUI)
 	c := &ComfyUIStage{}
 	c.stageBase = &stageBase[*ComfyUIStage]{s: s}
-	c.stageBase.self = c
+	c.self = c
 	return c
 }
 
@@ -846,7 +837,7 @@ func (p *Pipeline) YouTube(id string) *YouTubeStage {
 	s := p.appendStage(id, StageTypeYouTube)
 	y := &YouTubeStage{}
 	y.stageBase = &stageBase[*YouTubeStage]{s: s}
-	y.stageBase.self = y
+	y.self = y
 	return y
 }
 
@@ -880,7 +871,7 @@ func (p *Pipeline) Webhook(id string) *WebhookStage {
 	s := p.appendStage(id, StageTypeWebhook)
 	w := &WebhookStage{}
 	w.stageBase = &stageBase[*WebhookStage]{s: s}
-	w.stageBase.self = w
+	w.self = w
 	return w
 }
 
@@ -960,7 +951,7 @@ func (p *Pipeline) Confirm(id string) *ConfirmStage {
 	s := p.appendStage(id, StageTypeConfirm)
 	c := &ConfirmStage{}
 	c.stageBase = &stageBase[*ConfirmStage]{s: s}
-	c.stageBase.self = c
+	c.self = c
 	return c
 }
 

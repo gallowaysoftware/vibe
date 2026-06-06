@@ -847,9 +847,7 @@ func splitLinesKeepEmpty(s string) []string {
 	// Strip exactly one trailing newline if present so a file ending
 	// in "\n" doesn't yield a phantom empty last line. Files without
 	// a trailing newline keep all their content.
-	if strings.HasSuffix(s, "\n") {
-		s = s[:len(s)-1]
-	}
+	s = strings.TrimSuffix(s, "\n")
 	return strings.Split(s, "\n")
 }
 

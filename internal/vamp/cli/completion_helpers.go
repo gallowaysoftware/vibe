@@ -102,24 +102,3 @@ func completeRunIDs(_ *cobra.Command, args []string, _ string) ([]string, cobra.
 	}
 	return ids, cobra.ShellCompDirectiveNoFileComp
 }
-
-// completeCapabilityKeys is a cobra ValidArgsFunction that suggests
-// capability names from $XDG_CONFIG_HOME/vamp/capabilities.yaml.
-//
-// Today `vamp capabilities` takes no positional args (it just dumps the
-// mapping), so this is currently unused at the positional-arg level. It
-// lives here so a future `vamp capabilities <KEY>` subcommand — and the
-// per-flag completer for `--input KEY=` — can pick it up without each
-// place re-implementing the load.
-func completeCapabilityKeys(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
-	caps, err := vamp.LoadCapabilities()
-	if err != nil || caps == nil {
-		return nil, cobra.ShellCompDirectiveNoFileComp
-	}
-	keys := make([]string, 0, len(caps.Mapping))
-	for k := range caps.Mapping {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys, cobra.ShellCompDirectiveNoFileComp
-}

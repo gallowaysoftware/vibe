@@ -1674,9 +1674,9 @@ func looksLikeTemplate(s string) bool {
 // fields every backend vamp speaks to today actually understands plus the
 // llama.cpp grammar/sampling extensions (top_k, min_p, repetition_penalty)
 // that the inference proxy forwards. Any other key is most likely a typo
-// (e.g. "temperture") which historically slipped through verbatim and was
-// silently ignored by the backend; Validate now rejects unknowns up-front
-// with a "did you mean" hint computed against this list.
+// (e.g. a misspelled "temperature") which historically slipped through
+// verbatim and was silently ignored by the backend; Validate now rejects
+// unknowns up-front with a "did you mean" hint computed against this list.
 var knownTextParamKeys = []string{
 	"temperature",
 	"top_p",
@@ -1710,7 +1710,7 @@ var knownTextParamKeys = []string{
 // canonical allowlist. The first unknown key seen wins and the error
 // includes a "did you mean: X, Y" hint when a near-match exists. Validation
 // is intentionally strict-mode-only: silently ignoring unknown keys is what
-// historically let `temperture: 0.7` reach the wire as a no-op.
+// historically let a misspelled `temperature: 0.7` reach the wire as a no-op.
 func validateParamsKeys(ctx string, params map[string]any) error {
 	if len(params) == 0 {
 		return nil

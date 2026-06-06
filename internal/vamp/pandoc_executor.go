@@ -85,7 +85,8 @@ func (p *pandocExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 
 	useDocker := false
 	binary := st.Binary
-	if binary == "" {
+	switch binary {
+	case "":
 		// Prefer a host pandoc when available so we avoid the docker
 		// pull on first use; fall back to docker so the stage works on
 		// hosts without pandoc installed.
@@ -95,7 +96,7 @@ func (p *pandocExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 			useDocker = true
 			binary = "docker"
 		}
-	} else if binary == "docker" {
+	case "docker":
 		useDocker = true
 	}
 
