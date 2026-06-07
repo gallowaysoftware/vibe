@@ -55,7 +55,10 @@ sub-block must be set:
   `huggingface.mmproj_file`) to enable image input on vision-capable
   models (Gemma 3, Qwen2.5-VL, LLaVA, etc.). See the
   `examples/profiles/chat-with-search/` profile for a full multimodal
-  example.
+  example. For speculative decoding, set `backend.llama_server.draft_model`
+  (and optionally `huggingface.draft_file`) to a draft GGUF — e.g. a
+  Gemma 4 MTP assistant; vibe adds `--model-draft` + `--spec-type draft-mtp`
+  + `--spec-draft-n-max` (draft-mtp requires an f16 KV cache).
 - `comfyui` — supervises a [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
   python process for image/video generation. ComfyUI ships its own UI,
   so these profiles carry no `frontend:` block.

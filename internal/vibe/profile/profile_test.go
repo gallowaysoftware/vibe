@@ -1162,6 +1162,90 @@ frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 	}
 }
 
+func TestLoad_DraftModel_OnDisk(t *testing.T) {
+	model := stubModelFile(t)
+	draft := filepath.Join(t.TempDir(), "gemma-mtp.gguf")
+	if err := os.WriteFile(draft, []byte("stub"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	yaml := `
+name: gemma-mtp
+backend:
+  llama_server:
+    path: ` + model + `
+    draft_model: ` + draft + `
+    alias: gemma
+    context: 8192
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
+`
+	p, err := Load(writeProfile(t, yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if p.Backend.LlamaServer.DraftModel != draft {
+		t.Errorf("draft_model = %q, want %q", p.Backend.LlamaServer.DraftModel, draft)
+	}
+}
+
+func TestLoad_DraftModel_RejectsMissingFile(t *testing.T) {
+	model := stubModelFile(t)
+	yaml := `
+name: g
+backend:
+  llama_server:
+    path: ` + model + `
+    draft_model: /nonexistent/draft.gguf
+    alias: g
+    context: 1024
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
+`
+	_, err := Load(writeProfile(t, yaml))
+	if err == nil || !strings.Contains(err.Error(), "draft_model") {
+		t.Fatalf("expected draft_model error for missing file, got %v", err)
+	}
+}
+
+func TestLoad_DraftFile_RequiresDraftModel(t *testing.T) {
+	model := stubModelFile(t)
+	yaml := `
+name: g
+backend:
+  llama_server:
+    path: ` + model + `
+    alias: g
+    context: 1024
+    huggingface: {repo: a/b, file: m.gguf, draft_file: d.gguf}
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
+`
+	_, err := Load(writeProfile(t, yaml))
+	if err == nil || !strings.Contains(err.Error(), "draft_model") {
+		t.Fatalf("expected draft_model-required error, got %v", err)
+	}
+}
+
+func TestLoad_DraftMTP_RejectsQuantizedKV(t *testing.T) {
+	model := stubModelFile(t)
+	draft := filepath.Join(t.TempDir(), "d.gguf")
+	if err := os.WriteFile(draft, []byte("stub"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	yaml := `
+name: g
+backend:
+  llama_server:
+    path: ` + model + `
+    draft_model: ` + draft + `
+    cache_type_k: q8_0
+    alias: g
+    context: 1024
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
+`
+	_, err := Load(writeProfile(t, yaml))
+	if err == nil || !strings.Contains(err.Error(), "f16 KV") {
+		t.Fatalf("expected f16-KV error for draft-mtp + quantized KV, got %v", err)
+	}
+}
+
 // TestLoad_MMProj_HFPullDeferred: when huggingface.mmproj_file is set, the
 // target path is allowed to not yet exist — `vibe pull` will create it,
 // same contract as path/huggingface.file.

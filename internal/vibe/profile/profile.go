@@ -99,6 +99,25 @@ type LlamaServerBackend struct {
 	// When Huggingface.MMProjFile is set, this path is the *target* for
 	// the pulled file and may not yet exist.
 	MMProj string `yaml:"mmproj,omitempty"`
+	// DraftModel is a speculative-decoding draft model GGUF that
+	// llama-server loads via --model-draft. Used for Gemma 4 MTP, whose
+	// multi-token-prediction head ships as a separate ~0.4B "assistant"
+	// drafter (unlike Qwen MTP, which is in-weights and needs no draft
+	// file). When set, SpecType (default "draft-mtp") and SpecDraftNMax
+	// (default 4) are passed too. When Huggingface.DraftFile is set, this
+	// path is the *target* for the pulled file and may not yet exist.
+	// NOTE: draft-mtp requires an f16 KV cache — a quantized cache_type_k/v
+	// silently yields ~0% draft acceptance, so validation rejects that combo.
+	DraftModel string `yaml:"draft_model,omitempty"`
+	// SpecType selects the speculative-decoding strategy (--spec-type),
+	// e.g. "draft-mtp" for Gemma 4 MTP. Defaults to "draft-mtp" when
+	// DraftModel is set. Only meaningful alongside DraftModel.
+	SpecType string `yaml:"spec_type,omitempty"`
+	// SpecDraftNMax caps how many tokens the drafter proposes per step
+	// (--spec-draft-n-max). Defaults to 4 when DraftModel is set; 2-4 is
+	// the recommended range (higher reduces acceptance). Only meaningful
+	// alongside DraftModel.
+	SpecDraftNMax int `yaml:"spec_draft_n_max,omitempty"`
 	// Binary overrides which llama-server binary to spawn for this
 	// profile. Empty (default) means "use the daemon's configured
 	// llama-server, which falls back to the first one on $PATH" — the
@@ -279,6 +298,10 @@ type Huggingface struct {
 	File       string `yaml:"file"`
 	Revision   string `yaml:"revision,omitempty"` // default "main"
 	MMProjFile string `yaml:"mmproj_file,omitempty"`
+	// DraftFile, when non-empty, names a speculative draft model file from
+	// the same Repo/Revision (e.g. a Gemma 4 MTP assistant GGUF). It is
+	// downloaded to LlamaServerBackend.DraftModel, mirroring MMProjFile.
+	DraftFile string `yaml:"draft_file,omitempty"`
 }
 
 const (
@@ -442,6 +465,7 @@ func Load(path string) (*Profile, error) {
 		p.Backend.LlamaServer.Path = expandTilde(p.Backend.LlamaServer.Path)
 		p.Backend.LlamaServer.Binary = expandTilde(p.Backend.LlamaServer.Binary)
 		p.Backend.LlamaServer.MMProj = expandTilde(p.Backend.LlamaServer.MMProj)
+		p.Backend.LlamaServer.DraftModel = expandTilde(p.Backend.LlamaServer.DraftModel)
 	}
 	if p.Backend.HTTPServer != nil {
 		// Volumes' host paths get tilde-expanded so a profile can
@@ -681,7 +705,43 @@ func validateLlamaServer(m *LlamaServerBackend) error {
 			}
 		}
 	}
+	if m.Huggingface != nil && m.Huggingface.DraftFile != "" && m.DraftModel == "" {
+		return errors.New("backend.llama_server.draft_model is required when huggingface.draft_file is set (it's the target path for the pulled file)")
+	}
+	if (m.SpecType != "" || m.SpecDraftNMax != 0) && m.DraftModel == "" {
+		return errors.New("backend.llama_server.spec_type / spec_draft_n_max require draft_model to be set")
+	}
+	if m.DraftModel != "" {
+		hasHFPull := m.Huggingface != nil && m.Huggingface.DraftFile != ""
+		if !hasHFPull {
+			if _, err := os.Stat(m.DraftModel); err != nil {
+				return fmt.Errorf("backend.llama_server.draft_model %s: %w", m.DraftModel, err)
+			}
+		}
+		// draft-mtp gives ~0% draft acceptance with a quantized KV cache —
+		// the speedup silently evaporates. Reject the footgun rather than
+		// let it look enabled but do nothing. (f16, the llama-server default
+		// when cache_type is unset, is correct.)
+		specType := m.SpecType
+		if specType == "" {
+			specType = "draft-mtp"
+		}
+		if specType == "draft-mtp" && (isQuantizedKV(m.CacheTypeK) || isQuantizedKV(m.CacheTypeV)) {
+			return errors.New("draft-mtp requires an f16 KV cache: remove cache_type_k/cache_type_v (or set them to f16); a quantized KV cache yields ~0% draft acceptance")
+		}
+	}
 	return nil
+}
+
+// isQuantizedKV reports whether a cache_type_k/v value is a quantized type
+// (anything other than empty or an f16/f32 float cache).
+func isQuantizedKV(t string) bool {
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "", "f16", "f32", "bf16":
+		return false
+	default:
+		return true
+	}
 }
 
 func validateComfyUI(c *ComfyUIBackend) error {

@@ -68,7 +68,7 @@ func Schema() *schemaProperty {
 
 	huggingface := &schemaProperty{
 		Type:                 "object",
-		Description:          "HuggingFace pull spec. When set, vibe downloads backend.llama_server.path on demand (via `vibe pull` or implicitly at start). Setting mmproj_file additionally pulls a multimodal projector to backend.llama_server.mmproj.",
+		Description:          "HuggingFace pull spec. When set, vibe downloads backend.llama_server.path on demand (via `vibe pull` or implicitly at start). Setting mmproj_file additionally pulls a multimodal projector to backend.llama_server.mmproj; setting draft_file pulls a speculative draft model to backend.llama_server.draft_model.",
 		AdditionalProperties: false,
 		Required:             []string{"repo", "file"},
 		Properties: map[string]*schemaProperty{
@@ -87,6 +87,10 @@ func Schema() *schemaProperty {
 			"mmproj_file": {
 				Type:        "string",
 				Description: "Multimodal projector filename for vision-capable models. When set, backend.llama_server.mmproj must also be set as the target path.",
+			},
+			"draft_file": {
+				Type:        "string",
+				Description: "Speculative draft model filename from the same repo (e.g. a Gemma 4 MTP assistant GGUF). When set, backend.llama_server.draft_model must also be set as the target path.",
 			},
 		},
 	}
@@ -145,6 +149,19 @@ func Schema() *schemaProperty {
 			"mmproj": {
 				Type:        "string",
 				Description: "Path to the multimodal projector GGUF that llama-server loads via --mmproj to enable image input on vision-capable models (Gemma 3, Qwen2.5-VL, LLaVA, etc.). When huggingface.mmproj_file is set, this path is the target for the pulled file.",
+			},
+			"draft_model": {
+				Type:        "string",
+				Description: "Path to a speculative draft model GGUF loaded via --model-draft, e.g. a Gemma 4 MTP assistant. When set, vibe also passes --spec-type (spec_type, default \"draft-mtp\") and --spec-draft-n-max (spec_draft_n_max, default 4). draft-mtp requires an f16 KV cache (a quantized cache_type_k/v is rejected). When huggingface.draft_file is set, this path is the target for the pulled file.",
+			},
+			"spec_type": {
+				Type:        "string",
+				Description: "Speculative-decoding strategy passed as --spec-type (e.g. \"draft-mtp\" for Gemma 4 MTP). Defaults to \"draft-mtp\" when draft_model is set. Requires draft_model.",
+			},
+			"spec_draft_n_max": {
+				Type:        "integer",
+				Description: "Max tokens the drafter proposes per step (--spec-draft-n-max). Defaults to 4 when draft_model is set; 2-4 recommended. Requires draft_model.",
+				Minimum:     float64Ptr(1),
 			},
 			"binary": {
 				Type:        "string",

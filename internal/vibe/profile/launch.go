@@ -48,6 +48,19 @@ func LlamaServerSpec(p *Profile, binary string, port int) (supervisor.LaunchSpec
 	if m.MMProj != "" {
 		args = append(args, "--mmproj", m.MMProj)
 	}
+	if m.DraftModel != "" {
+		specType := m.SpecType
+		if specType == "" {
+			specType = "draft-mtp"
+		}
+		nMax := m.SpecDraftNMax
+		if nMax == 0 {
+			nMax = 4
+		}
+		args = append(args, "--model-draft", m.DraftModel,
+			"--spec-type", specType,
+			"--spec-draft-n-max", strconv.Itoa(nMax))
+	}
 	args = append(args, m.ExtraArgs...)
 
 	return supervisor.LaunchSpec{

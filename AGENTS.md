@@ -87,7 +87,8 @@ them before pushing.
   fields; the sub-block-presence trick doesn't fit.
 - Path fields (`backend.*.path`, `backend.*.dir`,
   `backend.comfyui.python`, `backend.llama_server.binary`,
-  `backend.llama_server.mmproj`, `backend.tabby_api.model_dir`,
+  `backend.llama_server.mmproj`, `backend.llama_server.draft_model`,
+  `backend.tabby_api.model_dir`,
   `backend.tabby_api.venv`, `backend.tabby_api.repo`,
   `backend.tabby_api.draft_model_dir`, `frontend.workdir`,
   `frontend.binary`, `frontend.write_file`, `frontend.compose_file`)
@@ -104,8 +105,19 @@ them before pushing.
   exist on disk unless an HF mmproj_file is provided; setting
   mmproj_file without an mmproj target is rejected. The HF pull
   flow in `daemon.Pull` is a helper closure (`pullOne`) called
-  twice — once for the weights, once for the mmproj — both
+  once per file — weights, mmproj, and draft model — all
   streaming download progress over the same RPC stream.
+- **Speculative draft models (Gemma 4 MTP).**
+  `backend.llama_server.draft_model` points at a draft GGUF loaded via
+  `--model-draft`; vibe also emits `--spec-type` (`spec_type`, default
+  `draft-mtp`) and `--spec-draft-n-max` (`spec_draft_n_max`, default 4).
+  Gemma 4's MTP head ships as a separate ~0.4B "assistant" drafter
+  (unlike Qwen MTP, which is in-weights and needs no draft file).
+  `huggingface.draft_file` pulls it from the same repo into the
+  draft_model path (same `pullOne` flow as mmproj). `validateLlamaServer`
+  mirrors the mmproj rules and additionally **rejects a quantized
+  `cache_type_k/v` when `spec_type` is `draft-mtp`** — quantized KV gives
+  ~0% draft acceptance, so the speedup would silently vanish.
 
 ## vamp stage rules
 

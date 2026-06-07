@@ -78,6 +78,67 @@ func TestLlamaServerSpec_MMProj(t *testing.T) {
 	}
 }
 
+func flagValue(args []string, flag string) (string, bool) {
+	for i, a := range args {
+		if a == flag {
+			if i+1 < len(args) {
+				return args[i+1], true
+			}
+			return "", true
+		}
+	}
+	return "", false
+}
+
+func TestLlamaServerSpec_DraftMTP_Defaults(t *testing.T) {
+	p := &Profile{
+		Backend: Backend{LlamaServer: &LlamaServerBackend{
+			Path:       "/m/gemma.gguf",
+			DraftModel: "/m/gemma-mtp.gguf",
+			Alias:      "gemma",
+			Context:    8192,
+			Parallel:   1,
+		}},
+	}
+	spec, err := LlamaServerSpec(p, "llama-server", 8080)
+	if err != nil {
+		t.Fatalf("LlamaServerSpec: %v", err)
+	}
+	if v, ok := flagValue(spec.Args, "--model-draft"); !ok || v != "/m/gemma-mtp.gguf" {
+		t.Errorf("--model-draft: got %q (present=%v), want /m/gemma-mtp.gguf", v, ok)
+	}
+	if v, ok := flagValue(spec.Args, "--spec-type"); !ok || v != "draft-mtp" {
+		t.Errorf("--spec-type default: got %q (present=%v), want draft-mtp", v, ok)
+	}
+	if v, ok := flagValue(spec.Args, "--spec-draft-n-max"); !ok || v != "4" {
+		t.Errorf("--spec-draft-n-max default: got %q (present=%v), want 4", v, ok)
+	}
+}
+
+func TestLlamaServerSpec_DraftMTP_Explicit(t *testing.T) {
+	p := &Profile{
+		Backend: Backend{LlamaServer: &LlamaServerBackend{
+			Path:          "/m/gemma.gguf",
+			DraftModel:    "/m/d.gguf",
+			SpecType:      "draft",
+			SpecDraftNMax: 2,
+			Alias:         "g",
+			Context:       1024,
+			Parallel:      1,
+		}},
+	}
+	spec, err := LlamaServerSpec(p, "llama-server", 8080)
+	if err != nil {
+		t.Fatalf("LlamaServerSpec: %v", err)
+	}
+	if v, _ := flagValue(spec.Args, "--spec-type"); v != "draft" {
+		t.Errorf("--spec-type: got %q, want draft", v)
+	}
+	if v, _ := flagValue(spec.Args, "--spec-draft-n-max"); v != "2" {
+		t.Errorf("--spec-draft-n-max: got %q, want 2", v)
+	}
+}
+
 func TestLlamaServerSpec_OmitsZeroValueFlags(t *testing.T) {
 	p := &Profile{
 		Backend: Backend{LlamaServer: &LlamaServerBackend{

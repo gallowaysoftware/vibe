@@ -832,12 +832,24 @@ func (d *Daemon) Pull(ctx context.Context, req *connect.Request[vibev1.PullReque
 		mmprojFlowed = flowed
 	}
 
-	total := modelSize + mmprojSize
+	var draftSize int64
+	draftFlowed := false
+	if m.Huggingface.DraftFile != "" {
+		size, flowed, err := pullOne(m.Huggingface.DraftFile, m.DraftModel)
+		if err != nil {
+			slog.Error("draft model download failed", "profile", p.Name, "err", err)
+			return connect.NewError(connect.CodeInternal, fmt.Errorf("download draft model: %w", err))
+		}
+		draftSize = size
+		draftFlowed = flowed
+	}
+
+	total := modelSize + mmprojSize + draftSize
 	msg := "complete"
-	if !modelFlowed && !mmprojFlowed {
+	if !modelFlowed && !mmprojFlowed && !draftFlowed {
 		msg = "already cached"
 	}
-	slog.Info("pull done", "profile", p.Name, "model", m.Path, "model_size", modelSize, "mmproj", m.MMProj, "mmproj_size", mmprojSize, "flowed", modelFlowed || mmprojFlowed)
+	slog.Info("pull done", "profile", p.Name, "model", m.Path, "model_size", modelSize, "mmproj", m.MMProj, "mmproj_size", mmprojSize, "draft", m.DraftModel, "draft_size", draftSize, "flowed", modelFlowed || mmprojFlowed || draftFlowed)
 	return stream.Send(&vibev1.PullProgress{
 		Phase:           vibev1.PullProgress_PHASE_DONE,
 		DownloadedBytes: total,
