@@ -218,7 +218,7 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 	if err := runner.Run(ctx, binary, args, text); err != nil {
 		return nil, fmt.Errorf("stage %s: piper: %w", st.ID, err)
 	}
-	if err := applyAudioEffect(ctx, outAbs, st.Effect); err != nil {
+	if err := applyAudioEffect(ctx, outAbs, st.Effect, "ffmpeg"); err != nil {
 		return nil, fmt.Errorf("stage %s: %w", st.ID, err)
 	}
 	// Report ABSOLUTE path: downstream {{ .stages.X.output(s) }} references
@@ -310,7 +310,7 @@ func (a *audioExecutor) executeKokoro(ctx context.Context, in StageInput, st *St
 	if err := os.WriteFile(outAbs, wav, 0o644); err != nil {
 		return nil, fmt.Errorf("stage %s: write %s: %w", st.ID, outAbs, err)
 	}
-	if err := applyAudioEffect(ctx, outAbs, st.Effect); err != nil {
+	if err := applyAudioEffect(ctx, outAbs, st.Effect, "ffmpeg"); err != nil {
 		return nil, fmt.Errorf("stage %s: %w", st.ID, err)
 	}
 	return &StageOutput{Files: []string{outAbs}}, nil
@@ -320,12 +320,18 @@ func (a *audioExecutor) executeKokoro(ctx context.Context, in StageInput, st *St
 // WAV — used to give TTS output a non-default timbre (e.g. a robotic
 // "malfunctioning AI" narrator) without changing the TTS engine. No-op when
 // effect is empty. Preserves the source sample rate.
-func applyAudioEffect(ctx context.Context, wavPath, effect string) error {
+func applyAudioEffect(ctx context.Context, wavPath, effect, binary string) error {
 	if strings.TrimSpace(effect) == "" {
 		return nil
 	}
+	if binary == "" {
+		binary = "ffmpeg"
+	}
+	if err := ensureFFmpegOnPath("audio effect", binary); err != nil {
+		return err
+	}
 	tmp := wavPath + ".fx.wav"
-	cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-loglevel", "error",
+	cmd := exec.CommandContext(ctx, binary, "-y", "-loglevel", "error",
 		"-i", wavPath, "-af", effect, tmp)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

@@ -59,7 +59,7 @@ func runCmd() *cobra.Command {
 			if err := ensureDaemon(ctx); err != nil {
 				return err
 			}
-			if err := pullProfile(ctx, args[0]); err != nil {
+			if err := pullProfile(ctx, cmd.OutOrStdout(), args[0]); err != nil {
 				return err
 			}
 

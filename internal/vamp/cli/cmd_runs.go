@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"os"
@@ -184,10 +185,11 @@ func runsCleanupCmd() *cobra.Command {
 	var (
 		olderThanFlag string
 		dryRunFlag    bool
+		yesFlag       bool
 	)
 	cmd := &cobra.Command{
 		Use:   "cleanup",
-		Short: "Delete run dirs older than --older-than (default safety: --dry-run shows what would go).",
+		Short: "Delete run dirs older than --older-than (pass --dry-run to preview; prompts before deleting unless --yes).",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if olderThanFlag == "" {
@@ -197,11 +199,29 @@ func runsCleanupCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("--older-than %q: %w", olderThanFlag, err)
 			}
+			out := cmd.OutOrStdout()
+			if !dryRunFlag && !yesFlag {
+				preview, err := vamp.CleanupRuns(vamp.RunsDir(), d, true)
+				if err != nil {
+					return err
+				}
+				if len(preview.Removed) == 0 {
+					fmt.Fprintf(out, "no run(s) older than %s\n", olderThanFlag)
+					return nil
+				}
+				fmt.Fprintf(out, "Delete %d run dir(s) older than %s under %s? [y/N] ", len(preview.Removed), olderThanFlag, vamp.RunsDir())
+				reader := bufio.NewReader(cmd.InOrStdin())
+				resp, _ := reader.ReadString('\n')
+				resp = strings.TrimSpace(strings.ToLower(resp))
+				if resp != "y" && resp != "yes" {
+					fmt.Fprintln(out, "aborted")
+					return nil
+				}
+			}
 			res, err := vamp.CleanupRuns(vamp.RunsDir(), d, dryRunFlag)
 			if err != nil {
 				return err
 			}
-			out := cmd.OutOrStdout()
 			if dryRunFlag {
 				fmt.Fprintf(out, "DRY RUN: %d run(s) would be removed, %d kept\n", len(res.Removed), len(res.Skipped))
 			} else {
@@ -222,6 +242,7 @@ func runsCleanupCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&olderThanFlag, "older-than", "", "Age threshold (e.g. 7d, 24h, 30m). Required.")
 	cmd.Flags().BoolVar(&dryRunFlag, "dry-run", false, "Show what would be removed without deleting anything.")
+	cmd.Flags().BoolVar(&yesFlag, "yes", false, "Skip the interactive confirmation prompt.")
 	return cmd
 }
 

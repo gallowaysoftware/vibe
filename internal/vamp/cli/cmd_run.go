@@ -103,7 +103,7 @@ func runCmd() *cobra.Command {
 	cmd.Flags().StringVar(&resumeFlag, "resume", "", "Resume a previous run from <dir>. Stages whose output files already exist with non-zero size are skipped; missing stages run as usual.")
 	cmd.Flags().BoolVar(&resumeForceFlag, "resume-force", false, "With --resume, skip the safety check that errors out when the pipeline file has changed since the run was started.")
 	cmd.Flags().BoolVar(&dryRunFlag, "dry-run", false, "Render templates and validate per-stage shape without contacting vibe, an LLM, ComfyUI, ffmpeg, Piper, or YouTube. Prints a per-stage plan and a final error/warning count.")
-	cmd.Flags().BoolVar(&detachFlag, "detach", false, "Fork the run into a background `vamp` worker and return immediately with a job id. Use `vamp jobs ls`, `vamp logs <id>`, `vamp cancel <id>` to drive it.")
+	cmd.Flags().BoolVar(&detachFlag, "detach", false, "Fork the run into a background `vamp` worker and return immediately with a job id. Use `vamp runs ls`, `vamp logs <id>`, `vamp cancel <id>` to drive it.")
 	cmd.Flags().BoolVar(&noCacheFlag, "no-cache", false, "Disable the content-addressed cache for this run; overrides per-pipeline / per-stage `cache: true` defaults.")
 	cmd.Flags().BoolVar(&noEnsureSvc, "no-ensure-services", false, "Skip the pre-flight probe + auto-start of declared RequireService URLs. Default behaviour auto-runs `vibe start <name>` for any unreachable service whose setup_hint matches that shape, sparing the operator a 3-second-retry-then-fail cascade in the first webhook stage.")
 	cmd.Flags().BoolVar(&internalRunJob, internalRunJobFlag, false, "Internal: marks this process as the detached worker spawned by --detach. Sets up vamp.log + vamp.pid in the run dir. Do not invoke manually.")
@@ -231,8 +231,20 @@ func spawnDetached(cmd *cobra.Command, runDirFlag, resumeFlag, pipelineName stri
 			<-stderrDone
 			msg := strings.TrimSpace(stderrBuf.String())
 			if werr == nil && msg == "" {
-				pidReady = true // treat as success
-				break
+				// Exit 0 before the pid file appeared can mean the run
+				// finished+cleaned up inside the window — but a child that
+				// mis-parsed argv and returned nil without starting the
+				// pipeline also lands here. Require positive evidence (a
+				// vamp.log or pipeline.json in the run dir) so we don't
+				// print a phantom run id for a job that left nothing for
+				// `vamp logs` to read.
+				_, logErr := os.Stat(filepath.Join(runDir, vamp.LogFileName))
+				_, recErr := os.Stat(filepath.Join(runDir, "pipeline.json"))
+				if logErr == nil || recErr == nil {
+					pidReady = true // treat as success
+					break
+				}
+				return fmt.Errorf("worker exited 0 without starting a run (no %s or pipeline.json in %s)", vamp.LogFileName, runDir)
 			}
 			if msg == "" && werr != nil {
 				msg = werr.Error()

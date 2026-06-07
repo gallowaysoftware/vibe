@@ -1,8 +1,8 @@
 package vamp
 
 import (
+	"bytes"
 	"io/fs"
-	"testing/fstest"
 	"time"
 
 	internalvamp "github.com/gallowaysoftware/vibe/internal/vamp"
@@ -271,10 +271,10 @@ func (p *Pipeline) Requirements() Requirements {
 	return p.inner.Requirements()
 }
 
-// Build runs the same validation the YAML loader applies and returns the
-// canonicalised *internal* Pipeline value (alias to vamp.Pipeline). Callers
-// that just want to run the pipeline through cobra should use Main; Build
-// is for tests and library callers that want the raw value.
+// Build validates the pipeline (the same checks the YAML loader applies) and
+// returns the same *Pipeline, or an error. Use Main to run a built pipeline
+// through cobra; Build is for tests and library callers that want to validate
+// eagerly.
 func (p *Pipeline) Build() (*Pipeline, error) {
 	if err := p.inner.Validate(); err != nil {
 		return nil, err
@@ -431,7 +431,7 @@ func (p *Pipeline) Compact(id string) *CompactStage {
 	return c
 }
 
-func (c *CompactStage) Capability(cap string) *CompactStage     { c.s.Capability = cap; return c }
+func (c *CompactStage) Capability(name string) *CompactStage    { c.s.Capability = name; return c }
 func (c *CompactStage) Source(template string) *CompactStage    { c.s.Source = template; return c }
 func (c *CompactStage) TargetChars(n int) *CompactStage         { c.s.TargetChars = n; return c }
 func (c *CompactStage) ChunkChars(n int) *CompactStage          { c.s.ChunkChars = n; return c }
@@ -767,7 +767,7 @@ func (p *Pipeline) ComfyUI(id string) *ComfyUIStage {
 	return c
 }
 
-func (c *ComfyUIStage) Capability(cap string) *ComfyUIStage { c.s.Capability = cap; return c }
+func (c *ComfyUIStage) Capability(name string) *ComfyUIStage { c.s.Capability = name; return c }
 
 // WorkflowFile points at a ComfyUI workflow JSON file on disk (absolute or
 // relative to the binary's working directory).
@@ -895,7 +895,7 @@ func (w *WebhookStage) Body(body map[string]any) *WebhookStage { w.s.Body = body
 func (w *WebhookStage) BodyTemplate(template string) *WebhookStage {
 	const name = "__body.tmpl"
 	w.s.BodyTemplateFile = name
-	w.s.AssetFS = fstest.MapFS{name: &fstest.MapFile{Data: []byte(template)}}
+	w.s.AssetFS = singleFileFS{name: name, data: []byte(template)}
 	return w
 }
 
@@ -906,6 +906,39 @@ func (w *WebhookStage) BodyTemplateFS(fsys fs.FS, name string) *WebhookStage {
 	w.s.AssetFS = fsys
 	return w
 }
+
+// singleFileFS is a minimal one-file fs.FS used to feed an inline template
+// through the AssetFS path without dragging testing/fstest into this public
+// package's production import graph.
+type singleFileFS struct {
+	name string
+	data []byte
+}
+
+func (f singleFileFS) Open(name string) (fs.File, error) {
+	if name != f.name {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+	}
+	return &singleFileHandle{fs: f, r: bytes.NewReader(f.data)}, nil
+}
+
+type singleFileHandle struct {
+	fs singleFileFS
+	r  *bytes.Reader
+}
+
+func (h *singleFileHandle) Stat() (fs.FileInfo, error) { return singleFileInfo{h.fs}, nil }
+func (h *singleFileHandle) Read(p []byte) (int, error) { return h.r.Read(p) }
+func (h *singleFileHandle) Close() error               { return nil }
+
+type singleFileInfo struct{ fs singleFileFS }
+
+func (i singleFileInfo) Name() string       { return i.fs.name }
+func (i singleFileInfo) Size() int64        { return int64(len(i.fs.data)) }
+func (i singleFileInfo) Mode() fs.FileMode  { return 0o444 }
+func (i singleFileInfo) ModTime() time.Time { return time.Time{} }
+func (i singleFileInfo) IsDir() bool        { return false }
+func (i singleFileInfo) Sys() any           { return nil }
 
 // BodyTemplateFile points at a body template on disk.
 func (w *WebhookStage) BodyTemplateFile(path string) *WebhookStage {

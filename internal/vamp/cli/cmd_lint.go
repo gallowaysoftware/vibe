@@ -98,7 +98,7 @@ func LintPipeline(p *vamp.Pipeline, w io.Writer) error {
 	}
 	sort.Strings(findings)
 	for _, f := range findings {
-		fmt.Fprintf(w, "  ⚠ %s\n", f)
+		fmt.Fprintf(w, "  [WARN] %s\n", f)
 	}
 	fmt.Fprintf(w, "lint: %s — %d warning(s) on %d stage(s)\n", p.Name, len(findings), len(p.Stages))
 	return nil

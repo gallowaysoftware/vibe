@@ -104,6 +104,7 @@ type keyInput struct {
 	VoiceModelSize   int64             // audio only — piper engine
 	AudioEngine      string            // audio only — "" / piper / kokoro
 	AudioURL         string            // audio only — kokoro endpoint base
+	AudioEffect      string            // audio only — ffmpeg -af chain applied in place
 	FFmpegArgs       []string          // ffmpeg only — rendered argv
 	FFmpegInputs     []string          // ffmpeg only — absolute paths to inputs, sha-mixed below
 }
@@ -190,6 +191,7 @@ func stageCacheKey(in keyInput) (string, error) {
 				in.AudioURL,
 				in.Voice,
 				in.RenderedText,
+				in.AudioEffect,
 			), nil
 		}
 		binary := in.Binary
@@ -202,6 +204,7 @@ func stageCacheKey(in keyInput) (string, error) {
 			in.RenderedText,
 			binary,
 			fmt.Sprintf("%d", in.VoiceModelSize),
+			in.AudioEffect,
 		), nil
 	case StageTypeFFmpeg:
 		binary := in.Binary
@@ -432,6 +435,7 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 				RenderedText: text,
 				AudioEngine:  AudioEngineKokoro,
 				AudioURL:     url,
+				AudioEffect:  st.Effect,
 			})
 		}
 		// Resolve the voice's .onnx path the same way audioExecutor does so
@@ -459,6 +463,7 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 			Binary:         st.Binary,
 			VoiceModelSize: size,
 			AudioEngine:    AudioEnginePiper,
+			AudioEffect:    st.Effect,
 		})
 	case StageTypeFFmpeg:
 		args := make([]string, 0, len(st.FFmpegArgs))

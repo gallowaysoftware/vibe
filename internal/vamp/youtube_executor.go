@@ -131,20 +131,22 @@ func (y *youtubeExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 	if !filepath.IsAbs(videoPath) {
 		videoPath = filepath.Join(in.RunDir, videoPath)
 	}
-	videoBytes, err := os.ReadFile(videoPath)
+	videoFile, err := os.Open(videoPath)
 	if err != nil {
-		return nil, fmt.Errorf("stage %s: read video %s: %w", st.ID, videoPath, err)
+		return nil, fmt.Errorf("stage %s: open video %s: %w", st.ID, videoPath, err)
 	}
+	defer videoFile.Close()
+	videoInfo, err := videoFile.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stage %s: stat video %s: %w", st.ID, videoPath, err)
+	}
+	videoSize := videoInfo.Size()
 
-	var thumbBytes []byte
+	var thumbPath string
 	if thumbnail != "" {
-		thumbPath := thumbnail
+		thumbPath = thumbnail
 		if !filepath.IsAbs(thumbPath) {
 			thumbPath = filepath.Join(in.RunDir, thumbPath)
-		}
-		thumbBytes, err = os.ReadFile(thumbPath)
-		if err != nil {
-			return nil, fmt.Errorf("stage %s: read thumbnail %s: %w", st.ID, thumbPath, err)
 		}
 	}
 
@@ -176,7 +178,7 @@ func (y *youtubeExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 	}
 
 	if in.Log != nil {
-		fmt.Fprintf(in.Log, "youtube: initiating resumable upload (%d byte(s))\n", len(videoBytes))
+		fmt.Fprintf(in.Log, "youtube: initiating resumable upload (%d byte(s))\n", videoSize)
 	}
 	uploadURL, err := initiateResumableUpload(ctx, doer, accessToken, youtubeVideoMetadata{
 		Title:       title,
@@ -184,7 +186,7 @@ func (y *youtubeExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 		Tags:        st.Tags,
 		Privacy:     privacy,
 		CategoryID:  categoryID,
-	}, int64(len(videoBytes)))
+	}, videoSize)
 	if err != nil {
 		return nil, fmt.Errorf("stage %s: init upload: %w", st.ID, err)
 	}
@@ -192,16 +194,27 @@ func (y *youtubeExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 	if in.Log != nil {
 		fmt.Fprintf(in.Log, "youtube: uploading video bytes\n")
 	}
-	videoID, err := uploadVideoBytes(ctx, doer, uploadURL, videoBytes)
+	videoID, err := uploadVideoBytes(ctx, doer, uploadURL, videoFile, videoSize)
 	if err != nil {
 		return nil, fmt.Errorf("stage %s: upload bytes: %w", st.ID, err)
 	}
 
-	if len(thumbBytes) > 0 {
-		if in.Log != nil {
-			fmt.Fprintf(in.Log, "youtube: uploading thumbnail (%d byte(s))\n", len(thumbBytes))
+	if thumbPath != "" {
+		thumbFile, err := os.Open(thumbPath)
+		if err != nil {
+			return nil, fmt.Errorf("stage %s: open thumbnail %s: %w", st.ID, thumbPath, err)
 		}
-		if err := uploadThumbnail(ctx, doer, accessToken, videoID, thumbBytes); err != nil {
+		thumbInfo, err := thumbFile.Stat()
+		if err != nil {
+			thumbFile.Close()
+			return nil, fmt.Errorf("stage %s: stat thumbnail %s: %w", st.ID, thumbPath, err)
+		}
+		if in.Log != nil {
+			fmt.Fprintf(in.Log, "youtube: uploading thumbnail (%d byte(s))\n", thumbInfo.Size())
+		}
+		err = uploadThumbnail(ctx, doer, accessToken, videoID, thumbFile, thumbInfo.Size())
+		thumbFile.Close()
+		if err != nil {
 			return nil, fmt.Errorf("stage %s: thumbnail: %w", st.ID, err)
 		}
 	}
@@ -430,13 +443,13 @@ func initiateResumableUpload(ctx context.Context, doer httpDoer, accessToken str
 // assigned id. 308 Resume Incomplete is treated as a transient failure
 // surface — Phase 1 fails clearly rather than silently looping, so the user
 // sees the problem instead of an indefinite hang.
-func uploadVideoBytes(ctx context.Context, doer httpDoer, uploadURL string, videoBytes []byte) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, bytes.NewReader(videoBytes))
+func uploadVideoBytes(ctx context.Context, doer httpDoer, uploadURL string, src io.Reader, size int64) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, src)
 	if err != nil {
 		return "", fmt.Errorf("build upload PUT: %w", err)
 	}
 	req.Header.Set("Content-Type", "video/*")
-	req.ContentLength = int64(len(videoBytes))
+	req.ContentLength = size
 
 	resp, err := doer.Do(req)
 	if err != nil {
@@ -470,9 +483,9 @@ func uploadVideoBytes(ctx context.Context, doer httpDoer, uploadURL string, vide
 // (the docs accept image/jpeg or image/png; the executor doesn't sniff because
 // YouTube does that itself and rejects mismatches with a clear error). Failure
 // returns the response body so quota / permission errors are diagnosable.
-func uploadThumbnail(ctx context.Context, doer httpDoer, accessToken, videoID string, imageBytes []byte) error {
+func uploadThumbnail(ctx context.Context, doer httpDoer, accessToken, videoID string, body io.Reader, size int64) error {
 	endpoint := fmt.Sprintf("https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=%s", url.QueryEscape(videoID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(imageBytes))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, body)
 	if err != nil {
 		return fmt.Errorf("build thumbnail request: %w", err)
 	}
@@ -480,7 +493,7 @@ func uploadThumbnail(ctx context.Context, doer httpDoer, accessToken, videoID st
 	// Let YouTube sniff the actual format; image/* is accepted as a generic
 	// hint by the docs.
 	req.Header.Set("Content-Type", "image/*")
-	req.ContentLength = int64(len(imageBytes))
+	req.ContentLength = size
 
 	resp, err := doer.Do(req)
 	if err != nil {

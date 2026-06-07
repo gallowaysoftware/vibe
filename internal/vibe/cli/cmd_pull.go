@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -26,37 +27,37 @@ func pullCmd() *cobra.Command {
 			if err := ensureDaemon(ctx); err != nil {
 				return err
 			}
-			return pullProfile(ctx, args[0])
+			return pullProfile(ctx, cmd.OutOrStdout(), args[0])
 		},
 	}
 }
 
 // pullProfile runs Pull and renders progress. Used by both `vibe pull` and
 // `vibe start` (which calls it before Start).
-func pullProfile(ctx context.Context, profile string) error {
+func pullProfile(ctx context.Context, out io.Writer, profile string) error {
 	stream, err := newClient().Pull(ctx, profile)
 	if err != nil {
 		return err
 	}
 	defer stream.Close()
-	return renderPull(stream)
+	return renderPull(out, stream)
 }
 
-func renderPull(stream *vibeclient.PullStream) error {
+func renderPull(out io.Writer, stream *vibeclient.PullStream) error {
 	var bar *progressBar
 	for stream.Receive() {
 		m := stream.Msg()
 		switch m.Phase {
 		case vibev1.PullProgress_PHASE_RESOLVING:
-			fmt.Println("resolving huggingface metadata...")
+			fmt.Fprintln(out, "resolving huggingface metadata...")
 		case vibev1.PullProgress_PHASE_DOWNLOADING:
 			if bar == nil {
 				if m.TotalBytes > 0 {
-					fmt.Printf("downloading %s\n", humanBytes(m.TotalBytes))
+					fmt.Fprintf(out, "downloading %s\n", humanBytes(m.TotalBytes))
 				} else {
-					fmt.Println("downloading (size unknown)")
+					fmt.Fprintln(out, "downloading (size unknown)")
 				}
-				bar = newProgressBar(m.TotalBytes)
+				bar = newProgressBar(out, m.TotalBytes)
 			}
 			bar.update(m.DownloadedBytes)
 		case vibev1.PullProgress_PHASE_DONE:
@@ -68,9 +69,9 @@ func renderPull(stream *vibeclient.PullStream) error {
 			case "", "no huggingface block; nothing to pull":
 				// silent
 			case "already cached":
-				fmt.Printf("already cached (%s)\n", humanBytes(m.TotalBytes))
+				fmt.Fprintf(out, "already cached (%s)\n", humanBytes(m.TotalBytes))
 			default:
-				fmt.Println(m.Message)
+				fmt.Fprintln(out, m.Message)
 			}
 		}
 	}
@@ -84,12 +85,13 @@ func renderPull(stream *vibeclient.PullStream) error {
 }
 
 type progressBar struct {
+	out   io.Writer
 	total int64
 	start time.Time
 }
 
-func newProgressBar(total int64) *progressBar {
-	return &progressBar{total: total, start: time.Now()}
+func newProgressBar(out io.Writer, total int64) *progressBar {
+	return &progressBar{out: out, total: total, start: time.Now()}
 }
 
 func (b *progressBar) update(downloaded int64) {
@@ -102,7 +104,7 @@ func (b *progressBar) update(downloaded int64) {
 		// Unknown-size mode (HEAD returned no Content-Length). Skip the
 		// bar/percentage and just print bytes + rate so the user can see
 		// the download is making progress.
-		fmt.Printf("\r  %s (%.1f MB/s)", humanBytes(downloaded), rate)
+		fmt.Fprintf(b.out, "\r  %s (%.1f MB/s)", humanBytes(downloaded), rate)
 		return
 	}
 	pct := float64(downloaded) / float64(b.total) * 100
@@ -112,12 +114,12 @@ func (b *progressBar) update(downloaded int64) {
 		filled = w
 	}
 	bar := strings.Repeat("=", filled) + strings.Repeat(" ", w-filled)
-	fmt.Printf("\r  [%s] %s / %s (%.1f%%, %.1f MB/s)",
+	fmt.Fprintf(b.out, "\r  [%s] %s / %s (%.1f%%, %.1f MB/s)",
 		bar, humanBytes(downloaded), humanBytes(b.total), pct, rate)
 }
 
 func (b *progressBar) finish() {
-	fmt.Println()
+	fmt.Fprintln(b.out)
 }
 
 func humanBytes(n int64) string {

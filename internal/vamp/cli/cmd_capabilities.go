@@ -20,8 +20,9 @@ func capabilitiesCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			out := cmd.OutOrStdout()
 			if len(caps.Mapping) == 0 {
-				fmt.Println("no capabilities defined")
+				fmt.Fprintln(out, "no capabilities defined")
 				return nil
 			}
 			keys := make([]string, 0, len(caps.Mapping))
@@ -39,7 +40,7 @@ func capabilitiesCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				fmt.Printf("%-25s  %s\n", k, strings.Join(ps, ", "))
+				fmt.Fprintf(out, "%-25s  %s\n", k, strings.Join(ps, ", "))
 			}
 			return nil
 		},

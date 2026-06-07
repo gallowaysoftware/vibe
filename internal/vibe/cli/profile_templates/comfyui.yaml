@@ -1,6 +1,6 @@
 # Starter profile: ComfyUI backend (image/video generation).
 #
-# This file was dropped by `vibe profile init comfyui`. Edit the
+# This file was dropped by `vibe profile new __PROFILE_NAME__ --kind comfyui`. Edit the
 # REPLACE-marked lines below, then `vibe start __PROFILE_NAME__`.
 #
 # Prereqs:

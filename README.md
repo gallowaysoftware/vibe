@@ -87,7 +87,8 @@ spec. Budget: 60 respawns per 30 min before the daemon clears
 `internal/vibe/daemon/daemon.go:maxBackendRespawns` if you regularly
 hit it on stable hardware.
 
-**Frontends.** Only applicable to `backend.llama_server` profiles:
+**Frontends.** Applicable to `backend.llama_server` and `backend.tabby_api`
+profiles (ComfyUI and http_server reject a frontend block):
 
 - `external` — vibe renders a sidecar config (e.g. `opencode.json`) and
   surfaces the env vars to set when launching the tool. No process
@@ -161,7 +162,8 @@ Across runs, unchanged stages short-circuit to a cache hit; a single
 tweaked prompt reruns only that stage (plus everything downstream).
 Foreach is per-item: changing 3 items of a 50-item foreach reuses 47.
 Disable with `cache: false` on the pipeline or stage, `--no-cache`, or
-`VAMP_NO_CACHE=1`. `webhook` and `youtube` are never cached (network
+`VAMP_NO_CACHE=1`. `webhook` is uncached by default (opt in with
+`cache: true` for idempotent reads); `youtube` is never cached (network
 side effects). Inspect with `vamp cache {ls,size,prune,clean}`.
 
 **Detach.** `vamp run --detach` forks a setsid'd worker, writes
@@ -191,6 +193,7 @@ capabilities:
 | `vibe doctor` | One-shot diagnostic; `--install comfyui\|llama-cpp` runs the bring-up steps. |
 | `vibe profile new <name> --kind <kind>` | Drop a starter YAML (run with `--help` for the kind list); `--hf <repo>[:<file>]` for gated llama-server. |
 | `vibe start <profile>` | Activate backend + frontend; pulls missing weights; `--no-vram-check` to bypass. Service-mode profiles run concurrently with each other and one active profile. |
+| `vibe run <profile>` | Start a profile, exec its frontend in the foreground, stop the profile on exit; `--session <id>` resumes a pi/opencode session. |
 | `vibe stop [name]` | Stop the active profile (no arg), a specific service (`vibe stop searxng`), or everything (`vibe stop --all`). |
 | `vibe ps` | Show the active profile + every running service. |
 | `vibe list` | List profiles (alias of `vibe profile list`; no daemon needed). |
@@ -208,6 +211,8 @@ capabilities:
 | --- | --- |
 | `vamp run <pipeline.yaml>` | Execute. Flags: `--detach`, `--resume <dir>`, `--resume-force`, `--dry-run`, `--no-cache`, `--no-ensure-services`, `--input k=v`. By default each `RequireService` URL is probed pre-run and auto-started via `vibe start <name>` when the setup hint matches that shape. |
 | `vamp validate <pipeline.yaml>` | Parse + schema-check without running. |
+| `vamp render <pipeline.yaml> <stage_id>` | Render a single stage's prompt template against inputs and prior outputs (no LLM call). |
+| `vamp requirements <pipeline.yaml>` | Report the runtime resources this pipeline needs (capabilities, services, inputs, hardware hints). |
 | `vamp lint <pipeline.yaml>` | Advisory checks layered on validate: webhook URL → matching `RequireService`, `output_format: json` → `Retry.RetryOn` includes `"invalid_output"`. Findings only — exit 0. |
 | `vamp list` | List pipelines under `$XDG_CONFIG_HOME/vamp/pipelines/`. |
 | `vamp capabilities` | Print the resolved capability table. |

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -217,11 +218,20 @@ func (m *mixExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput,
 	args = append(args, outputPath)
 
 	cmd := exec.CommandContext(ctx, binary, args...)
+	// Always retain a tail of stderr so a non-zero exit surfaces ffmpeg's own
+	// filtergraph diagnostic instead of a bare "exit status 1"; multi-stage
+	// capability groups pass a nil in.Log, which would otherwise drop stderr.
+	tail := newLineRingBuffer(ffmpegStderrTailLines)
 	if in.Log != nil {
 		cmd.Stdout = in.Log
-		cmd.Stderr = in.Log
+		cmd.Stderr = io.MultiWriter(tail, in.Log)
+	} else {
+		cmd.Stderr = tail
 	}
 	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(tail.String()); msg != "" {
+			return nil, fmt.Errorf("ffmpeg mix: %w: %s", err, msg)
+		}
 		return nil, fmt.Errorf("ffmpeg mix: %w", err)
 	}
 	// Verify the m4b/mp3 actually has content. ffmpeg occasionally

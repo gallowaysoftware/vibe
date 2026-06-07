@@ -27,7 +27,7 @@ func startCmd() *cobra.Command {
 			}
 			// Idempotent: PHASE_DONE immediately if the profile has no HF block
 			// or the model is already cached at the right size.
-			if err := pullProfile(ctx, args[0]); err != nil {
+			if err := pullProfile(ctx, cmd.OutOrStdout(), args[0]); err != nil {
 				return err
 			}
 			// Tail the daemon log during the Start RPC so the user sees
@@ -41,14 +41,15 @@ func startCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Printf("started %s\n", r.Status.Profile)
-			fmt.Printf("  backend: %s\n", r.Status.BackendAddr)
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "started %s\n", r.Status.Profile)
+			fmt.Fprintf(out, "  backend: %s\n", r.Status.BackendAddr)
 			// Service-mode profiles don't go through the proxy — the
 			// daemon returns ProxyAddr empty in that case. Skip the
 			// line to avoid surfacing a misleading "proxy: " line for
 			// a sidecar that callers reach via BackendAddr directly.
 			if r.Status.ProxyAddr != "" {
-				fmt.Printf("  proxy:   %s\n", r.Status.ProxyAddr)
+				fmt.Fprintf(out, "  proxy:   %s\n", r.Status.ProxyAddr)
 			}
 			if r.Frontend != nil {
 				// external = config rendered, user launches the binary;
@@ -58,21 +59,21 @@ func startCmd() *cobra.Command {
 				// the historical `frontend.app` cosmetic field was dropped.
 				external := r.Frontend.Kind == "external"
 				if external {
-					fmt.Printf("  frontend: %s (external — launch yourself)\n", r.Status.Profile)
+					fmt.Fprintf(out, "  frontend: %s (external — launch yourself)\n", r.Status.Profile)
 				} else {
-					fmt.Printf("  frontend: %s (running)\n", r.Status.Profile)
+					fmt.Fprintf(out, "  frontend: %s (running)\n", r.Status.Profile)
 				}
 				if r.Frontend.Url != "" && !external {
-					fmt.Printf("  browser: %s\n", r.Frontend.Url)
+					fmt.Fprintf(out, "  browser: %s\n", r.Frontend.Url)
 				}
 				if r.Frontend.WroteFile != "" {
-					fmt.Printf("  wrote:    %s\n", r.Frontend.WroteFile)
+					fmt.Fprintf(out, "  wrote:    %s\n", r.Frontend.WroteFile)
 				}
 				if len(r.Frontend.EnvVars) > 0 {
 					if external {
-						fmt.Println("  to use:")
+						fmt.Fprintln(out, "  to use:")
 					} else {
-						fmt.Println("  env (already applied to the running frontend):")
+						fmt.Fprintln(out, "  env (already applied to the running frontend):")
 					}
 					keys := make([]string, 0, len(r.Frontend.EnvVars))
 					for k := range r.Frontend.EnvVars {
@@ -80,11 +81,11 @@ func startCmd() *cobra.Command {
 					}
 					sort.Strings(keys)
 					for _, k := range keys {
-						fmt.Printf("    export %s=%q\n", k, r.Frontend.EnvVars[k])
+						fmt.Fprintf(out, "    export %s=%q\n", k, r.Frontend.EnvVars[k])
 					}
 				}
 				if external && r.Frontend.RestartRequired {
-					fmt.Printf("  note: %s does not hot-reload — start (or relaunch) it with the env above\n", r.Status.Profile)
+					fmt.Fprintf(out, "  note: %s does not hot-reload — start (or relaunch) it with the env above\n", r.Status.Profile)
 				}
 			}
 			return nil

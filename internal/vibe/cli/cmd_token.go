@@ -72,7 +72,8 @@ func regenerateToken(w io.Writer, r io.Reader, yes bool) error {
 		line, _ := br.ReadString('\n')
 		line = strings.ToLower(strings.TrimSpace(line))
 		if line != "y" && line != "yes" {
-			return errors.New("aborted")
+			fmt.Fprintln(w, "aborted")
+			return nil
 		}
 	}
 	tok, err := daemon.RegenerateToken()

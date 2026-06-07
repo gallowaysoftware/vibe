@@ -12,7 +12,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -1456,17 +1455,27 @@ func (e *Executor) executeForeachStage(ctx context.Context, st *Stage, exec Stag
 		}()
 	}
 	wg.Wait()
-	if err := errors.Join(errs...); err != nil {
-		return err
-	}
 
-	// Aggregate: .output is a deterministic newline-joined concatenation of
-	// per-item outputs (in input-array order) so legacy `.stages.<id>.output`
-	// references degrade gracefully; .outputs is the per-item slice.
-	combined := strings.Join(outputs, "\n\n")
+	// Aggregate partial output from the successful items even when some
+	// failed: downstream stages referencing .stages.<id>.output must see the
+	// successes (AGENTS.md: "the stage aggregates partial output from
+	// successes"). .output is a deterministic newline-joined concatenation of
+	// the successful per-item outputs (in input-array order); .outputs is the
+	// full per-item slice (failed slots stay empty). Record before the joined
+	// error so the result survives a partial failure.
+	succeeded := make([]string, 0, len(outputs))
+	for i, o := range outputs {
+		if errs[i] == nil {
+			succeeded = append(succeeded, o)
+		}
+	}
+	combined := strings.Join(succeeded, "\n\n")
 	e.mu.Lock()
 	e.stageOutputs[st.ID] = &stageResult{Output: combined, Outputs: outputs}
 	e.mu.Unlock()
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
 	e.runStageCleanup(st)
 	return nil
 }
@@ -2303,7 +2312,19 @@ func renderPrompt(st *Stage, pipelineDir string, cliInputs map[string]string, pr
 // current state. The returned path is always relative to RunDir.
 func (e *Executor) renderOutputPath(st *Stage, extra map[string]any) (string, error) {
 	prior := e.snapshotPrior(st.Inputs)
-	return renderTemplate(st.ID+":output", st.Output, st.Inputs, e.Inputs, prior, e.RunDir, extra)
+	out, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, e.Inputs, prior, e.RunDir, extra)
+	if err != nil {
+		return "", err
+	}
+	// The rendered path is joined against e.RunDir and written to disk; a
+	// foreach item field sourced from upstream LLM JSON could otherwise escape
+	// the run dir (e.g. output: "{{.item.slug}}.wav" with slug "../../etc").
+	// Mirror validateCleanupPatterns' guard.
+	cleaned := filepath.Clean(out)
+	if filepath.IsAbs(cleaned) || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("output path %q escapes the run dir", out)
+	}
+	return out, nil
 }
 
 // renderTemplate is the common rendering routine for prompt / output
@@ -2383,49 +2404,57 @@ func renderTemplate(name, raw string, deps []string, cliInputs map[string]string
 //     the request. Non-string values are stringified via fmt.Sprint
 //     first to match slugify's tolerance for foreach items that
 //     surface as map / number shapes.
-func templateFuncs() template.FuncMap {
-	return template.FuncMap{
-		"slugify":                    slugify,
-		"contains":                   func(haystack, needle string) bool { return strings.Contains(haystack, needle) },
-		"hasPrefix":                  func(s, prefix string) bool { return strings.HasPrefix(s, prefix) },
-		"hasSuffix":                  func(s, suffix string) bool { return strings.HasSuffix(s, suffix) },
-		"lower":                      strings.ToLower,
-		"upper":                      strings.ToUpper,
-		"trim":                       strings.TrimSpace,
-		"joinPath":                   func(parts ...string) string { return filepath.Join(parts...) },
-		"readFile":                   readFileTemplate,
-		"stripToHeading":             stripToHeadingTemplate,
-		"readFiles":                  readFilesTemplate,
-		"readFilesOrEmpty":           readFilesOrEmptyTemplate,
-		"readLessons":                readLessonsTemplate,
-		"enumerateLessons":           enumerateLessonsTemplate,
-		"mergeJSON":                  mergeJSONTemplate,
-		"parseJSON":                  parseJSONTemplate,
-		"toJSON":                     toJSONTemplate,
-		"urlencode":                  urlencodeTemplate,
-		"stripDataURIs":              stripDataURIsTemplate,
-		"truncate":                   truncateTemplate,
-		"flattenItems":               flattenItemsTemplate,
-		"uniqueByKey":                uniqueByKeyTemplate,
-		"filterByField":              filterByFieldTemplate,
-		"filterByValue":              filterByValueTemplate,
-		"joinByField":                joinByFieldTemplate,
-		"parseSearXNG":               parseSearXNGTemplate,
-		"parseWikipediaExtract":      parseWikipediaExtractTemplate,
-		"parseWikipediaSearch":       parseWikipediaSearchTemplate,
-		"parseArxiv":                 parseArxivTemplate,
-		"enumerateImagePairs":        enumerateImagePairsTemplate,
-		"enumerateUniqueImages":      enumerateUniqueImagesTemplate,
-		"imageDescriptionsForLesson": imageDescriptionsForLessonTemplate,
-		"extractSVGText":             extractSVGTextTemplate,
-		"chunkParagraphs":            chunkParagraphsTemplate,
-		"ttsNormalize":               ttsNormalizeTemplate,
-		"wordCount":                  wordCountTemplate,
-		"mulInt":                     mulIntTemplate,
-		"addInt":                     addIntTemplate,
-		"splitSentences":             splitSentencesTemplate,
-	}
+//
+// templateFuncMap is built once: every entry is a stateless closure or a
+// package-level function, so the same map is safe to share across all
+// renderTemplate calls (text/template only reads it). Rebuilding it per render
+// was pure churn — renderTemplate is called dozens of times per stage, scaling
+// with foreach item count.
+var templateFuncMap = template.FuncMap{
+	"slugify":                    slugify,
+	"contains":                   func(haystack, needle string) bool { return strings.Contains(haystack, needle) },
+	"hasPrefix":                  func(s, prefix string) bool { return strings.HasPrefix(s, prefix) },
+	"hasSuffix":                  func(s, suffix string) bool { return strings.HasSuffix(s, suffix) },
+	"lower":                      strings.ToLower,
+	"upper":                      strings.ToUpper,
+	"trim":                       strings.TrimSpace,
+	"joinPath":                   func(parts ...string) string { return filepath.Join(parts...) },
+	"readFile":                   readFileTemplate,
+	"stripToHeading":             stripToHeadingTemplate,
+	"readFiles":                  readFilesTemplate,
+	"readFilesOrEmpty":           readFilesOrEmptyTemplate,
+	"readLessons":                readLessonsTemplate,
+	"enumerateLessons":           enumerateLessonsTemplate,
+	"mergeJSON":                  mergeJSONTemplate,
+	"parseJSON":                  parseJSONTemplate,
+	"toJSON":                     toJSONTemplate,
+	"urlencode":                  urlencodeTemplate,
+	"stripDataURIs":              stripDataURIsTemplate,
+	"truncate":                   truncateTemplate,
+	"flattenItems":               flattenItemsTemplate,
+	"uniqueByKey":                uniqueByKeyTemplate,
+	"filterByField":              filterByFieldTemplate,
+	"filterByValue":              filterByValueTemplate,
+	"joinByField":                joinByFieldTemplate,
+	"parseSearXNG":               parseSearXNGTemplate,
+	"parseWikipediaExtract":      parseWikipediaExtractTemplate,
+	"parseWikipediaSearch":       parseWikipediaSearchTemplate,
+	"parseArxiv":                 parseArxivTemplate,
+	"enumerateImagePairs":        enumerateImagePairsTemplate,
+	"enumerateUniqueImages":      enumerateUniqueImagesTemplate,
+	"imageDescriptionsForLesson": imageDescriptionsForLessonTemplate,
+	"extractSVGText":             extractSVGTextTemplate,
+	"chunkParagraphs":            chunkParagraphsTemplate,
+	"ttsNormalize":               ttsNormalizeTemplate,
+	"wordCount":                  wordCountTemplate,
+	"mulInt":                     mulIntTemplate,
+	"addInt":                     addIntTemplate,
+	"splitSentences":             splitSentencesTemplate,
 }
+
+// templateFuncs returns the shared, build-once FuncMap. The map is read-only
+// once initialized, so all callers share the single instance.
+func templateFuncs() template.FuncMap { return templateFuncMap }
 
 // addIntTemplate adds two integers. Use in prompts / pipelines that
 // need to accumulate a counter across nested template ranges (Go
@@ -3019,7 +3048,6 @@ func parseWikipediaSearchTemplate(raw string) (string, error) {
 		return `{"items":[]}`, nil
 	}
 	out := []map[string]any{}
-	tagRe := regexp.MustCompile(`<[^>]*>`)
 	for _, raw := range hits {
 		hit, ok := raw.(map[string]any)
 		if !ok {
@@ -3030,7 +3058,7 @@ func parseWikipediaSearchTemplate(raw string) (string, error) {
 			continue
 		}
 		snippet, _ := hit["snippet"].(string)
-		snippet = strings.TrimSpace(tagRe.ReplaceAllString(snippet, ""))
+		snippet = strings.TrimSpace(wikiSearchTagRE.ReplaceAllString(snippet, ""))
 		url := "https://en.wikipedia.org/wiki/" + strings.ReplaceAll(title, " ", "_")
 		h := sha256.Sum256([]byte(url))
 		id := hex.EncodeToString(h[:6])
@@ -3287,6 +3315,8 @@ func stripDataURIsTemplate(s string) string {
 }
 
 var mdDataURIRE = regexp.MustCompile(`!\[([^\]]*)\]\(data:[^)]*\)`)
+
+var wikiSearchTagRE = regexp.MustCompile(`<[^>]*>`)
 
 // urlencodeTemplate percent-encodes v for safe use in a URL query
 // component. Accepts any value (stringified via fmt.Sprint) so foreach
@@ -4083,7 +4113,11 @@ func (e *Executor) modelIDForCurrent(ctx context.Context, status *vibev1.Status)
 		return id, nil
 	}
 	e.mu.Unlock()
-	id, err := ResolveModelID(ctx, http.DefaultClient, strings.TrimSuffix(status.ProxyAddr, "/v1"))
+	// nil → ResolveModelID uses defaultInferenceClient(), whose
+	// ResponseHeaderTimeout caps the wait so a backend that accepts the
+	// connection but never replies to /v1/models can't hang resolution until
+	// the long-lived group ctx breaks it.
+	id, err := ResolveModelID(ctx, nil, strings.TrimSuffix(status.ProxyAddr, "/v1"))
 	if err != nil {
 		return "", err
 	}

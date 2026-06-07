@@ -202,6 +202,7 @@ func doctorCmd() *cobra.Command {
 			"--method source: git fetch + reset --hard origin/master + "+
 			"incremental cmake build (already idempotent, but the flag "+
 			"makes intent explicit).")
+	cmd.MarkFlagsMutuallyExclusive("install", "pipeline")
 	return cmd
 }
 

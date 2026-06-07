@@ -1,6 +1,6 @@
 # Starter profile: llama-server backend + external frontend (opencode).
 #
-# This file was dropped by `vibe profile init llama-server`. Edit the
+# This file was dropped by `vibe profile new __PROFILE_NAME__ --kind llama-server`. Edit the
 # REPLACE-marked lines below, then `vibe start __PROFILE_NAME__`.
 #
 # vibe writes a sidecar opencode config to a vibe-managed path instead of

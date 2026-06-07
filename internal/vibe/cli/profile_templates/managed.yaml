@@ -1,6 +1,6 @@
 # Starter profile: llama-server backend + managed (native-binary) frontend.
 #
-# This file was dropped by `vibe profile init managed`. Edit the
+# This file was dropped by `vibe profile new __PROFILE_NAME__ --kind managed`. Edit the
 # REPLACE-marked lines below, then `vibe start __PROFILE_NAME__`.
 #
 # Note: `frontend.kind: managed` is not yet wired up in vibe — it is a

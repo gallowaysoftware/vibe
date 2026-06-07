@@ -6,6 +6,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -63,7 +64,15 @@ func (p *Proxy) Start() error {
 	}
 	p.srv = &http.Server{Handler: p}
 	p.started = true
-	go func() { _ = p.srv.Serve(ln) }()
+	go func() {
+		// A post-bind Serve failure (accept-loop error other than the
+		// expected close) is otherwise invisible: the daemon's errCh only
+		// covers the control-plane servers, so frontend requests would fail
+		// at the socket with no daemon-side explanation.
+		if err := p.srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("proxy serve failed", "addr", p.addr, "err", err)
+		}
+	}()
 	return nil
 }
 

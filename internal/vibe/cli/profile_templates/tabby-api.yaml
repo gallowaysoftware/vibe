@@ -1,6 +1,6 @@
 # Starter profile: tabbyAPI serving an EXL3 (ExLlamaV3) model.
 #
-# This file was dropped by `vibe profile init tabby-api`. Edit the
+# This file was dropped by `vibe profile new __PROFILE_NAME__ --kind tabby-api`. Edit the
 # REPLACE-marked lines below, set up the host prerequisites (see the
 # block below), then `vibe start __PROFILE_NAME__`.
 #

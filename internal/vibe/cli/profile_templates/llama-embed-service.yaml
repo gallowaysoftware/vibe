@@ -1,6 +1,6 @@
 # Starter profile: llama-server in --embeddings mode, run as a service.
 #
-# This file was dropped by `vibe profile init llama-embed-service`. Edit
+# This file was dropped by `vibe profile new __PROFILE_NAME__ --kind llama-embed-service`. Edit
 # the REPLACE-marked lines below, then `vibe start __PROFILE_NAME__`.
 #
 # Why llama-server in service mode instead of TEI:

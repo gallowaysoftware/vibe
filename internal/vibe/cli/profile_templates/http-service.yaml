@@ -1,6 +1,6 @@
 # Starter profile: http_server backend running in service mode.
 #
-# This file was dropped by `vibe profile init http-service`. Edit the
+# This file was dropped by `vibe profile new __PROFILE_NAME__ --kind http-service`. Edit the
 # REPLACE-marked lines below, then `vibe start __PROFILE_NAME__`.
 #
 # Service-mode profiles run alongside other services AND alongside one

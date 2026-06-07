@@ -522,11 +522,18 @@ func (d *Daemon) watchBackendForRespawn(name string, spec supervisor.LaunchSpec,
 		}
 		<-stopped
 
+		// Serialize the respawn decision+launch against operator Start/Stop:
+		// a Stop that lands between the stillActive check and Start would
+		// otherwise resurrect a backend the operator stopped. Lock (not
+		// TryLock) so an in-flight Stop completes first; we then observe the
+		// cleared d.active and return.
+		d.startMu.Lock()
 		d.mu.Lock()
 		stillActive := d.active != nil && d.active.Name == name
 		d.mu.Unlock()
 		if !stillActive {
 			// Operator-initiated Stop or profile switch: nothing to do.
+			d.startMu.Unlock()
 			return
 		}
 		if time.Since(windowStart) > respawnWindow {
@@ -540,6 +547,7 @@ func (d *Daemon) watchBackendForRespawn(name string, spec supervisor.LaunchSpec,
 			d.active = nil
 			d.mu.Unlock()
 			d.prx.SetBackend(nil)
+			d.startMu.Unlock()
 			return
 		}
 		respawns++
@@ -549,6 +557,7 @@ func (d *Daemon) watchBackendForRespawn(name string, spec supervisor.LaunchSpec,
 		err := d.sup.Start(ctx, spec, port)
 		cancel()
 		if err != nil {
+			d.startMu.Unlock()
 			slog.Error("backend respawn failed", "profile", name, "attempt", respawns, "err", err)
 			// A failed Start leaves supervisor in StateExited with its
 			// `stopped` channel already closed; the next loop iteration
@@ -568,6 +577,7 @@ func (d *Daemon) watchBackendForRespawn(name string, spec supervisor.LaunchSpec,
 		if perr == nil && backendURL != nil {
 			d.prx.SetBackend(backendURL)
 		}
+		d.startMu.Unlock()
 		slog.Info("backend respawned", "profile", name, "addr", d.sup.Status().Addr)
 	}
 }
@@ -1178,10 +1188,16 @@ func (d *Daemon) watchServiceForRespawn(name string, sup *supervisor.Supervisor,
 		}
 		<-stopped
 
+		// Serialize against operator Start/Stop the same way the backend
+		// watcher does: a stopService that lands after the registration
+		// check but before Start would otherwise resurrect a deregistered
+		// service. Lock (not TryLock) so an in-flight stop completes first.
+		d.startMu.Lock()
 		d.mu.Lock()
 		_, stillRegistered := d.services[name]
 		d.mu.Unlock()
 		if !stillRegistered {
+			d.startMu.Unlock()
 			return // operator-initiated stop
 		}
 		if time.Since(windowStart) > respawnWindow {
@@ -1194,20 +1210,25 @@ func (d *Daemon) watchServiceForRespawn(name string, sup *supervisor.Supervisor,
 			d.mu.Lock()
 			delete(d.services, name)
 			d.mu.Unlock()
+			d.startMu.Unlock()
 			return
 		}
 		respawns++
 		slog.Warn("service exited unexpectedly; auto-respawning",
 			"profile", name, "attempt", respawns)
 		startCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		if err := sup.Start(startCtx, spec, port); err != nil {
-			slog.Error("service respawn failed", "profile", name, "err", err)
-			d.mu.Lock()
-			delete(d.services, name)
-			d.mu.Unlock()
-			cancel()
-			return
-		}
+		err := sup.Start(startCtx, spec, port)
 		cancel()
+		d.startMu.Unlock()
+		if err != nil {
+			slog.Error("service respawn failed", "profile", name, "attempt", respawns, "err", err)
+			// Mirror the backend watcher: a transient relaunch failure
+			// (port in TIME_WAIT, GPU momentarily busy) shouldn't
+			// permanently deregister the service. Sleep a beat and retry
+			// within the respawn budget; only the budget exhaustion path
+			// above deregisters.
+			time.Sleep(2 * time.Second)
+			continue
+		}
 	}
 }

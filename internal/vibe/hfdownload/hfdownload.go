@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -58,7 +59,7 @@ func headSize(ctx context.Context, hc *http.Client, spec Spec, ep Endpoint) (int
 	if err != nil {
 		return 0, err
 	}
-	addAuth(req)
+	addAuth(req, ep)
 	resp, err := hc.Do(req)
 	if err != nil {
 		return 0, err
@@ -142,7 +143,7 @@ func download(ctx context.Context, hc *http.Client, spec Spec, destPath string, 
 	if err != nil {
 		return err
 	}
-	addAuth(req)
+	addAuth(req, ep)
 	if resumeFrom > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeFrom))
 	}
@@ -196,10 +197,20 @@ func (s Spec) path() string {
 	return fmt.Sprintf("/%s/resolve/%s/%s", s.Repo, rev, s.File)
 }
 
-func addAuth(req *http.Request) {
-	if tok := os.Getenv("HF_TOKEN"); tok != "" {
-		req.Header.Set("Authorization", "Bearer "+tok)
+// addAuth attaches the gated-model bearer token only when the request host
+// matches the configured (trusted) endpoint host. Gating on host means a
+// future endpoint override or an HF open-redirect can't forward the token
+// cross-host.
+func addAuth(req *http.Request, ep Endpoint) {
+	tok := os.Getenv("HF_TOKEN")
+	if tok == "" {
+		return
 	}
+	trusted, err := url.Parse(ep.String())
+	if err != nil || req.URL.Host != trusted.Host {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
 }
 
 func report(f ProgressFunc, downloaded, total int64) {

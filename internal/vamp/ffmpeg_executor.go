@@ -230,7 +230,11 @@ func (f *ffmpegExecutor) executeConcatWavs(ctx context.Context, in StageInput, s
 	listPath := filepath.Join(in.RunDir, listName)
 	listContent := strings.Builder{}
 	for _, w := range wavs {
-		fmt.Fprintf(&listContent, "file '%s'\n", w)
+		entry, err := concatListEntry(w)
+		if err != nil {
+			return nil, fmt.Errorf("stage %s: %w", st.ID, err)
+		}
+		fmt.Fprintf(&listContent, "file '%s'\n", entry)
 	}
 	if err := os.WriteFile(listPath, []byte(listContent.String()), 0o644); err != nil {
 		return nil, fmt.Errorf("stage %s: write concat list: %w", st.ID, err)
@@ -649,7 +653,11 @@ func (f *ffmpegExecutor) executeM4B(ctx context.Context, in StageInput, st *Stag
 	listPath := filepath.Join(in.RunDir, fmt.Sprintf(".ffmpeg-m4b-concat.%s.txt", st.ID))
 	var listBuf strings.Builder
 	for _, ch := range chapters {
-		fmt.Fprintf(&listBuf, "file '%s'\n", ch.File)
+		entry, err := concatListEntry(ch.File)
+		if err != nil {
+			return nil, fmt.Errorf("stage %s: %w", st.ID, err)
+		}
+		fmt.Fprintf(&listBuf, "file '%s'\n", entry)
 	}
 	if err := os.WriteFile(listPath, []byte(listBuf.String()), 0o644); err != nil {
 		return nil, fmt.Errorf("stage %s: write concat list: %w", st.ID, err)
@@ -766,6 +774,18 @@ func probeDurationMs(ctx context.Context, path string) (int64, error) {
 // (`=`, `;`, `#`, `\`, newlines) per ffmpeg's metadata-file format. Chapter
 // titles routinely include `:` which is fine; the listed characters are
 // the ones that break the parser.
+// concatListEntry escapes path for a single-quoted ffmpeg concat-demuxer
+// `file '...'` line. The concat list is run with -safe 0, so an unescaped
+// single quote in an upstream-derived path could terminate the quoted token
+// and inject an extra directive. A literal `'` becomes `'\”`. Newlines have
+// no valid escape in the concat format, so they are rejected outright.
+func concatListEntry(path string) (string, error) {
+	if strings.ContainsAny(path, "\n\r") {
+		return "", fmt.Errorf("concat path %q contains a newline", path)
+	}
+	return strings.ReplaceAll(path, "'", `'\''`), nil
+}
+
 func m4bEscapeMeta(s string) string {
 	repl := strings.NewReplacer(
 		`\`, `\\`,

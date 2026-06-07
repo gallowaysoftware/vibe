@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -20,12 +19,16 @@ func shutdownCmd() *cobra.Command {
 				ctx = context.Background()
 			}
 			if err := pingDaemon(200 * time.Millisecond); err != nil {
-				return errors.New("daemon is not running")
+				// Already-down is the desired end state for a teardown
+				// command; report it and exit 0 so `vibe shutdown` is
+				// idempotent (no `|| true` needed in scripts).
+				fmt.Fprintln(cmd.OutOrStdout(), "daemon not running")
+				return nil
 			}
 			if err := newClient().Shutdown(ctx); err != nil {
 				return err
 			}
-			fmt.Println("daemon shutting down")
+			fmt.Fprintln(cmd.OutOrStdout(), "daemon shutting down")
 			return nil
 		},
 	}

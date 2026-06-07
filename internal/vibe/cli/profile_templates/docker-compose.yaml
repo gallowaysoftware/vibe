@@ -1,6 +1,6 @@
 # Starter profile: llama-server backend + docker-compose frontend.
 #
-# This file was dropped by `vibe profile init docker-compose`. Edit the
+# This file was dropped by `vibe profile new __PROFILE_NAME__ --kind docker-compose`. Edit the
 # REPLACE-marked lines below, then `vibe start __PROFILE_NAME__`.
 #
 # On start, vibe runs:

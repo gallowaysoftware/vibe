@@ -18,10 +18,11 @@ func listCmd() *cobra.Command {
 		Short: "List pipelines under $XDG_CONFIG_HOME/vamp/pipelines/.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			out := cmd.OutOrStdout()
 			dir := vamp.PipelinesDir()
 			entries, err := os.ReadDir(dir)
 			if errors.Is(err, os.ErrNotExist) {
-				fmt.Printf("no pipelines dir (drop YAML files in %s)\n", dir)
+				fmt.Fprintf(out, "no pipelines dir (drop YAML files in %s)\n", dir)
 				return nil
 			}
 			if err != nil {
@@ -36,17 +37,17 @@ func listCmd() *cobra.Command {
 				path := filepath.Join(dir, e.Name())
 				p, err := vamp.LoadPipeline(path)
 				if err != nil {
-					fmt.Printf("%-30s  INVALID: %v\n", e.Name(), err)
+					fmt.Fprintf(out, "%-30s  INVALID: %v\n", e.Name(), err)
 					continue
 				}
 				desc := p.Description
 				if desc == "" {
 					desc = "(no description)"
 				}
-				fmt.Printf("%-20s  %s\n", p.Name, desc)
+				fmt.Fprintf(out, "%-20s  %s\n", p.Name, desc)
 			}
 			if !any {
-				fmt.Printf("no pipelines in %s\n", dir)
+				fmt.Fprintf(out, "no pipelines in %s\n", dir)
 			}
 			return nil
 		},

@@ -32,7 +32,7 @@ func BuildRoot(name string, factory PipelineFactory) *cobra.Command {
 		Long:          "vamp pipeline binary. Built from Go code using github.com/gallowaysoftware/vibe/vamp; mounts the same subcommands as the standalone vamp binary, but with the pipeline already in memory.",
 		Version:       buildinfo.String(),
 		SilenceUsage:  true,
-		SilenceErrors: false,
+		SilenceErrors: true,
 	}
 	root.SetVersionTemplate("{{.Version}}\n")
 	root.AddCommand(

@@ -21,7 +21,7 @@ func rootCmd() *cobra.Command {
 		Long:          "vamp runs a YAML pipeline against vibe, swapping profiles per stage based on a capability → profile mapping.",
 		Version:       buildinfo.String(),
 		SilenceUsage:  true,
-		SilenceErrors: false,
+		SilenceErrors: true,
 	}
 	root.SetVersionTemplate("{{.Version}}\n")
 	root.AddCommand(

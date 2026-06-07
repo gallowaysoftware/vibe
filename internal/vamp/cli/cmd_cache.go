@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -185,9 +183,9 @@ func cachePruneCmd() *cobra.Command {
 			if olderThan == "" {
 				return fmt.Errorf("--older-than is required (e.g. --older-than 30d)")
 			}
-			dur, err := parseAge(olderThan)
+			dur, err := parseDurationSpec(olderThan)
 			if err != nil {
-				return err
+				return fmt.Errorf("--older-than %q: %w", olderThan, err)
 			}
 			store, err := cache.New(cache.DefaultRoot())
 			if err != nil {
@@ -201,7 +199,7 @@ func cachePruneCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&olderThan, "older-than", "", "Duration threshold; entries older than this are deleted (e.g. 30d, 12h, 90m).")
+	cmd.Flags().StringVar(&olderThan, "older-than", "", "Duration threshold; entries older than this are deleted (e.g. 30d, 2w, 12h, 90m).")
 	return cmd
 }
 
@@ -255,34 +253,4 @@ func shortHash(h string) string {
 		return h[:12]
 	}
 	return h
-}
-
-// ageRE matches durations like "30d", "12h", "90m", "45s". Days are not
-// handled by time.ParseDuration so we parse them by hand; hours/minutes/
-// seconds delegate to the stdlib parser.
-var ageRE = regexp.MustCompile(`^(\d+)([dhms])$`)
-
-// parseAge parses age strings users would naturally type. We accept the
-// stdlib forms (e.g. "30m", "12h") AND a "d" suffix (days) that
-// time.ParseDuration rejects. Numbers are unsigned because the only sensible
-// interpretation is "delete entries older than N units".
-func parseAge(s string) (time.Duration, error) {
-	if m := ageRE.FindStringSubmatch(s); m != nil {
-		n, _ := strconv.Atoi(m[1])
-		switch m[2] {
-		case "d":
-			return time.Duration(n) * 24 * time.Hour, nil
-		case "h":
-			return time.Duration(n) * time.Hour, nil
-		case "m":
-			return time.Duration(n) * time.Minute, nil
-		case "s":
-			return time.Duration(n) * time.Second, nil
-		}
-	}
-	d, err := time.ParseDuration(s)
-	if err != nil {
-		return 0, fmt.Errorf("--older-than %q: must be a duration like 30d, 12h, 90m, 45s", s)
-	}
-	return d, nil
 }

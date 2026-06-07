@@ -23,7 +23,7 @@ func rootCmd() *cobra.Command {
 		Long:          "vibe brings up a llama-server + frontend stack from a single YAML profile.",
 		Version:       buildinfo.String(),
 		SilenceUsage:  true,
-		SilenceErrors: false,
+		SilenceErrors: true,
 	}
 	// Print just the version string (no "vibe version " prefix) so the
 	// install script can parse `vibe --version` cheaply.

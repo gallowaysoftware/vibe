@@ -145,7 +145,12 @@ func (s *Supervisor) Start(ctx context.Context, spec LaunchSpec, port int) error
 		return err
 	}
 	s.mu.Lock()
-	s.state = StateReady
+	// Only promote to Ready if the process is still starting: waitExit may
+	// have already moved a child that crashed in this window to StateExited,
+	// and overwriting that would report a dead process as Ready.
+	if s.state == StateStarting {
+		s.state = StateReady
+	}
 	s.mu.Unlock()
 	slog.Info("backend ready",
 		"addr", s.addr, "elapsed", time.Since(s.started).Round(time.Millisecond))

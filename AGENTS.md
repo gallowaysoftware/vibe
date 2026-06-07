@@ -10,8 +10,9 @@ that fit.
 Two binaries from one Go module (`github.com/gallowaysoftware/vibe`):
 
 - **`vibe`** (`cmd/vibe`, `internal/vibe/`): task launcher. One YAML
-  profile activates a backend (`llama_server` | `comfyui` | `http_server`)
-  and an optional frontend (`external` | `docker-compose` | `managed`).
+  profile activates a backend (`llama_server` | `comfyui` | `http_server` |
+  `tabby_api`) and an optional frontend (`external` | `docker-compose` |
+  `managed`).
   The daemon owns a Connect/protobuf control plane on a unix socket
   plus optional `127.0.0.1:9001` (bearer-token-authed). The supervisor
   auto-respawns a backend that exits unexpectedly mid-life (up to 60
@@ -67,10 +68,10 @@ them before pushing.
 ## vibe profile schema rules
 
 - Backend is a **discriminated union by sub-block presence** — exactly
-  one of `backend.llama_server`, `backend.comfyui`, or
-  `backend.http_server` must be set. We deliberately do NOT use a
-  `kind:` field; the sub-block IS the discriminator. If you add a
-  fourth backend, follow the same pattern.
+  one of `backend.llama_server`, `backend.comfyui`,
+  `backend.http_server`, or `backend.tabby_api` must be set. We
+  deliberately do NOT use a `kind:` field; the sub-block IS the
+  discriminator. If you add a fifth backend, follow the same pattern.
 - **`http_server` backend.** Wraps any HTTP-serving inference engine
   (TTS daemons, embedding servers, third-party inference). Two
   modes, mutually exclusive: docker (`image:` + optional `volumes`,
@@ -86,7 +87,9 @@ them before pushing.
   fields; the sub-block-presence trick doesn't fit.
 - Path fields (`backend.*.path`, `backend.*.dir`,
   `backend.comfyui.python`, `backend.llama_server.binary`,
-  `backend.llama_server.mmproj`, `frontend.workdir`,
+  `backend.llama_server.mmproj`, `backend.tabby_api.model_dir`,
+  `backend.tabby_api.venv`, `backend.tabby_api.repo`,
+  `backend.tabby_api.draft_model_dir`, `frontend.workdir`,
   `frontend.binary`, `frontend.write_file`, `frontend.compose_file`)
   are tilde-expanded in `internal/vibe/profile/profile.go:Load`. Add
   new path fields to that list.
@@ -116,8 +119,9 @@ them before pushing.
   `internal/vamp/cache_key.go`) is the single source of truth for "can
   this stage type be cached?". Today it returns true for `text`,
   `comfyui`, `audio`, `ffmpeg`, `render`, `compact`, `pandoc`, `mix`,
-  `short` and false for everything else (`webhook`, `youtube`,
-  `confirm`). Side-
+  `short` and false for everything else (`youtube`, `confirm`).
+  `webhook` is non-cacheable by default but opt-in cacheable via
+  `cache: true` (for idempotent reads). Side-
   effect stages must not be cached — replaying a "success" would skip
   the side effect that gave the pipeline its reason for existing.
 - **`.stages.X.output` semantics depend on stage type.** For text /

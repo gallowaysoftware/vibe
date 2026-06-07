@@ -30,27 +30,28 @@ func psCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			out := cmd.OutOrStdout()
 
 			// Active profile section.
 			if active == nil || !active.Running {
-				fmt.Println("no active profile")
+				fmt.Fprintln(out, "no active profile")
 			} else {
 				ready := "starting"
 				if active.Ready {
 					ready = "ready"
 				}
-				fmt.Printf("active:   %s (%s)\n", active.Profile, ready)
+				fmt.Fprintf(out, "active:   %s (%s)\n", active.Profile, ready)
 				if active.StartedAt != nil {
-					fmt.Printf("  uptime: %s\n", time.Since(active.StartedAt.AsTime()).Round(time.Second))
+					fmt.Fprintf(out, "  uptime: %s\n", time.Since(active.StartedAt.AsTime()).Round(time.Second))
 				}
 				if active.BackendAddr != "" {
-					fmt.Printf("  backend: %s\n", active.BackendAddr)
+					fmt.Fprintf(out, "  backend: %s\n", active.BackendAddr)
 				}
 				if active.ProxyAddr != "" {
-					fmt.Printf("  proxy:   %s\n", active.ProxyAddr)
+					fmt.Fprintf(out, "  proxy:   %s\n", active.ProxyAddr)
 				}
 				if active.Pid != 0 {
-					fmt.Printf("  pid:     %d\n", active.Pid)
+					fmt.Fprintf(out, "  pid:     %d\n", active.Pid)
 				}
 			}
 
@@ -59,8 +60,8 @@ func psCmd() *cobra.Command {
 			// addr is the published port the caller actually hits
 			// (services bypass the proxy).
 			if len(services) > 0 {
-				fmt.Println()
-				fmt.Printf("services: %d running\n", len(services))
+				fmt.Fprintln(out)
+				fmt.Fprintf(out, "services: %d running\n", len(services))
 				for _, s := range services {
 					ready := "starting"
 					if s.Ready {
@@ -70,7 +71,7 @@ func psCmd() *cobra.Command {
 					if s.StartedAt != nil {
 						uptime = " " + time.Since(s.StartedAt.AsTime()).Round(time.Second).String()
 					}
-					fmt.Printf("  - %-24s %s%s  %s (pid %d)\n",
+					fmt.Fprintf(out, "  - %-24s %s%s  %s (pid %d)\n",
 						s.Profile, ready, uptime, s.BackendAddr, s.Pid)
 				}
 			}

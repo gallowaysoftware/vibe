@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -143,53 +144,12 @@ func applyTTSRules(text string, rules []ttsRule) string {
 		r := &rules[i]
 		switch {
 		case r.Pattern != "":
-			// Literal replace — Go's strings.ReplaceAll is the
-			// natural fit but cheaper to inline via Replacer for
-			// the multi-rule case. Single-rule case here.
-			text = literalReplaceAll(text, r.Pattern, r.Replacement)
+			text = strings.ReplaceAll(text, r.Pattern, r.Replacement)
 		case r.compiled != nil:
 			text = r.compiled.ReplaceAllString(text, r.Replacement)
 		}
 	}
 	return text
-}
-
-// literalReplaceAll is strings.ReplaceAll but written here so the
-// import surface stays tight (only stdlib + yaml).
-func literalReplaceAll(s, from, to string) string {
-	if from == "" {
-		return s
-	}
-	var b []byte
-	start := 0
-	for {
-		i := indexAt(s, from, start)
-		if i < 0 {
-			break
-		}
-		b = append(b, s[start:i]...)
-		b = append(b, to...)
-		start = i + len(from)
-	}
-	if start == 0 {
-		return s
-	}
-	b = append(b, s[start:]...)
-	return string(b)
-}
-
-// indexAt returns the index of sub in s starting at from, or -1.
-func indexAt(s, sub string, from int) int {
-	if from >= len(s) {
-		return -1
-	}
-	rest := s[from:]
-	for i := 0; i+len(sub) <= len(rest); i++ {
-		if rest[i:i+len(sub)] == sub {
-			return from + i
-		}
-	}
-	return -1
 }
 
 // ttsNormalizeTemplate is the template-function entry point. Wires
