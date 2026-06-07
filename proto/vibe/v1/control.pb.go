@@ -526,7 +526,14 @@ type StartRequest struct {
 	// TUI tools like opencode get attached stdio. The daemon ignores this
 	// flag for kind=external (already config-only) and rejects it for
 	// kind=docker-compose (compose is inherently supervised).
-	Foreground    bool `protobuf:"varint,3,opt,name=foreground,proto3" json:"foreground,omitempty"`
+	Foreground bool `protobuf:"varint,3,opt,name=foreground,proto3" json:"foreground,omitempty"`
+	// backend activates a named backend definition (backends/<name>.yaml) as
+	// the active model server with NO frontend — the model is the deliverable,
+	// reached via the proxy. Used by vamp capability resolution so a pipeline
+	// depends on a backend, not a frontend-bearing profile. Exactly one of
+	// profile or backend must be set. The active identity is the backend name,
+	// so repeated activations of the same backend are no-op reuse.
+	Backend       string `protobuf:"bytes,4,opt,name=backend,proto3" json:"backend,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -580,6 +587,13 @@ func (x *StartRequest) GetForeground() bool {
 		return x.Foreground
 	}
 	return false
+}
+
+func (x *StartRequest) GetBackend() string {
+	if x != nil {
+		return x.Backend
+	}
+	return ""
 }
 
 type StartResponse struct {
@@ -1045,13 +1059,14 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\bservices\x18\x02 \x03(\v2\x0f.vibe.v1.StatusR\bservices\"\x15\n" +
 	"\x13ListProfilesRequest\"D\n" +
 	"\x14ListProfilesResponse\x12,\n" +
-	"\bprofiles\x18\x01 \x03(\v2\x10.vibe.v1.ProfileR\bprofiles\"l\n" +
+	"\bprofiles\x18\x01 \x03(\v2\x10.vibe.v1.ProfileR\bprofiles\"\x86\x01\n" +
 	"\fStartRequest\x12\x18\n" +
 	"\aprofile\x18\x01 \x01(\tR\aprofile\x12\"\n" +
 	"\rno_vram_check\x18\x02 \x01(\bR\vnoVramCheck\x12\x1e\n" +
 	"\n" +
 	"foreground\x18\x03 \x01(\bR\n" +
-	"foreground\"k\n" +
+	"foreground\x12\x18\n" +
+	"\abackend\x18\x04 \x01(\tR\abackend\"k\n" +
 	"\rStartResponse\x12'\n" +
 	"\x06status\x18\x01 \x01(\v2\x0f.vibe.v1.StatusR\x06status\x121\n" +
 	"\bfrontend\x18\x02 \x01(\v2\x15.vibe.v1.FrontendInfoR\bfrontend\"'\n" +

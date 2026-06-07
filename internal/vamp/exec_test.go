@@ -48,7 +48,13 @@ func (s *stubControl) Status(_ context.Context, _ *connect.Request[vibev1.Status
 }
 func (s *stubControl) Start(_ context.Context, req *connect.Request[vibev1.StartRequest]) (*connect.Response[vibev1.StartResponse], error) {
 	s.mu.Lock()
-	s.profile = req.Msg.Profile
+	// Capability activation sends Backend; interactive/profile activation sends
+	// Profile. Either becomes the active identity reported by Status.
+	if req.Msg.Backend != "" {
+		s.profile = req.Msg.Backend
+	} else {
+		s.profile = req.Msg.Profile
+	}
 	s.mu.Unlock()
 	r, _ := s.Status(context.TODO(), nil)
 	return connect.NewResponse(&vibev1.StartResponse{Status: r.Msg.Status}), nil
@@ -2354,11 +2360,17 @@ func (s *vramFallbackControl) Status(_ context.Context, _ *connect.Request[vibev
 	}}), nil
 }
 func (s *vramFallbackControl) Start(_ context.Context, req *connect.Request[vibev1.StartRequest]) (*connect.Response[vibev1.StartResponse], error) {
+	// Capability activation now names a backend; fall back to Profile for the
+	// interactive path. rejectProfiles is keyed on the candidate name.
+	name := req.Msg.Profile
+	if req.Msg.Backend != "" {
+		name = req.Msg.Backend
+	}
 	s.mu.Lock()
-	s.startedProfiles = append(s.startedProfiles, req.Msg.Profile)
-	reject := s.rejectProfiles[req.Msg.Profile]
+	s.startedProfiles = append(s.startedProfiles, name)
+	reject := s.rejectProfiles[name]
 	if !reject {
-		s.profile = req.Msg.Profile
+		s.profile = name
 	}
 	s.mu.Unlock()
 	if reject {
@@ -2367,7 +2379,7 @@ func (s *vramFallbackControl) Start(_ context.Context, req *connect.Request[vibe
 		// vibeclient.IsVRAMRejection looks for.
 		return nil, connect.NewError(
 			connect.CodeFailedPrecondition,
-			fmt.Errorf(`profile %q needs ~24.0 GiB free VRAM but only 8.0 GiB is free`, req.Msg.Profile),
+			fmt.Errorf(`profile %q needs ~24.0 GiB free VRAM but only 8.0 GiB is free`, name),
 		)
 	}
 	r, _ := s.Status(context.TODO(), nil)
@@ -2455,7 +2467,7 @@ func TestExecutor_VRAMFallbackPicksNextCandidate(t *testing.T) {
 	if !strings.Contains(logTxt, "free VRAM") {
 		t.Errorf("log missing VRAM reason from the daemon: %s", logTxt)
 	}
-	if !strings.Contains(logTxt, `activating profile "code_small"`) {
+	if !strings.Contains(logTxt, `activating backend "code_small"`) {
 		t.Errorf("log missing activation notice for 'code_small': %s", logTxt)
 	}
 
@@ -2463,7 +2475,7 @@ func TestExecutor_VRAMFallbackPicksNextCandidate(t *testing.T) {
 	// actually answered, AND flag that 1st-choice 'code' was skipped.
 	// Surfacing this at run end keeps the fallback visible after the
 	// scrolling skip lines drift past in long runs.
-	if !strings.Contains(logTxt, `capability "reasoning" resolved to profile "code_small"`) {
+	if !strings.Contains(logTxt, `capability "reasoning" resolved to backend "code_small"`) {
 		t.Errorf("log missing resolution summary line: %s", logTxt)
 	}
 	if !strings.Contains(logTxt, `fallback`) || !strings.Contains(logTxt, `"code"`) {

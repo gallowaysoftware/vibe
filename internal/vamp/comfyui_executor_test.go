@@ -251,7 +251,11 @@ func (s *stubControlWithBackend) Status(_ context.Context, _ *connect.Request[vi
 }
 func (s *stubControlWithBackend) Start(_ context.Context, req *connect.Request[vibev1.StartRequest]) (*connect.Response[vibev1.StartResponse], error) {
 	s.mu.Lock()
-	s.profile = req.Msg.Profile
+	if req.Msg.Backend != "" {
+		s.profile = req.Msg.Backend
+	} else {
+		s.profile = req.Msg.Profile
+	}
 	s.mu.Unlock()
 	r, _ := s.Status(context.TODO(), nil)
 	return connect.NewResponse(&vibev1.StartResponse{Status: r.Msg.Status}), nil

@@ -117,6 +117,13 @@ message StartRequest {
   // flag for kind=external (already config-only) and rejects it for
   // kind=docker-compose (compose is inherently supervised).
   bool foreground = 3;
+  // backend activates a named backend definition (backends/<name>.yaml) as
+  // the active model server with NO frontend — the model is the deliverable,
+  // reached via the proxy. Used by vamp capability resolution so a pipeline
+  // depends on a backend, not a frontend-bearing profile. Exactly one of
+  // profile or backend must be set. The active identity is the backend name,
+  // so repeated activations of the same backend are no-op reuse.
+  string backend = 4;
 }
 message StartResponse {
   Status status = 1;

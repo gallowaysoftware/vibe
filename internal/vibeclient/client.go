@@ -187,6 +187,18 @@ func (c *Client) StartWithOptions(ctx context.Context, profile string, opts Star
 	return &StartResult{Status: resp.Msg.Status, Frontend: resp.Msg.Frontend}, nil
 }
 
+// StartBackend activates a named backend definition (backends/<name>.yaml) as
+// the active model server with no frontend. The active identity is the backend
+// name. Used by vamp capability resolution so a pipeline targets a backend
+// rather than a frontend-bearing profile.
+func (c *Client) StartBackend(ctx context.Context, backend string) (*StartResult, error) {
+	resp, err := c.rpc.Start(ctx, connect.NewRequest(&vibev1.StartRequest{Backend: backend}))
+	if err != nil {
+		return nil, err
+	}
+	return &StartResult{Status: resp.Msg.Status, Frontend: resp.Msg.Frontend}, nil
+}
+
 func (c *Client) Stop(ctx context.Context) (*vibev1.Status, error) {
 	return c.StopByName(ctx, "")
 }
@@ -267,6 +279,21 @@ func IsVRAMRejection(err error) bool {
 	return strings.Contains(ce.Message(), "free VRAM")
 }
 
+// IsNotFound reports whether err is a Connect NotFound — e.g. EnsureBackendActive
+// against a name that has no backends/<name>.yaml. vamp uses it to fall back to
+// treating a capability target as a profile name (backward compat for
+// capabilities.yaml entries that still name profiles rather than backends).
+func IsNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ce *connect.Error
+	if !errors.As(err, &ce) {
+		return false
+	}
+	return ce.Code() == connect.CodeNotFound
+}
+
 // EnsureActive ensures `profile` is up and ready, regardless of whether
 // it's defined as active-mode or service-mode in its YAML.
 //
@@ -290,16 +317,37 @@ func IsVRAMRejection(err error) bool {
 // would unconditionally Stop+Start, only to have the daemon reject
 // the Start with already_exists.
 func (c *Client) EnsureActive(ctx context.Context, profile string) (*vibev1.Status, error) {
+	return c.ensureActive(ctx, profile, func(ctx context.Context) (*StartResult, error) {
+		return c.Start(ctx, profile)
+	})
+}
+
+// EnsureBackendActive is EnsureActive's backend twin: it ensures the named
+// backend is the active model server (no frontend), swapping out whatever is
+// currently active if needed. The active identity is the backend name, so a
+// backend already active — or already running as a service-mode sidecar — is
+// reused without a needless stop/start.
+func (c *Client) EnsureBackendActive(ctx context.Context, backend string) (*vibev1.Status, error) {
+	return c.ensureActive(ctx, backend, func(ctx context.Context) (*StartResult, error) {
+		return c.StartBackend(ctx, backend)
+	})
+}
+
+// ensureActive holds the shared resolution: reuse the active or a service if
+// its name matches, otherwise stop the current active and start anew via the
+// supplied start func. `name` is matched against Status.Profile, which is the
+// profile name for a profile activation and the backend name for a backend one.
+func (c *Client) ensureActive(ctx context.Context, name string, start func(context.Context) (*StartResult, error)) (*vibev1.Status, error) {
 	resp, err := c.rpc.Status(ctx, connect.NewRequest(&vibev1.StatusRequest{}))
 	if err != nil {
 		return nil, err
 	}
 	active := resp.Msg.Status
-	if active != nil && active.Running && active.Ready && active.Profile == profile {
+	if active != nil && active.Running && active.Ready && active.Profile == name {
 		return active, nil
 	}
 	for _, svc := range resp.Msg.Services {
-		if svc != nil && svc.Profile == profile && svc.Ready {
+		if svc != nil && svc.Profile == name && svc.Ready {
 			return svc, nil
 		}
 	}
@@ -308,7 +356,7 @@ func (c *Client) EnsureActive(ctx context.Context, profile string) (*vibev1.Stat
 			return nil, err
 		}
 	}
-	r, err := c.Start(ctx, profile)
+	r, err := start(ctx)
 	if err != nil {
 		return nil, err
 	}

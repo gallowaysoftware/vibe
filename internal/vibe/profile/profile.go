@@ -23,9 +23,17 @@ import (
 // leave it unset. LlamaServer-backed profiles still require a frontend block
 // (external or docker-compose).
 type Profile struct {
-	Name            string   `yaml:"name"`
-	Description     string   `yaml:"description,omitempty"`
-	Backend         Backend  `yaml:"backend"`
+	Name        string `yaml:"name"`
+	Description string `yaml:"description,omitempty"`
+	// Backend is the inline model-server spec. Mutually exclusive with
+	// BackendRef: a profile either inlines its backend here or references a
+	// shared one by name. After Load, Backend is always populated (resolved
+	// from the ref when BackendRef is set).
+	Backend Backend `yaml:"backend,omitempty"`
+	// BackendRef names a reusable backend defined under
+	// $XDG_CONFIG_HOME/vibe/backends/<ref>.yaml. Lets many frontends share one
+	// model spec and lets vamp capabilities target a backend (not a profile).
+	BackendRef      string   `yaml:"backend_ref,omitempty"`
 	Frontend        Frontend `yaml:"frontend,omitempty"`
 	EstimatedVRAMGB float64  `yaml:"estimated_vram_gb,omitempty"`
 	// Mode controls whether this profile takes the daemon's single
@@ -458,38 +466,28 @@ func Load(path string) (*Profile, error) {
 		return nil, fmt.Errorf("parse profile %s: %w", path, err)
 	}
 
-	if p.Backend.LlamaServer != nil {
-		if p.Backend.LlamaServer.Parallel == 0 {
-			p.Backend.LlamaServer.Parallel = 1
+	// Resolve a backend_ref into the inline Backend before normalization so
+	// downstream code (validation, launch, daemon) sees a fully-populated
+	// backend regardless of whether it was inlined or referenced.
+	if p.BackendRef != "" {
+		if !p.Backend.isEmpty() {
+			return nil, fmt.Errorf("parse profile %s: backend_ref and an inline backend block are mutually exclusive", path)
 		}
-		p.Backend.LlamaServer.Path = expandTilde(p.Backend.LlamaServer.Path)
-		p.Backend.LlamaServer.Binary = expandTilde(p.Backend.LlamaServer.Binary)
-		p.Backend.LlamaServer.MMProj = expandTilde(p.Backend.LlamaServer.MMProj)
-		p.Backend.LlamaServer.DraftModel = expandTilde(p.Backend.LlamaServer.DraftModel)
-	}
-	if p.Backend.HTTPServer != nil {
-		// Volumes' host paths get tilde-expanded so a profile can
-		// reference ~/cache without exporting HOME to the daemon's
-		// docker invocation.
-		for i, v := range p.Backend.HTTPServer.Volumes {
-			parts := strings.SplitN(v, ":", 2)
-			if len(parts) == 2 {
-				parts[0] = expandTilde(parts[0])
-				p.Backend.HTTPServer.Volumes[i] = strings.Join(parts, ":")
-			}
+		def, err := LoadBackend(p.BackendRef)
+		if err != nil {
+			return nil, fmt.Errorf("profile %s backend_ref %q: %w", path, p.BackendRef, err)
 		}
-		p.Backend.HTTPServer.Binary = expandTilde(p.Backend.HTTPServer.Binary)
+		p.Backend = def.Backend
+		// A referenced backend can carry estimated VRAM + mode; the profile
+		// may override either by setting its own.
+		if p.EstimatedVRAMGB == 0 {
+			p.EstimatedVRAMGB = def.EstimatedVRAMGB
+		}
+		if p.Mode == "" {
+			p.Mode = def.Mode
+		}
 	}
-	if p.Backend.ComfyUI != nil {
-		p.Backend.ComfyUI.Dir = expandTilde(p.Backend.ComfyUI.Dir)
-		p.Backend.ComfyUI.Python = expandTilde(p.Backend.ComfyUI.Python)
-	}
-	if p.Backend.TabbyAPI != nil {
-		p.Backend.TabbyAPI.ModelDir = expandTilde(p.Backend.TabbyAPI.ModelDir)
-		p.Backend.TabbyAPI.Venv = expandTilde(p.Backend.TabbyAPI.Venv)
-		p.Backend.TabbyAPI.Repo = expandTilde(p.Backend.TabbyAPI.Repo)
-		p.Backend.TabbyAPI.DraftModelDir = expandTilde(p.Backend.TabbyAPI.DraftModelDir)
-	}
+	p.Backend.normalize()
 	p.Frontend.WriteFile = expandTilde(p.Frontend.WriteFile)
 	p.Frontend.Binary = expandTilde(p.Frontend.Binary)
 	p.Frontend.Workdir = expandTilde(p.Frontend.Workdir)
@@ -560,31 +558,10 @@ func (p *Profile) validateMode() error {
 }
 
 func (p *Profile) validateBackend() error {
-	llama := p.Backend.LlamaServer
-	comfy := p.Backend.ComfyUI
-	http := p.Backend.HTTPServer
-	tabby := p.Backend.TabbyAPI
-	set := 0
-	for _, b := range []bool{llama != nil, comfy != nil, http != nil, tabby != nil} {
-		if b {
-			set++
-		}
-	}
-	switch {
-	case set == 0:
-		return errors.New("backend is required: set exactly one of backend.llama_server, backend.comfyui, backend.http_server, or backend.tabby_api")
-	case set > 1:
-		return errors.New("backend: only one of backend.llama_server, backend.comfyui, backend.http_server, or backend.tabby_api may be set")
-	case llama != nil:
-		return validateLlamaServer(llama)
-	case comfy != nil:
-		return validateComfyUI(comfy)
-	case http != nil:
-		return validateHTTPServer(http)
-	case tabby != nil:
-		return validateTabbyAPI(tabby)
-	}
-	return nil
+	// After Load, a backend_ref has been resolved into p.Backend, so the
+	// union validation is identical whether the backend was inlined or
+	// referenced. (The mutual-exclusion check happens in Load.)
+	return p.Backend.validate()
 }
 
 // validateTabbyAPI enforces the required fields. EXL3 models are

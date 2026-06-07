@@ -650,7 +650,7 @@ func (e *Executor) logCapabilityResolutionSummary() {
 				marker = fmt.Sprintf(" [fallback — 1st-choice %q skipped]", cands[0])
 			}
 		}
-		e.logf("capability %q resolved to profile %q%s", capability, profile, marker)
+		e.logf("capability %q resolved to backend %q%s", capability, profile, marker)
 	}
 }
 
@@ -961,11 +961,19 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 	)
 	for _, cand := range candidates {
 		if len(candidates) > 1 {
-			e.logf("  -> activating profile %q (candidate for %q)", cand, capability)
+			e.logf("  -> activating backend %q (candidate for %q)", cand, capability)
 		} else {
-			e.logf("  -> activating profile %q", cand)
+			e.logf("  -> activating backend %q", cand)
 		}
-		st, actErr := e.Vibe.EnsureActive(ctx, cand)
+		// Capability candidates name a BACKEND (backends/<name>.yaml), not a
+		// frontend-bearing profile — vamp depends on the model, not the UI.
+		st, actErr := e.Vibe.EnsureBackendActive(ctx, cand)
+		if actErr != nil && vibeclient.IsNotFound(actErr) {
+			// No backend by that name: fall back to treating the candidate as a
+			// profile name. Keeps pre-backend capabilities.yaml files working.
+			e.logf("  -> no backend %q; falling back to profile activation", cand)
+			st, actErr = e.Vibe.EnsureActive(ctx, cand)
+		}
 		if actErr != nil {
 			if vibeclient.IsVRAMRejection(actErr) {
 				e.logf("  -> skipping %q: %s", cand, actErr.Error())
@@ -975,11 +983,10 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 			return fmt.Errorf("activate %q: %w", cand, actErr)
 		}
 		if !st.Ready {
-			// Treat a not-ready response from EnsureActive the same as
-			// a generic activation failure: don't try the next
-			// candidate, since "not ready" is usually a daemon
-			// integration bug rather than a VRAM problem.
-			return fmt.Errorf("profile %q is not ready", cand)
+			// Treat a not-ready response the same as a generic activation
+			// failure: don't try the next candidate, since "not ready" is
+			// usually a daemon integration bug rather than a VRAM problem.
+			return fmt.Errorf("backend %q is not ready", cand)
 		}
 		status = st
 		picked = true

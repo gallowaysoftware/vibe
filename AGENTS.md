@@ -118,6 +118,25 @@ them before pushing.
   mirrors the mmproj rules and additionally **rejects a quantized
   `cache_type_k/v` when `spec_type` is `draft-mtp`** — quantized KV gives
   ~0% draft acceptance, so the speedup would silently vanish.
+- **Backends (reusable model specs).** A backend is a named model-server
+  spec under `$XDG_CONFIG_HOME/vibe/backends/<name>.yaml` (`profile.BackendDef`
+  = a `backend:` union + `estimated_vram_gb` + optional `mode`, no frontend).
+  A profile either inlines `backend:` or references one with `backend_ref:
+  <name>` (mutually exclusive; `Load` resolves the ref into `p.Backend` so
+  everything downstream is identical). Lets many frontends (pi, qwen-code,
+  Open WebUI profiles) share one model definition.
+  - **Backend is the unit of model activation.** `StartRequest.backend`
+    activates a backend with NO frontend — the daemon synthesizes a
+    frontend-less profile whose `Name` IS the backend name, then runs the
+    normal Start machinery. The active identity is that name, so repeated
+    activations of the same backend are no-op reuse.
+  - **vamp capabilities map to backend names**, not profiles:
+    `capabilities.yaml` values are backend names; the executor calls
+    `vibeclient.EnsureBackendActive`. Backward compat: if no backend by that
+    name exists (`IsNotFound`), it falls back to `EnsureActive` (profile).
+  - Adding a path field to a backend? It lives on the `Backend` union, so
+    `Backend.normalize()` (in `backend_def.go`) handles tilde-expansion for
+    both inline and referenced backends — add it there, not in `Load`.
 
 ## vamp stage rules
 

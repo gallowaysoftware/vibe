@@ -335,13 +335,34 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 	defer d.startMu.Unlock()
 
 	profileName := strings.TrimSpace(req.Msg.Profile)
-	if profileName == "" {
-		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("profile name required"))
+	backendName := strings.TrimSpace(req.Msg.Backend)
+	if (profileName == "") == (backendName == "") {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("exactly one of profile or backend must be set"))
 	}
 
-	p, err := loadProfileByName(profileName)
-	if err != nil {
-		return nil, connect.NewError(connect.CodeNotFound, err)
+	var p *profile.Profile
+	if backendName != "" {
+		def, err := profile.LoadBackend(backendName)
+		if err != nil {
+			return nil, connect.NewError(connect.CodeNotFound, err)
+		}
+		// Activate a backend with NO frontend: the model server is the
+		// deliverable (reached via the proxy). The synthetic profile's Name is
+		// the backend name, so the active-identity check below treats repeated
+		// activations of the same backend as no-op reuse — which is how vamp
+		// capability resolution keys on a backend rather than a profile.
+		p = &profile.Profile{
+			Name:            backendName,
+			Backend:         def.Backend,
+			EstimatedVRAMGB: def.EstimatedVRAMGB,
+			Mode:            def.Mode,
+		}
+	} else {
+		var err error
+		p, err = loadProfileByName(profileName)
+		if err != nil {
+			return nil, connect.NewError(connect.CodeNotFound, err)
+		}
 	}
 
 	startCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)

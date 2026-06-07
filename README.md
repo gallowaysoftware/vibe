@@ -46,6 +46,15 @@ starter; run it with `--help` for the full kind list (`llama-server`,
 `llama-embed-service`). Pass `--hf <repo>[:<file>]` on the `llama-server`
 kind to inject a `huggingface:` block so `vibe pull` can fetch the weights.
 
+**Reusable backends.** A backend (the model-server spec) can live on its own
+under `$XDG_CONFIG_HOME/vibe/backends/<name>.yaml` instead of being inlined in
+a profile. A profile then references it with `backend_ref: <name>` rather than
+an inline `backend:` block, so one model definition (e.g. `qwen3.6-27b`) is
+shared across many frontends. `vamp` capabilities resolve to a **backend name**
+(activated with no frontend — the model is the deliverable), so a pipeline
+depends on a model, not on a specific frontend-bearing profile. A capability
+that names a profile instead still works (backward-compatible fallback).
+
 **Backends.** A discriminated union under `backend:` — exactly one
 sub-block must be set:
 
