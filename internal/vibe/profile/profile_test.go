@@ -1223,7 +1223,11 @@ frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 	}
 }
 
-func TestLoad_DraftMTP_RejectsQuantizedKV(t *testing.T) {
+// TestLoad_DraftMTP_QuantizedKV_Allowed: draft-mtp + a quantized KV cache used to
+// be a hard error (it gave ~0% acceptance), but llama.cpp PR #23398 fixed that
+// (hadamard rotn for quantized K). It now LOADS (with a stderr warning) so fixed
+// builds aren't blocked.
+func TestLoad_DraftMTP_QuantizedKV_Allowed(t *testing.T) {
 	model := stubModelFile(t)
 	draft := filepath.Join(t.TempDir(), "d.gguf")
 	if err := os.WriteFile(draft, []byte("stub"), 0644); err != nil {
@@ -1240,9 +1244,8 @@ backend:
     context: 1024
 frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 `
-	_, err := Load(writeProfile(t, yaml))
-	if err == nil || !strings.Contains(err.Error(), "f16 KV") {
-		t.Fatalf("expected f16-KV error for draft-mtp + quantized KV, got %v", err)
+	if _, err := Load(writeProfile(t, yaml)); err != nil {
+		t.Fatalf("draft-mtp + quantized KV should load (warn, not error) post-#23398, got %v", err)
 	}
 }
 

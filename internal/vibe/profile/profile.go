@@ -695,16 +695,18 @@ func validateLlamaServer(m *LlamaServerBackend) error {
 				return fmt.Errorf("backend.llama_server.draft_model %s: %w", m.DraftModel, err)
 			}
 		}
-		// draft-mtp gives ~0% draft acceptance with a quantized KV cache —
-		// the speedup silently evaporates. Reject the footgun rather than
-		// let it look enabled but do nothing. (f16, the llama-server default
-		// when cache_type is unset, is correct.)
+		// draft-mtp historically gave ~0% draft acceptance with a quantized KV
+		// cache — the speedup silently evaporated. llama.cpp PR #23398 fixed this
+		// (added the missing Hadamard rotation for quantized K), so on a current
+		// build q8_0 KV works with draft-mtp and saves ~half the KV VRAM. On an
+		// OLDER build it's still a footgun. Warn rather than hard-fail so fixed
+		// builds aren't blocked; verify draft acceptance in the llama-server logs.
 		specType := m.SpecType
 		if specType == "" {
 			specType = "draft-mtp"
 		}
 		if specType == "draft-mtp" && (isQuantizedKV(m.CacheTypeK) || isQuantizedKV(m.CacheTypeV)) {
-			return errors.New("draft-mtp requires an f16 KV cache: remove cache_type_k/cache_type_v (or set them to f16); a quantized KV cache yields ~0% draft acceptance")
+			fmt.Fprintf(os.Stderr, "warning: profile %q uses a quantized KV cache with draft-mtp — needs llama.cpp >= PR #23398 (hadamard rotn for quantized K) or draft acceptance drops to ~0%%. Verify acceptance after start.\n", m.Alias)
 		}
 	}
 	return nil
