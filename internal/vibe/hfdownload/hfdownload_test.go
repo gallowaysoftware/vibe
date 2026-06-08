@@ -167,32 +167,44 @@ func TestSpec_URL(t *testing.T) {
 // silence "imported and not used" if we trim later
 var _ = io.Copy
 
-// TestLargestFileSize covers the in-flight polling path used by the hf-CLI
-// downloader: while `hf` writes to a `.incomplete` sibling we must find
-// THAT file (largest in the tree), not the final filename which doesn't
-// exist yet.
-func TestLargestFileSize(t *testing.T) {
+// TestLargestNewFileSize covers the in-flight polling path used by the hf-CLI
+// downloader: while `hf` writes to a `.incomplete` sibling we must find THAT
+// file (largest NEW file in the tree), not the final filename (which doesn't
+// exist yet) and crucially not a pre-existing unrelated file — the target dir is
+// shared, so a model's mmproj/drafter download sits beside the much larger main
+// weights, which must be ignored.
+func TestLargestNewFileSize(t *testing.T) {
 	dir := t.TempDir()
-	if got := largestFileSize(dir); got != 0 {
+	if got := largestNewFileSize(dir, nil); got != 0 {
 		t.Errorf("empty dir: got %d, want 0", got)
 	}
-	if got := largestFileSize(filepath.Join(dir, "missing")); got != 0 {
+	if got := largestNewFileSize(filepath.Join(dir, "missing"), nil); got != 0 {
 		t.Errorf("missing dir: got %d, want 0 (walk should be tolerant)", got)
 	}
-	// Drop several files: one small, one large, plus one in a subdir to
-	// exercise the recursive walk.
-	if err := os.WriteFile(filepath.Join(dir, "small.txt"), []byte("hi"), 0o644); err != nil {
+	// A pre-existing large file (e.g. the main model weights) that this download
+	// must NOT report as progress.
+	preexisting := bytes.Repeat([]byte("m"), 1<<16)
+	if err := os.WriteFile(filepath.Join(dir, "model.gguf"), preexisting, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	baseline := fileSizes(dir)
+
+	// With only the pre-existing file, nothing new → 0.
+	if got := largestNewFileSize(dir, baseline); got != 0 {
+		t.Errorf("only pre-existing files: got %d, want 0", got)
+	}
+
+	// Now an in-flight nested .incomplete blob (smaller than the pre-existing
+	// model) — it must be found despite not being the largest file in the tree.
 	sub := filepath.Join(dir, "nested")
 	if err := os.MkdirAll(sub, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	big := bytes.Repeat([]byte("a"), 4096)
-	if err := os.WriteFile(filepath.Join(sub, "model.gguf.incomplete"), big, 0o644); err != nil {
+	blob := bytes.Repeat([]byte("a"), 4096)
+	if err := os.WriteFile(filepath.Join(sub, "drafter.gguf.incomplete"), blob, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := largestFileSize(dir); got != int64(len(big)) {
-		t.Errorf("got %d, want %d (should find nested .incomplete)", got, len(big))
+	if got := largestNewFileSize(dir, baseline); got != int64(len(blob)) {
+		t.Errorf("got %d, want %d (should find the NEW nested blob, ignoring the bigger pre-existing model)", got, len(blob))
 	}
 }

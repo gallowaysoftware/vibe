@@ -90,6 +90,12 @@ func downloadViaHFCLI(ctx context.Context, hfBin string, spec Spec, destPath str
 	// progress without a known total (total = -1).
 	total, _ := HeadSize(ctx, spec)
 
+	// Snapshot files already in the target dir so progress tracks only the NEW
+	// download. The target dir is shared — a model's mmproj/drafter download into
+	// the same dir as the (much larger) main weights — so reporting the dir's
+	// largest file would show the pre-existing model, not this download.
+	baseline := fileSizes(targetDir)
+
 	args := []string{"download", spec.Repo, spec.File, "--local-dir", targetDir}
 	if spec.Revision != "" {
 		args = append(args, "--revision", spec.Revision)
@@ -125,7 +131,7 @@ func downloadViaHFCLI(ctx context.Context, hfBin string, spec Spec, destPath str
 				// the largest file size instead — covers both the
 				// in-flight `.incomplete` file and the final renamed
 				// one without caring which layout `hf` is using.
-				if n := largestFileSize(targetDir); n > 0 {
+				if n := largestNewFileSize(targetDir, baseline); n > 0 {
 					report(progress, n, total)
 				} else if info, err := os.Stat(hfWritePath); err == nil {
 					report(progress, info.Size(), total)
@@ -138,19 +144,46 @@ func downloadViaHFCLI(ctx context.Context, hfBin string, spec Spec, destPath str
 	close(stop)
 	<-done
 
-	if waitErr != nil {
+	// Don't trust the exit code alone. The modern `hf` CLI can exit NON-ZERO with
+	// a Python traceback even on a SUCCESSFUL download — a typer/click `Exit(0)`
+	// goes uncaught on Python 3.14 ("click.exceptions.Exit: 0"), so the process
+	// exits 1 after the bytes are safely on disk. hf only renames the blob to its
+	// FINAL name on completion, so a present, correctly-sized final file means the
+	// download succeeded regardless of exit code. Only surface the CLI error when
+	// the file is actually missing or short.
+	complete := func(path string) bool {
+		info, err := os.Stat(path)
+		if err != nil || info.Size() == 0 {
+			return false
+		}
+		if total > 0 {
+			return info.Size() == total
+		}
+		return true // final-named file present + non-empty, total unknown
+	}
+	if waitErr != nil && !complete(hfWritePath) && !complete(destPath) {
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = waitErr.Error()
 		}
 		return fmt.Errorf("hf download %s/%s: %s", spec.Repo, spec.File, msg)
 	}
+	if waitErr != nil {
+		slog.Warn("hf CLI exited non-zero but the file is complete — treating as success (likely the typer Exit(0) traceback on Python 3.14)",
+			"repo", spec.Repo, "file", spec.File, "err", waitErr)
+	}
 
 	// hf places the file at <local_dir>/<file>. If the profile's destPath has a
-	// different basename, rename it.
+	// different basename (or subdir, e.g. MTP/<file>), rename it. Skip when the
+	// file is already at destPath (e.g. a prior partial run left it there).
 	if hfWritePath != destPath {
-		if err := os.Rename(hfWritePath, destPath); err != nil {
-			return fmt.Errorf("rename %s -> %s: %w", hfWritePath, destPath, err)
+		if _, err := os.Stat(hfWritePath); err == nil {
+			if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+				return fmt.Errorf("mkdir for %s: %w", destPath, err)
+			}
+			if err := os.Rename(hfWritePath, destPath); err != nil {
+				return fmt.Errorf("rename %s -> %s: %w", hfWritePath, destPath, err)
+			}
 		}
 	}
 
@@ -161,22 +194,36 @@ func downloadViaHFCLI(ctx context.Context, hfBin string, spec Spec, destPath str
 	return nil
 }
 
-// largestFileSize returns the size of the largest regular file under root
-// (recursively), or 0 if the walk finds nothing. Used by the hf-CLI polling
-// path to track in-flight `.incomplete` files that the modern hf client
-// writes alongside the final destination filename. Walk errors are best-
-// effort: missing-directory at start-of-download is normal, and the next
-// tick will retry.
-func largestFileSize(root string) int64 {
-	var max int64
+// fileSizes returns a path->size map of every regular file under root, used to
+// snapshot what's already present before a download so progress can ignore it.
+// Best-effort: a missing root (download not started) yields an empty map.
+func fileSizes(root string) map[string]int64 {
+	m := map[string]int64{}
 	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			// Skip unreadable entries instead of bailing — partially-
-			// created subdirs are normal mid-download.
+		if err != nil || info.IsDir() {
 			return nil
 		}
-		if info.IsDir() {
+		m[path] = info.Size()
+		return nil
+	})
+	return m
+}
+
+// largestNewFileSize returns the size of the largest regular file under root
+// that is NOT in baseline at the same size — i.e. a file this download created
+// or grew. Used by the hf-CLI polling path to track the in-flight blob (and the
+// final renamed file) while ignoring unrelated files already in the shared
+// target dir (notably the main model weights sitting beside an mmproj/drafter
+// download). Walk errors are best-effort: a missing dir at start-of-download is
+// normal and the next tick retries.
+func largestNewFileSize(root string, baseline map[string]int64) int64 {
+	var max int64
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
 			return nil
+		}
+		if bs, ok := baseline[path]; ok && bs == info.Size() {
+			return nil // unchanged pre-existing file — not part of this download
 		}
 		if info.Size() > max {
 			max = info.Size()
