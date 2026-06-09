@@ -49,6 +49,25 @@ type Profile struct {
 	// They bypass the proxy (callers use the service's published
 	// port directly) and the frontend activation path.
 	Mode string `yaml:"mode,omitempty"`
+	// Hooks are shell commands run around this profile's lifecycle (see the
+	// Hooks type). Empty by default — a no-op for every existing profile.
+	Hooks Hooks `yaml:"hooks,omitempty"`
+}
+
+// Hooks are shell commands vibe runs around a profile's lifecycle, each via
+// `sh -c` with the daemon's environment. They let a profile bring its own
+// supporting processes up and down with the session — e.g. `docker compose
+// up -d` some sidecar services on start and `stop` them on teardown — without
+// a wrapper launcher.
+type Hooks struct {
+	// PreStart runs after the VRAM pre-flight and before the backend and
+	// frontend come up. A non-zero exit aborts the start, so a profile never
+	// half-launches against a missing dependency.
+	PreStart []string `yaml:"pre_start,omitempty"`
+	// PostStop runs after the frontend and backend are torn down. Best-effort:
+	// a failure is logged but never blocks the stop, and the remaining hooks
+	// still run.
+	PostStop []string `yaml:"post_stop,omitempty"`
 }
 
 // Profile modes. Default-empty maps to ModeActive so existing

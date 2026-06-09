@@ -117,6 +117,39 @@ estimated_vram_gb: 26
 	}
 }
 
+func TestLoad_Hooks(t *testing.T) {
+	model := stubModelFile(t)
+	yaml := `
+name: hooked
+backend:
+  llama_server:
+    path: ` + model + `
+    alias: m
+    context: 1024
+frontend:
+  kind: external
+  write_file: /tmp/x.json
+  template:
+    model: ${MODEL_ALIAS}
+hooks:
+  pre_start:
+    - docker compose up -d qdrant
+    - echo ready
+  post_stop:
+    - docker compose stop qdrant
+`
+	p, err := Load(writeProfile(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := p.Hooks.PreStart; len(got) != 2 || got[0] != "docker compose up -d qdrant" || got[1] != "echo ready" {
+		t.Errorf("pre_start = %v", got)
+	}
+	if got := p.Hooks.PostStop; len(got) != 1 || got[0] != "docker compose stop qdrant" {
+		t.Errorf("post_stop = %v", got)
+	}
+}
+
 func TestLoad_ComfyUI_Valid(t *testing.T) {
 	dir := stubComfyDir(t)
 	yaml := `

@@ -248,6 +248,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// requests at the (now-dead) proxy.
 	d.mu.Lock()
 	fr := d.frontend
+	act := d.active
 	// Clear d.active BEFORE stopping the supervisor — same rationale
 	// as stopActive does for a per-profile stop. The
 	// watchBackendForRespawn goroutine wakes the instant the
@@ -262,6 +263,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		if err := frontend.Deactivate(shCtx, fr); err != nil {
 			slog.Warn("frontend deactivate on shutdown failed", "err", err)
 		}
+	}
+	if act != nil {
+		_ = runHooks(shCtx, act.Name, "post_stop", act.Hooks.PostStop, false)
 	}
 	// Stop the supervisor unconditionally; if a start is mid-flight the
 	// child exists and SIGINT will unblock waitReady.
@@ -411,6 +415,13 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 				"estimated_gib", p.EstimatedVRAMGB,
 				"free_gib", res.FreeGiB)
 		}
+	}
+
+	// Lifecycle: pre_start hooks run after the VRAM pre-flight and before the
+	// backend/frontend come up. A failed hook aborts the start so we never
+	// half-launch against a missing dependency.
+	if err := runHooks(startCtx, p.Name, "pre_start", p.Hooks.PreStart, true); err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 
 	// Dispatch by backend kind to build the launch spec + pick a port.
@@ -915,6 +926,31 @@ func (d *Daemon) stopActive(ctx context.Context) error {
 		return err
 	}
 	d.prx.SetBackend(nil)
+	// post_stop hooks run after the frontend and backend are down (best-effort).
+	_ = runHooks(ctx, active.Name, "post_stop", active.Hooks.PostStop, false)
+	return nil
+}
+
+// runHooks executes a profile's lifecycle hook commands sequentially, each via
+// `sh -c` with the daemon's environment. When abortOnErr is true (pre_start),
+// the first failing hook returns an error so the caller aborts the start;
+// otherwise (post_stop) failures are logged and the remaining hooks still run.
+func runHooks(ctx context.Context, profileName, phase string, cmds []string, abortOnErr bool) error {
+	for i, cmd := range cmds {
+		c := exec.CommandContext(ctx, "sh", "-c", cmd)
+		c.Env = os.Environ()
+		out, err := c.CombinedOutput()
+		if err != nil {
+			slog.Warn("lifecycle hook failed",
+				"profile", profileName, "phase", phase, "index", i,
+				"cmd", cmd, "err", err, "output", strings.TrimSpace(string(out)))
+			if abortOnErr {
+				return fmt.Errorf("%s hook %d (%q) failed: %w", phase, i, cmd, err)
+			}
+			continue
+		}
+		slog.Info("lifecycle hook ran", "profile", profileName, "phase", phase, "cmd", cmd)
+	}
 	return nil
 }
 

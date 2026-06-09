@@ -459,6 +459,23 @@ func Schema() *schemaProperty {
 				Description: "Approximate VRAM the loaded model needs, in GiB. Used by the daemon's pre-flight VRAM check.",
 				Minimum:     float64Ptr(0),
 			},
+			"hooks": {
+				Type:                 "object",
+				Description:          "Shell commands run around the profile lifecycle, each via `sh -c` with the daemon's environment.",
+				AdditionalProperties: false,
+				Properties: map[string]*schemaProperty{
+					"pre_start": {
+						Type:        "array",
+						Description: "Commands run after the VRAM pre-flight and before the backend/frontend start. A non-zero exit aborts the start.",
+						Items:       &schemaProperty{Type: "string"},
+					},
+					"post_stop": {
+						Type:        "array",
+						Description: "Commands run after the frontend and backend are torn down. Best-effort: failures are logged and never block stop.",
+						Items:       &schemaProperty{Type: "string"},
+					},
+				},
+			},
 		},
 		Definitions: map[string]*schemaProperty{
 			"Backend":            backend,
