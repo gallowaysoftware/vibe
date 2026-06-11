@@ -43,12 +43,19 @@ type Profile struct {
 	// for every profile that existed before mode was introduced.
 	//
 	// "service" mode is for stateless sidecars (searxng, embedding
-	// servers, TTS engines, image-gen daemons) that pipelines call by
-	// well-known port. Multiple service-mode profiles can run
-	// concurrently with each other and with one active-mode profile.
-	// They bypass the proxy (callers use the service's published
-	// port directly) and the frontend activation path.
+	// servers, TTS engines, image-gen daemons) that run concurrently with
+	// each other and with one active-mode profile. They skip the default
+	// proxy backend and the frontend activation path; an llama_server
+	// service is still reachable on the proxy by its model alias (see
+	// Daemon.startService).
 	Mode string `yaml:"mode,omitempty"`
+	// Services names service-mode profiles to co-start when this
+	// (active-mode) profile starts, and stop again when it stops. Lets an
+	// active profile pull up its sidecars with one `vibe start`. Co-start
+	// is best-effort: a sidecar that fails to start logs a warning but
+	// doesn't abort the active profile. Already-running services are left
+	// as-is (idempotent). Ignored for service-mode profiles (no nesting).
+	Services []string `yaml:"services,omitempty"`
 	// Hooks are shell commands run around this profile's lifecycle (see the
 	// Hooks type). Empty by default — a no-op for every existing profile.
 	Hooks Hooks `yaml:"hooks,omitempty"`

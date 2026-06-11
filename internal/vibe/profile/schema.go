@@ -459,6 +459,11 @@ func Schema() *schemaProperty {
 				Description: "Approximate VRAM the loaded model needs, in GiB. Used by the daemon's pre-flight VRAM check.",
 				Minimum:     float64Ptr(0),
 			},
+			"services": {
+				Type:        "array",
+				Description: "Names of service-mode profiles to co-start with this active profile (and stop when it stops). Best-effort: a sidecar that fails to start logs a warning but doesn't abort the active profile.",
+				Items:       &schemaProperty{Type: "string"},
+			},
 			"hooks": {
 				Type:                 "object",
 				Description:          "Shell commands run around the profile lifecycle, each via `sh -c` with the daemon's environment.",
