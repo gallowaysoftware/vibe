@@ -78,7 +78,7 @@ func TestProxy_RoutesByModel(t *testing.T) {
 		{`{"model":"tiny-classifier","messages":[]}`, "classifier", `{"model":"tiny-classifier","messages":[]}`},
 		{`{"model":"qwen-coder","messages":[]}`, "default", `{"model":"qwen-coder","messages":[]}`},
 		{`{"messages":[]}`, "default", `{"messages":[]}`}, // no model → default
-		{`not json`, "default", `not json`},              // unparseable → default, body intact
+		{`not json`, "default", `not json`},               // unparseable → default, body intact
 	}
 	for _, tc := range cases {
 		w := httptest.NewRecorder()
