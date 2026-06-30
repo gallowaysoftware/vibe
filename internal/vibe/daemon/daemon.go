@@ -498,6 +498,11 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 	d.frontend = fr
 	d.mu.Unlock()
 
+	// Co-start declared sidecars. Best-effort: runs after the active
+	// profile is up so a sidecar failure can't abort it, and a slow
+	// sidecar doesn't delay dropping the user into the frontend.
+	d.startCompanions(startCtx, p)
+
 	// Auto-respawn watcher: when the supervised process exits mid-life
 	// (after reaching Ready) without an operator-initiated Stop, the
 	// backend probably crashed (e.g. llama-server SIGABRT from a flaky
@@ -697,6 +702,10 @@ func (d *Daemon) stopService(ctx context.Context, name string) error {
 	}
 	delete(d.services, name)
 	d.mu.Unlock()
+
+	if alias := serviceRouteAlias(svc.profile); alias != "" {
+		d.prx.RemoveRoute(alias)
+	}
 
 	slog.Info("stopping service", "profile", name)
 	if err := svc.sup.Stop(ctx); err != nil {
@@ -926,6 +935,8 @@ func (d *Daemon) stopActive(ctx context.Context) error {
 		return err
 	}
 	d.prx.SetBackend(nil)
+	// Tear down the sidecars this profile co-started (best-effort).
+	d.stopCompanions(ctx, active)
 	// post_stop hooks run after the frontend and backend are down (best-effort).
 	_ = runHooks(ctx, active.Name, "post_stop", active.Hooks.PostStop, false)
 	return nil
@@ -1174,6 +1185,78 @@ func (d *Daemon) buildLaunchSpec(p *profile.Profile) (supervisor.LaunchSpec, int
 	return spec, port, nil
 }
 
+// startCompanions brings up the service-mode profiles named in p.Services
+// alongside the just-started active profile. Best-effort by design: a
+// missing, mis-moded, or failing sidecar logs a warning and is skipped so
+// the active profile (the thing the user asked for) still comes up.
+// Already-running services are left untouched (idempotent), so switching
+// between two active profiles that share a sidecar doesn't restart it.
+//
+// Safe to call while holding d.startMu (Start does): startService
+// synchronises on d.mu only, not d.startMu.
+func (d *Daemon) startCompanions(ctx context.Context, p *profile.Profile) {
+	for _, name := range p.Services {
+		d.mu.Lock()
+		_, running := d.services[name]
+		d.mu.Unlock()
+		if running {
+			continue
+		}
+		sp, err := loadProfileByName(name)
+		if err != nil {
+			slog.Warn("companion service not found; continuing without it",
+				"active", p.Name, "service", name, "err", err)
+			continue
+		}
+		if sp.ResolvedMode() != profile.ModeService {
+			slog.Warn("companion is not a service-mode profile; skipping",
+				"active", p.Name, "service", name, "mode", sp.ResolvedMode())
+			continue
+		}
+		if _, err := d.startService(ctx, sp); err != nil {
+			slog.Warn("companion service failed to start; continuing without it",
+				"active", p.Name, "service", name, "err", err)
+			continue
+		}
+		slog.Info("companion service started", "active", p.Name, "service", name)
+	}
+}
+
+// stopCompanions tears down the sidecars a stopping active profile
+// declared. Best-effort and idempotent: a sidecar already gone (or never
+// started) is skipped. A service not declared here is left alone, so
+// manually-started services and other profiles' sidecars are untouched.
+func (d *Daemon) stopCompanions(ctx context.Context, p *profile.Profile) {
+	for _, name := range p.Services {
+		d.mu.Lock()
+		_, running := d.services[name]
+		d.mu.Unlock()
+		if !running {
+			continue
+		}
+		if err := d.stopService(ctx, name); err != nil {
+			slog.Warn("companion service stop failed",
+				"active", p.Name, "service", name, "err", err)
+		}
+	}
+}
+
+// serviceRouteAlias returns the model alias a service-mode profile
+// should be routed by on the proxy, or "" if it exposes no OpenAI model
+// id (only llama_server backends advertise one today).
+func serviceRouteAlias(p *profile.Profile) string {
+	if p == nil || p.Backend.LlamaServer == nil {
+		return ""
+	}
+	return p.Backend.LlamaServer.Alias
+}
+
+// serviceRouteURL is the loopback upstream for a service listening on
+// port, in the form the proxy's reverse-proxy expects.
+func serviceRouteURL(port int) *url.URL {
+	return &url.URL{Scheme: "http", Host: fmt.Sprintf("127.0.0.1:%d", port)}
+}
+
 // startService runs a service-mode profile alongside the daemon's
 // other services and (optionally) an active profile. Each service
 // gets its own supervisor instance so a crash + auto-respawn in one
@@ -1182,8 +1265,13 @@ func (d *Daemon) buildLaunchSpec(p *profile.Profile) (supervisor.LaunchSpec, int
 // Service-mode profiles bypass:
 //   - the d.active "already running" check (services don't compete for the active slot),
 //   - the VRAM pre-flight (services are typically CPU-bound; if a service genuinely needs GPU, the caller bears responsibility for sizing),
-//   - proxy backend wiring (callers reach services via the published port directly),
+//   - the default proxy backend wiring (the active profile owns the default upstream),
 //   - frontend activation (a sidecar has no UI to launch).
+//
+// A service IS reachable on the proxy when it exposes a model alias
+// (llama_server): startService adds a per-model route so the shared
+// proxy port forwards requests carrying that "model" to this service,
+// while everything else still flows to the active profile.
 //
 // Returns a StartResponse populated from the per-service supervisor
 // status; the StatusResponse's `services` list will pick up the new
@@ -1217,6 +1305,14 @@ func (d *Daemon) startService(ctx context.Context, p *profile.Profile) (*connect
 	d.mu.Lock()
 	d.services[p.Name] = svc
 	d.mu.Unlock()
+
+	// Expose this service on the proxy by its model alias so callers can
+	// reach it on the shared proxy port (selected by the request's
+	// "model"), not just the service's published port directly. Only
+	// llama_server services advertise an OpenAI model id worth routing.
+	if alias := serviceRouteAlias(p); alias != "" {
+		d.prx.AddRoute(alias, serviceRouteURL(port))
+	}
 
 	// Service-specific auto-respawn watcher: same shape as the active
 	// watcher, but parameterised on the service's own supervisor +
@@ -1277,8 +1373,14 @@ func (d *Daemon) watchServiceForRespawn(name string, sup *supervisor.Supervisor,
 			slog.Error("service respawn budget exhausted; deregistering",
 				"profile", name, "respawns", respawns, "window", respawnWindow)
 			d.mu.Lock()
+			svc := d.services[name]
 			delete(d.services, name)
 			d.mu.Unlock()
+			if svc != nil {
+				if alias := serviceRouteAlias(svc.profile); alias != "" {
+					d.prx.RemoveRoute(alias)
+				}
+			}
 			d.startMu.Unlock()
 			return
 		}

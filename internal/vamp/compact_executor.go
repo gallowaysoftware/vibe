@@ -185,8 +185,8 @@ func buildCompactPrompt(chunk string, targetChars int, preserve string) string {
 	}
 	var b strings.Builder
 	b.WriteString("You are a context compactor. The text below is one chunk of a larger document that does not fit a downstream LLM's context window. Produce a compressed version of THIS CHUNK with the following rules:\n\n")
-	b.WriteString(fmt.Sprintf("- Target length: approximately %d characters.\n", targetChars))
-	b.WriteString(fmt.Sprintf("- Preserve: %s.\n", preserve))
+	fmt.Fprintf(&b, "- Target length: approximately %d characters.\n", targetChars)
+	fmt.Fprintf(&b, "- Preserve: %s.\n", preserve)
 	b.WriteString("- Maintain the original structure when applicable (if input is JSON, output JSON of the same shape with shorter field values; if input is markdown, output markdown of the same heading hierarchy).\n")
 	b.WriteString("- Cut: redundant prose, repeated framing, motivation/recap paragraphs, anything that would survive a careful editor's pass.\n")
 	b.WriteString("- Do NOT add new information. Do NOT include commentary, preamble, or explanation of what you did. Return ONLY the compressed text.\n\n")
