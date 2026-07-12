@@ -113,7 +113,8 @@ func profileShowCmd() *cobra.Command {
 			"validation), and prints the result. Errors out on " +
 			"missing files or validation failures so it doubles as a " +
 			"lint check.",
-		Args: cobra.ExactArgs(1),
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeProfileNames,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
 			path := filepath.Join(paths.ProfilesDir(), name+".yaml")
@@ -275,7 +276,7 @@ func profileSchemaCmd() *cobra.Command {
 		Short: "Emit the vibe profile JSON Schema (draft-07).",
 		Long: "schema prints a JSON Schema document describing profile YAML " +
 			"to stdout (or --out <file>). The schema covers every Backend " +
-			"(llama_server / comfyui) and Frontend (external / " +
+			"and Frontend (external / " +
 			"docker-compose / managed) shape, including the huggingface " +
 			"pull block and the mmproj field. Point yaml-language-server at " +
 			"the rendered file with a " +
@@ -401,10 +402,10 @@ func profileInitCmd() *cobra.Command {
 // refused if the destination exists and force is false.
 func runProfileInit(out io.Writer, kind, name, hfRef string, force bool) error {
 	if name == "" {
-		return errors.New("--name must not be empty")
+		return errors.New("profile name must not be empty")
 	}
 	if !profileNameRE.MatchString(name) {
-		return fmt.Errorf("--name %q must match [a-zA-Z0-9_-]+", name)
+		return fmt.Errorf("profile name %q must match [a-zA-Z0-9_-]+", name)
 	}
 
 	tmpl, err := loadProfileTemplate(kind)

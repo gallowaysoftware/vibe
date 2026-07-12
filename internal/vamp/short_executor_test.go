@@ -84,7 +84,7 @@ func TestShortExecutor_BuildsFiltergraph(t *testing.T) {
 		"loudnorm=I=-16",
 		"-map [cv]", "-map [na]", "-c:v libx264", "-c:a aac",
 		"-ar 48000", "-ac 2", // 48kHz stereo for player/platform compatibility
-		"drawtext=", "textfile=", "expansion=none", ".caption-0.txt",
+		"drawtext=", "textfile=", "expansion=none", ".caption-assemble-0-0.txt",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("filtergraph/args missing %q in:\n%s", want, joined)
@@ -96,7 +96,7 @@ func TestShortExecutor_BuildsFiltergraph(t *testing.T) {
 	}
 	// The caption (apostrophe-bearing here) is written verbatim to a file —
 	// no escaping, the bug that broke apostrophe captions inline.
-	capBytes, err := os.ReadFile(filepath.Join(runDir, ".caption-0.txt"))
+	capBytes, err := os.ReadFile(filepath.Join(runDir, ".caption-assemble-0-0.txt"))
 	if err != nil {
 		t.Fatalf("caption file: %v", err)
 	}

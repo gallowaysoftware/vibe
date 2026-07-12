@@ -73,6 +73,17 @@ type probeResult struct {
 	err    error
 }
 
+// testPoller builds a waitPoller with the fast timings every driver test
+// wants; tests with bespoke timeouts construct waitPoller directly.
+func testPoller(probe func(ctx context.Context, url string) (int, error)) waitPoller {
+	return waitPoller{
+		probeURL:       probe,
+		now:            time.Now,
+		defaultTimeout: time.Second,
+		pollInterval:   time.Millisecond,
+	}
+}
+
 // writeComposeFile drops a placeholder compose file the driver will stat()
 // before invoking docker.
 func writeComposeFile(t *testing.T) string {
@@ -89,11 +100,8 @@ func TestCompose_Activate_BuildsArgv_WithServicesAndProjectName(t *testing.T) {
 	calls, runner := fakeRunner()
 
 	d := &composeDriver{
-		runCommand:     runner,
-		probeURL:       fakeProbe(probeResult{status: 200}),
-		now:            time.Now,
-		defaultTimeout: time.Second,
-		pollInterval:   time.Millisecond,
+		runCommand: runner,
+		waitPoller: testPoller(fakeProbe(probeResult{status: 200})),
 	}
 
 	p := &profile.Profile{
@@ -136,11 +144,8 @@ func TestCompose_Activate_DefaultsProjectName(t *testing.T) {
 	calls, runner := fakeRunner()
 
 	d := &composeDriver{
-		runCommand:     runner,
-		probeURL:       fakeProbe(probeResult{status: 200}),
-		now:            time.Now,
-		defaultTimeout: time.Second,
-		pollInterval:   time.Millisecond,
+		runCommand: runner,
+		waitPoller: testPoller(fakeProbe(probeResult{status: 200})),
 	}
 
 	p := &profile.Profile{
@@ -174,11 +179,8 @@ func TestCompose_Activate_NoWaitFor_NoServices(t *testing.T) {
 	calls, runner := fakeRunner()
 
 	d := &composeDriver{
-		runCommand:     runner,
-		probeURL:       fakeProbe(probeResult{status: 200}),
-		now:            time.Now,
-		defaultTimeout: time.Second,
-		pollInterval:   time.Millisecond,
+		runCommand: runner,
+		waitPoller: testPoller(fakeProbe(probeResult{status: 200})),
 	}
 
 	p := &profile.Profile{
@@ -203,11 +205,8 @@ func TestCompose_Activate_PassesEnvSorted(t *testing.T) {
 	calls, runner := fakeRunner()
 
 	d := &composeDriver{
-		runCommand:     runner,
-		probeURL:       fakeProbe(probeResult{status: 200}),
-		now:            time.Now,
-		defaultTimeout: time.Second,
-		pollInterval:   time.Millisecond,
+		runCommand: runner,
+		waitPoller: testPoller(fakeProbe(probeResult{status: 200})),
 	}
 
 	p := &profile.Profile{
@@ -255,16 +254,13 @@ func TestCompose_Activate_WaitForPollsUntilReady(t *testing.T) {
 	probeCalls := 0
 	d := &composeDriver{
 		runCommand: runner,
-		probeURL: func(_ context.Context, _ string) (int, error) {
+		waitPoller: testPoller(func(_ context.Context, _ string) (int, error) {
 			probeCalls++
 			if probeCalls < 3 {
 				return 503, nil
 			}
 			return 200, nil
-		},
-		now:            time.Now,
-		defaultTimeout: time.Second,
-		pollInterval:   time.Millisecond,
+		}),
 	}
 	p := &profile.Profile{
 		Name: "p",
@@ -290,11 +286,13 @@ func TestCompose_Activate_WaitForTimeoutTearsDown(t *testing.T) {
 	calls, runner := fakeRunner()
 
 	d := &composeDriver{
-		runCommand:     runner,
-		probeURL:       fakeProbe(probeResult{status: 503}),
-		now:            time.Now,
-		defaultTimeout: 10 * time.Millisecond,
-		pollInterval:   1 * time.Millisecond,
+		runCommand: runner,
+		waitPoller: waitPoller{
+			probeURL:       fakeProbe(probeResult{status: 503}),
+			now:            time.Now,
+			defaultTimeout: 10 * time.Millisecond,
+			pollInterval:   1 * time.Millisecond,
+		},
 	}
 	p := &profile.Profile{
 		Name: "p",
@@ -332,11 +330,8 @@ func TestCompose_Activate_UpFailureReturnsError(t *testing.T) {
 	calls, runner := fakeRunner(nil, upErr)
 
 	d := &composeDriver{
-		runCommand:     runner,
-		probeURL:       fakeProbe(probeResult{status: 200}),
-		now:            time.Now,
-		defaultTimeout: time.Second,
-		pollInterval:   time.Millisecond,
+		runCommand: runner,
+		waitPoller: testPoller(fakeProbe(probeResult{status: 200})),
 	}
 	p := &profile.Profile{
 		Name: "p",
@@ -363,10 +358,7 @@ func TestCompose_Activate_MissingComposeFile(t *testing.T) {
 			t.Fatal("runCommand should not be called when compose_file is missing")
 			return nil
 		},
-		probeURL:       fakeProbe(probeResult{status: 200}),
-		now:            time.Now,
-		defaultTimeout: time.Second,
-		pollInterval:   time.Millisecond,
+		waitPoller: testPoller(fakeProbe(probeResult{status: 200})),
 	}
 	p := &profile.Profile{
 		Name: "p",
@@ -390,11 +382,8 @@ func TestCompose_Deactivate_RunsDown(t *testing.T) {
 	calls, runner := fakeRunner()
 
 	d := &composeDriver{
-		runCommand:     runner,
-		probeURL:       fakeProbe(probeResult{status: 200}),
-		now:            time.Now,
-		defaultTimeout: time.Second,
-		pollInterval:   time.Millisecond,
+		runCommand: runner,
+		waitPoller: testPoller(fakeProbe(probeResult{status: 200})),
 	}
 	p := &profile.Profile{
 		Name: "p",
@@ -434,11 +423,8 @@ func TestCompose_ExpandsComposeFilePath(t *testing.T) {
 
 	calls, runner := fakeRunner()
 	d := &composeDriver{
-		runCommand:     runner,
-		probeURL:       fakeProbe(probeResult{status: 200}),
-		now:            time.Now,
-		defaultTimeout: time.Second,
-		pollInterval:   time.Millisecond,
+		runCommand: runner,
+		waitPoller: testPoller(fakeProbe(probeResult{status: 200})),
 	}
 	p := &profile.Profile{
 		Name: "research",

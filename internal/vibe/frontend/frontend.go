@@ -43,16 +43,11 @@ type Result struct {
 	teardown func(ctx context.Context) error
 }
 
-// Activate brings up the frontend for p. For kind=external, this writes the
-// rendered config file. For kind=docker-compose, this runs `docker compose
-// up -d` and polls wait_for. Callers must call Deactivate on the returned
-// Result when the profile stops.
-func Activate(p *profile.Profile, ctx profile.ExpandContext) (*Result, error) {
-	return ActivateWithContext(context.Background(), p, ctx)
-}
-
-// ActivateWithContext is like Activate but threads a context through to any
-// underlying long-running operations (compose up + wait_for polling).
+// ActivateWithContext brings up the frontend for p, threading a context
+// through to any underlying long-running operations (compose up + wait_for
+// polling). For kind=external, this writes the rendered config file. For
+// kind=docker-compose, this runs `docker compose up -d` and polls wait_for.
+// Callers must call Deactivate on the returned Result when the profile stops.
 func ActivateWithContext(reqCtx context.Context, p *profile.Profile, ctx profile.ExpandContext) (*Result, error) {
 	return activate(reqCtx, p, ctx, false)
 }

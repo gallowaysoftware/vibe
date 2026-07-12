@@ -20,7 +20,7 @@ func rootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "vibe",
 		Short:         "Task-oriented launcher for local AI inference.",
-		Long:          "vibe brings up a llama-server + frontend stack from a single YAML profile.",
+		Long:          "vibe brings up a model server (llama.cpp, tabbyAPI, ComfyUI, or any HTTP inference server) + frontend stack from a single YAML profile.",
 		Version:       buildinfo.String(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -42,6 +42,7 @@ func rootCmd() *cobra.Command {
 		doctorCmd(),
 		tuiCmd(),
 		profileCmd(),
+		backendCmd(),
 		tokenCmd(),
 	)
 	return root

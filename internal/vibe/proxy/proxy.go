@@ -169,14 +169,11 @@ func peekModel(r *http.Request) string {
 	return probe.Model
 }
 
-// serveAggregatedModels merges /v1/models from the default upstream and
-// every routed upstream into one list, deduped by model id. Returns
-// false (writing nothing) on any failure so the caller can fall back to
-// proxying /v1/models to the default upstream unchanged.
+// serveAggregatedModels merges /v1/models from the default upstream (if
+// any) and every routed upstream into one list, deduped by model id.
+// Returns false (writing nothing) on failure so the caller can fall back
+// to the default-upstream path (which 503s when there is no default).
 func (p *Proxy) serveAggregatedModels(w http.ResponseWriter, r *http.Request, def *backend) bool {
-	if def == nil {
-		return false
-	}
 	p.mu.RLock()
 	routes := make([]*backend, 0, len(p.routes))
 	for _, be := range p.routes {
@@ -215,13 +212,24 @@ func (p *Proxy) serveAggregatedModels(w http.ResponseWriter, r *http.Request, de
 		return nil
 	}
 
-	// The default upstream must succeed (it's the source of truth); a
-	// routed service that's mid-restart is skipped rather than fatal.
-	if err := add(def); err != nil {
-		return false
+	// When a default upstream exists it must succeed (it's the source of
+	// truth); a routed service that's mid-restart is skipped rather than
+	// fatal. With no default (service-mode backends only, no active
+	// profile), at least one routed upstream must answer — never serve an
+	// empty list that would hide models a restarted service will re-offer.
+	if def != nil {
+		if err := add(def); err != nil {
+			return false
+		}
 	}
+	ok := def != nil
 	for _, be := range routes {
-		_ = add(be)
+		if add(be) == nil {
+			ok = true
+		}
+	}
+	if !ok {
+		return false
 	}
 
 	out, err := json.Marshal(merged)

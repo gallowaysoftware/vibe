@@ -463,7 +463,7 @@ func runWithAudioRunner(e *Executor, runner audioRunner) error {
 		return fmt.Errorf("snapshot run inputs: %w", err)
 	}
 	e.registry = map[StageType]StageExecutor{
-		StageTypeText:  &textExecutor{inference: e.Inference},
+		StageTypeText:  &visionExecutor{inference: e.Inference},
 		StageTypeAudio: &audioExecutor{runner: runner},
 	}
 	// Use the same wave-scheduler the production Run does. We can't call

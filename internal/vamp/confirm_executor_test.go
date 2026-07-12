@@ -59,7 +59,7 @@ func TestConfirm_ExternalAccept(t *testing.T) {
 
 // TestConfirm_ExternalReject mirrors TestConfirm_ExternalAccept but writes
 // "rejected" into the response file. The stage must return an error that
-// satisfies IsConfirmRejection (so the caller can distinguish a user-
+// satisfies isConfirmRejection (so the caller can distinguish a user-
 // initiated rejection from an unexpected failure).
 func TestConfirm_ExternalReject(t *testing.T) {
 	runDir := t.TempDir()
@@ -90,7 +90,7 @@ func TestConfirm_ExternalReject(t *testing.T) {
 	if err == nil {
 		t.Fatal("Execute: expected error, got nil")
 	}
-	if !IsConfirmRejection(err) {
+	if !isConfirmRejection(err) {
 		t.Errorf("Execute error not a confirm rejection: %v", err)
 	}
 	if !errors.Is(err, errStageRejected) {
@@ -119,7 +119,7 @@ func TestConfirm_Timeout(t *testing.T) {
 	if err == nil {
 		t.Fatal("Execute: expected timeout error, got nil")
 	}
-	if !IsConfirmRejection(err) {
+	if !isConfirmRejection(err) {
 		t.Errorf("timeout should be reported as rejection: %v", err)
 	}
 	if elapsed > time.Second {
@@ -177,7 +177,7 @@ func TestConfirm_StdinReject(t *testing.T) {
 	if err == nil {
 		t.Fatal("Execute: expected rejection error")
 	}
-	if !IsConfirmRejection(err) {
+	if !isConfirmRejection(err) {
 		t.Errorf("Execute error not a confirm rejection: %v", err)
 	}
 }

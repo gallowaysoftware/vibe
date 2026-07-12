@@ -437,7 +437,7 @@ name: x
 backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
 frontend: {kind: external, template: {a: 1}}
 `,
-			wantErr: "write_file is required",
+			wantErr: "is required for kind=external",
 		},
 		{
 			name: "external missing template",
@@ -642,7 +642,7 @@ frontend:
   compose_file: /tmp/dc.yaml
   write_file: /tmp/x.json
 `,
-			wantErr: "write_file is only valid for kind=external",
+			wantErr: "write_file is only valid for kind=external or kind=managed",
 		},
 		{
 			name: "docker-compose rejects template",
@@ -654,7 +654,7 @@ frontend:
   compose_file: /tmp/dc.yaml
   template: {a: 1}
 `,
-			wantErr: "template is only valid for kind=external",
+			wantErr: "template is only valid for kind=external or kind=managed",
 		},
 		{
 			name: "docker-compose rejects mcps",
@@ -666,7 +666,7 @@ frontend:
   compose_file: /tmp/dc.yaml
   mcps: [datadog]
 `,
-			wantErr: "mcps is only valid for kind=external",
+			wantErr: "mcps is only valid for kind=external or kind=managed",
 		},
 		{
 			name: "docker-compose duplicate service",
@@ -732,6 +732,145 @@ frontend:
 `,
 			wantErr: `duplicate "datadog"`,
 		},
+		{
+			name: "docker-compose rejects write_files",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: docker-compose
+  compose_file: /tmp/dc.yaml
+  write_files:
+    - {path: /tmp/a.yml, template: {a: 1}}
+`,
+			wantErr: "write_files is only valid",
+		},
+		{
+			name: "managed write_files entry missing path",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: managed
+  binary: ` + stubManagedBinary(t) + `
+  write_files:
+    - {template: {a: 1}}
+`,
+			wantErr: "write_files[0].path is required",
+		},
+		{
+			name: "managed write_files entry missing template",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: managed
+  binary: ` + stubManagedBinary(t) + `
+  write_files:
+    - {path: /tmp/a.yml}
+`,
+			wantErr: "write_files[0].template is required",
+		},
+		{
+			name: "external write_files duplicate mcp",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: external
+  write_files:
+    - {path: /tmp/a.yml, template: {a: 1}, mcps: [datadog, datadog]}
+`,
+			wantErr: `write_files[0].mcps contains duplicate "datadog"`,
+		},
+		{
+			name: "managed rejects write_file without template",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: managed
+  binary: ` + stubManagedBinary(t) + `
+  write_file: /tmp/x.json
+`,
+			wantErr: "template is required when frontend.write_file is set",
+		},
+		{
+			name: "external rejects mcps without write_file",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: external
+  mcps: [datadog]
+  write_files:
+    - {path: /tmp/a.json, template: {a: 1}}
+`,
+			wantErr: "mcps requires frontend.write_file",
+		},
+		{
+			name: "write_files path duplicates legacy write_file",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: managed
+  binary: ` + stubManagedBinary(t) + `
+  write_file: /tmp/x/config.json
+  template: {a: 1}
+  write_files:
+    - {path: /tmp/x/config.json, template: {b: 2}}
+`,
+			wantErr: `write_files[0].path "/tmp/x/config.json" duplicates an earlier write target`,
+		},
+		{
+			name: "write_files internal duplicate path",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: external
+  write_files:
+    - {path: /tmp/a.json, template: {a: 1}}
+    - {path: /tmp/b/../a.json, template: {b: 2}}
+`,
+			wantErr: `write_files[1].path "/tmp/b/../a.json" duplicates an earlier write target`,
+		},
+		{
+			name: "write_files path cannot reference WRITE_FILE",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: external
+  write_files:
+    - {path: "${WRITE_FILE}.d/extra.json", template: {a: 1}}
+`,
+			wantErr: "write_files[0].path cannot reference ${WRITE_FILE}",
+		},
+		{
+			name: "write_file cannot reference WRITE_FILE",
+			yaml: `
+name: x
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  kind: external
+  write_file: "${WRITE_FILE}"
+  template: {a: 1}
+`,
+			wantErr: "frontend.write_file cannot reference ${WRITE_FILE}",
+		},
+		{
+			name: "service mode rejects url-only frontend",
+			yaml: `
+name: x
+mode: service
+backend: {llama_server: {path: ` + model + `, alias: x, context: 1024}}
+frontend:
+  url: "http://127.0.0.1:8080/"
+`,
+			wantErr: "cannot declare a frontend block",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -795,6 +934,72 @@ frontend:
 	}
 	if p.Frontend.Env["OLLAMA_API_URL"] != "${VIBE_API}" {
 		t.Errorf("env OLLAMA_API_URL = %q (should be the literal placeholder pre-expansion)", p.Frontend.Env["OLLAMA_API_URL"])
+	}
+}
+
+// TestLoad_WriteFiles covers a managed frontend that renders more than one
+// config file (oh-my-pi's models.yml + config.yml shape). It verifies the
+// list parses, ~/ paths are tilde-expanded while ${VAR} stays literal for
+// render-time expansion, and WriteFileSpecs surfaces the entries.
+func TestLoad_WriteFiles(t *testing.T) {
+	model := stubModelFile(t)
+	bin := stubManagedBinary(t)
+	yaml := `
+name: omp
+backend: {llama_server: {path: ` + model + `, alias: qwen, context: 1024}}
+frontend:
+  kind: managed
+  binary: ` + bin + `
+  args: [--model, vibe-local/qwen]
+  write_files:
+    - path: ${VIBE_STATE_DIR}/frontend/omp/models.yml
+      template: {providers: {vibe-local: {baseUrl: "${VIBE_API}"}}}
+    - path: ~/omp/config.yml
+      template: {modelRoles: {default: vibe-local/qwen}}
+`
+	p, err := Load(writeProfile(t, yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Frontend.WriteFiles) != 2 {
+		t.Fatalf("write_files len = %d, want 2", len(p.Frontend.WriteFiles))
+	}
+	// ${VIBE_STATE_DIR} is a render-time variable — it must stay literal at Load.
+	if p.Frontend.WriteFiles[0].Path != "${VIBE_STATE_DIR}/frontend/omp/models.yml" {
+		t.Errorf("write_files[0].path = %q (should be literal pre-expansion)", p.Frontend.WriteFiles[0].Path)
+	}
+	// ~/ is tilde-expanded at Load, like the other frontend path fields.
+	home, _ := os.UserHomeDir()
+	if !strings.HasPrefix(p.Frontend.WriteFiles[1].Path, home) {
+		t.Errorf("write_files[1].path = %q, want ~ expanded under %q", p.Frontend.WriteFiles[1].Path, home)
+	}
+	if specs := p.Frontend.WriteFileSpecs(); len(specs) != 2 {
+		t.Fatalf("WriteFileSpecs len = %d, want 2", len(specs))
+	}
+	if p.Frontend.IsZero() {
+		t.Error("IsZero = true for a populated write_files frontend")
+	}
+}
+
+// TestFrontend_WriteFileSpecs_Ordering asserts the legacy single-file form is
+// surfaced as the first (primary) spec, ahead of write_files entries, so
+// ${WRITE_FILE} and Result.WroteFile keep pointing at it.
+func TestFrontend_WriteFileSpecs_Ordering(t *testing.T) {
+	f := Frontend{
+		WriteFile:  "/legacy.json",
+		Template:   map[string]any{"a": 1},
+		MCPs:       []string{"datadog"},
+		WriteFiles: []WriteFileSpec{{Path: "/extra.yml", Template: map[string]any{"b": 2}}},
+	}
+	specs := f.WriteFileSpecs()
+	if len(specs) != 2 {
+		t.Fatalf("len = %d, want 2", len(specs))
+	}
+	if specs[0].Path != "/legacy.json" || specs[1].Path != "/extra.yml" {
+		t.Errorf("order = %q, %q; want legacy first", specs[0].Path, specs[1].Path)
+	}
+	if len(specs[0].MCPs) != 1 || specs[0].MCPs[0] != "datadog" {
+		t.Errorf("legacy mcps not carried into primary spec: %v", specs[0].MCPs)
 	}
 }
 
@@ -1067,7 +1272,7 @@ frontend:
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := p.ExpandTemplate(ExpandContext{
+	out, err := ExpandTemplate(p.Frontend.Template, ExpandContext{
 		VibeAPI:      "http://127.0.0.1:9000/v1",
 		ModelAlias:   "my-model",
 		ModelContext: 8192,
@@ -1109,7 +1314,7 @@ frontend:
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = p.ExpandTemplate(ExpandContext{})
+	_, err = ExpandTemplate(p.Frontend.Template, ExpandContext{})
 	if err == nil {
 		t.Fatal("expected error for unknown var")
 	}
@@ -1134,7 +1339,7 @@ frontend:
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := p.ExpandTemplate(ExpandContext{ModelAlias: "m", ModelContext: 1024})
+	out, err := ExpandTemplate(p.Frontend.Template, ExpandContext{ModelAlias: "m", ModelContext: 1024})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1399,5 +1604,37 @@ frontend:
 	}
 	if p.Frontend.Kind != FrontendExternal {
 		t.Errorf("Kind = %q, want %q", p.Frontend.Kind, FrontendExternal)
+	}
+}
+
+// TestLoad_RejectsUnknownFrontendField: the Legacy inline map hides typo'd
+// keys under frontend: from the KnownFields(true) decoder, so Load must
+// reject anything left in it after the deprecated app: key is stripped —
+// otherwise a misspelled optional field (writefiles: for write_files:) is a
+// fully silent no-op.
+func TestLoad_RejectsUnknownFrontendField(t *testing.T) {
+	model := stubModelFile(t)
+	yaml := `
+name: x
+backend:
+  llama_server:
+    path: ` + model + `
+    alias: x
+    context: 1024
+frontend:
+  kind: managed
+  binary: ` + stubManagedBinary(t) + `
+  writefiles:
+    - {path: /tmp/a.json, template: {a: 1}}
+`
+	_, err := Load(writeProfile(t, yaml))
+	if err == nil {
+		t.Fatal("expected error for typo'd frontend field")
+	}
+	if !strings.Contains(err.Error(), "writefiles") {
+		t.Errorf("err = %v, want mention of the typo'd key writefiles", err)
+	}
+	if !strings.Contains(err.Error(), "unknown frontend field") {
+		t.Errorf("err = %v, want unknown-frontend-field message", err)
 	}
 }

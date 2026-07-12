@@ -18,7 +18,7 @@ func rootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "vamp",
 		Short:         "Multi-stage AI pipeline orchestrator (drives vibe).",
-		Long:          "vamp runs a YAML pipeline against vibe, swapping profiles per stage based on a capability → profile mapping.",
+		Long:          "vamp runs a YAML pipeline against vibe, swapping backends per stage based on a capability → backend mapping (unmatched names fall back to profile activation).",
 		Version:       buildinfo.String(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -29,6 +29,7 @@ func rootCmd() *cobra.Command {
 		renderCmd(),
 		validateCmd(),
 		lintCmd(),
+		doctorCmd(),
 		listCmd(),
 		capabilitiesCmd(),
 		runsCmd(),

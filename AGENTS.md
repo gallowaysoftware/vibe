@@ -21,8 +21,9 @@ Two binaries from one Go module (`github.com/gallowaysoftware/vibe`):
 - **`vamp`** (`cmd/vamp`, `internal/vamp/`): pipeline orchestrator that
   drives `vibe`. A YAML pipeline declares stages (`text`, `comfyui`,
   `audio`, `ffmpeg`, `youtube`, `webhook`, `confirm`, `render`,
-  `compact`, `pandoc`) with a DAG of inputs; capability → profile
-  mapping lives in `$XDG_CONFIG_HOME/vamp/capabilities.yaml`.
+  `compact`, `pandoc`, `mix`, `short`) with a DAG of inputs;
+  capability → backend mapping (profile-name fallback) lives in
+  `$XDG_CONFIG_HOME/vamp/capabilities.yaml`.
 
 **`render` stage type.** Pure template → text without LLM invocation.
 Does not activate a vibe profile. Use for deterministic data
@@ -85,15 +86,33 @@ them before pushing.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.
-- Path fields (`backend.*.path`, `backend.*.dir`,
-  `backend.comfyui.python`, `backend.llama_server.binary`,
-  `backend.llama_server.mmproj`, `backend.llama_server.draft_model`,
-  `backend.tabby_api.model_dir`,
+- **`frontend.write_files: [{path, template, mcps}]`** renders multiple
+  config files per profile (split-config tools like oh-my-pi); valid
+  for kind=external and kind=managed. The legacy
+  write_file/template/mcps trio is treated as the first entry
+  (`Frontend.WriteFileSpecs`), whose resolved path backs
+  `${WRITE_FILE}`.
+- **Lifecycle hooks.** Top-level `hooks.pre_start` / `hooks.post_stop`
+  are lists of shell commands (each run via `sh -c` with the daemon's
+  environment). pre_start runs after the VRAM pre-flight and before
+  backend/frontend launch — a failure aborts the start. post_stop runs
+  best-effort after teardown — failures are logged and the remaining
+  hooks still run.
+- Backend path fields (`backend.llama_server.path`,
+  `backend.llama_server.binary`, `backend.llama_server.mmproj`,
+  `backend.llama_server.draft_model`, `backend.comfyui.dir`,
+  `backend.comfyui.python`, `backend.tabby_api.model_dir`,
   `backend.tabby_api.venv`, `backend.tabby_api.repo`,
-  `backend.tabby_api.draft_model_dir`, `frontend.workdir`,
-  `frontend.binary`, `frontend.write_file`, `frontend.compose_file`)
-  are tilde-expanded in `internal/vibe/profile/profile.go:Load`. Add
-  new path fields to that list.
+  `backend.tabby_api.draft_model_dir`, `backend.http_server.binary`,
+  and the host half of `backend.http_server.volumes` entries) are
+  tilde-expanded in `Backend.normalize()`
+  (`internal/vibe/profile/backend_def.go`) so inline and referenced
+  backends share the expansion. Frontend path fields
+  (`frontend.workdir`, `frontend.binary`, `frontend.write_file`,
+  `frontend.write_files[].path`, `frontend.compose_file`) are
+  tilde-expanded in `internal/vibe/profile/profile.go:Load`. Add new
+  backend path fields to `Backend.normalize()` and new frontend path
+  fields to `Load`.
 - **Vision models (mmproj).** `backend.llama_server.mmproj` is the
   path to the multimodal projector GGUF that llama-server loads via
   `--mmproj`. Required to enable image input on vision-capable
@@ -115,9 +134,11 @@ them before pushing.
   (unlike Qwen MTP, which is in-weights and needs no draft file).
   `huggingface.draft_file` pulls it from the same repo into the
   draft_model path (same `pullOne` flow as mmproj). `validateLlamaServer`
-  mirrors the mmproj rules and additionally **rejects a quantized
-  `cache_type_k/v` when `spec_type` is `draft-mtp`** — quantized KV gives
-  ~0% draft acceptance, so the speedup would silently vanish.
+  mirrors the mmproj rules and additionally **warns** (stderr,
+  non-fatal) on a quantized `cache_type_k/v` with `draft-mtp` —
+  quantized KV needs a llama.cpp build with PR #23398 (hadamard
+  rotation for quantized K); on older builds draft acceptance drops to
+  ~0%. Verify acceptance after start.
 - **Backends (reusable model specs).** A backend is a named model-server
   spec under `$XDG_CONFIG_HOME/vibe/backends/<name>.yaml` (`profile.BackendDef`
   = a `backend:` union + `estimated_vram_gb` + optional `mode`, no frontend).
@@ -223,7 +244,24 @@ them before pushing.
   (int arithmetic across nested template ranges; Go templates lack
   native arithmetic), `splitSentences(text, maxChars)` (JSON array of
   greedy-packed sentence chunks under maxChars — TTS-friendly chop
-  for long paragraphs that engines like Kokoro otherwise rush).
+  for long paragraphs that engines like Kokoro otherwise rush),
+  string helpers `slugify`, `contains`, `hasPrefix`, `hasSuffix`,
+  `lower`, `upper`, `trim`, `stripToHeading(text, prefix)` (drop any
+  preamble before the first line starting with prefix — e.g. leaked
+  reasoning before a `## ` heading), JSON-array helpers
+  `filterByField(field, json)` (keep items whose field is truthy),
+  `filterByValue(field, value, json)` (keep items whose field equals
+  value), `joinByField(field, left, right)` (relational join of two
+  `{"items":[...]}` arrays on a shared field — left items decorated
+  with matched right-side fields), web-source parsers `parseSearXNG`,
+  `parseWikipediaExtract`, `parseWikipediaSearch`, `parseArxiv`
+  (normalize each source's response into a compact result list —
+  check these before writing a new fetch-and-parse render stage),
+  and prose/TTS helpers `chunkParagraphs(text, maxChars)` (greedy
+  paragraph-boundary chop into `[{idx, text}]` JSON) and
+  `ttsNormalize(text, rulesPath)` (apply pronunciation-normalization
+  rules, defaults + optional rules file). The full registry with WHY
+  docs is `exec.go:templateFuncMap`.
 - **Concat WAVs.** `Stage.ConcatWavs` on an `ffmpeg` stage auto-globs
   all `*.wav` files, creates a concat list, and merges into the output
   MP3. Implemented in `ffmpeg_executor.go:executeConcatWavs`.
@@ -282,12 +320,14 @@ them before pushing.
   service whose setup_hint matches that exact shape. Disable with
   `--no-ensure-services`; the legacy 3-second-retry-then-fail-with-
   hint path still works behind the flag.
-- **`vamp lint` is the advisory layer.** Two checks today: webhook
+- **`vamp lint` is the advisory layer.** Four checks today: webhook
   URLs on loopback hosts must have a matching `RequireService`
   declaration; text stages with `output_format: json` must include
-  `"invalid_output"` in their `Retry.RetryOn` list. Exit code 0
+  `"invalid_output"` in their `Retry.RetryOn` list; trivial Retry
+  blocks (`MaxAttempts < 2` is a no-op); capabilities referenced but
+  missing from `CapabilityModelHints`. Exit code 0
   regardless of findings — lint is editorial, not gating. New checks
-  go in `internal/vamp/cli/cmd_lint.go` next to the existing two.
+  go in `internal/vamp/cli/cmd_lint.go` next to the existing four.
 
 ## Detach / job lifecycle
 
@@ -300,12 +340,12 @@ them before pushing.
   86db9b8 because of this trap.)
 - **`runs` is the single run noun.** History and live detached jobs are
   one surface: `vamp runs {ls,show,cancel,cleanup}`. `runs ls` derives a
-  `STATE` column per dir from the pid file (`vamp.JobStatus`); `runs
+  `STATE` column per dir from the pid file (`vamp.JobStateFor`); `runs
   show` overlays live pid/state via `FindJobByPrefix`; `runs cancel`
   reuses `runCancel`. `vamp jobs` is a hidden deprecated alias whose
   subcommands delegate to the same `runs*Cmd` constructors — don't add
   new behavior under `jobs`. The data layer (`jobs.go`: `ListJobs`,
-  `FindJobByPrefix`, `JobStatus`, `JobState`) is unchanged.
+  `FindJobByPrefix`, `JobState`) is unchanged.
 - **Run-targeting commands take an `<id-or-prefix>`.** `runs show`,
   `runs cancel`, `logs`, `confirm`, `diff`, and top-level `cancel` all
   resolve via `FindRunByPrefix`/`FindJobByPrefix` (path-shaped args work

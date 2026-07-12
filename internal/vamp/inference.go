@@ -141,8 +141,12 @@ func (c *ChatCompletion) Call(ctx context.Context, baseURL, model, prompt string
 // entries. imagePaths is a list of absolute paths to image files (.png, .jpg,
 // etc.) to include.
 func (c *ChatCompletion) CallMultimodal(ctx context.Context, baseURL, model, prompt string, imagePaths []string, params map[string]any, onToken StreamFunc) (string, error) {
-	if c.HTTPClient == nil {
-		c.HTTPClient = defaultInferenceClient()
+	// Read HTTPClient into a local instead of lazily initializing the shared
+	// field: concurrent foreach items call this on one ChatCompletion, and an
+	// unsynchronized read-check-write on the field is a data race.
+	client := c.HTTPClient
+	if client == nil {
+		client = defaultInferenceClient()
 	}
 	stream := onToken != nil
 
@@ -185,7 +189,7 @@ func (c *ChatCompletion) CallMultimodal(ctx context.Context, baseURL, model, pro
 		req.Header.Set("Accept", "text/event-stream")
 	}
 	start := time.Now()
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}

@@ -1512,7 +1512,13 @@ func (e *Executor) runWithRetry(ctx context.Context, st *Stage, exec StageExecut
 	// is eligible, compute the key and try Get before paying for the
 	// executor call. A cache miss falls through to the normal retry path
 	// below; a hit short-circuits with the cached payload.
-	cacheKey, _ := e.computeStageCacheKey(st, in.Item, in.ItemIdx)
+	cacheKey, keyErr := e.computeStageCacheKey(st, in.Item, in.ItemIdx)
+	if keyErr != nil && e.Cache != nil {
+		// A failed key computation silently disables both cache lookup and
+		// write for this stage; warn so "cache: miss on every run" is
+		// diagnosable. Only worth the noise when caching is actually on.
+		slog.Warn("cache key computation failed; caching disabled for stage", "stage", st.ID, "err", keyErr)
+	}
 	if hit, err := e.tryCacheGet(cacheKey); err != nil {
 		slog.Warn("cache get failed", "stage", st.ID, "key", cacheKey, "err", err)
 	} else if hit != nil {
@@ -1952,62 +1958,6 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.w.Write(p)
-}
-
-// textExecutor handles StageTypeText stages: render the prompt template, call
-// vibe's OpenAI-compatible inference endpoint with optional token streaming,
-// validate the JSON output_format if requested, and return the response.
-//
-// The inference function is held as a field rather than passed through
-// StageInput because (a) it's a stable per-Executor dependency, not per-stage
-// routing info, and (b) the StageInput.Vibe client is the gRPC control plane,
-// distinct from the OpenAI-compatible chat-completion HTTP client.
-type textExecutor struct {
-	inference InferenceFunc
-}
-
-func (t *textExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput, error) {
-	st := in.Stage
-	extra := map[string]any{
-		"pipeline_status": in.PipelineStatus,
-		"failure_summary": in.FailureSummary,
-	}
-	if st.Foreach != nil {
-		extra[st.Foreach.Var] = in.Item
-		extra["i"] = in.ItemIdx
-	}
-	prompt, err := renderPrompt(st, in.PipelineDir, in.Inputs, in.Prior, in.RunDir, extra)
-	if err != nil {
-		return nil, fmt.Errorf("render prompt: %w", err)
-	}
-
-	var onToken StreamFunc
-	if in.Log != nil {
-		onToken = func(delta string) {
-			_, _ = in.Log.Write([]byte(delta))
-		}
-	}
-	out, err := t.inference(ctx, in.BaseURL+"/v1", in.ModelID, prompt, st.Params, onToken)
-	if err != nil {
-		return nil, fmt.Errorf("inference: %w", err)
-	}
-	if in.Log != nil {
-		// Ensure the next status line starts on its own line after a
-		// live-streamed completion.
-		_, _ = in.Log.Write([]byte("\n"))
-	}
-
-	if st.OutputFormat == "json" {
-		cleaned, err := extractCleanJSON(out)
-		if err != nil {
-			return nil, fmt.Errorf("stage output is not valid JSON: %w", err)
-		}
-		// Replace the raw output with the extracted JSON so downstream
-		// stages reading {{ .stages.<id>.output }} see clean JSON, not
-		// the verbose preamble the LLM emitted before it.
-		out = cleaned
-	}
-	return &StageOutput{Text: out}, nil
 }
 
 // tryResumeStage attempts to load this stage's output(s) from the run dir
@@ -4290,8 +4240,9 @@ func validateJSON(s string) error {
 // extractCleanJSON returns the JSON payload from an LLM-produced string,
 // peeling off the wrappers and prose preamble LLMs add. Returns the
 // cleaned JSON string + nil error when extraction + parse both succeed.
-// Used by both validateJSON (output_format: json gate) and executeText
-// (so downstream stages see clean JSON, not the raw verbose output).
+// Used by both validateJSON (output_format: json gate) and
+// visionExecutor.Execute (so downstream stages see clean JSON, not the raw
+// verbose output).
 //
 // Handles, in order:
 //

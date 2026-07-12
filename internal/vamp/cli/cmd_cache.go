@@ -37,12 +37,16 @@ func cacheCmd() *cobra.Command {
 
 func cacheInfoCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "info <run-dir>",
+		Use:   "info <id-or-prefix>",
 		Short: "Show per-stage cache hit/miss for a specific pipeline run.",
-		Long: `info reads pipeline_timing.json from a finished run directory and
-prints, per stage: cache hit-or-miss, duration, and stage status.
-Useful for debugging "why did stage X re-run unexpectedly?" — the
-hit/miss field tells you whether the cache key matched.
+		Long: `info reads pipeline_timing.json from a finished run and prints,
+per stage: cache hit-or-miss, duration, and stage status. Useful for
+debugging "why did stage X re-run unexpectedly?" — the hit/miss field
+tells you whether the cache key matched.
+
+The run is named by id-or-prefix (the id ` + "`vamp run --detach`" + ` printed,
+resolved against $XDG_STATE_HOME/vamp/runs/) or a directory path — the
+same addressing as ` + "`vamp runs show`" + ` / ` + "`vamp logs`" + `.
 
 A "miss" means the executor recomputed the stage's output AND
 wrote it to the cache; the next run with the same key will hit.
@@ -52,9 +56,14 @@ bytes were used directly.
 Foreach stages report the parent's cache state; per-item caching
 is not surfaced here (see vamp cache ls for raw per-key entries).
 `,
-		Args: cobra.ExactArgs(1),
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeRunIDs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runCacheInfo(cmd, args[0])
+			r, err := vamp.FindRunByPrefix(vamp.RunsDir(), args[0])
+			if err != nil {
+				return renderLookupErr(cmd, err)
+			}
+			return runCacheInfo(cmd, r.Path)
 		},
 	}
 }

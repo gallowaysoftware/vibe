@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 )
 
 // ─── checkLlamaBinary ───────────────────────────────────────────────────────
@@ -240,18 +242,76 @@ func TestCheckProxyPort_DaemonHoldsIt(t *testing.T) {
 	}
 }
 
-// TestCheckCommonPorts_Smoke verifies the check runs without error and
-// returns one of the expected status/message shapes. We can't dictate
-// what's bound on the test runner so we accept both "all free" and
-// "in use" outputs; the test catches structural regressions only
-// (wrong Name field, panic, non-info-or-ok status).
-func TestCheckCommonPorts_Smoke(t *testing.T) {
+// setDoctorFixtureDirs points the XDG dirs at a fresh temp tree and
+// returns the (created) backends + profiles dirs, so checks that read
+// paths.BackendsDir()/paths.ProfilesDir() see a controlled inventory.
+func setDoctorFixtureDirs(t *testing.T) (backendsDir, profilesDir string) {
+	t.Helper()
+	tmp := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "c"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "s"))
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(tmp, "r"))
+	backendsDir = paths.BackendsDir()
+	profilesDir = paths.ProfilesDir()
+	for _, d := range []string{backendsDir, profilesDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return backendsDir, profilesDir
+}
+
+// TestCheckCommonPorts_DerivedFromDisk asserts the probe list comes from
+// the on-disk backend/profile inventory: a port declared in a backend
+// yaml and held by a live listener must be reported in-use, labeled with
+// the declaring file.
+func TestCheckCommonPorts_DerivedFromDisk(t *testing.T) {
+	backendsDir, _ := setDoctorFixtureDirs(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+	backend := fmt.Sprintf(`name: embed
+backend:
+  http_server:
+    image: ghcr.io/example/embed:latest
+    port: %d
+`, port)
+	if err := os.WriteFile(filepath.Join(backendsDir, "embed.yaml"), []byte(backend), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	r := checkCommonPorts()
 	if r.Name != "common ports" {
 		t.Errorf("Name = %q, want 'common ports'", r.Name)
 	}
-	if r.Status != statusOK && r.Status != statusInfo {
-		t.Errorf("Status = %v, want OK or INFO (got message: %q)", r.Status, r.Message)
+	if r.Status != statusInfo {
+		t.Fatalf("status = %v, want INFO (declared port is bound); msg=%q", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, fmt.Sprintf(":%d", port)) {
+		t.Errorf("message missing bound port %d: %q", port, r.Message)
+	}
+	if !strings.Contains(r.Message, "backend embed") {
+		t.Errorf("message missing declaring-file label: %q", r.Message)
+	}
+}
+
+func TestLoopbackPort(t *testing.T) {
+	cases := []struct {
+		url  string
+		want int
+	}{
+		{"http://127.0.0.1:8080/health", 8080},
+		{"http://localhost:14001/", 14001},
+		{"http://example.com:8080/", 0}, // non-loopback must not be probed
+		{"http://127.0.0.1/", 0},        // no explicit port
+		{"not a url", 0},
+	}
+	for _, c := range cases {
+		if got := loopbackPort(c.url); got != c.want {
+			t.Errorf("loopbackPort(%q) = %d, want %d", c.url, got, c.want)
+		}
 	}
 }
 
@@ -328,6 +388,118 @@ func TestCheckProfilesAt_AllInvalid(t *testing.T) {
 	r := checkProfilesAt(dir)
 	if r.Status != statusFail {
 		t.Fatalf("status = %v, want FAIL", r.Status)
+	}
+}
+
+// ─── backends ───────────────────────────────────────────────────────────────
+
+// TestCheckBackends_NoneSkipped asserts the check disappears entirely for
+// users who don't use the backends/ abstraction — no noise.
+func TestCheckBackends_NoneSkipped(t *testing.T) {
+	_, profilesDir := setDoctorFixtureDirs(t)
+	if _, ok := checkBackends(profilesDir); ok {
+		t.Fatal("expected ok=false when no backends are defined")
+	}
+}
+
+// TestCheckBackends_InvalidAndUnreferenced covers the check's two reasons
+// to exist: a broken backends/<name>.yaml (which otherwise only fails
+// mid-pipeline) and a valid backend no profile references (capability-only
+// target, invisible to checkProfilesAt).
+func TestCheckBackends_InvalidAndUnreferenced(t *testing.T) {
+	backendsDir, profilesDir := setDoctorFixtureDirs(t)
+	good := `name: embed
+backend:
+  http_server:
+    image: ghcr.io/example/embed:latest
+    port: 18099
+`
+	if err := os.WriteFile(filepath.Join(backendsDir, "embed.yaml"), []byte(good), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(backendsDir, "bad.yaml"), []byte("bogus: ::: bad"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, ok := checkBackends(profilesDir)
+	if !ok {
+		t.Fatal("expected ok=true when backends exist")
+	}
+	if r.Status != statusWarn {
+		t.Fatalf("status = %v, want WARN (invalid backend present); msg=%q", r.Status, r.Message)
+	}
+	for _, want := range []string{"embed", "bad", "capability-only"} {
+		if !strings.Contains(r.Message, want) {
+			t.Errorf("message missing %q: %q", want, r.Message)
+		}
+	}
+}
+
+// ─── docker ─────────────────────────────────────────────────────────────────
+
+// TestCheckDocker_SkippedWithoutDockerProfiles asserts machines with no
+// docker-using profiles see no output at all.
+func TestCheckDocker_SkippedWithoutDockerProfiles(t *testing.T) {
+	_, profilesDir := setDoctorFixtureDirs(t)
+	env := &doctorEnv{lookPath: func(string) (string, error) {
+		t.Fatal("lookPath should not be called when nothing needs docker")
+		return "", nil
+	}}
+	if _, ok := checkDockerForProfiles(context.Background(), env, profilesDir); ok {
+		t.Fatal("expected ok=false when nothing on disk needs docker")
+	}
+}
+
+// TestCheckDocker_WarnWhenMissing asserts a WARN (never FAIL) naming the
+// docker-needing definition when the docker CLI is absent.
+func TestCheckDocker_WarnWhenMissing(t *testing.T) {
+	backendsDir, profilesDir := setDoctorFixtureDirs(t)
+	backend := `name: tts
+backend:
+  http_server:
+    image: ghcr.io/example/tts:latest
+    port: 18098
+`
+	if err := os.WriteFile(filepath.Join(backendsDir, "tts.yaml"), []byte(backend), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env := &doctorEnv{lookPath: func(string) (string, error) { return "", errors.New("not found") }}
+	r, ok := checkDockerForProfiles(context.Background(), env, profilesDir)
+	if !ok {
+		t.Fatal("expected ok=true when a docker-mode backend exists")
+	}
+	if r.Status != statusWarn {
+		t.Fatalf("status = %v, want WARN", r.Status)
+	}
+	if !strings.Contains(r.Message, "backend tts") {
+		t.Errorf("message missing the docker-needing definition: %q", r.Message)
+	}
+}
+
+// TestCheckDocker_DaemonUnreachable asserts a present CLI whose daemon
+// doesn't answer `docker info` still degrades to WARN with the error.
+func TestCheckDocker_DaemonUnreachable(t *testing.T) {
+	backendsDir, profilesDir := setDoctorFixtureDirs(t)
+	backend := `name: tts
+backend:
+  http_server:
+    image: ghcr.io/example/tts:latest
+    port: 18098
+`
+	if err := os.WriteFile(filepath.Join(backendsDir, "tts.yaml"), []byte(backend), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env := &doctorEnv{
+		lookPath: func(string) (string, error) { return "/usr/bin/docker", nil },
+		run: func(context.Context, string, ...string) ([]byte, error) {
+			return nil, errors.New("cannot connect to the docker daemon")
+		},
+	}
+	r, ok := checkDockerForProfiles(context.Background(), env, profilesDir)
+	if !ok || r.Status != statusWarn {
+		t.Fatalf("ok=%v status=%v, want ok=true WARN; msg=%q", ok, r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "docker daemon") {
+		t.Errorf("message missing run error: %q", r.Message)
 	}
 }
 

@@ -21,7 +21,8 @@ func stopCmd() *cobra.Command {
 Service-mode profiles run as concurrent sidecars (searxng, embedding
 servers, TTS engines). Each must be addressed by name since multiple
 can be running at once — there's no single "active service".`,
-		Args: cobra.MaximumNArgs(1),
+		Args:              cobra.MaximumNArgs(1),
+		ValidArgsFunction: completeProfileNames,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {

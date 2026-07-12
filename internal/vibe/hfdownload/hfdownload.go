@@ -23,15 +23,6 @@ type Spec struct {
 	Revision string // optional, default "main"
 }
 
-// URL is the public HF resolve endpoint for the file.
-func (s Spec) URL() string {
-	rev := s.Revision
-	if rev == "" {
-		rev = "main"
-	}
-	return fmt.Sprintf("https://huggingface.co/%s/resolve/%s/%s", s.Repo, rev, s.File)
-}
-
 // ProgressFunc is called with (downloaded, total) bytes. total is -1 if HF
 // didn't return a Content-Length. Callbacks are best-effort; the downloader
 // throttles to roughly once every 250ms.
@@ -90,9 +81,12 @@ func Download(ctx context.Context, spec Spec, destPath string, progress Progress
 	// First: if the file exists locally, try to verify against HF metadata.
 	// If HEAD succeeds and sizes match, we're done. If HEAD fails (e.g.
 	// gated repo without auth), trust the local file rather than pretending
-	// we need to redownload something we can't even check. Cached paths
-	// deliberately do NOT call progress — the caller distinguishes "cached"
-	// vs "downloaded" by whether bytes flowed.
+	// we need to redownload something we can't even check. Trusting is
+	// sound because destPath only ever holds completed downloads: the
+	// direct path stages to a .partial sibling and renames on completion,
+	// and the hf CLI writes .incomplete files with the same rename-at-end
+	// invariant. Cached paths deliberately do NOT call progress — the
+	// caller distinguishes "cached" vs "downloaded" by whether bytes flowed.
 	if info, err := os.Stat(destPath); err == nil && info.Size() > 0 {
 		total, herr := HeadSize(ctx, spec)
 		switch {
@@ -120,16 +114,34 @@ func download(ctx context.Context, hc *http.Client, spec Spec, destPath string, 
 		return fmt.Errorf("head: %w", err)
 	}
 
-	var resumeFrom int64
 	if info, err := os.Stat(destPath); err == nil {
+		if total > 0 && info.Size() == total {
+			report(progress, total, total)
+			return nil
+		}
+		// Wrong size at destPath: redownload into the staging file and let
+		// the final rename replace it.
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	// Stage into a .partial sibling and rename onto destPath only after the
+	// size check passes, so an interrupted pull never leaves a truncated
+	// file where Download's HEAD-failed branch would trust it as complete.
+	partialPath := destPath + ".partial"
+	var resumeFrom int64
+	if info, err := os.Stat(partialPath); err == nil {
 		switch {
 		case total > 0 && info.Size() == total:
+			if err := os.Rename(partialPath, destPath); err != nil {
+				return fmt.Errorf("promote partial: %w", err)
+			}
 			report(progress, total, total)
 			return nil
 		case total > 0 && info.Size() > total:
 			// Local is somehow bigger than remote — assume corruption, start over.
-			if err := os.Remove(destPath); err != nil {
-				return fmt.Errorf("remove oversized local: %w", err)
+			if err := os.Remove(partialPath); err != nil {
+				return fmt.Errorf("remove oversized partial: %w", err)
 			}
 		case total > 0 && info.Size() < total:
 			resumeFrom = info.Size()
@@ -160,7 +172,7 @@ func download(ctx context.Context, hc *http.Client, spec Spec, destPath string, 
 	// If the server didn't honor Range (returned 200 instead of 206), restart.
 	if resumeFrom > 0 && resp.StatusCode == http.StatusOK {
 		resumeFrom = 0
-		_ = os.Remove(destPath)
+		_ = os.Remove(partialPath)
 	}
 
 	flag := os.O_CREATE | os.O_WRONLY
@@ -169,22 +181,29 @@ func download(ctx context.Context, hc *http.Client, spec Spec, destPath string, 
 	} else {
 		flag |= os.O_TRUNC
 	}
-	f, err := os.OpenFile(destPath, flag, 0o644)
+	f, err := os.OpenFile(partialPath, flag, 0o644)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	downloaded := resumeFrom
 	report(progress, downloaded, total)
 
 	r := &reportingReader{r: resp.Body, downloaded: &downloaded, total: total, progress: progress, lastReport: time.Now()}
 	if _, err := io.Copy(f, r); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	report(progress, downloaded, total) // ensure a final callback at completion
 	if total > 0 && downloaded != total {
+		// Leave the partial in place so the next attempt resumes from here.
 		return fmt.Errorf("downloaded %d, expected %d", downloaded, total)
+	}
+	if err := os.Rename(partialPath, destPath); err != nil {
+		return fmt.Errorf("promote partial: %w", err)
 	}
 	return nil
 }

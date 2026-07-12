@@ -24,6 +24,9 @@ func pullCmd() *cobra.Command {
 			if ctx == nil {
 				ctx = context.Background()
 			}
+			if _, _, err := loadLocalProfile(args[0]); err != nil {
+				return err
+			}
 			if err := ensureDaemon(ctx); err != nil {
 				return err
 			}

@@ -27,32 +27,21 @@ type composeDriver struct {
 	// production uses execCommand which shells out for real.
 	runCommand func(ctx context.Context, name string, args []string, env []string) error
 
-	// probeURL issues a single GET against url and returns the response
-	// status code. The default uses net/http.
-	probeURL func(ctx context.Context, url string) (int, error)
-
-	// now is wired so tests can advance time deterministically; defaults
-	// to time.Now.
-	now func() time.Time
-
-	// defaultTimeout is applied when a wait_for entry has no explicit
-	// timeout. 60s matches the spec's example.
-	defaultTimeout time.Duration
-
-	// pollInterval is the gap between wait_for polls. Small, but tests
-	// can override via withInterval if they need to spin faster.
-	pollInterval time.Duration
+	waitPoller
 }
 
 // defaultCompose returns a composeDriver configured for production: it
 // shells out to `docker` and polls URLs with net/http.
 func defaultCompose() *composeDriver {
 	return &composeDriver{
-		runCommand:     execCommand,
-		probeURL:       httpProbe,
-		now:            time.Now,
-		defaultTimeout: 60 * time.Second,
-		pollInterval:   500 * time.Millisecond,
+		runCommand: execCommand,
+		waitPoller: waitPoller{
+			driver:         "compose",
+			probeURL:       httpProbe,
+			now:            time.Now,
+			defaultTimeout: 60 * time.Second,
+			pollInterval:   500 * time.Millisecond,
+		},
 	}
 }
 
@@ -232,29 +221,54 @@ func envMapToSlice(env map[string]string) []string {
 	return out
 }
 
+// waitPoller is the wait_for readiness loop shared by the compose and
+// managed drivers via embedding. probeURL and now are injectable so tests
+// can fake network probes and time without either driver spawning anything.
+type waitPoller struct {
+	// driver names the embedding driver in log lines ("compose" |
+	// "managed") so a ready log still says which lifecycle produced it.
+	driver string
+
+	// probeURL issues a single GET against url and returns the response
+	// status code. The default uses net/http (httpProbe).
+	probeURL func(ctx context.Context, url string) (int, error)
+
+	// now is wired so tests can advance time deterministically; defaults
+	// to time.Now.
+	now func() time.Time
+
+	// defaultTimeout is applied when a wait_for entry has no explicit
+	// timeout. 60s matches the spec's example.
+	defaultTimeout time.Duration
+
+	// pollInterval is the gap between wait_for polls. Small, but tests
+	// can override if they need to spin faster.
+	pollInterval time.Duration
+}
+
 // waitForReady polls each wait_for URL until it returns 2xx or its timeout
 // (or reqCtx) expires. URLs are polled sequentially: the spec is small,
 // real frontends typically expose only one or two endpoints, and
 // sequential polling keeps the error message unambiguous about which URL
 // failed.
-func (c *composeDriver) waitForReady(reqCtx context.Context, urls []profile.WaitForURL) error {
-	for _, w := range urls {
-		timeout := w.Timeout
+func (w *waitPoller) waitForReady(reqCtx context.Context, urls []profile.WaitForURL) error {
+	for _, u := range urls {
+		timeout := u.Timeout
 		if timeout <= 0 {
-			timeout = c.defaultTimeout
+			timeout = w.defaultTimeout
 		}
-		if err := c.pollURL(reqCtx, w.URL, timeout); err != nil {
+		if err := w.pollURL(reqCtx, u.URL, timeout); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// pollURL hits url at c.pollInterval cadence until it answers with a 2xx
+// pollURL hits url at w.pollInterval cadence until it answers with a 2xx
 // status, or deadline / reqCtx fires. Non-2xx responses and transport
 // errors are treated equivalently — the service may still be starting up.
-func (c *composeDriver) pollURL(reqCtx context.Context, url string, timeout time.Duration) error {
-	deadline := c.now().Add(timeout)
+func (w *waitPoller) pollURL(reqCtx context.Context, url string, timeout time.Duration) error {
+	deadline := w.now().Add(timeout)
 	var lastStatus int
 	var lastErr error
 	for {
@@ -265,32 +279,32 @@ func (c *composeDriver) pollURL(reqCtx context.Context, url string, timeout time
 		// and a 5s ceiling, so a stuck request can't outlast the deadline.
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return composeWaitErr(url, lastStatus, lastErr)
+			return waitErr(url, lastStatus, lastErr)
 		}
-		probeCtx, cancel := context.WithTimeout(reqCtx, minDuration(remaining, 5*time.Second))
-		status, err := c.probeURL(probeCtx, url)
+		probeCtx, cancel := context.WithTimeout(reqCtx, min(remaining, 5*time.Second))
+		status, err := w.probeURL(probeCtx, url)
 		cancel()
 		if err == nil && status >= 200 && status < 300 {
-			slog.Info("frontend compose: wait_for ready", "url", url)
+			slog.Info("frontend "+w.driver+": wait_for ready", "url", url)
 			return nil
 		}
 		lastStatus = status
 		lastErr = err
-		if c.now().After(deadline) {
-			return composeWaitErr(url, lastStatus, lastErr)
+		if w.now().After(deadline) {
+			return waitErr(url, lastStatus, lastErr)
 		}
 		// Sleep with cancellation awareness.
 		select {
 		case <-reqCtx.Done():
 			return fmt.Errorf("wait_for %s: %w", url, reqCtx.Err())
-		case <-time.After(c.pollInterval):
+		case <-time.After(w.pollInterval):
 		}
 	}
 }
 
-// composeWaitErr formats a wait_for-failed error including the most recent
+// waitErr formats a wait_for-failed error including the most recent
 // observation so logs are actionable.
-func composeWaitErr(url string, status int, lastErr error) error {
+func waitErr(url string, status int, lastErr error) error {
 	if lastErr != nil {
 		return fmt.Errorf("wait_for %s: timeout (last err: %v)", url, lastErr)
 	}
@@ -298,11 +312,4 @@ func composeWaitErr(url string, status int, lastErr error) error {
 		return fmt.Errorf("wait_for %s: timeout (last status: %d)", url, status)
 	}
 	return fmt.Errorf("wait_for %s: timeout", url)
-}
-
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
 }

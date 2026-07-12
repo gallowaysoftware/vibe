@@ -90,7 +90,10 @@ See [`AGENTS.md`](AGENTS.md) "vibe profile schema rules" — the
 discriminator is sub-block presence under `backend:`, not a `kind:`
 field. Mirror the existing `LlamaServer` / `ComfyUI` shape in
 `internal/vibe/profile/profile.go` and add a `LaunchSpec` builder
-following `internal/vibe/profile/spec_*.go`.
+in `internal/vibe/profile/launch.go` following the existing
+`LlamaServerSpec` / `TabbyAPISpec` / `HTTPServerSpec` / `ComfyUISpec`
+builders. Tilde-expand any new path fields in `Backend.normalize()`
+(`internal/vibe/profile/backend_def.go`), not in `Load`.
 
 ## Releases
 

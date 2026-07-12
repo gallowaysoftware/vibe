@@ -4,9 +4,12 @@ package profile
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -59,6 +62,13 @@ type Profile struct {
 	// Hooks are shell commands run around this profile's lifecycle (see the
 	// Hooks type). Empty by default — a no-op for every existing profile.
 	Hooks Hooks `yaml:"hooks,omitempty"`
+
+	// modeInheritedFrom records the backend_ref that supplied Mode when the
+	// profile didn't set one, so mode-related validation errors can point at
+	// the backend file — grepping the profile for the mode finds nothing.
+	// Unexported: never serialized (the REPLACE- re-marshal check in Validate
+	// ignores it too).
+	modeInheritedFrom string
 }
 
 // Hooks are shell commands vibe runs around a profile's lifecycle, each via
@@ -394,6 +404,14 @@ type Frontend struct {
 	Template        map[string]any    `yaml:"template,omitempty"`
 	Env             map[string]string `yaml:"env,omitempty"`
 	MCPs            []string          `yaml:"mcps,omitempty"`
+	// WriteFiles renders more than one config file from a single profile.
+	// A frontend whose tool splits configuration across files (e.g.
+	// oh-my-pi's models.yml for providers + config.yml for model roles)
+	// lists them here instead of the single write_file/template pair.
+	// Legacy write_file/template/mcps still work and are treated as the
+	// first entry (see WriteFileSpecs). Valid for kind=external and
+	// kind=managed.
+	WriteFiles []WriteFileSpec `yaml:"write_files,omitempty"`
 	// URL is the address the user should point their browser at once
 	// the frontend is up. Optional: when unset, the daemon falls back
 	// to the wait_for entry whose URL path is "/" (the conventional
@@ -415,16 +433,36 @@ type Frontend struct {
 	Args    []string `yaml:"args,omitempty"`
 	Workdir string   `yaml:"workdir,omitempty"`
 
-	// Legacy collects YAML keys we no longer model but used to. The inline
-	// map lets the KnownFields(true) decoder accept these legacy fields
-	// without erroring — they're recognized by the parent decoder as
-	// "claimed" by this map. Currently only `app:` (a purely cosmetic
-	// display string the daemon would echo back) lands here; on Load we
-	// log a one-line deprecation hint when the key is present so users
-	// know it can be removed at their leisure. Genuine typos under
-	// `frontend:` will still be caught at the daemon's first attempt to
-	// use the value, so the strictness loss is bounded.
+	// Legacy exists solely to accept the deprecated `app:` key (a purely
+	// cosmetic display string the daemon would echo back) so on-disk YAMLs
+	// written before it was dropped still parse. The inline map means the
+	// KnownFields(true) decoder can't see typos under `frontend:` — every
+	// unknown key lands here — so Load strips `app:` and rejects anything
+	// else with a hard error, restoring the strictness the inline map costs.
 	Legacy map[string]any `yaml:",inline"`
+}
+
+// WriteFileSpec is one templated config file a frontend renders. Path is the
+// destination (with ${VAR} expansion + ~/ handling); Template is the object
+// rendered to it; MCPs (optional) are merged into the rendered template under
+// a top-level "mcp" key, same as the legacy single-file frontend.mcps.
+type WriteFileSpec struct {
+	Path     string         `yaml:"path"`
+	Template map[string]any `yaml:"template,omitempty"`
+	MCPs     []string       `yaml:"mcps,omitempty"`
+}
+
+// WriteFileSpecs returns the config files this frontend renders as a single
+// ordered list: the legacy single-file form (write_file + template + mcps)
+// first when set, then any write_files entries. Render and validation walk
+// this so the two input shapes share one code path. The first entry is the
+// "primary" file whose resolved path backs ${WRITE_FILE} and Result.WroteFile.
+func (f Frontend) WriteFileSpecs() []WriteFileSpec {
+	var specs []WriteFileSpec
+	if f.WriteFile != "" {
+		specs = append(specs, WriteFileSpec{Path: f.WriteFile, Template: f.Template, MCPs: f.MCPs})
+	}
+	return append(specs, f.WriteFiles...)
 }
 
 // WaitForURL describes a health-check endpoint the docker-compose driver
@@ -509,8 +547,9 @@ func Load(path string) (*Profile, error) {
 		if p.EstimatedVRAMGB == 0 {
 			p.EstimatedVRAMGB = def.EstimatedVRAMGB
 		}
-		if p.Mode == "" {
+		if p.Mode == "" && def.Mode != "" {
 			p.Mode = def.Mode
+			p.modeInheritedFrom = p.BackendRef
 		}
 	}
 	p.Backend.normalize()
@@ -518,17 +557,28 @@ func Load(path string) (*Profile, error) {
 	p.Frontend.Binary = expandTilde(p.Frontend.Binary)
 	p.Frontend.Workdir = expandTilde(p.Frontend.Workdir)
 	p.Frontend.ComposeFile = expandTilde(p.Frontend.ComposeFile)
+	for i := range p.Frontend.WriteFiles {
+		p.Frontend.WriteFiles[i].Path = expandTilde(p.Frontend.WriteFiles[i].Path)
+	}
 
 	// `app:` used to be a cosmetic display field; it's been removed from
 	// the schema but still appears in older user profiles on disk. Strip
 	// it from Legacy so it doesn't leak into IsZero or any other consumer
-	// that walks the map. Other legacy keys (if any future migration adds
-	// them) stay in the map so an explicit handler can decide what to do.
+	// that walks the map. Anything else that landed in Legacy is a typo the
+	// inline map hid from the KnownFields(true) decoder — reject it here so
+	// a misspelled optional field (e.g. writefiles:) fails loudly instead of
+	// silently doing nothing.
 	if len(p.Frontend.Legacy) > 0 {
 		delete(p.Frontend.Legacy, "app")
-		if len(p.Frontend.Legacy) == 0 {
-			p.Frontend.Legacy = nil
+		if len(p.Frontend.Legacy) > 0 {
+			keys := make([]string, 0, len(p.Frontend.Legacy))
+			for k := range p.Frontend.Legacy {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			return nil, fmt.Errorf("parse profile %s: unknown frontend field(s) %v (did you mean write_files?)", path, keys)
 		}
+		p.Frontend.Legacy = nil
 	}
 
 	if err := p.Validate(); err != nil {
@@ -575,12 +625,22 @@ func (p *Profile) validateMode() error {
 	case ModeActive, ModeService:
 		// ok
 	default:
-		return fmt.Errorf("mode %q is not recognised (expected %q or %q)", p.Mode, ModeActive, ModeService)
+		return fmt.Errorf("mode %q is not recognised (expected %q or %q)%s", p.Mode, ModeActive, ModeService, p.modeInheritedHint())
 	}
 	if p.ResolvedMode() == ModeService && !p.Frontend.IsZero() {
-		return errors.New("mode: service profiles cannot declare a frontend block (services are sidecars; the frontend path is for active-mode profiles only)")
+		return fmt.Errorf("mode: service profiles cannot declare a frontend block (services are sidecars; the frontend path is for active-mode profiles only)%s", p.modeInheritedHint())
 	}
 	return nil
+}
+
+// modeInheritedHint points mode-validation errors at the backend def that
+// supplied the mode. Without it the user greps their profile for the mode,
+// finds nothing, and has no pointer to the backends/<ref>.yaml that set it.
+func (p *Profile) modeInheritedHint() string {
+	if p.modeInheritedFrom == "" {
+		return ""
+	}
+	return fmt.Sprintf("; mode %q was inherited from backend_ref %q", p.Mode, p.modeInheritedFrom)
 }
 
 func (p *Profile) validateBackend() error {
@@ -684,15 +744,8 @@ func validateLlamaServer(m *LlamaServerBackend) error {
 		return errors.New("backend.llama_server.context must be > 0")
 	}
 	if m.Binary != "" {
-		info, err := os.Stat(m.Binary)
-		if err != nil {
-			return fmt.Errorf("backend.llama_server.binary %s: %w", m.Binary, err)
-		}
-		if info.IsDir() {
-			return fmt.Errorf("backend.llama_server.binary %s: is a directory", m.Binary)
-		}
-		if info.Mode().Perm()&0o111 == 0 {
-			return fmt.Errorf("backend.llama_server.binary %s: not executable (mode %v)", m.Binary, info.Mode().Perm())
+		if err := validateExecutable("backend.llama_server.binary", m.Binary); err != nil {
+			return err
 		}
 	}
 	if m.Huggingface != nil && m.Huggingface.MMProjFile != "" && m.MMProj == "" {
@@ -732,7 +785,8 @@ func validateLlamaServer(m *LlamaServerBackend) error {
 			specType = "draft-mtp"
 		}
 		if specType == "draft-mtp" && (isQuantizedKV(m.CacheTypeK) || isQuantizedKV(m.CacheTypeV)) {
-			fmt.Fprintf(os.Stderr, "warning: profile %q uses a quantized KV cache with draft-mtp — needs llama.cpp >= PR #23398 (hadamard rotn for quantized K) or draft acceptance drops to ~0%%. Verify acceptance after start.\n", m.Alias)
+			slog.Warn("quantized KV cache with draft-mtp: needs llama.cpp >= PR #23398 (hadamard rotation for quantized K) or draft acceptance drops to ~0%; verify acceptance after start",
+				"alias", m.Alias, "cache_type_k", m.CacheTypeK, "cache_type_v", m.CacheTypeV)
 		}
 	}
 	return nil
@@ -817,69 +871,36 @@ func (p *Profile) validateFrontend() error {
 	// Llama-server profiles still require a frontend block (Phase 1 behavior).
 	switch p.Frontend.Kind {
 	case FrontendExternal:
-		if p.Frontend.WriteFile == "" {
-			return errors.New("frontend.write_file is required for kind=external")
+		if p.Frontend.WriteFile == "" && len(p.Frontend.WriteFiles) == 0 {
+			return errors.New("frontend.write_file (or frontend.write_files) is required for kind=external")
 		}
-		if len(p.Frontend.Template) == 0 {
-			return errors.New("frontend.template is required for kind=external")
+		if p.Frontend.WriteFile != "" && len(p.Frontend.Template) == 0 {
+			return errors.New("frontend.template is required when frontend.write_file is set")
 		}
-		if p.Frontend.ComposeFile != "" {
-			return errors.New("frontend.compose_file is only valid for kind=docker-compose")
+		if p.Frontend.WriteFile == "" && len(p.Frontend.Template) > 0 {
+			return errors.New("frontend.template requires frontend.write_file (for multiple files use frontend.write_files[].template)")
 		}
-		if p.Frontend.ProjectName != "" {
-			return errors.New("frontend.project_name is only valid for kind=docker-compose")
+		if len(p.Frontend.MCPs) > 0 && p.Frontend.WriteFile == "" {
+			return errors.New("frontend.mcps requires frontend.write_file (for write_files entries use write_files[].mcps)")
 		}
-		if len(p.Frontend.Services) > 0 {
-			return errors.New("frontend.services is only valid for kind=docker-compose")
+		if err := validateWriteFileSpecs(p.Frontend); err != nil {
+			return err
 		}
-		if len(p.Frontend.WaitFor) > 0 {
-			return errors.New("frontend.wait_for is only valid for kind=docker-compose")
-		}
-		if p.Frontend.Binary != "" {
-			return errors.New("frontend.binary is only valid for kind=managed")
-		}
-		if len(p.Frontend.Args) > 0 {
-			return errors.New("frontend.args is only valid for kind=managed")
-		}
-		if p.Frontend.Workdir != "" {
-			return errors.New("frontend.workdir is only valid for kind=managed")
+		if err := p.Frontend.rejectFieldsNotFor(FrontendExternal); err != nil {
+			return err
 		}
 	case FrontendDockerCompose:
 		if p.Frontend.ComposeFile == "" {
 			return errors.New("frontend.compose_file is required for kind=docker-compose")
 		}
-		if p.Frontend.WriteFile != "" {
-			return errors.New("frontend.write_file is only valid for kind=external")
+		if err := p.Frontend.rejectFieldsNotFor(FrontendDockerCompose); err != nil {
+			return err
 		}
-		if len(p.Frontend.Template) > 0 {
-			return errors.New("frontend.template is only valid for kind=external")
+		if err := uniqueNonEmpty("frontend.services", p.Frontend.Services); err != nil {
+			return err
 		}
-		if len(p.Frontend.MCPs) > 0 {
-			return errors.New("frontend.mcps is only valid for kind=external")
-		}
-		if p.Frontend.Binary != "" {
-			return errors.New("frontend.binary is only valid for kind=managed")
-		}
-		if len(p.Frontend.Args) > 0 {
-			return errors.New("frontend.args is only valid for kind=managed")
-		}
-		if p.Frontend.Workdir != "" {
-			return errors.New("frontend.workdir is only valid for kind=managed")
-		}
-		seenSvc := make(map[string]struct{}, len(p.Frontend.Services))
-		for _, s := range p.Frontend.Services {
-			if s == "" {
-				return errors.New("frontend.services contains empty entry")
-			}
-			if _, dup := seenSvc[s]; dup {
-				return fmt.Errorf("frontend.services contains duplicate %q", s)
-			}
-			seenSvc[s] = struct{}{}
-		}
-		for i, w := range p.Frontend.WaitFor {
-			if w.URL == "" {
-				return fmt.Errorf("frontend.wait_for[%d].url is required", i)
-			}
+		if err := validateWaitFor(p.Frontend.WaitFor); err != nil {
+			return err
 		}
 	case FrontendManaged:
 		if p.Frontend.Binary == "" {
@@ -889,38 +910,26 @@ func (p *Profile) validateFrontend() error {
 		// need both a config file rendered AND a binary spawned, so the
 		// managed driver reuses external's config-write step. If you don't
 		// need a config file, just omit those fields.
+		if p.Frontend.WriteFile != "" && len(p.Frontend.Template) == 0 {
+			return errors.New("frontend.template is required when frontend.write_file is set")
+		}
 		if len(p.Frontend.Template) > 0 && p.Frontend.WriteFile == "" {
 			return errors.New("frontend.template requires frontend.write_file")
 		}
 		if len(p.Frontend.MCPs) > 0 && p.Frontend.WriteFile == "" {
-			return errors.New("frontend.mcps requires frontend.write_file (the MCPs are merged into the rendered template)")
+			return errors.New("frontend.mcps requires frontend.write_file (for write_files entries use write_files[].mcps)")
 		}
-		if p.Frontend.ComposeFile != "" {
-			return errors.New("frontend.compose_file is only valid for kind=docker-compose")
+		if err := validateWriteFileSpecs(p.Frontend); err != nil {
+			return err
 		}
-		if p.Frontend.ProjectName != "" {
-			return errors.New("frontend.project_name is only valid for kind=docker-compose")
+		if err := p.Frontend.rejectFieldsNotFor(FrontendManaged); err != nil {
+			return err
 		}
-		if len(p.Frontend.Services) > 0 {
-			return errors.New("frontend.services is only valid for kind=docker-compose")
+		if err := validateExecutable("frontend.binary", p.Frontend.Binary); err != nil {
+			return err
 		}
-		info, err := os.Stat(p.Frontend.Binary)
-		if err != nil {
-			return fmt.Errorf("frontend.binary %s: %w", p.Frontend.Binary, err)
-		}
-		if info.IsDir() {
-			return fmt.Errorf("frontend.binary %s: is a directory", p.Frontend.Binary)
-		}
-		// Require any executable bit (owner, group, or other) to be set so we
-		// fail validation rather than failing at exec time with a confusing
-		// "permission denied".
-		if info.Mode().Perm()&0o111 == 0 {
-			return fmt.Errorf("frontend.binary %s: not executable (mode %v)", p.Frontend.Binary, info.Mode().Perm())
-		}
-		for i, w := range p.Frontend.WaitFor {
-			if w.URL == "" {
-				return fmt.Errorf("frontend.wait_for[%d].url is required", i)
-			}
+		if err := validateWaitFor(p.Frontend.WaitFor); err != nil {
+			return err
 		}
 	case "":
 		return errors.New("frontend.kind is required")
@@ -928,40 +937,149 @@ func (p *Profile) validateFrontend() error {
 		return fmt.Errorf("frontend.kind %q is unknown (expected: external, docker-compose, managed)", p.Frontend.Kind)
 	}
 
-	if len(p.Frontend.MCPs) > 0 {
-		// mcps are valid for kind=external and kind=managed (both render a
-		// config file the MCPs merge into). docker-compose already rejected
-		// them in its own branch above, so only those two kinds reach here.
-		seen := make(map[string]struct{}, len(p.Frontend.MCPs))
-		for _, name := range p.Frontend.MCPs {
-			if _, dup := seen[name]; dup {
-				return fmt.Errorf("frontend.mcps contains duplicate %q", name)
-			}
-			seen[name] = struct{}{}
+	// mcps are valid for kind=external and kind=managed (both render a
+	// config file the MCPs merge into). docker-compose already rejected
+	// them in its own branch above, so only those two kinds reach here.
+	return uniqueNonEmpty("frontend.mcps", p.Frontend.MCPs)
+}
+
+// Kind sets for rejectFieldsNotFor: which frontend kinds accept a field.
+var (
+	kindsConfigWriting = map[string]bool{FrontendExternal: true, FrontendManaged: true}
+	kindsComposeOnly   = map[string]bool{FrontendDockerCompose: true}
+	kindsSupervised    = map[string]bool{FrontendDockerCompose: true, FrontendManaged: true}
+	kindsManagedOnly   = map[string]bool{FrontendManaged: true}
+)
+
+// rejectFieldsNotFor errors when a kind-specific field is set on a frontend
+// of a different kind. Each field is registered once with the kinds that
+// accept it, so a new frontend field means one table entry instead of a
+// rejection check copy-pasted into every other kind's branch — missing one
+// of those silently accepted an ignored field. Messages are stored verbatim
+// so the user-facing text stays stable. Called after each kind's
+// required-field checks so error precedence is unchanged (a docker-compose
+// profile missing compose_file still reports that first).
+func (f Frontend) rejectFieldsNotFor(kind string) error {
+	rules := []struct {
+		set     bool
+		allowed map[string]bool
+		msg     string
+	}{
+		{f.WriteFile != "", kindsConfigWriting, "frontend.write_file is only valid for kind=external or kind=managed"},
+		{len(f.WriteFiles) > 0, kindsConfigWriting, "frontend.write_files is only valid for kind=external or kind=managed"},
+		{len(f.Template) > 0, kindsConfigWriting, "frontend.template is only valid for kind=external or kind=managed"},
+		{len(f.MCPs) > 0, kindsConfigWriting, "frontend.mcps is only valid for kind=external or kind=managed"},
+		{f.ComposeFile != "", kindsComposeOnly, "frontend.compose_file is only valid for kind=docker-compose"},
+		{f.ProjectName != "", kindsComposeOnly, "frontend.project_name is only valid for kind=docker-compose"},
+		{len(f.Services) > 0, kindsComposeOnly, "frontend.services is only valid for kind=docker-compose"},
+		{len(f.WaitFor) > 0, kindsSupervised, "frontend.wait_for is only valid for kind=docker-compose or kind=managed"},
+		{f.Binary != "", kindsManagedOnly, "frontend.binary is only valid for kind=managed"},
+		{len(f.Args) > 0, kindsManagedOnly, "frontend.args is only valid for kind=managed"},
+		{f.Workdir != "", kindsManagedOnly, "frontend.workdir is only valid for kind=managed"},
+	}
+	for _, r := range rules {
+		if r.set && !r.allowed[kind] {
+			return errors.New(r.msg)
 		}
 	}
+	return nil
+}
 
+// uniqueNonEmpty rejects empty and duplicate entries in a list of names;
+// field names the YAML location in the error.
+func uniqueNonEmpty(field string, names []string) error {
+	seen := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		if n == "" {
+			return fmt.Errorf("%s contains empty entry", field)
+		}
+		if _, dup := seen[n]; dup {
+			return fmt.Errorf("%s contains duplicate %q", field, n)
+		}
+		seen[n] = struct{}{}
+	}
+	return nil
+}
+
+// validateWaitFor requires a URL on every wait_for entry.
+func validateWaitFor(waitFor []WaitForURL) error {
+	for i, w := range waitFor {
+		if w.URL == "" {
+			return fmt.Errorf("frontend.wait_for[%d].url is required", i)
+		}
+	}
+	return nil
+}
+
+// validateExecutable requires path to be an existing non-directory file with
+// any executable bit (owner, group, or other) set, so a bad path fails
+// validation rather than at exec time with a confusing "permission denied".
+// label names the YAML field in the error.
+func validateExecutable(label, path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("%s %s: %w", label, path, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("%s %s: is a directory", label, path)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("%s %s: not executable (mode %v)", label, path, info.Mode().Perm())
+	}
+	return nil
+}
+
+// validateWriteFileSpecs checks each frontend.write_files entry: a path is
+// required, a template is required, and per-entry mcps must be non-empty and
+// unique. Destination paths must also be unique across the legacy write_file
+// and all write_files entries — rendering walks them in order, so a duplicate
+// would silently clobber an earlier file. Only literal duplicates are
+// catchable here; ${VAR}-bearing paths are re-checked after expansion at
+// activation. Error messages reference the raw write_files[i] index so users
+// can locate the offending entry.
+func validateWriteFileSpecs(f Frontend) error {
+	// ${WRITE_FILE} is defined as the first entry's resolved path, which does
+	// not exist yet while the write targets themselves are resolved — it
+	// would silently expand to "" and yield a relative path in the daemon's
+	// cwd, so reject it in any write target.
+	if strings.Contains(f.WriteFile, "${WRITE_FILE}") {
+		return errors.New("frontend.write_file cannot reference ${WRITE_FILE}")
+	}
+	targets := make(map[string]struct{}, len(f.WriteFiles)+1)
+	if f.WriteFile != "" {
+		targets[filepath.Clean(f.WriteFile)] = struct{}{}
+	}
+	for i, s := range f.WriteFiles {
+		if s.Path == "" {
+			return fmt.Errorf("frontend.write_files[%d].path is required", i)
+		}
+		if strings.Contains(s.Path, "${WRITE_FILE}") {
+			return fmt.Errorf("frontend.write_files[%d].path cannot reference ${WRITE_FILE} (it is defined by the first entry's resolved path, which is not available while resolving write targets)", i)
+		}
+		if _, dup := targets[filepath.Clean(s.Path)]; dup {
+			return fmt.Errorf("frontend.write_files[%d].path %q duplicates an earlier write target", i, s.Path)
+		}
+		targets[filepath.Clean(s.Path)] = struct{}{}
+		if len(s.Template) == 0 {
+			return fmt.Errorf("frontend.write_files[%d].template is required", i)
+		}
+		if err := uniqueNonEmpty(fmt.Sprintf("frontend.write_files[%d].mcps", i), s.MCPs); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 // IsZero reports whether the Frontend was left unset. Used to allow ComfyUI
 // profiles to omit `frontend:` entirely without tripping the kind validator.
 // Legacy is intentionally ignored: a profile carrying only the deprecated
-// `app:` field (and nothing else) is still semantically empty.
+// `app:` field (and nothing else) is still semantically empty. Comparing
+// against the zero value covers new fields automatically — the hand-kept
+// field list this replaces drifted (URL was missing, so a url-only frontend
+// reported zero). Note an empty-but-non-nil map or slice counts as set.
 func (f Frontend) IsZero() bool {
-	return f.Kind == "" &&
-		!f.RestartRequired &&
-		f.WriteFile == "" &&
-		len(f.Template) == 0 &&
-		len(f.Env) == 0 &&
-		len(f.MCPs) == 0 &&
-		f.ComposeFile == "" &&
-		f.ProjectName == "" &&
-		len(f.Services) == 0 &&
-		len(f.WaitFor) == 0 &&
-		f.Binary == "" &&
-		len(f.Args) == 0 &&
-		f.Workdir == ""
+	f.Legacy = nil
+	return reflect.DeepEqual(f, Frontend{})
 }
 
 func expandTilde(p string) string {

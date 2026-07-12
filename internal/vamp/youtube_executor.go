@@ -242,7 +242,7 @@ func (y *youtubeExecutor) loadCredentials(path string) (youtubeCredentials, erro
 	if resolved == "" {
 		resolved = defaultYouTubeCredsPath
 	}
-	resolved = expandYouTubeTilde(resolved)
+	resolved = expandTilde(resolved)
 
 	loader := y.credsLoader
 	if loader == nil {
@@ -305,19 +305,6 @@ func readCredentialsFromDisk(path string) (youtubeCredentials, error) {
 		return creds, fmt.Errorf("parse credentials JSON: %w", err)
 	}
 	return creds, nil
-}
-
-// expandYouTubeTilde expands a leading "~/" against the user's home dir.
-// Mirrors expandAudioTilde to avoid coupling the two executors.
-func expandYouTubeTilde(p string) string {
-	if p == "" || !strings.HasPrefix(p, "~/") {
-		return p
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return p
-	}
-	return filepath.Join(home, p[2:])
 }
 
 // exchangeRefreshToken trades a long-lived refresh_token for a short-lived

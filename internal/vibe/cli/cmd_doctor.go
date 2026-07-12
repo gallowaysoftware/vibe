@@ -9,11 +9,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -203,6 +206,17 @@ func doctorCmd() *cobra.Command {
 			"incremental cmake build (already idempotent, but the flag "+
 			"makes intent explicit).")
 	cmd.MarkFlagsMutuallyExclusive("install", "pipeline")
+
+	// Tab-complete the enum flags so users discover the allowed values
+	// without consulting --help — same pattern as `vibe profile new`.
+	_ = cmd.RegisterFlagCompletionFunc("install",
+		func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+			return []string{"comfyui", "llama-cpp"}, cobra.ShellCompDirectiveNoFileComp
+		})
+	_ = cmd.RegisterFlagCompletionFunc("method",
+		func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+			return []string{"distro", "release", "source"}, cobra.ShellCompDirectiveNoFileComp
+		})
 	return cmd
 }
 
@@ -262,10 +276,16 @@ func runChecks(ctx context.Context, env *doctorEnv) []checkResult {
 	results = append(results, checkProxyPort(ctx, env, st.daemonOnControl))
 
 	results = append(results, checkProfiles())
+	if r, ok := checkBackends(paths.ProfilesDir()); ok {
+		results = append(results, r)
+	}
 	results = append(results, checkFrontendState())
 	results = append(results, checkCommonPorts())
 	results = append(results, checkMCPs())
 	if r, ok := checkRSVGForVision(env, paths.ProfilesDir()); ok {
+		results = append(results, r)
+	}
+	if r, ok := checkDockerForProfiles(ctx, env, paths.ProfilesDir()); ok {
 		results = append(results, r)
 	}
 
@@ -490,47 +510,128 @@ func checkProxyPort(ctx context.Context, env *doctorEnv, daemonOnControl bool) c
 	}
 }
 
-// checkCommonPorts probes the loopback ports that AI-stack frontends
-// typically claim (Open WebUI, SearXNG, TEI, Qdrant) and reports any
-// that are already bound. Bound != bad — the bind could be one of
-// vibe's own frontends still running from a previous session, or some
-// unrelated service. Goal is just to make conflicts visible BEFORE a
-// `vibe start` runs into them. The 9000/9001 checks above cover the
-// vibe-owned ports specifically; this check covers the next tier.
+// checkCommonPorts probes the loopback ports the profiles and backends on
+// this machine actually declare and reports any that are already bound.
+// Bound != bad — the bind could be one of vibe's own frontends still
+// running from a previous session, or some unrelated service — so the
+// result stays INFO, never FAIL. Goal is just to make conflicts visible
+// BEFORE a `vibe start` runs into them. The 9000/9001 checks above cover
+// the vibe-owned ports specifically; this check covers the next tier.
 //
-// Adding a new port here is harmless: extra INFO output, no
-// behavioral consequence.
+// The probe list is derived from disk (rather than hardcoded) so it tracks
+// the real inventory as profiles are renamed or archived. A small fixed
+// tail covers compose-managed ports that never appear in profile YAML
+// (Open WebUI's in-container default 8080).
 func checkCommonPorts() checkResult {
 	const name = "common ports"
-	type p struct {
-		port int
-		role string
+	ports := declaredPorts()
+	if _, ok := ports[8080]; !ok {
+		ports[8080] = []string{"Open WebUI (compose default)"}
 	}
-	probes := []p{
-		{8080, "Open WebUI"},
-		{8880, "Kokoro-FastAPI TTS (tts_kokoro)"},
-		{14001, "SearXNG (vibe-chat sidecar)"},
-		{14002, "SearXNG (searxng profile)"},
-		{14003, "TEI embeddings (tei profile)"},
-		{14010, "tabbyAPI (long_form_exl3 profile)"},
-		{6333, "Qdrant REST"},
-		{6334, "Qdrant gRPC"},
+	nums := make([]int, 0, len(ports))
+	for port := range ports {
+		nums = append(nums, port)
 	}
-	var bound []string
-	for _, pr := range probes {
-		free, _ := tryBind(fmt.Sprintf("127.0.0.1:%d", pr.port))
-		if !free {
-			bound = append(bound, fmt.Sprintf(":%d (%s)", pr.port, pr.role))
+	sort.Ints(nums)
+	var bound, free []string
+	for _, port := range nums {
+		if ok, _ := tryBind(fmt.Sprintf("127.0.0.1:%d", port)); ok {
+			free = append(free, strconv.Itoa(port))
+			continue
 		}
+		bound = append(bound, fmt.Sprintf(":%d (%s)", port, strings.Join(ports[port], ", ")))
 	}
 	if len(bound) == 0 {
-		return checkResult{Name: name, Status: statusOK, Message: "8080/8880/14001/14002/14003/14010/6333/6334 free"}
+		return checkResult{Name: name, Status: statusOK, Message: strings.Join(free, "/") + " free"}
 	}
 	return checkResult{
 		Name:    name,
 		Status:  statusInfo,
 		Message: "in use: " + strings.Join(bound, ", "),
 	}
+}
+
+// declaredPorts collects every loopback port the on-disk backends and
+// profiles declare, keyed to the declaring file(s). Since the backend_ref
+// split, backend port fields mostly live in backends/*.yaml; profiles
+// contribute inline backend ports plus the loopback wait_for / url entries
+// on compose frontends (the only place a compose-published port is written
+// down). Files that fail to parse are skipped — the profiles/backends
+// checks surface those; doctor must not hard-fail on one bad file.
+func declaredPorts() map[int][]string {
+	ports := map[int][]string{}
+	add := func(port int, label string) {
+		if port <= 0 || slices.Contains(ports[port], label) {
+			return
+		}
+		ports[port] = append(ports[port], label)
+	}
+	collect := func(label string, b profile.Backend) {
+		switch {
+		case b.LlamaServer != nil:
+			add(b.LlamaServer.Port, label)
+		case b.ComfyUI != nil:
+			add(b.ComfyUI.Port, label)
+		case b.HTTPServer != nil:
+			add(b.HTTPServer.Port, label)
+		case b.TabbyAPI != nil:
+			add(b.TabbyAPI.Port, label)
+		}
+	}
+	if names, err := profile.ListBackends(); err == nil {
+		for _, n := range names {
+			def, err := profile.LoadBackend(n)
+			if err != nil {
+				continue
+			}
+			collect("backend "+n, def.Backend)
+		}
+	}
+	dir := paths.ProfilesDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ports
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
+			continue
+		}
+		p, err := profile.Load(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		label := "profile " + strings.TrimSuffix(e.Name(), ".yaml")
+		// A referenced backend's port is already labeled under the backend's
+		// own name; only inline backends contribute under the profile label.
+		if p.BackendRef == "" {
+			collect(label, p.Backend)
+		}
+		for _, w := range p.Frontend.WaitFor {
+			add(loopbackPort(w.URL), label)
+		}
+		add(loopbackPort(p.Frontend.URL), label)
+	}
+	return ports
+}
+
+// loopbackPort extracts the port from a loopback URL. Non-loopback hosts
+// return 0 — probing a bind on a port some remote URL happens to use would
+// report phantom conflicts.
+func loopbackPort(raw string) int {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return 0
+	}
+	switch u.Hostname() {
+	case "127.0.0.1", "localhost", "::1", "0.0.0.0":
+	default:
+		return 0
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		return 0
+	}
+	return port
 }
 
 // tryBind attempts a one-shot TCP listen on addr and closes the listener
@@ -605,6 +706,53 @@ func checkProfilesAt(dir string) checkResult {
 		status = statusWarn
 	}
 	return checkResult{Name: name, Status: status, Message: msg}
+}
+
+// checkBackends mirrors checkProfilesAt for backends/<name>.yaml. A broken
+// backend that a profile references already fails through that profile's
+// row in checkProfilesAt (backend_ref resolution is eager in profile.Load),
+// so this check's distinct value is backends nothing references —
+// capability-only targets that would otherwise surface only mid-pipeline
+// as a vamp stage failure. Backends are optional, so the check is skipped
+// (ok=false) when none are defined.
+func checkBackends(profilesDir string) (checkResult, bool) {
+	const name = "backends"
+	names, err := profile.ListBackends()
+	if err != nil {
+		return checkResult{Name: name, Status: statusWarn, Message: err.Error()}, true
+	}
+	if len(names) == 0 {
+		return checkResult{}, false
+	}
+	referenced := backendRefsIn(profilesDir)
+	var valid, invalids, capOnly []string
+	for _, n := range names {
+		if _, err := profile.LoadBackend(n); err != nil {
+			invalids = append(invalids, fmt.Sprintf("%s (%v)", n, err))
+			continue
+		}
+		valid = append(valid, n)
+		if len(referenced[n]) == 0 {
+			capOnly = append(capOnly, n)
+		}
+	}
+	if len(valid) == 0 {
+		return checkResult{
+			Name:    name,
+			Status:  statusFail,
+			Message: fmt.Sprintf("0 valid; %d invalid: %s", len(invalids), strings.Join(invalids, "; ")),
+		}, true
+	}
+	msg := fmt.Sprintf("%d valid (%s)", len(valid), strings.Join(valid, ", "))
+	status := statusOK
+	if len(invalids) > 0 {
+		msg += fmt.Sprintf("; %d invalid: %s", len(invalids), strings.Join(invalids, "; "))
+		status = statusWarn
+	}
+	if len(capOnly) > 0 {
+		msg += "; no backend_ref points here (capability-only or stale): " + strings.Join(capOnly, ", ")
+	}
+	return checkResult{Name: name, Status: status, Message: msg}, true
 }
 
 // checkFrontendState surfaces where per-profile frontend state lives so
@@ -720,6 +868,77 @@ func scanMMProjProfiles(dir string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// checkDockerForProfiles warns when something on disk needs docker (a
+// docker-compose frontend or an http_server image backend) but the docker
+// CLI is missing or its daemon is unreachable. Without this, a stopped
+// docker daemon surfaces as a mid-start supervisor failure ("start
+// backend: ...") instead of a pre-flight hint. WARN, never FAIL — the
+// non-docker profiles still work. Skipped (ok=false) when nothing on disk
+// needs docker. vamp's pandoc stage also defaults to the pandoc/core
+// docker image, but that isn't detectable from vibe profiles, so the
+// message mentions docker generally rather than claiming full coverage.
+func checkDockerForProfiles(ctx context.Context, env *doctorEnv, profilesDir string) (checkResult, bool) {
+	const name = "docker"
+	users := scanDockerProfiles(profilesDir)
+	if len(users) == 0 {
+		return checkResult{}, false
+	}
+	needs := "needed by " + strings.Join(users, ", ") +
+		" (vamp pandoc stages also default to a docker image)"
+	if _, err := env.lookPath("docker"); err != nil {
+		return checkResult{
+			Name:    name,
+			Status:  statusWarn,
+			Message: "not on $PATH — " + needs,
+		}, true
+	}
+	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if _, err := env.run(cctx, "docker", "info"); err != nil {
+		return checkResult{
+			Name:    name,
+			Status:  statusWarn,
+			Message: "`docker info` failed (daemon not running?): " + err.Error() + " — " + needs,
+		}, true
+	}
+	return checkResult{Name: name, Status: statusOK, Message: "daemon reachable; " + needs}, true
+}
+
+// scanDockerProfiles returns the profiles and backend definitions whose
+// start path shells out to docker. YAML parse failures are tolerated
+// silently, like scanMMProjProfiles — the profiles/backends checks
+// already surface those.
+func scanDockerProfiles(profilesDir string) []string {
+	var out []string
+	entries, _ := os.ReadDir(profilesDir)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
+			continue
+		}
+		p, err := profile.Load(filepath.Join(profilesDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		if p.Frontend.Kind == profile.FrontendDockerCompose ||
+			(p.Backend.HTTPServer != nil && p.Backend.HTTPServer.Image != "") {
+			out = append(out, p.Name)
+		}
+	}
+	if names, err := profile.ListBackends(); err == nil {
+		for _, n := range names {
+			def, err := profile.LoadBackend(n)
+			if err != nil {
+				continue
+			}
+			if def.Backend.HTTPServer != nil && def.Backend.HTTPServer.Image != "" {
+				out = append(out, "backend "+n)
+			}
+		}
+	}
+	sort.Strings(out)
+	return slices.Compact(out)
 }
 
 func checkGPU(ctx context.Context, env *doctorEnv) checkResult {

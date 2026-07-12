@@ -67,7 +67,8 @@ sub-block must be set:
   example. For speculative decoding, set `backend.llama_server.draft_model`
   (and optionally `huggingface.draft_file`) to a draft GGUF — e.g. a
   Gemma 4 MTP assistant; vibe adds `--model-draft` + `--spec-type draft-mtp`
-  + `--spec-draft-n-max` (draft-mtp requires an f16 KV cache).
+  + `--spec-draft-n-max` (quantized KV with draft-mtp needs a llama.cpp
+  build with PR #23398; older builds need f16 KV).
 - `comfyui` — supervises a [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
   python process for image/video generation. ComfyUI ships its own UI,
   so these profiles carry no `frontend:` block.
@@ -102,9 +103,9 @@ hit it on stable hardware.
 **Frontends.** Applicable to `backend.llama_server` and `backend.tabby_api`
 profiles (ComfyUI and http_server reject a frontend block):
 
-- `external` — vibe renders a sidecar config (e.g. `opencode.json`) and
-  surfaces the env vars to set when launching the tool. No process
-  lifecycle.
+- `external` — vibe renders one or more sidecar configs (`write_file`
+  or `write_files`, e.g. `opencode.json`) and surfaces the env vars to
+  set when launching the tool. No process lifecycle.
 - `docker-compose` — `docker compose up -d` against a user-supplied
   compose file on `vibe start`, `down` on `vibe stop`. Polls any
   `wait_for` health endpoints. Good fit for Perplexica, Open WebUI.
@@ -115,11 +116,22 @@ profiles (ComfyUI and http_server reject a frontend block):
 `$XDG_CONFIG_HOME/vibe/mcp/` (`datadog.yaml`, `jira.yaml`, ...). Profiles
 compose them by name: `frontend.mcps: [datadog, jira]`. Secrets stay in
 env vars (`${env:...}` references in the MCP file); profiles never name
-them inline.
+them inline. Frontends that render multiple config files
+(`frontend.write_files`) can list `mcps` per file — each entry's MCP
+servers are merged into that rendered file the same way.
 
 **Proxy and control plane.** The daemon reverse-proxies frontends to the
 active llama-server on `:9000` so swapping models doesn't require
-reconfiguring the frontend. The Connect/protobuf control plane listens
+reconfiguring the frontend. The same `:9000` port also routes by model
+id: requests whose body names the model alias of a service-mode
+`llama_server` profile are forwarded to that sidecar, so one proxy port
+serves multiple concurrently-loaded models. (Other service kinds don't
+advertise an OpenAI model id and are addressed by their own port.)
+Profiles can declare a top-level `services:` list of service-mode
+sidecars co-started best-effort on `vibe start` and stopped
+(best-effort) when the profile stops — manually-started services and
+other profiles' sidecars are left running, docker-compose-style up/down.
+The Connect/protobuf control plane listens
 on `$XDG_RUNTIME_DIR/vibe/vibe.sock` (0600) and, optionally,
 `127.0.0.1:9001`.
 
@@ -225,7 +237,7 @@ capabilities:
 | `vamp validate <pipeline.yaml>` | Parse + schema-check without running. |
 | `vamp render <pipeline.yaml> <stage_id>` | Render a single stage's prompt template against inputs and prior outputs (no LLM call). |
 | `vamp requirements <pipeline.yaml>` | Report the runtime resources this pipeline needs (capabilities, services, inputs, hardware hints). |
-| `vamp lint <pipeline.yaml>` | Advisory checks layered on validate: webhook URL → matching `RequireService`, `output_format: json` → `Retry.RetryOn` includes `"invalid_output"`. Findings only — exit 0. |
+| `vamp lint <pipeline.yaml>` | Advisory checks layered on validate: webhook URL → matching `RequireService`, `output_format: json` → `Retry.RetryOn` includes `"invalid_output"`, trivial Retry blocks, capabilities missing a `CapabilityModelHints` entry. Findings only — exit 0. |
 | `vamp list` | List pipelines under `$XDG_CONFIG_HOME/vamp/pipelines/`. |
 | `vamp capabilities` | Print the resolved capability table. |
 | `vamp runs ls/show/cancel/cleanup` | One noun for everything a run leaves behind: history + live detached jobs. `ls` has a `STATE` column (running/finished/crashed); `show` reports live pid/state; `cancel` SIGTERMs a running detached run. (`vamp jobs` is a hidden deprecated alias.) |
@@ -298,6 +310,8 @@ authed (gated by filesystem perms instead). If the token leaks, run
 | [`youtube-upload`](examples/youtube-upload/) | OAuth-driven YouTube Data API upload. |
 | [`content-mill`](examples/content-mill/) | Every stage type stitched end-to-end with a failure-path webhook. |
 | [`rag-eval-pipeline`](examples/rag-eval-pipeline/) | Tier-3 RAG: embed query suite via TEI, retrieve from Qdrant, judge quality with the LLM, aggregate report. Demonstrates `readFile`/`parseJSON`/`toJSON` chaining. |
+| [`rag-eval-pipeline-go`](examples/rag-eval-pipeline-go/) | Go-DSL twin of rag-eval-pipeline: same DAG built with the vamp package's fluent builders, templates embedded via embed.FS into a single binary. |
+| [`bench-formats-go`](examples/bench-formats-go/) | Go-DSL pipeline (vamp.Main + fluent builders) benchmarking GGUF+MTP vs EXL3 backends across context depths via vamp's per-stage throughput capture. |
 
 ## Editor support
 

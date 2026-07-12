@@ -98,6 +98,16 @@ func LoadBackend(name string) (*BackendDef, error) {
 	if name == "" {
 		return nil, errors.New("backend name is required")
 	}
+	if name != filepath.Base(name) || name == "." || name == ".." {
+		return nil, fmt.Errorf("backend name %q must be a bare file stem under backends/ (no path separators)", name)
+	}
+	// A trailing extension would silently double up ("<name>.yaml.yaml") and
+	// produce a confusing not-found error instead of telling the author to
+	// drop it.
+	if ext := filepath.Ext(name); ext == ".yaml" || ext == ".yml" {
+		return nil, fmt.Errorf("backend name %q should not include the %s extension (use %q)",
+			name, ext, strings.TrimSuffix(name, ext))
+	}
 	path := filepath.Join(paths.BackendsDir(), name+".yaml")
 	f, err := os.Open(path)
 	if err != nil {
@@ -110,6 +120,12 @@ func LoadBackend(name string) (*BackendDef, error) {
 	var def BackendDef
 	if err := dec.Decode(&def); err != nil {
 		return nil, fmt.Errorf("parse backend %s: %w", name, err)
+	}
+	// The filename is the backend's identity everywhere (backend_ref,
+	// StartRequest.backend, the synthetic profile's Name); a stale `name:`
+	// after a rename/copy would silently mislead, so reject the mismatch.
+	if def.Name != "" && def.Name != name {
+		return nil, fmt.Errorf("backend %s: name %q does not match filename (rename the file or fix name:)", name, def.Name)
 	}
 	def.Backend.normalize()
 	if err := def.Backend.validate(); err != nil {

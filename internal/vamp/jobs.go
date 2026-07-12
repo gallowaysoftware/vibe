@@ -439,20 +439,9 @@ func TailLogs(ctx context.Context, w io.Writer, path string, follow bool, pollIn
 	}
 }
 
-// JobStatus is a convenience that returns the same JobState
-// summarizeJob would derive, without forcing the caller to round-trip
-// through JobSummary. Used by the `jobs show` command and tests.
-func JobStatus(dir string) (JobState, error) {
-	js, err := summarizeJob(dir)
-	if err != nil {
-		return JobStateUnknown, err
-	}
-	return js.State, nil
-}
-
 // JobStateFor derives the JobState from an already-summarized run plus a
 // cheap pid-file read — without re-walking the run dir's file tree the way
-// JobStatus (via summarizeJob -> SummarizeRun) does. `vamp runs ls` calls
+// summarizeJob (via SummarizeRun) does. `vamp runs ls` calls
 // this once per run it already listed, so the listing stays O(runs) stats
 // instead of O(files) on every invocation. The state matrix matches
 // summarizeJob exactly; keep the two in lockstep.

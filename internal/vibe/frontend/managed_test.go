@@ -127,12 +127,9 @@ func TestManaged_Activate_BuildsArgvAndEnv(t *testing.T) {
 
 	d := &managedDriver{
 		startProcess: starter,
-		probeURL: func(_ context.Context, _ string) (int, error) {
+		waitPoller: testPoller(func(_ context.Context, _ string) (int, error) {
 			return 200, nil
-		},
-		now:              time.Now,
-		defaultTimeout:   time.Second,
-		pollInterval:     time.Millisecond,
+		}),
 		gracefulShutdown: 100 * time.Millisecond,
 	}
 
@@ -194,6 +191,43 @@ func TestManaged_Activate_BuildsArgvAndEnv(t *testing.T) {
 	}
 }
 
+func TestManaged_Activate_ExpandsArgs(t *testing.T) {
+	bin := writeManagedBinary(t)
+	proc := newFakeProc(1)
+	calls, starter := fakeStarter(proc, nil)
+
+	d := &managedDriver{
+		startProcess:     starter,
+		waitPoller:       testPoller(func(context.Context, string) (int, error) { return 200, nil }),
+		gracefulShutdown: 100 * time.Millisecond,
+	}
+	p := &profile.Profile{
+		Name: "omp",
+		Frontend: profile.Frontend{
+			Kind:   profile.FrontendManaged,
+			Binary: bin,
+			Args: []string{
+				"--model", "vibe-local/${MODEL_ALIAS}",
+				"--api", "${VIBE_API}",
+			},
+		},
+	}
+	if _, err := d.Activate(context.Background(), p, profile.ExpandContext{
+		ModelAlias: "qwen",
+		VibeAPI:    "http://127.0.0.1:9000/v1",
+	}); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	got := (*calls)[0].args
+	want := []string{
+		"--model", "vibe-local/qwen",
+		"--api", "http://127.0.0.1:9000/v1",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("argv =\n  %v\nwant\n  %v", got, want)
+	}
+}
+
 func TestManaged_Activate_NoArgsNoEnvNoWorkdir(t *testing.T) {
 	bin := writeManagedBinary(t)
 	proc := newFakeProc(7)
@@ -201,12 +235,9 @@ func TestManaged_Activate_NoArgsNoEnvNoWorkdir(t *testing.T) {
 
 	d := &managedDriver{
 		startProcess: starter,
-		probeURL: func(_ context.Context, _ string) (int, error) {
+		waitPoller: testPoller(func(_ context.Context, _ string) (int, error) {
 			return 200, nil
-		},
-		now:              time.Now,
-		defaultTimeout:   time.Second,
-		pollInterval:     time.Millisecond,
+		}),
 		gracefulShutdown: 100 * time.Millisecond,
 	}
 	p := &profile.Profile{
@@ -240,10 +271,7 @@ func TestManaged_Activate_MissingBinary(t *testing.T) {
 			t.Fatal("startProcess should not be called when binary is empty")
 			return nil, nil
 		},
-		probeURL:         func(context.Context, string) (int, error) { return 200, nil },
-		now:              time.Now,
-		defaultTimeout:   time.Second,
-		pollInterval:     time.Millisecond,
+		waitPoller:       testPoller(func(context.Context, string) (int, error) { return 200, nil }),
 		gracefulShutdown: time.Millisecond,
 	}
 	p := &profile.Profile{
@@ -265,10 +293,7 @@ func TestManaged_Activate_StartErrorReturned(t *testing.T) {
 	_, starter := fakeStarter(nil, startErr)
 	d := &managedDriver{
 		startProcess:     starter,
-		probeURL:         func(context.Context, string) (int, error) { return 200, nil },
-		now:              time.Now,
-		defaultTimeout:   time.Second,
-		pollInterval:     time.Millisecond,
+		waitPoller:       testPoller(func(context.Context, string) (int, error) { return 200, nil }),
 		gracefulShutdown: time.Millisecond,
 	}
 	p := &profile.Profile{
@@ -292,16 +317,13 @@ func TestManaged_Activate_WaitForPollsUntilReady(t *testing.T) {
 	probeCalls := 0
 	d := &managedDriver{
 		startProcess: starter,
-		probeURL: func(_ context.Context, _ string) (int, error) {
+		waitPoller: testPoller(func(_ context.Context, _ string) (int, error) {
 			probeCalls++
 			if probeCalls < 3 {
 				return 503, nil
 			}
 			return 200, nil
-		},
-		now:              time.Now,
-		defaultTimeout:   time.Second,
-		pollInterval:     time.Millisecond,
+		}),
 		gracefulShutdown: 100 * time.Millisecond,
 	}
 	p := &profile.Profile{
@@ -329,12 +351,14 @@ func TestManaged_Activate_WaitForTimeoutTearsDown(t *testing.T) {
 
 	d := &managedDriver{
 		startProcess: starter,
-		probeURL: func(context.Context, string) (int, error) {
-			return 503, nil
+		waitPoller: waitPoller{
+			probeURL: func(context.Context, string) (int, error) {
+				return 503, nil
+			},
+			now:            time.Now,
+			defaultTimeout: 10 * time.Millisecond,
+			pollInterval:   1 * time.Millisecond,
 		},
-		now:              time.Now,
-		defaultTimeout:   10 * time.Millisecond,
-		pollInterval:     1 * time.Millisecond,
 		gracefulShutdown: 100 * time.Millisecond,
 	}
 	p := &profile.Profile{
@@ -379,16 +403,13 @@ func TestManaged_Activate_WaitFor503Then200(t *testing.T) {
 	idx := 0
 	d := &managedDriver{
 		startProcess: starter,
-		probeURL: func(context.Context, string) (int, error) {
+		waitPoller: testPoller(func(context.Context, string) (int, error) {
 			r := results[idx]
 			if idx < len(results)-1 {
 				idx++
 			}
 			return r.status, r.err
-		},
-		now:              time.Now,
-		defaultTimeout:   time.Second,
-		pollInterval:     time.Millisecond,
+		}),
 		gracefulShutdown: 100 * time.Millisecond,
 	}
 	p := &profile.Profile{
@@ -416,10 +437,7 @@ func TestManaged_Deactivate_GracefulStop(t *testing.T) {
 
 	d := &managedDriver{
 		startProcess:     starter,
-		probeURL:         func(context.Context, string) (int, error) { return 200, nil },
-		now:              time.Now,
-		defaultTimeout:   time.Second,
-		pollInterval:     time.Millisecond,
+		waitPoller:       testPoller(func(context.Context, string) (int, error) { return 200, nil }),
 		gracefulShutdown: time.Second,
 	}
 	p := &profile.Profile{
@@ -458,10 +476,7 @@ func TestManaged_Deactivate_KillFallback(t *testing.T) {
 
 	d := &managedDriver{
 		startProcess:     starter,
-		probeURL:         func(context.Context, string) (int, error) { return 200, nil },
-		now:              time.Now,
-		defaultTimeout:   time.Second,
-		pollInterval:     time.Millisecond,
+		waitPoller:       testPoller(func(context.Context, string) (int, error) { return 200, nil }),
 		gracefulShutdown: 50 * time.Millisecond,
 	}
 	p := &profile.Profile{

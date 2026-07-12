@@ -37,7 +37,7 @@ func diffCmd() *cobra.Command {
 			"absolute / relative directory path. Honors NO_COLOR; ANSI colour\n" +
 			"otherwise lights up when stdout is a tty.",
 		Args:              cobra.ExactArgs(2),
-		ValidArgsFunction: completeRunIDs,
+		ValidArgsFunction: completeRunIDsUpTo(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pathA, err := resolveRunPath(cmd, args[0])
 			if err != nil {

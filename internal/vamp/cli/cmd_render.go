@@ -38,7 +38,7 @@ func renderCmd() *cobra.Command {
 		Short:             "Render a single stage's prompt template against inputs and prior outputs (no LLM call).",
 		Long:              renderCmdLongDescription,
 		Args:              cobra.ExactArgs(2),
-		ValidArgsFunction: completePipelineFiles,
+		ValidArgsFunction: completeRenderArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pipelinePath, err := filepath.Abs(args[0])
 			if err != nil {

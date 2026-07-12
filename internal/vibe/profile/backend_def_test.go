@@ -104,3 +104,25 @@ frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 		t.Fatalf("expected backend_ref resolution error, got %v", err)
 	}
 }
+
+func TestLoadBackend_NameValidation(t *testing.T) {
+	writeBackend(t, "qwen", "name: qwen\nbackend:\n  llama_server: {path: ~/m.gguf, alias: q, context: 1024}\n")
+
+	if _, err := LoadBackend("../profiles/qwen"); err == nil || !strings.Contains(err.Error(), "path separators") {
+		t.Errorf("path-shaped name: got %v, want bare-file-stem error", err)
+	}
+	if _, err := LoadBackend("qwen.yaml"); err == nil || !strings.Contains(err.Error(), "extension") {
+		t.Errorf("extension-suffixed name: got %v, want drop-the-extension error", err)
+	}
+	// Dots in the stem are legal — real backends are named like qwen3.6-27b.
+	if _, err := LoadBackend("qwen3.6-27b"); err == nil || strings.Contains(err.Error(), "extension") {
+		t.Errorf("dotted stem must pass name validation (fail only on open): got %v", err)
+	}
+}
+
+func TestLoadBackend_NameFieldMustMatchFilename(t *testing.T) {
+	writeBackend(t, "qwen", "name: other\nbackend:\n  llama_server: {path: ~/m.gguf, alias: q, context: 1024}\n")
+	if _, err := LoadBackend("qwen"); err == nil || !strings.Contains(err.Error(), "does not match filename") {
+		t.Fatalf("mismatched name: got %v, want mismatch error", err)
+	}
+}

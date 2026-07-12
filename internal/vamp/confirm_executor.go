@@ -80,10 +80,9 @@ func newConfirmExecutor() *confirmExecutor {
 // (`errors.Is`) distinguish a user-initiated rejection from a real bug.
 var errStageRejected = errors.New("confirm stage rejected")
 
-// IsConfirmRejection reports whether err originated from a confirm stage
-// rejecting (operator said no or timed out). Exported so the CLI layer
-// can render a friendlier message than the raw aggregated pipeline error.
-func IsConfirmRejection(err error) bool { return errors.Is(err, errStageRejected) }
+// isConfirmRejection reports whether err originated from a confirm stage
+// rejecting (operator said no or timed out).
+func isConfirmRejection(err error) bool { return errors.Is(err, errStageRejected) }
 
 // confirmAcceptedBody / confirmRejectedBody are the canonical strings
 // written to <stage-id>.response by `vamp confirm` and back into the

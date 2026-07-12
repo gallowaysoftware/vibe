@@ -136,6 +136,41 @@ func TestProxy_AggregatesModels(t *testing.T) {
 	}
 }
 
+func TestProxy_AggregatesModels_NoDefault(t *testing.T) {
+	clsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"object":"list","data":[{"id":"tiny-classifier"}]}`))
+	}))
+	defer clsSrv.Close()
+	clsURL, _ := url.Parse(clsSrv.URL)
+
+	p := New("127.0.0.1:0")
+	p.AddRoute("tiny-classifier", clsURL)
+
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, httptest.NewRequest("GET", "/v1/models", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if body := w.Body.String(); !strings.Contains(body, "tiny-classifier") {
+		t.Errorf("/v1/models missing routed model: %s", body)
+	}
+}
+
+func TestProxy_AggregatesModels_NoDefault_AllRoutesDown_Returns503(t *testing.T) {
+	deadSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL, _ := url.Parse(deadSrv.URL)
+	deadSrv.Close()
+
+	p := New("127.0.0.1:0")
+	p.AddRoute("tiny-classifier", deadURL)
+
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, httptest.NewRequest("GET", "/v1/models", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", w.Code)
+	}
+}
+
 func TestProxy_SetBackendNilClears(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("hi"))

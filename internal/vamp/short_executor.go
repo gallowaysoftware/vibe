@@ -155,8 +155,10 @@ func (s *shortExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 			// Write the (word-wrapped) caption to a file and reference it via
 			// drawtext's textfile= option. Inline text=... can't safely carry
 			// apostrophes/colons inside a single-quoted filtergraph value;
-			// textfile sidesteps all escaping.
-			capPath := filepath.Join(in.RunDir, fmt.Sprintf(".caption-%d.txt", i))
+			// textfile sidesteps all escaping. The name is scoped by stage ID
+			// and item index so parallel foreach items (or two short stages in
+			// one wave) don't overwrite each other's captions mid-run.
+			capPath := filepath.Join(in.RunDir, fmt.Sprintf(".caption-%s-%d-%d.txt", st.ID, in.ItemIdx, i))
 			if err := os.WriteFile(capPath, []byte(wrapText(capt, captionMaxChars(w))), 0o644); err != nil {
 				return nil, fmt.Errorf("stage %s: write caption %d: %w", st.ID, i, err)
 			}

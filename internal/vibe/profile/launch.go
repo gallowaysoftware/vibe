@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strconv"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/supervisor"
@@ -114,7 +115,7 @@ func HTTPServerSpec(p *Profile, profileName string) (supervisor.LaunchSpec, erro
 	for k := range h.Env {
 		envKeys = append(envKeys, k)
 	}
-	sortStrings(envKeys)
+	slices.Sort(envKeys)
 
 	if h.Image != "" {
 		containerPort := h.ContainerPort
@@ -155,16 +156,6 @@ func HTTPServerSpec(p *Profile, profileName string) (supervisor.LaunchSpec, erro
 		Env:       env,
 		HealthURL: healthURL,
 	}, nil
-}
-
-// sortStrings is the local stable sort used by HTTPServerSpec for env-flag
-// ordering. Avoids pulling in sort throughout the package for one site.
-func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j-1] > s[j]; j-- {
-			s[j-1], s[j] = s[j], s[j-1]
-		}
-	}
 }
 
 // TabbyAPISpec returns the LaunchSpec for a tabbyAPI-backed profile.

@@ -186,13 +186,28 @@ func stageCacheKey(in keyInput) (string, error) {
 		// instead so two different Kokoro servers / two different voices
 		// won't collide.
 		if engine == "kokoro" {
-			return cache.HashStrings("audio",
+			parts := []string{
 				engine,
 				in.AudioURL,
 				in.Voice,
 				in.RenderedText,
 				in.AudioEffect,
-			), nil
+			}
+			// A capability-routed stage resolves its live endpoint from the
+			// active profile's proxy URL (in.BaseURL in the executor), which
+			// isn't known at key time — AudioURL above only carries the
+			// explicit engine_url or the localhost default. Fold the
+			// capability name in so two capabilities fronting different TTS
+			// servers don't collide. Gated on non-empty (HashStrings is
+			// positional) so non-capability stages keep their historical
+			// keys; their live URL resolution matches AudioURL exactly.
+			// This distinguishes capabilities, not the same capability
+			// repointed at a different server — the same tradeoff the text
+			// and comfyui keys make.
+			if in.Capability != "" {
+				parts = append(parts, in.Capability)
+			}
+			return cache.HashStrings("audio", parts...), nil
 		}
 		binary := in.Binary
 		if binary == "" {
@@ -431,6 +446,7 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 			}
 			return stageCacheKey(keyInput{
 				StageType:    StageTypeAudio,
+				Capability:   st.Capability,
 				Voice:        voice,
 				RenderedText: text,
 				AudioEngine:  AudioEngineKokoro,
@@ -447,7 +463,7 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 		if voicesDir == "" {
 			voicesDir = defaultVoicesDirPath
 		}
-		voicesDir = expandAudioTilde(voicesDir)
+		voicesDir = expandTilde(voicesDir)
 		voicePath := filepath.Join(voicesDir, voice+".onnx")
 		size, err := cache.FileSize(voicePath)
 		if err != nil {
@@ -651,11 +667,19 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 			return "", fmt.Errorf("cache key: render url: %w", err)
 		}
 		// Body is a YAML map; serialise canonically so reordered keys
-		// don't change the hash. BodyTemplateFile (if set) is hashed
-		// via its rendered content.
+		// don't change the hash. String leaves are template-rendered
+		// first, mirroring the executor's renderWebhookMap — hashing the
+		// raw templates would give every foreach item / every run with
+		// different bindings the SAME key, so item 0's response would be
+		// silently served for all of them. BodyTemplateFile (if set) is
+		// hashed via its rendered content.
 		bodyJSON := ""
 		if len(st.Body) > 0 {
-			b, err := cache.CanonicalJSON(st.Body)
+			renderedBody, err := e.renderCacheBodyValue(st, st.ID+":body", st.Body, extra)
+			if err != nil {
+				return "", fmt.Errorf("cache key: render body: %w", err)
+			}
+			b, err := cache.CanonicalJSON(renderedBody)
 			if err != nil {
 				return "", fmt.Errorf("cache key: marshal body: %w", err)
 			}
@@ -713,29 +737,91 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 		if err != nil {
 			return "", fmt.Errorf("mix cache key: %w", err)
 		}
-		return cache.HashStrings("mix",
+		parts := []string{
 			string(scriptBytes),
 			strings.Join(mediaHashes, "\n"),
 			outRel,
 			fmt.Sprintf("%g", st.LoudnessTarget),
 			strings.Join(metaParts, "\n"),
-		), nil
+		}
+		// Gated because HashStrings is positional (see the comfyui
+		// input_images comment above): the empty default resolves to
+		// "ffmpeg" in the executor, so only a non-default binary needs to
+		// change the key, and existing entries keep their keys.
+		if st.Binary != "" {
+			parts = append(parts, "binary:"+st.Binary)
+		}
+		return cache.HashStrings("mix", parts...), nil
 	case StageTypeShort:
 		scriptBytes, mediaHashes, outRel, metaParts, err := e.scriptStageKeyParts(st, nil, shortMediaPaths, extra)
 		if err != nil {
 			return "", fmt.Errorf("short cache key: %w", err)
 		}
 		w, h, fps := normalizeVideoDims(firstNonZero(st.ShortWidth, 0), firstNonZero(st.ShortHeight, 0), firstNonZero(st.ShortFPS, 0))
-		return cache.HashStrings("short",
+		parts := []string{
 			string(scriptBytes),
 			strings.Join(mediaHashes, "\n"),
 			outRel,
 			fmt.Sprintf("%dx%d@%d", w, h, fps),
 			fmt.Sprintf("%g", st.LoudnessTarget),
 			strings.Join(metaParts, "\n"),
-		), nil
+		}
+		// stretch_video swaps the rendered filtergraph (freeze-frame tpad
+		// vs setpts time-stretch) — visibly different output bytes, so it
+		// must key. Both extras are gated because HashStrings is
+		// positional: default configs (stretch off, binary "" = ffmpeg)
+		// keep their historical keys.
+		if st.ShortStretchVideo {
+			parts = append(parts, "stretch_video")
+		}
+		if st.Binary != "" {
+			parts = append(parts, "binary:"+st.Binary)
+		}
+		return cache.HashStrings("short", parts...), nil
 	default:
 		return "", nil
+	}
+}
+
+// renderCacheBodyValue renders every string leaf of an opt-in webhook's
+// inline body for cache keying, mirroring renderWebhookValue's type switch
+// (including the map[any]any coercion and []any recursion) so the key stays
+// mechanically in lockstep with what the executor actually sends. It renders
+// via the plain renderTemplate binding: bodies that use the webhook-only
+// {{ env }} helper fail at key time — the same pre-existing limitation the
+// URL and header renders in the webhook branch already have.
+func (e *Executor) renderCacheBodyValue(st *Stage, name string, v any, extra map[string]any) (any, error) {
+	switch tv := v.(type) {
+	case string:
+		return renderTemplate(name, tv, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+	case map[string]any:
+		out := make(map[string]any, len(tv))
+		for k, val := range tv {
+			r, err := e.renderCacheBodyValue(st, name+"."+k, val, extra)
+			if err != nil {
+				return nil, err
+			}
+			out[k] = r
+		}
+		return out, nil
+	case map[any]any:
+		coerced := make(map[string]any, len(tv))
+		for k, val := range tv {
+			coerced[fmt.Sprint(k)] = val
+		}
+		return e.renderCacheBodyValue(st, name, coerced, extra)
+	case []any:
+		out := make([]any, len(tv))
+		for i, item := range tv {
+			r, err := e.renderCacheBodyValue(st, fmt.Sprintf("%s[%d]", name, i), item, extra)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = r
+		}
+		return out, nil
+	default:
+		return v, nil
 	}
 }
 
@@ -868,7 +954,14 @@ func (e *Executor) hashStageImages(st *Stage, extra map[string]any) ([]string, e
 			h, err := cache.HashFile(p)
 			if err != nil {
 				if os.IsNotExist(err) {
-					return nil, nil
+					// Fold a marker (mirroring the ffmpeg-inputs branch)
+					// instead of collapsing to the no-images key: image_files
+					// entries are explicit, so a missing one is a
+					// misconfiguration the live executor will surface — the
+					// key must not alias a stale no-image (or
+					// different-missing-image) cache entry over that error.
+					hashes = append(hashes, "missing:"+p)
+					continue
 				}
 				return nil, fmt.Errorf("cache key: hash image %s: %w", p, err)
 			}
@@ -886,11 +979,11 @@ func (e *Executor) hashStageImages(st *Stage, extra map[string]any) ([]string, e
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		// A missing image_dir is not a cache-key error: the live executor
-		// will surface the same os.ReadDir failure with a clearer message
-		// from collectImages. Returning an empty slice here keeps the key
-		// composition deterministic and lets the failure happen once, in
-		// the executor.
+		// A missing image_dir deliberately keys as "no images":
+		// collectImages degrades to text-only inference on a missing dir
+		// (foreach items legitimately lack an images/ subdir), so those
+		// items must share cache entries with plain text-only runs rather
+		// than fold a missing-marker that would split them.
 		if os.IsNotExist(err) {
 			return nil, nil
 		}

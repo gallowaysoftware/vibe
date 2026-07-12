@@ -445,22 +445,6 @@ func TestWriteAndReadPidFile(t *testing.T) {
 	}
 }
 
-// TestJobStatus_TopLevel exercises the JobStatus convenience the CLI
-// uses; mostly a smoke test that we don't regress to returning the
-// wrong bucket when summarizeJob is later refactored.
-func TestJobStatus_TopLevel(t *testing.T) {
-	t.Parallel()
-	tmp := t.TempDir()
-	dir := writeJobDir(t, tmp, "2026-05-16T15-00-00_z", os.Getpid(), nil, "")
-	st, err := JobStatus(dir)
-	if err != nil {
-		t.Fatalf("JobStatus: %v", err)
-	}
-	if st != JobStateRunning {
-		t.Errorf("JobStatus = %q, want %q", st, JobStateRunning)
-	}
-}
-
 // --- helpers ---------------------------------------------------------
 
 // deadlyPid forks a tiny child (a no-op `true`), reaps it, and returns

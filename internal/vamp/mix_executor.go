@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -118,15 +119,87 @@ func (m *mixExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput,
 	if intro != "" {
 		inputs = append(inputs, intro)
 	}
+	voicePaths := make([]string, 0, len(script.VoiceSegments))
 	for i, seg := range script.VoiceSegments {
 		p := resolveInRunDir(seg, in.RunDir)
 		if _, err := os.Stat(p); err != nil {
 			return nil, fmt.Errorf("voice segment %d (%s): %w", i, p, err)
 		}
+		voicePaths = append(voicePaths, p)
 		inputs = append(inputs, p)
 	}
 	if outro != "" {
 		inputs = append(inputs, outro)
+	}
+
+	ext := strings.ToLower(filepath.Ext(outputPath))
+
+	// Chapter metadata. Start times are summed ffprobe durations of the
+	// inputs preceding each chapter's first voice segment — including the
+	// intro, which plays before every segment. loudnorm's dynamic mode can
+	// shift the mixed duration slightly relative to the summed inputs;
+	// executeM4B shares that characteristic and the drift is inaudible.
+	metaPath := ""
+	if len(script.Chapters) > 0 {
+		for k, ch := range script.Chapters {
+			if ch.StartSegment < 0 || ch.StartSegment >= len(voicePaths) {
+				return nil, fmt.Errorf("mix script %s: chapter %d (%q): start_segment %d out of range [0,%d)", scriptPath, k, ch.Title, ch.StartSegment, len(voicePaths))
+			}
+			if k > 0 && ch.StartSegment <= script.Chapters[k-1].StartSegment {
+				return nil, fmt.Errorf("mix script %s: chapter %d (%q): start_segment %d must be strictly greater than chapter %d's %d", scriptPath, k, ch.Title, ch.StartSegment, k-1, script.Chapters[k-1].StartSegment)
+			}
+		}
+		if ext == ".mp3" {
+			// The mp3 path carries no chapter atoms (see the codec
+			// comment below); dropping silently would hide a schema
+			// field the showrunner deliberately set.
+			if in.Log != nil {
+				fmt.Fprintf(in.Log, "mix: dropping %d chapter(s): .mp3 output carries no chapter metadata, use an .m4b output for chapterised audio\n", len(script.Chapters))
+			}
+		} else {
+			introMs := int64(0)
+			if intro != "" {
+				introMs, err = probeDurationMs(ctx, intro)
+				if err != nil {
+					return nil, fmt.Errorf("mix: ffprobe intro %s: %w", intro, err)
+				}
+			}
+			cumMs := introMs
+			segStartMs := make([]int64, len(voicePaths))
+			for i, p := range voicePaths {
+				segStartMs[i] = cumMs
+				dur, err := probeDurationMs(ctx, p)
+				if err != nil {
+					return nil, fmt.Errorf("mix: ffprobe voice segment %d %s: %w", i, p, err)
+				}
+				cumMs += dur
+			}
+			// The outro tail belongs to the last chapter.
+			totalMs := cumMs
+			if outro != "" {
+				dur, err := probeDurationMs(ctx, outro)
+				if err != nil {
+					return nil, fmt.Errorf("mix: ffprobe outro %s: %w", outro, err)
+				}
+				totalMs += dur
+			}
+			var metaBuf strings.Builder
+			metaBuf.WriteString(";FFMETADATA1\n")
+			for k, ch := range script.Chapters {
+				startMs := segStartMs[ch.StartSegment]
+				endMs := totalMs
+				if k+1 < len(script.Chapters) {
+					endMs = segStartMs[script.Chapters[k+1].StartSegment]
+				}
+				fmt.Fprintf(&metaBuf, "[CHAPTER]\nTIMEBASE=1/1000\nSTART=%d\nEND=%d\ntitle=%s\n", startMs, endMs, m4bEscapeMeta(ch.Title))
+			}
+			// Scratch name scoped by stage + item so parallel mix stages
+			// or foreach items never share a metadata file.
+			metaPath = filepath.Join(in.RunDir, fmt.Sprintf(".mix-meta.%s-%d.txt", st.ID, in.ItemIdx))
+			if err := os.WriteFile(metaPath, []byte(metaBuf.String()), 0o644); err != nil {
+				return nil, fmt.Errorf("mix: write chapter metadata: %w", err)
+			}
+		}
 	}
 
 	binary := st.Binary
@@ -157,6 +230,16 @@ func (m *mixExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput,
 		coverIdx = len(inputs)
 		args = append(args, "-i", coverImage)
 	}
+	// The FFMETADATA file carries no streams, only chapter markers;
+	// ffmpeg detects its format from the ;FFMETADATA1 header.
+	metaIdx := -1
+	if metaPath != "" {
+		metaIdx = len(inputs)
+		if coverIdx >= 0 {
+			metaIdx++
+		}
+		args = append(args, "-i", metaPath)
+	}
 
 	// Filter graph: concat all N audio inputs, then loudnorm.
 	var fg strings.Builder
@@ -178,7 +261,6 @@ func (m *mixExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput,
 	//                  a single audio stream, so we drop the
 	//                  cover here (mp3 ID3 cover is doable but
 	//                  needs a different filtergraph shape; v2).
-	ext := strings.ToLower(filepath.Ext(outputPath))
 	switch ext {
 	case ".mp3":
 		args = append(args, "-c:a", "libmp3lame", "-b:a", "96k")
@@ -189,6 +271,12 @@ func (m *mixExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput,
 				"-c:v", "mjpeg",
 				"-disposition:v:0", "attached_pic",
 			)
+		}
+		if metaIdx >= 0 {
+			// -map_metadata must precede the -metadata tags appended
+			// below, or ffmpeg's metadata mapping clobbers them —
+			// mirrors executeM4B's arg ordering.
+			args = append(args, "-map_metadata", strconv.Itoa(metaIdx))
 		}
 		args = append(args, "-c:a", "aac", "-b:a", "96k")
 		args = append(args, "-movflags", "+faststart")

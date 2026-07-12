@@ -35,7 +35,7 @@ func TestSchemaJSON_RoundTrip(t *testing.T) {
 		t.Errorf("root type = %v, want object", got)
 	}
 	required, _ := doc["required"].([]any)
-	wantRequired := map[string]bool{"name": true, "backend": true}
+	wantRequired := map[string]bool{"name": true}
 	gotRequired := make(map[string]bool, len(required))
 	for _, r := range required {
 		gotRequired[r.(string)] = true
@@ -43,6 +43,26 @@ func TestSchemaJSON_RoundTrip(t *testing.T) {
 	for k := range wantRequired {
 		if !gotRequired[k] {
 			t.Errorf("root required missing %q (got %v)", k, required)
+		}
+	}
+	if gotRequired["backend"] {
+		t.Errorf("root required must not include \"backend\" (backend_ref profiles have no inline backend); got %v", required)
+	}
+
+	// The inline-backend-or-backend_ref requirement lives in a shallow
+	// root anyOf, mirroring Load's runtime check.
+	rootAnyOf, _ := doc["anyOf"].([]any)
+	anyOfReq := make(map[string]bool, len(rootAnyOf))
+	for _, branch := range rootAnyOf {
+		b, _ := branch.(map[string]any)
+		req, _ := b["required"].([]any)
+		for _, r := range req {
+			anyOfReq[r.(string)] = true
+		}
+	}
+	for _, k := range []string{"backend", "backend_ref"} {
+		if !anyOfReq[k] {
+			t.Errorf("root anyOf missing a branch requiring %q (got %v)", k, rootAnyOf)
 		}
 	}
 

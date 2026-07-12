@@ -121,6 +121,9 @@ func RunPipeline(ctx context.Context, p *vamp.Pipeline, pipelineDir string, pipe
 		if err := ensureServicesUp(ctx, p, stdout); err != nil {
 			return err
 		}
+		if err := ensureVibeReachable(ctx, p, opts.APIURL); err != nil {
+			return err
+		}
 	}
 	runDir := opts.RunDir
 	if opts.Resume != "" {
@@ -281,6 +284,68 @@ func ensureServicesUp(ctx context.Context, p *vamp.Pipeline, stdout io.Writer) e
 		return fmt.Errorf("ensure-services: %s", strings.Join(bad, "; "))
 	}
 	return nil
+}
+
+// ensureVibeReachable pings the vibe control plane once with a short
+// timeout, but only when some stage will need a profile/backend
+// activation. Why: without the preflight, the first activation failure
+// surfaces as a bare "dial tcp ...: connection refused" — potentially
+// minutes into a pipeline whose early stages are render/ffmpeg — with
+// no hint that any vibe command auto-spawns the daemon or that
+// --api/$VIBE_API may point at the wrong host. Pipelines that never
+// touch vibe (pure ffmpeg/render/piper-audio) skip the probe so they
+// don't gain a daemon dependency they never had.
+func ensureVibeReachable(ctx context.Context, p *vamp.Pipeline, apiURL string) error {
+	if !pipelineRequiresVibe(p) {
+		return nil
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if _, err := vibeclient.New(apiURL).Status(pingCtx); err != nil {
+		return fmt.Errorf("vibe control plane not reachable at %s: %v — start it with any vibe command (e.g. \"vibe start <profile>\" auto-spawns the daemon), or point --api / $VIBE_API at the right host",
+			resolveVibeAPIURL(apiURL), err)
+	}
+	return nil
+}
+
+// pipelineRequiresVibe reports whether any stage needs a vibe
+// profile/backend activation. Mirrors the executor's per-stage
+// stageRequiresVibeProfile (internal/vamp/exec.go) — keep the two in
+// sync when adding stage types.
+func pipelineRequiresVibe(p *vamp.Pipeline) bool {
+	for i := range p.Stages {
+		st := &p.Stages[i]
+		switch st.Type {
+		case vamp.StageTypeAudio:
+			// Capability-less audio is a local subprocess (piper, or
+			// kokoro with an explicit engine_url); a capability means
+			// the daemon manages the backing TTS profile.
+			if st.Capability != "" {
+				return true
+			}
+		case vamp.StageTypeFFmpeg, vamp.StageTypeYouTube, vamp.StageTypeWebhook,
+			vamp.StageTypeConfirm, vamp.StageTypeRender, vamp.StageTypePandoc,
+			vamp.StageTypeMix, vamp.StageTypeShort:
+		default:
+			// Empty type defaults to text; text/comfyui/compact and any
+			// future type all activate a vibe-managed backend.
+			return true
+		}
+	}
+	return false
+}
+
+// resolveVibeAPIURL mirrors vibeclient's baseURL resolution (argument,
+// then $VIBE_API, then the default) so error messages can name the
+// address that was actually dialed.
+func resolveVibeAPIURL(apiURL string) string {
+	if apiURL != "" {
+		return apiURL
+	}
+	if env := os.Getenv("VIBE_API"); env != "" {
+		return env
+	}
+	return vibeclient.DefaultBaseURL
 }
 
 // probeServiceURL is the single-shot read-only counterpart to

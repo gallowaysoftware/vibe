@@ -163,9 +163,24 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := paths.EnsureDirs(); err != nil {
 		return fmt.Errorf("ensure dirs: %w", err)
 	}
-	if err := ensureSingleInstance(); err != nil {
-		return err
+	// An exclusive flock held for the daemon's lifetime is the
+	// single-instance gate. The old PID-file heuristic raced: the PID file
+	// is written only after the listeners bind, so two daemons spawned
+	// within the CLI's ping window both passed the check — and the loser's
+	// socket cleanup deleted the winner's live unix socket, wedging every
+	// subsequent CLI call until manual cleanup. The flock loser exits
+	// before touching the socket path, which also makes the unconditional
+	// os.Remove below safe: any socket file present while we hold the lock
+	// is stale by definition.
+	lock, err := os.OpenFile(paths.PIDFile()+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return fmt.Errorf("open daemon lock: %w", err)
 	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lock.Close()
+		return errors.New("vibe daemon already running")
+	}
+	defer lock.Close()
 
 	sockPath := paths.Socket()
 	_ = os.Remove(sockPath)
@@ -346,6 +361,10 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 
 	var p *profile.Profile
 	if backendName != "" {
+		if !validBackendName.MatchString(backendName) {
+			return nil, connect.NewError(connect.CodeInvalidArgument,
+				fmt.Errorf("backend name %q is invalid (allowed: [a-zA-Z0-9._-]+)", backendName))
+		}
 		def, err := profile.LoadBackend(backendName)
 		if err != nil {
 			return nil, connect.NewError(connect.CodeNotFound, err)
@@ -423,6 +442,24 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 	if err := runHooks(startCtx, p.Name, "pre_start", p.Hooks.PreStart, true); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
+	// Once pre_start side effects exist (e.g. `docker compose up` of a
+	// sidecar), a failure anywhere below must run post_stop or the sidecar
+	// leaks and conflicts with the next activation. Defer ordering runs this
+	// after the in-branch sup.Stop calls, matching stopActive's
+	// backend-down-then-post_stop order. Disarmed on success.
+	startOK := false
+	defer func() {
+		if startOK {
+			return
+		}
+		// Fresh context: startCtx may be the very thing that failed
+		// (cancelled/expired), and CommandContext would kill the hooks
+		// instantly — same reason the error paths use context.Background()
+		// for d.sup.Stop.
+		hookCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		_ = runHooks(hookCtx, p.Name, "post_stop", p.Hooks.PostStop, false)
+	}()
 
 	// Dispatch by backend kind to build the launch spec + pick a port.
 	spec, port, err := d.buildLaunchSpec(p)
@@ -472,6 +509,13 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 			if p.Backend.LlamaServer != nil {
 				alias = p.Backend.LlamaServer.Alias
 				ctxLen = p.Backend.LlamaServer.Context
+			} else if t := p.Backend.TabbyAPI; t != nil {
+				// ${MODEL_ALIAS}/${MODEL_CONTEXT} are always-known expansion
+				// vars, so leaving these unset would not error — the template
+				// would silently render ""/0 and a frontend like pi would fall
+				// back to its paid default model.
+				alias = t.Alias
+				ctxLen = t.Context
 			}
 			ectx := profile.ExpandContext{
 				VibeAPI:      vibeAPI,
@@ -526,6 +570,7 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 	} else {
 		slog.Info("profile started", "profile", p.Name, "backend", st.Addr)
 	}
+	startOK = true
 	return connect.NewResponse(resp), nil
 }
 
@@ -580,10 +625,33 @@ func (d *Daemon) watchBackendForRespawn(name string, spec supervisor.LaunchSpec,
 		if respawns >= maxBackendRespawns {
 			slog.Error("backend respawn budget exhausted; giving up",
 				"profile", name, "respawns", respawns, "window", respawnWindow)
+			// Full teardown, not just clearing the active slot: leaving
+			// d.frontend set would orphan the compose stack / managed binary
+			// forever (a later Start overwrites the only reference), and a
+			// managed frontend keeps holding its port so the next
+			// activation's wait_for can pass against the stale instance.
+			// Bounded context — nobody waits on this goroutine. Holding
+			// d.startMu through the teardown is safe: Start/Stop TryLock and
+			// fail fast.
 			d.mu.Lock()
+			p := d.active
+			fr := d.frontend
 			d.active = nil
+			d.frontend = nil
 			d.mu.Unlock()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			if fr != nil {
+				if err := frontend.Deactivate(ctx, fr); err != nil {
+					slog.Warn("frontend deactivate after respawn budget exhaustion failed",
+						"profile", name, "err", err)
+				}
+			}
 			d.prx.SetBackend(nil)
+			if p != nil {
+				d.stopCompanions(ctx, p)
+				_ = runHooks(ctx, p.Name, "post_stop", p.Hooks.PostStop, false)
+			}
+			cancel()
 			d.startMu.Unlock()
 			return
 		}
@@ -915,21 +983,25 @@ func (d *Daemon) stopActive(ctx context.Context) error {
 	d.active = nil
 	d.frontend = nil
 	d.mu.Unlock()
-	if active == nil {
-		return nil
+	if active != nil {
+		slog.Info("stopping profile", "profile", active.Name)
 	}
-	slog.Info("stopping profile", "profile", active.Name)
 	// Tear down the frontend first. For docker-compose this issues
 	// `docker compose down`, which may make requests against the proxy on
 	// its way out — better to fail those requests cleanly than to surface
-	// 502s from a half-stopped proxy/supervisor.
+	// 502s from a half-stopped proxy/supervisor. Runs even when active is
+	// nil: dropping the snapshot here would discard the only reference to
+	// the frontend's teardown, orphaning it forever.
 	if fr != nil {
 		if err := frontend.Deactivate(ctx, fr); err != nil {
 			// Log and continue: leaving a stack up is bad, but failing to
 			// stop the supervisor is worse. The user can still `docker
 			// compose down` by hand if needed.
-			slog.Warn("frontend deactivate failed", "profile", active.Name, "err", err)
+			slog.Warn("frontend deactivate failed", "err", err)
 		}
+	}
+	if active == nil {
+		return nil
 	}
 	if err := d.sup.Stop(ctx); err != nil {
 		return err
@@ -1052,6 +1124,12 @@ func firstNonEmpty(s ...string) string {
 // a Start/Pull/Status RPC's profile-name field.
 var validProfileName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// validBackendName guards StartRequest.backend the same way — the control
+// plane must not be able to load YAML from outside backends/ — but admits
+// '.', which real backend names use (qwen3.6-27b). Dots without a path
+// separator cannot escape the backends dir.
+var validBackendName = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+
 func loadProfileByName(name string) (*profile.Profile, error) {
 	if !validProfileName.MatchString(name) {
 		return nil, fmt.Errorf("profile name %q is invalid (allowed: [a-zA-Z0-9_-]+)", name)
@@ -1065,26 +1143,6 @@ func loadProfileByName(name string) (*profile.Profile, error) {
 
 func writePIDFile() error {
 	return os.WriteFile(paths.PIDFile(), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644)
-}
-
-func ensureSingleInstance() error {
-	data, err := os.ReadFile(paths.PIDFile())
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || pid <= 0 {
-		_ = os.Remove(paths.PIDFile())
-		return nil
-	}
-	if err := syscall.Kill(pid, 0); err == nil {
-		return fmt.Errorf("vibe daemon already running (pid %d)", pid)
-	}
-	_ = os.Remove(paths.PIDFile())
-	return nil
 }
 
 // buildLaunchSpec dispatches a Profile to its backend-specific spec

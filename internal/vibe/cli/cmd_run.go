@@ -59,14 +59,24 @@ func runCmd() *cobra.Command {
 			if err := ensureDaemon(ctx); err != nil {
 				return err
 			}
+			client := newClient()
+			// Idempotent no-op, matching `vibe start`: a foreground Start
+			// against an already-held active slot would only be rejected
+			// with "stop first". We don't launch the frontend either — this
+			// invocation didn't start the profile, so it must not stop it
+			// when the frontend exits.
+			if st := runningStatus(ctx, client, args[0]); st != nil {
+				out := cmd.OutOrStdout()
+				fmt.Fprintf(out, "%s already running (backend: %s)\n", st.Profile, st.BackendAddr)
+				fmt.Fprintln(out, "frontend not launched — `vibe stop` first to run it fresh")
+				return nil
+			}
 			if err := pullProfile(ctx, cmd.OutOrStdout(), args[0]); err != nil {
 				return err
 			}
 
 			cancelTail := startProgressTail(cmd.OutOrStdout())
 			defer cancelTail()
-
-			client := newClient()
 			r, err := client.StartWithOptions(ctx, args[0], vibeclient.StartOptions{
 				NoVRAMCheck: noVRAMCheck,
 				Foreground:  true,
@@ -130,28 +140,34 @@ func runCmd() *cobra.Command {
 			// the wrapping `vibe run` swallowing the signal. The frontend
 			// gets its own chance to exit cleanly; if the operator hits ^C
 			// twice we still want the second one to land on the child too.
+			// Notify before Start so a ^C during spawn buffers here instead
+			// of killing vibe with the default disposition (which would skip
+			// the deferred profile stop); the forwarding goroutine only
+			// launches after Start, when child.Process is immutable, so it
+			// never races with Start's write.
 			sigCh := make(chan os.Signal, 2)
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 			defer signal.Stop(sigCh)
+
+			if err := child.Start(); err != nil {
+				return fmt.Errorf("launch %s: %w", p.Frontend.Binary, err)
+			}
 			go func() {
 				for sig := range sigCh {
-					if child.Process != nil {
-						_ = child.Process.Signal(sig)
-					}
+					_ = child.Process.Signal(sig)
 				}
 			}()
 
-			if err := child.Run(); err != nil {
+			if err := child.Wait(); err != nil {
 				// A non-zero exit from the frontend is its problem to report;
 				// surface the error but still return success-ish so the
 				// teardown defer fires cleanly. ExitError specifically is
-				// expected (user quit a TUI with q/^C); other errors mean
-				// we failed to launch.
+				// expected (user quit a TUI with q/^C).
 				var exitErr *exec.ExitError
 				if errors.As(err, &exitErr) {
 					return nil
 				}
-				return fmt.Errorf("launch %s: %w", p.Frontend.Binary, err)
+				return fmt.Errorf("wait for %s: %w", p.Frontend.Binary, err)
 			}
 			return nil
 		},

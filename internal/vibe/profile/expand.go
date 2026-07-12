@@ -30,15 +30,19 @@ var (
 	wholeVarRE = regexp.MustCompile(`^\$\{([A-Z_]+)\}$`)
 )
 
-// ExpandTemplate returns a deep copy of the frontend template with all ${VAR}
-// placeholders substituted. When a string consists of exactly one ${VAR}
-// reference, the variable's native type is preserved (so an int stays an int);
-// otherwise placeholders are substituted as strings. Unknown variables are an
-// error.
-func (p *Profile) ExpandTemplate(ctx ExpandContext) (map[string]any, error) {
-	out, err := expandValue(p.Frontend.Template, ctx.vars())
+// ExpandTemplate returns a deep copy of tmpl with all ${VAR} placeholders
+// substituted. When a string consists of exactly one ${VAR} reference, the
+// variable's native type is preserved (so an int stays an int); otherwise
+// placeholders are substituted as strings. Unknown variables are an error.
+// Package-level (not a Profile method) because a frontend can render several
+// files (frontend.write_files), each with its own template map.
+func ExpandTemplate(tmpl map[string]any, ctx ExpandContext) (map[string]any, error) {
+	out, err := expandValue(tmpl, ctx.vars())
 	if err != nil {
 		return nil, err
+	}
+	if out == nil {
+		return map[string]any{}, nil
 	}
 	m, ok := out.(map[string]any)
 	if !ok {

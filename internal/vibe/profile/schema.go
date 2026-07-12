@@ -141,6 +141,11 @@ func Schema() *schemaProperty {
 				Type:        "boolean",
 				Description: "Use the model's Jinja chat template (--jinja).",
 			},
+			"port": {
+				Type:        "integer",
+				Description: "Pins the host port llama-server publishes on. Zero / unset lets the daemon pick a free port. Useful for service-mode profiles whose clients expect a stable address.",
+				Minimum:     float64Ptr(0),
+			},
 			"extra_args": {
 				Type:        "array",
 				Description: "Extra positional flags forwarded to llama-server, after vibe-managed flags. Each entry is one argv token.",
@@ -396,6 +401,30 @@ func Schema() *schemaProperty {
 				Description: "MCP server names (lookup keys under $XDG_CONFIG_HOME/vibe/mcp/<name>.yaml) merged into the rendered template. Only valid for kind=external.",
 				Items:       &schemaProperty{Type: "string"},
 			},
+			"write_files": {
+				Type:        "array",
+				Description: "Render more than one config file from one profile (e.g. oh-my-pi's models.yml for providers + config.yml for model roles). Each entry has path/template/mcps; the first entry backs ${WRITE_FILE}. Valid for kind=external and kind=managed. The legacy write_file/template pair renders as the first file when both are set.",
+				Items: &schemaProperty{
+					Type:     "object",
+					Required: []string{"path", "template"},
+					Properties: map[string]*schemaProperty{
+						"path": {
+							Type:        "string",
+							Description: "Destination path. Supports ${VIBE_STATE_DIR}/${VAR} substitution and ~/ expansion.",
+						},
+						"template": {
+							Type:                 "object",
+							Description:          "YAML/JSON object rendered to path with ${VAR} substitution.",
+							AdditionalProperties: true,
+						},
+						"mcps": {
+							Type:        "array",
+							Description: "MCP server names merged into this file's template under a top-level \"mcp\" key.",
+							Items:       &schemaProperty{Type: "string"},
+						},
+					},
+				},
+			},
 			"url": {
 				Type:        "string",
 				Description: "Browser-pointable URL surfaced in the `vibe start` summary. Optional; defaults to the wait_for entry with a \"/\" path when set.",
@@ -435,12 +464,21 @@ func Schema() *schemaProperty {
 	}
 
 	root := &schemaProperty{
-		Schema:               JSONSchemaDraft,
-		ID:                   "https://github.com/gallowaysoftware/vibe/schemas/vibe.profile.schema.json",
-		Title:                "vibe profile",
-		Type:                 "object",
-		Description:          "A vibe profile definition: a named backend (llama_server, comfyui, http_server, or tabby_api) plus an optional frontend renderer.",
-		Required:             []string{"name", "backend"},
+		Schema:      JSONSchemaDraft,
+		ID:          "https://github.com/gallowaysoftware/vibe/schemas/vibe.profile.schema.json",
+		Title:       "vibe profile",
+		Type:        "object",
+		Description: "A vibe profile definition: a named backend (llama_server, comfyui, http_server, or tabby_api — inline or via backend_ref) plus an optional frontend renderer.",
+		Required:    []string{"name"},
+		// Shallow anyOf so the "inline backend or backend_ref" requirement
+		// still surfaces in editors; unlike the deeply-nested frontend
+		// oneOf this file avoids, a one-level anyOf on the root yields a
+		// legible error. Mutual exclusion of the two stays with the
+		// runtime validator (Load).
+		AnyOf: []*schemaProperty{
+			{Required: []string{"backend"}},
+			{Required: []string{"backend_ref"}},
+		},
 		AdditionalProperties: false,
 		Properties: map[string]*schemaProperty{
 			"name": {
@@ -452,7 +490,16 @@ func Schema() *schemaProperty {
 				Type:        "string",
 				Description: "Free-form human description shown by `vibe list`.",
 			},
-			"backend":  backend,
+			"backend": backend,
+			"backend_ref": {
+				Type:        "string",
+				Description: "Name of a reusable backend defined under $XDG_CONFIG_HOME/vibe/backends/<ref>.yaml, resolved into the profile at load time. Mutually exclusive with an inline backend block (enforced at runtime).",
+			},
+			"mode": {
+				Type:        "string",
+				Enum:        []any{ModeActive, ModeService},
+				Description: "Profile mode: \"active\" (default) takes the daemon's single active slot and may carry a frontend; \"service\" runs as a frontend-less sidecar co-started via another profile's services list.",
+			},
 			"frontend": frontend,
 			"estimated_vram_gb": {
 				Type:        "number",

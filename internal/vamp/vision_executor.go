@@ -14,10 +14,17 @@ import (
 	"github.com/gallowaysoftware/vibe/internal/vamp/cache"
 )
 
-// visionExecutor handles text stages with image_dir: reads the prompt, scans
-// the image directory for supported image files, and calls the multimodal
-// inference endpoint. Falls through to the standard text executor when
-// image_dir is empty.
+// visionExecutor handles all StageTypeText stages: render the prompt
+// template, call vibe's OpenAI-compatible inference endpoint with optional
+// token streaming, validate + clean the JSON output_format if requested, and
+// return the response. When image_dir or image_files is set, the collected
+// images travel as multimodal content alongside the prompt.
+//
+// The inference functions are held as fields rather than passed through
+// StageInput because (a) they're stable per-Executor dependencies, not
+// per-stage routing info, and (b) the StageInput.Vibe client is the gRPC
+// control plane, distinct from the OpenAI-compatible chat-completion HTTP
+// client.
 type visionExecutor struct {
 	inference  InferenceFunc
 	multimodal func(ctx context.Context, baseURL, model, prompt string, images []string, params map[string]any, onToken StreamFunc) (string, error)
@@ -26,9 +33,9 @@ type visionExecutor struct {
 // Compile-time guarantee that visionExecutor satisfies StageExecutor.
 var _ StageExecutor = (*visionExecutor)(nil)
 
-// Execute processes a vision-capable text stage. If ImageDir is set, all
+// Execute processes a text stage. If ImageDir or ImageFiles is set, all
 // supported images are collected and sent as multimodal content alongside the
-// prompt. Otherwise it delegates to the text executor path.
+// prompt. Otherwise the stage runs as plain text inference.
 func (v *visionExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput, error) {
 	st := in.Stage
 	extra := map[string]any{
@@ -67,7 +74,7 @@ func (v *visionExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 		if !filepath.IsAbs(imgDir) {
 			imgDir = filepath.Join(in.PipelineDir, imgDir)
 		}
-		imagePaths, err = collectImages(imgDir)
+		imagePaths, err = collectImages(ctx, imgDir)
 		if err != nil {
 			return nil, fmt.Errorf("collect images from %s: %w", resolvedDir, err)
 		}
@@ -86,7 +93,7 @@ func (v *visionExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 			}
 			// SVGs get the same rsvg-convert path as collectImages does.
 			if strings.EqualFold(filepath.Ext(p), ".svg") {
-				png, rasterErr := rasterizeSVG(p)
+				png, rasterErr := rasterizeSVG(ctx, p)
 				if rasterErr != nil {
 					return nil, fmt.Errorf("rasterize %s: %w", p, rasterErr)
 				}
@@ -110,9 +117,14 @@ func (v *visionExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 	}
 
 	if st.OutputFormat == "json" {
-		if err := validateJSON(out); err != nil {
+		cleaned, err := extractCleanJSON(out)
+		if err != nil {
 			return nil, fmt.Errorf("stage output is not valid JSON: %w", err)
 		}
+		// Replace the raw output with the extracted JSON so downstream
+		// stages reading {{ .stages.<id>.output }} see clean JSON, not
+		// the verbose preamble the LLM emitted before it.
+		out = cleaned
 	}
 	return &StageOutput{Text: out}, nil
 }
@@ -126,7 +138,14 @@ func (v *visionExecutor) inferenceMultimodal(ctx context.Context, baseURL, model
 	return v.inference(ctx, baseURL, model, prompt, params, onToken)
 }
 
-// expandTilde expands a leading "~/" against the user's home directory.
+// expandTilde expands a leading "~/" against the user's home directory. The
+// package's single tilde helper — anchored prefix only, no general shell
+// expansion. It deliberately falls back to the unexpanded path when
+// UserHomeDir fails: callers treat the value as best-effort, so a bad
+// environment surfaces as a later stat/read failure naming the literal "~/"
+// path. exec.go's template functions keep their own error-returning
+// expansion because a template author needs the wrapped error, not a
+// silently-unexpanded path.
 func expandTilde(p string) string {
 	if !strings.HasPrefix(p, "~/") {
 		return p
@@ -150,7 +169,7 @@ func expandTilde(p string) string {
 // a course curriculum carry no images/ subdir); failing the stage on the
 // missing-dir case would refuse to do text-only inference on those items,
 // which is what the vision-capable backend cleanly degrades to.
-func collectImages(dir string) ([]string, error) {
+func collectImages(ctx context.Context, dir string) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -182,7 +201,7 @@ func collectImages(dir string) ([]string, error) {
 		}
 	}
 	for _, svg := range svgs {
-		png, err := rasterizeSVG(svg)
+		png, err := rasterizeSVG(ctx, svg)
 		if err != nil {
 			return nil, fmt.Errorf("rasterize %s: %w", svg, err)
 		}
@@ -207,7 +226,7 @@ const svgRasterMaxDim = 896
 // for boilerplate diagrams) share one render. Errors propagate — a missing
 // rsvg-convert or a malformed SVG should fail the stage rather than silently
 // drop the image the lesson author put there for the model to read.
-func rasterizeSVG(svgPath string) (string, error) {
+func rasterizeSVG(ctx context.Context, svgPath string) (string, error) {
 	data, err := os.ReadFile(svgPath)
 	if err != nil {
 		return "", fmt.Errorf("read svg: %w", err)
@@ -221,11 +240,26 @@ func rasterizeSVG(svgPath string) (string, error) {
 	if info, err := os.Stat(pngPath); err == nil && info.Size() > 0 {
 		return pngPath, nil
 	}
+	// Render to a unique temp file and rename into place. Concurrent foreach
+	// items referencing the same SVG all miss the Stat above; writing the
+	// final path directly would let one item read a half-written PNG and send
+	// truncated image bytes to the model. Rename is atomic within cacheDir,
+	// so race losers just replace identical bytes with identical bytes.
+	tmp, err := os.CreateTemp(cacheDir, hex.EncodeToString(sum[:])+".*.png.tmp")
+	if err != nil {
+		return "", fmt.Errorf("create temp png: %w", err)
+	}
+	tmpPath := tmp.Name()
+	_ = tmp.Close()
 	dim := fmt.Sprintf("%d", svgRasterMaxDim)
-	cmd := exec.Command("rsvg-convert", "--width", dim, "--height", dim, "--keep-aspect-ratio", "-o", pngPath, svgPath)
+	cmd := exec.CommandContext(ctx, "rsvg-convert", "--width", dim, "--height", dim, "--keep-aspect-ratio", "-o", tmpPath, svgPath)
 	if out, runErr := cmd.CombinedOutput(); runErr != nil {
-		_ = os.Remove(pngPath)
+		_ = os.Remove(tmpPath)
 		return "", fmt.Errorf("rsvg-convert: %w: %s", runErr, strings.TrimSpace(string(out)))
+	}
+	if err := os.Rename(tmpPath, pngPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("rename rasterized png: %w", err)
 	}
 	return pngPath, nil
 }

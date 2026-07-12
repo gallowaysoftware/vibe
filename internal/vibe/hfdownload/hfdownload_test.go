@@ -115,9 +115,10 @@ func TestDownload_ResumesFromPartial(t *testing.T) {
 	srv, spec := newFakeHF(t, body)
 	dest := filepath.Join(t.TempDir(), "model.gguf")
 
-	// Pre-populate with first half.
+	// Pre-populate the staging file with the first half, as an interrupted
+	// earlier download would have left it.
 	half := len(body) / 2
-	if err := os.WriteFile(dest, body[:half], 0o644); err != nil {
+	if err := os.WriteFile(dest+".partial", body[:half], 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -130,6 +131,9 @@ func TestDownload_ResumesFromPartial(t *testing.T) {
 	}
 	if !bytes.Equal(got, body) {
 		t.Errorf("resumed download mismatch (got len %d, want %d)", len(got), len(body))
+	}
+	if _, err := os.Stat(dest + ".partial"); !os.IsNotExist(err) {
+		t.Errorf("staging file should be promoted away, stat err = %v", err)
 	}
 }
 
@@ -149,17 +153,17 @@ func TestDownload_ServerError(t *testing.T) {
 	}
 }
 
-func TestSpec_URL(t *testing.T) {
+func TestSpec_Path(t *testing.T) {
 	cases := []struct {
 		spec Spec
 		want string
 	}{
-		{Spec{Repo: "a/b", File: "c.gguf"}, "https://huggingface.co/a/b/resolve/main/c.gguf"},
-		{Spec{Repo: "a/b", File: "c.gguf", Revision: "v1.0"}, "https://huggingface.co/a/b/resolve/v1.0/c.gguf"},
+		{Spec{Repo: "a/b", File: "c.gguf"}, "/a/b/resolve/main/c.gguf"},
+		{Spec{Repo: "a/b", File: "c.gguf", Revision: "v1.0"}, "/a/b/resolve/v1.0/c.gguf"},
 	}
 	for _, tc := range cases {
-		if got := tc.spec.URL(); got != tc.want {
-			t.Errorf("URL = %q, want %q", got, tc.want)
+		if got := tc.spec.path(); got != tc.want {
+			t.Errorf("path = %q, want %q", got, tc.want)
 		}
 	}
 }

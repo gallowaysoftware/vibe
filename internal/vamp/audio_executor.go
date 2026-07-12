@@ -188,7 +188,7 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 	if voicesDir == "" {
 		voicesDir = defaultVoicesDirPath
 	}
-	voicesDir = expandAudioTilde(voicesDir)
+	voicesDir = expandTilde(voicesDir)
 	voicePath := filepath.Join(voicesDir, voice+".onnx")
 	if _, err := os.Stat(voicePath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -423,17 +423,6 @@ func (execCommandRunner) Run(ctx context.Context, binary string, args []string, 
 	return nil
 }
 
-// expandAudioTilde expands a leading "~/" against the user's home dir. Kept
-// private to the audio executor to avoid coupling vamp to vibe's profile
-// package; the surface is identical (anchored prefix only, no general shell
-// expansion).
-func expandAudioTilde(p string) string {
-	if p == "" || !strings.HasPrefix(p, "~/") {
-		return p
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return p
-	}
-	return filepath.Join(home, p[2:])
-}
+// expandAudioTilde is a deprecated alias of expandTilde, retained only until
+// its remaining caller migrates; new code should call expandTilde directly.
+func expandAudioTilde(p string) string { return expandTilde(p) }

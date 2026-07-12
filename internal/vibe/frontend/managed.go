@@ -38,31 +38,16 @@ type managedProc interface {
 }
 
 // managedDriver supervises a native binary as the frontend for a profile.
-// Shape mirrors composeDriver — startProcess and probeURL are injectable
-// so unit tests can assert argv / env / URL polling without spawning real
-// binaries or making real network calls.
+// Shape mirrors composeDriver — startProcess and the embedded waitPoller
+// are injectable so unit tests can assert argv / env / URL polling without
+// spawning real binaries or making real network calls.
 type managedDriver struct {
 	// startProcess execs name with args, env, and workdir, and returns a
 	// handle the driver can signal/wait on. In production this wraps
 	// *exec.Cmd; tests inject a fake.
 	startProcess func(ctx context.Context, name string, args []string, env []string, workdir string) (managedProc, error)
 
-	// probeURL issues a single GET against url and returns the response
-	// status code. The default uses net/http (httpProbe, shared with
-	// composeDriver).
-	probeURL func(ctx context.Context, url string) (int, error)
-
-	// now is wired so tests can advance time deterministically; defaults
-	// to time.Now.
-	now func() time.Time
-
-	// defaultTimeout applies when a wait_for entry has no explicit
-	// timeout. Matches composeDriver's default for consistency.
-	defaultTimeout time.Duration
-
-	// pollInterval is the gap between wait_for polls. Tests override this
-	// to spin faster.
-	pollInterval time.Duration
+	waitPoller
 
 	// gracefulShutdown is how long teardown waits between SIGINT and
 	// SIGKILL. Exposed for tests; production uses managedGracefulShutdown.
@@ -73,11 +58,14 @@ type managedDriver struct {
 // real exec.Command starts, real net/http probes, real time.
 func defaultManaged() *managedDriver {
 	return &managedDriver{
-		startProcess:     execStartProcess,
-		probeURL:         httpProbe,
-		now:              time.Now,
-		defaultTimeout:   60 * time.Second,
-		pollInterval:     500 * time.Millisecond,
+		startProcess: execStartProcess,
+		waitPoller: waitPoller{
+			driver:         "managed",
+			probeURL:       httpProbe,
+			now:            time.Now,
+			defaultTimeout: 60 * time.Second,
+			pollInterval:   500 * time.Millisecond,
+		},
 		gracefulShutdown: managedGracefulShutdown,
 	}
 }
@@ -164,7 +152,18 @@ func (m *managedDriver) Activate(reqCtx context.Context, p *profile.Profile, ctx
 	}
 	envSlice := envMapToSlice(env)
 
-	args := append([]string(nil), p.Frontend.Args...)
+	// Args feed exec, so they get the same ${VAR} expansion env values and
+	// write_file templates receive — otherwise "vibe-local/${MODEL_ALIAS}"
+	// would reach the binary as a literal and fail only at first use.
+	// Expanded after writeFrontendConfig so ${WRITE_FILE} resolves too.
+	args := make([]string, len(p.Frontend.Args))
+	for i, a := range p.Frontend.Args {
+		ea, err := profile.ExpandPathString(a, ctx)
+		if err != nil {
+			return nil, fmt.Errorf("expand args[%d] %q: %w", i, a, err)
+		}
+		args[i] = ea
+	}
 
 	proc, err := m.startProcess(reqCtx, p.Frontend.Binary, args, envSlice, p.Frontend.Workdir)
 	if err != nil {
@@ -244,64 +243,4 @@ func (m *managedDriver) stopProcess(ctx context.Context, proc managedProc) error
 		<-done
 		return ctx.Err()
 	}
-}
-
-// waitForReady polls each wait_for URL until it returns 2xx or its
-// timeout (or reqCtx) expires. Sequential, same as composeDriver, so the
-// error message can name the URL that failed.
-func (m *managedDriver) waitForReady(reqCtx context.Context, urls []profile.WaitForURL) error {
-	for _, w := range urls {
-		timeout := w.Timeout
-		if timeout <= 0 {
-			timeout = m.defaultTimeout
-		}
-		if err := m.pollURL(reqCtx, w.URL, timeout); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// pollURL hits url at m.pollInterval cadence until it 2xxs, or the
-// deadline / reqCtx fires. Same shape as composeDriver.pollURL — kept
-// separate to avoid coupling the two drivers' lifecycles.
-func (m *managedDriver) pollURL(reqCtx context.Context, url string, timeout time.Duration) error {
-	deadline := m.now().Add(timeout)
-	var lastStatus int
-	var lastErr error
-	for {
-		if err := reqCtx.Err(); err != nil {
-			return fmt.Errorf("wait_for %s: %w", url, err)
-		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return managedWaitErr(url, lastStatus, lastErr)
-		}
-		probeCtx, cancel := context.WithTimeout(reqCtx, minDuration(remaining, 5*time.Second))
-		status, err := m.probeURL(probeCtx, url)
-		cancel()
-		if err == nil && status >= 200 && status < 300 {
-			return nil
-		}
-		lastStatus = status
-		lastErr = err
-		if m.now().After(deadline) {
-			return managedWaitErr(url, lastStatus, lastErr)
-		}
-		select {
-		case <-reqCtx.Done():
-			return fmt.Errorf("wait_for %s: %w", url, reqCtx.Err())
-		case <-time.After(m.pollInterval):
-		}
-	}
-}
-
-func managedWaitErr(url string, status int, lastErr error) error {
-	if lastErr != nil {
-		return fmt.Errorf("wait_for %s: timeout (last err: %v)", url, lastErr)
-	}
-	if status != 0 {
-		return fmt.Errorf("wait_for %s: timeout (last status: %d)", url, status)
-	}
-	return fmt.Errorf("wait_for %s: timeout", url)
 }

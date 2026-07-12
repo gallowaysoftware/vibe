@@ -34,7 +34,7 @@ func confirmCmd() *cobra.Command {
 			"resolved against $XDG_STATE_HOME/vamp/runs/) or a directory path — the " +
 			"same addressing as `vamp runs show` / `vamp logs`.",
 		Args:              cobra.ExactArgs(2),
-		ValidArgsFunction: completeRunIDs,
+		ValidArgsFunction: completeConfirmArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			stageID := args[1]
 			r, err := vamp.FindRunByPrefix(vamp.RunsDir(), args[0])
