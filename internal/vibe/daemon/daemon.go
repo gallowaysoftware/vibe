@@ -1275,10 +1275,18 @@ func (d *Daemon) checkExternalBackendReady(ctx context.Context, p *profile.Profi
 	if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
 		return fmt.Errorf("external backend %q: parse %s/v1/models: %w", p.Name, base, err)
 	}
+	// The router's catalog lists model IDS; aliases appear only with
+	// llama-swap's includeAliasesInList. A profile reaches its backend via
+	// backend_ref, and the A1 convention names the llama-swap model after
+	// the backend def — so the ref name is the id most likely to match.
+	// Try all three: alias, backend_ref, profile name (inline backends).
+	wanted := []string{alias, p.BackendRef, p.Name}
 	ids := make([]string, 0, len(catalog.Data))
 	for _, m := range catalog.Data {
-		if m.ID == alias || m.ID == p.Name {
-			return nil
+		for _, w := range wanted {
+			if w != "" && m.ID == w {
+				return nil
+			}
 		}
 		ids = append(ids, m.ID)
 	}
@@ -1286,8 +1294,8 @@ func (d *Daemon) checkExternalBackendReady(ctx context.Context, p *profile.Profi
 	if serving == "" {
 		serving = "none"
 	}
-	return fmt.Errorf("external backend %q: model %q is not in the router catalog at %s/v1/models (serving: %s) — add it to the llama-swap config",
-		p.Name, alias, base, serving)
+	return fmt.Errorf("external backend %q: none of %q are in the router catalog at %s/v1/models (serving: %s) — add the model to the llama-swap config",
+		p.Name, wanted, base, serving)
 }
 
 // buildLaunchSpec dispatches a Profile to its backend-specific spec

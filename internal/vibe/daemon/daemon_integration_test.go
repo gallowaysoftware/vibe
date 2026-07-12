@@ -725,6 +725,51 @@ func TestDaemon_ExternalBackend(t *testing.T) {
 	}
 }
 
+// The router catalog lists model IDS (aliases appear only with llama-swap's
+// includeAliasesInList), and the A1 convention names the llama-swap model
+// after the backend def — so a profile whose backend_ref name is in the
+// catalog must pass readiness even when the def's alias is absent from it.
+func TestDaemon_ExternalBackend_MatchesBackendRefName(t *testing.T) {
+	_, _, _ = setupXDG(t)
+	stub := stubModel(t)
+
+	defPath := filepath.Join(paths.BackendsDir(), "ref-ext.yaml")
+	def := fmt.Sprintf(`name: ref-ext
+backend:
+  external: true
+  llama_server:
+    path: %s
+    alias: ref-ext-alias
+    context: 1024
+`, stub)
+	if err := os.WriteFile(defPath, []byte(def), 0o644); err != nil {
+		t.Fatalf("write backend def: %v", err)
+	}
+	writeProfile(t, "extref", `name: extref
+backend_ref: ref-ext
+frontend:
+  kind: external
+  write_file: ${VIBE_STATE_DIR}/frontend/extref/sidecar.json
+  template:
+    alias: ${MODEL_ALIAS}
+`)
+
+	// Catalog advertises the backend def's NAME, not its alias.
+	routerPort := fakeRouter(t, "other-model", "ref-ext")
+	client, _ := startDaemon(t, externalDaemon(t, routerPort))
+
+	startCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	res, err := client.Start(startCtx, "extref")
+	if err != nil {
+		t.Fatalf("Start via backend_ref name in catalog: %v", err)
+	}
+	t.Cleanup(func() { _, _ = client.Stop(context.Background()) })
+	if res.Status == nil || !res.Status.Ready {
+		t.Fatalf("status = %+v; want ready", res.Status)
+	}
+}
+
 // A router that isn't listening must fail the start with a clear pointer at
 // llama-swap, not a generic dial error string buried in a supervisor log.
 func TestDaemon_ExternalBackend_RouterDown(t *testing.T) {
@@ -765,7 +810,7 @@ func TestDaemon_ExternalBackend_ModelNotInCatalog(t *testing.T) {
 	if err == nil {
 		t.Fatal("Start succeeded for a model absent from the router catalog")
 	}
-	if !strings.Contains(err.Error(), "not in the router catalog") {
+	if !strings.Contains(err.Error(), "in the router catalog") {
 		t.Errorf("error %q must mention the router catalog", err.Error())
 	}
 	if !strings.Contains(err.Error(), "some-other-model") {
