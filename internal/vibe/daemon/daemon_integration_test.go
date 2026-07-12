@@ -877,3 +877,43 @@ func TestDaemon_ExternalBackend_ModelNotInCatalog(t *testing.T) {
 		t.Errorf("error %q should list what the router IS serving", err.Error())
 	}
 }
+
+// External ComfyUI is a llama-swap swap tenant: vamp's comfyui executor dials
+// Status.BackendAddr directly, so it must carry the router's /upstream URL
+// instead of the "external (router)" marker LLM backends use.
+func TestDaemon_ExternalBackend_ComfyUIUpstreamAddr(t *testing.T) {
+	setupXDG(t)
+	comfyDir := stubComfyDir(t)
+	writeProfile(t, "media", fmt.Sprintf(`name: media
+backend_ref: comfyui
+`))
+	defPath := filepath.Join(paths.BackendsDir(), "comfyui.yaml")
+	def := fmt.Sprintf(`name: comfyui
+backend:
+  external: true
+  comfyui:
+    dir: %s
+    port: 8188
+`, comfyDir)
+	if err := os.WriteFile(defPath, []byte(def), 0o644); err != nil {
+		t.Fatalf("write backend def: %v", err)
+	}
+
+	routerPort := fakeRouter(t, "comfyui")
+	client, _ := startDaemon(t, externalDaemon(t, routerPort))
+
+	startCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	res, err := client.Start(startCtx, "media")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _, _ = client.Stop(context.Background()) })
+	want := fmt.Sprintf("http://127.0.0.1:%d/upstream/comfyui", routerPort)
+	if res.Status.BackendAddr != want {
+		t.Errorf("BackendAddr = %q, want %q (vamp dials this directly)", res.Status.BackendAddr, want)
+	}
+	if res.Status.Pid != 0 {
+		t.Errorf("Pid = %d, want 0", res.Status.Pid)
+	}
+}

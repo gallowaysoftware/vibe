@@ -70,6 +70,10 @@ type swapConfig struct {
 type swapModel struct {
 	Cmd     string   `yaml:"cmd"`
 	Aliases []string `yaml:"aliases,omitempty"`
+	// Proxy/CheckEndpoint are emitted only for non-llama_server tenants
+	// (comfyui): llama-server entries use llama-swap's ${PORT} defaults.
+	Proxy         string `yaml:"proxy,omitempty"`
+	CheckEndpoint string `yaml:"checkEndpoint,omitempty"`
 	// TTL is always emitted (never omitted): 0 is llama-swap's "never
 	// unload", which must stay distinguishable from "field absent".
 	TTL      int  `yaml:"ttl"`
@@ -139,7 +143,7 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 			continue
 		}
 		switch {
-		case def.Backend.LlamaServer != nil:
+		case def.Backend.LlamaServer != nil, def.Backend.ComfyUI != nil:
 			modelDefs = append(modelDefs, def)
 		case def.Backend.CloudPeer != nil:
 			peerDefs = append(peerDefs, def)
@@ -167,14 +171,28 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 		if cfg.Models == nil {
 			cfg.Models = map[string]*swapModel{}
 		}
-		cmd, err := modelCmd(def, opts)
-		if err != nil {
-			return "", err
-		}
 		m := &swapModel{
-			Cmd:     cmd,
 			Aliases: aliases[def.Name],
 			TTL:     int(DefaultTTL / time.Second),
+		}
+		if c := def.Backend.ComfyUI; c != nil {
+			// ComfyUI as a swap tenant (design §16): fixed port from the def
+			// (its clients dial /upstream/<id>, so ${PORT} indirection buys
+			// nothing), health on /system_stats, cmd re-creates ComfyUISpec's
+			// workdir semantics via cd+exec since llama-swap has no workdir.
+			cmd, err := comfyuiCmd(def)
+			if err != nil {
+				return "", err
+			}
+			m.Cmd = cmd
+			m.Proxy = fmt.Sprintf("http://127.0.0.1:%d", c.Port)
+			m.CheckEndpoint = "/system_stats"
+		} else {
+			cmd, err := modelCmd(def, opts)
+			if err != nil {
+				return "", err
+			}
+			m.Cmd = cmd
 		}
 		if lc := def.Lifecycle; lc != nil {
 			if lc.TTL != nil {
@@ -301,8 +319,8 @@ func resolveAliases(modelDefs []*profile.BackendDef) (map[string][]string, error
 		var want []string
 		if def.Router != nil && len(def.Router.Aliases) > 0 {
 			want = def.Router.Aliases
-		} else if a := def.Backend.LlamaServer.Alias; a != "" {
-			want = []string{a}
+		} else if ls := def.Backend.LlamaServer; ls != nil && ls.Alias != "" {
+			want = []string{ls.Alias}
 		}
 		owner := def.Router != nil && def.Router.AliasOwner
 		for _, a := range want {
@@ -389,6 +407,39 @@ func modelCmd(def *profile.BackendDef, opts Options) (string, error) {
 		}
 		b.WriteString(quoteArg(tok))
 	}
+	return b.String(), nil
+}
+
+// comfyuiCmd renders the swap-tenant launch for a ComfyUI def. It mirrors
+// profile.ComfyUISpec's choices (defaults, arg order) but must wrap them in
+// sh -c "cd … && exec …": ComfyUI resolves models/ and custom_nodes/ relative
+// to its checkout, and llama-swap has no workdir field.
+func comfyuiCmd(def *profile.BackendDef) (string, error) {
+	c := def.Backend.ComfyUI
+	if c.Dir == "" {
+		return "", fmt.Errorf("backend %s: comfyui.dir is required to render a router entry", def.Name)
+	}
+	if c.Port <= 0 {
+		return "", fmt.Errorf("backend %s: comfyui.port must be fixed (>0) for a router entry — the proxy target can't be random", def.Name)
+	}
+	python := c.Python
+	if python == "" {
+		python = "python3"
+	}
+	listen := c.Listen
+	if listen == "" {
+		listen = "127.0.0.1"
+	}
+	// Dir/Python arrive tilde-expanded from LoadBackend normalization.
+	args := []string{"main.py", "--listen", listen, "--port", fmt.Sprint(c.Port)}
+	args = append(args, c.ExtraArgs...)
+	var b strings.Builder
+	fmt.Fprintf(&b, "sh -c \"cd %s && exec %s", c.Dir, python)
+	for _, a := range args {
+		b.WriteString(" ")
+		b.WriteString(a)
+	}
+	b.WriteString("\"")
 	return b.String(), nil
 }
 

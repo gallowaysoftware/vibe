@@ -516,6 +516,14 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 			return nil, connect.NewError(connect.CodeFailedPrecondition, err)
 		}
 		backendAddr = externalBackendAddr
+		if p.Backend.ComfyUI != nil {
+			// External ComfyUI is a llama-swap swap tenant reached through the
+			// router's raw passthrough. Unlike LLM backends (whose clients use
+			// the OpenAI surface at ${VIBE_API}), vamp's comfyui executor dials
+			// BackendAddr directly — so it must carry the real upstream URL,
+			// not the "external (router)" marker.
+			backendAddr = fmt.Sprintf("http://127.0.0.1:%d/upstream/%s", d.cfg.ProxyPort, canonicalRouterModelID(p))
+		}
 		slog.Info("starting profile (external backend)",
 			"profile", p.Name, "mode", p.ResolvedMode(),
 			"alias", externalBackendAlias(p), "router_port", d.cfg.ProxyPort)
@@ -1144,6 +1152,12 @@ func (d *Daemon) protoStatus() *vibev1.Status {
 			// cap vamp's foreach fan-out at a single request.
 			s.Ready = true
 			s.BackendAddr = externalBackendAddr
+			if d.active.Backend.ComfyUI != nil {
+				// vamp's comfyui executor dials BackendAddr directly, so the
+				// external mask must carry the router's raw passthrough URL
+				// (mirrors the Start-path computation) rather than the marker.
+				s.BackendAddr = fmt.Sprintf("http://127.0.0.1:%d/upstream/%s", d.cfg.ProxyPort, canonicalRouterModelID(d.active))
+			}
 			s.Pid = 0
 		} else if ls := d.active.Backend.LlamaServer; ls != nil {
 			// Surface the llama_server `parallel` value so clients (notably

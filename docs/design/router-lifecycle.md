@@ -620,3 +620,37 @@ non-exclusive group exactly as simulated; (4) a model's own
 `reasoning_content` chunks are indistinguishable in-band from llama-swap's
 loading states — clients that budget max_tokens tightly on reasoning models
 will see "empty" answers (generation semantics, not router misbehavior).
+
+## 17. Waves 1+2 executed (2026-07-12, same day)
+
+**Code shipped** (A2, A7, A8a): `vibe router render` (+`--check`, `--stdout`,
+`--extras` for entries defs can't express); `lifecycle:`/`router:` schema
+blocks; `cloud_peer` and external-`comfyui` backend kinds; canonical-id
+`${MODEL_ALIAS}` expansion; vamp typed `RouterError` + streaming warm +
+lease heartbeat (`keep_warm`, default 20m) + `vamp run --warm`;
+`/api/fleet/state` + `/api/fleet/events` + persisted start-duration history.
+
+**Live cutover done**: the llama-swap config is RENDERED (hand-written A1
+file retired); ALL six LLM defs are external (incl. both text gemmas —
+`alias_owner` on the mm variant), `anthropic` is a `cloud_peer` def,
+ComfyUI is external via its def (fixed port required; `vibe ps` shows
+`backend: http://127.0.0.1:9000/upstream/comfyui`, which vamp dials
+directly); vamp capabilities are canonical backend ids (profile-era names
+`qwen-code`/`fast`/`long_form`/`gemma_long_form` retired from
+capabilities.yaml); the comfyui profile dropped `mode: service`.
+
+**Simulated A5 (peer-hop) gate**: a scratch "sim cell" llama-swap on :9101
+(groups: persistent utility plane + swap pool) is peered from the front.
+Six-client rig against a 90s cold start on the PEER: all five automated
+clients STREAMED, and the crux held — **first byte in 0.7ms through two
+llama-swap hops** (the front relays the cell's loading-state bytes
+unbuffered). Rig limitation found: `COLD_EACH` unloads via the front's
+unload API, which doesn't reach peer models — only the first client of a
+run gets a true peer cold start. Real-cell reruns should unload on the
+cell directly.
+
+**Still pending hardware**: A3/A4 (loft provisioning + model distribution),
+real A5/A6 (Sparks: single-node cell, dual-node pair scripts, NCCL
+workarounds, deep-health watchdog), A8b (delete proxy.go + LLM respawn
+paths once nothing daemon-supervised serves LLMs — bge-embed service is
+the last holdout on anvil, destined for loft).

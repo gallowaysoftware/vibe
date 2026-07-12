@@ -457,3 +457,65 @@ routing:
 		t.Errorf("missing extras file should be a no-op, got %v", err)
 	}
 }
+
+func TestRender_ComfyUITenant(t *testing.T) {
+	dir := t.TempDir()
+	comfy := t.TempDir()
+	if err := os.WriteFile(filepath.Join(comfy, "main.py"), []byte("# stub\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	def := `name: comfyui
+backend:
+  external: true
+  comfyui:
+    dir: ` + comfy + `
+    python: /venv/bin/python
+    port: 8188
+lifecycle:
+  ttl: 30m
+`
+	if err := os.WriteFile(filepath.Join(dir, "comfyui.yaml"), []byte(def), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defs, err := LoadDefs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := Render(defs, Options{LlamaServerBinary: "/usr/bin/llama-server"})
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	var cfg struct {
+		Models map[string]*swapModel `yaml:"models"`
+	}
+	if err := yaml.Unmarshal([]byte(out), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	m := cfg.Models["comfyui"]
+	if m == nil {
+		t.Fatal("comfyui model entry missing")
+	}
+	wantCmd := `sh -c "cd ` + comfy + ` && exec /venv/bin/python main.py --listen 127.0.0.1 --port 8188"`
+	if m.Cmd != wantCmd {
+		t.Errorf("cmd = %q, want %q", m.Cmd, wantCmd)
+	}
+	if m.Proxy != "http://127.0.0.1:8188" || m.CheckEndpoint != "/system_stats" || m.TTL != 1800 {
+		t.Errorf("proxy/check/ttl = %q %q %d, want fixed-port proxy, /system_stats, 1800", m.Proxy, m.CheckEndpoint, m.TTL)
+	}
+
+	// A random-port comfyui def can't be proxied — must fail loudly.
+	if err := os.WriteFile(filepath.Join(dir, "comfyui.yaml"), []byte(`name: comfyui
+backend:
+  external: true
+  comfyui: {dir: `+comfy+`, port: 0}
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defs, err = LoadDefs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Render(defs, Options{}); err == nil || !strings.Contains(err.Error(), "port") {
+		t.Errorf("random-port comfyui render = %v, want port error", err)
+	}
+}

@@ -210,13 +210,14 @@ func (b Backend) validate() error {
 	case set > 1:
 		return errors.New("backend: only one of backend.llama_server, backend.comfyui, backend.http_server, backend.tabby_api, or backend.cloud_peer may be set")
 	}
-	// external only makes sense where the router serves the backend's OpenAI
-	// surface: comfyui speaks its own workflow API and http_server wraps
-	// arbitrary HTTP services — neither is something llama-swap advertises on
-	// /v1/models, so an external flag there could only be a mistake.
-	// (cloud_peer is external by definition; normalize forces the flag.)
-	if b.External && b.LlamaServer == nil && b.TabbyAPI == nil && b.CloudPeer == nil {
-		return errors.New("backend.external is only valid for LLM-serving backends (llama_server, tabby_api, cloud_peer); comfyui and http_server stay vibe-supervised")
+	// external makes sense where the router serves the backend: LLM kinds
+	// appear on /v1/models, and comfyui rides llama-swap's /upstream/<id>
+	// raw passthrough as a swap tenant (design §16 experiment). http_server
+	// wraps arbitrary vibe-supervised services — external there could only
+	// be a mistake. (cloud_peer is external by definition; normalize forces
+	// the flag.)
+	if b.External && b.HTTPServer != nil {
+		return errors.New("backend.external is not valid for http_server backends (they stay vibe-supervised); llama_server, tabby_api, cloud_peer, and comfyui may be external")
 	}
 	switch {
 	case b.LlamaServer != nil:

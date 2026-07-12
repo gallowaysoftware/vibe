@@ -170,27 +170,31 @@ backend:
 // surface; comfyui and http_server must reject it.
 func TestBackend_External_OnlyLLMServingKinds(t *testing.T) {
 	comfy := stubComfyDir(t)
-	cases := map[string]string{
-		"comfyui": `
-name: c
-backend:
-  external: true
-  comfyui: {dir: ` + comfy + `}
-`,
-		"http_server": `
+
+	// http_server is the one kind the router can never serve.
+	_, err := Load(writeProfile(t, `
 name: h
 backend:
   external: true
   http_server: {image: some/image, port: 8000}
-`,
+`))
+	if err == nil || !strings.Contains(err.Error(), "not valid for http_server") {
+		t.Fatalf("external http_server: got %v, want rejection", err)
 	}
-	for kind, yaml := range cases {
-		t.Run(kind, func(t *testing.T) {
-			_, err := Load(writeProfile(t, yaml))
-			if err == nil || !strings.Contains(err.Error(), "backend.external is only valid") {
-				t.Fatalf("external %s: got %v, want LLM-serving-kinds rejection", kind, err)
-			}
-		})
+
+	// comfyui became a valid swap tenant (router-lifecycle §16): it rides
+	// llama-swap's /upstream passthrough.
+	pc, err := Load(writeProfile(t, `
+name: c
+backend:
+  external: true
+  comfyui: {dir: `+comfy+`}
+`))
+	if err != nil {
+		t.Fatalf("external comfyui: %v", err)
+	}
+	if !pc.Backend.External {
+		t.Error("comfyui external flag not retained")
 	}
 
 	// tabby_api is LLM-serving and must accept the flag.
