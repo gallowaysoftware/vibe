@@ -5,6 +5,7 @@
 package router
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,6 +26,15 @@ type Options struct {
 	// absolute path: llama-swap runs under its own systemd unit whose $PATH
 	// vibe doesn't control.
 	LlamaServerBinary string
+
+	// ExtrasPath optionally names a YAML file whose top-level sections merge
+	// into the rendered config verbatim. It exists for router entries that
+	// have no backend-def representation yet: arbitrary-cmd swap tenants
+	// (ComfyUI, the smoke rig's slowmodel), peer cells, and routing groups.
+	// Merge is strictly additive — a key that would override anything the
+	// renderer emitted is an error, so defs stay the single source of truth
+	// for everything they can express. Missing file = no extras.
+	ExtrasPath string
 }
 
 const (
@@ -210,7 +220,59 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal llama-swap config: %w", err)
 	}
+	if opts.ExtrasPath != "" {
+		merged, err := mergeExtras(body, opts.ExtrasPath)
+		if err != nil {
+			return "", err
+		}
+		body = merged
+	}
 	return headerComment + string(body), nil
+}
+
+// mergeExtras folds the extras file's top-level sections into the rendered
+// config. models/peers-style map sections merge per key; scalar or absent
+// sections are set whole. Any key the renderer already emitted is an error:
+// extras extend the config, they never silently override the defs.
+func mergeExtras(rendered []byte, path string) ([]byte, error) {
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return rendered, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read router extras %s: %w", path, err)
+	}
+	var base map[string]any
+	if err := yaml.Unmarshal(rendered, &base); err != nil {
+		return nil, fmt.Errorf("reparse rendered config for extras merge: %w", err)
+	}
+	var extras map[string]any
+	if err := yaml.Unmarshal(raw, &extras); err != nil {
+		return nil, fmt.Errorf("parse router extras %s: %w", path, err)
+	}
+	for section, val := range extras {
+		existing, present := base[section]
+		if !present {
+			base[section] = val
+			continue
+		}
+		baseMap, baseOK := existing.(map[string]any)
+		extraMap, extraOK := val.(map[string]any)
+		if !baseOK || !extraOK {
+			return nil, fmt.Errorf("router extras %s: section %q already rendered from backend defs and cannot be overridden", path, section)
+		}
+		for k, v := range extraMap {
+			if _, dup := baseMap[k]; dup {
+				return nil, fmt.Errorf("router extras %s: %s.%s collides with a rendered backend def — express it in the def instead", path, section, k)
+			}
+			baseMap[k] = v
+		}
+	}
+	out, err := yaml.Marshal(base)
+	if err != nil {
+		return nil, fmt.Errorf("marshal merged config: %w", err)
+	}
+	return out, nil
 }
 
 // resolveAliases computes each rendered model's alias list and enforces the

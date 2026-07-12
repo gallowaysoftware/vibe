@@ -1,6 +1,8 @@
 package router
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -390,4 +392,68 @@ func equalSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func TestRender_ExtrasMerge(t *testing.T) {
+	dir := t.TempDir()
+	extras := filepath.Join(dir, "extras.yaml")
+	if err := os.WriteFile(extras, []byte(`models:
+  slowmodel:
+    cmd: sh -c "exec /tmp/slowmodel --port 18099"
+    proxy: http://127.0.0.1:18099
+    checkEndpoint: /health
+    ttl: 300
+peers:
+  sim-cell:
+    proxy: http://127.0.0.1:9101
+    models: [fastfake]
+routing:
+  router:
+    use: group
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	defs, err := LoadDefs("testdata/backends")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := Render(defs, Options{LlamaServerBinary: "/usr/bin/llama-server", ExtrasPath: extras})
+	if err != nil {
+		t.Fatalf("render with extras: %v", err)
+	}
+	var cfg map[string]any
+	if err := yaml.Unmarshal([]byte(out), &cfg); err != nil {
+		t.Fatalf("reparse: %v", err)
+	}
+	models := cfg["models"].(map[string]any)
+	if _, ok := models["slowmodel"]; !ok {
+		t.Error("extras model slowmodel missing from merge")
+	}
+	if _, ok := models["qwen3.6-27b"]; !ok {
+		t.Error("rendered model lost in merge")
+	}
+	peers := cfg["peers"].(map[string]any)
+	if _, ok := peers["sim-cell"]; !ok {
+		t.Error("extras peer sim-cell missing")
+	}
+	if _, ok := peers["anthropic"]; !ok {
+		t.Error("rendered peer anthropic lost in merge")
+	}
+	if _, ok := cfg["routing"]; !ok {
+		t.Error("extras routing section missing")
+	}
+
+	// A collision with a rendered def must fail loudly, naming the key.
+	if err := os.WriteFile(extras, []byte("models:\n  qwen3.6-27b:\n    cmd: echo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Render(defs, Options{LlamaServerBinary: "/usr/bin/llama-server", ExtrasPath: extras}); err == nil || !strings.Contains(err.Error(), "qwen3.6-27b") {
+		t.Errorf("collision error = %v, want mention of qwen3.6-27b", err)
+	}
+
+	// Missing extras file is fine.
+	if _, err := Render(defs, Options{LlamaServerBinary: "/usr/bin/llama-server", ExtrasPath: filepath.Join(dir, "absent.yaml")}); err != nil {
+		t.Errorf("missing extras file should be a no-op, got %v", err)
+	}
 }

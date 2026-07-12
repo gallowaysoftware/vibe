@@ -35,6 +35,7 @@ func routerRenderCmd() *cobra.Command {
 		check    bool
 		toStdout bool
 		llamaBin string
+		extras   string
 	)
 	cmd := &cobra.Command{
 		Use:   "render",
@@ -47,13 +48,17 @@ func routerRenderCmd() *cobra.Command {
 			"automatically; apply a changed config with `systemctl --user restart llama-swap`.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			opts := router.Options{LlamaServerBinary: resolveLlamaServerBinary(llamaBin)}
+			opts := router.Options{
+				LlamaServerBinary: resolveLlamaServerBinary(llamaBin),
+				ExtrasPath:        extras,
+			}
 			return runRouterRender(cmd.OutOrStdout(), paths.BackendsDir(), llamaSwapConfigPath(), opts, check, toStdout)
 		},
 	}
 	cmd.Flags().BoolVar(&check, "check", false, "print the diff and exit 1 on drift without writing")
 	cmd.Flags().BoolVar(&toStdout, "stdout", false, "print the rendered config to stdout instead of writing the file")
 	cmd.Flags().StringVar(&llamaBin, "llama-server", "", "llama-server binary path written into rendered cmds (default: daemon config llama_binary, then ~/.local/bin/llama-server)")
+	cmd.Flags().StringVar(&extras, "extras", routerExtrasPath(), "YAML file merged verbatim into the render for entries defs can't express (smoke models, peer cells, groups); additive only, missing file is fine")
 	return cmd
 }
 
@@ -97,6 +102,12 @@ func llamaSwapConfigPath() string {
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".config", "llama-swap", "config.yaml")
+}
+
+// routerExtrasPath is the default extras file, kept beside the backend defs
+// (it is vibe-owned input, unlike the rendered llama-swap output).
+func routerExtrasPath() string {
+	return filepath.Join(paths.ConfigHome(), "router-extras.yaml")
 }
 
 // resolveLlamaServerBinary picks the llama-server path rendered into cmds:
