@@ -57,6 +57,12 @@ type RunOptions struct {
 	// vamp.log + vamp.pid + signal handling. Never set by end users
 	// directly; the spawnDetached helper injects it on re-exec.
 	InternalRunJob bool
+	// Warm fires Executor.WarmCapabilities before DAG execution: every
+	// declared capability is Ensured in parallel (activation + streaming
+	// 1-token warm probe for LLM capabilities) so cold starts overlap.
+	// A warm failure aborts the run — the failing capability would fail
+	// identically, later and slower, inside the DAG.
+	Warm bool
 	// NoEnsureServices opts out of the pre-flight that probes each
 	// p.RequireService URL and auto-runs `vibe start <name>` for any
 	// that aren't reachable + have a parseable `vibe start ...` hint.
@@ -109,6 +115,9 @@ func RunPipeline(ctx context.Context, p *vamp.Pipeline, pipelineDir string, pipe
 		}
 		if opts.RunDir != "" {
 			return fmt.Errorf("--dry-run is incompatible with --run-dir (no files are written)")
+		}
+		if opts.Warm {
+			return fmt.Errorf("--dry-run is incompatible with --warm (dry runs never contact vibe)")
 		}
 	}
 	if opts.Resume != "" && opts.RunDir != "" {
@@ -187,6 +196,11 @@ func RunPipeline(ctx context.Context, p *vamp.Pipeline, pipelineDir string, pipe
 	}
 	if opts.DryRun {
 		return exec.DryRun(ctx)
+	}
+	if opts.Warm {
+		if err := exec.WarmCapabilities(ctx); err != nil {
+			return fmt.Errorf("warm: %w", err)
+		}
 	}
 	return exec.Run(ctx)
 }

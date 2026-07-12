@@ -1,0 +1,23 @@
+# Fixture mirroring the fast-drafting model. Its llama_server alias equals
+# the def name, so no aliases line may be rendered (the models: key already
+# serves that id). start_timeout raises the global healthCheckTimeout to 600.
+name: qwen2.5-coder-7b
+backend:
+  external: true
+  llama_server:
+    path: ~/models/qwen2.5-coder-7b/qwen2.5-coder-7b-instruct-q4_k_m.gguf
+    huggingface:
+      repo: Qwen/Qwen2.5-Coder-7B-Instruct-GGUF
+      file: qwen2.5-coder-7b-instruct-q4_k_m.gguf
+    alias: qwen2.5-coder-7b
+    context: 32768
+    parallel: 1
+    gpu_layers: 999
+    flash_attn: true
+    cache_type_k: q8_0
+    cache_type_v: q8_0
+    jinja: true
+lifecycle:
+  ttl: 30m
+  start_timeout: 10m
+estimated_vram_gb: 6

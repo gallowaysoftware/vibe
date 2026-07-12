@@ -40,6 +40,18 @@
         "additionalProperties": false
       }
     },
+    "keep_warm": {
+      "description": "Lease heartbeat for router-managed LLM backends: while the run is active, every ensured endpoint idle past this interval gets a 1-token streaming keep-warm request so a TTL idle-unload doesn't reap the model mid-pipeline. A Go duration string overrides the 20m default; false disables.",
+      "oneOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h)$"
+        }
+      ]
+    },
     "name": {
       "type": "string",
       "description": "Pipeline name; identifier-like, used in run dir names and pipeline.json.",
@@ -96,7 +108,7 @@
           },
           "cache": {
             "type": "boolean",
-            "description": "Per-stage opt-out: explicit false disables the content-addressed cache for this stage; absent inherits the pipeline default."
+            "description": "Per-stage cache control. For default-cacheable types (text/comfyui/audio/ffmpeg/render/compact/pandoc) `false` opts out, absent inherits the pipeline default. For `webhook` stages this is opt-IN: `true` caches the rendered URL/method/body/headers (use for idempotent reads like SearXNG queries); absent or false skips the cache (the default — most webhooks are side-effecting POSTs)."
           },
           "capability": {
             "type": "string",
@@ -106,6 +118,50 @@
             "type": "string",
             "description": "YouTube numeric category id (default \"22\")."
           },
+          "chunk_chars": {
+            "type": "integer",
+            "description": "Max characters of source sent per LLM call (compact stages). 0 = pick automatically (target_chars × 4).",
+            "minimum": 0
+          },
+          "cleanup": {
+            "type": "array",
+            "description": "Glob patterns (relative to the run dir) removed from disk after the stage's success path completes. Best-effort: cleanup failures log a warning and never fail the stage. Patterns must NOT escape the run dir (no absolute paths, no \"..\" segments). Only valid on stage types that produce a stable on-disk output (text/comfyui/audio/ffmpeg).",
+            "items": {
+              "type": "string"
+            }
+          },
+          "concat_video_file": {
+            "type": "string",
+            "description": "Template rendered per upstream item to each clip path (concat_video mode)."
+          },
+          "concat_video_fps": {
+            "type": "integer",
+            "description": "Normalized output fps for concat_video (default 30)."
+          },
+          "concat_video_from": {
+            "type": "string",
+            "description": "Upstream stage whose JSON array drives an ordered video-clip concat (ffmpeg stages). Re-encodes each clip to a normalized vertical profile."
+          },
+          "concat_video_height": {
+            "type": "integer",
+            "description": "Normalized output height for concat_video (default 1920)."
+          },
+          "concat_video_var": {
+            "type": "string",
+            "description": "Per-item template var bound while rendering concat_video_file (default \"item\")."
+          },
+          "concat_video_width": {
+            "type": "integer",
+            "description": "Normalized output width for concat_video (default 1080)."
+          },
+          "concat_wavs_dir": {
+            "type": "string",
+            "description": "Subdirectory (template-rendered, relative to the run dir) to scope the *.wav walk when concat_wavs is true. Defaults to the whole run dir."
+          },
+          "cover_image": {
+            "type": "string",
+            "description": "Optional path (template-rendered, absolute or relative to run dir) to a PNG/JPEG cover image embedded in the output (M4B audiobook art or EPUB cover)."
+          },
           "credentials_file": {
             "type": "string",
             "description": "OAuth refresh-token JSON path (youtube stages)."
@@ -113,6 +169,19 @@
           "description": {
             "type": "string",
             "description": "Templated video description (youtube stages)."
+          },
+          "engine": {
+            "type": "string",
+            "description": "TTS backend for audio stages. \"piper\" (default) shells out to the piper binary. \"kokoro\" POSTs to an OpenAI-compatible /v1/audio/speech endpoint.",
+            "enum": [
+              "",
+              "piper",
+              "kokoro"
+            ]
+          },
+          "engine_url": {
+            "type": "string",
+            "description": "OpenAI-compatible TTS endpoint base URL (engine: kokoro). Defaults to http://127.0.0.1:8880. Executor appends /v1/audio/speech."
           },
           "ffmpeg_args": {
             "type": "array",
@@ -151,12 +220,35 @@
             "description": "Stage id; template-syntax-safe identifier.",
             "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$"
           },
+          "input_images": {
+            "type": "object",
+            "description": "Map of \"\u003cnode_id\u003e.\u003cinput_name\u003e\" -\u003e templated source image path; uploaded to ComfyUI at run time and bound as the node's image (image-to-video / ref-conditioned edit).",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
           "inputs": {
             "type": "array",
             "description": "IDs of prior stages this stage depends on.",
             "items": {
               "type": "string"
             }
+          },
+          "m4b_chapter": {
+            "type": "string",
+            "description": "Template rendering per-item chapter title embedded in M4B metadata."
+          },
+          "m4b_file": {
+            "type": "string",
+            "description": "Template rendering per-item MP3 file path (absolute or relative to run dir)."
+          },
+          "m4b_from": {
+            "type": "string",
+            "description": "Upstream stage whose JSON array drives M4B chapter order (ffmpeg stages). Setting any m4b_* field requires m4b_from + m4b_file + m4b_chapter; m4b_var defaults to \"item\"."
+          },
+          "m4b_var": {
+            "type": "string",
+            "description": "Template variable bound to each upstream item when rendering m4b_file/m4b_chapter. Defaults to \"item\"."
           },
           "message": {
             "type": "string",
@@ -186,6 +278,28 @@
               "json"
             ]
           },
+          "pandoc_args": {
+            "type": "array",
+            "description": "Extra raw pandoc args, appended after the generated ones.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "pandoc_from": {
+            "type": "string",
+            "description": "Pandoc --from format (e.g. \"markdown\") for pandoc stages."
+          },
+          "pandoc_metadata": {
+            "type": "object",
+            "description": "Map of pandoc --metadata key=value pairs (title, author, etc.) for pandoc stages.",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "pandoc_to": {
+            "type": "string",
+            "description": "Pandoc --to format (e.g. \"epub\") for pandoc stages."
+          },
           "parameters": {
             "type": "object",
             "description": "Map of \"\u003cnode_id\u003e.\u003cinput_name\u003e\" -\u003e templated value for comfyui workflows.",
@@ -197,6 +311,10 @@
             "type": "object",
             "description": "Extra fields merged into the chat-completion body (text stages only).",
             "additionalProperties": true
+          },
+          "preserve": {
+            "type": "string",
+            "description": "Free-form directive describing what MUST be preserved in the compaction (compact stages). E.g. `every numerical value, equipment name, process step`."
           },
           "privacy": {
             "type": "string",
@@ -247,7 +365,8 @@
                   "type": "string",
                   "enum": [
                     "transient",
-                    "timeout"
+                    "timeout",
+                    "invalid_output"
                   ]
                 }
               }
@@ -267,12 +386,37 @@
             "description": "Gate the stage. Reserved keywords success (default) / failure / always inspect upstream status; any other value is a Go text/template expression that must render to one of true/yes/1 (run) or false/no/0/\"\" (skip).",
             "default": "success"
           },
+          "short_fps": {
+            "type": "integer",
+            "description": "Output fps for type: short (default 30)."
+          },
+          "short_height": {
+            "type": "integer",
+            "description": "Vertical output height for type: short (default 1920)."
+          },
+          "short_width": {
+            "type": "integer",
+            "description": "Vertical output width for type: short (default 1080)."
+          },
+          "source": {
+            "type": "string",
+            "description": "Template rendering the text to compact (compact stages). Typically `{{ .stages.\u003cupstream\u003e.output }}`."
+          },
+          "source_file": {
+            "type": "string",
+            "description": "Template rendering input file path for pandoc stages."
+          },
           "tags": {
             "type": "array",
             "description": "Fixed string list of YouTube tags.",
             "items": {
               "type": "string"
             }
+          },
+          "target_chars": {
+            "type": "integer",
+            "description": "Approximate ceiling on the compacted output's length in characters (compact stages). Must be \u003e 0.",
+            "minimum": 1
           },
           "text": {
             "type": "string",
@@ -302,7 +446,12 @@
               "ffmpeg",
               "youtube",
               "webhook",
-              "confirm"
+              "confirm",
+              "render",
+              "compact",
+              "pandoc",
+              "mix",
+              "short"
             ]
           },
           "url": {
@@ -319,7 +468,7 @@
           },
           "voices_dir": {
             "type": "string",
-            "description": "Override directory containing \u003cvoice\u003e.onnx model files (audio stages)."
+            "description": "Override directory containing \u003cvoice\u003e.onnx model files (audio stages, engine: piper)."
           },
           "workflow": {
             "type": "string",
@@ -412,7 +561,8 @@
             "type": "string",
             "enum": [
               "transient",
-              "timeout"
+              "timeout",
+              "invalid_output"
             ]
           }
         }
@@ -467,7 +617,7 @@
         },
         "cache": {
           "type": "boolean",
-          "description": "Per-stage opt-out: explicit false disables the content-addressed cache for this stage; absent inherits the pipeline default."
+          "description": "Per-stage cache control. For default-cacheable types (text/comfyui/audio/ffmpeg/render/compact/pandoc) `false` opts out, absent inherits the pipeline default. For `webhook` stages this is opt-IN: `true` caches the rendered URL/method/body/headers (use for idempotent reads like SearXNG queries); absent or false skips the cache (the default — most webhooks are side-effecting POSTs)."
         },
         "capability": {
           "type": "string",
@@ -477,6 +627,50 @@
           "type": "string",
           "description": "YouTube numeric category id (default \"22\")."
         },
+        "chunk_chars": {
+          "type": "integer",
+          "description": "Max characters of source sent per LLM call (compact stages). 0 = pick automatically (target_chars × 4).",
+          "minimum": 0
+        },
+        "cleanup": {
+          "type": "array",
+          "description": "Glob patterns (relative to the run dir) removed from disk after the stage's success path completes. Best-effort: cleanup failures log a warning and never fail the stage. Patterns must NOT escape the run dir (no absolute paths, no \"..\" segments). Only valid on stage types that produce a stable on-disk output (text/comfyui/audio/ffmpeg).",
+          "items": {
+            "type": "string"
+          }
+        },
+        "concat_video_file": {
+          "type": "string",
+          "description": "Template rendered per upstream item to each clip path (concat_video mode)."
+        },
+        "concat_video_fps": {
+          "type": "integer",
+          "description": "Normalized output fps for concat_video (default 30)."
+        },
+        "concat_video_from": {
+          "type": "string",
+          "description": "Upstream stage whose JSON array drives an ordered video-clip concat (ffmpeg stages). Re-encodes each clip to a normalized vertical profile."
+        },
+        "concat_video_height": {
+          "type": "integer",
+          "description": "Normalized output height for concat_video (default 1920)."
+        },
+        "concat_video_var": {
+          "type": "string",
+          "description": "Per-item template var bound while rendering concat_video_file (default \"item\")."
+        },
+        "concat_video_width": {
+          "type": "integer",
+          "description": "Normalized output width for concat_video (default 1080)."
+        },
+        "concat_wavs_dir": {
+          "type": "string",
+          "description": "Subdirectory (template-rendered, relative to the run dir) to scope the *.wav walk when concat_wavs is true. Defaults to the whole run dir."
+        },
+        "cover_image": {
+          "type": "string",
+          "description": "Optional path (template-rendered, absolute or relative to run dir) to a PNG/JPEG cover image embedded in the output (M4B audiobook art or EPUB cover)."
+        },
         "credentials_file": {
           "type": "string",
           "description": "OAuth refresh-token JSON path (youtube stages)."
@@ -484,6 +678,19 @@
         "description": {
           "type": "string",
           "description": "Templated video description (youtube stages)."
+        },
+        "engine": {
+          "type": "string",
+          "description": "TTS backend for audio stages. \"piper\" (default) shells out to the piper binary. \"kokoro\" POSTs to an OpenAI-compatible /v1/audio/speech endpoint.",
+          "enum": [
+            "",
+            "piper",
+            "kokoro"
+          ]
+        },
+        "engine_url": {
+          "type": "string",
+          "description": "OpenAI-compatible TTS endpoint base URL (engine: kokoro). Defaults to http://127.0.0.1:8880. Executor appends /v1/audio/speech."
         },
         "ffmpeg_args": {
           "type": "array",
@@ -522,12 +729,35 @@
           "description": "Stage id; template-syntax-safe identifier.",
           "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$"
         },
+        "input_images": {
+          "type": "object",
+          "description": "Map of \"\u003cnode_id\u003e.\u003cinput_name\u003e\" -\u003e templated source image path; uploaded to ComfyUI at run time and bound as the node's image (image-to-video / ref-conditioned edit).",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "inputs": {
           "type": "array",
           "description": "IDs of prior stages this stage depends on.",
           "items": {
             "type": "string"
           }
+        },
+        "m4b_chapter": {
+          "type": "string",
+          "description": "Template rendering per-item chapter title embedded in M4B metadata."
+        },
+        "m4b_file": {
+          "type": "string",
+          "description": "Template rendering per-item MP3 file path (absolute or relative to run dir)."
+        },
+        "m4b_from": {
+          "type": "string",
+          "description": "Upstream stage whose JSON array drives M4B chapter order (ffmpeg stages). Setting any m4b_* field requires m4b_from + m4b_file + m4b_chapter; m4b_var defaults to \"item\"."
+        },
+        "m4b_var": {
+          "type": "string",
+          "description": "Template variable bound to each upstream item when rendering m4b_file/m4b_chapter. Defaults to \"item\"."
         },
         "message": {
           "type": "string",
@@ -557,6 +787,28 @@
             "json"
           ]
         },
+        "pandoc_args": {
+          "type": "array",
+          "description": "Extra raw pandoc args, appended after the generated ones.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "pandoc_from": {
+          "type": "string",
+          "description": "Pandoc --from format (e.g. \"markdown\") for pandoc stages."
+        },
+        "pandoc_metadata": {
+          "type": "object",
+          "description": "Map of pandoc --metadata key=value pairs (title, author, etc.) for pandoc stages.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "pandoc_to": {
+          "type": "string",
+          "description": "Pandoc --to format (e.g. \"epub\") for pandoc stages."
+        },
         "parameters": {
           "type": "object",
           "description": "Map of \"\u003cnode_id\u003e.\u003cinput_name\u003e\" -\u003e templated value for comfyui workflows.",
@@ -568,6 +820,10 @@
           "type": "object",
           "description": "Extra fields merged into the chat-completion body (text stages only).",
           "additionalProperties": true
+        },
+        "preserve": {
+          "type": "string",
+          "description": "Free-form directive describing what MUST be preserved in the compaction (compact stages). E.g. `every numerical value, equipment name, process step`."
         },
         "privacy": {
           "type": "string",
@@ -618,7 +874,8 @@
                 "type": "string",
                 "enum": [
                   "transient",
-                  "timeout"
+                  "timeout",
+                  "invalid_output"
                 ]
               }
             }
@@ -638,12 +895,37 @@
           "description": "Gate the stage. Reserved keywords success (default) / failure / always inspect upstream status; any other value is a Go text/template expression that must render to one of true/yes/1 (run) or false/no/0/\"\" (skip).",
           "default": "success"
         },
+        "short_fps": {
+          "type": "integer",
+          "description": "Output fps for type: short (default 30)."
+        },
+        "short_height": {
+          "type": "integer",
+          "description": "Vertical output height for type: short (default 1920)."
+        },
+        "short_width": {
+          "type": "integer",
+          "description": "Vertical output width for type: short (default 1080)."
+        },
+        "source": {
+          "type": "string",
+          "description": "Template rendering the text to compact (compact stages). Typically `{{ .stages.\u003cupstream\u003e.output }}`."
+        },
+        "source_file": {
+          "type": "string",
+          "description": "Template rendering input file path for pandoc stages."
+        },
         "tags": {
           "type": "array",
           "description": "Fixed string list of YouTube tags.",
           "items": {
             "type": "string"
           }
+        },
+        "target_chars": {
+          "type": "integer",
+          "description": "Approximate ceiling on the compacted output's length in characters (compact stages). Must be \u003e 0.",
+          "minimum": 1
         },
         "text": {
           "type": "string",
@@ -673,7 +955,12 @@
             "ffmpeg",
             "youtube",
             "webhook",
-            "confirm"
+            "confirm",
+            "render",
+            "compact",
+            "pandoc",
+            "mix",
+            "short"
           ]
         },
         "url": {
@@ -690,7 +977,7 @@
         },
         "voices_dir": {
           "type": "string",
-          "description": "Override directory containing \u003cvoice\u003e.onnx model files (audio stages)."
+          "description": "Override directory containing \u003cvoice\u003e.onnx model files (audio stages, engine: piper)."
         },
         "workflow": {
           "type": "string",

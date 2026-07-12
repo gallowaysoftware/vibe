@@ -102,6 +102,8 @@ func backendKind(b profile.Backend) string {
 		return "http_server"
 	case b.ComfyUI != nil:
 		return "comfyui"
+	case b.CloudPeer != nil:
+		return "cloud_peer"
 	}
 	return "?"
 }

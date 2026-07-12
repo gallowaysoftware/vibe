@@ -245,3 +245,177 @@ func TestLoadBackend_NameFieldMustMatchFilename(t *testing.T) {
 		t.Fatalf("mismatched name: got %v, want mismatch error", err)
 	}
 }
+
+func TestLoadBackend_LifecycleAndRouter(t *testing.T) {
+	writeBackend(t, "qwen", `
+name: qwen
+backend:
+  external: true
+  llama_server: {path: ~/m.gguf, huggingface: {repo: a/b, file: m.gguf}, alias: q, context: 1024}
+lifecycle:
+  ttl: 45m
+  preload: true
+  evict_cost: 3
+  refresh: nightly_if_idle
+  start_timeout: 15m
+router:
+  aliases: [coder-max, coder]
+  alias_owner: true
+  unlisted: true
+`)
+	def, err := LoadBackend("qwen")
+	if err != nil {
+		t.Fatalf("LoadBackend: %v", err)
+	}
+	lc := def.Lifecycle
+	if lc == nil {
+		t.Fatal("lifecycle block not stored")
+	}
+	if lc.TTL == nil || lc.TTL.Seconds() != 2700 {
+		t.Errorf("ttl = %v, want 45m (2700s)", lc.TTL)
+	}
+	if !lc.Preload {
+		t.Error("preload not stored")
+	}
+	if lc.EvictCost != 3 {
+		t.Errorf("evict_cost = %d, want 3", lc.EvictCost)
+	}
+	if lc.Refresh != RefreshNightlyIfIdle {
+		t.Errorf("refresh = %q", lc.Refresh)
+	}
+	if lc.StartTimeout == nil || lc.StartTimeout.Seconds() != 900 {
+		t.Errorf("start_timeout = %v, want 15m (900s)", lc.StartTimeout)
+	}
+	r := def.Router
+	if r == nil {
+		t.Fatal("router block not stored")
+	}
+	if len(r.Aliases) != 2 || r.Aliases[0] != "coder-max" || r.Aliases[1] != "coder" {
+		t.Errorf("aliases = %v", r.Aliases)
+	}
+	if !r.AliasOwner || !r.Unlisted {
+		t.Errorf("alias_owner/unlisted not stored: %+v", r)
+	}
+}
+
+func TestLoadBackend_LifecycleValidation(t *testing.T) {
+	base := `
+name: qwen
+backend:
+  external: true
+  llama_server: {path: ~/m.gguf, huggingface: {repo: a/b, file: m.gguf}, alias: q, context: 1024}
+lifecycle:
+`
+	cases := map[string]struct{ yaml, wantErr string }{
+		"unknown refresh policy": {base + "  refresh: hourly\n", "refresh"},
+		"negative ttl":           {base + "  ttl: -5m\n", "negative"},
+		"negative evict_cost":    {base + "  evict_cost: -1\n", "evict_cost"},
+		"non-duration ttl":       {base + "  ttl: soon\n", "duration"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			writeBackend(t, "qwen", tc.yaml)
+			if _, err := LoadBackend("qwen"); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("got %v, want error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadBackend_CloudPeer(t *testing.T) {
+	writeBackend(t, "anthropic", `
+name: anthropic
+backend:
+  cloud_peer:
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+    models: [claude-opus-4-8, claude-sonnet-5]
+    formats: [anthropic, openai]
+`)
+	def, err := LoadBackend("anthropic")
+	if err != nil {
+		t.Fatalf("LoadBackend: %v", err)
+	}
+	if !def.Backend.External {
+		t.Error("cloud_peer must imply backend.external")
+	}
+	cp := def.Backend.CloudPeer
+	if cp == nil || cp.BaseURL != "https://api.anthropic.com" || cp.APIKeyEnv != "ANTHROPIC_API_KEY" {
+		t.Errorf("cloud_peer = %+v", cp)
+	}
+	if len(cp.Models) != 2 {
+		t.Errorf("models = %v", cp.Models)
+	}
+}
+
+func TestLoadBackend_CloudPeerValidation(t *testing.T) {
+	cases := map[string]struct{ yaml, wantErr string }{
+		"missing base_url": {`
+name: p
+backend:
+  cloud_peer: {models: [m]}
+`, "base_url"},
+		"non-http base_url": {`
+name: p
+backend:
+  cloud_peer: {base_url: api.anthropic.com, models: [m]}
+`, "http"},
+		"empty models": {`
+name: p
+backend:
+  cloud_peer: {base_url: https://x.example}
+`, "models"},
+		"bad api_key_env": {`
+name: p
+backend:
+  cloud_peer: {base_url: https://x.example, models: [m], api_key_env: "1BAD KEY"}
+`, "api_key_env"},
+		"unknown format": {`
+name: p
+backend:
+  cloud_peer: {base_url: https://x.example, models: [m], formats: [grpc]}
+`, "formats"},
+		// cloud_peer implies external; a service sidecar contradiction must
+		// trip the same guard as an explicit external: true.
+		"service mode": {`
+name: p
+mode: service
+backend:
+  cloud_peer: {base_url: https://x.example, models: [m]}
+`, "service"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			writeBackend(t, "p", tc.yaml)
+			if _, err := LoadBackend("p"); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("got %v, want error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoad_CloudPeerProfile(t *testing.T) {
+	writeBackend(t, "anthropic", `
+name: anthropic
+backend:
+  cloud_peer: {base_url: https://api.anthropic.com, models: [claude-sonnet-5]}
+`)
+	p, err := Load(writeProfile(t, "name: claude\nbackend_ref: anthropic\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !p.Backend.External || p.Backend.CloudPeer == nil {
+		t.Errorf("cloud_peer profile: external=%v cloud_peer=%v", p.Backend.External, p.Backend.CloudPeer)
+	}
+
+	// Frontends are rejected: nothing expands ${MODEL_ALIAS} for a peer.
+	_, err = Load(writeProfile(t, `
+name: claude
+backend:
+  cloud_peer: {base_url: https://api.anthropic.com, models: [claude-sonnet-5]}
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
+`))
+	if err == nil || !strings.Contains(err.Error(), "cloud_peer") {
+		t.Fatalf("frontend on cloud_peer: got %v, want rejection", err)
+	}
+}

@@ -1,7 +1,6 @@
 package vamp
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -38,11 +37,15 @@ type EnsureOptions struct {
 	// probe is what JIT-loads the model, so size this to the model's cold
 	// start — raise it for models that take longer than the default to load.
 	Timeout time.Duration
-	// Probe, when true (the default), confirms readiness with a 1-token chat
-	// completion rather than trusting /v1/models — a backend can register its
-	// alias with the proxy before its weights finish loading, so the probe is
-	// what catches a "registered but not actually serving" model early instead
-	// of letting the caller's first real request hang.
+	// Probe, when true (the default), confirms readiness with a 1-token
+	// STREAMING chat completion rather than trusting /v1/models — a backend
+	// can register its alias with the proxy before its weights finish
+	// loading, so the probe is what catches a "registered but not actually
+	// serving" model early instead of letting the caller's first real
+	// request hang. Streaming rides llama-swap's loading-state chunks, so a
+	// multi-minute cold start is observable byte-by-byte; failures surface
+	// as typed *RouterError values (see errors.go) — errors.Is against
+	// ErrNotFound / ErrStartFailed / ErrCapacity / ErrUpstreamDown.
 	Probe *bool
 }
 
@@ -221,54 +224,19 @@ func fetchModelID(ctx context.Context, client *http.Client, base string) (string
 }
 
 // waitForGeneration confirms the model genuinely generates by asking for a
-// single token, retrying until it succeeds or ctx expires. This is the check
-// that distinguishes "proxy knows the alias" from "model is loaded and serving".
+// single token with stream: true and reading the SSE to completion, retrying
+// until it succeeds, fails with a non-retryable typed error (NOT_FOUND), or
+// ctx expires. This is the check that distinguishes "proxy knows the alias"
+// from "model is loaded and serving". Streaming matters behind llama-swap:
+// the router's loading-state chunks make a multi-minute cold start
+// observable byte-by-byte instead of a silent POST hold, and failures come
+// back as typed *RouterError values (see errors.go).
+//
+// Timeout structure: each attempt is bounded at 5 minutes (behind an
+// external router the probe is what triggers the JIT load, so one attempt
+// gets room to ride the load out instead of cancelling and re-queueing every
+// 60s); the overall EnsureOptions.Timeout (or the caller's ctx deadline)
+// stays the hang guard.
 func waitForGeneration(ctx context.Context, base, model string) error {
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
-	var lastErr error
-	for {
-		if err := probeGeneration(ctx, base, model); err == nil {
-			return nil
-		} else {
-			lastErr = err
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("model did not generate before timeout: %w", lastErr)
-		case <-ticker.C:
-		}
-	}
-}
-
-func probeGeneration(ctx context.Context, base, model string) error {
-	payload := map[string]any{
-		"model":      model,
-		"messages":   []map[string]string{{"role": "user", "content": "ok"}},
-		"max_tokens": 1,
-		"stream":     false,
-	}
-	b, _ := json.Marshal(payload)
-	// Per-attempt budget: behind an external router (llama-swap on :9000)
-	// this probe is what triggers the JIT load, and a big model can take
-	// minutes to come up — so a single attempt gets room to ride the load
-	// out instead of cancelling and re-queueing every 60s. The overall
-	// EnsureOptions.Timeout (or the caller's ctx deadline) stays the hang
-	// guard; this cap only bounds a wedged backend that accepted the
-	// connection and went silent.
-	attemptCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
-	req, _ := http.NewRequestWithContext(attemptCtx, http.MethodPost, base+"/v1/chat/completions", bytes.NewReader(b))
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("chat probe status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	return nil
+	return internalvamp.WaitForWarm(ctx, nil, base, model, 5*time.Minute, 3*time.Second)
 }

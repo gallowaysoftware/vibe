@@ -55,6 +55,11 @@ func FrontendStateDir(profile string) string {
 	return filepath.Join(FrontendStateRoot(), profile)
 }
 
+// StartHistoryFile persists the fleet API's per-model start-duration
+// history. Under StateHome (not ConfigHome) because it's daemon-generated
+// runtime data, same as the PID file and token.
+func StartHistoryFile() string { return filepath.Join(StateHome(), "fleet", "start-history.json") }
+
 // TokenFile is the path to the daemon's bearer-token file. The token lives in
 // $XDG_STATE_HOME/vibe rather than $XDG_CONFIG_HOME because it's a generated
 // runtime secret, not user-authored configuration — same reasoning that puts

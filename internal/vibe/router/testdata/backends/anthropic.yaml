@@ -1,0 +1,8 @@
+# Fixture mirroring the Anthropic peer stanza from the A1 golden config.
+name: anthropic
+backend:
+  cloud_peer:
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+    models: [claude-opus-4-8, claude-sonnet-5]
+    formats: [anthropic, openai]

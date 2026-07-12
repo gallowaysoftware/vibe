@@ -115,14 +115,39 @@ type Backend struct {
 	// stop leaves the model alone (the router's TTL owns unload). The
 	// definition stays the source of truth for client-facing config:
 	// ${MODEL_ALIAS} / ${MODEL_CONTEXT} still expand from the sub-block.
-	// Only valid for the LLM-serving kinds (llama_server, tabby_api) —
-	// the router speaks their OpenAI surface; comfyui and http_server
-	// stay vibe-supervised.
+	// Only valid for the LLM-serving kinds (llama_server, tabby_api,
+	// cloud_peer — the last is external by definition and normalize forces
+	// the flag) — the router speaks their OpenAI surface; comfyui and
+	// http_server stay vibe-supervised.
 	External    bool                `yaml:"external,omitempty"`
 	LlamaServer *LlamaServerBackend `yaml:"llama_server,omitempty"`
 	ComfyUI     *ComfyUIBackend     `yaml:"comfyui,omitempty"`
 	HTTPServer  *HTTPServerBackend  `yaml:"http_server,omitempty"`
 	TabbyAPI    *TabbyAPIBackend    `yaml:"tabby_api,omitempty"`
+	CloudPeer   *CloudPeerBackend   `yaml:"cloud_peer,omitempty"`
+}
+
+// CloudPeerBackend names a remote OpenAI/Anthropic-compatible API the router
+// (llama-swap) proxies to as a peer — cloud providers behind the same :9000
+// endpoint as local models. There is never a process to launch, so cloud_peer
+// implies backend.external (normalize forces the flag): readiness is "the
+// peer's model ids appear in the router catalog", and `vibe router render`
+// turns the def into a llama-swap peers: stanza with the API key injected
+// from the environment (`apiKey: ${env.<api_key_env>}` — no literals in YAML;
+// the key lives in the router unit's EnvironmentFile).
+type CloudPeerBackend struct {
+	// BaseURL is the peer's API origin (e.g. https://api.anthropic.com),
+	// rendered as the llama-swap peer `proxy`.
+	BaseURL string `yaml:"base_url"`
+	// APIKeyEnv names the environment variable holding the API key in the
+	// router's environment. Rendered as apiKey: ${env.<APIKeyEnv>}.
+	APIKeyEnv string `yaml:"api_key_env,omitempty"`
+	// Models are the model ids the peer serves; the router advertises them
+	// in the merged /v1/models catalog and routes matching requests here.
+	Models []string `yaml:"models"`
+	// Formats documents which API surfaces the peer speaks ("openai",
+	// "anthropic"). Informational for now: routing is by model id.
+	Formats []string `yaml:"formats,omitempty"`
 }
 
 // LlamaServerBackend supervises a llama-server child process exposing an
@@ -821,6 +846,36 @@ func isQuantizedKV(t string) bool {
 	}
 }
 
+// envVarNameRE matches POSIX-ish environment variable names — what llama-swap
+// will substitute via ${env.VAR}.
+var envVarNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+func validateCloudPeer(c *CloudPeerBackend) error {
+	if c.BaseURL == "" {
+		return errors.New("backend.cloud_peer.base_url is required")
+	}
+	if !strings.HasPrefix(c.BaseURL, "http://") && !strings.HasPrefix(c.BaseURL, "https://") {
+		return fmt.Errorf("backend.cloud_peer.base_url %q must be an http(s) URL", c.BaseURL)
+	}
+	if len(c.Models) == 0 {
+		return errors.New("backend.cloud_peer.models must list at least one model id")
+	}
+	if err := uniqueNonEmpty("backend.cloud_peer.models", c.Models); err != nil {
+		return err
+	}
+	if c.APIKeyEnv != "" && !envVarNameRE.MatchString(c.APIKeyEnv) {
+		return fmt.Errorf("backend.cloud_peer.api_key_env %q is not a valid environment variable name", c.APIKeyEnv)
+	}
+	for _, f := range c.Formats {
+		switch f {
+		case "openai", "anthropic":
+		default:
+			return fmt.Errorf("backend.cloud_peer.formats entry %q is not recognised (expected \"openai\" or \"anthropic\")", f)
+		}
+	}
+	return nil
+}
+
 func validateComfyUI(c *ComfyUIBackend) error {
 	if c.Dir == "" {
 		return errors.New("backend.comfyui.dir is required")
@@ -858,6 +913,17 @@ func (p *Profile) validateFrontend() error {
 	if p.Backend.HTTPServer != nil {
 		if !p.Frontend.IsZero() {
 			return errors.New("frontend is not supported for http_server backends (the HTTP server is the deliverable; consume it via the vibe proxy)")
+		}
+		return nil
+	}
+
+	// cloud_peer backends have no single model alias for ${MODEL_ALIAS} to
+	// expand from and no vibe-side activation to hang a frontend on — the
+	// router proxies clients straight to the cloud API. Point a frontend at
+	// a specific peer model via its own config instead.
+	if p.Backend.CloudPeer != nil {
+		if !p.Frontend.IsZero() {
+			return errors.New("frontend is not supported for cloud_peer backends (clients reach peer models through the router by model id)")
 		}
 		return nil
 	}

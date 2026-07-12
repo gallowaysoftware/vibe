@@ -1,0 +1,7 @@
+# Service-mode sidecar: never router-served, must be ignored by the renderer.
+name: searxng
+mode: service
+backend:
+  http_server:
+    image: searxng/searxng:latest
+    port: 14002

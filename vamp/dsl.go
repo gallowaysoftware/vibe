@@ -203,6 +203,21 @@ func (p *Pipeline) Cache(enabled bool) *Pipeline {
 	return p
 }
 
+// KeepWarm overrides the run-scoped lease-heartbeat interval (YAML:
+// `keep_warm:`): while the pipeline is executing, every Ensured LLM endpoint
+// idle past the interval gets a 1-token streaming keep-warm request so a
+// TTL-reaping router (llama-swap) doesn't unload the model between distant
+// stages. Pass a non-positive interval to disable the heartbeat; the default
+// without a call is 20 minutes.
+func (p *Pipeline) KeepWarm(interval time.Duration) *Pipeline {
+	if interval <= 0 {
+		p.inner.KeepWarm = internalvamp.KeepWarmSetting{Disabled: true}
+	} else {
+		p.inner.KeepWarm = internalvamp.KeepWarmSetting{Interval: interval}
+	}
+	return p
+}
+
 // RequireService declares a non-vibe HTTP service the pipeline needs
 // reachable at run time. setupHint is a one-line shell command surfaced
 // verbatim by tooling when the service is unreachable (e.g.

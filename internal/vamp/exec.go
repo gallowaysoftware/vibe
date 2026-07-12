@@ -414,6 +414,17 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 	}
 	e.completedStages = make(map[string]bool)
 
+	// Lease heartbeat: for the duration of the run, every Ensured LLM
+	// endpoint idle past keep_warm gets a 1-token streaming re-warm so a
+	// TTL-reaping router doesn't unload it between distant stages. The
+	// goroutine's lifetime is pinned to this function — stopAndWait blocks
+	// until it exits, so Run never leaks it.
+	if kw := newKeepWarm(e.Pipeline.KeepWarm.EffectiveInterval(), e.logf); kw != nil {
+		kw.start(ctx)
+		defer kw.stopAndWait()
+		ctx = withKeepWarm(ctx, kw)
+	}
+
 	// Build the per-type executor registry. Per-stage routing happens through
 	// Stage.Type (empty defaults to text); the executor's per-call deps travel
 	// via StageInput.
@@ -945,64 +956,9 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 		return errors.Join(errs...)
 	}
 
-	candidates, err := e.Capabilities.Profiles(capability)
+	status, _, err := e.activateCapability(ctx, capability)
 	if err != nil {
 		return err
-	}
-	// Walk the candidate list in declared order (biggest first). Stop on
-	// the first one that activates; skip on a VRAM rejection (the daemon's
-	// FailedPrecondition pre-flight error) so we can fall back to a
-	// smaller profile; abort on any other error so genuine failures aren't
-	// silently re-tried against a different profile.
-	var (
-		status  *vibev1.Status
-		lastErr error
-		picked  bool
-	)
-	for _, cand := range candidates {
-		if len(candidates) > 1 {
-			e.logf("  -> activating backend %q (candidate for %q)", cand, capability)
-		} else {
-			e.logf("  -> activating backend %q", cand)
-		}
-		// Capability candidates name a BACKEND (backends/<name>.yaml), not a
-		// frontend-bearing profile — vamp depends on the model, not the UI.
-		st, actErr := e.Vibe.EnsureBackendActive(ctx, cand)
-		if actErr != nil && vibeclient.IsNotFound(actErr) {
-			// No backend by that name: fall back to treating the candidate as a
-			// profile name. Keeps pre-backend capabilities.yaml files working.
-			e.logf("  -> no backend %q; falling back to profile activation", cand)
-			st, actErr = e.Vibe.EnsureActive(ctx, cand)
-		}
-		if actErr != nil {
-			if vibeclient.IsVRAMRejection(actErr) {
-				e.logf("  -> skipping %q: %s", cand, actErr.Error())
-				lastErr = fmt.Errorf("activate %q: %w", cand, actErr)
-				continue
-			}
-			return fmt.Errorf("activate %q: %w", cand, actErr)
-		}
-		if !st.Ready {
-			// Treat a not-ready response the same as a generic activation
-			// failure: don't try the next candidate, since "not ready" is
-			// usually a daemon integration bug rather than a VRAM problem.
-			return fmt.Errorf("backend %q is not ready", cand)
-		}
-		status = st
-		picked = true
-		e.mu.Lock()
-		if e.resolvedCapabilities == nil {
-			e.resolvedCapabilities = make(map[string]string)
-		}
-		e.resolvedCapabilities[capability] = cand
-		e.mu.Unlock()
-		break
-	}
-	if !picked {
-		// All candidates VRAM-rejected. Return the last error so the
-		// caller still sees a useful "needs N GiB" message rather than a
-		// vague "no candidates fit".
-		return lastErr
 	}
 	// Only resolve the chat-completion model id when at least one stage in
 	// this group needs it. ComfyUI backends don't speak OpenAI /v1/models, so
@@ -1023,6 +979,11 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 	}
 	baseURL := strings.TrimSuffix(status.ProxyAddr, "/v1")
 	backendAddr := status.BackendAddr
+	if modelID != "" {
+		// An Ensured LLM endpoint joins the lease: from here on the
+		// heartbeat keeps it loaded across long non-LLM gaps in the run.
+		keepWarmFrom(ctx).touch(baseURL, modelID)
+	}
 
 	// profileParallel is the active profile's llama_server `parallel` slot
 	// count (Status.Parallel, populated by the daemon). For text/foreach
@@ -1080,6 +1041,61 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 	return nil
 }
 
+// activateCapability walks the capability's candidate list in declared order
+// (biggest first). It stops on the first candidate that activates; skips on
+// a VRAM rejection (the daemon's FailedPrecondition pre-flight error) so it
+// can fall back to a smaller profile; and aborts on any other error so
+// genuine failures aren't silently re-tried against a different profile.
+// Returns the winning activation's status plus the candidate name.
+func (e *Executor) activateCapability(ctx context.Context, capability string) (*vibev1.Status, string, error) {
+	candidates, err := e.Capabilities.Profiles(capability)
+	if err != nil {
+		return nil, "", err
+	}
+	var lastErr error
+	for _, cand := range candidates {
+		if len(candidates) > 1 {
+			e.logf("  -> activating backend %q (candidate for %q)", cand, capability)
+		} else {
+			e.logf("  -> activating backend %q", cand)
+		}
+		// Capability candidates name a BACKEND (backends/<name>.yaml), not a
+		// frontend-bearing profile — vamp depends on the model, not the UI.
+		st, actErr := e.Vibe.EnsureBackendActive(ctx, cand)
+		if actErr != nil && vibeclient.IsNotFound(actErr) {
+			// No backend by that name: fall back to treating the candidate as a
+			// profile name. Keeps pre-backend capabilities.yaml files working.
+			e.logf("  -> no backend %q; falling back to profile activation", cand)
+			st, actErr = e.Vibe.EnsureActive(ctx, cand)
+		}
+		if actErr != nil {
+			if vibeclient.IsVRAMRejection(actErr) {
+				e.logf("  -> skipping %q: %s", cand, actErr.Error())
+				lastErr = fmt.Errorf("activate %q: %w", cand, actErr)
+				continue
+			}
+			return nil, "", fmt.Errorf("activate %q: %w", cand, actErr)
+		}
+		if !st.Ready {
+			// Treat a not-ready response the same as a generic activation
+			// failure: don't try the next candidate, since "not ready" is
+			// usually a daemon integration bug rather than a VRAM problem.
+			return nil, "", fmt.Errorf("backend %q is not ready", cand)
+		}
+		e.mu.Lock()
+		if e.resolvedCapabilities == nil {
+			e.resolvedCapabilities = make(map[string]string)
+		}
+		e.resolvedCapabilities[capability] = cand
+		e.mu.Unlock()
+		return st, cand, nil
+	}
+	// All candidates VRAM-rejected. Return the last error so the caller
+	// still sees a useful "needs N GiB" message rather than a vague "no
+	// candidates fit".
+	return nil, "", lastErr
+}
+
 // freeProfileIfRequested stops the active vibe profile (unloading the LLM and
 // releasing its VRAM) after a capability group completes, when any stage in
 // the group set FreeProfileAfter(). It is the LLM analogue of a ComfyUI
@@ -1119,6 +1135,9 @@ func (e *Executor) freeProfileIfRequested(ctx context.Context, group []*Stage) {
 	e.cachedModelID = ""
 	e.cachedModelProfile = ""
 	e.mu.Unlock()
+	// Drop the lease on everything we just unloaded — a keep_warm heartbeat
+	// would otherwise reload the model the pipeline deliberately evicted.
+	keepWarmFrom(ctx).forgetAll()
 }
 
 // executeStage runs a single stage. For ordinary stages it invokes the

@@ -31,6 +31,15 @@ type Pipeline struct {
 	// pipeline default via Stage.Cache.
 	Cache *bool `yaml:"cache,omitempty"`
 
+	// KeepWarm tunes the run-scoped lease heartbeat: while the pipeline is
+	// executing, every LLM endpoint that was Ensured gets a 1-token
+	// streaming keep-warm request whenever it hasn't been used for the
+	// interval, so a TTL-reaping router (llama-swap) doesn't unload the
+	// model during a long non-LLM stage (e.g. a 50-minute ComfyUI render)
+	// and force a full cold start on the next text stage. `keep_warm: 20m`
+	// overrides the interval, `keep_warm: false` disables; unset = 20m.
+	KeepWarm KeepWarmSetting `yaml:"keep_warm,omitempty"`
+
 	// RequiredServices declares non-vibe HTTP services the pipeline needs
 	// reachable at run time (SearXNG, Kokoro-FastAPI, etc.). Surfaced via
 	// Pipeline.Requirements() so vibe doctor can preflight-check them.

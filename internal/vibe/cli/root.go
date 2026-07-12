@@ -43,6 +43,7 @@ func rootCmd() *cobra.Command {
 		tuiCmd(),
 		profileCmd(),
 		backendCmd(),
+		routerCmd(),
 		tokenCmd(),
 	)
 	return root

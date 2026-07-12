@@ -1,0 +1,15 @@
+# NOT external: stays vibe-managed and must not appear in the rendered
+# config even though it shares model files with gemma-4-31b-mm.
+name: gemma-4-31b
+backend:
+  llama_server:
+    path: ~/models/gemma-4-31B-it-GGUF/gemma-4-31B-it-UD-Q5_K_XL.gguf
+    huggingface:
+      repo: unsloth/gemma-4-31B-it-GGUF
+      file: gemma-4-31B-it-UD-Q5_K_XL.gguf
+    alias: gemma-4-31b-it
+    context: 49152
+    gpu_layers: 999
+    flash_attn: true
+    jinja: true
+estimated_vram_gb: 28

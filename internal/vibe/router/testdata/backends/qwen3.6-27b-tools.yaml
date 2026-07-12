@@ -1,0 +1,21 @@
+# Fixture mirroring the tool-loop variant: same model + alias as qwen3.6-27b
+# plus --reasoning off. The base def owns the contested alias, so this one
+# must render WITHOUT aliases (clients address it by def name).
+name: qwen3.6-27b-tools
+backend:
+  external: true
+  llama_server:
+    path: ~/models/qwen3.6-27b-mtp-gguf/Qwen3.6-27B-Q6_K.gguf
+    huggingface:
+      repo: unsloth/Qwen3.6-27B-MTP-GGUF
+      file: Qwen3.6-27B-Q6_K.gguf
+    alias: qwen3.6-27b-mtp-q6_k
+    context: 131072
+    parallel: 1
+    gpu_layers: 999
+    flash_attn: true
+    cache_type_k: q8_0
+    cache_type_v: q8_0
+    jinja: true
+    extra_args: ["--spec-type", "draft-mtp", "--spec-draft-n-max", "5", "--spec-draft-p-min", "0.75", "--reasoning", "off"]
+estimated_vram_gb: 26

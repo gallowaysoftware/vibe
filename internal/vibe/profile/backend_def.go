@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"gopkg.in/yaml.v3"
@@ -24,6 +25,124 @@ type BackendDef struct {
 	// Mode mirrors Profile.Mode ("" / "active" / "service"); a service
 	// backend (embedding server, TTS daemon) runs as a sidecar.
 	Mode string `yaml:"mode,omitempty"`
+	// Lifecycle carries router-lifecycle knobs consumed by `vibe router
+	// render` for external backends (docs/design/router-lifecycle.md §4).
+	// Accepted on any def so a backend can flip external on/off without
+	// having to delete the block, but only external defs are rendered.
+	Lifecycle *Lifecycle `yaml:"lifecycle,omitempty"`
+	// Router carries client-facing naming knobs for the rendered llama-swap
+	// entry (extra aliases, alias-collision ownership, catalog visibility).
+	Router *RouterOpts `yaml:"router,omitempty"`
+}
+
+// Lifecycle is the router-lifecycle block on a backend def. All fields feed
+// the llama-swap config renderer; none affect vibe-supervised backends.
+type Lifecycle struct {
+	// TTL is the idle-unload timeout, rendered to llama-swap's per-model
+	// `ttl` (seconds). Explicit 0 means "never unload"; absent defaults to
+	// 2h for external LLM backends at render time.
+	TTL *Duration `yaml:"ttl,omitempty"`
+	// Preload asks the router to load this model at startup
+	// (hooks.on_startup.preload).
+	Preload bool `yaml:"preload,omitempty"`
+	// EvictCost is reserved for llama-swap matrix mode (higher = evicted
+	// last). Accepted and stored now; the renderer emits it only once a
+	// matrix section exists (multi-model co-residency, phase A6).
+	EvictCost int `yaml:"evict_cost,omitempty"`
+	// Refresh names a periodic restart policy. Only "nightly_if_idle" is
+	// recognised: a systemd timer that unloads the model at 04:00 when idle
+	// (an unloaded model makes the unload a no-op, so "if idle" is free).
+	// TODO(router-lifecycle A2+): rendering the systemd timer unit is out of
+	// scope for the config renderer pass; the field is accepted and stored
+	// so defs can declare intent ahead of the timer renderer.
+	Refresh string `yaml:"refresh,omitempty"`
+	// StartTimeout is this model's cold-start budget. The renderer's global
+	// healthCheckTimeout is max(300s, max start_timeout over rendered defs),
+	// so one slow-loading model raises the shared ceiling.
+	StartTimeout *Duration `yaml:"start_timeout,omitempty"`
+}
+
+// RefreshNightlyIfIdle is the only recognised Lifecycle.Refresh policy.
+const RefreshNightlyIfIdle = "nightly_if_idle"
+
+func (l *Lifecycle) validate() error {
+	if l == nil {
+		return nil
+	}
+	if l.Refresh != "" && l.Refresh != RefreshNightlyIfIdle {
+		return fmt.Errorf("lifecycle.refresh %q is not recognised (expected %q)", l.Refresh, RefreshNightlyIfIdle)
+	}
+	if l.EvictCost < 0 {
+		return errors.New("lifecycle.evict_cost must be >= 0")
+	}
+	return nil
+}
+
+// RouterOpts controls how a backend def surfaces in the rendered llama-swap
+// config. The def NAME is always the canonical model id; these knobs shape
+// the extra client-facing names around it.
+type RouterOpts struct {
+	// Aliases are extra client-facing model names. When absent, the
+	// llama_server alias field is the default alias (kept for stale-state
+	// compat with configs written against the pre-router alias).
+	Aliases []string `yaml:"aliases,omitempty"`
+	// AliasOwner resolves alias collisions: when several defs claim the same
+	// alias (e.g. a base model and its --reasoning-off variant sharing one
+	// llama_server alias), the def with alias_owner: true keeps the alias
+	// and the others render without it. Zero or multiple owners for a
+	// contested alias is a render error.
+	AliasOwner bool `yaml:"alias_owner,omitempty"`
+	// Unlisted hides the model from the router's /v1/models catalog.
+	Unlisted bool `yaml:"unlisted,omitempty"`
+}
+
+func (r *RouterOpts) validate() error {
+	if r == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	for _, a := range r.Aliases {
+		if a == "" {
+			return errors.New("router.aliases entries must be non-empty")
+		}
+		if seen[a] {
+			return fmt.Errorf("router.aliases lists %q twice", a)
+		}
+		seen[a] = true
+	}
+	return nil
+}
+
+// Duration is a time.Duration that unmarshals from the Go duration string
+// form ("2h", "45m") used across vibe YAML. Negative values are rejected —
+// llama-swap's ttl -1 ("use globalTTL") is deliberately not exposed; a def
+// that wants the default simply omits the field.
+type Duration time.Duration
+
+func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
+	var s string
+	if err := value.Decode(&s); err != nil {
+		return err
+	}
+	dd, err := time.ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("duration %q: %w", s, err)
+	}
+	if dd < 0 {
+		return fmt.Errorf("duration %q must not be negative", s)
+	}
+	*d = Duration(dd)
+	return nil
+}
+
+func (d Duration) MarshalYAML() (any, error) {
+	return time.Duration(d).String(), nil
+}
+
+// Seconds returns the duration in whole seconds, the unit llama-swap's ttl
+// and healthCheckTimeout fields speak.
+func (d Duration) Seconds() int {
+	return int(time.Duration(d) / time.Second)
 }
 
 // isEmpty reports whether the backend block is the zero union. External is
@@ -31,13 +150,20 @@ type BackendDef struct {
 // mutual-exclusion error instead of being silently discarded when the ref
 // resolves over it.
 func (b Backend) isEmpty() bool {
-	return !b.External && b.LlamaServer == nil && b.ComfyUI == nil && b.HTTPServer == nil && b.TabbyAPI == nil
+	return !b.External && b.LlamaServer == nil && b.ComfyUI == nil && b.HTTPServer == nil && b.TabbyAPI == nil && b.CloudPeer == nil
 }
 
 // normalize applies in-place defaults (llama_server.parallel) and tilde-expands
 // every path field. Shared by profile Load and LoadBackend so an inline
 // backend and a referenced one are treated identically.
 func (b *Backend) normalize() {
+	// cloud_peer implies external semantics: there is never a process for
+	// vibe to launch — the router proxies to the cloud API and readiness is
+	// "the peer's model ids appear in the router catalog". Forcing the flag
+	// here lets every downstream external check stay a single boolean.
+	if b.CloudPeer != nil {
+		b.External = true
+	}
 	if b.LlamaServer != nil {
 		if b.LlamaServer.Parallel == 0 {
 			b.LlamaServer.Parallel = 1
@@ -73,23 +199,24 @@ func (b *Backend) normalize() {
 // and runs the per-backend validation.
 func (b Backend) validate() error {
 	set := 0
-	for _, on := range []bool{b.LlamaServer != nil, b.ComfyUI != nil, b.HTTPServer != nil, b.TabbyAPI != nil} {
+	for _, on := range []bool{b.LlamaServer != nil, b.ComfyUI != nil, b.HTTPServer != nil, b.TabbyAPI != nil, b.CloudPeer != nil} {
 		if on {
 			set++
 		}
 	}
 	switch {
 	case set == 0:
-		return errors.New("backend is required: set exactly one of backend.llama_server, backend.comfyui, backend.http_server, or backend.tabby_api")
+		return errors.New("backend is required: set exactly one of backend.llama_server, backend.comfyui, backend.http_server, backend.tabby_api, or backend.cloud_peer")
 	case set > 1:
-		return errors.New("backend: only one of backend.llama_server, backend.comfyui, backend.http_server, or backend.tabby_api may be set")
+		return errors.New("backend: only one of backend.llama_server, backend.comfyui, backend.http_server, backend.tabby_api, or backend.cloud_peer may be set")
 	}
 	// external only makes sense where the router serves the backend's OpenAI
 	// surface: comfyui speaks its own workflow API and http_server wraps
 	// arbitrary HTTP services — neither is something llama-swap advertises on
 	// /v1/models, so an external flag there could only be a mistake.
-	if b.External && b.LlamaServer == nil && b.TabbyAPI == nil {
-		return errors.New("backend.external is only valid for LLM-serving backends (llama_server, tabby_api); comfyui and http_server stay vibe-supervised")
+	// (cloud_peer is external by definition; normalize forces the flag.)
+	if b.External && b.LlamaServer == nil && b.TabbyAPI == nil && b.CloudPeer == nil {
+		return errors.New("backend.external is only valid for LLM-serving backends (llama_server, tabby_api, cloud_peer); comfyui and http_server stay vibe-supervised")
 	}
 	switch {
 	case b.LlamaServer != nil:
@@ -98,6 +225,8 @@ func (b Backend) validate() error {
 		return validateComfyUI(b.ComfyUI)
 	case b.HTTPServer != nil:
 		return validateHTTPServer(b.HTTPServer)
+	case b.CloudPeer != nil:
+		return validateCloudPeer(b.CloudPeer)
 	default:
 		return validateTabbyAPI(b.TabbyAPI)
 	}
@@ -107,6 +236,13 @@ func (b Backend) validate() error {
 // definition from $XDG_CONFIG_HOME/vibe/backends/<name>.yaml. Unknown fields
 // are rejected; ~/-prefixed paths are expanded.
 func LoadBackend(name string) (*BackendDef, error) {
+	return LoadBackendFrom(paths.BackendsDir(), name)
+}
+
+// LoadBackendFrom is LoadBackend against an explicit backends directory.
+// Exists so the router config renderer (and its tests) can load defs from a
+// fixture dir instead of the user's config home.
+func LoadBackendFrom(dir, name string) (*BackendDef, error) {
 	if name == "" {
 		return nil, errors.New("backend name is required")
 	}
@@ -120,7 +256,7 @@ func LoadBackend(name string) (*BackendDef, error) {
 		return nil, fmt.Errorf("backend name %q should not include the %s extension (use %q)",
 			name, ext, strings.TrimSuffix(name, ext))
 	}
-	path := filepath.Join(paths.BackendsDir(), name+".yaml")
+	path := filepath.Join(dir, name+".yaml")
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open backend %s: %w", name, err)
@@ -141,6 +277,12 @@ func LoadBackend(name string) (*BackendDef, error) {
 	}
 	def.Backend.normalize()
 	if err := def.Backend.validate(); err != nil {
+		return nil, fmt.Errorf("backend %s: %w", name, err)
+	}
+	if err := def.Lifecycle.validate(); err != nil {
+		return nil, fmt.Errorf("backend %s: %w", name, err)
+	}
+	if err := def.Router.validate(); err != nil {
 		return nil, fmt.Errorf("backend %s: %w", name, err)
 	}
 	// Mirrors Profile.validateMode: backend defs are also activated directly

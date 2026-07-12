@@ -48,6 +48,7 @@ func (s *stubControl) Status(_ context.Context, _ *connect.Request[vibev1.Status
 }
 func (s *stubControl) Start(_ context.Context, req *connect.Request[vibev1.StartRequest]) (*connect.Response[vibev1.StartResponse], error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	// Capability activation sends Backend; interactive/profile activation sends
 	// Profile. Either becomes the active identity reported by Status.
 	if req.Msg.Backend != "" {
@@ -55,9 +56,12 @@ func (s *stubControl) Start(_ context.Context, req *connect.Request[vibev1.Start
 	} else {
 		s.profile = req.Msg.Profile
 	}
-	s.mu.Unlock()
-	r, _ := s.Status(context.TODO(), nil)
-	return connect.NewResponse(&vibev1.StartResponse{Status: r.Msg.Status}), nil
+	// Build the response under the same lock so parallel Starts (the --warm
+	// path activates every capability concurrently) each see their own
+	// profile in the response instead of whichever Start landed last.
+	return connect.NewResponse(&vibev1.StartResponse{Status: &vibev1.Status{
+		Running: true, Ready: true, Profile: s.profile, ProxyAddr: s.proxyURL, Parallel: s.parallel,
+	}}), nil
 }
 func (s *stubControl) Stop(_ context.Context, _ *connect.Request[vibev1.StopRequest]) (*connect.Response[vibev1.StopResponse], error) {
 	s.mu.Lock()

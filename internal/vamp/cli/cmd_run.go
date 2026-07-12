@@ -44,6 +44,7 @@ func runCmd() *cobra.Command {
 		detachFlag      bool
 		noCacheFlag     bool
 		noEnsureSvc     bool
+		warmFlag        bool
 		internalRunJob  bool
 	)
 	cmd := &cobra.Command{
@@ -92,6 +93,7 @@ func runCmd() *cobra.Command {
 				DryRun:           dryRunFlag,
 				NoCache:          noCacheFlag,
 				NoEnsureServices: noEnsureSvc,
+				Warm:             warmFlag,
 				InternalRunJob:   internalRunJob,
 			}
 			return RunPipeline(ctx, p, filepath.Dir(pipelinePath), pipelineBytes, opts, cmd.OutOrStdout(), cmd.ErrOrStderr())
@@ -106,6 +108,7 @@ func runCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&detachFlag, "detach", false, "Fork the run into a background `vamp` worker and return immediately with a job id. Use `vamp runs ls`, `vamp logs <id>`, `vamp cancel <id>` to drive it.")
 	cmd.Flags().BoolVar(&noCacheFlag, "no-cache", false, "Disable the content-addressed cache for this run; overrides per-pipeline / per-stage `cache: true` defaults.")
 	cmd.Flags().BoolVar(&noEnsureSvc, "no-ensure-services", false, "Skip the pre-flight probe + auto-start of declared RequireService URLs. Default behaviour auto-runs `vibe start <name>` for any unreachable service whose setup_hint matches that shape, sparing the operator a 3-second-retry-then-fail cascade in the first webhook stage.")
+	cmd.Flags().BoolVar(&warmFlag, "warm", false, "Before DAG execution starts, ensure every capability the pipeline declares in PARALLEL (activation + a 1-token streaming warm probe for LLM capabilities) so router cold starts overlap instead of serializing at each capability's first stage. Prints one line per capability with resolve + warm durations.")
 	cmd.Flags().BoolVar(&internalRunJob, internalRunJobFlag, false, "Internal: marks this process as the detached worker spawned by --detach. Sets up vamp.log + vamp.pid in the run dir. Do not invoke manually.")
 	_ = cmd.Flags().MarkHidden(internalRunJobFlag)
 	return cmd

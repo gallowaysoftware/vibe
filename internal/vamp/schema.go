@@ -460,6 +460,13 @@ func Schema() *schemaProperty {
 				Type:        "boolean",
 				Description: "Pipeline-level opt-out: explicit false disables the content-addressed cache for every stage in the pipeline.",
 			},
+			"keep_warm": {
+				Description: "Lease heartbeat for router-managed LLM backends: while the run is active, every ensured endpoint idle past this interval gets a 1-token streaming keep-warm request so a TTL idle-unload doesn't reap the model mid-pipeline. A Go duration string overrides the 20m default; false disables.",
+				OneOf: []*schemaProperty{
+					{Type: "boolean"},
+					{Type: "string", Pattern: `^[0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h)$`},
+				},
+			},
 		},
 		Definitions: map[string]*schemaProperty{
 			"InputSpec":   inputSpec,

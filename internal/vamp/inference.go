@@ -148,6 +148,14 @@ func (c *ChatCompletion) CallMultimodal(ctx context.Context, baseURL, model, pro
 	if client == nil {
 		client = defaultInferenceClient()
 	}
+	// Lease bookkeeping: mark the endpoint used at request start (so a long
+	// generation doesn't trigger a pointless mid-flight heartbeat) and again
+	// at completion (so the idle clock starts when the response finished).
+	// keepWarmFrom is nil outside a heartbeat-enabled Run; touch is nil-safe.
+	if kw := keepWarmFrom(ctx); kw != nil {
+		kw.touch(baseURL, model)
+		defer kw.touch(baseURL, model)
+	}
 	stream := onToken != nil
 
 	// Build content: plain string for text-only, array for multimodal.

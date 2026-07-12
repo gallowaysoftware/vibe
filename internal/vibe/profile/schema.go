@@ -323,22 +323,51 @@ func Schema() *schemaProperty {
 		},
 	}
 
+	cloudPeer := &schemaProperty{
+		Type:                 "object",
+		Description:          "Remote OpenAI/Anthropic-compatible API served through the router (llama-swap) as a peer. Implies backend.external: there is never a process to launch; `vibe router render` turns the definition into a llama-swap peers: stanza with apiKey: ${env.<api_key_env>} (the key itself lives in the router unit's environment, never in YAML).",
+		AdditionalProperties: false,
+		Required:             []string{"base_url", "models"},
+		Properties: map[string]*schemaProperty{
+			"base_url": {
+				Type:        "string",
+				Description: "Peer API origin (e.g. \"https://api.anthropic.com\"), rendered as the llama-swap peer proxy.",
+			},
+			"api_key_env": {
+				Type:        "string",
+				Pattern:     `^[A-Za-z_][A-Za-z0-9_]*$`,
+				Description: "Environment variable (in the router's environment) holding the API key. Rendered as apiKey: ${env.<name>}.",
+			},
+			"models": {
+				Type:        "array",
+				Description: "Model ids the peer serves; the router advertises them in the merged /v1/models catalog and routes matching requests to the peer.",
+				Items:       &schemaProperty{Type: "string"},
+			},
+			"formats": {
+				Type:        "array",
+				Description: "API surfaces the peer speaks. Informational — routing is by model id.",
+				Items:       &schemaProperty{Type: "string", Enum: []any{"openai", "anthropic"}},
+			},
+		},
+	}
+
 	backend := &schemaProperty{
 		Type:                 "object",
-		Description:          "Backend configuration. Exactly one of llama_server, comfyui, http_server, or tabby_api must be set (discriminated union).",
+		Description:          "Backend configuration. Exactly one of llama_server, comfyui, http_server, tabby_api, or cloud_peer must be set (discriminated union).",
 		AdditionalProperties: false,
 		Properties: map[string]*schemaProperty{
 			"external": {
 				Type:        "boolean",
-				Description: "Marks a backend whose process lifecycle is owned by an external router (llama-swap) listening on the vibe proxy port. vibe skips launch/supervision/VRAM pre-flight and instead verifies at start that the backend's model id appears in the router's /v1/models catalog; stop leaves the model alone (the router's TTL owns unload). ${MODEL_ALIAS}/${MODEL_CONTEXT} still expand from this definition. Only valid for llama_server and tabby_api backends.",
+				Description: "Marks a backend whose process lifecycle is owned by an external router (llama-swap) listening on the vibe proxy port. vibe skips launch/supervision/VRAM pre-flight and instead verifies at start that the backend's model id appears in the router's /v1/models catalog; stop leaves the model alone (the router's TTL owns unload). ${MODEL_ALIAS}/${MODEL_CONTEXT} still expand from this definition. Only valid for llama_server, tabby_api, and cloud_peer backends (cloud_peer implies it).",
 			},
 			"llama_server": llamaServer,
 			"comfyui":      comfyui,
 			"http_server":  httpServer,
 			"tabby_api":    tabbyAPI,
+			"cloud_peer":   cloudPeer,
 		},
 		// Discriminated-union XOR: exactly one sub-block. Each oneOf
-		// branch requires one of the four keys; the loader rejects
+		// branch requires one of the five keys; the loader rejects
 		// "more than one set" and "none set" at runtime, matching this
 		// constraint.
 		OneOf: []*schemaProperty{
@@ -346,6 +375,7 @@ func Schema() *schemaProperty {
 			{Required: []string{"comfyui"}},
 			{Required: []string{"http_server"}},
 			{Required: []string{"tabby_api"}},
+			{Required: []string{"cloud_peer"}},
 		},
 	}
 
@@ -472,7 +502,7 @@ func Schema() *schemaProperty {
 		ID:          "https://github.com/gallowaysoftware/vibe/schemas/vibe.profile.schema.json",
 		Title:       "vibe profile",
 		Type:        "object",
-		Description: "A vibe profile definition: a named backend (llama_server, comfyui, http_server, or tabby_api — inline or via backend_ref) plus an optional frontend renderer.",
+		Description: "A vibe profile definition: a named backend (llama_server, comfyui, http_server, tabby_api, or cloud_peer — inline or via backend_ref) plus an optional frontend renderer.",
 		Required:    []string{"name"},
 		// Shallow anyOf so the "inline backend or backend_ref" requirement
 		// still surfaces in editors; unlike the deeply-nested frontend
@@ -539,6 +569,7 @@ func Schema() *schemaProperty {
 			"ComfyUIBackend":     comfyui,
 			"HTTPServerBackend":  httpServer,
 			"TabbyAPIBackend":    tabbyAPI,
+			"CloudPeerBackend":   cloudPeer,
 			"Frontend":           frontend,
 			"Huggingface":        huggingface,
 			"HuggingfaceRepo":    huggingfaceRepo,

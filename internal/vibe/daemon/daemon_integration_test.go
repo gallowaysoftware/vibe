@@ -696,8 +696,12 @@ func TestDaemon_ExternalBackend(t *testing.T) {
 		t.Errorf("Status = %+v; want running+ready external (router) pid 0", s)
 	}
 
-	// ${MODEL_ALIAS} / ${VIBE_API} still expand from the backend def — the
-	// def stays the source of truth for client-facing config.
+	// For an external backend ${MODEL_ALIAS} expands to the CANONICAL router
+	// model id — the backend def name (here: the inline profile's name) —
+	// because the rendered llama-swap config keys models by def name and a
+	// shared llama_server alias may belong to a different def variant. The
+	// llama_server alias ("fake-ext") stays in the router config as an alias
+	// for stale client state only.
 	data, err := os.ReadFile(filepath.Join(stateHome, "vibe", "frontend", "ext", "sidecar.json"))
 	if err != nil {
 		t.Fatalf("read sidecar: %v", err)
@@ -706,8 +710,8 @@ func TestDaemon_ExternalBackend(t *testing.T) {
 	if err := json.Unmarshal(skipGeneratedComment(data), &sidecar); err != nil {
 		t.Fatalf("unmarshal sidecar: %v\nbody: %s", err, string(data))
 	}
-	if sidecar["alias"] != "fake-ext" {
-		t.Errorf("sidecar alias = %v, want fake-ext", sidecar["alias"])
+	if sidecar["alias"] != "ext" {
+		t.Errorf("sidecar alias = %v, want ext (canonical router id, not the llama_server alias)", sidecar["alias"])
 	}
 	if got, want := sidecar["api"], fmt.Sprintf("http://127.0.0.1:%d/v1", routerPort); got != want {
 		t.Errorf("sidecar api = %v, want %v (the router's port)", got, want)
@@ -730,7 +734,7 @@ func TestDaemon_ExternalBackend(t *testing.T) {
 // after the backend def — so a profile whose backend_ref name is in the
 // catalog must pass readiness even when the def's alias is absent from it.
 func TestDaemon_ExternalBackend_MatchesBackendRefName(t *testing.T) {
-	_, _, _ = setupXDG(t)
+	_, stateHome, _ := setupXDG(t)
 	stub := stubModel(t)
 
 	defPath := filepath.Join(paths.BackendsDir(), "ref-ext.yaml")
@@ -768,6 +772,62 @@ frontend:
 	if res.Status == nil || !res.Status.Ready {
 		t.Fatalf("status = %+v; want ready", res.Status)
 	}
+
+	// ${MODEL_ALIAS} expands to the backend_ref name — the canonical id the
+	// rendered router config serves — not the def's llama_server alias.
+	data, err := os.ReadFile(filepath.Join(stateHome, "vibe", "frontend", "extref", "sidecar.json"))
+	if err != nil {
+		t.Fatalf("read sidecar: %v", err)
+	}
+	var sidecar map[string]any
+	if err := json.Unmarshal(skipGeneratedComment(data), &sidecar); err != nil {
+		t.Fatalf("unmarshal sidecar: %v\nbody: %s", err, string(data))
+	}
+	if sidecar["alias"] != "ref-ext" {
+		t.Errorf("sidecar alias = %v, want ref-ext (the backend def name)", sidecar["alias"])
+	}
+}
+
+// cloud_peer readiness = every peer model id present in the router catalog;
+// any missing id means the rendered peer stanza is stale.
+func TestDaemon_ExternalBackend_CloudPeer(t *testing.T) {
+	setupXDG(t)
+	writeProfile(t, "claude", `name: claude
+backend:
+  cloud_peer:
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+    models: [claude-opus-4-8, claude-sonnet-5]
+`)
+
+	t.Run("all models advertised", func(t *testing.T) {
+		routerPort := fakeRouter(t, "qwen3.6-27b", "claude-opus-4-8", "claude-sonnet-5")
+		client, _ := startDaemon(t, externalDaemon(t, routerPort))
+		startCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		res, err := client.Start(startCtx, "claude")
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		t.Cleanup(func() { _, _ = client.Stop(context.Background()) })
+		if res.Status == nil || !res.Status.Ready || res.Status.Pid != 0 {
+			t.Fatalf("status = %+v; want ready external with no pid", res.Status)
+		}
+	})
+
+	t.Run("missing model fails with the gap named", func(t *testing.T) {
+		routerPort := fakeRouter(t, "claude-opus-4-8")
+		client, _ := startDaemon(t, externalDaemon(t, routerPort))
+		startCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, err := client.Start(startCtx, "claude")
+		if err == nil {
+			t.Fatal("Start succeeded with a peer model missing from the catalog")
+		}
+		if !strings.Contains(err.Error(), "claude-sonnet-5") {
+			t.Errorf("error %q must name the missing model", err.Error())
+		}
+	})
 }
 
 // A router that isn't listening must fail the start with a clear pointer at

@@ -28,6 +28,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"gopkg.in/yaml.v3"
 
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
 	"github.com/gallowaysoftware/vibe/internal/vibe/frontend"
 	"github.com/gallowaysoftware/vibe/internal/vibe/hfdownload"
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
@@ -238,6 +239,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 	mountPath, connectHandler := vibev1connect.NewControlServiceHandler(d)
 	mux.Handle(mountPath, connectHandler)
 
+	// Fleet observability surface (docs/design/router-lifecycle.md §11).
+	// Shares the Connect mux, so the TCP listener's bearer middleware covers
+	// it and the unix socket serves it unauthenticated — same boundary as
+	// the RPCs. The front cell is whatever serves the proxy port (llama-swap
+	// under disable_proxy, else vibe's own proxy); an absent router degrades
+	// to reachable:false + fleet.cellDown, never an error.
+	fleet := fleetapi.New(
+		[]fleetapi.Cell{{Name: "front", URL: fmt.Sprintf("http://127.0.0.1:%d", d.cfg.ProxyPort)}},
+		paths.StartHistoryFile(),
+		d.fleetDaemonInfo,
+	)
+	fleet.Register(mux)
+	fleet.Start()
+	defer fleet.Close()
+
 	unixSrv := &http.Server{Handler: mux}
 	// The TCP server gets a bearer-auth wrapper around the same mux. Two
 	// separate http.Server instances (one per listener) is the cleanest
@@ -326,6 +342,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	wg.Wait()
 
+	// Close the fleet hub before Shutdown: open /api/fleet/events responses
+	// only return once the hub's done channel closes, and Shutdown waits for
+	// active requests.
+	fleet.Close()
 	_ = unixSrv.Shutdown(shCtx)
 	_ = httpSrv.Shutdown(shCtx)
 	return nil
@@ -558,6 +578,17 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 				// back to its paid default model.
 				alias = t.Alias
 				ctxLen = t.Context
+			}
+			if external {
+				// The rendered router config keys models by BACKEND DEF
+				// NAME — the canonical model id (router-lifecycle.md §4) —
+				// because a llama_server alias can be shared across def
+				// variants (base + -tools) and the router can attach it to
+				// only one of them. Expanding ${MODEL_ALIAS} to the def name
+				// guarantees a freshly-rendered frontend config routes to
+				// exactly this definition; the old aliases stay in the
+				// router config purely for stale client state.
+				alias = canonicalRouterModelID(p)
 			}
 			ectx := profile.ExpandContext{
 				VibeAPI:      vibeAPI,
@@ -1167,6 +1198,33 @@ func (d *Daemon) servicesStatus() []*vibev1.Status {
 	return out
 }
 
+// fleetDaemonInfo snapshots the daemon half of /api/fleet/state: the active
+// profile plus every running service. Same data protoStatus/servicesStatus
+// expose over Connect, reshaped for the JSON surface.
+func (d *Daemon) fleetDaemonInfo() fleetapi.DaemonInfo {
+	info := fleetapi.DaemonInfo{Services: []fleetapi.ServiceInfo{}}
+	d.mu.Lock()
+	if d.active != nil {
+		info.ActiveProfile = d.active.Name
+	}
+	svcs := make([]*serviceInstance, 0, len(d.services))
+	for _, svc := range d.services {
+		svcs = append(svcs, svc)
+	}
+	d.mu.Unlock()
+	for _, svc := range svcs {
+		st := svc.sup.Status()
+		info.Services = append(info.Services, fleetapi.ServiceInfo{
+			Name:  svc.profile.Name,
+			Ready: st.State == supervisor.StateReady,
+			Addr:  st.Addr,
+			Pid:   st.PID,
+		})
+	}
+	sort.Slice(info.Services, func(i, j int) bool { return info.Services[i].Name < info.Services[j].Name })
+	return info
+}
+
 // firstNonEmpty returns the first non-"" string from its arguments.
 // Used by the http_server start logging path so the same slog field can
 // surface either the docker image or the bare-binary path without two
@@ -1216,7 +1274,8 @@ const externalBackendAddr = "external (router)"
 
 // externalBackendAlias returns the OpenAI model id an external backend is
 // expected to advertise. Only the LLM-serving kinds can be external
-// (enforced by profile validation), so one of the two is always set.
+// (enforced by profile validation); cloud_peer has no single alias — its
+// model list is checked wholesale by checkExternalBackendReady.
 func externalBackendAlias(p *profile.Profile) string {
 	switch {
 	case p.Backend.LlamaServer != nil:
@@ -1225,6 +1284,17 @@ func externalBackendAlias(p *profile.Profile) string {
 		return p.Backend.TabbyAPI.Alias
 	}
 	return ""
+}
+
+// canonicalRouterModelID is the model id the rendered llama-swap config
+// serves an external backend under: the backend def's name. Falls back to
+// the profile name for inline external backends and backend-synthesized
+// profiles, whose Name IS the def name.
+func canonicalRouterModelID(p *profile.Profile) string {
+	if p.BackendRef != "" {
+		return p.BackendRef
+	}
+	return p.Name
 }
 
 // rollbackBackendStart undoes the backend half of a Start whose frontend
@@ -1275,24 +1345,42 @@ func (d *Daemon) checkExternalBackendReady(ctx context.Context, p *profile.Profi
 	if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
 		return fmt.Errorf("external backend %q: parse %s/v1/models: %w", p.Name, base, err)
 	}
+	ids := make([]string, 0, len(catalog.Data))
+	have := make(map[string]bool, len(catalog.Data))
+	for _, m := range catalog.Data {
+		ids = append(ids, m.ID)
+		have[m.ID] = true
+	}
+	serving := strings.Join(ids, ", ")
+	if serving == "" {
+		serving = "none"
+	}
+	// cloud_peer readiness is the whole model list: the router advertises a
+	// peer's models in the merged catalog, so any missing id means the peer
+	// stanza is absent or stale.
+	if cp := p.Backend.CloudPeer; cp != nil {
+		var missing []string
+		for _, m := range cp.Models {
+			if !have[m] {
+				missing = append(missing, m)
+			}
+		}
+		if len(missing) == 0 {
+			return nil
+		}
+		return fmt.Errorf("external backend %q: peer model(s) %s missing from the router catalog at %s/v1/models (serving: %s) — re-render the llama-swap config (vibe router render)",
+			p.Name, strings.Join(missing, ", "), base, serving)
+	}
 	// The router's catalog lists model IDS; aliases appear only with
 	// llama-swap's includeAliasesInList. A profile reaches its backend via
 	// backend_ref, and the A1 convention names the llama-swap model after
 	// the backend def — so the ref name is the id most likely to match.
 	// Try all three: alias, backend_ref, profile name (inline backends).
 	wanted := []string{alias, p.BackendRef, p.Name}
-	ids := make([]string, 0, len(catalog.Data))
-	for _, m := range catalog.Data {
-		for _, w := range wanted {
-			if w != "" && m.ID == w {
-				return nil
-			}
+	for _, w := range wanted {
+		if w != "" && have[w] {
+			return nil
 		}
-		ids = append(ids, m.ID)
-	}
-	serving := strings.Join(ids, ", ")
-	if serving == "" {
-		serving = "none"
 	}
 	return fmt.Errorf("external backend %q: none of %q are in the router catalog at %s/v1/models (serving: %s) — add the model to the llama-swap config",
 		p.Name, wanted, base, serving)
