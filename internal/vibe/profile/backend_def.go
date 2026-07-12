@@ -26,9 +26,12 @@ type BackendDef struct {
 	Mode string `yaml:"mode,omitempty"`
 }
 
-// isEmpty reports whether no backend sub-block is set (the zero union).
+// isEmpty reports whether the backend block is the zero union. External is
+// included so `backend: {external: true}` next to a backend_ref trips the
+// mutual-exclusion error instead of being silently discarded when the ref
+// resolves over it.
 func (b Backend) isEmpty() bool {
-	return b.LlamaServer == nil && b.ComfyUI == nil && b.HTTPServer == nil && b.TabbyAPI == nil
+	return !b.External && b.LlamaServer == nil && b.ComfyUI == nil && b.HTTPServer == nil && b.TabbyAPI == nil
 }
 
 // normalize applies in-place defaults (llama_server.parallel) and tilde-expands
@@ -80,6 +83,15 @@ func (b Backend) validate() error {
 		return errors.New("backend is required: set exactly one of backend.llama_server, backend.comfyui, backend.http_server, or backend.tabby_api")
 	case set > 1:
 		return errors.New("backend: only one of backend.llama_server, backend.comfyui, backend.http_server, or backend.tabby_api may be set")
+	}
+	// external only makes sense where the router serves the backend's OpenAI
+	// surface: comfyui speaks its own workflow API and http_server wraps
+	// arbitrary HTTP services — neither is something llama-swap advertises on
+	// /v1/models, so an external flag there could only be a mistake.
+	if b.External && b.LlamaServer == nil && b.TabbyAPI == nil {
+		return errors.New("backend.external is only valid for LLM-serving backends (llama_server, tabby_api); comfyui and http_server stay vibe-supervised")
+	}
+	switch {
 	case b.LlamaServer != nil:
 		return validateLlamaServer(b.LlamaServer)
 	case b.ComfyUI != nil:
@@ -130,6 +142,12 @@ func LoadBackend(name string) (*BackendDef, error) {
 	def.Backend.normalize()
 	if err := def.Backend.validate(); err != nil {
 		return nil, fmt.Errorf("backend %s: %w", name, err)
+	}
+	// Mirrors Profile.validateMode: backend defs are also activated directly
+	// (StartRequest.backend synthesizes a profile without running Validate),
+	// so the service/external contradiction must be caught here too.
+	if def.Mode == ModeService && def.Backend.External {
+		return nil, fmt.Errorf("backend %s: mode: service cannot be combined with backend.external (the router owns external lifecycles; services are vibe-supervised sidecars)", name)
 	}
 	return &def, nil
 }

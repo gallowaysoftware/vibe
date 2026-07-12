@@ -107,6 +107,18 @@ func (p *Profile) ResolvedMode() string {
 // Backend is a discriminated union of supported local-AI backends. Exactly
 // one sub-block must be non-nil; loaders reject zero-or-both.
 type Backend struct {
+	// External marks a backend whose process lifecycle is owned by an
+	// external router (llama-swap) listening on the vibe proxy port — see
+	// docs/design/router-lifecycle.md. vibe never launches, supervises, or
+	// VRAM-preflights an external backend; at start it only verifies the
+	// router's /v1/models catalog advertises the backend's model id, and
+	// stop leaves the model alone (the router's TTL owns unload). The
+	// definition stays the source of truth for client-facing config:
+	// ${MODEL_ALIAS} / ${MODEL_CONTEXT} still expand from the sub-block.
+	// Only valid for the LLM-serving kinds (llama_server, tabby_api) —
+	// the router speaks their OpenAI surface; comfyui and http_server
+	// stay vibe-supervised.
+	External    bool                `yaml:"external,omitempty"`
 	LlamaServer *LlamaServerBackend `yaml:"llama_server,omitempty"`
 	ComfyUI     *ComfyUIBackend     `yaml:"comfyui,omitempty"`
 	HTTPServer  *HTTPServerBackend  `yaml:"http_server,omitempty"`
@@ -629,6 +641,12 @@ func (p *Profile) validateMode() error {
 	}
 	if p.ResolvedMode() == ModeService && !p.Frontend.IsZero() {
 		return fmt.Errorf("mode: service profiles cannot declare a frontend block (services are sidecars; the frontend path is for active-mode profiles only)%s", p.modeInheritedHint())
+	}
+	// A service is by definition a vibe-supervised sidecar process; an
+	// external backend has no process for vibe to supervise, so the combo
+	// can only mean a misconfiguration.
+	if p.ResolvedMode() == ModeService && p.Backend.External {
+		return fmt.Errorf("mode: service profiles cannot use an external backend (the router owns external lifecycles; services are vibe-supervised sidecars)%s", p.modeInheritedHint())
 	}
 	return nil
 }

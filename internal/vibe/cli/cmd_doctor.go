@@ -22,6 +22,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/gallowaysoftware/vibe/internal/vibe/daemon"
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 	"github.com/gallowaysoftware/vibe/internal/vibeclient"
@@ -273,7 +274,7 @@ func runChecks(ctx context.Context, env *doctorEnv) []checkResult {
 	results = append(results, cp)
 
 	// Then the proxy port 9000 (also probed against the daemon).
-	results = append(results, checkProxyPort(ctx, env, st.daemonOnControl))
+	results = append(results, checkProxyPort(st.daemonOnControl, proxyDisabledInConfig()))
 
 	results = append(results, checkProfiles())
 	if r, ok := checkBackends(paths.ProfilesDir()); ok {
@@ -487,14 +488,45 @@ func checkControlPlanePort(ctx context.Context, env *doctorEnv, daemonOnControl 
 	}
 }
 
-func checkProxyPort(ctx context.Context, env *doctorEnv, daemonOnControl bool) checkResult {
-	const name = "proxy port :9000"
-	free, err := tryBind("127.0.0.1:9000")
+// proxyDisabledInConfig reports whether the daemon config opts out of the
+// reverse proxy (disable_proxy: an external router owns :9000). A config
+// read error degrades to false so the enabled-path messaging — the safe
+// default — applies.
+func proxyDisabledInConfig() bool {
+	cfg, err := daemon.LoadConfig()
+	return err == nil && cfg.DisableProxy
+}
+
+func checkProxyPort(daemonOnControl, proxyDisabled bool) checkResult {
+	return checkProxyPortAt("127.0.0.1:9000", daemonOnControl, proxyDisabled)
+}
+
+func checkProxyPortAt(addr string, daemonOnControl, proxyDisabled bool) checkResult {
+	name := "proxy port " + strings.TrimPrefix(addr, "127.0.0.1")
+	free, err := tryBind(addr)
+	if !free && !isAddrInUse(err) {
+		// Some other listen failure (permissions, bad iface). Report it.
+		return checkResult{Name: name, Status: statusFail, Message: err.Error()}
+	}
+	if proxyDisabled {
+		// disable_proxy hands the proxy port to an external router
+		// (llama-swap), so the port being held is the healthy state here,
+		// not a conflict.
+		if free {
+			return checkResult{
+				Name:    name,
+				Status:  statusWarn,
+				Message: "free, but disable_proxy is set — external router not listening yet",
+			}
+		}
+		return checkResult{
+			Name:    name,
+			Status:  statusOK,
+			Message: "in use (disable_proxy set; external router expected here)",
+		}
+	}
 	if free {
 		return checkResult{Name: name, Status: statusOK, Message: "free"}
-	}
-	if !isAddrInUse(err) {
-		return checkResult{Name: name, Status: statusFail, Message: err.Error()}
 	}
 	if daemonOnControl {
 		return checkResult{

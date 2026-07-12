@@ -34,7 +34,9 @@ type EnsureOptions struct {
 	ProxyURL string
 	// Timeout bounds the wait for the model to become ready (load weights +
 	// answer a probe). Default 6 minutes. Ignored if the context already has a
-	// shorter deadline.
+	// shorter deadline. When an external router (llama-swap) owns :9000 the
+	// probe is what JIT-loads the model, so size this to the model's cold
+	// start — raise it for models that take longer than the default to load.
 	Timeout time.Duration
 	// Probe, when true (the default), confirms readiness with a 1-token chat
 	// completion rather than trusting /v1/models — a backend can register its
@@ -247,9 +249,14 @@ func probeGeneration(ctx context.Context, base, model string) error {
 		"stream":     false,
 	}
 	b, _ := json.Marshal(payload)
-	// Per-attempt budget: model load can make the first request block for a
-	// while; cap it so a wedged backend doesn't hold the whole attempt.
-	attemptCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	// Per-attempt budget: behind an external router (llama-swap on :9000)
+	// this probe is what triggers the JIT load, and a big model can take
+	// minutes to come up — so a single attempt gets room to ride the load
+	// out instead of cancelling and re-queueing every 60s. The overall
+	// EnsureOptions.Timeout (or the caller's ctx deadline) stays the hang
+	// guard; this cap only bounds a wedged backend that accepted the
+	// connection and went silent.
+	attemptCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(attemptCtx, http.MethodPost, base+"/v1/chat/completions", bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")

@@ -66,22 +66,28 @@ func renderBackendList(out io.Writer) error {
 		return nil
 	}
 	usedBy := backendRefsIn(paths.ProfilesDir())
-	fmt.Fprintf(out, "%-22s  %-10s  %-12s  %s\n", "NAME", "MODE", "BACKEND", "USED BY")
+	fmt.Fprintf(out, "%-22s  %-10s  %-24s  %s\n", "NAME", "MODE", "BACKEND", "USED BY")
 	for _, n := range names {
 		def, err := profile.LoadBackend(n)
 		if err != nil {
-			fmt.Fprintf(out, "%-22s  %-10s  %-12s  (invalid: %v)\n", n, "?", "?", err)
+			fmt.Fprintf(out, "%-22s  %-10s  %-24s  (invalid: %v)\n", n, "?", "?", err)
 			continue
 		}
 		mode := def.Mode
 		if mode == "" {
 			mode = profile.ModeActive
 		}
+		kind := backendKind(def.Backend)
+		if def.Backend.External {
+			// The single most useful fact about an external backend at a
+			// glance: `vibe start` won't launch this — the router serves it.
+			kind += " (external)"
+		}
 		refs := "-"
 		if len(usedBy[n]) > 0 {
 			refs = strings.Join(usedBy[n], ", ")
 		}
-		fmt.Fprintf(out, "%-22s  %-10s  %-12s  %s\n", n, mode, backendKind(def.Backend), refs)
+		fmt.Fprintf(out, "%-22s  %-10s  %-24s  %s\n", n, mode, kind, refs)
 	}
 	return nil
 }

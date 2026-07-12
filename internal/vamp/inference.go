@@ -325,10 +325,17 @@ func parseSSEStream(ctx context.Context, r io.Reader, onToken StreamFunc, start 
 	return acc.String(), nil
 }
 
-// ResolveModelID queries baseURL/v1/models and returns the first model id, or
-// "vibe" if the server returned no models. baseURL is the inference root
+// ResolveModelID queries baseURL/v1/models and returns the id equal to
+// prefer when the catalog contains it, otherwise the first id, or "vibe" if
+// the server returned no models. baseURL is the inference root
 // (e.g. http://127.0.0.1:9000); /v1/models is appended.
-func ResolveModelID(ctx context.Context, hc *http.Client, baseURL string) (string, error) {
+//
+// prefer matters when an external router (llama-swap) owns the proxy port:
+// its catalog lists every configured model, so "first id" would name an
+// arbitrary one — and a completion sent with the wrong id JIT-loads a model
+// nobody asked for. Empty prefer (or no match) keeps the historical
+// first-id behavior, which is exact for vibe's own single-model proxy.
+func ResolveModelID(ctx context.Context, hc *http.Client, baseURL, prefer string) (string, error) {
 	if hc == nil {
 		// Same bounded client as the chat path: a dead backend that accepts
 		// the connection but never replies must not hang model resolution.
@@ -356,6 +363,13 @@ func ResolveModelID(ctx context.Context, hc *http.Client, baseURL string) (strin
 	}
 	if len(r.Data) == 0 {
 		return "vibe", nil
+	}
+	if prefer != "" {
+		for _, m := range r.Data {
+			if m.ID == prefer {
+				return m.ID, nil
+			}
+		}
 	}
 	return r.Data[0].ID, nil
 }

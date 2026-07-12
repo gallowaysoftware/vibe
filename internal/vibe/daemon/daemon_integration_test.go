@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
+
 	"github.com/gallowaysoftware/vibe/internal/vibe/daemon"
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"github.com/gallowaysoftware/vibe/internal/vibeclient"
@@ -327,6 +329,75 @@ func TestDaemon_StartActivatesFrontend(t *testing.T) {
 	}
 }
 
+// TestDaemon_DisableProxy pins the external-router mode (disable_proxy:
+// llama-swap owns :9000): the daemon must not bind the proxy port, while
+// the whole profile lifecycle — start, proxy-wiring no-ops, frontend
+// activation, stop — keeps working. ${VIBE_API} must still expand to the
+// proxy port because the external router serves the same OpenAI contract
+// there.
+func TestDaemon_DisableProxy(t *testing.T) {
+	_, stateHome, _ := setupXDG(t)
+	stub := stubModel(t)
+	writeProfile(t, "code", externalProfile("code", stub))
+
+	proxyPort := pickFreePort(t)
+	d := daemon.New(daemon.Config{
+		ProxyPort:    proxyPort,
+		DisableProxy: true,
+		HTTPAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreePort(t)),
+		LlamaBinary:  fakeBinary,
+	})
+	client, _ := startDaemon(t, d)
+
+	// The daemon is up (control plane answered) — the proxy port must
+	// still be free for the external router to claim.
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort))
+	if err != nil {
+		t.Fatalf("proxy port %d is bound despite disable_proxy: %v", proxyPort, err)
+	}
+	_ = ln.Close()
+
+	startCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	res, err := client.Start(startCtx, "code")
+	if err != nil {
+		t.Fatalf("Start with proxy disabled: %v", err)
+	}
+	t.Cleanup(func() { _, _ = client.Stop(context.Background()) })
+	if res.Status == nil || !res.Status.Running || !res.Status.Ready {
+		t.Fatalf("status after Start = %+v; want running+ready", res.Status)
+	}
+	wantProxy := fmt.Sprintf("http://127.0.0.1:%d", proxyPort)
+	if res.Status.ProxyAddr != wantProxy {
+		t.Errorf("ProxyAddr = %q, want %q (external router serves the contract there)", res.Status.ProxyAddr, wantProxy)
+	}
+
+	// ${VIBE_API} in the rendered frontend config must point at the proxy
+	// port even though vibe itself never bound it.
+	data, err := os.ReadFile(filepath.Join(stateHome, "vibe", "frontend", "code", "sidecar.json"))
+	if err != nil {
+		t.Fatalf("read sidecar: %v", err)
+	}
+	var sidecar map[string]any
+	if err := json.Unmarshal(skipGeneratedComment(data), &sidecar); err != nil {
+		t.Fatalf("unmarshal sidecar: %v\nbody: %s", err, string(data))
+	}
+	if got, want := sidecar["api"], fmt.Sprintf("http://127.0.0.1:%d/v1", proxyPort); got != want {
+		t.Errorf("sidecar api = %v, want %v", got, want)
+	}
+
+	if _, err := client.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop with proxy disabled: %v", err)
+	}
+	s, err := client.Status(context.Background())
+	if err != nil {
+		t.Fatalf("post-Stop Status: %v", err)
+	}
+	if s.Running {
+		t.Errorf("still running after Stop: %+v", s)
+	}
+}
+
 func TestDaemon_StartConflict(t *testing.T) {
 	setupXDG(t)
 	stub := stubModel(t)
@@ -519,5 +590,185 @@ func TestDaemon_PullForComfyUI(t *testing.T) {
 	}
 	if !strings.Contains(last.Message, "ComfyUI manages its own model assets") {
 		t.Errorf("message = %q, want ComfyUI-specific short-circuit", last.Message)
+	}
+}
+
+// externalRouterProfile returns YAML for a profile whose backend lifecycle
+// belongs to an external router (llama-swap) on the proxy port: vibe must
+// launch no process and only verify the router's catalog.
+func externalRouterProfile(name, modelPath, alias string) string {
+	return fmt.Sprintf(`name: %s
+backend:
+  external: true
+  llama_server:
+    path: %s
+    alias: %s
+    context: 1024
+frontend:
+  kind: external
+  write_file: ${VIBE_STATE_DIR}/frontend/%s/sidecar.json
+  template:
+    api: ${VIBE_API}
+    alias: ${MODEL_ALIAS}
+`, name, modelPath, alias, name)
+}
+
+// fakeRouter serves a llama-swap-shaped /v1/models catalog advertising the
+// given ids, on a random loopback port the caller wires in as the daemon's
+// ProxyPort. Any completion endpoint is deliberately absent: the daemon's
+// external readiness check must never send one (it would JIT-load the model).
+func fakeRouter(t *testing.T, ids ...string) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen fake router: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, _ *http.Request) {
+		type model struct {
+			ID string `json:"id"`
+		}
+		data := make([]model, 0, len(ids))
+		for _, id := range ids {
+			data = append(data, model{ID: id})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+	})
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// externalDaemon builds a daemon whose proxy port points at the given
+// (router-owned) port, with vibe's own proxy disabled — the deployment shape
+// external backends exist for.
+func externalDaemon(t *testing.T, routerPort int) *daemon.Daemon {
+	t.Helper()
+	return daemon.New(daemon.Config{
+		ProxyPort:    routerPort,
+		DisableProxy: true,
+		HTTPAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreePort(t)),
+		LlamaBinary:  fakeBinary,
+	})
+}
+
+// TestDaemon_ExternalBackend pins the external-backend start/stop contract:
+// no supervised process (Pid 0, BackendAddr = "external (router)"), readiness
+// from the router catalog, frontend rendered from the backend def as usual,
+// and stop succeeding without touching the router.
+func TestDaemon_ExternalBackend(t *testing.T) {
+	_, stateHome, _ := setupXDG(t)
+	stub := stubModel(t)
+	writeProfile(t, "ext", externalRouterProfile("ext", stub, "fake-ext"))
+
+	routerPort := fakeRouter(t, "other-model", "fake-ext")
+	client, _ := startDaemon(t, externalDaemon(t, routerPort))
+
+	startCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	res, err := client.Start(startCtx, "ext")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _, _ = client.Stop(context.Background()) })
+	if res.Status == nil || !res.Status.Running || !res.Status.Ready {
+		t.Fatalf("status after Start = %+v; want running+ready", res.Status)
+	}
+	if res.Status.BackendAddr != "external (router)" {
+		t.Errorf("BackendAddr = %q, want %q", res.Status.BackendAddr, "external (router)")
+	}
+	if res.Status.Pid != 0 {
+		t.Errorf("Pid = %d, want 0 (no vibe-supervised process for an external backend)", res.Status.Pid)
+	}
+	if res.Status.Parallel != 0 {
+		t.Errorf("Parallel = %d, want 0 (the router owns concurrency)", res.Status.Parallel)
+	}
+
+	// A fresh Status must agree with the StartResponse (protoStatus masks
+	// the never-started supervisor's state for external backends).
+	s, err := client.Status(context.Background())
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if !s.Running || !s.Ready || s.BackendAddr != "external (router)" || s.Pid != 0 {
+		t.Errorf("Status = %+v; want running+ready external (router) pid 0", s)
+	}
+
+	// ${MODEL_ALIAS} / ${VIBE_API} still expand from the backend def — the
+	// def stays the source of truth for client-facing config.
+	data, err := os.ReadFile(filepath.Join(stateHome, "vibe", "frontend", "ext", "sidecar.json"))
+	if err != nil {
+		t.Fatalf("read sidecar: %v", err)
+	}
+	var sidecar map[string]any
+	if err := json.Unmarshal(skipGeneratedComment(data), &sidecar); err != nil {
+		t.Fatalf("unmarshal sidecar: %v\nbody: %s", err, string(data))
+	}
+	if sidecar["alias"] != "fake-ext" {
+		t.Errorf("sidecar alias = %v, want fake-ext", sidecar["alias"])
+	}
+	if got, want := sidecar["api"], fmt.Sprintf("http://127.0.0.1:%d/v1", routerPort); got != want {
+		t.Errorf("sidecar api = %v, want %v (the router's port)", got, want)
+	}
+
+	if _, err := client.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	s, err = client.Status(context.Background())
+	if err != nil {
+		t.Fatalf("post-Stop Status: %v", err)
+	}
+	if s.Running {
+		t.Errorf("still running after Stop: %+v", s)
+	}
+}
+
+// A router that isn't listening must fail the start with a clear pointer at
+// llama-swap, not a generic dial error string buried in a supervisor log.
+func TestDaemon_ExternalBackend_RouterDown(t *testing.T) {
+	setupXDG(t)
+	stub := stubModel(t)
+	writeProfile(t, "ext", externalRouterProfile("ext", stub, "fake-ext"))
+
+	client, _ := startDaemon(t, externalDaemon(t, pickFreePort(t)))
+
+	startCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := client.Start(startCtx, "ext")
+	if err == nil {
+		t.Fatal("Start succeeded with no router listening")
+	}
+	if code := connect.CodeOf(err); code != connect.CodeFailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition (err: %v)", code, err)
+	}
+	if !strings.Contains(err.Error(), "llama-swap not listening") {
+		t.Errorf("error %q must point at the router being down", err.Error())
+	}
+}
+
+// A live router that doesn't advertise the model must also fail with a
+// catalog-shaped message (the likely cause: the llama-swap config is missing
+// the model the backend def promises).
+func TestDaemon_ExternalBackend_ModelNotInCatalog(t *testing.T) {
+	setupXDG(t)
+	stub := stubModel(t)
+	writeProfile(t, "ext", externalRouterProfile("ext", stub, "fake-ext"))
+
+	routerPort := fakeRouter(t, "some-other-model")
+	client, _ := startDaemon(t, externalDaemon(t, routerPort))
+
+	startCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := client.Start(startCtx, "ext")
+	if err == nil {
+		t.Fatal("Start succeeded for a model absent from the router catalog")
+	}
+	if !strings.Contains(err.Error(), "not in the router catalog") {
+		t.Errorf("error %q must mention the router catalog", err.Error())
+	}
+	if !strings.Contains(err.Error(), "some-other-model") {
+		t.Errorf("error %q should list what the router IS serving", err.Error())
 	}
 }

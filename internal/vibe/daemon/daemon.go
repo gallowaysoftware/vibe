@@ -6,6 +6,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -45,9 +46,18 @@ const (
 )
 
 type Config struct {
-	ProxyPort   int    `yaml:"proxy_port,omitempty"`
-	HTTPAddr    string `yaml:"http_addr,omitempty"`    // empty → "127.0.0.1:9001"
-	LlamaBinary string `yaml:"llama_binary,omitempty"` // empty → "llama-server" from $PATH
+	ProxyPort int `yaml:"proxy_port,omitempty"`
+	// DisableProxy skips binding the reverse proxy so an external router
+	// (llama-swap) can own the proxy port instead — see
+	// docs/design/router-lifecycle.md. Everything else keeps working: the
+	// Proxy object is still constructed (just never started), so
+	// SetBackend/AddRoute/RemoveRoute calls across the start/stop/respawn
+	// paths degrade to harmless in-memory updates, and ${VIBE_API} /
+	// Status.ProxyAddr keep pointing at ProxyPort because the external
+	// router serves the same OpenAI contract there.
+	DisableProxy bool   `yaml:"disable_proxy,omitempty"`
+	HTTPAddr     string `yaml:"http_addr,omitempty"`    // empty → "127.0.0.1:9001"
+	LlamaBinary  string `yaml:"llama_binary,omitempty"` // empty → "llama-server" from $PATH
 	// BindAll, when true, switches the TCP listener from 127.0.0.1 to
 	// 0.0.0.0 so a remote machine on the LAN can reach the control plane.
 	// Bearer-token auth is enforced on the TCP listener regardless. If the
@@ -204,9 +214,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer os.Remove(paths.PIDFile())
 
-	if err := d.prx.Start(); err != nil {
+	if d.cfg.DisableProxy {
+		slog.Info("reverse proxy disabled; leaving the proxy port unbound for an external router serving the same OpenAI contract",
+			"proxy_addr", fmt.Sprintf("127.0.0.1:%d", d.cfg.ProxyPort))
+	} else if err := d.prx.Start(); err != nil {
 		return fmt.Errorf("start proxy: %w", err)
 	}
+	// Safe when DisableProxy skipped Start: Stop on a never-started proxy
+	// is a no-op.
 	defer func() { _ = d.prx.Stop(context.Background()) }()
 
 	// Generate or load the bearer token before binding the TCP server.
@@ -410,8 +425,10 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 	// Pre-flight VRAM check. We only run this when the profile declares an
 	// estimate (otherwise the older zero-VRAM profiles would all skip
 	// silently). A missing nvidia-smi degrades to a warning so users on
-	// CPU/AMD/Apple-Silicon hosts aren't blocked.
-	if !req.Msg.NoVramCheck && p.EstimatedVRAMGB > 0 {
+	// CPU/AMD/Apple-Silicon hosts aren't blocked. External backends skip it
+	// outright: the router owns placement, and the model may not even load
+	// until its first request (JIT), so "free VRAM now" proves nothing.
+	if !req.Msg.NoVramCheck && p.EstimatedVRAMGB > 0 && !p.Backend.External {
 		res := vram.Check(startCtx, d.nvidiaSMI, p.EstimatedVRAMGB, d.vramSlopGiB)
 		switch {
 		case res.Skipped:
@@ -461,33 +478,56 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 		_ = runHooks(hookCtx, p.Name, "post_stop", p.Hooks.PostStop, false)
 	}()
 
-	// Dispatch by backend kind to build the launch spec + pick a port.
-	spec, port, err := d.buildLaunchSpec(p)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := d.sup.Start(startCtx, spec, port); err != nil {
-		slog.Error("supervisor start failed", "profile", p.Name, "err", err)
-		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("start backend: %w", err))
-	}
-
-	st := d.sup.Status()
-
-	// Wire the proxy for llama_server and http_server backends — both
-	// front a generic HTTP API that vamp / external tools reach through
-	// the proxy. ComfyUI is reached directly via Status.BackendAddr
-	// (workflow API is one big POST, no streaming, no profile-managed
-	// state worth proxying) and ships its own UI so there's no frontend.
-	var fr *frontend.Result
-	if p.Backend.LlamaServer != nil || p.Backend.HTTPServer != nil || p.Backend.TabbyAPI != nil {
-		backendURL, err := url.Parse(st.Addr)
-		if err != nil {
-			_ = d.sup.Stop(context.Background())
-			return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("parse backend url: %w", err))
+	// External backends have no process to launch: the router (llama-swap)
+	// on the proxy port owns lifecycle + placement and JIT-loads the model
+	// on first request. vibe's contribution shrinks to a cheap catalog
+	// check — is the router up, does it know this model — plus the frontend
+	// wiring below (which reads alias/context from the same backend def as
+	// always, so client-facing config is unchanged).
+	external := p.Backend.External
+	var (
+		spec        supervisor.LaunchSpec
+		port        int
+		backendAddr string
+	)
+	if external {
+		if err := d.checkExternalBackendReady(startCtx, p); err != nil {
+			slog.Warn("external backend readiness check failed", "profile", p.Name, "err", err)
+			return nil, connect.NewError(connect.CodeFailedPrecondition, err)
 		}
-		d.prx.SetBackend(backendURL)
+		backendAddr = externalBackendAddr
+		slog.Info("starting profile (external backend)",
+			"profile", p.Name, "mode", p.ResolvedMode(),
+			"alias", externalBackendAlias(p), "router_port", d.cfg.ProxyPort)
+	} else {
+		// Dispatch by backend kind to build the launch spec + pick a port.
+		var err error
+		spec, port, err = d.buildLaunchSpec(p)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := d.sup.Start(startCtx, spec, port); err != nil {
+			slog.Error("supervisor start failed", "profile", p.Name, "err", err)
+			return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("start backend: %w", err))
+		}
+		backendAddr = d.sup.Status().Addr
+
+		// Wire the proxy for llama_server and http_server backends — both
+		// front a generic HTTP API that vamp / external tools reach through
+		// the proxy. ComfyUI is reached directly via Status.BackendAddr
+		// (workflow API is one big POST, no streaming, no profile-managed
+		// state worth proxying) and ships its own UI so there's no frontend.
+		if p.Backend.LlamaServer != nil || p.Backend.HTTPServer != nil || p.Backend.TabbyAPI != nil {
+			backendURL, err := url.Parse(backendAddr)
+			if err != nil {
+				_ = d.sup.Stop(context.Background())
+				return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("parse backend url: %w", err))
+			}
+			d.prx.SetBackend(backendURL)
+		}
 	}
+	var fr *frontend.Result
 	// Frontend activation for llama_server and tabby_api — both may have
 	// a separate UI/client process to launch (e.g. Open WebUI via docker-compose).
 	if p.Backend.LlamaServer != nil || p.Backend.TabbyAPI != nil {
@@ -498,11 +538,13 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 			// profile activates. Cheap idempotent mkdir.
 			stateDir := paths.FrontendStateDir(p.Name)
 			if err := os.MkdirAll(stateDir, 0o755); err != nil {
-				_ = d.sup.Stop(context.Background())
-				d.prx.SetBackend(nil)
+				d.rollbackBackendStart(external)
 				return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("create frontend state dir %s: %w", stateDir, err))
 			}
 
+			// Still ProxyPort when DisableProxy is set: the external
+			// router owning that port serves the same OpenAI contract,
+			// so rendered frontend configs keep pointing at it.
 			vibeAPI := fmt.Sprintf("http://127.0.0.1:%d/v1", d.cfg.ProxyPort)
 			alias := ""
 			ctxLen := 0
@@ -523,14 +565,14 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 				ModelContext: ctxLen,
 				VibeStateDir: paths.StateHome(),
 			}
+			var err error
 			if req.Msg.Foreground {
 				fr, err = frontend.ActivateForeground(startCtx, p, ectx)
 			} else {
 				fr, err = frontend.ActivateWithContext(startCtx, p, ectx)
 			}
 			if err != nil {
-				_ = d.sup.Stop(context.Background())
-				d.prx.SetBackend(nil)
+				d.rollbackBackendStart(external)
 				return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("activate frontend: %w", err))
 			}
 		}
@@ -554,12 +596,15 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 	// "Running but !Ready" forever and every vamp retry returns 502.
 	// We try up to maxBackendRespawns within respawnWindow; on the last
 	// failed restart we clear d.active so the next vamp EnsureActive
-	// goes through a clean start path.
-	go d.watchBackendForRespawn(p.Name, spec, port)
+	// goes through a clean start path. External backends have nothing to
+	// watch — the router restarts (or JIT-reloads) its own children.
+	if !external {
+		go d.watchBackendForRespawn(p.Name, spec, port)
+	}
 
 	resp := &vibev1.StartResponse{Status: d.protoStatus()}
 	if fr != nil {
-		slog.Info("profile started", "profile", p.Name, "backend", st.Addr, "wrote", fr.WroteFile)
+		slog.Info("profile started", "profile", p.Name, "backend", backendAddr, "wrote", fr.WroteFile)
 		resp.Frontend = &vibev1.FrontendInfo{
 			WroteFile:       fr.WroteFile,
 			RestartRequired: fr.RestartRequired,
@@ -568,7 +613,7 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 			Url:             p.Frontend.BrowserURL(),
 		}
 	} else {
-		slog.Info("profile started", "profile", p.Name, "backend", st.Addr)
+		slog.Info("profile started", "profile", p.Name, "backend", backendAddr)
 	}
 	startOK = true
 	return connect.NewResponse(resp), nil
@@ -1003,10 +1048,17 @@ func (d *Daemon) stopActive(ctx context.Context) error {
 	if active == nil {
 		return nil
 	}
-	if err := d.sup.Stop(ctx); err != nil {
-		return err
+	if active.Backend.External {
+		// No backend process to stop: the router's TTL owns model unload,
+		// so a vibe stop only takes down the frontend (already done above)
+		// and the profile's sidecars/hooks.
+		slog.Info("external backend left to the router", "profile", active.Name)
+	} else {
+		if err := d.sup.Stop(ctx); err != nil {
+			return err
+		}
+		d.prx.SetBackend(nil)
 	}
-	d.prx.SetBackend(nil)
 	// Tear down the sidecars this profile co-started (best-effort).
 	d.stopCompanions(ctx, active)
 	// post_stop hooks run after the frontend and backend are down (best-effort).
@@ -1051,11 +1103,22 @@ func (d *Daemon) protoStatus() *vibev1.Status {
 	if d.active != nil {
 		s.Profile = d.active.Name
 		s.StartedAt = timestamppb.New(d.startTime)
-		// Surface the llama_server `parallel` value so clients (notably vamp)
-		// can cap their own foreach concurrency at the actual back-pressure
-		// point. ComfyUI-backed profiles leave Parallel at its zero value:
-		// the parallel concept is llama-server-specific.
-		if ls := d.active.Backend.LlamaServer; ls != nil {
+		if d.active.Backend.External {
+			// The supervisor never ran for this profile, so its state is
+			// stale (whatever the previous profile left behind) — mask it.
+			// Readiness was verified against the router catalog at start;
+			// after that, JIT load and TTL unload are the router's business,
+			// so "running" IS "ready". Parallel stays 0 too: the router (not
+			// this def) owns concurrency, and a leaked default of 1 would
+			// cap vamp's foreach fan-out at a single request.
+			s.Ready = true
+			s.BackendAddr = externalBackendAddr
+			s.Pid = 0
+		} else if ls := d.active.Backend.LlamaServer; ls != nil {
+			// Surface the llama_server `parallel` value so clients (notably
+			// vamp) can cap their own foreach concurrency at the actual
+			// back-pressure point. ComfyUI-backed profiles leave Parallel at
+			// its zero value: the parallel concept is llama-server-specific.
 			s.Parallel = int32(ls.Parallel)
 		}
 	}
@@ -1143,6 +1206,88 @@ func loadProfileByName(name string) (*profile.Profile, error) {
 
 func writePIDFile() error {
 	return os.WriteFile(paths.PIDFile(), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644)
+}
+
+// externalBackendAddr is surfaced as Status.BackendAddr for external
+// backends: there is no vibe-supervised process (and no pid), so `vibe ps`
+// and `vibe start` show where the model actually lives instead of a stale
+// supervisor address.
+const externalBackendAddr = "external (router)"
+
+// externalBackendAlias returns the OpenAI model id an external backend is
+// expected to advertise. Only the LLM-serving kinds can be external
+// (enforced by profile validation), so one of the two is always set.
+func externalBackendAlias(p *profile.Profile) string {
+	switch {
+	case p.Backend.LlamaServer != nil:
+		return p.Backend.LlamaServer.Alias
+	case p.Backend.TabbyAPI != nil:
+		return p.Backend.TabbyAPI.Alias
+	}
+	return ""
+}
+
+// rollbackBackendStart undoes the backend half of a Start whose frontend
+// half failed. For a vibe-supervised backend that means stopping the child
+// and unwiring the proxy; for an external backend there is nothing to undo
+// — the router was never touched (the readiness check is read-only).
+func (d *Daemon) rollbackBackendStart(external bool) {
+	if external {
+		return
+	}
+	_ = d.sup.Stop(context.Background())
+	d.prx.SetBackend(nil)
+}
+
+// checkExternalBackendReady is the external-backend replacement for the
+// supervisor's health wait: a GET on the router's /v1/models catalog,
+// verifying the backend's model id (alias, or the backend/profile name) is
+// served there. Deliberately NOT a completion request — the router (llama-swap)
+// JIT-loads a model on its first completion, which can take minutes and
+// would defeat lazy loading; the catalog read is cheap and load-free.
+func (d *Daemon) checkExternalBackendReady(ctx context.Context, p *profile.Profile) error {
+	alias := externalBackendAlias(p)
+	base := fmt.Sprintf("http://127.0.0.1:%d", d.cfg.ProxyPort)
+	// Short budget independent of the caller's 5-minute start window: a
+	// catalog read answers immediately when the router is up, so anything
+	// slower is "router not there" and should fail fast.
+	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, base+"/v1/models", nil)
+	if err != nil {
+		return fmt.Errorf("external backend %q: build catalog request: %w", p.Name, err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("external backend %q: router not reachable at %s (llama-swap not listening on :%d?): %w",
+			p.Name, base, d.cfg.ProxyPort, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("external backend %q: GET %s/v1/models returned %s (is llama-swap the process on :%d?)",
+			p.Name, base, resp.Status, d.cfg.ProxyPort)
+	}
+	var catalog struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
+		return fmt.Errorf("external backend %q: parse %s/v1/models: %w", p.Name, base, err)
+	}
+	ids := make([]string, 0, len(catalog.Data))
+	for _, m := range catalog.Data {
+		if m.ID == alias || m.ID == p.Name {
+			return nil
+		}
+		ids = append(ids, m.ID)
+	}
+	serving := strings.Join(ids, ", ")
+	if serving == "" {
+		serving = "none"
+	}
+	return fmt.Errorf("external backend %q: model %q is not in the router catalog at %s/v1/models (serving: %s) — add it to the llama-swap config",
+		p.Name, alias, base, serving)
 }
 
 // buildLaunchSpec dispatches a Profile to its backend-specific spec

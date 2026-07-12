@@ -105,6 +105,125 @@ frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 	}
 }
 
+// TestLoadBackend_External pins the external-backend flag: it must load from
+// a backend def and survive backend_ref resolution into the profile, because
+// the daemon decides launch-vs-router-check off the resolved p.Backend.
+func TestLoadBackend_External(t *testing.T) {
+	writeBackend(t, "qwen", `
+name: qwen
+backend:
+  external: true
+  llama_server: {path: ~/m.gguf, huggingface: {repo: a/b, file: m.gguf}, alias: q, context: 1024}
+`)
+	def, err := LoadBackend("qwen")
+	if err != nil {
+		t.Fatalf("LoadBackend: %v", err)
+	}
+	if !def.Backend.External {
+		t.Error("Backend.External = false, want true")
+	}
+
+	p, err := Load(writeProfile(t, `
+name: c
+backend_ref: qwen
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
+`))
+	if err != nil {
+		t.Fatalf("Load via backend_ref: %v", err)
+	}
+	if !p.Backend.External {
+		t.Error("profile did not inherit external: true from the referenced backend")
+	}
+}
+
+// mode: service means "vibe supervises this sidecar process"; external means
+// "vibe supervises nothing". The contradiction must be rejected at both load
+// surfaces (backend def and profile), since backend defs are also activated
+// directly without Profile.Validate.
+func TestLoadBackend_External_RejectsServiceMode(t *testing.T) {
+	writeBackend(t, "emb", `
+name: emb
+mode: service
+backend:
+  external: true
+  llama_server: {path: ~/m.gguf, huggingface: {repo: a/b, file: m.gguf}, alias: q, context: 1024}
+`)
+	if _, err := LoadBackend("emb"); err == nil || !strings.Contains(err.Error(), "service") {
+		t.Fatalf("service+external backend def: got %v, want service/external contradiction error", err)
+	}
+}
+
+func TestLoad_External_RejectsServiceModeProfile(t *testing.T) {
+	_, err := Load(writeProfile(t, `
+name: s
+mode: service
+backend:
+  external: true
+  llama_server: {path: ~/m.gguf, huggingface: {repo: a/b, file: m.gguf}, alias: q, context: 1024}
+`))
+	if err == nil || !strings.Contains(err.Error(), "external backend") {
+		t.Fatalf("service-mode profile with external backend: got %v, want rejection", err)
+	}
+}
+
+// external is only meaningful where the router serves the backend's OpenAI
+// surface; comfyui and http_server must reject it.
+func TestBackend_External_OnlyLLMServingKinds(t *testing.T) {
+	comfy := stubComfyDir(t)
+	cases := map[string]string{
+		"comfyui": `
+name: c
+backend:
+  external: true
+  comfyui: {dir: ` + comfy + `}
+`,
+		"http_server": `
+name: h
+backend:
+  external: true
+  http_server: {image: some/image, port: 8000}
+`,
+	}
+	for kind, yaml := range cases {
+		t.Run(kind, func(t *testing.T) {
+			_, err := Load(writeProfile(t, yaml))
+			if err == nil || !strings.Contains(err.Error(), "backend.external is only valid") {
+				t.Fatalf("external %s: got %v, want LLM-serving-kinds rejection", kind, err)
+			}
+		})
+	}
+
+	// tabby_api is LLM-serving and must accept the flag.
+	p, err := Load(writeProfile(t, `
+name: ok
+backend:
+  external: true
+  tabby_api: {model_dir: /models/q, alias: q, context: 1024, port: 5000, venv: /venv, repo: /repo}
+`))
+	if err != nil {
+		t.Fatalf("external tabby_api: %v", err)
+	}
+	if !p.Backend.External {
+		t.Error("tabby_api external flag not retained")
+	}
+}
+
+// backend: {external: true} next to backend_ref must trip the
+// mutual-exclusion error rather than being silently overwritten when the
+// ref resolves.
+func TestBackendRef_ExternalOnlyInlineBlockIsExclusive(t *testing.T) {
+	writeBackend(t, "qwen", "name: qwen\nbackend:\n  llama_server: {path: ~/m.gguf, huggingface: {repo: a/b, file: m.gguf}, alias: q, context: 1024}\n")
+	_, err := Load(writeProfile(t, `
+name: c
+backend_ref: qwen
+backend: {external: true}
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
+`))
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("backend_ref + inline external flag: got %v, want mutual-exclusion error", err)
+	}
+}
+
 func TestLoadBackend_NameValidation(t *testing.T) {
 	writeBackend(t, "qwen", "name: qwen\nbackend:\n  llama_server: {path: ~/m.gguf, alias: q, context: 1024}\n")
 

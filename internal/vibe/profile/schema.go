@@ -328,6 +328,10 @@ func Schema() *schemaProperty {
 		Description:          "Backend configuration. Exactly one of llama_server, comfyui, http_server, or tabby_api must be set (discriminated union).",
 		AdditionalProperties: false,
 		Properties: map[string]*schemaProperty{
+			"external": {
+				Type:        "boolean",
+				Description: "Marks a backend whose process lifecycle is owned by an external router (llama-swap) listening on the vibe proxy port. vibe skips launch/supervision/VRAM pre-flight and instead verifies at start that the backend's model id appears in the router's /v1/models catalog; stop leaves the model alone (the router's TTL owns unload). ${MODEL_ALIAS}/${MODEL_CONTEXT} still expand from this definition. Only valid for llama_server and tabby_api backends.",
+			},
 			"llama_server": llamaServer,
 			"comfyui":      comfyui,
 			"http_server":  httpServer,

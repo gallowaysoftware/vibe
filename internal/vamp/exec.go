@@ -4073,8 +4073,12 @@ func (e *Executor) modelIDForCurrent(ctx context.Context, status *vibev1.Status)
 	// nil → ResolveModelID uses defaultInferenceClient(), whose
 	// ResponseHeaderTimeout caps the wait so a backend that accepts the
 	// connection but never replies to /v1/models can't hang resolution until
-	// the long-lived group ctx breaks it.
-	id, err := ResolveModelID(ctx, nil, strings.TrimSuffix(status.ProxyAddr, "/v1"))
+	// the long-lived group ctx breaks it. Status.Profile (the backend name
+	// for a backend activation) is passed as the preferred id: behind an
+	// external router the catalog lists many models, and picking the wrong
+	// one would JIT-load it. Alias-keyed catalogs that don't match fall back
+	// to first-id, same as vibe's own single-model proxy always did.
+	id, err := ResolveModelID(ctx, nil, strings.TrimSuffix(status.ProxyAddr, "/v1"), status.GetProfile())
 	if err != nil {
 		return "", err
 	}

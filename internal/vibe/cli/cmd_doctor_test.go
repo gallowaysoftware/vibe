@@ -240,6 +240,59 @@ func TestCheckProxyPort_DaemonHoldsIt(t *testing.T) {
 	if !isAddrInUse(bindErr) {
 		t.Fatalf("expected address-in-use, got %v", bindErr)
 	}
+	r := checkProxyPortAt(ln.Addr().String(), true, false)
+	if r.Status != statusOK {
+		t.Errorf("status = %v, want OK; msg=%q", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "vibe daemon") {
+		t.Errorf("message = %q, want daemon attribution", r.Message)
+	}
+}
+
+func TestCheckProxyPortAt_InUseNoDaemon_Fails(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	r := checkProxyPortAt(ln.Addr().String(), false, false)
+	if r.Status != statusFail {
+		t.Errorf("status = %v, want FAIL; msg=%q", r.Status, r.Message)
+	}
+}
+
+// disable_proxy inverts the check: an external router holding the port is
+// the healthy state, not a conflict.
+func TestCheckProxyPortAt_DisabledExternalRouterHoldsIt(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	r := checkProxyPortAt(ln.Addr().String(), false, true)
+	if r.Status != statusOK {
+		t.Errorf("status = %v, want OK; msg=%q", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "external router") {
+		t.Errorf("message = %q, want external-router attribution", r.Message)
+	}
+}
+
+func TestCheckProxyPortAt_DisabledButFree_Warns(t *testing.T) {
+	// Grab a free port, then release it so the check sees it unbound.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	r := checkProxyPortAt(addr, false, true)
+	if r.Status != statusWarn {
+		t.Errorf("status = %v, want WARN (router expected but absent); msg=%q", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "disable_proxy") {
+		t.Errorf("message = %q, want disable_proxy mention", r.Message)
+	}
 }
 
 // setDoctorFixtureDirs points the XDG dirs at a fresh temp tree and

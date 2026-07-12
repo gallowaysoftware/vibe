@@ -117,6 +117,12 @@ func TestSchemaJSON_RoundTrip(t *testing.T) {
 	if _, ok := llamaProps["huggingface"]; !ok {
 		t.Errorf("llama_server.properties missing huggingface")
 	}
+
+	// external must surface on the backend union so editors autocomplete
+	// the router-owned-lifecycle flag next to the sub-blocks it modifies.
+	if _, ok := backendProps["external"]; !ok {
+		t.Errorf("backend.properties missing external")
+	}
 }
 
 // TestSchema_BundledTemplateRoundTrip loads the llama-server template,
