@@ -884,9 +884,9 @@ func TestDaemon_ExternalBackend_ModelNotInCatalog(t *testing.T) {
 func TestDaemon_ExternalBackend_ComfyUIUpstreamAddr(t *testing.T) {
 	setupXDG(t)
 	comfyDir := stubComfyDir(t)
-	writeProfile(t, "media", fmt.Sprintf(`name: media
+	writeProfile(t, "media", `name: media
 backend_ref: comfyui
-`))
+`)
 	defPath := filepath.Join(paths.BackendsDir(), "comfyui.yaml")
 	def := fmt.Sprintf(`name: comfyui
 backend:

@@ -128,7 +128,7 @@ func subscribeEvents(t *testing.T, ctx context.Context, ts *httptest.Server) <-c
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req) //nolint:bodyclose // closed by the reader goroutine below (bodyclose can't see across the goroutine)
 	if err != nil {
 		t.Fatalf("GET events: %v", err)
 	}
