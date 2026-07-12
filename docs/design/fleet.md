@@ -6,6 +6,18 @@ router landscape, SSH orchestration). The winning base was the ops-first
 design; grafts from the schema-minimalist and consumer-experience designs are
 folded in and marked where the decision was contested.
 
+> **PARTIALLY SUPERSEDED (2026-07-12, same day):** a follow-up
+> research + design pass on routing and on-demand model lifecycle
+> ([router-lifecycle.md](router-lifecycle.md)) adopts llama-swap as the
+> routing/lifecycle substrate. That replaces this document's §6 router v2
+> (routes.yaml chains, format-affinity walker, pre-first-byte fallback,
+> `max_concurrency`), the health engine, the per-host slot map,
+> `EnsureModelAvailable`, and the JSONL metrics plan — and overturns the
+> "no request-triggered autostart" rule (autostart is now the product).
+> The provisioning half (hosts.yaml, SSH+systemd converge, model
+> distribution, doctor, Spark commissioning, cloud-key resolution) stands
+> and is a dependency of the new design.
+
 ## 1. Why
 
 The fleet is growing from one box to four:

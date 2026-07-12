@@ -2,12 +2,21 @@
 
 ## Open
 
-- **Fleet extension (multi-host + router + cloud keys).** Design at
+- **Router + model lifecycle (adopt llama-swap).** Design at
+  `docs/design/router-lifecycle.md` (2026-07-12): llama-swap per cell
+  (anvil / spark-pair / loft) federated via peers, front instance takes
+  over :9000, per-model TTL idle-unload + JIT autostart with SSE
+  loading-state keepalives, matrix eviction, Anthropic as an apiKey
+  peer, vamp streaming warm + lease heartbeat. Supersedes fleet.md's
+  router/health/slot half; A0-A8 roadmap in the doc. Next = A1:
+  llama-swap on anvil at :9000 gated on the six-client smoke rig.
+
+- **Fleet provisioning (multi-host + cloud keys).** Design at
   `docs/design/fleet.md` (2026-07-12): agentless SSH provisioning of
-  2x DGX Spark + a 3080 Ti utility box, the :9000 proxy grown into the
-  fleet router (format-affinity, fallback chains, cloud_api backends,
-  per-route metrics), vamp capabilities resolving to router aliases.
-  Phased P0-P8 roadmap in the doc; P0 = commit the current working tree.
+  2x DGX Spark + a 3080 Ti utility box, hosts.yaml converge, model
+  distribution, doctor, Spark commissioning. The router half is
+  superseded by router-lifecycle.md; the provisioning half stands and
+  is a dependency of it (A2/A4 reuse fleet P2/P4 verbatim).
 
 - **Multi-GPU scheduling.** The current single-profile-at-a-time
   invariant assumes one GPU; supporting two or more cards needs (a) a
