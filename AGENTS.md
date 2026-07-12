@@ -371,6 +371,43 @@ them before pushing.
   report "not running" rather than `ensureDaemon`. Only `start` / `run`
   / `pull` / `stop` / `logs` may auto-spawn.
 
+## Router / model lifecycle (llama-swap era, 2026-07-12+)
+
+Read `docs/design/router-lifecycle.md` before touching anything in this
+area — §15/§16 record what is EXECUTED and hardware-validated vs still
+planned. The short version an agent needs:
+
+- **:9000 is llama-swap, not vibe.** A systemd user unit (`llama-swap.service`)
+  serves the OpenAI+Anthropic contract there and owns LLM model lifecycle
+  (JIT start on request, TTL idle-unload, swap/eviction, ComfyUI as a swap
+  tenant via `/upstream/comfyui`). The vibe daemon runs with
+  `disable_proxy: true` (`~/.config/vibe/config.yaml`) and keeps frontends,
+  services, converge, and the control plane (:9001/unix).
+- **`backend.external: true`** on a backend def means vibe launches nothing
+  for it: readiness is a GET on the router's `/v1/models` matching
+  alias|backend_ref|name — NEVER a completion (that JIT-loads the model and
+  defeats lazy loading). Stop leaves the model to the router's TTL.
+- **Canonical model id = backend def name** (e.g. `qwen3.6-27b`); llama-server
+  aliases exist for legacy client state. Alias collisions across defs are an
+  error resolved by explicit ownership, not magic.
+- **Config flow**: `~/.config/vibe/backends/*.yaml` is the source of truth;
+  the llama-swap config at `~/.config/llama-swap/config.yaml` is (post-A2)
+  RENDERED — regenerate via `vibe router render`, don't hand-edit. The
+  Anthropic key lives in `~/.config/llama-swap/env` (0600, systemd
+  EnvironmentFile).
+- **Gates**: any change to the router path re-runs
+  `scripts/smoke/llama-swap/run-smoke.sh` (six-client cold-start gate;
+  `DELAY_S=90` for iteration, `420` for the real thing) and
+  `kill-cancel-test.sh`. Client stall/timeout behavior is version-dependent —
+  re-gate after client upgrades, not just server changes.
+- **vamp** talks to models through :9000 (streaming warm requests tolerate
+  llama-swap's `reasoning_content` loading chunks) and to ComfyUI through
+  `/upstream/comfyui` — never :8188 directly, or the router can't see
+  in-flight work and may TTL-reap ComfyUI mid-pipeline.
+- Don't re-introduce model-serving/proxy logic into the vibe daemon; the
+  design's pre-agreed fallback for router gaps is a thin front shim, decided
+  deliberately — not ad-hoc daemon features.
+
 ## Things to never do
 
 - Don't add `--no-verify`, `--no-gpg-sign`, or any hook-bypass flag to

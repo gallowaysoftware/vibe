@@ -594,3 +594,29 @@ surfaces as a clean in-stream error — observed live when a game held 9GB);
 alias collisions resolved by convention (base model keeps the shared alias,
 variants addressed by backend name); `includeAliasesInList: true` is worth
 setting once the A2 renderer owns the config.
+
+## 16. Live hardware validation (2026-07-12, GPU freed)
+
+Every lifecycle mechanic verified against real models on the 5090; numbers
+here are the baseline for regressions:
+
+| mechanic | result |
+|---|---|
+| JIT autostart, 26GB qwen3.6-27b | ready in 3.9s page-cached (disk-cold will be slower); evicted resident ComfyUI automatically |
+| swap under request, qwen → 29GB gemma-4-31b-mm | 8.1s total incl. drain+stop+load; `/running` never showed two big tenants |
+| kill-cancel | mid-LOAD kill: queued request dropped, upstream never saw it; mid-STREAM kill: upstream stopped generating |
+| six-client 420s cold start | all five automated clients STREAMED (see §15) |
+| TTL reaper | ttl:30 model self-unloaded on schedule; ttl:0 (pinned) member survived |
+| group co-residency | `routing.router.settings.groups` (v239 exact path): persistent `{swap:false, exclusive:false}` group held embed-bge (preloaded via hooks.on_startup) + coder-7b + a fake model simultaneously; embeddings + chat served concurrently |
+| ComfyUI-as-swap-tenant (§3.5 experiment) | **PASS all abort criteria**: JIT via `/upstream/comfyui/system_stats` (4.3s), WebSocket proxies through `/upstream/comfyui/ws` (status frame received), internal/comfyui client builds its WS URL path-aware (ws.go: TrimRight(path)+"/ws") + has a polling fallback → base-URL change only |
+
+Consequences adopted into the plan: (1) ComfyUI is now a llama-swap model
+(unlisted, ttl 1800) — media and coding models displace each other
+automatically; (2) vamp MUST address ComfyUI via
+`:9000/upstream/comfyui`, never `:8188` directly — direct requests are
+invisible to llama-swap's in-flight tracking, so the TTL could reap
+ComfyUI mid-workflow; (3) the loft utility plane maps to a persistent
+non-exclusive group exactly as simulated; (4) a model's own
+`reasoning_content` chunks are indistinguishable in-band from llama-swap's
+loading states — clients that budget max_tokens tightly on reasoning models
+will see "empty" answers (generation semantics, not router misbehavior).
