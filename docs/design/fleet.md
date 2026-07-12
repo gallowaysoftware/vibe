@@ -47,6 +47,19 @@ Full sources and numbers live in the session research digest; the decisions:
   ConnectX-7 200GbE RoCE link.** llama.cpp RPC across nodes is NOT a
   substitute (memory leaks, unclean tensor split). NVFP4 only via
   vendor-prequantized checkpoints.
+- **Turnkey layers exist and we use them for what they're good at**
+  (follow-up research 2026-07-12): NVIDIA Sync's **Cluster Assistant**
+  (June 2026 OTA) automates the CX-7 fabric — topology detection, netplan,
+  RoCE devices, node-to-node SSH, bandwidth verification — and nothing else
+  (no docker/NCCL/models/vLLM). **sparkrun** (spark-arena, very active) is
+  the community daily driver: `sparkrun run <recipe> --tp 2` handles image +
+  model distribution, NCCL env, and multi-node launch from git recipe
+  registries wrapping eugr's CI-tested images. No true whole-OS cluster
+  image exists; NIM on Spark is single-node only; DeepSeek V4 Flash remains
+  patch-carried (vLLM PR #41834 unmerged) but packaged in the
+  sparkrun/eugr/tonyd2wild recipe ecosystem. Division of labor: Sync owns
+  the fabric, sparkrun owns commissioning experiments, **vibe owns day-2**
+  (frozen recipes as backend YAML, systemd units, health, routing).
 - **Models** (see appendix A for recipes): DeepSeek V4 Flash (284B/13B-active,
   1M ctx) is validated for dual-Spark agentic coding at ~35-44 tok/s
   thinking-on with MTP — the user's leaning survives scrutiny — but it is the
@@ -214,6 +227,18 @@ backend:
     startup_timeout: 12m             # container + 149GB weights + CUDA-graph capture
     parallel: 1                      # vamp foreach cap; V4 Flash is single-agent until proven otherwise
 ```
+
+**Recipe provenance and the experiment→freeze workflow.** The pinned
+image/flags in a `vllm` backend are not hand-assembled: they come from the
+sparkrun / eugr recipe registries (CI-tested images; immutable dated tags
+like `:2026-07-01`, never the `:latest` sentinel). Commissioning a new model
+is done *interactively* with sparkrun (`sparkrun search deepseek`,
+`sparkrun run <recipe> --tp 2`) until it works; the working recipe's image
+digest + flags are then **frozen** into `backends/<name>.yaml`, where vibe's
+systemd units give it what sparkrun doesn't: reboot survival, health-driven
+coordinated pair restarts, route registration, and drift detection. vibe does
+not shell out to sparkrun at runtime — the unit runs the same docker
+invocation the recipe resolved to.
 
 vibe **auto-injects** `NCCL_SOCKET_IFNAME`/`GLOO_SOCKET_IFNAME`/
 `TP_SOCKET_IFNAME` from `hosts.yaml cluster.iface`, the rendezvous address
@@ -471,8 +496,12 @@ per route TARGET(health)/FALLBACKS/req/tool%/leak/p95, and a 24h events tail
 (reboots via boot_id, degradations, fallbacks, NRestarts creep).
 
 Factory-fresh Spark to serving V4 Flash: console first-boot + ssh-copy-id →
+**NVIDIA Sync Cluster Assistant** for the CX-7 fabric (requires the April
+2026+ OTA; it does topology/netplan/RoCE/node-SSH/bandwidth-verify — vibe's
+converge then *asserts* the result rather than configuring it) →
 `vibe host add spark-1 --addr ... --user kyle` (probes arch/GPU/driver,
-writes hosts.yaml) → `vibe host bootstrap spark-1` (prints the sudo script;
+writes hosts.yaml) → `vibe host bootstrap spark-1` (prints the sudo script
+for what Sync doesn't cover: docker group, linger, sysctls, clock lock;
 user pastes once) → `vibe host converge spark-1` → **RMA-window stress test**
 (`vibe doctor --host spark-1 --stress`: hours of uncapped load; overcurrent
 hard-shutdowns are a per-unit hardware lottery and RMA is the only fix) →
@@ -519,7 +548,7 @@ fan-out caps on per-backend `parallel` instead of the singleton
 | P3 | Remote backends: `host:` on BackendDef, remoteUnit runtime, per-host slots + swap/--evict, fleet-token data plane, health engine + events. Deliver: loft utility plane (embed/rerank/classifier/kokoro/whisper) as converged units surviving anvil restarts | L |
 | P4 | Model library + distribution: `vibe model ls/ensure` (rsync --partial --inplace, peer/CX-7 selection, hf fallback, size+xxh64 manifest), fleet doctor | M |
 | P5 | Spark single-node: bootstrap/tuning encoding, arm64 llama-server units, qwen3-coder-next on spark-2 behind `coder`. The fleet becomes daily-driver useful here, before any dual-node fragility | M |
-| P6 | Dual-node vLLM: `vllm` kind, NCCL auto-injection, CX-7 preflight, coordinated start/stop + on_down budget, pinned Recipe A, `vibe route smoke` gate. Flip `coder` to v4-flash-first after a clean week | L |
+| P6 | Dual-node vLLM: `vllm` kind, NCCL auto-injection, CX-7 preflight, coordinated start/stop + on_down budget, `vibe route smoke` gate. Recipe pins come from commissioning with sparkrun/eugr (experiment→freeze, 4.3); flip `coder` to v4-flash-first after a clean week | L |
 | P7 | vamp integration: EnsureModelAvailable, typed errors, capabilities → aliases, --warm, per-backend parallel | M |
 | P8 | Hygiene: archive superseded profiles/composes, dedupe ports into the fleet block, template-expand frontend.args, `vibe owui sync`, AGENTS.md schema-rule updates | S |
 
@@ -566,6 +595,17 @@ Spark serving is boring and useful while the dual-node recipe is de-risked.
 | wildcard (re-test ~Sept) | Ornith-1.0-397B; MiniMax M2.7 (needs thinking round-trip) | dual Spark | vLLM | 33 / 42 tok/s |
 | fast dense + media | current Qwen3.6-27B / Gemma 4 31B + ComfyUI | anvil 5090 | unchanged | unchanged |
 | embed / rerank / classify / STT / TTS | Qwen3-Embedding-0.6B, Qwen3-Reranker-0.6B, Qwen3-0.6B, whisper large-v3-turbo, Kokoro (+Qwen3-TTS) | loft 3080 Ti | llama.cpp + faster-whisper | ~9-10GB resident total |
+
+Turnkey layer (July 2026): fabric via NVIDIA Sync Cluster Assistant;
+commissioning via sparkrun (`uvx sparkrun setup`, git recipe registries,
+spark-arena immutable dated image tags — never `:latest` sentinels) wrapping
+eugr/spark-vllm-docker's CI-tested images (which carry the V4 Flash SM12x
+patches via recipe; verified 44 tok/s TP=2+MTP practitioner run, hazyumps
+variant adds EP + NCCL 2.30.4 + 384K ctx at ~31 tok/s). V4 Flash stays
+patch-carried until vLLM PR #41834 or jasl's sm12x-stable lands upstream.
+Both nodes must match driver/kernel/firmware exactly (mismatch costs +140%
+prefill). `docker save | ssh docker load` beats registry copy for image
+distribution.
 
 Spark operational pins: DGX OS (not vanilla Ubuntu — Realtek NIC vanishing
 risk), known-good stack DGX OS 7.4.0 / driver 580.126.09 / CUDA 13.0.2, avoid
