@@ -2,6 +2,13 @@
 
 ## Open
 
+- **Fleet extension (multi-host + router + cloud keys).** Design at
+  `docs/design/fleet.md` (2026-07-12): agentless SSH provisioning of
+  2x DGX Spark + a 3080 Ti utility box, the :9000 proxy grown into the
+  fleet router (format-affinity, fallback chains, cloud_api backends,
+  per-route metrics), vamp capabilities resolving to router aliases.
+  Phased P0-P8 roadmap in the doc; P0 = commit the current working tree.
+
 - **Multi-GPU scheduling.** The current single-profile-at-a-time
   invariant assumes one GPU; supporting two or more cards needs (a) a
   GPU index in the profile schema, (b) per-GPU free-VRAM accounting in
@@ -9,6 +16,50 @@
   capabilities concurrently when they land on different cards.
 
 ## Recently shipped
+
+- **Proxy model-id routing + `services:` co-start** (2026-06-30, b688968).
+  The reverse proxy grew per-model routes (AddRoute/RemoveRoute): POSTs
+  get their JSON `model` field peeked and routed to a matching upstream,
+  falling through to the active profile otherwise, with `/v1/models`
+  aggregated across upstreams. An llama_server service auto-registers its
+  alias as a route on start and deregisters on stop / respawn-giveup. A
+  profile's new `services:` field co-starts (and stops) service-mode
+  sidecars best-effort — dormant plumbing until a profile declares one.
+
+- **vamp EnsureProfile / EnsureCapability Go API** (2026-06-09, 14a86b9).
+  Public primitive for "stand up the environment, then drive it from Go":
+  declare a vibe profile (or capability), call `vamp.EnsureProfile`, and
+  talk plain OpenAI HTTP to the returned Endpoint (BaseURL + Model). It
+  probes /v1/chat/completions until the model actually generates, so a
+  backend still loading weights fails with a clear timeout instead of
+  hanging the caller's first request. `StopProfile` releases the slot.
+
+- **Profile lifecycle hooks (`pre_start` / `post_stop`)** (2026-06-09,
+  b9634bf). A `hooks:` block runs shell commands around a profile's
+  lifecycle: `pre_start` after the VRAM pre-flight and before the
+  backend/frontend come up (non-zero exit aborts), `post_stop` after
+  teardown, best-effort. Lets a managed-frontend profile bring its own
+  sidecar services up and down with the session without a wrapper
+  launcher.
+
+- **Reusable backends; vamp capabilities target backends** (2026-06-07,
+  e90e795). A profile's model spec decomposes into a named backend under
+  `backends/<name>.yaml`, referenced via `backend_ref:` (resolved at
+  Load), so one model definition is shared across frontends.
+  `StartRequest.backend` activates a backend with no frontend — the
+  active identity is the backend name, so repeated activations are no-op
+  reuse. vamp capability candidates resolve to backend names via
+  `EnsureBackendActive`, falling back to profiles for pre-backend
+  capabilities.yaml files.
+
+- **Speculative draft models (Gemma 4 MTP)** (2026-06-07, 8d72ee1).
+  `backend.llama_server.draft_model` + `spec_type` + `spec_draft_n_max`
+  and `huggingface.draft_file`, mirroring the mmproj plumbing
+  (tilde-expansion, HF pull, validation, schema, launch flags). Gemma 4's
+  MTP head ships as a separate ~0.4B drafter, unlike Qwen's in-weights
+  MTP. A quantized `cache_type_k/v` with `spec_type: draft-mtp` draws a
+  warning (originally a rejection; softened in 344fac4) — quantized KV
+  gives ~0% draft acceptance, silently killing the speedup.
 
 - **Video content-mill primitives** (2026-05-30). Three vamp features +
   a cache fix to drive image-to-video pipelines:
