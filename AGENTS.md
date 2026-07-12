@@ -43,10 +43,13 @@ go vet ./...
 go test -race ./...
 gofmt -l .          # CI fails if this prints anything
 go mod tidy         # CI fails if this dirties go.mod/go.sum
+golangci-lint run   # CI runs this too (bodyclose, staticcheck, …) — vet alone is NOT enough
 ```
 
 The CI workflow (`.github/workflows/ci.yml`) gates exactly these. Run
-them before pushing.
+them before pushing. (2026-07-12: a push failed CI on golangci-lint
+findings that vet+gofmt missed — the linter is part of the gate, not
+optional.)
 
 ## Conventions agents tend to violate
 
