@@ -8,8 +8,11 @@
   over :9000, per-model TTL idle-unload + JIT autostart with SSE
   loading-state keepalives, matrix eviction, Anthropic as an apiKey
   peer, vamp streaming warm + lease heartbeat. Supersedes fleet.md's
-  router/health/slot half; A0-A8 roadmap in the doc. Next = A1:
-  llama-swap on anvil at :9000 gated on the six-client smoke rig.
+  router/health/slot half; A0-A8 roadmap in the doc. **A1 DONE
+  2026-07-12** (llama-swap v239 on :9000, `disable_proxy`,
+  `backend.external`, six-client gate passed at 420s — results in the
+  doc §15). Next = A2: vibe renderer for llama-swap configs + canonical
+  model-id rename pass.
 
 - **Fleet provisioning (multi-host + cloud keys).** Design at
   `docs/design/fleet.md` (2026-07-12): agentless SSH provisioning of

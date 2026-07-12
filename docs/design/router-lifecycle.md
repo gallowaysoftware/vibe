@@ -564,3 +564,33 @@ parser and stall detector for 8+ minutes, (c) fails cleanly after
 commit-to-200. All asserted by verified research, never proven end-to-end
 with these clients. A1 tests it with a fake slow start before any Spark
 exists; the bail-out is pre-agreed (§12) and is a shim, not a fork.
+
+## 15. A1 executed (2026-07-12) — gate results
+
+llama-swap v239 owns anvil:9000 (systemd unit, Restart=always); daemon runs
+`disable_proxy: true`; the four LLM backends are `external: true`; profiles
+activate against the router catalog (`vibe start long_form` verified live).
+
+Six-client gate at 420s synthetic cold start, cold per client: **curl-sse,
+openai-python, anthropic-python, claude-code, qwen-code all STREAMED** (OWUI
+and pi manual, procedures in scripts/smoke/llama-swap/README.md). Two
+findings that amend this doc's research-derived assumptions:
+
+1. **v239's loading state covers ONLY `/v1/chat/completions`**
+   (`internal/router/loading.go` whitelists that path; payload is
+   `reasoning_content` deltas, not SSE comments). The Anthropic
+   `/v1/messages` path is a silent hold. No upstream issue exists —
+   candidate small PR (Anthropic streams have a spec-legal `ping` event).
+2. **The Claude Code ~5-min byte-silence stall timer did NOT reproduce**:
+   both Anthropic-path clients survived 420s of first-byte silence
+   (anthropic SDK first byte at 420.7s; claude-code answered at 434.8s with
+   `API_TIMEOUT_MS` raised). So the silent `/v1/messages` hold is currently
+   tolerable even at Spark-scale starts — treat as version-dependent client
+   behavior, re-run the rig (`DELAY_S=420 ./scripts/smoke/llama-swap/run-smoke.sh`)
+   after client upgrades and before relying on it in A5/A6.
+
+Known residuals: llama-swap has no VRAM preflight (a too-big JIT load
+surfaces as a clean in-stream error — observed live when a game held 9GB);
+alias collisions resolved by convention (base model keeps the shared alias,
+variants addressed by backend name); `includeAliasesInList: true` is worth
+setting once the A2 renderer owns the config.
