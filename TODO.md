@@ -28,11 +28,16 @@
     generated (`HUM_URL`, `RIFF_IPV4=172.16.3.212`, `WEBUI_SECRET_KEY`).
     Both compose stacks are UP on unraid (macvlan: hum-front `.211`,
     riff-webui `.212`; fixed a missing top-level `networks:` block in
-    riff's compose, b2a4256). Model library seed: `~/models` (251GB)
-    rsyncing to the new unraid `models` share in the background
-    (`--partial --inplace`, survives interruption; re-run the same
-    rsync command to resume/verify — do not assume it finished without
-    checking).
+    riff's compose, b2a4256). Model library seed DONE: `~/models`
+    rsynced to the unraid `models` share, verified byte-identical
+    (268,875,026,353 bytes, 295 files both sides). `rsync exit: 23`
+    ("partial transfer due to error") is misleading here — it was 295
+    `chgrp` failures ("Operation not permitted"), one per file, because
+    the NFS export doesn't let a non-root client change group
+    ownership; no data was lost. Future syncs to this share: expect the
+    same chgrp noise and verify with `du -sb`/file-count comparison
+    rather than trusting rsync's exit code alone, or drop `-g`
+    (`--no-g`) from the rsync flags to suppress the attempt entirely.
   - RESOLVED 2026-07-13: real completions through hum were failing with
     `peer proxy error: dial tcp 192.168.13.117:9000: i/o timeout` even
     after adding a UDM Pro inter-VLAN allow rule (172.16.3.211 →
