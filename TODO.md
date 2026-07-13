@@ -33,17 +33,21 @@
     (`--partial --inplace`, survives interruption; re-run the same
     rsync command to resume/verify — do not assume it finished without
     checking).
-  - BLOCKED on a UDM Pro firewall rule: hum-front (`172.16.3.211`,
-    services VLAN) times out dialing localmodel (`192.168.13.117:9000`,
-    main LAN) — `peer proxy error: dial tcp ...: i/o timeout` on any
-    real completion through hum, even though catalog listing and the
-    reverse direction (localmodel curling hum) both work. Needs an
-    Allow rule, LAN-to-LAN/inter-VLAN, source `172.16.3.211` → dest
-    `192.168.13.117:9000` tcp, placed above any existing block-inter-VLAN
-    rule. Once added: re-verify with a real chat completion through
-    `http://172.16.3.211:9000/v1/chat/completions` (model
-    `qwen2.5-coder-7b` is the cheap JIT-load test) — the earlier attempt
-    hung and 502'd, this is the exact repro.
+  - RESOLVED 2026-07-13: real completions through hum were failing with
+    `peer proxy error: dial tcp 192.168.13.117:9000: i/o timeout` even
+    after adding a UDM Pro inter-VLAN allow rule (172.16.3.211 →
+    192.168.13.117:9000 tcp). TWO firewalls were in the path, not one:
+    the UDM Pro rule was necessary but not sufficient — localmodel
+    itself runs `ufw` (default deny incoming, only port 22 was open;
+    9000 was never opened for LAN because the llama-swap unit only
+    switched from `127.0.0.1` to `0.0.0.0` listen this same session).
+    Same-subnet curl from localmodel's own shell had been masking this
+    the whole time (loopback bypasses the INPUT chain). Fix:
+    `sudo ufw allow from 172.16.3.0/24 to any port 9000 proto tcp &&
+    sudo ufw reload`. Verified end to end: hum → localmodel completion
+    returned 200 in 286ms. **Any future cell (llamaloft, spark) needs
+    BOTH the UDM Pro rule AND a host-firewall check — don't assume the
+    router rule alone is sufficient.**
   - NOT YET DONE: NPM proxy host `chat.<domain>` → `172.16.3.212:8080`
     with Authelia forward-auth + header-strip (block in
     `deploy/riff/README.md`); PWA install on phone; repointing coding
