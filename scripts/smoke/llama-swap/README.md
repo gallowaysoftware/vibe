@@ -151,3 +151,43 @@ cell that owns slowmodel (or the real spark model with its real ~3-min cold
 start — then set `DELAY_S` accordingly and skip the slowmodel stanza). The
 keepalive must arrive through the hop unbuffered: the curl-sse first-byte
 check is the detector for a buffering peer proxy.
+
+No real cell yet? Recreate the scratch sim cell that ran the recorded
+2026-07-12 gate: a second llama-swap instance on :9101 with its own config —
+
+```yaml
+# sim-cell.yaml — scratch cell for the peer-hop gate
+healthCheckTimeout: 600
+sendLoadingState: true
+models:
+  peerslow:                      # the cold-start subject (90s "load")
+    cmd: sh -c "exec /ABS/PATH/TO/vibe/scripts/smoke/llama-swap/slowmodel/slowmodel --port 18095 --delay 90s 2>>/tmp/peerslow.log"
+    proxy: http://127.0.0.1:18095
+    checkEndpoint: /health
+    ttl: 300
+  fastfake:                      # a fast control (2s)
+    cmd: sh -c "exec /ABS/PATH/TO/vibe/scripts/smoke/llama-swap/slowmodel/slowmodel --port 18094 --delay 2s 2>>/tmp/fastfake.log"
+    proxy: http://127.0.0.1:18094
+    checkEndpoint: /health
+    ttl: 300
+```
+
+```
+llama-swap -config sim-cell.yaml -listen 127.0.0.1:9101
+```
+
+then peer it from the front via `~/.config/vibe/router-extras.yaml`:
+
+```yaml
+peers:
+  sim-cell:
+    proxy: http://127.0.0.1:9101
+    models: [fastfake, peerslow]
+```
+
+re-render (`vibe router render`), restart the front, and run the rig with
+`MODEL=peerslow DELAY_S=90`. Known rig limitation: `COLD_EACH` unloads via
+the front's unload API, which does NOT reach peer models — only the first
+client of a run experiences a true peer cold start; unload on the cell
+(`curl -X POST http://127.0.0.1:9101/api/models/unload/peerslow`) between
+clients for a full cold-each pass.
