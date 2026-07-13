@@ -1,5 +1,6 @@
-# llama-swap FRONT config (peers only — the front owns no models and no GPU).
-# Lives at /mnt/user/appdata/llama-swap-front/config.yaml on unraid.
+# hum front config: llama-swap, peers only — the front owns no models and
+# no GPU. Lives at <appdata>/hum/front/config.yaml on the hum host (the
+# docker-compose.yaml bind mount).
 #
 # HAND-MAINTAINED FOR NOW. Note the per-peer `models:` lists are explicit,
 # so adding a backend def on a cell means adding its id here too — that

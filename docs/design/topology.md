@@ -10,20 +10,20 @@ the four use cases.
 
 | box | hardware | availability | role |
 |---|---|---|---|
-| **unraid** | no GPU, 128GB DDR4, iGPU, big storage | always-on | **The front.** llama-swap front cell (CPU image, peers only — zero local models), persistent OWUI, NPM + Authelia, SearXNG, toqui, fleet dashboard. The one URL everything talks to. |
+| **hum** (role name; the unraid server today) | no GPU, 128GB DDR4, iGPU, big storage | always-on | **The front + persistent apps** (`deploy/hum`): llama-swap front cell (CPU image, peers only — zero local models), persistent OWUI, NPM + Authelia, SearXNG, toqui, fleet dashboard. The one URL everything talks to. Also the **model library**: the `models` share is the source-of-truth weights store (download once); cells rsync local NVMe copies for JIT-speed loads (`vibe model ensure`, fleet.md P4 — share-as-library replaces localmodel as the preferred source). |
 | **localmodel** (this box) | 5090 32GB | opportunistic (dev + games) | GPU cell: 27B/31B-class JIT models + ComfyUI. Explicitly allowed to be off or full of game. |
 | **llamaloft** | 3080Ti 12GB, R5 2600, 32GB | always-on (once built) | Utility-plane cell: embed/rerank/classifier/STT/TTS pinned (`ttl: 0` + preload, ~9-10GB), small swap pool in the remainder. |
 | **spark pair** | 2× DGX Spark, 125GB unified, QSFP400 | always-on (once built) | Heavy cell on spark-1 (owns both nodes): dsv4flash via dual-node vLLM; single-node models (e.g. qwen3-coder-next) on spark-2. |
 | **cloud** | — | always | `cloud_peer` defs on the front (anthropic today; others are one def away). Never a silent fallback — always an explicit model id. |
 
-The key move vs today: **the front relocates from localmodel to unraid.** The
+The key move vs today: **the front relocates from localmodel to hum.** The
 front is a pure proxy (the official `ghcr.io/mostlygeek/llama-swap:cpu`
 image runs it; peers-only config, no GPU, no model binaries), and it must
 live on the box that is never off, because it is the stable address every
 client — phone, coding harness, toqui, vamp — is configured with, forever:
 
 ```
-http://unraid:9000/v1          (LAN / VPN, OpenAI + Anthropic formats)
+http://hum-host:9000/v1          (LAN / VPN, OpenAI + Anthropic formats)
 https://llm.<domain>           (via NPM, if/when an HTTPS name is wanted)
 ```
 
@@ -32,7 +32,7 @@ gaming) changes the *catalog*, never the *address*. When localmodel relocates
 its front role it keeps a cell llama-swap on localmodel:9000 — but with its
 `anthropic` peer removed (the front owns cloud peers; otherwise the front
 importing localmodel's catalog would double-list claude). localmodel-local clients
-also repoint to the unraid front for a uniform catalog; the peer-hop relay
+also repoint to the hum front for a uniform catalog; the peer-hop relay
 is proven unbuffered (0.7ms first byte, router-lifecycle §17), so the extra
 LAN hop costs nothing perceptible.
 
@@ -54,8 +54,8 @@ LAN hop costs nothing perceptible.
 
 ### UC1 — persistent chat/research/websearch (the Claude-app replacement)
 
-**Stack (all on unraid, all off-the-shelf):** OWUI as a normal unraid
-docker app behind NPM + Authelia — same pattern as every other app —
+**Stack (all on hum, all off-the-shelf — `deploy/hum`):** OWUI as a
+normal docker app behind NPM + Authelia — same pattern as every other app —
 plus a SearXNG container for web search. OWUI is a PWA: "install" it from
 the phone browser and it lives on the home screen like the Claude app did.
 
@@ -64,7 +64,7 @@ the phone browser and it lives on the home screen like the Claude app did.
   not Authelia-then-OWUI. NPM must strip inbound `Remote-*` headers
   (standard trusted-header caveat — a client that can send the header IS
   that user).
-- Models: OWUI points at `http://<unraid>:9000/v1` (localhost once the
+- Models: OWUI points at `http://<hum-host>:9000/v1` (localhost once the
   front is there). The dropdown is the live fleet catalog: spark models,
   localmodel models when awake, llamaloft utilities, claude. Picking a cold model
   just works — JIT + loading-state hold is the core router feature.
@@ -75,10 +75,10 @@ the phone browser and it lives on the home screen like the Claude app did.
 - Interim (today, before llamaloft/sparks): stand this up pointed at
   localmodel:9000. Claude peer models work even mid-game (cloud needs no VRAM);
   local models work when localmodel is awake. Migrating later = repointing one
-  URL (or zero, if the front moves to unraid first).
+  URL (or zero, if the front moves to hum first).
 - NOT reused: the distillery OWUI stacks. Those are episodic, tool-loop
   tuned, vibe-profile-launched appliances on localmodel; this is a persistent
-  general instance with its own webui.db on unraid's SSD cache.
+  general instance with its own webui.db on fast storage.
 
 ### UC2 — multi-model agentic coding with cloud offload
 
@@ -97,7 +97,7 @@ this unchanged — both sides are just model ids on :9000.
 Pattern for any app: `OPENAI_BASE_URL=http://<front>:9000/v1`, a model id
 from the catalog, and design for lazy loading (first request after idle
 takes seconds-to-minutes; stream it or show a warming state). Apps on
-unraid reach the front over localhost; nothing exposes :9000 past the
+hum reach the front over localhost; nothing exposes :9000 past the
 LAN/VPN. Utility calls (embeddings, rerank, classification) go to llamaloft's
 pinned models — instant, never cold. Big-model calls share whatever the
 fleet already has warm.
@@ -144,9 +144,9 @@ the same front — fleet.md §8's per-group BaseURL/ModelID carries it.
 ## 3. Gaps: build vs buy
 
 Off the shelf (no code):
-- Front on unraid: official llama-swap CPU docker image + a peers-only
-  config file on a share. unraid-native.
-- OWUI + SearXNG + NPM + Authelia on unraid: existing app patterns;
+- The hum stack (`deploy/hum`): official llama-swap CPU docker image + a
+  peers-only config file on a share — plain compose, nothing built.
+- OWUI + SearXNG + NPM + Authelia on the hum host: existing app patterns;
   trusted-header SSO is config, not code.
 - Phone app: OWUI PWA.
 
@@ -157,11 +157,11 @@ Build (all small, and all already-roadmapped except the first):
    local defs. Extends the A2 renderer; the alias/owner rules already
    exist. This is the one new piece this doc adds to the roadmap.
 2. **Config distribution** — fleet.md P2 converge (render → hash → scp →
-   restart unit), with an unraid variant (docker restart over SSH instead
+   restart unit), with a docker-host variant (docker restart over SSH instead
    of systemd user unit).
 3. **Model distribution** — fleet.md P4 `vibe model ensure` unchanged.
 4. **Fleet dashboard** — the A8a substrate (/api/fleet/state + /events)
-   needs its web UI; host it on unraid behind Authelia like everything
+   needs its web UI; host it on hum behind Authelia like everything
    else.
 5. **Warm schedules (optional)** — a cron hitting the front with a 1-token
    request warms dsv4flash before waking hours; llama-swap `hooks` only
@@ -170,12 +170,12 @@ Build (all small, and all already-roadmapped except the first):
 
 ## 4. Sequencing (interleaves with router-lifecycle §17 remainder)
 
-1. **Now (no new hardware):** persistent OWUI + SearXNG on unraid behind
+1. **Now (no new hardware):** persistent OWUI + SearXNG (deploy/hum) behind
    Authelia, pointed at localmodel:9000 — UC1 in interim form, and it shakes
    out the NPM/Authelia/PWA UX while the fleet is still one box.
-2. **Front relocation:** llama-swap:cpu on unraid + `--cell` rendering;
+2. **Front relocation:** llama-swap:cpu on the hum host + `--cell` rendering;
    localmodel demotes to a cell (drops its anthropic peer); every client
-   repoints to unraid:9000 once, forever. Do this before the new boxes so
+   repoints to hum:9000 once, forever. Do this before the new boxes so
    they join as peers with zero client churn.
 3. **llamaloft arrives:** provision (fleet P2/P3), utility plane pinned, front
    peers it. UC3's embeddings/classify path goes always-on.
