@@ -1,0 +1,79 @@
+# unraid LLM stack: the persistent half of the fleet (topology.md §1).
+# Run via unraid's "Docker Compose Manager" plugin (or split into CA
+# templates if you prefer per-app tiles — the env blocks transfer 1:1).
+#
+# Three services on one user-defined network:
+#   llama-swap-front — THE stable :9000. Peers-only config, no GPU, no
+#                      local models; federates the GPU cells + Anthropic.
+#   open-webui       — persistent chat/research (UC1), PWA on the phone.
+#   searxng          — web search for OWUI.
+#
+# NPM + Authelia are assumed to already exist on this box; see README.md
+# for the proxy-host + forward-auth wiring (and the header-strip caveat).
+#
+# Paths use /mnt/user/appdata/... — adjust to taste. Put webui data on the
+# SSD cache share.
+
+networks:
+  llm:
+    driver: bridge
+
+services:
+  llama-swap-front:
+    image: ghcr.io/mostlygeek/llama-swap:cpu
+    container_name: llama-swap-front
+    restart: unless-stopped
+    networks: [llm]
+    ports:
+      - "9000:8080"            # LAN-facing stable address; container listens on 8080
+    volumes:
+      - /mnt/user/appdata/llama-swap-front/config.yaml:/app/config.yaml:ro
+    environment:
+      # Consumed by ${env.ANTHROPIC_API_KEY} in config.yaml (peers.anthropic).
+      # Set the real key in the compose-manager env / an .env file, not here.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?set in .env}
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    networks: [llm]
+    ports:
+      - "8091:8080"            # NPM proxies chat.<domain> -> unraid:8091
+    volumes:
+      - /mnt/user/appdata/open-webui:/app/backend/data
+    environment:
+      # Model access: everything through the front, service-name DNS.
+      - OPENAI_API_BASE_URL=http://llama-swap-front:8080/v1
+      - OPENAI_API_KEY=vibe-local
+      # SSO: Authelia forward-auth injects Remote-Email; OWUI trusts it.
+      # NPM MUST strip inbound Remote-* headers or anyone can forge a login
+      # (README.md has the exact NPM advanced-config block).
+      - WEBUI_AUTH_TRUSTED_EMAIL_HEADER=Remote-Email
+      - WEBUI_AUTH_TRUSTED_NAME_HEADER=Remote-Name
+      - WEBUI_URL=https://chat.example.com          # set to the real NPM name
+      # Pin the session secret so logins survive container recreation
+      # (owui-chat-profile gotcha). Generate once: openssl rand -hex 32
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:?set in .env}
+      # Env is the source of truth, not the DB (PersistentConfig masks
+      # compose env otherwise — the classic OWUI gotcha).
+      - ENABLE_PERSISTENT_CONFIG=False
+      # Web search via searxng; bypass the web-loader (playwright loader
+      # yields "no sources" — known bug, same fix as the chat profile).
+      - ENABLE_WEB_SEARCH=True
+      - WEB_SEARCH_ENGINE=searxng
+      - SEARXNG_QUERY_URL=http://searxng:8080/search?q=<query>
+      - BYPASS_WEB_SEARCH_WEB_LOADER=True
+      - WEB_SEARCH_RESULT_COUNT=5
+    depends_on: [llama-swap-front, searxng]
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    networks: [llm]
+    # No published port — only OWUI talks to it, on the llm network.
+    volumes:
+      - /mnt/user/appdata/searxng:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080/
