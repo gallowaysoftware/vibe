@@ -48,10 +48,22 @@
     returned 200 in 286ms. **Any future cell (llamaloft, spark) needs
     BOTH the UDM Pro rule AND a host-firewall check — don't assume the
     router rule alone is sufficient.**
+  - DONE: added `client_api_url` to vibe's daemon config (d068c47) — the
+    one gap topology.md's sequencing step 2 needed: `${VIBE_API}` in
+    rendered frontend configs (omp, qwen-code, pi, ...) was always
+    hardcoded to the local cell's own `127.0.0.1:<proxy_port>`; now an
+    optional override points it at hum instead, so local coding
+    harnesses see the whole fleet catalog. Set on localmodel
+    (`~/.config/vibe/config.yaml: client_api_url:
+    http://172.16.3.211:9000`), verified live: omp's rendered
+    `models.yml` now has `baseUrl: http://172.16.3.211:9000/v1`.
+    Internal bookkeeping (readiness checks, ComfyUI `/upstream/`,
+    fleet API's own "front" cell) deliberately still dials
+    `127.0.0.1:ProxyPort` — that describes this box's own cell, not
+    the fleet front.
   - NOT YET DONE: NPM proxy host `chat.<domain>` → `172.16.3.212:8080`
     with Authelia forward-auth + header-strip (block in
-    `deploy/riff/README.md`); PWA install on phone; repointing coding
-    harnesses at hum's address once it's confirmed end-to-end.
+    `deploy/riff/README.md`); PWA install on phone.
 
 - **Fleet provisioning (multi-host + cloud keys).** Design at
   `docs/design/fleet.md` (2026-07-12): agentless SSH provisioning of
