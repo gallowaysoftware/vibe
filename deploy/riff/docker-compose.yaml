@@ -68,3 +68,11 @@ services:
       - /mnt/user/appdata/riff/searxng:/etc/searxng
     environment:
       SEARXNG_BASE_URL: http://riff-search:8080/
+
+networks:
+  riff:
+    driver: bridge
+    name: riff
+  macvlan:
+    external: true
+    name: br0
