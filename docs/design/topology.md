@@ -174,7 +174,7 @@ Build (all small, and all already-roadmapped except the first):
 
 ## 4. Sequencing (interleaves with router-lifecycle §17 remainder)
 
-1. **Now (no new hardware):** persistent OWUI + SearXNG (deploy/hum) behind
+1. **Now (no new hardware):** riff (deploy/riff) behind
    Authelia, pointed at localmodel:9000 — UC1 in interim form, and it shakes
    out the NPM/Authelia/PWA UX while the fleet is still one box.
 2. **Front relocation:** llama-swap:cpu on the hum host + `--cell` rendering;
