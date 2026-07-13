@@ -8,14 +8,18 @@ warm models with other clients all come from hum; riff just points at it.
 
 ## Files
 
-- `docker-compose.yaml` — OWUI + SearXNG. Needs an `.env` with `HUM_URL`
-  (the front's address, e.g. `http://192.168.1.10:9000`) and
-  `WEBUI_SECRET_KEY` (`openssl rand -hex 32`).
+- `docker-compose.yaml` — OWUI + SearXNG. House networking pattern: the
+  webui sits on the `br0` macvlan with its own static LAN IP (`RIFF_IPV4`,
+  default 172.16.3.212) for NPM to proxy to; SearXNG stays on an internal
+  bridge with no LAN exposure. Needs an `.env` with `HUM_URL` (the front's
+  macvlan address, e.g. `http://172.16.3.211:9000` — NOT the unraid host
+  IP, which macvlan containers cannot reach), `WEBUI_SECRET_KEY`
+  (`openssl rand -hex 32`), and optionally `RIFF_IPV4`/`RIFF_PUBLIC_URL`.
 
 ## Bring-up
 
 1. Create the `.env`; `compose up`.
-2. Reverse-proxy host: `chat.<domain>` → `http://<host>:8091`, with the
+2. NPM proxy host: `chat.<domain>` → `http://<RIFF_IPV4>:8080`, with the
    Authelia forward-auth snippet **plus header stripping** (below).
 3. Open `chat.<domain>` on the phone, log in via Authelia, browser menu →
    "Add to Home Screen" — OWUI is a PWA; that tile is the Claude-app

@@ -3,21 +3,40 @@
 # forever. Applications that consume it (e.g. deploy/riff) are separate
 # stacks with their own lifecycles; nothing else belongs in this one.
 #
-# Plain docker compose — runs anywhere; on unraid use the Docker Compose
-# Manager plugin. Needs an .env with ANTHROPIC_API_KEY.
+# Networking (house pattern, same as the stillhouse stack):
+#   - `macvlan` (br0 external): the front gets its own LAN IP (default
+#     172.16.3.211) so it appears as a real host — THE fleet address.
+#     GPU cells, riff, toqui, coding harnesses, phones all dial
+#     http://<HUM_IPV4>:9000. No port mapping — macvlan has no NAT; the
+#     container's listen port is directly reachable on its IP.
+#   - macvlan/host isolation caveat: the unraid host itself cannot reach
+#     this IP (and vice versa) without a macvlan shim. Sanity-check from
+#     another LAN box, not the unraid shell.
 #
-# Volume path is an example (unraid appdata style) — adjust to the host.
+# Prereqs: br0 is an existing macvlan network on unraid (Settings → Docker).
+# .env (sibling of this file): ANTHROPIC_API_KEY, optionally HUM_IPV4.
 
 services:
+
   hum-front:
     image: ghcr.io/mostlygeek/llama-swap:cpu
     container_name: hum-front
     restart: unless-stopped
-    ports:
-      - "9000:8080"            # LAN-facing stable address; container listens on 8080
+    # The image defaults to listening on 8080; pin the canonical fleet port.
+    command: ["-config", "/app/config.yaml", "-listen", ":9000"]
     volumes:
       - /mnt/user/appdata/hum/front/config.yaml:/app/config.yaml:ro
     environment:
       # Consumed by ${env.ANTHROPIC_API_KEY} in config.yaml (peers.anthropic).
-      # Set the real key in the compose-manager env / an .env file, not here.
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?set in .env}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY must be set in .env}
+    networks:
+      macvlan:
+        ipv4_address: ${HUM_IPV4:-172.16.3.211}
+    labels:
+      net.unraid.docker.webui: "http://${HUM_IPV4:-172.16.3.211}:9000/ui"
+      net.unraid.docker.shell: "sh"
+
+networks:
+  macvlan:
+    external: true
+    name: br0
