@@ -1,30 +1,18 @@
-# hum: the always-on half of the fleet (docs/design/topology.md §1).
+# hum: the fleet's always-on front router (docs/design/topology.md §1).
+# INFRA — this is the stable :9000 every client in the fleet points at,
+# forever. Applications that consume it (e.g. deploy/riff) are separate
+# stacks with their own lifecycles; nothing else belongs in this one.
+#
 # Plain docker compose — runs anywhere; on unraid use the Docker Compose
-# Manager plugin (or split into CA templates; the env blocks transfer 1:1).
+# Manager plugin. Needs an .env with ANTHROPIC_API_KEY.
 #
-# Three services on one user-defined network:
-#   hum-front  — THE stable :9000. Peers-only llama-swap config, no GPU,
-#                no local models; federates the GPU cells + Anthropic.
-#   hum-webui  — persistent chat/research (UC1), PWA on the phone.
-#   hum-search — SearXNG web search for OWUI.
-#
-# A reverse proxy + SSO (NPM + Authelia in the reference deployment) is
-# assumed to already exist on the host; see README.md for the proxy-host +
-# forward-auth wiring (and the header-strip caveat).
-#
-# Volume paths are examples (unraid appdata style) — adjust to the host.
-# Put the webui data dir on fast storage.
-
-networks:
-  llm:
-    driver: bridge
+# Volume path is an example (unraid appdata style) — adjust to the host.
 
 services:
   hum-front:
     image: ghcr.io/mostlygeek/llama-swap:cpu
     container_name: hum-front
     restart: unless-stopped
-    networks: [llm]
     ports:
       - "9000:8080"            # LAN-facing stable address; container listens on 8080
     volumes:
@@ -33,48 +21,3 @@ services:
       # Consumed by ${env.ANTHROPIC_API_KEY} in config.yaml (peers.anthropic).
       # Set the real key in the compose-manager env / an .env file, not here.
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?set in .env}
-
-  hum-webui:
-    image: ghcr.io/open-webui/open-webui:main
-    container_name: hum-webui
-    restart: unless-stopped
-    networks: [llm]
-    ports:
-      - "8091:8080"            # reverse proxy points chat.<domain> here
-    volumes:
-      - /mnt/user/appdata/hum/webui:/app/backend/data
-    environment:
-      # Model access: everything through the front, service-name DNS.
-      - OPENAI_API_BASE_URL=http://hum-front:8080/v1
-      - OPENAI_API_KEY=vibe-local
-      # SSO: Authelia forward-auth injects Remote-Email; OWUI trusts it.
-      # The proxy MUST strip inbound Remote-* headers or anyone can forge a
-      # login (README.md has the exact nginx block).
-      - WEBUI_AUTH_TRUSTED_EMAIL_HEADER=Remote-Email
-      - WEBUI_AUTH_TRUSTED_NAME_HEADER=Remote-Name
-      - WEBUI_URL=https://chat.example.com          # set to the real proxied name
-      # Pin the session secret so logins survive container recreation
-      # (owui-chat-profile gotcha). Generate once: openssl rand -hex 32
-      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:?set in .env}
-      # Env is the source of truth, not the DB (PersistentConfig masks
-      # compose env otherwise — the classic OWUI gotcha).
-      - ENABLE_PERSISTENT_CONFIG=False
-      # Web search via searxng; bypass the web-loader (playwright loader
-      # yields "no sources" — known bug, same fix as the chat profile).
-      - ENABLE_WEB_SEARCH=True
-      - WEB_SEARCH_ENGINE=searxng
-      - SEARXNG_QUERY_URL=http://hum-search:8080/search?q=<query>
-      - BYPASS_WEB_SEARCH_WEB_LOADER=True
-      - WEB_SEARCH_RESULT_COUNT=5
-    depends_on: [hum-front, hum-search]
-
-  hum-search:
-    image: searxng/searxng:latest
-    container_name: hum-search
-    restart: unless-stopped
-    networks: [llm]
-    # No published port — only OWUI talks to it, on the llm network.
-    volumes:
-      - /mnt/user/appdata/hum/searxng:/etc/searxng
-    environment:
-      - SEARXNG_BASE_URL=http://hum-search:8080/

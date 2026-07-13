@@ -1,0 +1,64 @@
+# riff: the persistent chat/research app (topology.md UC1) — Open WebUI +
+# SearXNG. APPLICATION — a client of the hum front (deploy/hum) like any
+# other; it consumes the published :9000, not a private link, so the two
+# stacks deploy/restart/upgrade independently.
+#
+# Plain docker compose. Needs an .env with HUM_URL (e.g.
+# http://192.168.1.10:9000) and WEBUI_SECRET_KEY (openssl rand -hex 32).
+#
+# A reverse proxy + SSO (NPM + Authelia in the reference deployment) is
+# assumed to exist on the host; see README.md for the proxy-host +
+# forward-auth wiring (and the header-strip caveat).
+#
+# Volume paths are examples (unraid appdata style) — adjust to the host.
+# Put the webui data dir on fast storage.
+
+networks:
+  riff:
+    driver: bridge
+
+services:
+  riff-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: riff-webui
+    restart: unless-stopped
+    networks: [riff]
+    ports:
+      - "8091:8080"            # reverse proxy points chat.<domain> here
+    volumes:
+      - /mnt/user/appdata/riff/webui:/app/backend/data
+    environment:
+      # Model access: the hum front's published address.
+      - OPENAI_API_BASE_URL=${HUM_URL:?set in .env}/v1
+      - OPENAI_API_KEY=vibe-local
+      # SSO: Authelia forward-auth injects Remote-Email; OWUI trusts it.
+      # The proxy MUST strip inbound Remote-* headers or anyone can forge a
+      # login (README.md has the exact nginx block).
+      - WEBUI_AUTH_TRUSTED_EMAIL_HEADER=Remote-Email
+      - WEBUI_AUTH_TRUSTED_NAME_HEADER=Remote-Name
+      - WEBUI_URL=https://chat.example.com          # set to the real proxied name
+      # Pin the session secret so logins survive container recreation
+      # (owui-chat-profile gotcha). Generate once: openssl rand -hex 32
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:?set in .env}
+      # Env is the source of truth, not the DB (PersistentConfig masks
+      # compose env otherwise — the classic OWUI gotcha).
+      - ENABLE_PERSISTENT_CONFIG=False
+      # Web search via searxng; bypass the web-loader (playwright loader
+      # yields "no sources" — known bug, same fix as the chat profile).
+      - ENABLE_WEB_SEARCH=True
+      - WEB_SEARCH_ENGINE=searxng
+      - SEARXNG_QUERY_URL=http://riff-search:8080/search?q=<query>
+      - BYPASS_WEB_SEARCH_WEB_LOADER=True
+      - WEB_SEARCH_RESULT_COUNT=5
+    depends_on: [riff-search]
+
+  riff-search:
+    image: searxng/searxng:latest
+    container_name: riff-search
+    restart: unless-stopped
+    networks: [riff]
+    # No published port — only OWUI talks to it, on the riff network.
+    volumes:
+      - /mnt/user/appdata/riff/searxng:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://riff-search:8080/

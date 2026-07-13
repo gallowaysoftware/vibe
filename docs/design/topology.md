@@ -10,7 +10,7 @@ the four use cases.
 
 | box | hardware | availability | role |
 |---|---|---|---|
-| **hum** (role name; the unraid server today) | no GPU, 128GB DDR4, iGPU, big storage | always-on | **The front + persistent apps** (`deploy/hum`): llama-swap front cell (CPU image, peers only — zero local models), persistent OWUI, NPM + Authelia, SearXNG, toqui, fleet dashboard. The one URL everything talks to. Also the **model library**: the `models` share is the source-of-truth weights store (download once); cells rsync local NVMe copies for JIT-speed loads (`vibe model ensure`, fleet.md P4 — share-as-library replaces localmodel as the preferred source). |
+| **hum** (role name; the unraid server today) | no GPU, 128GB DDR4, iGPU, big storage | always-on | **The front** (`deploy/hum`, infra): llama-swap front cell (CPU image, peers only — zero local models), the one URL everything talks to. The same host also carries the application stacks that consume it — riff (`deploy/riff`: persistent OWUI + SearXNG), toqui, the fleet dashboard — behind the existing NPM + Authelia. Also the **model library**: the `models` share is the source-of-truth weights store (download once); cells rsync local NVMe copies for JIT-speed loads (`vibe model ensure`, fleet.md P4 — share-as-library replaces localmodel as the preferred source). |
 | **localmodel** (this box) | 5090 32GB | opportunistic (dev + games) | GPU cell: 27B/31B-class JIT models + ComfyUI. Explicitly allowed to be off or full of game. |
 | **llamaloft** | 3080Ti 12GB, R5 2600, 32GB | always-on (once built) | Utility-plane cell: embed/rerank/classifier/STT/TTS pinned (`ttl: 0` + preload, ~9-10GB), small swap pool in the remainder. |
 | **spark pair** | 2× DGX Spark, 125GB unified, QSFP400 | always-on (once built) | Heavy cell on spark-1 (owns both nodes): dsv4flash via dual-node vLLM; single-node models (e.g. qwen3-coder-next) on spark-2. |
@@ -54,8 +54,9 @@ LAN hop costs nothing perceptible.
 
 ### UC1 — persistent chat/research/websearch (the Claude-app replacement)
 
-**Stack (all on hum, all off-the-shelf — `deploy/hum`):** OWUI as a
-normal docker app behind NPM + Authelia — same pattern as every other app —
+**Stack: `deploy/riff` (application, separate from the `deploy/hum` front
+infra):** OWUI as a normal docker app behind NPM + Authelia — same pattern
+as every other app —
 plus a SearXNG container for web search. OWUI is a PWA: "install" it from
 the phone browser and it lives on the home screen like the Claude app did.
 
@@ -144,9 +145,12 @@ the same front — fleet.md §8's per-group BaseURL/ModelID carries it.
 ## 3. Gaps: build vs buy
 
 Off the shelf (no code):
-- The hum stack (`deploy/hum`): official llama-swap CPU docker image + a
-  peers-only config file on a share — plain compose, nothing built.
-- OWUI + SearXNG + NPM + Authelia on the hum host: existing app patterns;
+- The hum front (`deploy/hum`, infra): official llama-swap CPU docker
+  image + a peers-only config file on a share — plain compose, nothing
+  built. Applications are separate stacks that consume its published
+  :9000, so infra and apps upgrade independently.
+- riff (`deploy/riff`, application): OWUI + SearXNG behind the existing
+  NPM + Authelia — existing app patterns;
   trusted-header SSO is config, not code.
 - Phone app: OWUI PWA.
 
