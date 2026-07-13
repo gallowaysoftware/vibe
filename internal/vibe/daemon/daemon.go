@@ -65,6 +65,16 @@ type Config struct {
 	// user sets HTTPAddr explicitly (e.g. "0.0.0.0:9001"), that value wins
 	// and BindAll is ignored.
 	BindAll bool `yaml:"bind_all,omitempty"`
+	// ClientAPIURL, when set, is what rendered frontend configs get for
+	// ${VIBE_API} instead of the local proxy port — e.g.
+	// "http://172.16.3.211:9000" once a fleet front (hum) exists, so
+	// coding harnesses on this box see the whole fleet catalog (cells +
+	// cloud) instead of just this box's own cell. Purely a client-facing
+	// override: internal bookkeeping (readiness checks, ComfyUI's
+	// /upstream/ address, the fleet API's "front" cell) keeps dialing
+	// 127.0.0.1:ProxyPort, since those describe THIS box's own router
+	// instance, not the fleet.
+	ClientAPIURL string `yaml:"client_api_url,omitempty"`
 }
 
 // LoadConfig reads the global vibe config; missing file is not an error.
@@ -572,8 +582,12 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 
 			// Still ProxyPort when DisableProxy is set: the external
 			// router owning that port serves the same OpenAI contract,
-			// so rendered frontend configs keep pointing at it.
+			// so rendered frontend configs keep pointing at it — unless
+			// ClientAPIURL redirects clients to a fleet front instead.
 			vibeAPI := fmt.Sprintf("http://127.0.0.1:%d/v1", d.cfg.ProxyPort)
+			if d.cfg.ClientAPIURL != "" {
+				vibeAPI = strings.TrimRight(d.cfg.ClientAPIURL, "/") + "/v1"
+			}
 			alias := ""
 			ctxLen := 0
 			if p.Backend.LlamaServer != nil {
