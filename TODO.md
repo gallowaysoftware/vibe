@@ -16,6 +16,39 @@
   Remaining needs hardware: A3/A4 (llamaloft), real A5/A6 (Sparks), A8b
   (proxy.go deletion once bge-embed moves to llamaloft).
 
+- **hum/riff bring-up (in progress 2026-07-13).** Design at
+  `docs/design/topology.md`; stacks at `deploy/hum` (front router, infra)
+  and `deploy/riff` (persistent OWUI + SearXNG, application) — split
+  deliberately so infra and app upgrade independently. Status:
+  - DONE: localmodel's llama-swap cell now listens on `0.0.0.0:9000`
+    (LAN-reachable at `192.168.13.117:9000`). hum's front config staged
+    at unraid `/mnt/user/appdata/hum/front/config.yaml` (localmodel peer,
+    all 9 model ids; llamaloft/spark/anthropic commented — anthropic
+    key is NOT required, cloud peer ships disabled). riff's `.env`
+    generated (`HUM_URL`, `RIFF_IPV4=172.16.3.212`, `WEBUI_SECRET_KEY`).
+    Both compose stacks are UP on unraid (macvlan: hum-front `.211`,
+    riff-webui `.212`; fixed a missing top-level `networks:` block in
+    riff's compose, b2a4256). Model library seed: `~/models` (251GB)
+    rsyncing to the new unraid `models` share in the background
+    (`--partial --inplace`, survives interruption; re-run the same
+    rsync command to resume/verify — do not assume it finished without
+    checking).
+  - BLOCKED on a UDM Pro firewall rule: hum-front (`172.16.3.211`,
+    services VLAN) times out dialing localmodel (`192.168.13.117:9000`,
+    main LAN) — `peer proxy error: dial tcp ...: i/o timeout` on any
+    real completion through hum, even though catalog listing and the
+    reverse direction (localmodel curling hum) both work. Needs an
+    Allow rule, LAN-to-LAN/inter-VLAN, source `172.16.3.211` → dest
+    `192.168.13.117:9000` tcp, placed above any existing block-inter-VLAN
+    rule. Once added: re-verify with a real chat completion through
+    `http://172.16.3.211:9000/v1/chat/completions` (model
+    `qwen2.5-coder-7b` is the cheap JIT-load test) — the earlier attempt
+    hung and 502'd, this is the exact repro.
+  - NOT YET DONE: NPM proxy host `chat.<domain>` → `172.16.3.212:8080`
+    with Authelia forward-auth + header-strip (block in
+    `deploy/riff/README.md`); PWA install on phone; repointing coding
+    harnesses at hum's address once it's confirmed end-to-end.
+
 - **Fleet provisioning (multi-host + cloud keys).** Design at
   `docs/design/fleet.md` (2026-07-12): agentless SSH provisioning of
   2x DGX Spark + a 3080 Ti utility box, hosts.yaml converge, model
