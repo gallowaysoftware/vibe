@@ -24,10 +24,10 @@ The fleet is growing from one box to four:
 
 | host | hardware | role |
 |---|---|---|
-| `anvil` (existing) | 9950X3D, 64GB, RTX 5090 32GB, CachyOS | controller: vibe daemon, fast-decode dense models (27-31B), ComfyUI/media, OWUI, coding frontends |
+| `localmodel` (existing) | 9950X3D, 64GB, RTX 5090 32GB, CachyOS | controller: vibe daemon, fast-decode dense models (27-31B), ComfyUI/media, OWUI, coding frontends |
 | `spark-1` (incoming) | DGX Spark GB10, 128GB unified, aarch64 | big-MoE serving (head node for dual-node vLLM) |
 | `spark-2` (incoming) | DGX Spark GB10, 128GB unified, aarch64 | big-MoE serving (dual-node worker) or independent single-node serving |
-| `loft` (probable) | RTX 3080 Ti 12GB, CachyOS | always-on utility plane: embed, rerank, classifier, STT, TTS |
+| `llamaloft` (probable) | RTX 3080 Ti 12GB, CachyOS | always-on utility plane: embed, rerank, classifier, STT, TTS |
 | cloud | Anthropic (+ optional OpenAI-compat keys) | fallback + frontier-model routes |
 
 vibe today is a single-host daemon: one active GPU profile + service-mode
@@ -85,7 +85,7 @@ Full sources and numbers live in the session research digest; the decisions:
   Kimi K2.x (don't fit 256GB), gpt-oss-120b (superseded).
 - **3080 Ti box: utility plane, llama.cpp-first** — Qwen3-Embedding-0.6B (+
   optional 4B), Qwen3-Reranker-0.6B, Qwen3-0.6B classifier (relocated from
-  anvil), faster-whisper large-v3-turbo, Kokoro (+ Qwen3-TTS for pipelines).
+  localmodel), faster-whisper large-v3-turbo, Kokoro (+ Qwen3-TTS for pipelines).
   Skip a 7-14B coder there (strictly dominated) and guard models. CachyOS
   with `linux-cachyos-lts` + precompiled `linux-cachyos-lts-nvidia-open`
   (no DKMS build to fail).
@@ -98,7 +98,7 @@ Full sources and numbers live in the session research digest; the decisions:
 
 ## 3. Architecture in one paragraph
 
-One vibe daemon, on anvil, remains the only daemon (daemon-per-host
+One vibe daemon, on localmodel, remains the only daemon (daemon-per-host
 federation rejected: doubles the upgrade surface; everything downstream of
 the supervisor already consumes only a URL). Remote hosts are operated
 agentless over SSH; long-running remote processes are owned by remote systemd
@@ -120,7 +120,7 @@ config.yaml            # existing daemon config + fleet: section
 hosts.yaml             # NEW fleet inventory (one file — it IS the fleet)
 backends/<name>.yaml   # existing BackendDef + host:/formats:/context:, two new union kinds
 routes.yaml            # NEW virtual aliases -> ordered target chains (chains only — see 4.5)
-profiles/<name>.yaml   # unchanged shape; profiles stay human-facing frontends on anvil
+profiles/<name>.yaml   # unchanged shape; profiles stay human-facing frontends on localmodel
 ```
 
 State: `$XDG_STATE_HOME/vibe/fleet/<host>.json` (converge hash, unit set,
@@ -131,7 +131,7 @@ boot_id, last-seen), `metrics/requests-YYYY-MM-DD.jsonl`, `events.jsonl`
 
 ```yaml
 hosts:
-  anvil:
+  localmodel:
     local: true
     arch: amd64
     gpu: {kind: cuda, vram_gb: 32}
@@ -153,7 +153,7 @@ hosts:
     gpu: {kind: cuda-unified, vram_gb: 110}
     model_dir: /home/kyle/models
     cluster: {iface: enp1s0f1np1, addr: 192.168.200.12, peer: spark-1}
-  loft:
+  llamaloft:
     addr: 10.0.40.20
     ssh: {user: kyle, key: ~/.ssh/id_ed25519_fleet}
     arch: amd64
@@ -336,7 +336,7 @@ per-user YAML; `hosts.yaml tuning:` exists only to *override* defaults.
    retained through the transition).
 5. `${MODEL_ALIAS}`/`${MODEL_CONTEXT}` populated for all backend kinds
    (tabby bug already fixed in the working tree; `context:` on BackendDef
-   covers vllm/cloud), and `VibeAPI` becomes configurable to anvil's LAN
+   covers vllm/cloud), and `VibeAPI` becomes configurable to localmodel's LAN
    address for remote-rendered configs.
 6. schema.go, `Backend.isEmpty()`, the pointer-count loop, and the AGENTS.md
    schema rules all update in lockstep for host/formats/context/vllm/
@@ -393,13 +393,13 @@ dances.
 
 At daemon boot, remote units are **adopted without restart** (hash-check +
 health probe + route registration, seconds) — a vibe reinstall/daemon restart
-on anvil never touches Spark KV caches. Extending systemd-owned lifecycle to
-anvil's own local backends (so daemon restarts stop killing the 5090 model's
+on localmodel never touches Spark KV caches. Extending systemd-owned lifecycle to
+localmodel's own local backends (so daemon restarts stop killing the 5090 model's
 KV cache too) is a noted future option, not v1.
 
 ### 5.4 VRAM preflight: ledger for remote hosts
 
-anvil keeps nvidia-smi probing. Remote hosts use declared capacity
+localmodel keeps nvidia-smi probing. Remote hosts use declared capacity
 (`gpu.vram_gb`) minus the sum of resident backends' `estimated_vram_gb`
 (unified-memory Sparks make point-in-time probes lie; page cache eats the
 reading), sanity-checked against the observe pass.
@@ -418,7 +418,7 @@ head's health probe fails, backend goes degraded→down, and per-backend
 `on_down: restart` does a coordinated pair stop/start with a budget (3/hour)
 so a flapping unit pages via `vibe fleet status` instead of burning the night.
 
-Auth: control plane unchanged (unix socket + :9001 bearer on anvil; remote
+Auth: control plane unchanged (unix socket + :9001 bearer on localmodel; remote
 hosts have no control plane). Data plane: remote model servers bind
 `0.0.0.0:<pinned>` but require the **fleet token** (converge distributes the
 existing state token, unit rendering passes `--api-key`; the router injects
@@ -434,7 +434,7 @@ sysctls, clock-lock unit, CX-7 netplan, mlx5 packages); converge only
 ### 6.1 Request path
 
 ```
-harness/OWUI/vamp → POST anvil:9000 /v1/chat/completions|/v1/messages {"model": "coder"}
+harness/OWUI/vamp → POST localmodel:9000 /v1/chat/completions|/v1/messages {"model": "coder"}
   1. format tag from path (/v1/messages → anthropic, else openai)
   2. peekModel (existing; cap 2→8 MiB for multimodal; over-cap streams w/o fallback, logged)
   3. exact alias → route | glob passthrough | default upstream (active profile — backward compatible)
@@ -518,7 +518,7 @@ user pastes once) → `vibe host converge spark-1` → **RMA-window stress test*
 (`vibe doctor --host spark-1 --stress`: hours of uncapped load; overcurrent
 hard-shutdowns are a per-unit hardware lottery and RMA is the only fix) →
 `vibe model ensure deepseek-ai/DeepSeek-V4-Flash --host spark-1,spark-2`
-(rsync from anvil library, then spark-1→spark-2 over CX-7) → `vibe start
+(rsync from localmodel library, then spark-1→spark-2 over CX-7) → `vibe start
 v4-flash` → `vibe route smoke coder` → set
 `{"env":{"CLAUDE_CODE_ATTRIBUTION_HEADER":"0"}}` in ~/.claude/settings.json
 (config file, not shell export — otherwise the mutating header zeroes
@@ -545,7 +545,7 @@ Typed Connect error details (`VRAM_EXCEEDED | HOST_UNREACHABLE | SLOT_HELD |
 NOT_STAGED | NOT_FOUND`) replace the `IsVRAMRejection` substring contract.
 `vamp run --warm` pre-ensures every declared capability in parallel before
 wave 1 so multiple 10-minute cold starts overlap. Cross-host pipelines
-(ComfyUI on anvil + text on Sparks + TTS on loft) work via per-host slots +
+(ComfyUI on localmodel + text on Sparks + TTS on llamaloft) work via per-host slots +
 the per-group BaseURL/ModelID that `StageInput` already carries; foreach
 fan-out caps on per-backend `parallel` instead of the singleton
 `Status.Parallel`.
@@ -557,7 +557,7 @@ fan-out caps on per-backend `parallel` instead of the singleton
 | P0 | Commit the working tree (write_files + cleanup pass) | S |
 | P1 | Router v2 on one box: cloud_api kind, routes.yaml + reload, format affinity, header injection, model rewrite, pre-first-byte fallback, max_concurrency, JSONL metrics + `vibe metrics summary`, alias-advertised /v1/models. Immediately useful: Claude through :9000 (omp stops hardcoding), qwen tool-call rate measured | M |
 | P2 | Remote plumbing: `internal/vibe/remote` + hosts.yaml + `vibe host add/bootstrap/converge/logs` + observe/doctor — no backend changes yet | M |
-| P3 | Remote backends: `host:` on BackendDef, remoteUnit runtime, per-host slots + swap/--evict, fleet-token data plane, health engine + events. Deliver: loft utility plane (embed/rerank/classifier/kokoro/whisper) as converged units surviving anvil restarts | L |
+| P3 | Remote backends: `host:` on BackendDef, remoteUnit runtime, per-host slots + swap/--evict, fleet-token data plane, health engine + events. Deliver: llamaloft utility plane (embed/rerank/classifier/kokoro/whisper) as converged units surviving localmodel restarts | L |
 | P4 | Model library + distribution: `vibe model ls/ensure` (rsync --partial --inplace, peer/CX-7 selection, hf fallback, size+xxh64 manifest), fleet doctor | M |
 | P5 | Spark single-node: bootstrap/tuning encoding, arm64 llama-server units, qwen3-coder-next on spark-2 behind `coder`. The fleet becomes daily-driver useful here, before any dual-node fragility | M |
 | P6 | Dual-node vLLM: `vllm` kind, NCCL auto-injection, CX-7 preflight, coordinated start/stop + on_down budget, `vibe route smoke` gate. Recipe pins come from commissioning with sparkrun/eugr (experiment→freeze, 4.3); flip `coder` to v4-flash-first after a clean week | L |
@@ -589,7 +589,7 @@ Spark serving is boring and useful while the dual-node recipe is de-risked.
    `formats: [openai]`; llama.cpp covers Anthropic-format locally; the smoke
    gate decides if the tag ever flips.
 7. **Unified-memory OOM near 127GB.** → converge-asserted sysctls +
-   gpu-memory-utilization 0.85 + doctor check (the anvil zram lesson, encoded
+   gpu-memory-utilization 0.85 + doctor check (the localmodel zram lesson, encoded
    this time).
 8. **Schema churn bricking the daily driver.** → `host: ""` default keeps
    every existing backend loading unchanged; capability fallback retained
@@ -605,8 +605,8 @@ Spark serving is boring and useful while the dual-node recipe is de-risked.
 | chat (single Spark) | Qwen3.5-122B-A10B AutoRound INT4 | one Spark | vLLM | 28-38 tok/s (+MTP ~51 w/ patches) |
 | chat (dual, intelligence play) | Qwen3.5-397B-A17B 4-bit | dual Spark | vLLM | ~30 tok/s, AA index 45 |
 | wildcard (re-test ~Sept) | Ornith-1.0-397B; MiniMax M2.7 (needs thinking round-trip) | dual Spark | vLLM | 33 / 42 tok/s |
-| fast dense + media | current Qwen3.6-27B / Gemma 4 31B + ComfyUI | anvil 5090 | unchanged | unchanged |
-| embed / rerank / classify / STT / TTS | Qwen3-Embedding-0.6B, Qwen3-Reranker-0.6B, Qwen3-0.6B, whisper large-v3-turbo, Kokoro (+Qwen3-TTS) | loft 3080 Ti | llama.cpp + faster-whisper | ~9-10GB resident total |
+| fast dense + media | current Qwen3.6-27B / Gemma 4 31B + ComfyUI | localmodel 5090 | unchanged | unchanged |
+| embed / rerank / classify / STT / TTS | Qwen3-Embedding-0.6B, Qwen3-Reranker-0.6B, Qwen3-0.6B, whisper large-v3-turbo, Kokoro (+Qwen3-TTS) | llamaloft 3080 Ti | llama.cpp + faster-whisper | ~9-10GB resident total |
 
 Turnkey layer (July 2026): fabric via NVIDIA Sync Cluster Assistant;
 commissioning via sparkrun (`uvx sparkrun setup`, git recipe registries,

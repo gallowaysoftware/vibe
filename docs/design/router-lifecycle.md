@@ -34,8 +34,8 @@ rule. Autostart is now the product.
 
 **ADOPT [llama-swap](https://github.com/mostlygeek/llama-swap) (MIT, Go,
 single binary, v239 July 2026, 5k+ stars) as the routing + lifecycle
-substrate — one instance per "cell" (anvil, spark-pair, loft), federated via
-its `peers` mechanism, with the anvil instance taking over :9000. vibe's
+substrate — one instance per "cell" (localmodel, spark-pair, llamaloft), federated via
+its `peers` mechanism, with the localmodel instance taking over :9000. vibe's
 `proxy.go` is retired.** vibe shrinks to what cannot be bought: config
 rendering + SSH/systemd converge, model distribution, the dual-Spark pair
 scripts, ComfyUI, vamp, frontends, and a thin fleet-state aggregator for the
@@ -101,18 +101,18 @@ in §13.
 
 ```
                    clients: claude code, qwen-code, pi, OWUI, vamp
-                                    │  (unchanged: anvil:9000)
+                                    │  (unchanged: localmodel:9000)
                       ┌─────────────▼──────────────┐
-                      │ llama-swap "front" @ anvil │  :9000
-                      │  local models: anvil 5090  │  (llama.cpp, tabby, comfyui*)
+                      │ llama-swap "front" @ localmodel │  :9000
+                      │  local models: localmodel 5090  │  (llama.cpp, tabby, comfyui*)
                       │  peers:                    │
                       │   spark-cell → spark-1:9100│
-                      │   loft-cell  → loft:9100   │
+                      │   llamaloft-cell  → llamaloft:9100   │
                       │   anthropic  → api.anthropic.com (apiKey peer)
                       └───────┬──────────┬─────────┘
                               │          │
              ┌────────────────▼───┐   ┌──▼──────────────────┐
-             │ llama-swap @spark-1│   │ llama-swap @ loft   │ :9100
+             │ llama-swap @spark-1│   │ llama-swap @ llamaloft   │ :9100
              │ :9100 — the "cell" │   │ ttl:0 everything,   │
              │ owns BOTH sparks:  │   │ preloaded at boot   │
              │  dsv4flash (dual,  │   │ (embed/rerank/      │
@@ -124,7 +124,7 @@ in §13.
              │    docker -H ssh://)│
              └────────────────────┘
 
-  vibe daemon @ anvil: renders the 3 llama-swap configs from backends/ +
+  vibe daemon @ localmodel: renders the 3 llama-swap configs from backends/ +
   hosts.yaml, converges them over SSH+systemd, distributes models, runs
   doctor, owns ComfyUI + frontends + the vamp control plane, aggregates
   fleet state for the web UI.
@@ -141,7 +141,7 @@ Structural decisions:
    (dsv4flash excludes everything; one single-node model per Spark may
    coexist). Separate llama-swaps per Spark would split the ledger and
    reintroduce cross-host placement.
-   - *Settled (judge Q): cell lives on spark-1, not anvil.* spark-1 down
+   - *Settled (judge Q): cell lives on spark-1, not localmodel.* spark-1 down
      means the pair is down regardless (it's the TP head), and co-locating
      the ledger with the hardware keeps the start path local. The residual
      orphan risk (spark-2 containers after a spark-1 llama-swap restart) is
@@ -149,7 +149,7 @@ Structural decisions:
 2. **The front owns :9000** — every existing client config keeps its URL.
 3. **Anthropic is a peer, not a special case.** `model: claude-sonnet-5`
    reaches the real API with the key injected; `model: coder` reaches metal.
-4. **anvil's own models move under the front llama-swap.** `cmd` = the same
+4. **localmodel's own models move under the front llama-swap.** `cmd` = the same
    llama-server/tabby invocations vibe renders today. vibe's supervisor +
    respawn watcher stop managing LLM processes (systemd `Restart=always` on
    the llama-swap unit + its child management replace them). The tabby EXL3
@@ -204,8 +204,8 @@ backend:
     api_key_cmd: op read op://Private/anthropic-api/credential
     models: [claude-opus-4-8, claude-sonnet-5]
 
-# backends/qwen-embed.yaml (loft utility plane)
-cell: loft-cell
+# backends/qwen-embed.yaml (llamaloft utility plane)
+cell: llamaloft-cell
 lifecycle: {ttl: 0, preload: true}   # pinned: never unloads, loaded at cell boot
 backend:
   llama_server: {path: ~/models/qwen3-embedding-0.6b.gguf, alias: qwen-embed}
@@ -227,7 +227,7 @@ Renderer contract:
 
 Render-time lint (hard failures): alias collisions across the whole
 namespace; any matrix-valid co-resident set exceeding the cell's declared
-capacity; the loft pinned set exceeding 12GB.
+capacity; the llamaloft pinned set exceeding 12GB.
 
 Cloud keys: no literals in YAML. Converge resolves `api_key_cmd` into a 0600
 systemd `EnvironmentFile`; the config references `${env.VAR}`. Re-resolve on
@@ -267,10 +267,10 @@ matrix:
   evict_costs: {dsv4flash: 3, qwen3-coder-next: 2, qwen35-122b: 1}
 ```
 
-Front config (anvil, :9000): local models (qwen-code, gemma4-chat, pi-tabby
+Front config (localmodel, :9000): local models (qwen-code, gemma4-chat, pi-tabby
 with `filters.setParams`, comfyui experiment) in a one-occupant `matrix`, plus
 peers: `spark-cell` (`responseHeader: 1800` — see §7 budget chain),
-`loft-cell`, `anthropic` (`apiKey: ${env.ANTHROPIC_API_KEY}`).
+`llamaloft-cell`, `anthropic` (`apiKey: ${env.ANTHROPIC_API_KEY}`).
 
 ## 5. Lifecycle state machine + the degradation verdict
 
@@ -325,8 +325,8 @@ stream shows a minute-7 failure from one place.
 ### 6.1 "Routing like LiteLLM"
 
 `GET :9000/v1/models` returns the merged namespace: front locals + every
-peer's advertised models (spark, loft, claude-*). Aliases give friendly names
-(`coder-max` → dsv4flash, `coder-local` → anvil qwen); vibe lints collisions
+peer's advertised models (spark, llamaloft, claude-*). Aliases give friendly names
+(`coder-max` → dsv4flash, `coder-local` → localmodel qwen); vibe lints collisions
 at render time. Cloud: `model: claude-sonnet-5` on either
 `/v1/chat/completions` or `/v1/messages` forwards with the key injected.
 Given up vs LiteLLM: same-name deployment groups with weighted failover —
@@ -336,7 +336,7 @@ covers fallback).
 ### 6.2 "On-demand loading with idle timeout"
 
 Any request naming an unloaded model JIT-starts it; every model carries
-`ttl`; countdown from completion; unload drains first. Loft = `ttl: 0` +
+`ttl`; countdown from completion; unload drains first. llamaloft = `ttl: 0` +
 preload, exempt. Per-request TTL override (Ollama `keep_alive`) doesn't exist
 in llama-swap — honest gap; vamp compensates with the lease (§10), a chat
 user pins via the cell UI.
@@ -387,7 +387,7 @@ anti-thrash guard exists — acceptable for one human; §13.3.
   No cross-cell scheduler. gguf-parser-go style VRAM estimation is relegated
   to `vibe doctor` advisories + render-time lint.
 - **Eviction**: matrix solver per cell; human-declared valid sets; cheapest
-  eviction by `evict_cost`. Pinned = `ttl: 0` + preload (loft). anvil = one
+  eviction by `evict_cost`. Pinned = `ttl: 0` + preload (llamaloft). localmodel = one
   big occupant (`big:` set), restoring the "one 5090 tenant" rule with
   automatic instead of manual swaps.
 - **Dual-node is one unit**: one matrix var; the solver can't half-evict it;
@@ -505,7 +505,7 @@ stops supervising LLM processes.
 **Dies (breaking, sanctioned)**: `internal/vibe/proxy/proxy.go`; fleet.md
 router v2 + health engine + slot map + `EnsureModelAvailable` + JSONL metrics
 (the majority of fleet P1/P3/P7 code is never written — that's the payoff);
-the classifier-sidecar co-start routing (relocates to loft); the active-slot
+the classifier-sidecar co-start routing (relocates to llamaloft); the active-slot
 / `vibe swap --evict` concepts (the matrix decides).
 
 **Namespace rename (settled judge Q)**: canonical model ids are decided once,
@@ -549,9 +549,9 @@ trigger: project abandonment AND a blocking defect.
 | phase | scope | effort | proves |
 |---|---|---|---|
 | A0 | ~~Commit working tree~~ (done: fc8541e / 94a1fbe / cfe4fb7) | — | — |
-| A1 | **llama-swap on anvil at :9000**, hand-written config: current anvil models + ttl + `sendLoadingState` + anthropic peer; vibe proxy retired behind a flag. **Gate: the six-client smoke rig** — claude code, qwen-code, pi, OWUI, OpenAI SDK, Anthropic SDK against a synthetic `sleep 420` slow-start backend; pass = streamed answer or cleanly surfaced error, no hangs, recorded per client; plus mid-stream client-kill cancels upstream. **Fail → the §12 front-shim bail-out, decided now, not under duress** | M | The riskiest bet, day one, one box |
+| A1 | **llama-swap on localmodel at :9000**, hand-written config: current localmodel models + ttl + `sendLoadingState` + anthropic peer; vibe proxy retired behind a flag. **Gate: the six-client smoke rig** — claude code, qwen-code, pi, OWUI, OpenAI SDK, Anthropic SDK against a synthetic `sleep 420` slow-start backend; pass = streamed answer or cleanly surfaced error, no hangs, recorded per client; plus mid-stream client-kill cancels upstream. **Fail → the §12 front-shim bail-out, decided now, not under duress** | M | The riskiest bet, day one, one box |
 | A2 | vibe renderer: backends+hosts → llama-swap configs + units; converge push (fleet P2 plumbing); **canonical model-id rename pass (mapping table)** | M | Config source of truth |
-| A3 | loft cell: always-on plane, preload, peer | S | Federation + pinning |
+| A3 | llamaloft cell: always-on plane, preload, peer | S | Federation + pinning |
 | A4 | model distribution (`vibe model ensure`, fleet P4) | M | — |
 | A5 | spark-1 single-node cell (qwen3-coder-next), peer; **scenario 3 minus dual-node with a real ~3-min cold start; re-run the six-client rig through the peer hop** | M | Peer-hop hold + keepalive end-to-end |
 | A6 | dual-node: pair scripts (cleanup preflight + both-journal streaming), matrix, `docker -H ssh://` spark-2, NCCL env, nightly-if-idle timer, deep-health watchdog (TTL-neutral probe), **cell-restart acceptance test** | L | Scenario 3 verbatim |
@@ -567,7 +567,7 @@ exists; the bail-out is pre-agreed (§12) and is a shim, not a fork.
 
 ## 15. A1 executed (2026-07-12) — gate results
 
-llama-swap v239 owns anvil:9000 (systemd unit, Restart=always); daemon runs
+llama-swap v239 owns localmodel:9000 (systemd unit, Restart=always); daemon runs
 `disable_proxy: true`; the four LLM backends are `external: true`; profiles
 activate against the router catalog (`vibe start long_form` verified live).
 
@@ -615,7 +615,7 @@ Consequences adopted into the plan: (1) ComfyUI is now a llama-swap model
 automatically; (2) vamp MUST address ComfyUI via
 `:9000/upstream/comfyui`, never `:8188` directly — direct requests are
 invisible to llama-swap's in-flight tracking, so the TTL could reap
-ComfyUI mid-workflow; (3) the loft utility plane maps to a persistent
+ComfyUI mid-workflow; (3) the llamaloft utility plane maps to a persistent
 non-exclusive group exactly as simulated; (4) a model's own
 `reasoning_content` chunks are indistinguishable in-band from llama-swap's
 loading states — clients that budget max_tokens tightly on reasoning models
@@ -649,8 +649,8 @@ unload API, which doesn't reach peer models — only the first client of a
 run gets a true peer cold start. Real-cell reruns should unload on the
 cell directly.
 
-**Still pending hardware**: A3/A4 (loft provisioning + model distribution),
+**Still pending hardware**: A3/A4 (llamaloft provisioning + model distribution),
 real A5/A6 (Sparks: single-node cell, dual-node pair scripts, NCCL
 workarounds, deep-health watchdog), A8b (delete proxy.go + LLM respawn
 paths once nothing daemon-supervised serves LLMs — bge-embed service is
-the last holdout on anvil, destined for loft).
+the last holdout on localmodel, destined for llamaloft).

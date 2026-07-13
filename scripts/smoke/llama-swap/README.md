@@ -145,7 +145,7 @@ front-shim bail-out.
 
 ## 7. A5 re-run (peer hop)
 
-Same rig, different target: point `BASE_URL` at the FRONT router (anvil
+Same rig, different target: point `BASE_URL` at the FRONT router (localmodel
 :9000) and `MODEL` at a model that the front resolves via `peers:` to the
 cell that owns slowmodel (or the real spark model with its real ~3-min cold
 start — then set `DELAY_S` accordingly and skip the slowmodel stanza). The

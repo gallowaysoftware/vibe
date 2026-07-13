@@ -4,7 +4,7 @@
 
 - **Router + model lifecycle (adopt llama-swap).** Design at
   `docs/design/router-lifecycle.md` (2026-07-12): llama-swap per cell
-  (anvil / spark-pair / loft) federated via peers, front instance takes
+  (localmodel / spark-pair / llamaloft) federated via peers, front instance takes
   over :9000, per-model TTL idle-unload + JIT autostart with SSE
   loading-state keepalives, matrix eviction, Anthropic as an apiKey
   peer, vamp streaming warm + lease heartbeat. Supersedes fleet.md's
@@ -13,8 +13,8 @@
   all LLM defs + ComfyUI external, cloud_peer anthropic, canonical
   capability ids, vamp typed errors/lease/--warm, fleet state+events
   API, 420s six-client gate + simulated peer-hop gate passed — §15-§17).
-  Remaining needs hardware: A3/A4 (loft), real A5/A6 (Sparks), A8b
-  (proxy.go deletion once bge-embed moves to loft).
+  Remaining needs hardware: A3/A4 (llamaloft), real A5/A6 (Sparks), A8b
+  (proxy.go deletion once bge-embed moves to llamaloft).
 
 - **Fleet provisioning (multi-host + cloud keys).** Design at
   `docs/design/fleet.md` (2026-07-12): agentless SSH provisioning of
