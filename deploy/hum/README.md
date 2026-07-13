@@ -22,8 +22,8 @@ the share as the preferred source.
 - `docker-compose.yaml` — the single-service stack. House networking
   pattern: the front sits on the `br0` macvlan with its own static LAN IP
   (`HUM_IPV4`, default 172.16.3.211) — a real host on the network, no
-  port NAT. Needs an `.env` with `ANTHROPIC_API_KEY` (and `HUM_IPV4` to
-  override the default).
+  port NAT. `.env` is optional: `HUM_IPV4` to override the default IP, and
+  `ANTHROPIC_API_KEY` if/when the anthropic peer is enabled in the config.
 - `front-config.example.yaml` — the peers-only llama-swap config; copy to
   `<appdata>/hum/front/config.yaml` and fill in real cell addresses/model
   lists.
@@ -32,13 +32,14 @@ the share as the preferred source.
 
 1. Copy + edit the front config; create the `.env`.
 2. `compose up`. Sanity: `curl http://<HUM_IPV4>:9000/v1/models` should
-   list every peer model (claude ids immediately; cell ids once cells are
-   reachable). Run it from another LAN box — macvlan isolation means the
-   unraid host itself cannot reach this IP.
-3. On localmodel, flip its llama-swap unit to `-listen 0.0.0.0:9000` and
-   remove its `anthropic` peer from `~/.config/vibe/router-extras.yaml`
-   (hum owns cloud peers now — otherwise claude ids appear twice), then
+   list every peer model (cell ids once cells are reachable). Run it from
+   another LAN box — macvlan isolation means the unraid host itself
+   cannot reach this IP.
+3. On localmodel, flip its llama-swap unit to `-listen 0.0.0.0:9000`, then
    `vibe router render && systemctl --user restart llama-swap`.
+   (Cloud peers are hum's job once enabled: when the anthropic peer gets a
+   real key here, remove localmodel's `anthropic` def at the same time or
+   claude ids appear twice in hum's catalog.)
 4. Repoint clients at `http://<HUM_IPV4>:9000/v1` as they come up for
    changes (riff via its `HUM_URL`; coding harnesses; toqui).
 

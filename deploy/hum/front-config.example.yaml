@@ -35,10 +35,13 @@ peers:
   #   proxy: http://spark-1:9000
   #   models: [dsv4flash, qwen3-coder-next]
 
-  # Cloud — explicit model ids, never a fallback target.
-  anthropic:
-    proxy: https://api.anthropic.com
-    apiKey: ${env.ANTHROPIC_API_KEY}
-    models:
-      - claude-opus-4-8
-      - claude-sonnet-5
+  # Cloud — explicit model ids, never a fallback target. Disabled until a
+  # key is wanted: uncomment AND set ANTHROPIC_API_KEY in the stack .env
+  # (leaving this enabled with an empty key would list claude ids in the
+  # catalog that fail on use).
+  # anthropic:
+  #   proxy: https://api.anthropic.com
+  #   apiKey: ${env.ANTHROPIC_API_KEY}
+  #   models:
+  #     - claude-opus-4-8
+  #     - claude-sonnet-5
