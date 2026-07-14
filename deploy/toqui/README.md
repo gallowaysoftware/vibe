@@ -65,12 +65,25 @@ server URL on first launch — that's `TOQUI_API_URL` below.
    On the API host, allow WebSocket/streaming (chat is server-streamed) and
    **deny `/debug/` + gRPC reflection** at the proxy (see the security note).
 
-5. **Register the first account** at `TOQUI_APP_URL` (email + a ≥12-char
-   password). Open a trip and chat — the first message JIT-loads the model on
-   the owning cell (streamed warming state); later messages share whatever the
-   fleet already has warm.
+   Note: toqui still owns login (Bearer/no forward-auth), so keep Authelia
+   *off* the proxy for these hosts even if you enable SSO below — SSO is a
+   login option inside toqui, not a proxy gate.
 
-6. **iOS app**: on first launch enter `TOQUI_API_URL`; it verifies `/healthz`
+5. **(Optional) Authelia SSO** — to log in with your existing Authelia instead
+   of a toqui password, register a confidential OIDC client in Authelia
+   (`redirect_uris: [ <TOQUI_APP_URL>/auth/callback ]`, scopes
+   `openid email profile`, `client_secret_post`) and set `OIDC_ISSUER` +
+   `OIDC_CLIENT_ID` + `OIDC_CLIENT_SECRET` in `.env`. A "Sign in with Authelia"
+   button then appears. Identity is the Authelia-verified email, so it lands on
+   the same account as an email+password login for that address. Leave
+   `OIDC_ISSUER` blank to skip.
+
+6. **Register the first account** at `TOQUI_APP_URL` (email + a ≥12-char
+   password, or the SSO button if you enabled it). Open a trip and chat — the
+   first message JIT-loads the model on the owning cell (streamed warming
+   state); later messages share whatever the fleet already has warm.
+
+7. **iOS app**: on first launch enter `TOQUI_API_URL`; it verifies `/healthz`
    and you're in. (TestFlight build is a separate task.)
 
 ## Model / tier mapping

@@ -84,6 +84,14 @@ services:
       ALLOWED_EMAIL_DOMAINS: ${ALLOWED_EMAIL_DOMAINS:?set ALLOWED_EMAIL_DOMAINS in .env}
       # 0 = keep chat forever (personal deploy).
       CHAT_RETENTION_DAYS: ${CHAT_RETENTION_DAYS:-0}
+      # Single sign-on via your existing Authelia (or any OIDC provider).
+      # Leave OIDC_ISSUER unset for email+password only. When set, a "Sign in
+      # with <name>" button appears. Authelia asserts email_verified, so the
+      # default verified-email requirement is satisfied — no opt-out needed.
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_PROVIDER_NAME: ${OIDC_PROVIDER_NAME:-Authelia}
     networks:
       toqui: {}
       macvlan:
