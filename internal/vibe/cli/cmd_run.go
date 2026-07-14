@@ -30,9 +30,19 @@ func runCmd() *cobra.Command {
 	var noVRAMCheck bool
 	var session string
 	cmd := &cobra.Command{
-		Use:               "run <profile>",
-		Short:             "Start a profile, exec its frontend in the foreground, and stop the profile when the frontend exits.",
-		Args:              cobra.ExactArgs(1),
+		Use:   "run <profile> [-- <frontend args>]",
+		Short: "Start a profile, exec its frontend in the foreground, and stop the profile when the frontend exits.",
+		Example: `  vibe run omp                # plain launch
+  vibe run omp -- -c          # forward -c/--continue (or any other frontend-native flag) straight to the binary
+  vibe run omp -- -r abc123`,
+		// Exactly one profile name is required; anything after a literal
+		// `--` is opaque to vibe and forwarded verbatim to the frontend
+		// binary (frontends have their own flag surfaces — e.g. omp's
+		// -c/--continue, -r/--resume — that vibe shouldn't have to know
+		// about or keep in sync with).
+		Args: func(cmd *cobra.Command, args []string) error {
+			return validateRunArgs(cmd.ArgsLenAtDash(), args)
+		},
 		ValidArgsFunction: completeProfileNames,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -40,20 +50,22 @@ func runCmd() *cobra.Command {
 				ctx = context.Background()
 			}
 
+			profileName, passthroughArgs := splitRunArgs(cmd.ArgsLenAtDash(), args)
+
 			// Load the profile locally to get binary/args/workdir. The daemon
 			// will load it again from the same on-disk file when we call
 			// Start, so this is a cheap pre-flight that also catches "no
 			// such profile" before we touch the daemon.
-			pPath := filepath.Join(paths.ProfilesDir(), args[0]+".yaml")
+			pPath := filepath.Join(paths.ProfilesDir(), profileName+".yaml")
 			p, err := profile.Load(pPath)
 			if err != nil {
-				return fmt.Errorf("load profile %q: %w (run `vibe profile list` to see available)", args[0], err)
+				return fmt.Errorf("load profile %q: %w (run `vibe profile list` to see available)", profileName, err)
 			}
 			if p.Frontend.Kind != profile.FrontendManaged {
 				return fmt.Errorf("`vibe run` requires kind=managed (got %q); use `vibe start` for kind=external profiles", p.Frontend.Kind)
 			}
 			if p.Frontend.Binary == "" {
-				return fmt.Errorf("profile %q is kind=managed but frontend.binary is unset; set frontend.binary in %s", args[0], pPath)
+				return fmt.Errorf("profile %q is kind=managed but frontend.binary is unset; set frontend.binary in %s", profileName, pPath)
 			}
 
 			if err := ensureDaemon(ctx); err != nil {
@@ -65,19 +77,19 @@ func runCmd() *cobra.Command {
 			// with "stop first". We don't launch the frontend either — this
 			// invocation didn't start the profile, so it must not stop it
 			// when the frontend exits.
-			if st := runningStatus(ctx, client, args[0]); st != nil {
+			if st := runningStatus(ctx, client, profileName); st != nil {
 				out := cmd.OutOrStdout()
 				fmt.Fprintf(out, "%s already running (backend: %s)\n", st.Profile, st.BackendAddr)
 				fmt.Fprintln(out, "frontend not launched — `vibe stop` first to run it fresh")
 				return nil
 			}
-			if err := pullProfile(ctx, cmd.OutOrStdout(), args[0]); err != nil {
+			if err := pullProfile(ctx, cmd.OutOrStdout(), profileName); err != nil {
 				return err
 			}
 
 			cancelTail := startProgressTail(cmd.OutOrStdout())
 			defer cancelTail()
-			r, err := client.StartWithOptions(ctx, args[0], vibeclient.StartOptions{
+			r, err := client.StartWithOptions(ctx, profileName, vibeclient.StartOptions{
 				NoVRAMCheck: noVRAMCheck,
 				Foreground:  true,
 			})
@@ -129,6 +141,9 @@ func runCmd() *cobra.Command {
 			if session != "" {
 				childArgs = append(childArgs, "--session", session)
 			}
+			// `--` passthrough last: it's the most specific thing the user
+			// typed, so it should win if the frontend does last-flag-wins.
+			childArgs = append(childArgs, passthroughArgs...)
 
 			child := exec.Command(p.Frontend.Binary, childArgs...)
 			child.Stdin = os.Stdin
@@ -187,6 +202,30 @@ func runCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&noVRAMCheck, "no-vram-check", false, noVRAMCheckUsage)
-	cmd.Flags().StringVar(&session, "session", "", "resume a specific frontend session by id (passed to pi/opencode as --session <id>)")
+	cmd.Flags().StringVar(&session, "session", "", "resume a specific frontend session by id, pi/opencode's own flag spelling (passed through as --session <id>); other frontends' session flags go after -- instead, e.g. 'vibe run omp -- -r <id>'")
 	return cmd
+}
+
+// validateRunArgs enforces exactly one profile name before a `--`, or
+// exactly one arg total when there is no `--`. dashAt is cmd.ArgsLenAtDash()
+// (-1 when the command line had no literal `--`). Pulled out of the Args
+// closure so the dash-boundary logic is unit-testable without a full
+// cobra/daemon round trip.
+func validateRunArgs(dashAt int, args []string) error {
+	if dashAt >= 0 {
+		if dashAt != 1 {
+			return fmt.Errorf("accepts 1 arg (profile name) before --, received %d", dashAt)
+		}
+		return nil
+	}
+	return cobra.ExactArgs(1)(nil, args)
+}
+
+// splitRunArgs separates the profile name from any `--`-forwarded frontend
+// args, mirroring validateRunArgs's notion of where the boundary is.
+func splitRunArgs(dashAt int, args []string) (profileName string, passthroughArgs []string) {
+	if dashAt >= 0 {
+		return args[0], args[dashAt:]
+	}
+	return args[0], nil
 }
