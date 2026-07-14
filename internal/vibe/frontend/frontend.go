@@ -22,6 +22,23 @@ import (
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 )
 
+// expandArgs expands ${VAR} placeholders in p.Frontend.Args against ctx.
+// Shared by the managed driver (which execs the binary itself) and the
+// foreground path (which hands expanded args back to the CLI to exec) so
+// the two can't drift the way they did when only one of them expanded args
+// and the other passed placeholders straight through to the child binary.
+func expandArgs(p *profile.Profile, ctx profile.ExpandContext) ([]string, error) {
+	args := make([]string, len(p.Frontend.Args))
+	for i, a := range p.Frontend.Args {
+		ea, err := profile.ExpandPathString(a, ctx)
+		if err != nil {
+			return nil, fmt.Errorf("expand args[%d] %q: %w", i, a, err)
+		}
+		args[i] = ea
+	}
+	return args, nil
+}
+
 // Result describes everything the daemon needs to know after a successful
 // Activate: any file that was written (for diagnostics / `vibe status`),
 // whether the user needs to restart their frontend, the env vars to print,
@@ -36,6 +53,16 @@ type Result struct {
 	// Kind is the frontend kind that produced this Result. Used by
 	// Deactivate to pick a teardown path; not all kinds need one.
 	Kind string
+
+	// Args is p.Frontend.Args with ${VAR} placeholders expanded (e.g.
+	// ${MODEL_ALIAS} -> the resolved canonical model id). Populated for
+	// kind=managed regardless of foreground/background so callers that
+	// exec the binary themselves (`vibe run`, cmd_run.go) don't have to
+	// duplicate the expansion the managed driver already does internally —
+	// using the profile's own raw Args there passed placeholders straight
+	// to the child binary unexpanded (found via omp's "${MODEL_ALIAS}" not
+	// found" error, 2026-07-14).
+	Args []string
 
 	// teardown, when non-nil, is invoked by Deactivate to undo whatever
 	// Activate did (e.g. `docker compose down`). It must be safe to call
@@ -75,8 +102,14 @@ func activate(reqCtx context.Context, p *profile.Profile, ctx profile.ExpandCont
 		if foreground {
 			// Render the config file + env, but don't spawn the binary.
 			// `vibe run` will exec the binary in the caller's terminal so
-			// TUI frontends like opencode get attached stdio.
+			// TUI frontends like opencode get attached stdio — using its own
+			// exec path (cmd_run.go), so it needs the expanded args back
+			// rather than expanding them itself a second time.
 			resolved, env, err := writeFrontendConfig(p, &ctx)
+			if err != nil {
+				return nil, err
+			}
+			args, err := expandArgs(p, ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -85,6 +118,7 @@ func activate(reqCtx context.Context, p *profile.Profile, ctx profile.ExpandCont
 				RestartRequired: p.Frontend.RestartRequired,
 				Env:             env,
 				Kind:            profile.FrontendManaged,
+				Args:            args,
 			}, nil
 		}
 		return defaultManaged().Activate(reqCtx, p, ctx)

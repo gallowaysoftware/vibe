@@ -156,13 +156,9 @@ func (m *managedDriver) Activate(reqCtx context.Context, p *profile.Profile, ctx
 	// write_file templates receive — otherwise "vibe-local/${MODEL_ALIAS}"
 	// would reach the binary as a literal and fail only at first use.
 	// Expanded after writeFrontendConfig so ${WRITE_FILE} resolves too.
-	args := make([]string, len(p.Frontend.Args))
-	for i, a := range p.Frontend.Args {
-		ea, err := profile.ExpandPathString(a, ctx)
-		if err != nil {
-			return nil, fmt.Errorf("expand args[%d] %q: %w", i, a, err)
-		}
-		args[i] = ea
+	args, err := expandArgs(p, ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	proc, err := m.startProcess(reqCtx, p.Frontend.Binary, args, envSlice, p.Frontend.Workdir)

@@ -111,7 +111,21 @@ func runCmd() *cobra.Command {
 			// coding frontends we ship (pi, opencode) accept `--session <id>`
 			// to continue an existing session by id; append it after the
 			// profile's static args so a profile-level arg can't clobber it.
-			childArgs := append([]string(nil), p.Frontend.Args...)
+			//
+			// Use the daemon's expanded args (r.Frontend.Args), not the
+			// locally-loaded p.Frontend.Args — the local copy still has raw
+			// ${VAR} placeholders (e.g. ${MODEL_ALIAS}) since only the
+			// daemon has the ExpandContext to resolve them. Passing the raw
+			// profile's args here reached the child binary unexpanded and
+			// failed at first use (found via omp's "${MODEL_ALIAS} not
+			// found" error, 2026-07-14). Fall back to the raw args only if
+			// an old daemon binary hasn't been reinstalled yet.
+			var childArgs []string
+			if r.Frontend != nil && len(r.Frontend.Args) > 0 {
+				childArgs = append([]string(nil), r.Frontend.Args...)
+			} else {
+				childArgs = append([]string(nil), p.Frontend.Args...)
+			}
 			if session != "" {
 				childArgs = append(childArgs, "--session", session)
 			}

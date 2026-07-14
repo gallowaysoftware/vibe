@@ -85,6 +85,12 @@ message FrontendInfo {
   // the wait_for entry with a "/" path). Empty when neither applies —
   // the CLI omits the browser hint in that case.
   string url = 6;
+  // args is frontend.Args with ${VAR} placeholders already expanded (e.g.
+  // ${MODEL_ALIAS} -> the resolved canonical model id). Only populated for
+  // kind=managed foreground activations (`vibe run`) — that's the one path
+  // where the CLI itself execs the binary and must not re-derive expansion
+  // client-side (it doesn't have the daemon's ExpandContext).
+  repeated string args = 7;
 }
 
 message StatusRequest {}

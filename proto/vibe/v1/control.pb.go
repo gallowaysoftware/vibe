@@ -269,7 +269,13 @@ type FrontendInfo struct {
 	// from profile.Frontend.BrowserURL() (explicit frontend.url field or
 	// the wait_for entry with a "/" path). Empty when neither applies —
 	// the CLI omits the browser hint in that case.
-	Url           string `protobuf:"bytes,6,opt,name=url,proto3" json:"url,omitempty"`
+	Url string `protobuf:"bytes,6,opt,name=url,proto3" json:"url,omitempty"`
+	// args is frontend.Args with ${VAR} placeholders already expanded (e.g.
+	// ${MODEL_ALIAS} -> the resolved canonical model id). Only populated for
+	// kind=managed foreground activations (`vibe run`) — that's the one path
+	// where the CLI itself execs the binary and must not re-derive expansion
+	// client-side (it doesn't have the daemon's ExpandContext).
+	Args          []string `protobuf:"bytes,7,rep,name=args,proto3" json:"args,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -337,6 +343,13 @@ func (x *FrontendInfo) GetUrl() string {
 		return x.Url
 	}
 	return ""
+}
+
+func (x *FrontendInfo) GetArgs() []string {
+	if x != nil {
+		return x.Args
+	}
+	return nil
 }
 
 type StatusRequest struct {
@@ -1042,14 +1055,15 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\aProfile\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12 \n" +
 	"\vdescription\x18\x02 \x01(\tR\vdescription\x12\x12\n" +
-	"\x04path\x18\x03 \x01(\tR\x04path\"\x84\x02\n" +
+	"\x04path\x18\x03 \x01(\tR\x04path\"\x98\x02\n" +
 	"\fFrontendInfo\x12\x1d\n" +
 	"\n" +
 	"wrote_file\x18\x02 \x01(\tR\twroteFile\x12)\n" +
 	"\x10restart_required\x18\x03 \x01(\bR\x0frestartRequired\x12=\n" +
 	"\benv_vars\x18\x04 \x03(\v2\".vibe.v1.FrontendInfo.EnvVarsEntryR\aenvVars\x12\x12\n" +
 	"\x04kind\x18\x05 \x01(\tR\x04kind\x12\x10\n" +
-	"\x03url\x18\x06 \x01(\tR\x03url\x1a:\n" +
+	"\x03url\x18\x06 \x01(\tR\x03url\x12\x12\n" +
+	"\x04args\x18\a \x03(\tR\x04args\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x01\x10\x02R\x03app\"\x0f\n" +
