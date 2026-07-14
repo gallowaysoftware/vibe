@@ -1,0 +1,124 @@
+# toqui: the AI travel companion (topology.md UC3) — a self-hosted app that
+# is a plain client of the hum front (deploy/hum), like riff. APPLICATION:
+# it consumes hum's published :9000 for its LLM, deploys/upgrades on its own
+# lifecycle, and keeps ALL its data (trips, bookings, chat) in its own
+# postgres volume.
+#
+# It builds from a checkout of the toqui repo (github.com/gallowaysoftware/
+# toqui) — set TOQUI_SRC in .env to that checkout's path on the unraid box.
+# The upstream repo's own docker-compose.yml is the localhost/dev form; this
+# stack is the house-networked form (macvlan + hum), so it defines services
+# directly rather than overriding (compose can't un-publish the base file's
+# host ports).
+#
+# Networking (house pattern, same as deploy/riff):
+#   - `toqui` bridge (internal): backend ↔ postgres. No LAN exposure.
+#   - `macvlan` (br0 external): the web and API each get their own LAN IP
+#     (defaults .214 / .213) so NPM can proxy names to them, AND so the
+#     backend can reach hum at its macvlan IP (172.16.3.211). A bridge-only
+#     container CANNOT reach a macvlan IP (host isolation) — that's why the
+#     backend must be on macvlan, exactly like riff-webui.
+#   - No host port maps — macvlan has no NAT; sanity-check from another LAN
+#     box, never the unraid shell.
+#
+# Prereqs: br0 macvlan exists on unraid; hum is up (deploy/hum). NPM proxy
+# hosts + the .env are in the README. Keep it LAN/VPN-or-NPM-only; TARGET_ENV
+# defaults to `local` so the app uses Bearer/localStorage auth (no cookies) —
+# see the README note on the /debug + reflection surface.
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: toqui-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: toqui
+      POSTGRES_USER: toqui
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - /mnt/user/appdata/toqui/postgres:/var/lib/postgresql/data
+    networks: [toqui]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U toqui"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  migrate:
+    build:
+      context: ${TOQUI_SRC:?set TOQUI_SRC to the toqui checkout}/backend
+    container_name: toqui-migrate
+    entrypoint: ["/migrate"]
+    command: ["-direction", "up"]
+    environment:
+      DATABASE_URL: "postgres://toqui:${POSTGRES_PASSWORD}@postgres:5432/toqui?sslmode=disable"
+    networks: [toqui]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  backend:
+    build:
+      context: ${TOQUI_SRC}/backend
+    container_name: toqui-backend
+    restart: unless-stopped
+    environment:
+      PORT: "8090"
+      DATABASE_URL: "postgres://toqui:${POSTGRES_PASSWORD}@postgres:5432/toqui?sslmode=disable"
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env — openssl rand -hex 32}
+      # Public origins (drive CORS + share links). The web app calls the API
+      # from the browser, so CORS must allow the app's public origin.
+      FRONTEND_URL: ${TOQUI_APP_URL:?set TOQUI_APP_URL in .env}
+      CORS_ALLOWED_ORIGINS: ${TOQUI_APP_URL}
+      # LLM via the hum front. Any non-empty key; hum has no auth of its own.
+      AI_PROVIDER: openai
+      OPENAI_API_KEY: vibe-local
+      OPENAI_BASE_URL: ${HUM_URL:?set HUM_URL in .env}/v1
+      # Swap-safe tier mapping (topology.md UC3): all three tiers → one
+      # co-resident tools def so a tool-loop turn never swap-storms a cell.
+      OPENAI_MODEL_FAST: ${TOQUI_MODEL:-qwen3.6-27b-tools}
+      OPENAI_MODEL_SMART: ${TOQUI_MODEL:-qwen3.6-27b-tools}
+      OPENAI_MODEL_BEST: ${TOQUI_MODEL:-qwen3.6-27b-tools}
+      # Internet-facing (the iOS app reaches the API through NPM), so gate
+      # registration to your own domain(s).
+      ALLOWED_EMAIL_DOMAINS: ${ALLOWED_EMAIL_DOMAINS:?set ALLOWED_EMAIL_DOMAINS in .env}
+      # 0 = keep chat forever (personal deploy).
+      CHAT_RETENTION_DAYS: ${CHAT_RETENTION_DAYS:-0}
+    networks:
+      toqui: {}
+      macvlan:
+        ipv4_address: ${TOQUI_API_IPV4:-172.16.3.213}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    labels:
+      net.unraid.docker.webui: "http://${TOQUI_API_IPV4:-172.16.3.213}:8090/healthz"
+      net.unraid.docker.shell: "sh"
+
+  frontend:
+    build:
+      context: ${TOQUI_SRC}
+    container_name: toqui-frontend
+    restart: unless-stopped
+    environment:
+      # The browser reads this from /config.json and calls the API directly,
+      # so it must be the API's PUBLIC url (NPM), not an internal address.
+      EXPO_PUBLIC_API_URL: ${TOQUI_API_URL:?set TOQUI_API_URL in .env}
+      EXPO_PUBLIC_PUBLIC_URL: ${TOQUI_APP_URL}
+    networks:
+      macvlan:
+        ipv4_address: ${TOQUI_WEB_IPV4:-172.16.3.214}
+    depends_on:
+      - backend
+    labels:
+      net.unraid.docker.webui: "http://${TOQUI_WEB_IPV4:-172.16.3.214}:8080"
+      net.unraid.docker.shell: "sh"
+
+networks:
+  toqui:
+    driver: bridge
+  macvlan:
+    external: true
+    name: br0
