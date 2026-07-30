@@ -14,8 +14,9 @@
 #     another LAN box, not the unraid shell.
 #
 # Prereqs: br0 is an existing macvlan network on unraid (Settings → Docker).
-# .env (sibling of this file): optional — HUM_IPV4, and ANTHROPIC_API_KEY
-# if/when the anthropic peer is enabled in the config.
+# .env (sibling of this file): optional — HUM_IPV4, and ANTHROPIC_API_KEY /
+# MOONSHOT_API_KEY if/when the corresponding cloud peer is enabled in the
+# config.
 
 services:
 
@@ -28,9 +29,11 @@ services:
     volumes:
       - /mnt/user/appdata/hum/front/config.yaml:/app/config.yaml:ro
     environment:
-      # Consumed by ${env.ANTHROPIC_API_KEY} in config.yaml if the
-      # anthropic peer is enabled there; empty is fine until then.
+      # Consumed by ${env.ANTHROPIC_API_KEY} / ${env.MOONSHOT_API_KEY} in
+      # config.yaml if the corresponding peer is enabled there; empty is
+      # fine until then.
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:-}
     networks:
       macvlan:
         ipv4_address: ${HUM_IPV4:-172.16.3.211}

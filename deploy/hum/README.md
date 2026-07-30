@@ -23,7 +23,8 @@ the share as the preferred source.
   pattern: the front sits on the `br0` macvlan with its own static LAN IP
   (`HUM_IPV4`, default 172.16.3.211) — a real host on the network, no
   port NAT. `.env` is optional: `HUM_IPV4` to override the default IP, and
-  `ANTHROPIC_API_KEY` if/when the anthropic peer is enabled in the config.
+  `ANTHROPIC_API_KEY` / `MOONSHOT_API_KEY` if/when the corresponding cloud
+  peer is enabled in the config.
 - `front-config.example.yaml` — the peers-only llama-swap config; copy to
   `<appdata>/hum/front/config.yaml` and fill in real cell addresses/model
   lists.

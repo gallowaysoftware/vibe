@@ -45,3 +45,18 @@ peers:
   #   models:
   #     - claude-opus-4-8
   #     - claude-sonnet-5
+
+  # Moonshot AI (Kimi) — OpenAI-compatible, so llama-swap's plain proxy
+  # forwards the request as-is; Moonshot applies its own chat template
+  # server-side (no --jinja / local template concern, unlike the GPU
+  # cells' llama_server backends). Uncomment AND set MOONSHOT_API_KEY in
+  # the stack .env first (same empty-key caveat as anthropic above).
+  # proxy is the bare origin (no /v1) — same shape as the anthropic peer
+  # above: llama-swap forwards the incoming .../v1/chat/completions path
+  # as-is, so a proxy value ending in /v1 double-appends it and Moonshot
+  # 404s the request.
+  # kimi:
+  #   proxy: https://api.moonshot.ai
+  #   apiKey: ${env.MOONSHOT_API_KEY}
+  #   models:
+  #     - kimi-k3
