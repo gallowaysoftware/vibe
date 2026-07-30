@@ -141,6 +141,10 @@ func Schema() *schemaProperty {
 				Type:        "boolean",
 				Description: "Use the model's Jinja chat template (--jinja).",
 			},
+			"chat_template_file": {
+				Type:        "string",
+				Description: "Path to a Jinja chat template that overrides the one embedded in the GGUF (--chat-template-file). Pin this on tool-calling profiles: quantizers have repeatedly shipped GGUFs whose embedded template breaks OpenAI-style tool calls, then fixed them via silent re-uploads. Requires jinja: true.",
+			},
 			"port": {
 				Type:        "integer",
 				Description: "Pins the host port llama-server publishes on. Zero / unset lets the daemon pick a free port. Useful for service-mode profiles whose clients expect a stable address.",

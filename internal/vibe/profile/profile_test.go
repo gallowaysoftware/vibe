@@ -1379,6 +1379,82 @@ frontend:
 	}
 }
 
+func TestLoad_ChatTemplateFile_OnDisk(t *testing.T) {
+	model := stubModelFile(t)
+	tmpl := filepath.Join(t.TempDir(), "qwen3-coder-tools.jinja")
+	if err := os.WriteFile(tmpl, []byte("{{ messages }}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	yaml := `
+name: code
+backend:
+  llama_server:
+    path: ` + model + `
+    chat_template_file: ` + tmpl + `
+    jinja: true
+    alias: qwen
+    context: 8192
+frontend:
+  kind: external
+  write_file: /tmp/x.json
+  template: {a: 1}
+`
+	p, err := Load(writeProfile(t, yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if p.Backend.LlamaServer.ChatTemplateFile != tmpl {
+		t.Errorf("chat_template_file = %q, want %q", p.Backend.LlamaServer.ChatTemplateFile, tmpl)
+	}
+}
+
+func TestLoad_ChatTemplateFile_RejectsMissingFile(t *testing.T) {
+	model := stubModelFile(t)
+	yaml := `
+name: code
+backend:
+  llama_server:
+    path: ` + model + `
+    chat_template_file: /nonexistent/tools.jinja
+    jinja: true
+    alias: q
+    context: 1024
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
+`
+	_, err := Load(writeProfile(t, yaml))
+	if err == nil {
+		t.Fatal("expected error for missing chat_template_file")
+	}
+	if !strings.Contains(err.Error(), "chat_template_file") {
+		t.Errorf("err = %v, want mention of chat_template_file", err)
+	}
+}
+
+func TestLoad_ChatTemplateFile_RequiresJinja(t *testing.T) {
+	model := stubModelFile(t)
+	tmpl := filepath.Join(t.TempDir(), "tools.jinja")
+	if err := os.WriteFile(tmpl, []byte("{{ messages }}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	yaml := `
+name: code
+backend:
+  llama_server:
+    path: ` + model + `
+    chat_template_file: ` + tmpl + `
+    alias: q
+    context: 1024
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
+`
+	_, err := Load(writeProfile(t, yaml))
+	if err == nil {
+		t.Fatal("expected error for chat_template_file without jinja")
+	}
+	if !strings.Contains(err.Error(), "jinja") {
+		t.Errorf("err = %v, want mention of jinja", err)
+	}
+}
+
 func TestLoad_MMProj_RejectsMissingFile(t *testing.T) {
 	model := stubModelFile(t)
 	yaml := `

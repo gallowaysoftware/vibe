@@ -58,6 +58,43 @@ frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 	}
 }
 
+// chat_template_file is expanded in Backend.normalize() like the other backend
+// path fields, so a referenced backend must get the same treatment as an
+// inline one — validation stats the path and would fail on a literal "~".
+func TestLoadBackend_ChatTemplateFileTildeExpanded(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tmpl := filepath.Join(home, "templates", "qwen3-coder-tools.jinja")
+	if err := os.MkdirAll(filepath.Dir(tmpl), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmpl, []byte("{{ messages }}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	writeBackend(t, "qwen", `
+name: qwen
+backend:
+  llama_server:
+    path: ~/m.gguf
+    huggingface: {repo: a/b, file: m.gguf}
+    chat_template_file: ~/templates/qwen3-coder-tools.jinja
+    jinja: true
+    alias: q
+    context: 1024
+`)
+	p, err := Load(writeProfile(t, `
+name: coder
+backend_ref: qwen
+frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := p.Backend.LlamaServer.ChatTemplateFile; got != tmpl {
+		t.Errorf("chat_template_file = %q, want %q", got, tmpl)
+	}
+}
+
 func TestBackendRef_ProfileOverridesVRAM(t *testing.T) {
 	writeBackend(t, "qwen", `
 name: qwen

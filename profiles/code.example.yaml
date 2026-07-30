@@ -26,6 +26,14 @@ backend:
     cache_type_k: q8_0
     cache_type_v: q8_0
     jinja: true
+    # opencode sends an OpenAI `tools` array, and `jinja: true` alone only
+    # promises "render whatever template this GGUF happens to carry" — early
+    # Qwen3-Coder quants shipped a template that broke tool calls and were
+    # re-uploaded fixed in place, so a GGUF pulled before that keeps the broken
+    # one. Uncomment to pin a known-good template if tool calls misbehave.
+    # What the running backend actually resolved:
+    #   curl -s ${VIBE_API%/v1}/props | jq .chat_template_caps
+    # chat_template_file: ~/models/templates/qwen3-coder-tools.jinja
     extra_args:
       - --no-mmap
 
