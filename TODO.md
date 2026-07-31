@@ -18,7 +18,7 @@
   moves to the utility cell).
 
 - **Front + chat-client bring-up.** Design at `docs/design/topology.md`;
-  reference stacks at `deploy/hum` (front router). Landed across
+  reference stack at `deploy/front` (front router). Landed across
   2026-07-13: the front cell serving a federated catalog over the LAN,
   an Open WebUI instance pointed at it, and the model library seeded to
   NAS storage. Reusable lessons kept from that work:

@@ -6,6 +6,10 @@ ergonomics), an adversarial claim-verification pass, and a three-designer /
 two-judge panel. Both judges independently picked the adopt-first design as
 base; the grafts from the two native designs are folded in and marked.
 
+Host and model names throughout refer to a *reference fleet* — the one
+this design was proven against. Substitute your own; the mechanics are
+what transfer.
+
 **This document supersedes the router/lifecycle half of
 [fleet.md](fleet.md):** fleet.md §6 (router v2: routes.yaml chains,
 format-affinity walker, pre-first-byte fallback, `max_concurrency`), the

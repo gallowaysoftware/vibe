@@ -22,13 +22,16 @@ folded in and marked where the decision was contested.
 
 The fleet is growing from one box to four:
 
-| host | hardware | role |
+| host | hardware class | role |
 |---|---|---|
-| `localmodel` (existing) | 9950X3D, 64GB, RTX 5090 32GB, CachyOS | controller: vibe daemon, fast-decode dense models (27-31B), ComfyUI/media, OWUI, coding frontends |
-| `spark-1` (incoming) | DGX Spark GB10, 128GB unified, aarch64 | big-MoE serving (head node for dual-node vLLM) |
-| `spark-2` (incoming) | DGX Spark GB10, 128GB unified, aarch64 | big-MoE serving (dual-node worker) or independent single-node serving |
-| `llamaloft` (probable) | RTX 3080 Ti 12GB, CachyOS | always-on utility plane: embed, rerank, classifier, STT, TTS |
-| cloud | Anthropic (+ optional OpenAI-compat keys) | fallback + frontier-model routes |
+| `gpu-cell` | desktop GPU, 24-32GB VRAM | controller: vibe daemon, fast-decode dense models, ComfyUI/media, coding frontends |
+| `heavy-1` | large unified memory, fast interconnect | big-MoE serving (head node for multi-node serving) |
+| `heavy-2` | same | multi-node worker, or independent single-node serving |
+| `utility-cell` | small always-on GPU, 12GB class | always-on utility plane: embed, rerank, classifier, STT, TTS |
+| cloud | an API key (Anthropic and/or OpenAI-compatible) | explicit frontier-model routes |
+
+(Host names and hardware describe a *reference fleet*; the roles are the
+transferable part, and they recur throughout this document.)
 
 vibe today is a single-host daemon: one active GPU profile + service-mode
 sidecars, an OpenAI proxy on :9000 that routes by model id, `exec.Command`

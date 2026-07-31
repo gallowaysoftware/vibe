@@ -1,6 +1,9 @@
-# hum front config: llama-swap, peers only — the front owns no models and
-# no GPU. Lives at <appdata>/hum/front/config.yaml on the hum host (the
-# docker-compose.yaml bind mount).
+# Front config: llama-swap, peers only — the front owns no models and no
+# GPU. Lives at the path the docker-compose.yaml bind-mounts.
+#
+# EXAMPLE VALUES. Peer names, hostnames and model ids below describe a
+# reference fleet; replace them with your own cells. The shape is what
+# matters: one peer per cell, each listing the model ids that cell serves.
 #
 # HAND-MAINTAINED FOR NOW. Note the per-peer `models:` lists are explicit,
 # so adding a backend def on a cell means adding its id here too — that
@@ -8,32 +11,28 @@
 # §3 item 1) is the first build item; once it lands, vibe renders + pushes
 # this file and hand-editing stops.
 #
-# Cells must listen on their LAN address (not 127.0.0.1) once the front
-# moves here — flip localmodel's unit to `-listen 0.0.0.0:9000` (LAN is
-# VPN-gated; add peer apiKey later if that ever changes).
+# Cells must listen on their LAN address, not 127.0.0.1, once a front
+# fronts them (`-listen 0.0.0.0:9000`). If the LAN is not otherwise
+# gated, give each peer an apiKey.
 
 sendLoadingState: true   # relays cells' loading bytes to clients (proven unbuffered)
 
 peers:
   # GPU cells — each is that box's own llama-swap, which owns JIT/TTL/swap.
-  localmodel:
-    proxy: http://localmodel:9000
+  gpu-cell:                          # a workstation-class GPU box
+    proxy: http://gpu-cell-host:9000
     models:
-      - qwen3.6-27b
-      - qwen3.6-27b-mtp-q6_k
-      - qwen3.6-27b-tools
-      - gemma-4-31b
-      - gemma-4-31b-it
-      - gemma-4-31b-mm
-      - gemma-4-31b-tools
-      - qwen2.5-coder-7b
+      - <chat-model>
+      - <chat-model>-tools           # the tool-calling def, if separate
+      - <vision-model>
+      - <coder-model>
       - comfyui
-  # llamaloft:                       # uncomment when the 3080 Ti box is up
-  #   proxy: http://llamaloft:9000
+  # utility-cell:                    # small always-warm service models
+  #   proxy: http://utility-cell-host:9000
   #   models: [bge-embed, rerank, classifier, kokoro-tts, whisper]
-  # spark:                           # uncomment when the pair is commissioned
-  #   proxy: http://spark-1:9000
-  #   models: [dsv4flash, qwen3-coder-next]
+  # heavy-cell:                      # large-model host
+  #   proxy: http://heavy-cell-host:9000
+  #   models: [<big-model>]
 
   # Cloud — explicit model ids, never a fallback target. Disabled until a
   # key is wanted: uncomment AND set ANTHROPIC_API_KEY in the stack .env

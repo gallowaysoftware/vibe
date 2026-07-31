@@ -1,0 +1,49 @@
+# The fleet front: an always-on llama-swap router (docs/design/topology.md
+# §1). INFRA — this is the stable :9000 every client in the fleet points
+# at, forever. Applications that consume it are separate stacks with their
+# own lifecycles; nothing else belongs in this one.
+#
+# REFERENCE STACK. It runs as-is on a macvlan-capable Docker host once
+# .env is filled; adapt the networking to your own setup.
+#
+# Networking (the pattern this example uses):
+#   - `macvlan` (an external network, `br0` here): the front gets its own
+#     LAN IP so it appears as a real host — THE fleet address. GPU cells,
+#     chat stacks, coding harnesses and phones all dial
+#     http://<FRONT_IPV4>:9000. No port mapping — macvlan has no NAT; the
+#     container's listen port is reachable directly on its IP.
+#   - macvlan/host isolation caveat: the Docker host itself cannot reach
+#     this IP (and vice versa) without a macvlan shim. Sanity-check from
+#     another LAN box, not the host's own shell.
+#
+# Prereqs: the external macvlan network exists; the front config file is
+# in place at FRONT_CONFIG. .env (sibling of this file): FRONT_IPV4,
+# FRONT_CONFIG, and ANTHROPIC_API_KEY if a cloud peer is enabled.
+
+services:
+
+  front:
+    image: ghcr.io/mostlygeek/llama-swap:cpu
+    container_name: ${FRONT_NAME:-fleet-front}
+    restart: unless-stopped
+    # The image defaults to listening on 8080; pin the canonical fleet port.
+    command: ["-config", "/app/config.yaml", "-listen", ":9000"]
+    volumes:
+      # The peers config (see front-config.example.yaml).
+      - ${FRONT_CONFIG:?set FRONT_CONFIG to the front config.yaml path}:/app/config.yaml:ro
+    environment:
+      # Consumed by ${env.ANTHROPIC_API_KEY} in config.yaml if the
+      # anthropic peer is enabled there; empty is fine until then.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    networks:
+      macvlan:
+        ipv4_address: ${FRONT_IPV4:?set FRONT_IPV4 to the front's LAN address}
+    labels:
+      # Unraid convenience labels; harmless elsewhere.
+      net.unraid.docker.webui: "http://${FRONT_IPV4}:9000/ui"
+      net.unraid.docker.shell: "sh"
+
+networks:
+  macvlan:
+    external: true
+    name: ${MACVLAN_NETWORK:-br0}
