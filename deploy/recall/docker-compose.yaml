@@ -1,0 +1,42 @@
+# recall: the fleet's personal-memory service (git-backed markdown per
+# expert). House networking pattern: br0 macvlan so riff (also macvlan)
+# and LAN/VPN clients reach it directly. Remember the macvlan gotcha:
+# the unraid host itself cannot reach RECALL_IPV4 — check from another
+# LAN box.
+#
+# The memory root is a LOCAL git repository living in appdata. It is
+# the only irreplaceable data on this box that cannot be re-derived
+# from any source — back it up accordingly (it is small; the whole
+# point is that it's just markdown + .git). Adding a private remote
+# later is one `git remote add` away and the service needs no change.
+#
+# Endpoints (:8092): /mcp (MCP streamable HTTP tools), /digest?expert=
+# (injection block for harness hooks), /healthz.
+#
+# Prereqs: RECALL_SRC points at a vibe repo checkout; .env sets
+# RECALL_IPV4 if the default collides.
+
+services:
+  recall:
+    build:
+      context: ${RECALL_SRC:?set RECALL_SRC to the vibe repo checkout path}
+      dockerfile: deploy/recall/Dockerfile
+    container_name: recall
+    restart: unless-stopped
+    environment:
+      TARGET_ENV: prod
+      PORT: "8092"
+      RECALL_ROOT: /data/memories
+    volumes:
+      - /mnt/user/appdata/recall/memories:/data/memories
+    networks:
+      macvlan:
+        ipv4_address: ${RECALL_IPV4:-172.16.3.215}
+    labels:
+      net.unraid.docker.webui: "http://${RECALL_IPV4:-172.16.3.215}:8092/healthz"
+      net.unraid.docker.shell: "sh"
+
+networks:
+  macvlan:
+    external: true
+    name: br0
