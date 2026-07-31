@@ -26,7 +26,7 @@ rules:
     note: |
       "F-150" -> "F 150" (heard "eff minus one fifty"). Catches model
       numbers, vehicle designations, single-letter labels. Doesn't
-      touch "Lesson 10 - SAQ" because the hyphen has spaces.
+      touch "Chapter 10 - Intro" because the hyphen has spaces.
 
   - regex: '\b([A-Za-z]{2,})-([0-9]+)\b'
     replacement: '$1 $2'
@@ -83,18 +83,6 @@ rules:
 
   # ---- Acronyms Kokoro mangles ----
 
-  - pattern: 'CRA'
-    replacement: 'C R A'
-    note: 'Canada Revenue Agency — heard as "krah" otherwise.'
 
-  - pattern: 'LAA'
-    replacement: 'L A A'
-    note: 'Litres of absolute alcohol — common in course content.'
 
-  - pattern: 'ABV'
-    replacement: 'A B V'
-    note: 'Alcohol by volume.'
 
-  - pattern: 'SAQ'
-    replacement: 'S A Q'
-    note: 'Self-assessment question — appears in course lesson titles.'

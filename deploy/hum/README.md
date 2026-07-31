@@ -2,13 +2,13 @@
 
 hum is the always-on llama-swap front from `docs/design/topology.md`: the
 stable `:9000` every client in the fleet — chat apps, coding harnesses,
-toqui, vamp — points at, forever. Peers-only config: it owns no models and
+vamp — points at, forever. Peers-only config: it owns no models and
 no GPU (the `:cpu` image is a pure Go proxy); the GPU cells it federates
 own JIT/TTL/swap. Cells appearing or disappearing changes the catalog,
 never this address.
 
-This stack is infrastructure. Applications that consume it (the riff chat
-stack, toqui, the future fleet dashboard) live in their own stacks and
+This stack is infrastructure. Applications that consume it (chat
+stacks, self-hosted apps, dashboards) live in their own stacks and
 treat hum's published `:9000` like any other client would.
 
 The same host should also carry the fleet's **model library** — a bulk
@@ -41,7 +41,7 @@ the share as the preferred source.
    real key here, remove localmodel's `anthropic` def at the same time or
    claude ids appear twice in hum's catalog.)
 4. Repoint clients at `http://<HUM_IPV4>:9000/v1` as they come up for
-   changes (riff via its `HUM_URL`; coding harnesses; toqui).
+   changes (chat stacks via their `HUM_URL`; coding harnesses).
 
 Keep `:9000` LAN/VPN-only (no NPM proxy host for it) unless a real need
 appears; the API surface has no auth of its own.

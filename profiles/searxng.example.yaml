@@ -9,8 +9,8 @@ description: SearXNG metasearch — web search backend for vamp pipelines that f
 mode: service
 
 # Why this profile exists:
-#   Several example pipelines (it-is-important-to-note, textbook-to-audiobook,
-#   chat-with-search) require SearXNG. Before this profile existed each
+#   Search-enabled example pipelines (e.g. examples' chat-with-search)
+#   require SearXNG. Before this profile existed each
 #   pipeline shipped a setup hint pointing at a raw `docker compose up` of
 #   ~/.config/vibe/compose/searxng/. That worked, but left lifecycle
 #   management outside vibe — pipelines couldn't ask vibe to bring it up,

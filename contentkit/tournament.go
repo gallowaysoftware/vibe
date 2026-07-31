@@ -33,7 +33,7 @@ type TournamentConfig struct {
 // Tournament wires generate-N-pick-best: several independent drafts at varied
 // temperatures, then a judge that selects (and optionally merges) the funniest /
 // strongest. Comparison is more reliable than single-shot generation for
-// subjective quality. This is brainrot's draft_a/b/c→bakeoff, generalised.
+// subjective quality. Generalised from the draft-a/b/c→bakeoff pattern used by the content pipelines.
 // Returns the judge stage (the winner) and the draft stages.
 func Tournament(p *vamp.Pipeline, cfg TournamentConfig) (judge *vamp.TextStage, drafts []*vamp.TextStage) {
 	if cfg.DraftTokens == 0 {

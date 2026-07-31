@@ -67,7 +67,7 @@ type Config struct {
 	BindAll bool `yaml:"bind_all,omitempty"`
 	// ClientAPIURL, when set, is what rendered frontend configs get for
 	// ${VIBE_API} instead of the local proxy port — e.g.
-	// "http://172.16.3.211:9000" once a fleet front (hum) exists, so
+	// "http://<fleet-front-host>:9000" once a fleet front exists, so
 	// coding harnesses on this box see the whole fleet catalog (cells +
 	// cloud) instead of just this box's own cell. Purely a client-facing
 	// override: internal bookkeeping (readiness checks, ComfyUI's

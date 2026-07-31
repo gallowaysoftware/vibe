@@ -2399,8 +2399,10 @@ var templateFuncMap = template.FuncMap{
 	"stripToHeading":             stripToHeadingTemplate,
 	"readFiles":                  readFilesTemplate,
 	"readFilesOrEmpty":           readFilesOrEmptyTemplate,
-	"readLessons":                readLessonsTemplate,
-	"enumerateLessons":           enumerateLessonsTemplate,
+	"readFileBatch":              readLessonsTemplate,
+	"readLessons":                readLessonsTemplate, // deprecated alias
+	"enumerateDirs":              enumerateLessonsTemplate,
+	"enumerateLessons":           enumerateLessonsTemplate, // deprecated alias
 	"mergeJSON":                  mergeJSONTemplate,
 	"parseJSON":                  parseJSONTemplate,
 	"toJSON":                     toJSONTemplate,
@@ -2418,7 +2420,8 @@ var templateFuncMap = template.FuncMap{
 	"parseArxiv":                 parseArxivTemplate,
 	"enumerateImagePairs":        enumerateImagePairsTemplate,
 	"enumerateUniqueImages":      enumerateUniqueImagesTemplate,
-	"imageDescriptionsForLesson": imageDescriptionsForLessonTemplate,
+	"imageDescriptionsFor":       imageDescriptionsForLessonTemplate,
+	"imageDescriptionsForLesson": imageDescriptionsForLessonTemplate, // deprecated alias
 	"extractSVGText":             extractSVGTextTemplate,
 	"chunkParagraphs":            chunkParagraphsTemplate,
 	"ttsNormalize":               ttsNormalizeTemplate,
@@ -3373,7 +3376,8 @@ func readFilesTemplate(pattern string) (string, error) {
 	return readFilesFromMatches(filtered)
 }
 
-// readLessonsTemplate paginates sorted lesson files from a module into batches.
+// readLessonsTemplate paginates a sorted glob of files into batches
+// (exposed as readFileBatch; readLessons is the deprecated alias).
 // Args: path (glob pattern), batch (1-indexed), total (number of batches).
 // Skips files > 200 KB (math textbooks, etc.). Returns files for the
 // requested batch so a 128-token context window isn't exceeded.
