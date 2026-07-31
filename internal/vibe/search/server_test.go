@@ -111,9 +111,11 @@ func TestSearchPassesPaginationAndLimits(t *testing.T) {
 	p := &stubProvider{resp: &Response{}}
 	ts := newTestServer(t, &Server{Provider: p, Fetcher: &stubFetcher{name: "direct"}})
 
-	if _, err := http.Get(ts.URL + "/search?q=x&pageno=3&limit=7&days=5"); err != nil {
+	resp, err := http.Get(ts.URL + "/search?q=x&pageno=3&limit=7&days=5")
+	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
+	resp.Body.Close()
 	if p.last.Page != 3 || p.last.Limit != 7 || p.last.Recency != 5 {
 		t.Errorf("query = %+v, want page 3 limit 7 recency 5", p.last)
 	}
