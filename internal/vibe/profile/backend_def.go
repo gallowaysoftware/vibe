@@ -172,6 +172,7 @@ func (b *Backend) normalize() {
 		b.LlamaServer.Binary = expandTilde(b.LlamaServer.Binary)
 		b.LlamaServer.MMProj = expandTilde(b.LlamaServer.MMProj)
 		b.LlamaServer.DraftModel = expandTilde(b.LlamaServer.DraftModel)
+		b.LlamaServer.ChatTemplateFile = expandTilde(b.LlamaServer.ChatTemplateFile)
 	}
 	if b.HTTPServer != nil {
 		for i, v := range b.HTTPServer.Volumes {

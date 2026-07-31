@@ -112,7 +112,8 @@ optional.)
   hooks still run.
 - Backend path fields (`backend.llama_server.path`,
   `backend.llama_server.binary`, `backend.llama_server.mmproj`,
-  `backend.llama_server.draft_model`, `backend.comfyui.dir`,
+  `backend.llama_server.draft_model`,
+  `backend.llama_server.chat_template_file`, `backend.comfyui.dir`,
   `backend.comfyui.python`, `backend.tabby_api.model_dir`,
   `backend.tabby_api.venv`, `backend.tabby_api.repo`,
   `backend.tabby_api.draft_model_dir`, `backend.http_server.binary`,
@@ -125,6 +126,25 @@ optional.)
   tilde-expanded in `internal/vibe/profile/profile.go:Load`. Add new
   backend path fields to `Backend.normalize()` and new frontend path
   fields to `Load`.
+- **Chat templates (`jinja` / `chat_template_file`).** `jinja: true`
+  emits `--jinja`, which renders whatever Jinja `chat_template` the
+  quantizer baked into the GGUF. That is the *only* thing it does — it
+  carries no guarantee the template can handle an OpenAI `tools` array.
+  Quantizers have repeatedly shipped tool-call-broken templates
+  (Qwen3-Coder, gpt-oss, Gemma 4) and fixed them by re-uploading in
+  place on the same HF repo, so a GGUF pulled before the fix keeps
+  rendering the broken one forever. `chat_template_file` pins an
+  explicit `.jinja` file via `--chat-template-file` for profiles whose
+  frontend does tool calling. Two constraints, both enforced in
+  `validateLlamaServer`: the file must exist (no HF pull path covers
+  it), and `jinja: true` is required — llama-server validates the
+  template as it parses the flag and only accepts an arbitrary file
+  once `--jinja` has been seen, so `LlamaServerSpec` also emits the two
+  flags in that order. To check what a running backend actually
+  resolved, `GET /props` reports `chat_template` and
+  `chat_template_caps`. Unrelated to vamp's per-request
+  `chat_template_kwargs` (that toggles variables *inside* whichever
+  template is loaded; this picks the template).
 - **Vision models (mmproj).** `backend.llama_server.mmproj` is the
   path to the multimodal projector GGUF that llama-server loads via
   `--mmproj`. Required to enable image input on vision-capable

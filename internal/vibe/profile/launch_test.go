@@ -2,6 +2,7 @@ package profile
 
 import (
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -155,7 +156,7 @@ func TestLlamaServerSpec_OmitsZeroValueFlags(t *testing.T) {
 	if spec.Binary != "llama-server" {
 		t.Errorf("binary = %q (empty should default to llama-server)", spec.Binary)
 	}
-	mustNotContain := []string{"--flash-attn", "--jinja", "--cache-type-k", "--cache-type-v", "--mmproj"}
+	mustNotContain := []string{"--flash-attn", "--jinja", "--cache-type-k", "--cache-type-v", "--mmproj", "--chat-template-file"}
 	for _, bad := range mustNotContain {
 		for _, a := range spec.Args {
 			if a == bad {
@@ -177,6 +178,35 @@ func TestLlamaServerSpec_OmitsZeroValueFlags(t *testing.T) {
 		if !found {
 			t.Errorf("missing expected flag %s in %v", good, spec.Args)
 		}
+	}
+}
+
+// llama-server parses --chat-template-file against the template validator in
+// flag order and rejects a model-specific file until --jinja has been seen, so
+// the relative order of the two flags is part of the contract, not cosmetic.
+func TestLlamaServerSpec_ChatTemplateFileFollowsJinja(t *testing.T) {
+	p := &Profile{
+		Backend: Backend{LlamaServer: &LlamaServerBackend{
+			Path:             "/m/qwen.gguf",
+			Alias:            "qwen",
+			Context:          8192,
+			Parallel:         1,
+			Jinja:            true,
+			ChatTemplateFile: "/m/templates/qwen3-coder-tools.jinja",
+			ExtraArgs:        []string{"--no-mmap"},
+		}},
+	}
+	spec, err := LlamaServerSpec(p, "llama-server", 8080)
+	if err != nil {
+		t.Fatalf("LlamaServerSpec: %v", err)
+	}
+	if v, ok := flagValue(spec.Args, "--chat-template-file"); !ok || v != "/m/templates/qwen3-coder-tools.jinja" {
+		t.Errorf("--chat-template-file: got %q (present=%v), want /m/templates/qwen3-coder-tools.jinja", v, ok)
+	}
+	jinjaAt := slices.Index(spec.Args, "--jinja")
+	tmplAt := slices.Index(spec.Args, "--chat-template-file")
+	if jinjaAt < 0 || tmplAt < jinjaAt {
+		t.Errorf("--chat-template-file must come after --jinja, got args: %v", spec.Args)
 	}
 }
 

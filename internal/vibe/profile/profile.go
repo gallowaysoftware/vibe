@@ -165,7 +165,19 @@ type LlamaServerBackend struct {
 	CacheTypeK  string       `yaml:"cache_type_k,omitempty"`
 	CacheTypeV  string       `yaml:"cache_type_v,omitempty"`
 	Jinja       bool         `yaml:"jinja,omitempty"`
-	ExtraArgs   []string     `yaml:"extra_args,omitempty"`
+	// ChatTemplateFile pins an explicit Jinja template (--chat-template-file)
+	// instead of the one embedded in the GGUF. Bare --jinja renders whatever
+	// template the quantizer happened to bake into the file, and for
+	// tool-calling models that has repeatedly been the wrong one: Qwen3-Coder,
+	// gpt-oss and Gemma 4 GGUFs all shipped templates that broke OpenAI-style
+	// tool calls, then got fixed by in-place re-uploads to the same HF repo —
+	// which an already-downloaded file never picks up. A profile whose
+	// frontend sends a `tools` array should pin the template rather than
+	// trust whatever is baked into the blob on disk. Requires Jinja —
+	// without it llama-server only accepts its small set of built-in template
+	// names and exits on an arbitrary file.
+	ChatTemplateFile string   `yaml:"chat_template_file,omitempty"`
+	ExtraArgs        []string `yaml:"extra_args,omitempty"`
 	// Port pins the host port llama-server publishes on. When set,
 	// the daemon uses this exact port instead of PickFreePort. Useful
 	// for service-mode profiles that pipelines reach by a stable
@@ -902,6 +914,17 @@ func validateLlamaServer(m *LlamaServerBackend) error {
 	if m.Binary != "" {
 		if err := validateExecutable("backend.llama_server.binary", m.Binary); err != nil {
 			return err
+		}
+	}
+	if m.ChatTemplateFile != "" {
+		// Catch the ordering constraint here rather than letting llama-server
+		// exit at start: it only accepts a template file once --jinja has been
+		// parsed, and vibe emits --jinja from this same struct.
+		if !m.Jinja {
+			return errors.New("backend.llama_server.chat_template_file requires jinja: true (llama-server rejects a template file unless --jinja precedes it)")
+		}
+		if _, err := os.Stat(m.ChatTemplateFile); err != nil {
+			return fmt.Errorf("backend.llama_server.chat_template_file %s: %w", m.ChatTemplateFile, err)
 		}
 	}
 	if m.Huggingface != nil && m.Huggingface.MMProjFile != "" && m.MMProj == "" {

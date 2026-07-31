@@ -47,6 +47,12 @@ func LlamaServerSpec(p *Profile, binary string, port int) (supervisor.LaunchSpec
 	if m.Jinja {
 		args = append(args, "--jinja")
 	}
+	// Must follow --jinja: llama-server validates the template as it parses
+	// the flag, and until --jinja has been seen it only accepts the names of
+	// its built-in templates, rejecting an arbitrary model-specific file.
+	if m.ChatTemplateFile != "" {
+		args = append(args, "--chat-template-file", m.ChatTemplateFile)
+	}
 	if m.MMProj != "" {
 		args = append(args, "--mmproj", m.MMProj)
 	}
