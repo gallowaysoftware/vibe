@@ -61,16 +61,45 @@ func TestDaemon_VRAMCheck_Sufficient(t *testing.T) {
 	}
 }
 
-// TestDaemon_VRAMCheck_Insufficient: profile estimate exceeds free VRAM, so
-// Start must fail with FailedPrecondition, the profile must NOT be active,
-// and no supervisor child should have been launched.
-func TestDaemon_VRAMCheck_Insufficient(t *testing.T) {
+// TestDaemon_VRAMCheck_Tight: an estimate above free memory but within the
+// machine's capacity is a warning, not a refusal — free memory is largely
+// reclaimable, so blocking here produced false negatives. Start proceeds.
+func TestDaemon_VRAMCheck_Tight(t *testing.T) {
 	setupXDG(t)
 	stub := stubModel(t)
 	writeProfile(t, "code", vramProfile("code", stub, 22.0))
 
 	d := makeDaemon(t)
 	d.SetVRAMProbe(func(context.Context) (float64, error) { return 14.3, nil })
+	// Pinned: a 16 GiB CI runner really cannot fit 22 GiB, so an ambient
+	// capacity probe turns this warn case into a refusal there.
+	d.SetCapacityProbe(func(context.Context) (float64, error) { return 64.0, nil })
+
+	client, _ := startDaemon(t, d)
+
+	startCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	res, err := client.Start(startCtx, "code")
+	if err != nil {
+		t.Fatalf("Start should proceed on a tight estimate, got: %v", err)
+	}
+	if res.Status == nil || !res.Status.Running {
+		t.Fatalf("status after Start = %+v; want running", res.Status)
+	}
+	t.Cleanup(func() { _, _ = client.Stop(context.Background()) })
+}
+
+// TestDaemon_VRAMCheck_ExceedsCapacity: an estimate larger than the whole
+// machine is the one case that still fails closed — the profile must NOT be
+// active and no supervisor child should have been launched.
+func TestDaemon_VRAMCheck_ExceedsCapacity(t *testing.T) {
+	setupXDG(t)
+	stub := stubModel(t)
+	writeProfile(t, "code", vramProfile("code", stub, 128.0))
+
+	d := makeDaemon(t)
+	d.SetVRAMProbe(func(context.Context) (float64, error) { return 1.0, nil })
+	d.SetCapacityProbe(func(context.Context) (float64, error) { return 64.0, nil })
 
 	client, _ := startDaemon(t, d)
 
@@ -84,13 +113,9 @@ func TestDaemon_VRAMCheck_Insufficient(t *testing.T) {
 	if !strings.Contains(msg, "failed_precondition") && !strings.Contains(msg, "FailedPrecondition") {
 		t.Errorf("err code = %v; want FailedPrecondition", err)
 	}
-	// The actionable text from daemon.go's message:
-	for _, want := range []string{
-		`"code"`,
-		"22.0 GiB",
-		"14.3 GiB",
-		"vibe stop",
-	} {
+	// The actionable text from daemon.go's message, including the escape
+	// hatch — a user staring at this needs to know it can be overridden.
+	for _, want := range []string{`"code"`, "in total", "--no-vram-check"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("err message %q missing %q", msg, want)
 		}

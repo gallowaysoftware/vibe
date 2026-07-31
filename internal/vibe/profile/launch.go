@@ -1,6 +1,7 @@
 package profile
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -248,6 +249,76 @@ func TabbyAPISpec(p *Profile) (supervisor.LaunchSpec, error) {
 		Args:      args,
 		Workdir:   filepath.Clean(t.Repo),
 		HealthURL: fmt.Sprintf("http://127.0.0.1:%d/health", t.Port),
+	}, nil
+}
+
+// MLXServerSpec returns the LaunchSpec for an mlx_server-backed profile.
+//
+// argv: <venv>/bin/mlx_lm.server
+//
+//	--model <ModelDir>
+//	--host <Host> --port <port>
+//	[--max-tokens N]
+//	[--draft-model <dir> [--num-draft-tokens N]]
+//	[--chat-template-args <json>]
+//	[--trust-remote-code]
+//	[extra_args...]
+//
+// Note what is NOT here: no context flag (mlx_lm.server reads the window
+// from the model's config.json) and no alias flag (it advertises the
+// --model value verbatim). Backend.Alias is reconciled with that by the
+// proxy rewrite and the router's useModelName — see MLXServerBackend.
+//
+// HealthURL: /health, which mlx_lm.server answers 200 once the HTTP server
+// is up.
+func MLXServerSpec(p *Profile, port int) (supervisor.LaunchSpec, error) {
+	if p == nil || p.Backend.MLXServer == nil {
+		return supervisor.LaunchSpec{}, errors.New("MLXServerSpec: profile has no mlx_server backend")
+	}
+	m := p.Backend.MLXServer
+	if m.ModelDir == "" {
+		return supervisor.LaunchSpec{}, errors.New("MLXServerSpec: backend.mlx_server.model_dir is required at launch time (pull the snapshot first)")
+	}
+	host := m.Host
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	args := []string{
+		"--model", m.ModelDir,
+		"--host", host,
+		"--port", strconv.Itoa(port),
+	}
+	if m.MaxTokens > 0 {
+		args = append(args, "--max-tokens", strconv.Itoa(m.MaxTokens))
+	}
+	if m.DraftModel != "" {
+		args = append(args, "--draft-model", m.DraftModel)
+		if m.NumDraftTokens > 0 {
+			args = append(args, "--num-draft-tokens", strconv.Itoa(m.NumDraftTokens))
+		}
+	}
+	if len(m.ChatTemplateArgs) > 0 {
+		// Marshalled rather than passed through as YAML: the flag takes a
+		// JSON document, and json.Marshal of a map sorts keys, so the argv
+		// stays byte-stable across runs (same reason HTTPServerSpec sorts
+		// its env keys).
+		raw, err := json.Marshal(m.ChatTemplateArgs)
+		if err != nil {
+			return supervisor.LaunchSpec{}, fmt.Errorf("MLXServerSpec: chat_template_args: %w", err)
+		}
+		args = append(args, "--chat-template-args", string(raw))
+	}
+	if m.TrustRemoteCode {
+		args = append(args, "--trust-remote-code")
+	}
+	args = append(args, m.ExtraArgs...)
+
+	// Health always over loopback: the daemon reaches the child locally
+	// regardless of what Host binds, mirroring ComfyUISpec's --listen note.
+	return supervisor.LaunchSpec{
+		Binary:    filepath.Join(m.Venv, "bin", "mlx_lm.server"),
+		Args:      args,
+		HealthURL: fmt.Sprintf("http://127.0.0.1:%d/health", port),
 	}, nil
 }
 

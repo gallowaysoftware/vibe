@@ -40,7 +40,7 @@ func fakeRunner(t *testing.T, expected []*stubRun) commandRunner {
 			}
 			if e.match(name, args) {
 				e.hit = true
-				base := exec.Command("/bin/true")
+				base := exec.Command(trueBin)
 				if e.onCall != nil {
 					return e.onCall(base)
 				}
@@ -49,7 +49,7 @@ func fakeRunner(t *testing.T, expected []*stubRun) commandRunner {
 		}
 		t.Errorf("unexpected exec: %s %v", name, args)
 		// Return /bin/false so the test fails fast in the installer too.
-		return exec.Command("/bin/false")
+		return exec.Command(falseBin)
 	}
 }
 
@@ -235,7 +235,7 @@ func TestInstallComfyUI_PipInstallFails(t *testing.T) {
 				// Need to also create the venv/bin/pip so step 4 finds it
 				// when it tries pip freeze. We do that via a sh -c that
 				// touches the file too.
-				return exec.Command("/bin/true")
+				return exec.Command(trueBin)
 			}},
 		// Note: pip freeze will fail because the pip binary doesn't really
 		// exist on disk; the installer treats that as "not satisfied" and
@@ -244,7 +244,7 @@ func TestInstallComfyUI_PipInstallFails(t *testing.T) {
 			return strings.HasSuffix(name, "/bin/pip") &&
 				len(args) >= 2 && args[0] == "install" && args[1] == "-r"
 		}, onCall: func(_ *exec.Cmd) *exec.Cmd {
-			return exec.Command("/bin/false")
+			return exec.Command(falseBin)
 		}},
 	}
 	env, _ := newTestEnv(t, stubs, alwaysYes, true)
@@ -270,7 +270,7 @@ func TestInstallComfyUI_HFDownloadFails(t *testing.T) {
 		}},
 		{label: "hf download", match: matchPrefix("hf", "download"),
 			onCall: func(_ *exec.Cmd) *exec.Cmd {
-				return exec.Command("/bin/false")
+				return exec.Command(falseBin)
 			}},
 	}
 	env, _ := newTestEnv(t, stubs, alwaysYes, true)
@@ -400,7 +400,7 @@ func TestPipFreezeHasComfyDeps_OnlyTorchvision(t *testing.T) {
 func TestPipFreezeHasComfyDeps_PipMissing(t *testing.T) {
 	env := &installerEnv{
 		runCmd: func(name string, args ...string) *exec.Cmd {
-			return exec.Command("/bin/true")
+			return exec.Command(trueBin)
 		},
 	}
 	_, err := pipFreezeHasComfyDeps(env, "/nonexistent/pip")

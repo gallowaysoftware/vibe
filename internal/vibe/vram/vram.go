@@ -93,9 +93,17 @@ func parseFreeGiB(out []byte) (float64, error) {
 // CheckResult is the outcome of a pre-flight check. The daemon consults
 // these fields to either proceed, refuse, or warn-and-proceed.
 type CheckResult struct {
-	// OK is true when the profile's estimate fits within free VRAM + slop,
-	// OR when the probe couldn't determine free VRAM (Skipped=true).
+	// OK is true when the start should proceed: the estimate fits, the
+	// probe had no info (Skipped), or it is merely tight (Warn). Only a
+	// physically impossible request sets OK false.
 	OK bool
+	// Warn is true when the estimate exceeds currently-free memory but not
+	// the machine's total capacity. The start proceeds; callers should say
+	// so loudly, because the load may thrash, swap, or fail.
+	Warn bool
+	// TotalGiB is the machine's usable capacity, set only when a hard
+	// failure was decided against it.
+	TotalGiB float64
 	// Skipped is true when the probe returned ErrNoGPUInfo. Callers should
 	// log a warning and proceed.
 	Skipped bool
@@ -112,7 +120,27 @@ type CheckResult struct {
 //
 // When the probe returns ErrNoGPUInfo, Check returns OK=true / Skipped=true:
 // the daemon will log a warning and proceed (CPU/AMD-friendly).
+// CapacityProbe reports the largest a single model could ever be on this
+// host. Separate from Probe because free memory and total capacity answer
+// different questions: "is it tight right now" versus "can this ever fit".
+type CapacityProbe func(ctx context.Context) (totalGiB float64, err error)
+
+// DefaultCapacityProbe resolves capacity from nvidia-smi, /proc/meminfo, or
+// darwin sysctls depending on the host.
+var DefaultCapacityProbe CapacityProbe = capacityGiB
+
+// Check is CheckWith against the host's real capacity.
 func Check(ctx context.Context, probe Probe, estimatedGiB, slopGiB float64) CheckResult {
+	return CheckWith(ctx, probe, DefaultCapacityProbe, estimatedGiB, slopGiB)
+}
+
+// CheckWith takes the capacity probe explicitly so the verdict is a pure
+// function of its inputs. Check used to read host capacity through an
+// ambient call, which made its result depend on the machine running it —
+// tests written on a 36 GiB laptop passed and the same tests failed on a
+// 16 GiB CI runner because a "tight" estimate there genuinely exceeded
+// capacity.
+func CheckWith(ctx context.Context, probe Probe, capacity CapacityProbe, estimatedGiB, slopGiB float64) CheckResult {
 	if estimatedGiB <= 0 {
 		// Nothing to check.
 		return CheckResult{OK: true, EstimatedGiB: estimatedGiB}
@@ -140,8 +168,28 @@ func Check(ctx context.Context, probe Probe, estimatedGiB, slopGiB float64) Chec
 		res.OK = true
 		return res
 	}
-	res.OK = false
-	res.Message = fmt.Sprintf("needs ~%.1f GiB free VRAM but only %.1f GiB is free",
+	// Short of free memory is not the same as impossible. "Free" moves
+	// constantly — on a unified-memory host most of it is page cache the
+	// kernel hands back under pressure, and even on a discrete GPU another
+	// tenant may exit between the probe and the load. Blocking on that
+	// produced false refusals, so being over the free figure is a warning
+	// and the start proceeds.
+	res.OK = true
+	res.Warn = true
+	res.Message = fmt.Sprintf("needs ~%.1f GiB but only %.1f GiB is free right now; the load may thrash or fail",
 		estimatedGiB, free)
+
+	// Exceeding what the machine physically has is the one case that cannot
+	// come good, so that stays a hard stop.
+	if capacity == nil {
+		return res
+	}
+	if total, err := capacity(ctx); err == nil && total > 0 && estimatedGiB > total {
+		res.OK = false
+		res.Warn = false
+		res.TotalGiB = total
+		res.Message = fmt.Sprintf("needs ~%.1f GiB but this machine has only %.1f GiB of usable memory in total",
+			estimatedGiB, total)
+	}
 	return res
 }

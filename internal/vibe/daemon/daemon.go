@@ -131,8 +131,13 @@ type Daemon struct {
 	prx *proxy.Proxy
 
 	// nvidiaSMI is the VRAM probe used by Start for its pre-flight check.
-	// Tests inject a stub here; production wires vram.NvidiaSMIProbe via New.
+	// Tests inject a stub here; production wires vram.DefaultProbe via New,
+	// which is nvidia-smi where there's an NVIDIA GPU and unified-memory
+	// accounting on Apple silicon.
 	nvidiaSMI vram.Probe
+	// vramCapacity answers "could this ever fit on this machine", the only
+	// question that can refuse a start outright.
+	vramCapacity vram.CapacityProbe
 	// vramSlopGiB is added to free VRAM before comparing to the profile's
 	// estimate, absorbing the inherent fuzziness of those numbers. Defaults
 	// to vram.DefaultSlopGiB in New.
@@ -162,13 +167,14 @@ var _ vibev1connect.ControlServiceHandler = (*Daemon)(nil)
 
 func New(cfg Config) *Daemon {
 	return &Daemon{
-		cfg:         cfg,
-		sup:         supervisor.New(),
-		prx:         proxy.New(fmt.Sprintf("127.0.0.1:%d", cfg.ProxyPort)),
-		nvidiaSMI:   vram.NvidiaSMIProbe,
-		vramSlopGiB: vram.DefaultSlopGiB,
-		services:    map[string]*serviceInstance{},
-		shutdown:    make(chan struct{}),
+		cfg:          cfg,
+		sup:          supervisor.New(),
+		prx:          proxy.New(fmt.Sprintf("127.0.0.1:%d", cfg.ProxyPort)),
+		nvidiaSMI:    vram.DefaultProbe,
+		vramCapacity: vram.DefaultCapacityProbe,
+		vramSlopGiB:  vram.DefaultSlopGiB,
+		services:     map[string]*serviceInstance{},
+		shutdown:     make(chan struct{}),
 	}
 }
 
@@ -176,6 +182,14 @@ func New(cfg Config) *Daemon {
 // out to nvidia-smi.
 func (d *Daemon) SetVRAMProbe(p vram.Probe) {
 	d.nvidiaSMI = p
+}
+
+// SetCapacityProbe overrides the total-capacity probe. Tests must pin this
+// alongside SetVRAMProbe: capacity decides warn-vs-refuse, so leaving it
+// reading the real host makes the same test pass on a big dev machine and
+// fail on a small CI runner.
+func (d *Daemon) SetCapacityProbe(p vram.CapacityProbe) {
+	d.vramCapacity = p
 }
 
 // Run brings up the proxy and both control-plane listeners (unix + TCP),
@@ -459,7 +473,7 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 	// outright: the router owns placement, and the model may not even load
 	// until its first request (JIT), so "free VRAM now" proves nothing.
 	if !req.Msg.NoVramCheck && p.EstimatedVRAMGB > 0 && !p.Backend.External {
-		res := vram.Check(startCtx, d.nvidiaSMI, p.EstimatedVRAMGB, d.vramSlopGiB)
+		res := vram.CheckWith(startCtx, d.nvidiaSMI, d.vramCapacity, p.EstimatedVRAMGB, d.vramSlopGiB)
 		switch {
 		case res.Skipped:
 			slog.Warn("vram pre-flight skipped",
@@ -467,14 +481,27 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 				"estimated_gib", p.EstimatedVRAMGB,
 				"reason", res.Message)
 		case !res.OK:
+			// Only reached when the estimate exceeds the machine's total
+			// capacity — no amount of freeing memory makes this one work,
+			// so the override is offered but not encouraged.
 			msg := fmt.Sprintf(
-				"profile %q needs ~%.1f GiB free VRAM but only %.1f GiB is free.\nStop the current profile (`vibe stop`) or close other GPU users first.",
-				p.Name, p.EstimatedVRAMGB, res.FreeGiB)
+				"profile %q needs ~%.1f GiB but this machine has only %.1f GiB of usable memory in total.\nUse a smaller quantisation, or re-run with --no-vram-check to try anyway.",
+				p.Name, p.EstimatedVRAMGB, res.TotalGiB)
 			slog.Warn("vram pre-flight failed",
 				"profile", p.Name,
 				"estimated_gib", p.EstimatedVRAMGB,
+				"total_gib", res.TotalGiB,
 				"free_gib", res.FreeGiB)
 			return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New(msg))
+		case res.Warn:
+			// Tight, not impossible: free memory moves (page cache, another
+			// tenant exiting), so this proceeds and says so rather than
+			// refusing a start that usually works. The CLI's progress tail
+			// renders this msg in yellow.
+			slog.Warn("vram pre-flight tight",
+				"profile", p.Name,
+				"estimated_gib", p.EstimatedVRAMGB,
+				"free_gib", res.FreeGiB)
 		default:
 			slog.Info("vram pre-flight ok",
 				"profile", p.Name,
@@ -556,19 +583,28 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 		// the proxy. ComfyUI is reached directly via Status.BackendAddr
 		// (workflow API is one big POST, no streaming, no profile-managed
 		// state worth proxying) and ships its own UI so there's no frontend.
-		if p.Backend.LlamaServer != nil || p.Backend.HTTPServer != nil || p.Backend.TabbyAPI != nil {
+		if p.Backend.LlamaServer != nil || p.Backend.HTTPServer != nil || p.Backend.TabbyAPI != nil || p.Backend.MLXServer != nil {
 			backendURL, err := url.Parse(backendAddr)
 			if err != nil {
 				_ = d.sup.Stop(context.Background())
 				return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("parse backend url: %w", err))
 			}
 			d.prx.SetBackend(backendURL)
+			// mlx_lm.server can only answer to the path it was launched
+			// with, so the proxy carries the alias <-> path translation for
+			// it. Cleared for every other backend kind, which advertise
+			// their own alias.
+			if m := p.Backend.MLXServer; m != nil {
+				d.prx.SetModelRewrite(m.Alias, m.ModelDir)
+			} else {
+				d.prx.SetModelRewrite("", "")
+			}
 		}
 	}
 	var fr *frontend.Result
 	// Frontend activation for llama_server and tabby_api — both may have
 	// a separate UI/client process to launch (e.g. Open WebUI via docker-compose).
-	if p.Backend.LlamaServer != nil || p.Backend.TabbyAPI != nil {
+	if p.Backend.LlamaServer != nil || p.Backend.TabbyAPI != nil || p.Backend.MLXServer != nil {
 		if p.Frontend.Kind != "" {
 			// Pre-create the per-profile frontend state dir so docker-compose
 			// bind mounts (and any other path the profile points inside it)
@@ -600,6 +636,12 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 				// back to its paid default model.
 				alias = t.Alias
 				ctxLen = t.Context
+			} else if m := p.Backend.MLXServer; m != nil {
+				// The friendly alias, not ModelDir: clients reach this
+				// backend through the proxy, which rewrites the alias to the
+				// path the server demands.
+				alias = m.Alias
+				ctxLen = m.Context
 			}
 			if external {
 				// The rendered router config keys models by BACKEND DEF
@@ -976,6 +1018,39 @@ func (d *Daemon) Pull(ctx context.Context, req *connect.Request[vibev1.PullReque
 			Message: fmt.Sprintf("downloaded snapshot to %s", t.ModelDir),
 		})
 	}
+	// MLX models are HF snapshots like tabby_api's, so the same shell-out to
+	// the venv's `hf` applies — mlx-lm depends on huggingface_hub, so the
+	// CLI is always present in a venv that can run the backend at all.
+	if p.Backend.MLXServer != nil {
+		m := p.Backend.MLXServer
+		if m.Huggingface == nil {
+			return stream.Send(&vibev1.PullProgress{
+				Phase:   vibev1.PullProgress_PHASE_DONE,
+				Message: "no huggingface block; nothing to pull (mlx_server: pre-place the MLX snapshot at model_dir)",
+			})
+		}
+		if err := stream.Send(&vibev1.PullProgress{Phase: vibev1.PullProgress_PHASE_RESOLVING}); err != nil {
+			return err
+		}
+		hfCli := filepath.Join(m.Venv, "bin", "hf")
+		args := []string{"download", m.Huggingface.Repo, "--local-dir", m.ModelDir}
+		if m.Huggingface.Revision != "" {
+			args = append(args, "--revision", m.Huggingface.Revision)
+		}
+		slog.Info("pulling mlx_server snapshot", "profile", p.Name,
+			"repo", m.Huggingface.Repo, "revision", m.Huggingface.Revision,
+			"dest", m.ModelDir)
+		cmd := exec.CommandContext(ctx, hfCli, args...)
+		out, runErr := cmd.CombinedOutput()
+		if runErr != nil {
+			return connect.NewError(connect.CodeInternal,
+				fmt.Errorf("hf download: %w (output: %s)", runErr, strings.TrimSpace(string(out))))
+		}
+		return stream.Send(&vibev1.PullProgress{
+			Phase:   vibev1.PullProgress_PHASE_DONE,
+			Message: fmt.Sprintf("downloaded snapshot to %s", m.ModelDir),
+		})
+	}
 	if p.Backend.LlamaServer == nil {
 		return connect.NewError(connect.CodeFailedPrecondition,
 			errors.New("profile has no backend"))
@@ -1311,6 +1386,8 @@ func externalBackendAlias(p *profile.Profile) string {
 		return p.Backend.LlamaServer.Alias
 	case p.Backend.TabbyAPI != nil:
 		return p.Backend.TabbyAPI.Alias
+	case p.Backend.MLXServer != nil:
+		return p.Backend.MLXServer.Alias
 	}
 	return ""
 }
@@ -1506,9 +1583,28 @@ func (d *Daemon) buildLaunchSpec(p *profile.Profile) (supervisor.LaunchSpec, int
 			"model_dir", filepath.Base(p.Backend.TabbyAPI.ModelDir),
 			"context", p.Backend.TabbyAPI.Context, "port", port,
 			"cache_mode", firstNonEmpty(p.Backend.TabbyAPI.CacheMode, "FP16"))
+	case p.Backend.MLXServer != nil:
+		if p.Backend.MLXServer.Port > 0 {
+			port = p.Backend.MLXServer.Port
+		} else {
+			port, err = supervisor.PickFreePort()
+			if err != nil {
+				return spec, 0, connect.NewError(connect.CodeInternal, fmt.Errorf("pick port: %w", err))
+			}
+		}
+		spec, err = profile.MLXServerSpec(p, port)
+		if err != nil {
+			return spec, 0, connect.NewError(connect.CodeInternal, err)
+		}
+		slog.Info("starting profile (mlx_server)",
+			"profile", p.Name, "mode", p.ResolvedMode(),
+			"alias", p.Backend.MLXServer.Alias,
+			"model_dir", filepath.Base(p.Backend.MLXServer.ModelDir),
+			"context", p.Backend.MLXServer.Context, "port", port,
+			"host", p.Backend.MLXServer.Host)
 	default:
 		return spec, 0, connect.NewError(connect.CodeFailedPrecondition,
-			errors.New("profile has no backend (set backend.llama_server, backend.comfyui, backend.http_server, or backend.tabby_api)"))
+			errors.New("profile has no backend (set backend.llama_server, backend.comfyui, backend.http_server, backend.tabby_api, or backend.mlx_server)"))
 	}
 	return spec, port, nil
 }

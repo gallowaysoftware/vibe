@@ -72,8 +72,8 @@ func TestSchemaJSON_RoundTrip(t *testing.T) {
 	props, _ := doc["properties"].(map[string]any)
 	backend, _ := props["backend"].(map[string]any)
 	oneOf, _ := backend["oneOf"].([]any)
-	if len(oneOf) != 5 {
-		t.Errorf("backend.oneOf length = %d, want 5 (llama_server XOR comfyui XOR http_server XOR tabby_api XOR cloud_peer)", len(oneOf))
+	if len(oneOf) != 6 {
+		t.Errorf("backend.oneOf length = %d, want 6 (llama_server XOR comfyui XOR http_server XOR tabby_api XOR cloud_peer XOR mlx_server)", len(oneOf))
 	}
 
 	// llama_server required keys: path, alias, context. Catches drift
@@ -86,6 +86,17 @@ func TestSchemaJSON_RoundTrip(t *testing.T) {
 	for _, k := range []string{"path", "alias", "context"} {
 		if !llamaReqSet[k] {
 			t.Errorf("llama_server.required missing %q (got %v)", k, llamaReq)
+		}
+	}
+
+	// mlx_server required keys: alias, context, venv. model_dir is absent
+	// on purpose — a huggingface block supplies it at pull time.
+	mlx, _ := backendProps["mlx_server"].(map[string]any)
+	mlxReq, _ := mlx["required"].([]any)
+	mlxReqSet := toStringSet(mlxReq)
+	for _, k := range []string{"alias", "context", "venv"} {
+		if !mlxReqSet[k] {
+			t.Errorf("mlx_server.required missing %q (got %v)", k, mlxReq)
 		}
 	}
 

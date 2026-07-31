@@ -351,9 +351,72 @@ func Schema() *schemaProperty {
 		},
 	}
 
+	mlxServer := &schemaProperty{
+		Type:                 "object",
+		Description:          "MLX backend. Supervises an mlx_lm.server process serving an MLX-quantised snapshot on Apple silicon, and proxies its OpenAI-compatible endpoint through vibe's reverse proxy. Two upstream quirks are handled for you: mlx_lm.server has no context flag (the window comes from the model's config.json, so `context` here is advertised metadata only) and no alias flag (it answers only to its --model path, so vibe's proxy rewrites alias <-> model_dir and the router renders useModelName).",
+		AdditionalProperties: false,
+		Required:             []string{"alias", "context", "venv"},
+		Properties: map[string]*schemaProperty{
+			"model_dir": {
+				Type:        "string",
+				Description: "Path to the MLX model snapshot directory (safetensors shards + config.json + tokenizer files). Required unless huggingface is set; tilde-expanded.",
+			},
+			"huggingface": huggingfaceRepo,
+			"alias": {
+				Type:        "string",
+				Description: "Client-facing model id reported on /v1/models through the proxy and sent as `model:` by frontends and vamp. Must be a plain id, not a path — vibe translates it to the snapshot path for the server.",
+			},
+			"context": {
+				Type:        "integer",
+				Minimum:     float64Ptr(1),
+				Description: "Context window advertised to clients as ${MODEL_CONTEXT}. Metadata only: mlx_lm.server takes the real window from the model's config.json, so lowering this does not save memory.",
+			},
+			"port": {
+				Type:        "integer",
+				Minimum:     float64Ptr(0),
+				Description: "Listen port. 0 (or absent) lets the daemon pick a free one.",
+			},
+			"host": {
+				Type:        "string",
+				Description: "Bind address, default 127.0.0.1. Set 0.0.0.0 to serve other hosts directly; a box fronted by llama-swap does not need this (the router binds the LAN address and reaches backends over loopback).",
+			},
+			"venv": {
+				Type:        "string",
+				Description: "Python venv with mlx-lm installed. The daemon execs <venv>/bin/mlx_lm.server directly; `vibe pull` uses <venv>/bin/hf. Tilde-expanded.",
+			},
+			"draft_model": {
+				Type:        "string",
+				Description: "MLX snapshot directory used as a speculative-decoding drafter (--draft-model). Tilde-expanded.",
+			},
+			"num_draft_tokens": {
+				Type:        "integer",
+				Minimum:     float64Ptr(1),
+				Description: "Tokens drafted per step (--num-draft-tokens). Requires draft_model.",
+			},
+			"chat_template_args": {
+				Type:        "object",
+				Description: "Forwarded as --chat-template-args JSON, e.g. {enable_thinking: false}. The same knob vamp text stages call chat_template_kwargs — unlike llama-server, mlx_lm.server honours it.",
+			},
+			"max_tokens": {
+				Type:        "integer",
+				Minimum:     float64Ptr(0),
+				Description: "Default generation cap (--max-tokens). mlx_lm.server's own default is 512, which truncates most coding replies.",
+			},
+			"trust_remote_code": {
+				Type:        "boolean",
+				Description: "Enables --trust-remote-code for tokenizers that need it. Off by default: it executes repo-supplied python.",
+			},
+			"extra_args": {
+				Type:        "array",
+				Description: "Extra flags appended after vibe's standard mlx_lm.server argv.",
+				Items:       &schemaProperty{Type: "string"},
+			},
+		},
+	}
+
 	backend := &schemaProperty{
 		Type:                 "object",
-		Description:          "Backend configuration. Exactly one of llama_server, comfyui, http_server, tabby_api, or cloud_peer must be set (discriminated union).",
+		Description:          "Backend configuration. Exactly one of llama_server, comfyui, http_server, tabby_api, cloud_peer, or mlx_server must be set (discriminated union).",
 		AdditionalProperties: false,
 		Properties: map[string]*schemaProperty{
 			"external": {
@@ -365,9 +428,10 @@ func Schema() *schemaProperty {
 			"http_server":  httpServer,
 			"tabby_api":    tabbyAPI,
 			"cloud_peer":   cloudPeer,
+			"mlx_server":   mlxServer,
 		},
 		// Discriminated-union XOR: exactly one sub-block. Each oneOf
-		// branch requires one of the five keys; the loader rejects
+		// branch requires one of the six keys; the loader rejects
 		// "more than one set" and "none set" at runtime, matching this
 		// constraint.
 		OneOf: []*schemaProperty{
@@ -376,6 +440,7 @@ func Schema() *schemaProperty {
 			{Required: []string{"http_server"}},
 			{Required: []string{"tabby_api"}},
 			{Required: []string{"cloud_peer"}},
+			{Required: []string{"mlx_server"}},
 		},
 	}
 
@@ -502,7 +567,7 @@ func Schema() *schemaProperty {
 		ID:          "https://github.com/gallowaysoftware/vibe/schemas/vibe.profile.schema.json",
 		Title:       "vibe profile",
 		Type:        "object",
-		Description: "A vibe profile definition: a named backend (llama_server, comfyui, http_server, tabby_api, or cloud_peer — inline or via backend_ref) plus an optional frontend renderer.",
+		Description: "A vibe profile definition: a named backend (llama_server, comfyui, http_server, tabby_api, cloud_peer, or mlx_server — inline or via backend_ref) plus an optional frontend renderer.",
 		Required:    []string{"name"},
 		// Shallow anyOf so the "inline backend or backend_ref" requirement
 		// still surfaces in editors; unlike the deeply-nested frontend
@@ -570,6 +635,7 @@ func Schema() *schemaProperty {
 			"HTTPServerBackend":  httpServer,
 			"TabbyAPIBackend":    tabbyAPI,
 			"CloudPeerBackend":   cloudPeer,
+			"MLXServerBackend":   mlxServer,
 			"Frontend":           frontend,
 			"Huggingface":        huggingface,
 			"HuggingfaceRepo":    huggingfaceRepo,

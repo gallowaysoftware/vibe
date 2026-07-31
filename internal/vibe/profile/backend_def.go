@@ -150,7 +150,7 @@ func (d Duration) Seconds() int {
 // mutual-exclusion error instead of being silently discarded when the ref
 // resolves over it.
 func (b Backend) isEmpty() bool {
-	return !b.External && b.LlamaServer == nil && b.ComfyUI == nil && b.HTTPServer == nil && b.TabbyAPI == nil && b.CloudPeer == nil
+	return !b.External && b.LlamaServer == nil && b.ComfyUI == nil && b.HTTPServer == nil && b.TabbyAPI == nil && b.CloudPeer == nil && b.MLXServer == nil
 }
 
 // normalize applies in-place defaults (llama_server.parallel) and tilde-expands
@@ -193,22 +193,33 @@ func (b *Backend) normalize() {
 		b.TabbyAPI.Repo = expandTilde(b.TabbyAPI.Repo)
 		b.TabbyAPI.DraftModelDir = expandTilde(b.TabbyAPI.DraftModelDir)
 	}
+	if b.MLXServer != nil {
+		if b.MLXServer.Host == "" {
+			b.MLXServer.Host = "127.0.0.1"
+		}
+		// The expanded ModelDir is what reaches --model, /v1/models, and
+		// the proxy's rewrite target, so it has to be absolute here or the
+		// three would disagree about the model's identity.
+		b.MLXServer.ModelDir = expandTilde(b.MLXServer.ModelDir)
+		b.MLXServer.Venv = expandTilde(b.MLXServer.Venv)
+		b.MLXServer.DraftModel = expandTilde(b.MLXServer.DraftModel)
+	}
 }
 
 // validate enforces the discriminated-union rule (exactly one sub-block set)
 // and runs the per-backend validation.
 func (b Backend) validate() error {
 	set := 0
-	for _, on := range []bool{b.LlamaServer != nil, b.ComfyUI != nil, b.HTTPServer != nil, b.TabbyAPI != nil, b.CloudPeer != nil} {
+	for _, on := range []bool{b.LlamaServer != nil, b.ComfyUI != nil, b.HTTPServer != nil, b.TabbyAPI != nil, b.CloudPeer != nil, b.MLXServer != nil} {
 		if on {
 			set++
 		}
 	}
 	switch {
 	case set == 0:
-		return errors.New("backend is required: set exactly one of backend.llama_server, backend.comfyui, backend.http_server, backend.tabby_api, or backend.cloud_peer")
+		return errors.New("backend is required: set exactly one of backend.llama_server, backend.comfyui, backend.http_server, backend.tabby_api, backend.cloud_peer, or backend.mlx_server")
 	case set > 1:
-		return errors.New("backend: only one of backend.llama_server, backend.comfyui, backend.http_server, backend.tabby_api, or backend.cloud_peer may be set")
+		return errors.New("backend: only one of backend.llama_server, backend.comfyui, backend.http_server, backend.tabby_api, backend.cloud_peer, or backend.mlx_server may be set")
 	}
 	// external makes sense where the router serves the backend: LLM kinds
 	// appear on /v1/models, and comfyui rides llama-swap's /upstream/<id>
@@ -228,6 +239,8 @@ func (b Backend) validate() error {
 		return validateHTTPServer(b.HTTPServer)
 	case b.CloudPeer != nil:
 		return validateCloudPeer(b.CloudPeer)
+	case b.MLXServer != nil:
+		return validateMLXServer(b.MLXServer)
 	default:
 		return validateTabbyAPI(b.TabbyAPI)
 	}
