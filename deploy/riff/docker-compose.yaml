@@ -1,11 +1,9 @@
-# riff: the persistent chat/research app (topology.md UC1) — Open WebUI +
-# SearXNG. APPLICATION — a client of the hum front (deploy/hum) like any
-# other; it consumes hum's LAN address, not a private link, so the two
-# stacks deploy/restart/upgrade independently.
+# riff: the persistent chat/research app (topology.md UC1) — Open WebUI,
+# web search via Tavily. APPLICATION — a client of the hum front
+# (deploy/hum) like any other; it consumes hum's LAN address, not a
+# private link, so the two stacks deploy/restart/upgrade independently.
 #
 # Networking (house pattern, same as the stillhouse stack):
-#   - `riff` bridge: internal; webui ↔ searxng talk over it. SearXNG has
-#     no LAN exposure at all.
 #   - `macvlan` (br0 external): the webui gets its own LAN IP (default
 #     172.16.3.212) so it appears as a real host. NPM proxies
 #     chat.<domain> → <RIFF_IPV4>:8080 for TLS + Authelia forward-auth.
@@ -16,7 +14,8 @@
 #
 # Prereqs: br0 is an existing macvlan network on unraid (Settings → Docker).
 # .env (sibling of this file): HUM_URL (e.g. http://172.16.3.211:9000),
-# WEBUI_SECRET_KEY (openssl rand -hex 32), optionally RIFF_IPV4.
+# WEBUI_SECRET_KEY (openssl rand -hex 32), TAVILY_API_KEY, optionally
+# RIFF_IPV4.
 
 services:
 
@@ -42,37 +41,38 @@ services:
       # Env is the source of truth, not the DB (PersistentConfig masks
       # compose env otherwise — the classic OWUI gotcha).
       ENABLE_PERSISTENT_CONFIG: "False"
-      # Web search via searxng; bypass the web-loader (playwright loader
-      # yields "no sources" — known bug, same fix as the chat profile).
+      # Web search via Tavily (was self-hosted SearXNG — dropped 2026-07-30,
+      # local privacy isn't a requirement here and SearXNG's result quality
+      # wasn't holding up). Bypass the web-loader regardless of engine
+      # (playwright loader yields "no sources" — known bug).
       ENABLE_WEB_SEARCH: "True"
-      WEB_SEARCH_ENGINE: searxng
-      SEARXNG_QUERY_URL: http://riff-search:8080/search?q=<query>
+      WEB_SEARCH_ENGINE: tavily
+      TAVILY_API_KEY: ${TAVILY_API_KEY:?TAVILY_API_KEY must be set in .env}
       BYPASS_WEB_SEARCH_WEB_LOADER: "True"
       WEB_SEARCH_RESULT_COUNT: "5"
-    depends_on: [riff-search]
+      # External tool server: subkb (subreddit-knowledge-aggregator) as a
+      # native MCP streamable-HTTP connection — search_knowledge,
+      # get_thread, get_document, list_collections. Declared HERE and not
+      # in the admin UI because persistent config is off: UI-added tool
+      # servers revert to this env value on the next recreate. Both
+      # containers sit on br0, so the macvlan/host gotcha doesn't apply.
+      # Per-expert workspace models attach these tools and pin their
+      # collection in the system prompt (README "Knowledge experts").
+      TOOL_SERVER_CONNECTIONS: >-
+        [{"type":"mcp",
+          "url":"${SUBKB_URL:-http://172.16.3.214:8091}/mcp",
+          "auth_type":"none",
+          "info":{"id":"subkb","name":"Subreddit Knowledge",
+                  "description":"Hybrid RAG over archived subreddit corpora and curated documents"},
+          "config":{"enable":true,"access_control":null}}]
     networks:
       macvlan:
         ipv4_address: ${RIFF_IPV4:-172.16.3.212}
-      riff: {}
     labels:
       net.unraid.docker.webui: "http://${RIFF_IPV4:-172.16.3.212}:8080"
       net.unraid.docker.shell: "sh"
 
-  riff-search:
-    image: searxng/searxng:latest
-    container_name: riff-search
-    restart: unless-stopped
-    # No macvlan, no published ports — only the webui talks to it.
-    networks: [riff]
-    volumes:
-      - /mnt/user/appdata/riff/searxng:/etc/searxng
-    environment:
-      SEARXNG_BASE_URL: http://riff-search:8080/
-
 networks:
-  riff:
-    driver: bridge
-    name: riff
   macvlan:
     external: true
     name: br0

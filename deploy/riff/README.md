@@ -1,20 +1,21 @@
 # riff — persistent chat/research (application)
 
-riff is topology.md's UC1: a persistent Open WebUI + SearXNG, the
-phone-installable replacement for the Claude app. It is an *application*
-stack — a plain client of the hum front (`deploy/hum`), deployed and
-upgraded independently of it. Model selection, lazy loading, and sharing
-warm models with other clients all come from hum; riff just points at it.
+riff is topology.md's UC1: a persistent Open WebUI, web search via Tavily,
+the phone-installable replacement for the Claude app. It is an
+*application* stack — a plain client of the hum front (`deploy/hum`),
+deployed and upgraded independently of it. Model selection, lazy loading,
+and sharing warm models with other clients all come from hum; riff just
+points at it.
 
 ## Files
 
-- `docker-compose.yaml` — OWUI + SearXNG. House networking pattern: the
-  webui sits on the `br0` macvlan with its own static LAN IP (`RIFF_IPV4`,
-  default 172.16.3.212) for NPM to proxy to; SearXNG stays on an internal
-  bridge with no LAN exposure. Needs an `.env` with `HUM_URL` (the front's
-  macvlan address, e.g. `http://172.16.3.211:9000` — NOT the unraid host
-  IP, which macvlan containers cannot reach), `WEBUI_SECRET_KEY`
-  (`openssl rand -hex 32`), and optionally `RIFF_IPV4`/`RIFF_PUBLIC_URL`.
+- `docker-compose.yaml` — single-service OWUI. House networking pattern:
+  the webui sits on the `br0` macvlan with its own static LAN IP
+  (`RIFF_IPV4`, default 172.16.3.212) for NPM to proxy to. Needs an `.env`
+  with `HUM_URL` (the front's macvlan address, e.g.
+  `http://172.16.3.211:9000` — NOT the unraid host IP, which macvlan
+  containers cannot reach), `WEBUI_SECRET_KEY` (`openssl rand -hex 32`),
+  `TAVILY_API_KEY`, and optionally `RIFF_IPV4`/`RIFF_PUBLIC_URL`.
 
 ## Bring-up
 
@@ -51,7 +52,9 @@ proxy_set_header Remote-Name  $name;
 - `ENABLE_PERSISTENT_CONFIG=False` makes the compose env the source of
   truth for OWUI settings (otherwise the DB masks env changes after first
   boot — the recurring gotcha). Per-user prefs still persist in the DB.
-- Web search is SearXNG with the web-loader bypassed (the playwright
+- Web search is Tavily (dropped self-hosted SearXNG 2026-07-30 — local
+  privacy isn't a requirement here and result quality wasn't holding up),
+  with the web-loader bypassed regardless of engine (the playwright
   loader's "no sources" bug — same fix as the localmodel chat profile).
 - Tool-loop rule applies here as everywhere: if you wire MCP tools into
   this OWUI against a Qwen model, address the `-tools` def

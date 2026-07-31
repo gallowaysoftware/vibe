@@ -1,12 +1,18 @@
-# Chat profile: local Gemma 3 (vision) + Open WebUI + SearXNG + Tier-1 RAG
+# Chat profile: local Gemma 3 (vision) + Open WebUI + Tavily + Tier-1 RAG
 
 A vibe profile that brings up a Claude/ChatGPT-style chat experience
 against a local **multimodal** model: Gemma 3 27B-it at Q6_K (text +
-image input) served by llama-server, Open WebUI for the UI, SearXNG
-sidecar for "turbo Google" web search, and Open WebUI's built-in RAG
-(BGE-M3 embeddings + BGE-reranker-v2-m3 reranker + hybrid BM25+vector
-search) for chatting with your own documents. Profile targets a 32 GB
-GPU; drop to Q4_K_M for 24 GB or to 12B for 16 GB (see Customizing).
+image input) served by llama-server, Open WebUI for the UI, Tavily for
+web search, and Open WebUI's built-in RAG (BGE-M3 embeddings +
+BGE-reranker-v2-m3 reranker + hybrid BM25+vector search) for chatting
+with your own documents. Profile targets a 32 GB GPU; drop to Q4_K_M
+for 24 GB or to 12B for 16 GB (see Customizing).
+
+The compose file also ships a SearXNG sidecar (self-hosted, no API
+key) — it's not wired into Open WebUI's search feature by default
+anymore (see Why these choices) but stays up for pipelines that hit
+it directly and for the smoke test below. Switching back is a
+one-line env change (see Customizing).
 
 The whole stack is two containers managed by `vibe start chat`. State
 (SQLite chat history, ChromaDB vectors, uploads, embedding model
@@ -33,7 +39,12 @@ sed -i "s/REPLACE-WITH-RAND-HEX-32/$(openssl rand -hex 32)/" \
 #    at the GGUF model you want, fix the absolute paths under frontend.
 #    The REPLACE: markers call out the lines you need to change.
 
-# 5. Bring it up. First boot pulls 2 images (~1.6 GB), downloads
+# 5. Export a Tavily key wherever the vibe daemon runs (its shell, or
+#    the daemon's systemd EnvironmentFile) — NOT in chat.yaml itself,
+#    see the docker-compose.yaml comment on TAVILY_API_KEY.
+export TAVILY_API_KEY=tvly-...
+
+# 6. Bring it up. First boot pulls 2 images (~1.6 GB), downloads
 #    Playwright's Chromium (~500 MB, for web-search scraping), the
 #    embedding model (~2.3 GB on first knowledge upload), and may
 #    pull the LLM weights from HuggingFace. Subsequent starts are
@@ -106,9 +117,14 @@ fresh deploy without a UI round-trip).
 
 ## Why these choices
 
-**SearXNG over DuckDuckGo / Tavily / Brave** — self-hosted, no API
-key, no per-query cost, aggregates multiple upstream engines, JSON
-output mode is purpose-built for LLM consumption.
+**Tavily over the self-hosted SearXNG sidecar** — updated 2026-07-30.
+SearXNG's pitch (no API key, no per-query cost, self-hosted) is real,
+but result quality in practice didn't hold up, and this profile isn't
+a context where the local-privacy angle matters. Tavily has a workable
+free monthly tier and results tuned for LLM consumption. The SearXNG
+sidecar stays in the compose file — set `RAG_WEB_SEARCH_ENGINE=searxng`
+and `SEARXNG_QUERY_URL=http://127.0.0.1:14001/search?q=<query>` to
+switch back (see Customizing).
 
 **Playwright over Open WebUI's default `safe_web` scraper** — Open
 WebUI's default uses langchain's `WebBaseLoader` (aiohttp) with a
@@ -147,8 +163,13 @@ storage; the chat profile keeps its in-process setup for casual use.
   `CHUNK_OVERLAP`, `RAG_TOP_K` env vars in the compose file. Code
   collections want smaller chunks (200/50); long-form prose wants
   larger (1500/300).
-- **Disable web search**: drop the `searxng:` service from the compose
-  file and set `ENABLE_RAG_WEB_SEARCH=False`. Two-line change.
+- **Switch search engine back to SearXNG**: set `RAG_WEB_SEARCH_ENGINE=searxng`
+  and `SEARXNG_QUERY_URL=http://127.0.0.1:14001/search?q=<query>` in
+  place of `RAG_WEB_SEARCH_ENGINE=tavily` / `TAVILY_API_KEY`. The
+  sidecar is already running (see Why these choices).
+- **Disable web search entirely**: set `ENABLE_RAG_WEB_SEARCH=False`.
+  The `searxng:` service can stay (other pipelines may still hit it
+  directly) or be dropped from the compose file if nothing else needs it.
 - **Reset chat history**: stop the profile, `rm -rf
   ~/.local/state/vibe/frontend/chat/data/`, start again. The state
   dir gets recreated on activate.

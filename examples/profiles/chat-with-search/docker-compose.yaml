@@ -32,18 +32,25 @@ services:
       - CHUNK_SIZE=1000
       - CHUNK_OVERLAP=200
       - RAG_TOP_K=5
-      # Web search via SearXNG sidecar + Playwright scraper. We
-      # deliberately use the playwright engine rather than the default
-      # safe_web (langchain WebBaseLoader): real Chromium handles WAFs,
-      # JS-rendered pages, and Wikipedia's bot-policy UA rejection that
-      # would otherwise 403 every fetch. Open WebUI's start.sh
-      # auto-installs Chromium when WEB_LOADER_ENGINE=playwright is set
-      # (~500 MB download on first container start, cached after).
+      # Web search via Tavily + Playwright scraper. We deliberately use
+      # the playwright engine rather than the default safe_web (langchain
+      # WebBaseLoader): real Chromium handles WAFs, JS-rendered pages, and
+      # Wikipedia's bot-policy UA rejection that would otherwise 403 every
+      # fetch. Open WebUI's start.sh auto-installs Chromium when
+      # WEB_LOADER_ENGINE=playwright is set (~500 MB download on first
+      # container start, cached after).
       - WEB_LOADER_ENGINE=playwright
       - PLAYWRIGHT_TIMEOUT=15000
       - ENABLE_RAG_WEB_SEARCH=True
-      - RAG_WEB_SEARCH_ENGINE=searxng
-      - SEARXNG_QUERY_URL=http://127.0.0.1:14001/search?q=<query>
+      - RAG_WEB_SEARCH_ENGINE=tavily
+      # TAVILY_API_KEY comes from the environment vibe's daemon itself
+      # runs in (export it before `vibe start chat`, or set it in the
+      # daemon's systemd EnvironmentFile) — docker-compose's native
+      # ${VAR} substitution reads it from there. Do NOT add it to
+      # chat.yaml's frontend.env: vibe's own ${VAR} expansion only
+      # recognizes a fixed set (VIBE_API, MODEL_ALIAS, MODEL_CONTEXT,
+      # WRITE_FILE, VIBE_STATE_DIR) and errors on anything else.
+      - TAVILY_API_KEY=${TAVILY_API_KEY:?TAVILY_API_KEY must be set in vibe daemon's environment}
       - RAG_WEB_SEARCH_RESULT_COUNT=5
       - RAG_WEB_SEARCH_CONCURRENT_REQUESTS=10
     volumes:
