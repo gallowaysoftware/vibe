@@ -73,24 +73,11 @@ temporal supersession) and hide the docs from other MCP clients.
 
 ### Memory (recall)
 
-Each expert also gets persistent memory via `recall`
-(`deploy/recall/`, default `http://172.16.3.215:8092`) through BOTH
-mechanisms — and both are required, because tool-based recall alone is
-unreliable (a model can't search for what it doesn't know it forgot):
-
-1. **Injection**: install `functions/recall_digest_filter.py` (Admin →
-   Functions → import) and enable it per expert model (model editor →
-   Filters). It prepends `GET /digest?expert=<slug>` at chat start —
-   profile, goals, recent decisions, last session. Model-id → expert
-   mapping is a filter valve. Fails open on recall outage.
-2. **Tools**: the `recall` MCP entry in `TOOL_SERVER_CONNECTIONS`
-   (above) exposes record_decision / update_goals / append_session_log
-   / search_memory etc. The expert system prompts (subkb
-   `docs/experts/`) carry the when-to-save contract.
-
-Memory is git-backed markdown on hum
-(`/mnt/user/appdata/recall/memories`) — the only irreplaceable data in
-the fleet; back it up.
+Persistent per-expert memory is provided by the `recall` service
+(github.com/gallowaysoftware/recall) — both an MCP tool server (add it to
+`TOOL_SERVER_CONNECTIONS` alongside subkb) and an Open WebUI inlet filter
+that injects a memory digest at chat start. See recall's
+`integrations/openwebui/` for the filter and setup.
 
 ## Notes
 

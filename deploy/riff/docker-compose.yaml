@@ -63,12 +63,6 @@ services:
           "auth_type":"none",
           "info":{"id":"subkb","name":"Subreddit Knowledge",
                   "description":"Hybrid RAG over archived subreddit corpora and curated documents"},
-          "config":{"enable":true,"access_control":null}},
-         {"type":"mcp",
-          "url":"${RECALL_URL:-http://172.16.3.215:8092}/mcp",
-          "auth_type":"none",
-          "info":{"id":"recall","name":"Recall",
-                  "description":"Personal per-expert memory: goals, decisions, session logs, notes"},
           "config":{"enable":true,"access_control":null}}]
     depends_on: [riff-search]
     networks:
