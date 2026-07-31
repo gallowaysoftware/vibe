@@ -135,6 +135,9 @@ type Daemon struct {
 	// which is nvidia-smi where there's an NVIDIA GPU and unified-memory
 	// accounting on Apple silicon.
 	nvidiaSMI vram.Probe
+	// vramCapacity answers "could this ever fit on this machine", the only
+	// question that can refuse a start outright.
+	vramCapacity vram.CapacityProbe
 	// vramSlopGiB is added to free VRAM before comparing to the profile's
 	// estimate, absorbing the inherent fuzziness of those numbers. Defaults
 	// to vram.DefaultSlopGiB in New.
@@ -164,13 +167,14 @@ var _ vibev1connect.ControlServiceHandler = (*Daemon)(nil)
 
 func New(cfg Config) *Daemon {
 	return &Daemon{
-		cfg:         cfg,
-		sup:         supervisor.New(),
-		prx:         proxy.New(fmt.Sprintf("127.0.0.1:%d", cfg.ProxyPort)),
-		nvidiaSMI:   vram.DefaultProbe,
-		vramSlopGiB: vram.DefaultSlopGiB,
-		services:    map[string]*serviceInstance{},
-		shutdown:    make(chan struct{}),
+		cfg:          cfg,
+		sup:          supervisor.New(),
+		prx:          proxy.New(fmt.Sprintf("127.0.0.1:%d", cfg.ProxyPort)),
+		nvidiaSMI:    vram.DefaultProbe,
+		vramCapacity: vram.DefaultCapacityProbe,
+		vramSlopGiB:  vram.DefaultSlopGiB,
+		services:     map[string]*serviceInstance{},
+		shutdown:     make(chan struct{}),
 	}
 }
 
@@ -178,6 +182,14 @@ func New(cfg Config) *Daemon {
 // out to nvidia-smi.
 func (d *Daemon) SetVRAMProbe(p vram.Probe) {
 	d.nvidiaSMI = p
+}
+
+// SetCapacityProbe overrides the total-capacity probe. Tests must pin this
+// alongside SetVRAMProbe: capacity decides warn-vs-refuse, so leaving it
+// reading the real host makes the same test pass on a big dev machine and
+// fail on a small CI runner.
+func (d *Daemon) SetCapacityProbe(p vram.CapacityProbe) {
+	d.vramCapacity = p
 }
 
 // Run brings up the proxy and both control-plane listeners (unix + TCP),
@@ -461,7 +473,7 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 	// outright: the router owns placement, and the model may not even load
 	// until its first request (JIT), so "free VRAM now" proves nothing.
 	if !req.Msg.NoVramCheck && p.EstimatedVRAMGB > 0 && !p.Backend.External {
-		res := vram.Check(startCtx, d.nvidiaSMI, p.EstimatedVRAMGB, d.vramSlopGiB)
+		res := vram.CheckWith(startCtx, d.nvidiaSMI, d.vramCapacity, p.EstimatedVRAMGB, d.vramSlopGiB)
 		switch {
 		case res.Skipped:
 			slog.Warn("vram pre-flight skipped",

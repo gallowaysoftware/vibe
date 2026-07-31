@@ -116,7 +116,11 @@ func TestCheck_SlopRescue(t *testing.T) {
 // tenant exiting on a discrete GPU, so the start proceeds loudly.
 func TestCheck_TightWarnsButProceeds(t *testing.T) {
 	probe := func(context.Context) (float64, error) { return 14.3, nil }
-	res := Check(context.Background(), probe, 22.0, DefaultSlopGiB)
+	// Capacity is pinned, not read from the host: on a 16 GiB CI runner a
+	// 22 GiB estimate really does exceed capacity, so leaving it ambient
+	// made this assertion depend on the machine.
+	capacity := func(context.Context) (float64, error) { return 64.0, nil }
+	res := CheckWith(context.Background(), probe, capacity, 22.0, DefaultSlopGiB)
 	if !res.OK {
 		t.Errorf("OK = false, want true — being short of free memory must not block")
 	}
@@ -132,9 +136,8 @@ func TestCheck_TightWarnsButProceeds(t *testing.T) {
 // cannot come good no matter what is evicted.
 func TestCheck_ExceedsCapacityFails(t *testing.T) {
 	probe := func(context.Context) (float64, error) { return 1.0, nil }
-	// 10 PiB is beyond any host this will run on, so the real capacity
-	// probe underneath must reject it whichever branch it takes.
-	res := Check(context.Background(), probe, 10*1024*1024, DefaultSlopGiB)
+	capacity := func(context.Context) (float64, error) { return 64.0, nil }
+	res := CheckWith(context.Background(), probe, capacity, 128.0, DefaultSlopGiB)
 	if res.OK {
 		t.Errorf("OK = true, want false for an estimate beyond total capacity")
 	}

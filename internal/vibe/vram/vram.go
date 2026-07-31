@@ -120,7 +120,27 @@ type CheckResult struct {
 //
 // When the probe returns ErrNoGPUInfo, Check returns OK=true / Skipped=true:
 // the daemon will log a warning and proceed (CPU/AMD-friendly).
+// CapacityProbe reports the largest a single model could ever be on this
+// host. Separate from Probe because free memory and total capacity answer
+// different questions: "is it tight right now" versus "can this ever fit".
+type CapacityProbe func(ctx context.Context) (totalGiB float64, err error)
+
+// DefaultCapacityProbe resolves capacity from nvidia-smi, /proc/meminfo, or
+// darwin sysctls depending on the host.
+var DefaultCapacityProbe CapacityProbe = capacityGiB
+
+// Check is CheckWith against the host's real capacity.
 func Check(ctx context.Context, probe Probe, estimatedGiB, slopGiB float64) CheckResult {
+	return CheckWith(ctx, probe, DefaultCapacityProbe, estimatedGiB, slopGiB)
+}
+
+// CheckWith takes the capacity probe explicitly so the verdict is a pure
+// function of its inputs. Check used to read host capacity through an
+// ambient call, which made its result depend on the machine running it —
+// tests written on a 36 GiB laptop passed and the same tests failed on a
+// 16 GiB CI runner because a "tight" estimate there genuinely exceeded
+// capacity.
+func CheckWith(ctx context.Context, probe Probe, capacity CapacityProbe, estimatedGiB, slopGiB float64) CheckResult {
 	if estimatedGiB <= 0 {
 		// Nothing to check.
 		return CheckResult{OK: true, EstimatedGiB: estimatedGiB}
@@ -161,7 +181,10 @@ func Check(ctx context.Context, probe Probe, estimatedGiB, slopGiB float64) Chec
 
 	// Exceeding what the machine physically has is the one case that cannot
 	// come good, so that stays a hard stop.
-	if total, err := capacityGiB(ctx); err == nil && total > 0 && estimatedGiB > total {
+	if capacity == nil {
+		return res
+	}
+	if total, err := capacity(ctx); err == nil && total > 0 && estimatedGiB > total {
 		res.OK = false
 		res.Warn = false
 		res.TotalGiB = total

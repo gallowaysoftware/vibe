@@ -71,6 +71,9 @@ func TestDaemon_VRAMCheck_Tight(t *testing.T) {
 
 	d := makeDaemon(t)
 	d.SetVRAMProbe(func(context.Context) (float64, error) { return 14.3, nil })
+	// Pinned: a 16 GiB CI runner really cannot fit 22 GiB, so an ambient
+	// capacity probe turns this warn case into a refusal there.
+	d.SetCapacityProbe(func(context.Context) (float64, error) { return 64.0, nil })
 
 	client, _ := startDaemon(t, d)
 
@@ -92,12 +95,11 @@ func TestDaemon_VRAMCheck_Tight(t *testing.T) {
 func TestDaemon_VRAMCheck_ExceedsCapacity(t *testing.T) {
 	setupXDG(t)
 	stub := stubModel(t)
-	// Beyond any real host, so the capacity probe rejects it whichever
-	// branch (nvidia-smi / darwin sysctl) it takes.
-	writeProfile(t, "code", vramProfile("code", stub, 10*1024*1024))
+	writeProfile(t, "code", vramProfile("code", stub, 128.0))
 
 	d := makeDaemon(t)
 	d.SetVRAMProbe(func(context.Context) (float64, error) { return 1.0, nil })
+	d.SetCapacityProbe(func(context.Context) (float64, error) { return 64.0, nil })
 
 	client, _ := startDaemon(t, d)
 
