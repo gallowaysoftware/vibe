@@ -10,7 +10,7 @@ the four use cases.
 
 | box | hardware | availability | role |
 |---|---|---|---|
-| **hum** (role name; the unraid server today) | no GPU, 128GB DDR4, iGPU, big storage | always-on | **The front** (`deploy/hum`, infra): llama-swap front cell (CPU image, peers only — zero local models), the one URL everything talks to. The same host also carries the application stacks that consume it — riff (`deploy/riff`: persistent OWUI + SearXNG), toqui, the fleet dashboard — behind the existing NPM + Authelia. Also the **model library**: the `models` share is the source-of-truth weights store (download once); cells rsync local NVMe copies for JIT-speed loads (`vibe model ensure`, fleet.md P4 — share-as-library replaces localmodel as the preferred source). |
+| **hum** (role name; the unraid server today) | no GPU, 128GB DDR4, iGPU, big storage | always-on | **The front** (`deploy/hum`, infra): llama-swap front cell (CPU image, peers only — zero local models), the one URL everything talks to. The same host also carries the application stacks that consume it — riff (`deploy/riff`: persistent OWUI + SearXNG) and other self-hosted apps — behind the existing NPM + Authelia. Also the **model library**: the `models` share is the source-of-truth weights store (download once); cells rsync local NVMe copies for JIT-speed loads (`vibe model ensure`, fleet.md P4 — share-as-library replaces localmodel as the preferred source). |
 | **localmodel** (this box) | 5090 32GB | opportunistic (dev + games) | GPU cell: 27B/31B-class JIT models + ComfyUI. Explicitly allowed to be off or full of game. |
 | **llamaloft** | 3080Ti 12GB, R5 2600, 32GB | always-on (once built) | Utility-plane cell: embed/rerank/classifier/STT/TTS pinned (`ttl: 0` + preload, ~9-10GB), small swap pool in the remainder. |
 | **spark pair** | 2× DGX Spark, 125GB unified, QSFP400 | always-on (once built) | Heavy cell on spark-1 (owns both nodes): dsv4flash via dual-node vLLM; single-node models (e.g. qwen3-coder-next) on spark-2. |
@@ -20,7 +20,7 @@ The key move vs today: **the front relocates from localmodel to hum.** The
 front is a pure proxy (the official `ghcr.io/mostlygeek/llama-swap:cpu`
 image runs it; peers-only config, no GPU, no model binaries), and it must
 live on the box that is never off, because it is the stable address every
-client — phone, coding harness, toqui, vamp — is configured with, forever:
+client — phone, coding harness, vamp — is configured with, forever:
 
 ```
 http://hum-host:9000/v1          (LAN / VPN, OpenAI + Anthropic formats)
@@ -93,7 +93,7 @@ default/smol/task tiers), not router magic. The Opus-architect +
 local-worker kanban handoff (see agentic-coding-handoff memory) rides on
 this unchanged — both sides are just model ids on :9000.
 
-### UC3 — LLM backend for self-hosted apps (toqui, and the next one)
+### UC3 — LLM backend for self-hosted apps
 
 Pattern for any app: `OPENAI_BASE_URL=http://<front>:9000/v1`, a model id
 from the catalog, and design for lazy loading (first request after idle
@@ -103,36 +103,19 @@ LAN/VPN. Utility calls (embeddings, rerank, classification) go to llamaloft's
 pinned models — instant, never cold. Big-model calls share whatever the
 fleet already has warm.
 
-**toqui specifics** (surveyed 2026-07-13; `backend/internal/ai/`): it is
-already fleet-shaped. Its OpenAI-compatible provider streams always, does
-tool calls heavily, needs no embeddings, does no startup health check,
-has a 5-minute per-request timeout, and retries connection-refused/5xx
-with backoff — i.e. lazy loading works with zero toqui changes. Wiring:
+A worked example of this pattern (a tool-loop travel app surveyed
+2026-07-13) lives with that app's own repo; the reusable rules it
+surfaced:
 
-```
-AI_PROVIDER=openai
-OPENAI_BASE_URL=http://<front>:9000/v1
-OPENAI_API_KEY=anything-nonempty
-OPENAI_MODEL_FAST / _SMART / _BEST = <catalog ids>
-```
-
-Three constraints its survey surfaced:
-- **Tier mapping must be swap-safe.** One toqui turn runs up to 7
-  sequential LLM calls (`maxToolLoopIterations`) and can alternate tiers
-  call-to-call. If FAST and SMART map to models that evict each other on
-  one cell, every turn becomes a swap storm. Rule: within one cell, tiers
-  map to the SAME model or to a co-resident group (llama-swap groups,
-  `swap: false`) — e.g. today all three tiers → `qwen3.6-27b-tools` on
-  localmodel; later FAST → a small always-warm spark/llamaloft model grouped
-  alongside SMART/BEST → `dsv4flash`.
-- **It is a tool-loop client**, so on Qwen it takes the `-tools` def
-  (visible-content tool calls), same rule as the distillery stacks. Image
-  input arrives as `image_url` data-URLs — if trips use photos, the tier
-  model needs vision (gemma-4-31b-mm locally; dsv4flash has it).
-- **Its Claude provider is hardcoded to api.anthropic.com** — only the
-  OpenAI-compatible provider routes through the front. Fine (cloud-direct
-  is allowed); just don't expect toqui's claude path to appear in fleet
-  metrics.
+- **Tier mapping must be swap-safe.** A multi-call agent turn can
+  alternate tiers call-to-call; if two tiers map to models that evict
+  each other on one cell, every turn becomes a swap storm. Rule: within
+  one cell, all tiers map to the SAME model or a co-resident group
+  (llama-swap groups, `swap: false`).
+- **Tool-loop clients on Qwen take the `-tools` def** (visible-content
+  tool calls). Vision input needs a vision-capable tier model.
+- **Cloud-direct providers bypass the front** and won't appear in fleet
+  metrics — allowed, just expected.
 
 ### UC4 — vamp / pipelines
 

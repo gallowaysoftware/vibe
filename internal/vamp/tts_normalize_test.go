@@ -38,15 +38,15 @@ func TestTTSNormalize_TempAndPercent(t *testing.T) {
 	}
 }
 
-func TestTTSNormalize_AcronymsSpelledOut(t *testing.T) {
-	// "B266" without a hyphen is something Kokoro pronounces
-	// natively as "B two sixty-six" — no rule fires on it. We test
-	// the acronym rewrites independently.
-	got, err := ttsNormalizeTemplate("the LAA per CRA in ABV terms", "")
+func TestTTSNormalize_UnitsExpandedAcronymsUntouched(t *testing.T) {
+	// Unit abbreviations expand (default rules); bare domain acronyms
+	// pass through untouched — per-domain spell-outs belong in the
+	// owning pipeline's tts_rules.yaml, not the shared defaults.
+	got, err := ttsNormalizeTemplate("dose 5 mg/L of LAA", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "the L A A per C R A in A B V terms"
+	want := "dose 5 milligrams per litre of LAA"
 	if got != want {
 		t.Errorf("got %q\nwant %q", got, want)
 	}

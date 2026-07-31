@@ -3,10 +3,10 @@
 # forever. Applications that consume it (e.g. deploy/riff) are separate
 # stacks with their own lifecycles; nothing else belongs in this one.
 #
-# Networking (house pattern, same as the stillhouse stack):
+# Networking (house pattern):
 #   - `macvlan` (br0 external): the front gets its own LAN IP (default
 #     172.16.3.211) so it appears as a real host — THE fleet address.
-#     GPU cells, riff, toqui, coding harnesses, phones all dial
+#     GPU cells, chat stacks, coding harnesses, phones all dial
 #     http://<HUM_IPV4>:9000. No port mapping — macvlan has no NAT; the
 #     container's listen port is directly reachable on its IP.
 #   - macvlan/host isolation caveat: the unraid host itself cannot reach

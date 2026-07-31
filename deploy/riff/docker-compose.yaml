@@ -3,7 +3,7 @@
 # other; it consumes hum's LAN address, not a private link, so the two
 # stacks deploy/restart/upgrade independently.
 #
-# Networking (house pattern, same as the stillhouse stack):
+# Networking (house pattern):
 #   - `riff` bridge: internal; webui ↔ searxng talk over it. SearXNG has
 #     no LAN exposure at all.
 #   - `macvlan` (br0 external): the webui gets its own LAN IP (default
