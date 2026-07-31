@@ -257,6 +257,10 @@ func Schema() *schemaProperty {
 				Type:        "string",
 				Description: "Path appended to http://127.0.0.1:port for the readiness check. Defaults to /health.",
 			},
+			"bind": {
+				Type:        "string",
+				Description: "Host interface the docker publish binds to (the left side of `-p <bind>:<port>:<container_port>`). Defaults to 127.0.0.1, which suits a sidecar only this box consumes; set 0.0.0.0 for a service other hosts must reach. Docker mode only — in binary mode the process controls its own listen address. Readiness still probes 127.0.0.1.",
+			},
 		},
 	}
 

@@ -129,10 +129,14 @@ func HTTPServerSpec(p *Profile, profileName string) (supervisor.LaunchSpec, erro
 		if containerPort == 0 {
 			containerPort = h.Port
 		}
+		bind := h.Bind
+		if bind == "" {
+			bind = "127.0.0.1"
+		}
 		args := []string{
 			"run", "--rm",
 			"--name", "vibe-" + profileName,
-			"-p", fmt.Sprintf("127.0.0.1:%d:%d", h.Port, containerPort),
+			"-p", fmt.Sprintf("%s:%d:%d", bind, h.Port, containerPort),
 		}
 		if h.GPU {
 			args = append(args, "--gpus", "all")

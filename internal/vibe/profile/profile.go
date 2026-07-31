@@ -285,6 +285,18 @@ type HTTPServerBackend struct {
 	// — a non-2xx response without a body is fine, it just proves the
 	// process is up).
 	HealthPath string `yaml:"health_path,omitempty"`
+	// Bind is the host interface the docker publish binds to, i.e. the
+	// left-hand side of `-p <bind>:<port>:<container_port>`. Defaults to
+	// 127.0.0.1, which is right for a sidecar only this box consumes.
+	//
+	// Set 0.0.0.0 for a service other hosts must reach — a fleet-wide
+	// retrieval plane, a shared TTS daemon. Without this the service is
+	// unreachable from anywhere but the host running it, which is exactly
+	// wrong for anything the rest of the fleet depends on.
+	//
+	// Readiness still probes 127.0.0.1: the daemon is checking the process
+	// it launched on this box, not the address clients use.
+	Bind string `yaml:"bind,omitempty"`
 }
 
 // TabbyAPIBackend supervises a tabbyAPI process serving an ExLlamaV3
@@ -879,13 +891,25 @@ func validateHTTPServer(h *HTTPServerBackend) error {
 		return errors.New("backend.http_server.port must be > 0 (daemon-picked ports are not supported for this backend type)")
 	}
 	if h.Image == "" {
-		// Binary mode: Volumes / GPU are docker-only.
+		// Binary mode: Volumes / GPU / Bind are docker-only.
 		if len(h.Volumes) > 0 {
 			return errors.New("backend.http_server.volumes is only valid in docker mode (image: set)")
 		}
 		if h.GPU {
 			return errors.New("backend.http_server.gpu is only valid in docker mode (image: set)")
 		}
+		// Bind shapes the docker publish flag; in binary mode the process
+		// chooses its own listen address, so accepting it here would look
+		// like it worked while changing nothing.
+		if h.Bind != "" {
+			return errors.New("backend.http_server.bind is only valid in docker mode (image: set); in binary mode the process controls its own listen address, typically via args")
+		}
+	}
+	if h.Bind != "" && strings.ContainsAny(h.Bind, " \t:/") {
+		// Catch "0.0.0.0:8080" and URL forms here: they would otherwise be
+		// spliced into `-p` and produce an opaque docker parse error at
+		// start, long after the typo.
+		return fmt.Errorf("backend.http_server.bind %q must be a bare host address (e.g. 0.0.0.0), without a port or scheme", h.Bind)
 	}
 	return nil
 }

@@ -13,16 +13,44 @@ type ExpandContext struct {
 	ModelContext int
 	WriteFile    string // resolved write_file path; set by Activate after expanding write_file itself
 	VibeStateDir string // $XDG_STATE_HOME/vibe
+	// VibeSearch is the fleet's retrieval-plane base URL (search + fetch),
+	// from `search_url` in the daemon config. Empty when the operator has
+	// not deployed one — see optionalVars for why that is not the same as
+	// expanding to "".
+	VibeSearch string
+}
+
+// optionalVars are template variables that exist as a concept but may be
+// unconfigured. They are left OUT of the expansion map when empty so a
+// profile referencing one fails loudly instead of rendering an empty string
+// into a harness config — a client silently pointed at "" is far harder to
+// diagnose than a start that refuses with a reason.
+var optionalVars = map[string]string{
+	"VIBE_SEARCH": "set search_url in the vibe daemon config (~/.config/vibe/config.yaml) to the retrieval plane's base URL",
 }
 
 func (c ExpandContext) vars() map[string]any {
-	return map[string]any{
+	v := map[string]any{
 		"VIBE_API":       c.VibeAPI,
 		"MODEL_ALIAS":    c.ModelAlias,
 		"MODEL_CONTEXT":  c.ModelContext,
 		"WRITE_FILE":     c.WriteFile,
 		"VIBE_STATE_DIR": c.VibeStateDir,
 	}
+	if c.VibeSearch != "" {
+		v["VIBE_SEARCH"] = c.VibeSearch
+	}
+	return v
+}
+
+// unknownVarError distinguishes "you typo'd a variable name" from "this
+// variable is real but not configured on this machine", which are different
+// problems with different fixes.
+func unknownVarError(name string) error {
+	if hint, ok := optionalVars[name]; ok {
+		return fmt.Errorf("template variable ${%s} is not configured: %s", name, hint)
+	}
+	return fmt.Errorf("unknown template variable ${%s}", name)
 }
 
 var (
@@ -124,7 +152,7 @@ func expandString(s string, vars map[string]any) (any, error) {
 	if m := wholeVarRE.FindStringSubmatch(s); m != nil {
 		val, ok := vars[m[1]]
 		if !ok {
-			return nil, fmt.Errorf("unknown template variable ${%s}", m[1])
+			return nil, unknownVarError(m[1])
 		}
 		return val, nil
 	}
@@ -139,7 +167,7 @@ func expandString(s string, vars map[string]any) (any, error) {
 		return fmt.Sprintf("%v", val)
 	})
 	if unknown != "" {
-		return nil, fmt.Errorf("unknown template variable ${%s}", unknown)
+		return nil, unknownVarError(unknown)
 	}
 	return out, nil
 }
