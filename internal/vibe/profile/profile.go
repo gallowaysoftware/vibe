@@ -125,6 +125,7 @@ type Backend struct {
 	HTTPServer  *HTTPServerBackend  `yaml:"http_server,omitempty"`
 	TabbyAPI    *TabbyAPIBackend    `yaml:"tabby_api,omitempty"`
 	CloudPeer   *CloudPeerBackend   `yaml:"cloud_peer,omitempty"`
+	MLXServer   *MLXServerBackend   `yaml:"mlx_server,omitempty"`
 }
 
 // CloudPeerBackend names a remote OpenAI/Anthropic-compatible API the router
@@ -341,6 +342,78 @@ type TabbyAPIBackend struct {
 	// ExtraArgs are appended to the start.py argv after vibe's
 	// standard ones. Use for tabbyAPI-specific knobs vibe doesn't
 	// yet expose as first-class fields.
+	ExtraArgs []string `yaml:"extra_args,omitempty"`
+}
+
+// MLXServerBackend supervises an `mlx_lm.server` child process — Apple's
+// MLX runtime, which is the fast path on Apple silicon (unified memory, no
+// host/device copy). It exists alongside llama_server rather than replacing
+// it: MLX is Apple-only and consumes MLX-quantised safetensors snapshots,
+// not GGUF.
+//
+// Two upstream quirks shape this schema, and both are load-bearing:
+//
+//   - **No context flag.** mlx_lm.server takes the window from the model's
+//     own config.json; there is no --ctx-size equivalent. Context here is
+//     therefore METADATA — it feeds ${MODEL_CONTEXT} so frontend configs
+//     advertise the right window, and it does not constrain the server.
+//     Setting it lower will not save memory.
+//
+//   - **No alias flag.** The server advertises the literal --model value on
+//     /v1/models (an absolute path), and it treats a request's `model`
+//     field as a model to LOAD — an unrecognised id sends it to the
+//     HuggingFace API and fails the request. Alias is still the
+//     client-facing id: the proxy rewrites alias→ModelDir on the way in
+//     (Proxy.SetModelRewrite) and ModelDir→alias on /v1/models responses,
+//     and the router renderer emits llama-swap's useModelName for the same
+//     reason. Without that translation every client would have to send an
+//     absolute filesystem path as its model name.
+type MLXServerBackend struct {
+	// ModelDir is the MLX model snapshot directory (safetensors shards +
+	// config.json + tokenizer files), passed verbatim as --model.
+	// Tilde-expanded at load.
+	ModelDir string `yaml:"model_dir"`
+	// Huggingface, when set, downloads the MLX snapshot into ModelDir on
+	// `vibe pull`. Mirrors TabbyAPIBackend.Huggingface — MLX models are
+	// multi-file directories, not the single GGUF llama_server pulls.
+	Huggingface *HuggingfaceRepo `yaml:"huggingface,omitempty"`
+	// Alias is the client-facing model id (what /v1/models reports through
+	// the proxy and what vamp/frontends send as `model:`). Required.
+	Alias string `yaml:"alias"`
+	// Context is the advertised window for ${MODEL_CONTEXT}. See the type
+	// doc: metadata only, it does not configure the server.
+	Context int `yaml:"context"`
+	// Port pins the listen port; 0 lets the daemon pick a free one (the
+	// llama_server convention — MLX has no reason to be stricter).
+	Port int `yaml:"port,omitempty"`
+	// Host is the bind address. Defaults to 127.0.0.1. Set 0.0.0.0 to make
+	// this box an inference target for other hosts directly; a machine
+	// fronted by llama-swap does NOT need this (the router binds the LAN
+	// address and reaches its backends over loopback).
+	Host string `yaml:"host,omitempty"`
+	// Venv is the python venv with mlx-lm installed. The daemon execs
+	// <Venv>/bin/mlx_lm.server directly so PATH state doesn't matter.
+	// Required. Tilde-expanded.
+	Venv string `yaml:"venv"`
+	// DraftModel is an MLX snapshot dir used for speculative decoding
+	// (--draft-model). Tilde-expanded.
+	DraftModel string `yaml:"draft_model,omitempty"`
+	// NumDraftTokens caps tokens drafted per step (--num-draft-tokens).
+	// Only meaningful alongside DraftModel.
+	NumDraftTokens int `yaml:"num_draft_tokens,omitempty"`
+	// ChatTemplateArgs is forwarded as --chat-template-args JSON, e.g.
+	// {enable_thinking: false}. This is the same knob vamp text stages
+	// call chat_template_kwargs — unlike llama-server, mlx_lm.server
+	// honours it, so a strict-JSON stage can actually silence Qwen CoT.
+	ChatTemplateArgs map[string]any `yaml:"chat_template_args,omitempty"`
+	// MaxTokens is the server's default generation cap (--max-tokens).
+	// mlx_lm.server defaults to 512, which truncates most coding replies;
+	// vibe leaves it unset only when the profile says so explicitly.
+	MaxTokens int `yaml:"max_tokens,omitempty"`
+	// TrustRemoteCode enables --trust-remote-code for tokenizers that need
+	// it. Off by default: it executes repo-supplied python.
+	TrustRemoteCode bool `yaml:"trust_remote_code,omitempty"`
+	// ExtraArgs are appended after vibe's standard argv.
 	ExtraArgs []string `yaml:"extra_args,omitempty"`
 }
 
@@ -740,6 +813,46 @@ func validateTabbyAPI(t *TabbyAPIBackend) error {
 	return nil
 }
 
+// validateMLXServer mirrors validateTabbyAPI's shape: a snapshot dir (or an
+// HF block that will create one), an alias, and the venv holding the runtime.
+// Context is required despite being metadata — a frontend rendered with
+// ${MODEL_CONTEXT} of 0 silently misconfigures the client, which is worse
+// than being made to write the number down.
+func validateMLXServer(m *MLXServerBackend) error {
+	if m.ModelDir == "" && m.Huggingface == nil {
+		return errors.New("backend.mlx_server: model_dir or huggingface is required")
+	}
+	if m.Huggingface != nil && m.Huggingface.Repo == "" {
+		return errors.New("backend.mlx_server.huggingface.repo is required when huggingface is set")
+	}
+	if m.Alias == "" {
+		return errors.New("backend.mlx_server.alias is required")
+	}
+	if m.Context <= 0 {
+		return errors.New("backend.mlx_server.context must be > 0 (it is advertised to clients as ${MODEL_CONTEXT}; mlx_lm.server itself takes the window from the model's config.json)")
+	}
+	if m.Venv == "" {
+		return errors.New("backend.mlx_server.venv is required (python venv with mlx-lm installed)")
+	}
+	if m.Port < 0 {
+		return fmt.Errorf("backend.mlx_server.port %d must be >= 0 (0 lets the daemon pick)", m.Port)
+	}
+	if m.NumDraftTokens != 0 && m.DraftModel == "" {
+		return errors.New("backend.mlx_server.num_draft_tokens requires draft_model")
+	}
+	if m.MaxTokens < 0 {
+		return fmt.Errorf("backend.mlx_server.max_tokens %d must be >= 0", m.MaxTokens)
+	}
+	// An alias that looks like a path is almost certainly someone working
+	// around the /v1/models behaviour by hand. The proxy already handles
+	// the translation, and a path alias would defeat the router's
+	// useModelName rendering, so reject it with the reason.
+	if strings.HasPrefix(m.Alias, "/") || strings.HasPrefix(m.Alias, "~") {
+		return fmt.Errorf("backend.mlx_server.alias %q must be a plain model id, not a path (vibe translates alias <-> model_dir for you: the proxy rewrites requests, and the router renders useModelName)", m.Alias)
+	}
+	return nil
+}
+
 // validateHTTPServer enforces the docker-mode vs binary-mode XOR plus the
 // always-required Port field. Image OR Binary must be set; Port must be > 0
 // (this MVP doesn't support daemon-picked ports for http_server backends).
@@ -935,7 +1048,12 @@ func (p *Profile) validateFrontend() error {
 	// (Compare to llama_server, which still demands a frontend for Phase-1
 	// historical reasons — tabby_api shipped after that requirement was
 	// relaxed and follows the modern shape.)
-	if p.Backend.TabbyAPI != nil {
+	// mlx_server follows tabby_api's modern shape rather than llama_server's:
+	// the same def is meant to be usable headless (a fleet node the router
+	// spawns, or a vamp text stage over the proxy) and with a frontend
+	// attached (pi/omp on the laptop). Demanding a frontend would make the
+	// disconnected-laptop and fleet-node uses two different definitions.
+	if p.Backend.TabbyAPI != nil || p.Backend.MLXServer != nil {
 		if p.Frontend.IsZero() {
 			return nil
 		}

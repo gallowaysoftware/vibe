@@ -138,6 +138,34 @@ optional.)
   flow in `daemon.Pull` is a helper closure (`pullOne`) called
   once per file — weights, mmproj, and draft model — all
   streaming download progress over the same RPC stream.
+- **`mlx_server` backend (Apple silicon).** Supervises `mlx_lm.server`
+  from a venv (`<venv>/bin/mlx_lm.server`; `vibe pull` shells out to
+  `<venv>/bin/hf` for the snapshot, same as tabby_api). It exists because
+  MLX is measurably the faster runtime on Apple silicon — on an M3 Pro,
+  Qwen3.6-35B-A3B ran ~27 tok/s under MLX 4-bit against ~15 tok/s for the
+  same model as Q4_K_XL under llama-server, matched at 400 generated
+  tokens. llama_server stays the right backend on the NVIDIA boxes.
+  Two upstream quirks drive the schema, and both are handled for the user:
+  - **No context flag.** mlx_lm.server takes the window from the model's
+    `config.json`. `context:` is advertised metadata (it feeds
+    `${MODEL_CONTEXT}`) and does NOT constrain the server — lowering it
+    saves no memory, unlike llama_server's `context`.
+  - **No alias flag.** It advertises the literal `--model` value on
+    /v1/models and treats a request's `model` field as a model to *load*,
+    so an unrecognised id sends it to the HuggingFace API and fails the
+    request. `alias:` is still the client-facing id: the proxy rewrites
+    alias→model_dir on the way in and model_dir→alias in /v1/models and in
+    completion responses (including SSE chunks — otherwise an absolute
+    filesystem path leaks to every client), and the router renders
+    llama-swap's `useModelName` for the same reason. A path-shaped alias
+    is rejected at load with that explanation.
+  Unlike llama_server it does not demand a frontend (it follows
+  tabby_api's shape): the same def is meant to serve a laptop frontend
+  when disconnected and be spawned by hum/llama-swap when connected, and
+  `router.modelCmd` builds its argv from the same `profile.MLXServerSpec`
+  the daemon uses so the two can't drift. Unlike llama-server it honours
+  `chat_template_args` (`{enable_thinking: false}`) — verified: without it
+  Qwen3.6 spent 1200 tokens in `reasoning` and emitted no content.
 - **Speculative draft models (Gemma 4 MTP).**
   `backend.llama_server.draft_model` points at a draft GGUF loaded via
   `--model-draft`; vibe also emits `--spec-type` (`spec_type`, default
@@ -151,6 +179,18 @@ optional.)
   quantized KV needs a llama.cpp build with PR #23398 (hadamard
   rotation for quantized K); on older builds draft acceptance drops to
   ~0%. Verify acceptance after start.
+- **VRAM pre-flight: warn, don't block.** `vram.Check` refuses a start
+  ONLY when `estimated_vram_gb` exceeds the machine's total capacity —
+  the one case no amount of freeing fixes. Merely being over *free*
+  memory is a yellow warning and the start proceeds, because free memory
+  is a moving target: the same profile on the same laptop reported 15.2
+  GiB free (warn) and 23.5 GiB free (ok) minutes apart, purely from page
+  cache. `--no-vram-check` (on `start`, `run`, and `backend start`)
+  bypasses even the hard stop. `vram.DefaultProbe` is nvidia-smi where
+  there's an NVIDIA GPU and vm_stat-based unified-memory accounting on
+  Apple silicon; the Metal working-set ceiling is deliberately NOT
+  guessed at (reading it needs Metal, and vibe is cgo-free), so a model
+  between that ceiling and total RAM warns rather than failing.
 - **Backends (reusable model specs).** A backend is a named model-server
   spec under `$XDG_CONFIG_HOME/vibe/backends/<name>.yaml` (`profile.BackendDef`
   = a `backend:` union + `estimated_vram_gb` + optional `mode`, no frontend).

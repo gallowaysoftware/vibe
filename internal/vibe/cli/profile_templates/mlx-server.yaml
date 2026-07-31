@@ -1,0 +1,92 @@
+# Starter profile: mlx_server backend (Apple silicon) + oh-my-pi frontend.
+#
+# This file was dropped by `vibe profile new __PROFILE_NAME__ --kind mlx-server`. Edit the
+# REPLACE-marked lines below, then `vibe pull __PROFILE_NAME__` and `vibe run __PROFILE_NAME__`.
+#
+# MLX is the fast path on Apple silicon; llama_server remains the right
+# backend on the NVIDIA boxes. Both kinds can coexist in one backends/
+# catalog, so a model id can be served by whichever machine is up.
+#
+# Prerequisite: a venv with mlx-lm.
+#   uv venv ~/.venvs/mlx && uv pip install --python ~/.venvs/mlx/bin/python mlx-lm
+
+name: __PROFILE_NAME__
+description: __PROFILE_NAME__ (mlx_lm.server + oh-my-pi)
+
+backend:
+  mlx_server:
+    # REPLACE: where the MLX snapshot lives (a directory, not a single file).
+    model_dir: ~/models/REPLACE-mlx-snapshot
+    huggingface:
+      # REPLACE: an MLX-quantised repo — mlx-community publishes most models.
+      repo: mlx-community/REPLACE-Model-4bit
+    # REPLACE: the client-facing model id. A plain id, never a path: vibe
+    # translates it to model_dir for the server (which only answers to its
+    # own --model value) at the proxy and, for router-served defs, via
+    # llama-swap's useModelName.
+    alias: REPLACE-model-alias
+    # Advertised to frontends as ${MODEL_CONTEXT}. NOTE: metadata only.
+    # mlx_lm.server takes the real window from the model's config.json, so
+    # lowering this does not save memory the way llama_server's context does.
+    context: 65536
+    venv: ~/.venvs/mlx
+    # mlx_lm.server's own default is 512, which truncates most coding replies.
+    max_tokens: 32768
+    # Uncomment to bind every interface and serve other machines directly.
+    # A box fronted by llama-swap does NOT need this — the router binds the
+    # LAN address and reaches its backends over loopback.
+    # host: 0.0.0.0
+    #
+    # Unlike llama-server, mlx_lm.server honours chat-template kwargs, so
+    # CoT can actually be silenced for strict-JSON work:
+    # chat_template_args: {enable_thinking: false}
+
+frontend:
+  kind: managed
+  # REPLACE (or drop this whole block): oh-my-pi. A profile with no frontend
+  # is valid for mlx_server — that is the shape a fleet node or a
+  # vamp-driven pipeline uses.
+  binary: ~/.local/bin/omp
+  restart_required: true
+  env:
+    # omp joins PI_CONFIG_DIR onto $HOME unconditionally — an absolute path
+    # comes back as $HOME + path — so this stays home-relative and must
+    # match the write_files paths below. omp appends "agent" itself.
+    PI_CONFIG_DIR: .omp-vibe/__PROFILE_NAME__
+  write_files:
+    # A sidecar config dir, so the user's real ~/.omp/agent/models.yml and
+    # session history are left alone.
+    - path: ~/.omp-vibe/__PROFILE_NAME__/agent/models.yml
+      template:
+        providers:
+          vibe-local:
+            baseUrl: ${VIBE_API}
+            # The server ignores the key, but omp hides models from an
+            # unauthenticated provider, so the placeholder is load-bearing.
+            apiKey: vibe
+            api: openai-completions
+            compat:
+              supportsDeveloperRole: false
+              supportsReasoningEffort: false
+            models:
+              - id: ${MODEL_ALIAS}
+                name: ${MODEL_ALIAS}
+                reasoning: true
+                input: [text]
+                contextWindow: ${MODEL_CONTEXT}
+                maxTokens: 32768
+                cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}
+    - path: ~/.omp-vibe/__PROFILE_NAME__/agent/config.yml
+      template:
+        modelRoles:
+          # Every role points at the one loaded model: an unresolved role
+          # sends omp to a cloud provider this sidecar has no key for.
+          main: vibe-local/${MODEL_ALIAS}
+          smol: vibe-local/${MODEL_ALIAS}
+          slow: vibe-local/${MODEL_ALIAS}
+          plan: vibe-local/${MODEL_ALIAS}
+
+# REPLACE: roughly the snapshot size on disk plus a couple of GiB for KV and
+# compute buffers. On Apple silicon the ceiling is Metal's working-set limit
+# (`vibe doctor` prints it), not total RAM.
+estimated_vram_gb: 24

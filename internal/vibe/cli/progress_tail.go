@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/lipgloss"
+
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 )
 
@@ -99,6 +101,11 @@ func tailDaemonLog(ctx context.Context, logPath string, out io.Writer) {
 	}
 }
 
+// warnStyle colours non-fatal pre-flight warnings. lipgloss drops the
+// escape codes on its own when the output isn't a colour terminal or
+// NO_COLOR is set, so the same string stays readable when piped to a file.
+var warnStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Bold(true)
+
 // renderDaemonEvent decodes a JSON daemon-log line and prints a friendly
 // progress line for known msg values. Anything we don't recognise is
 // silently dropped — the goal is high-signal progress, not log tailing.
@@ -125,6 +132,12 @@ func renderDaemonEvent(line string, out io.Writer) {
 		fmt.Fprintf(out, "  vram ok (%.1f GiB free, %.1f GiB estimated)\n", e.FreeGiB, e.EstimatedGiB)
 	case "vram pre-flight skipped":
 		fmt.Fprintln(out, "  vram check skipped (probe unavailable)")
+	case "vram pre-flight tight":
+		// Loud but not fatal: free memory is a moving target, so this is
+		// the case where the load usually still works.
+		fmt.Fprintln(out, warnStyle.Render(fmt.Sprintf(
+			"  warning: needs ~%.1f GiB but only %.1f GiB free — loading anyway (--no-vram-check to silence)",
+			e.EstimatedGiB, e.FreeGiB)))
 	case "starting profile (llama_server)":
 		switch {
 		case e.Alias != "" && e.ModelFile != "":

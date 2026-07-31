@@ -104,6 +104,8 @@ func backendKind(b profile.Backend) string {
 		return "comfyui"
 	case b.CloudPeer != nil:
 		return "cloud_peer"
+	case b.MLXServer != nil:
+		return "mlx_server"
 	}
 	return "?"
 }
@@ -175,7 +177,8 @@ func backendShowCmd() *cobra.Command {
 // structurally instead of via flag validation. No pull step — `vibe pull`
 // is profile-keyed, so missing weights surface as a daemon start error.
 func backendStartCmd() *cobra.Command {
-	return &cobra.Command{
+	var noVRAMCheck bool
+	cmd := &cobra.Command{
 		Use:               "start <name>",
 		Short:             "Activate a backend with no frontend (auto-spawns the daemon if needed).",
 		Args:              cobra.ExactArgs(1),
@@ -190,7 +193,7 @@ func backendStartCmd() *cobra.Command {
 			}
 			cancelTail := startProgressTail(cmd.OutOrStdout())
 			defer cancelTail()
-			r, err := newClient().StartBackend(ctx, args[0])
+			r, err := newClient().StartBackendOpts(ctx, args[0], noVRAMCheck)
 			if err != nil {
 				return err
 			}
@@ -203,6 +206,8 @@ func backendStartCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&noVRAMCheck, "no-vram-check", false, noVRAMCheckUsage)
+	return cmd
 }
 
 // completeBackendNames mirrors completeProfileNames for backend

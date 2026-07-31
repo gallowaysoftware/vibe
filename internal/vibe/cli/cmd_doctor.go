@@ -608,6 +608,8 @@ func declaredPorts() map[int][]string {
 			add(b.HTTPServer.Port, label)
 		case b.TabbyAPI != nil:
 			add(b.TabbyAPI.Port, label)
+		case b.MLXServer != nil:
+			add(b.MLXServer.Port, label)
 		}
 	}
 	if names, err := profile.ListBackends(); err == nil {

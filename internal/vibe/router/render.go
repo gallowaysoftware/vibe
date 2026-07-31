@@ -17,6 +17,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
+	"github.com/gallowaysoftware/vibe/internal/vibe/supervisor"
 )
 
 // Options configure a render pass.
@@ -70,6 +71,12 @@ type swapConfig struct {
 type swapModel struct {
 	Cmd     string   `yaml:"cmd"`
 	Aliases []string `yaml:"aliases,omitempty"`
+	// UseModelName overrides the model name llama-swap forwards upstream.
+	// Emitted only for mlx_server tenants: mlx_lm.server answers to the
+	// filesystem path it was launched with and treats anything else as a
+	// model to fetch from HuggingFace, so the client-facing id has to be
+	// translated at the router the same way vibe's own proxy translates it.
+	UseModelName string `yaml:"useModelName,omitempty"`
 	// Proxy/CheckEndpoint are emitted only for non-llama_server tenants
 	// (comfyui): llama-server entries use llama-swap's ${PORT} defaults.
 	Proxy         string `yaml:"proxy,omitempty"`
@@ -143,7 +150,7 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 			continue
 		}
 		switch {
-		case def.Backend.LlamaServer != nil, def.Backend.ComfyUI != nil:
+		case def.Backend.LlamaServer != nil, def.Backend.ComfyUI != nil, def.Backend.MLXServer != nil:
 			modelDefs = append(modelDefs, def)
 		case def.Backend.CloudPeer != nil:
 			peerDefs = append(peerDefs, def)
@@ -193,6 +200,11 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 				return "", err
 			}
 			m.Cmd = cmd
+			if mx := def.Backend.MLXServer; mx != nil {
+				// Clients address this by def name; the process only
+				// answers to its snapshot path.
+				m.UseModelName = mx.ModelDir
+			}
 		}
 		if lc := def.Lifecycle; lc != nil {
 			if lc.TTL != nil {
@@ -321,6 +333,8 @@ func resolveAliases(modelDefs []*profile.BackendDef) (map[string][]string, error
 			want = def.Router.Aliases
 		} else if ls := def.Backend.LlamaServer; ls != nil && ls.Alias != "" {
 			want = []string{ls.Alias}
+		} else if mx := def.Backend.MLXServer; mx != nil && mx.Alias != "" {
+			want = []string{mx.Alias}
 		}
 		owner := def.Router != nil && def.Router.AliasOwner
 		for _, a := range want {
@@ -377,15 +391,26 @@ func resolveAliases(modelDefs []*profile.BackendDef) (map[string][]string, error
 // so router-served and vibe-supervised starts can never drift flag-by-flag.
 // The daemon-picked port becomes llama-swap's ${PORT} macro.
 func modelCmd(def *profile.BackendDef, opts Options) (string, error) {
-	bin := opts.LlamaServerBinary
-	if b := def.Backend.LlamaServer.Binary; b != "" {
-		bin = b
-	}
-	if bin == "" {
-		bin = "llama-server"
-	}
 	p := &profile.Profile{Name: def.Name, Backend: def.Backend}
-	spec, err := profile.LlamaServerSpec(p, bin, 0)
+	var (
+		spec supervisor.LaunchSpec
+		err  error
+	)
+	if def.Backend.MLXServer != nil {
+		// Same builder the daemon uses, so a def launched locally while
+		// disconnected and the same def spawned by the router carry
+		// byte-identical flags.
+		spec, err = profile.MLXServerSpec(p, 0)
+	} else {
+		bin := opts.LlamaServerBinary
+		if b := def.Backend.LlamaServer.Binary; b != "" {
+			bin = b
+		}
+		if bin == "" {
+			bin = "llama-server"
+		}
+		spec, err = profile.LlamaServerSpec(p, bin, 0)
+	}
 	if err != nil {
 		return "", fmt.Errorf("backend %s: %w", def.Name, err)
 	}

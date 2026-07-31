@@ -111,14 +111,38 @@ func TestCheck_SlopRescue(t *testing.T) {
 	}
 }
 
-func TestCheck_Insufficient(t *testing.T) {
+// Short of free memory is a warning, not a refusal: free memory is mostly
+// reclaimable cache on a unified-memory host and can be freed by another
+// tenant exiting on a discrete GPU, so the start proceeds loudly.
+func TestCheck_TightWarnsButProceeds(t *testing.T) {
 	probe := func(context.Context) (float64, error) { return 14.3, nil }
 	res := Check(context.Background(), probe, 22.0, DefaultSlopGiB)
-	if res.OK {
-		t.Errorf("OK = true, want false (free=14.3 << est=22)")
+	if !res.OK {
+		t.Errorf("OK = false, want true — being short of free memory must not block")
+	}
+	if !res.Warn {
+		t.Errorf("Warn = false, want true (free=14.3 << est=22)")
 	}
 	if !strings.Contains(res.Message, "14.3") || !strings.Contains(res.Message, "22.0") {
 		t.Errorf("message %q missing expected numbers", res.Message)
+	}
+}
+
+// The one hard stop: an estimate larger than the machine's whole capacity
+// cannot come good no matter what is evicted.
+func TestCheck_ExceedsCapacityFails(t *testing.T) {
+	probe := func(context.Context) (float64, error) { return 1.0, nil }
+	// 10 PiB is beyond any host this will run on, so the real capacity
+	// probe underneath must reject it whichever branch it takes.
+	res := Check(context.Background(), probe, 10*1024*1024, DefaultSlopGiB)
+	if res.OK {
+		t.Errorf("OK = true, want false for an estimate beyond total capacity")
+	}
+	if res.Warn {
+		t.Errorf("Warn = true, want false — this is a hard failure, not a warning")
+	}
+	if !strings.Contains(res.Message, "in total") {
+		t.Errorf("message %q should explain it exceeds total capacity", res.Message)
 	}
 }
 

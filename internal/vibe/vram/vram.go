@@ -93,9 +93,17 @@ func parseFreeGiB(out []byte) (float64, error) {
 // CheckResult is the outcome of a pre-flight check. The daemon consults
 // these fields to either proceed, refuse, or warn-and-proceed.
 type CheckResult struct {
-	// OK is true when the profile's estimate fits within free VRAM + slop,
-	// OR when the probe couldn't determine free VRAM (Skipped=true).
+	// OK is true when the start should proceed: the estimate fits, the
+	// probe had no info (Skipped), or it is merely tight (Warn). Only a
+	// physically impossible request sets OK false.
 	OK bool
+	// Warn is true when the estimate exceeds currently-free memory but not
+	// the machine's total capacity. The start proceeds; callers should say
+	// so loudly, because the load may thrash, swap, or fail.
+	Warn bool
+	// TotalGiB is the machine's usable capacity, set only when a hard
+	// failure was decided against it.
+	TotalGiB float64
 	// Skipped is true when the probe returned ErrNoGPUInfo. Callers should
 	// log a warning and proceed.
 	Skipped bool
@@ -140,8 +148,25 @@ func Check(ctx context.Context, probe Probe, estimatedGiB, slopGiB float64) Chec
 		res.OK = true
 		return res
 	}
-	res.OK = false
-	res.Message = fmt.Sprintf("needs ~%.1f GiB free VRAM but only %.1f GiB is free",
+	// Short of free memory is not the same as impossible. "Free" moves
+	// constantly — on a unified-memory host most of it is page cache the
+	// kernel hands back under pressure, and even on a discrete GPU another
+	// tenant may exit between the probe and the load. Blocking on that
+	// produced false refusals, so being over the free figure is a warning
+	// and the start proceeds.
+	res.OK = true
+	res.Warn = true
+	res.Message = fmt.Sprintf("needs ~%.1f GiB but only %.1f GiB is free right now; the load may thrash or fail",
 		estimatedGiB, free)
+
+	// Exceeding what the machine physically has is the one case that cannot
+	// come good, so that stays a hard stop.
+	if total, err := capacityGiB(ctx); err == nil && total > 0 && estimatedGiB > total {
+		res.OK = false
+		res.Warn = false
+		res.TotalGiB = total
+		res.Message = fmt.Sprintf("needs ~%.1f GiB but this machine has only %.1f GiB of usable memory in total",
+			estimatedGiB, total)
+	}
 	return res
 }

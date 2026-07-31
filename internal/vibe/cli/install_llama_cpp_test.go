@@ -101,7 +101,7 @@ func newLlamaTestEnv(t *testing.T, opts llamaTestOpts) (*llamaInstallerEnv, *byt
 			if opts.runHandler != nil {
 				return opts.runHandler(name, args)
 			}
-			return exec.Command("/bin/true")
+			return exec.Command(trueBin)
 		},
 		chooseMethod: func(string) llamaInstallMethod { return opts.method },
 		httpClient:   &http.Client{Transport: rt},
@@ -482,13 +482,13 @@ func TestInstallLlamaCpp_ArchDistroPathPrintsPacman(t *testing.T) {
 	// pacman -Si llama.cpp succeeds (stub returns /bin/true).
 	stub := func(name string, args []string) *exec.Cmd {
 		if name == "pacman" && len(args) >= 2 && args[0] == "-Si" {
-			return exec.Command("/bin/true")
+			return exec.Command(trueBin)
 		}
 		// llama-server --version verify step
 		if strings.HasSuffix(name, "llama-server") {
-			return exec.Command("/bin/true")
+			return exec.Command(trueBin)
 		}
-		return exec.Command("/bin/false")
+		return exec.Command(falseBin)
 	}
 	env, out, _ := newLlamaTestEnv(t, llamaTestOpts{
 		osRelease:  `ID=arch` + "\n",
@@ -526,9 +526,9 @@ func TestInstallLlamaCpp_ArchPackageNotAvailableFallsThrough(t *testing.T) {
 	})
 	stub := func(name string, args []string) *exec.Cmd {
 		if name == "pacman" && len(args) >= 2 && args[0] == "-Si" {
-			return exec.Command("/bin/false") // package not found
+			return exec.Command(falseBin) // package not found
 		}
-		return exec.Command("/bin/true")
+		return exec.Command(trueBin)
 	}
 	env, out, calls := newLlamaTestEnv(t, llamaTestOpts{
 		osRelease:  `ID=arch` + "\n",
@@ -664,7 +664,7 @@ func TestInstallLlamaCpp_ReleasePathSymlinkAlreadyExists(t *testing.T) {
 	var stdout bytes.Buffer
 	env := &llamaInstallerEnv{
 		home:          home,
-		runCmd:        func(name string, args ...string) *exec.Cmd { return exec.Command("/bin/true") },
+		runCmd:        func(name string, args ...string) *exec.Cmd { return exec.Command(trueBin) },
 		chooseMethod:  func(string) llamaInstallMethod { return llamaMethodRelease },
 		httpClient:    &http.Client{Transport: rt},
 		readOSRelease: func() ([]byte, error) { return []byte("ID=ubuntu\n"), nil },
@@ -733,7 +733,7 @@ func TestInstallLlamaCpp_SourcePathRunsCloneAndCmake(t *testing.T) {
 				_ = os.MkdirAll(binDir, 0o755)
 				_ = os.WriteFile(filepath.Join(binDir, "llama-server"), []byte("#!/bin/sh\necho stub\n"), 0o755)
 			}
-			return exec.Command("/bin/true")
+			return exec.Command(trueBin)
 		},
 	})
 	home = env.home
@@ -788,7 +788,7 @@ func TestInstallLlamaCpp_SourcePathWithCUDA(t *testing.T) {
 				_ = os.MkdirAll(binDir, 0o755)
 				_ = os.WriteFile(filepath.Join(binDir, "llama-server"), []byte("#!/bin/sh\n"), 0o755)
 			}
-			return exec.Command("/bin/true")
+			return exec.Command(trueBin)
 		},
 	})
 	home = env.home

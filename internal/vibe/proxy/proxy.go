@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -44,12 +45,127 @@ func newBackend(u *url.URL) *backend {
 	return &backend{url: u, rp: rp}
 }
 
+// newRewritingBackend is newBackend plus a response filter that puts the
+// client-facing alias back into the "model" field. Completion responses
+// echo the id the upstream knows itself by, which for mlx_lm.server is an
+// absolute path — so without this every client (and every hum user
+// downstream of llama-swap, which does not rewrite responses either) sees
+// a filesystem path where it asked for a model name.
+func newRewritingBackend(u *url.URL, rw *modelRewrite) *backend {
+	be := newBackend(u)
+	needle := []byte(`"model": "` + rw.upstream + `"`)
+	compact := []byte(`"model":"` + rw.upstream + `"`)
+	replNeedle := []byte(`"model": "` + rw.alias + `"`)
+	replCompact := []byte(`"model":"` + rw.alias + `"`)
+	be.rp.ModifyResponse = func(resp *http.Response) error {
+		ct := resp.Header.Get("Content-Type")
+		if !strings.Contains(ct, "json") && !strings.Contains(ct, "event-stream") {
+			return nil
+		}
+		// Content-Length can't survive a substitution of a different
+		// length; dropping it makes the response chunked, which every
+		// OpenAI client already handles (streaming responses are chunked).
+		resp.Header.Del("Content-Length")
+		resp.ContentLength = -1
+		resp.Body = &replacingReader{
+			src: resp.Body,
+			// Both spellings: encoding/json in the upstream may or may not
+			// put a space after the colon, and matching the whole
+			// `"model": "<id>"` token rather than the bare path means
+			// model output that happens to mention the path is untouched.
+			pairs: [][2][]byte{{needle, replNeedle}, {compact, replCompact}},
+		}
+		return nil
+	}
+	return be
+}
+
+// replacingReader substitutes fixed byte sequences in a stream without
+// buffering the whole body — required because completion responses stream
+// as SSE and must keep flowing token by token. It retains up to one
+// needle's length between reads so a match spanning a chunk boundary is
+// still found.
+type replacingReader struct {
+	src   io.ReadCloser
+	pairs [][2][]byte
+	buf   []byte
+	eof   bool
+}
+
+func (r *replacingReader) Read(p []byte) (int, error) {
+	for {
+		if len(r.buf) > 0 {
+			// Hold back a needle-length tail unless the source is done, so
+			// a match split across reads isn't missed.
+			emit := len(r.buf)
+			if !r.eof {
+				if keep := r.maxNeedle() - 1; emit > keep {
+					emit -= keep
+				} else {
+					emit = 0
+				}
+			}
+			if emit > 0 {
+				n := copy(p, r.buf[:emit])
+				r.buf = r.buf[n:]
+				return n, nil
+			}
+		}
+		if r.eof {
+			return 0, io.EOF
+		}
+		chunk := make([]byte, 32<<10)
+		n, err := r.src.Read(chunk)
+		if n > 0 {
+			r.buf = append(r.buf, chunk[:n]...)
+			for _, pr := range r.pairs {
+				r.buf = bytes.ReplaceAll(r.buf, pr[0], pr[1])
+			}
+		}
+		if err != nil {
+			r.eof = true
+			if err != io.EOF {
+				// Emit whatever survived, then surface the error next call.
+				if len(r.buf) > 0 {
+					n := copy(p, r.buf)
+					r.buf = r.buf[n:]
+					return n, nil
+				}
+				return 0, err
+			}
+		}
+	}
+}
+
+func (r *replacingReader) maxNeedle() int {
+	m := 0
+	for _, pr := range r.pairs {
+		if len(pr[0]) > m {
+			m = len(pr[0])
+		}
+	}
+	return m
+}
+
+func (r *replacingReader) Close() error { return r.src.Close() }
+
+// modelRewrite translates between the client-facing model id and the id an
+// upstream insists on. Needed by mlx_lm.server, which advertises the
+// filesystem path it was launched with and treats any other `model` value
+// as a model to download from HuggingFace — so a client sending a friendly
+// alias gets an HF 401 instead of a completion.
+type modelRewrite struct {
+	alias    string // what clients send and see
+	upstream string // what the upstream requires
+}
+
 type Proxy struct {
 	addr string
 
-	mu     sync.RWMutex
-	def    *backend            // active-profile upstream; nil => 503
-	routes map[string]*backend // model alias -> service upstream
+	mu      sync.RWMutex
+	def     *backend            // active-profile upstream; nil => 503
+	routes  map[string]*backend // model alias -> service upstream
+	rewrite *modelRewrite       // default upstream's id translation, if any
 
 	srvMu   sync.Mutex
 	srv     *http.Server
@@ -71,7 +187,34 @@ func (p *Proxy) SetBackend(u *url.URL) {
 		p.def = nil
 		return
 	}
+	// Order-independent with SetModelRewrite: whichever lands second
+	// rebuilds the default backend with both pieces applied.
+	if p.rewrite != nil {
+		p.def = newRewritingBackend(u, p.rewrite)
+		return
+	}
 	p.def = newBackend(u)
+}
+
+// SetModelRewrite makes the default upstream addressable by alias: inbound
+// requests naming alias are rewritten to upstreamID before forwarding, and
+// upstreamID is rewritten back to alias in /v1/models responses. Passing
+// empty strings clears it. Set alongside SetBackend when the active profile
+// is one of the backends that cannot be told its own model name.
+func (p *Proxy) SetModelRewrite(alias, upstreamID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if alias == "" || upstreamID == "" || alias == upstreamID {
+		p.rewrite = nil
+		if p.def != nil {
+			p.def = newBackend(p.def.url)
+		}
+		return
+	}
+	p.rewrite = &modelRewrite{alias: alias, upstream: upstreamID}
+	if p.def != nil {
+		p.def = newRewritingBackend(p.def.url, p.rewrite)
+	}
 }
 
 // AddRoute registers a model alias that should be routed to u instead of
@@ -97,14 +240,24 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mu.RLock()
 	def := p.def
 	nroutes := len(p.routes)
+	rw := p.rewrite
 	p.mu.RUnlock()
 
 	// Fast path: no model routes registered → behave exactly like the
 	// original single-upstream proxy (no body inspection, zero overhead).
+	// A rewrite still costs a body pass, but only when one is configured.
 	if nroutes == 0 {
 		if def == nil {
 			http.Error(w, "vibe: no profile active", http.StatusServiceUnavailable)
 			return
+		}
+		if rw != nil {
+			if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/v1/models") {
+				if p.serveRewrittenModels(w, r, def, rw) {
+					return
+				}
+			}
+			rewriteRequestModel(r, rw)
 		}
 		def.rp.ServeHTTP(w, r)
 		return
@@ -114,7 +267,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// model AND every routed service model. Best-effort: any failure
 	// falls through to the default upstream's own /v1/models.
 	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/v1/models") {
-		if p.serveAggregatedModels(w, r, def) {
+		if p.serveAggregatedModels(w, r, def, rw) {
 			return
 		}
 	}
@@ -124,7 +277,103 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "vibe: no profile active", http.StatusServiceUnavailable)
 		return
 	}
+	// The rewrite belongs to the default upstream only — a routed service
+	// backend advertises its own alias and must receive it unchanged.
+	if rw != nil && be == def {
+		rewriteRequestModel(r, rw)
+	}
 	be.rp.ServeHTTP(w, r)
+}
+
+// rewriteRequestModel replaces a top-level JSON "model" equal to rw.alias
+// with rw.upstream, restoring the body either way. A body that hits
+// maxPeekBody may be truncated, so it is passed through untouched rather
+// than re-serialised from a partial read.
+func rewriteRequestModel(r *http.Request, rw *modelRewrite) {
+	if r.Method != http.MethodPost || r.Body == nil {
+		return
+	}
+	orig := r.Body
+	buf, err := io.ReadAll(io.LimitReader(orig, maxPeekBody))
+	restore := func() {
+		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf), orig))
+	}
+	if err != nil || len(buf) == maxPeekBody {
+		restore()
+		return
+	}
+	var doc map[string]json.RawMessage
+	if json.Unmarshal(buf, &doc) != nil {
+		restore()
+		return
+	}
+	var model string
+	if json.Unmarshal(doc["model"], &model) != nil || model != rw.alias {
+		restore()
+		return
+	}
+	repl, err := json.Marshal(rw.upstream)
+	if err != nil {
+		restore()
+		return
+	}
+	doc["model"] = repl
+	out, err := json.Marshal(doc)
+	if err != nil {
+		restore()
+		return
+	}
+	// ContentLength must track the new body: the reverse proxy forwards it
+	// verbatim, and a stale value truncates the request upstream.
+	r.Body = io.NopCloser(bytes.NewReader(out))
+	r.ContentLength = int64(len(out))
+	r.Header.Set("Content-Length", strconv.Itoa(len(out)))
+}
+
+// rewriteModelIDs swaps id == from for to in an OpenAI /v1/models payload,
+// leaving every other field of each entry untouched. Returns nil when the
+// body isn't the expected shape so callers can fall back to passthrough.
+func rewriteModelIDs(body []byte, from, to string) []byte {
+	var ml struct {
+		Object string                       `json:"object"`
+		Data   []map[string]json.RawMessage `json:"data"`
+	}
+	if json.Unmarshal(body, &ml) != nil {
+		return nil
+	}
+	repl, err := json.Marshal(to)
+	if err != nil {
+		return nil
+	}
+	for _, entry := range ml.Data {
+		var id string
+		if json.Unmarshal(entry["id"], &id) == nil && id == from {
+			entry["id"] = repl
+		}
+	}
+	out, err := json.Marshal(ml)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
+// serveRewrittenModels answers /v1/models from the single default upstream
+// with the upstream's id swapped for the client-facing alias, so discovery
+// returns the same name the client is expected to send back.
+func (p *Proxy) serveRewrittenModels(w http.ResponseWriter, r *http.Request, def *backend, rw *modelRewrite) bool {
+	body, err := fetchModels(r.Context(), def.url)
+	if err != nil {
+		return false
+	}
+	out := rewriteModelIDs(body, rw.upstream, rw.alias)
+	if out == nil {
+		return false
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(out)
+	return true
 }
 
 // pick selects the upstream for r. A POST carrying a JSON "model" that
@@ -173,7 +422,7 @@ func peekModel(r *http.Request) string {
 // any) and every routed upstream into one list, deduped by model id.
 // Returns false (writing nothing) on failure so the caller can fall back
 // to the default-upstream path (which 503s when there is no default).
-func (p *Proxy) serveAggregatedModels(w http.ResponseWriter, r *http.Request, def *backend) bool {
+func (p *Proxy) serveAggregatedModels(w http.ResponseWriter, r *http.Request, def *backend, rw *modelRewrite) bool {
 	p.mu.RLock()
 	routes := make([]*backend, 0, len(p.routes))
 	for _, be := range p.routes {
@@ -191,6 +440,14 @@ func (p *Proxy) serveAggregatedModels(w http.ResponseWriter, r *http.Request, de
 		body, err := fetchModels(r.Context(), be.url)
 		if err != nil {
 			return err
+		}
+		// The rewrite describes the default upstream only, so the swap is
+		// scoped to it: a routed service that happens to serve the same id
+		// keeps its own name.
+		if rw != nil && be == def {
+			if swapped := rewriteModelIDs(body, rw.upstream, rw.alias); swapped != nil {
+				body = swapped
+			}
 		}
 		var ml modelList
 		if err := json.Unmarshal(body, &ml); err != nil {

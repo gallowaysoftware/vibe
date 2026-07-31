@@ -68,6 +68,17 @@ func writeTabbyRepoStub(t *testing.T) string {
 }
 
 // writeTabbyVenvStub mints a venv-shaped directory.
+// writeManagedBinaryStub creates an executable file so a template with a
+// managed frontend passes validateExecutable.
+func writeManagedBinaryStub(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "frontend-stub")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func writeTabbyVenvStub(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -205,6 +216,17 @@ func fillReplacements(t *testing.T, body, kind string) string {
 		body = strings.ReplaceAll(body, "REPLACE-model-name", "test-model")
 		body = strings.ReplaceAll(body, "~/.local/state/vibe/tabby-venv", venvDir)
 		body = strings.ReplaceAll(body, "~/src/tabbyAPI", repoDir)
+	case "mlx-server":
+		// mlx_server needs a snapshot dir and a venv on disk, plus the
+		// managed frontend's binary. Unlike tabby-api the alias is free of
+		// the dir basename — vibe translates alias <-> model_dir itself.
+		snapshot := t.TempDir()
+		venv := t.TempDir()
+		body = strings.ReplaceAll(body, "~/models/REPLACE-mlx-snapshot", snapshot)
+		body = strings.ReplaceAll(body, "mlx-community/REPLACE-Model-4bit", "mlx-community/Example-4bit")
+		body = strings.ReplaceAll(body, "REPLACE-model-alias", "test-alias")
+		body = strings.ReplaceAll(body, "~/.venvs/mlx", venv)
+		body = strings.ReplaceAll(body, "~/.local/bin/omp", writeManagedBinaryStub(t))
 	default:
 		t.Fatalf("fillReplacements: unknown kind %q (extend this switch)", kind)
 	}

@@ -194,6 +194,8 @@ func renderProfileList(out io.Writer) error {
 			backend = "http_server"
 		case p.Backend.ComfyUI != nil:
 			backend = "comfyui"
+		case p.Backend.MLXServer != nil:
+			backend = "mlx_server"
 		}
 		rows = append(rows, row{p.Name, p.ResolvedMode(), backend, p.Description})
 	}

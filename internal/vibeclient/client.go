@@ -192,7 +192,17 @@ func (c *Client) StartWithOptions(ctx context.Context, profile string, opts Star
 // name. Used by vamp capability resolution so a pipeline targets a backend
 // rather than a frontend-bearing profile.
 func (c *Client) StartBackend(ctx context.Context, backend string) (*StartResult, error) {
-	resp, err := c.rpc.Start(ctx, connect.NewRequest(&vibev1.StartRequest{Backend: backend}))
+	return c.StartBackendOpts(ctx, backend, false)
+}
+
+// StartBackendOpts is StartBackend with the pre-flight override, so
+// activating a backend directly has the same escape hatch as `vibe start`
+// and `vibe run`.
+func (c *Client) StartBackendOpts(ctx context.Context, backend string, noVRAMCheck bool) (*StartResult, error) {
+	resp, err := c.rpc.Start(ctx, connect.NewRequest(&vibev1.StartRequest{
+		Backend:     backend,
+		NoVramCheck: noVRAMCheck,
+	}))
 	if err != nil {
 		return nil, err
 	}
