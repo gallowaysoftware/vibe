@@ -4,7 +4,7 @@
 
 - **Router + model lifecycle (adopt llama-swap).** Design at
   `docs/design/router-lifecycle.md` (2026-07-12): llama-swap per cell
-  (localmodel / spark-pair / llamaloft) federated via peers, front instance takes
+  (e.g. a GPU cell / a paired-accelerator cell / a utility cell) federated via peers, front instance takes
   over :9000, per-model TTL idle-unload + JIT autostart with SSE
   loading-state keepalives, matrix eviction, Anthropic as an apiKey
   peer, vamp streaming warm + lease heartbeat. Supersedes fleet.md's
@@ -13,66 +13,32 @@
   all LLM defs + ComfyUI external, cloud_peer anthropic, canonical
   capability ids, vamp typed errors/lease/--warm, fleet state+events
   API, 420s six-client gate + simulated peer-hop gate passed — §15-§17).
-  Remaining needs hardware: A3/A4 (llamaloft), real A5/A6 (Sparks), A8b
-  (proxy.go deletion once bge-embed moves to llamaloft).
+  Remaining needs hardware: A3/A4 (utility cell), real A5/A6 (the
+  accelerator pair), A8b (proxy.go deletion once the embed service
+  moves to the utility cell).
 
-- **hum/riff bring-up (in progress 2026-07-13).** Design at
-  `docs/design/topology.md`; stacks at `deploy/hum` (front router, infra)
-  and `deploy/riff` (persistent OWUI + SearXNG, application) — split
-  deliberately so infra and app upgrade independently. Status:
-  - DONE: localmodel's llama-swap cell now listens on `0.0.0.0:9000`
-    (LAN-reachable at `192.168.13.117:9000`). hum's front config staged
-    at unraid `/mnt/user/appdata/hum/front/config.yaml` (localmodel peer,
-    all 9 model ids; llamaloft/spark/anthropic commented — anthropic
-    key is NOT required, cloud peer ships disabled). riff's `.env`
-    generated (`HUM_URL`, `RIFF_IPV4=172.16.3.212`, `WEBUI_SECRET_KEY`).
-    Both compose stacks are UP on unraid (macvlan: hum-front `.211`,
-    riff-webui `.212`; fixed a missing top-level `networks:` block in
-    riff's compose, b2a4256). Model library seed DONE: `~/models`
-    rsynced to the unraid `models` share, verified byte-identical
-    (268,875,026,353 bytes, 295 files both sides). `rsync exit: 23`
-    ("partial transfer due to error") is misleading here — it was 295
-    `chgrp` failures ("Operation not permitted"), one per file, because
-    the NFS export doesn't let a non-root client change group
-    ownership; no data was lost. Future syncs to this share: expect the
-    same chgrp noise and verify with `du -sb`/file-count comparison
-    rather than trusting rsync's exit code alone, or drop `-g`
-    (`--no-g`) from the rsync flags to suppress the attempt entirely.
-  - RESOLVED 2026-07-13: real completions through hum were failing with
-    `peer proxy error: dial tcp 192.168.13.117:9000: i/o timeout` even
-    after adding a UDM Pro inter-VLAN allow rule (172.16.3.211 →
-    192.168.13.117:9000 tcp). TWO firewalls were in the path, not one:
-    the UDM Pro rule was necessary but not sufficient — localmodel
-    itself runs `ufw` (default deny incoming, only port 22 was open;
-    9000 was never opened for LAN because the llama-swap unit only
-    switched from `127.0.0.1` to `0.0.0.0` listen this same session).
-    Same-subnet curl from localmodel's own shell had been masking this
-    the whole time (loopback bypasses the INPUT chain). Fix:
-    `sudo ufw allow from 172.16.3.0/24 to any port 9000 proto tcp &&
-    sudo ufw reload`. Verified end to end: hum → localmodel completion
-    returned 200 in 286ms. **Any future cell (llamaloft, spark) needs
-    BOTH the UDM Pro rule AND a host-firewall check — don't assume the
-    router rule alone is sufficient.**
-  - DONE: added `client_api_url` to vibe's daemon config (d068c47) — the
-    one gap topology.md's sequencing step 2 needed: `${VIBE_API}` in
-    rendered frontend configs (omp, qwen-code, pi, ...) was always
-    hardcoded to the local cell's own `127.0.0.1:<proxy_port>`; now an
-    optional override points it at hum instead, so local coding
-    harnesses see the whole fleet catalog. Set on localmodel
-    (`~/.config/vibe/config.yaml: client_api_url:
-    http://172.16.3.211:9000`), verified live: omp's rendered
-    `models.yml` now has `baseUrl: http://172.16.3.211:9000/v1`.
-    Internal bookkeeping (readiness checks, ComfyUI `/upstream/`,
-    fleet API's own "front" cell) deliberately still dials
-    `127.0.0.1:ProxyPort` — that describes this box's own cell, not
-    the fleet front.
-  - NOT YET DONE: NPM proxy host `chat.<domain>` → `172.16.3.212:8080`
-    with Authelia forward-auth + header-strip (block in
-    `deploy/riff/README.md`); PWA install on phone.
+- **Front + chat-client bring-up.** Design at `docs/design/topology.md`;
+  reference stacks at `deploy/hum` (front router). Landed across
+  2026-07-13: the front cell serving a federated catalog over the LAN,
+  an Open WebUI instance pointed at it, and the model library seeded to
+  NAS storage. Reusable lessons kept from that work:
+  - rsync to an NFS share exits 23 ("partial transfer") when the export
+    forbids chgrp — one benign failure per file. Verify with
+    `du -sb`/file-count instead of trusting the exit code, or drop `-g`.
+  - When a cell's port times out from another VLAN, expect TWO
+    firewalls: the router's inter-VLAN rule AND the host firewall
+    (loopback curls mask the latter). Any new cell needs both checked.
+  - DONE: added `client_api_url` to vibe's daemon config (d068c47):
+    rendered frontend configs (omp, qwen-code, pi, ...) previously
+    hardcoded `${VIBE_API}` to the local cell's own
+    `127.0.0.1:<proxy_port>`; the optional override points them at the
+    fleet front so local coding harnesses see the whole catalog.
+    Internal bookkeeping deliberately still dials the local cell.
 
 - **Fleet provisioning (multi-host + cloud keys).** Design at
   `docs/design/fleet.md` (2026-07-12): agentless SSH provisioning of
-  2x DGX Spark + a 3080 Ti utility box, hosts.yaml converge, model
+  new cells (reference fleet: an accelerator pair + a utility box),
+  hosts.yaml converge, model
   distribution, doctor, Spark commissioning. The router half is
   superseded by router-lifecycle.md; the provisioning half stands and
   is a dependency of it (A2/A4 reuse fleet P2/P4 verbatim).
