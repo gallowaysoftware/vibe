@@ -2,8 +2,10 @@ package vram
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
@@ -135,6 +137,25 @@ func capacityGiB(ctx context.Context) (float64, error) {
 	if total, err := nvidiaTotalGiB(cctx); err == nil {
 		return total, nil
 	}
+	// A CPU Linux host still has a knowable ceiling: system RAM. Without
+	// this the hard stop silently degraded to a warning everywhere except
+	// darwin and NVIDIA hosts, which is exactly where it went unnoticed.
+	//
+	// On a Linux box with a non-NVIDIA GPU this overstates the ceiling,
+	// because that card's VRAM is separate from system RAM. That is the
+	// safe direction to be wrong in: too large a capacity only ever
+	// downgrades a hard stop to a warning, whereas too small a one would
+	// refuse a load that fits. For the same reason there is deliberately no
+	// Linux *free* probe — reporting system RAM as free VRAM on a discrete
+	// GPU would be wrong in the unsafe direction.
+	if runtime.GOOS == "linux" {
+		if raw, err := os.ReadFile("/proc/meminfo"); err == nil {
+			if total, err := parseMemTotalGiB(raw); err == nil {
+				return total, nil
+			}
+		}
+		return 0, ErrNoGPUInfo
+	}
 	if runtime.GOOS != "darwin" {
 		return 0, ErrNoGPUInfo
 	}
@@ -152,6 +173,29 @@ func capacityGiB(ctx context.Context) (float64, error) {
 		return 0, ErrNoGPUInfo
 	}
 	return float64(memBytes) / (1 << 30), nil
+}
+
+// parseMemTotalGiB pulls MemTotal out of /proc/meminfo, whose line reads
+// "MemTotal:       32797156 kB". The unit column is always kB on Linux, so
+// it is checked rather than parsed.
+func parseMemTotalGiB(raw []byte) (float64, error) {
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	for scanner.Scan() {
+		key, value, ok := strings.Cut(scanner.Text(), ":")
+		if !ok || key != "MemTotal" {
+			continue
+		}
+		fields := strings.Fields(value)
+		if len(fields) < 2 || fields[1] != "kB" {
+			return 0, ErrNoGPUInfo
+		}
+		kb, err := strconv.ParseInt(fields[0], 10, 64)
+		if err != nil || kb <= 0 {
+			return 0, ErrNoGPUInfo
+		}
+		return float64(kb) / (1 << 20), nil
+	}
+	return 0, ErrNoGPUInfo
 }
 
 func nvidiaTotalGiB(ctx context.Context) (float64, error) {

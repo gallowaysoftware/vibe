@@ -101,3 +101,48 @@ func TestDefaultProbe_ResolvesOnThisHost(t *testing.T) {
 		t.Errorf("free = %v, want > 0", got)
 	}
 }
+
+// Real /proc/meminfo head from an ubuntu runner. The capacity probe must
+// find MemTotal here: without a Linux source, the hard stop degraded to a
+// warning on every non-darwin, non-NVIDIA host — which is what CI caught.
+func TestParseMemTotal(t *testing.T) {
+	raw := []byte(`MemTotal:       16373544 kB
+MemFree:         2158372 kB
+MemAvailable:   12043128 kB
+Buffers:          312496 kB
+`)
+	got, err := parseMemTotalGiB(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(got-15.615) > 0.01 {
+		t.Errorf("MemTotal = %.3f GiB, want ~15.615", got)
+	}
+}
+
+func TestParseMemTotal_Malformed(t *testing.T) {
+	for _, tc := range []struct{ name, raw string }{
+		{"no MemTotal", "MemFree: 100 kB\n"},
+		{"unexpected unit", "MemTotal: 16373544 MB\n"},
+		{"not a number", "MemTotal: lots kB\n"},
+		{"empty", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parseMemTotalGiB([]byte(tc.raw)); !errors.Is(err, ErrNoGPUInfo) {
+				t.Errorf("err = %v, want ErrNoGPUInfo", err)
+			}
+		})
+	}
+}
+
+// Capacity must resolve on any host CI or a developer actually uses,
+// otherwise the hard stop quietly stops existing there.
+func TestCapacity_ResolvesOnThisHost(t *testing.T) {
+	got, err := capacityGiB(context.Background())
+	if err != nil {
+		t.Fatalf("capacity unknown on %s: %v — the hard stop cannot fire here", runtime.GOOS, err)
+	}
+	if got <= 0 {
+		t.Errorf("capacity = %v, want > 0", got)
+	}
+}
