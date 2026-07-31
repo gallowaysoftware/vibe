@@ -75,6 +75,17 @@ type Config struct {
 	// 127.0.0.1:ProxyPort, since those describe THIS box's own router
 	// instance, not the fleet.
 	ClientAPIURL string `yaml:"client_api_url,omitempty"`
+	// SearchURL is the fleet's retrieval plane (search + page fetch), served
+	// by vibe-search. It backs ${VIBE_SEARCH} in frontend templates and env,
+	// so one profile can point a harness at all three pieces of
+	// infrastructure — models, search, fetch — instead of the operator
+	// wiring search and fetch by hand on every machine.
+	//
+	// Purely client-facing, like ClientAPIURL: nothing in the daemon dials
+	// it. Empty means no retrieval plane is deployed, and a profile that
+	// references ${VIBE_SEARCH} then fails to activate with that reason
+	// rather than rendering an empty URL into a harness config.
+	SearchURL string `yaml:"search_url,omitempty"`
 }
 
 // LoadConfig reads the global vibe config; missing file is not an error.
@@ -659,6 +670,7 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 				ModelAlias:   alias,
 				ModelContext: ctxLen,
 				VibeStateDir: paths.StateHome(),
+				VibeSearch:   strings.TrimRight(d.cfg.SearchURL, "/"),
 			}
 			var err error
 			if req.Msg.Foreground {

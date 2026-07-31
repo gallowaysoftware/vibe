@@ -86,6 +86,35 @@ optional.)
   invocation in docker mode. Used today for Kokoro-FastAPI TTS
   serving the audio stage's `capability: tts` capability. Frontend
   block is rejected — the HTTP server IS the deliverable.
+  - **`bind`** is the host interface the docker publish binds to (left
+    side of `-p <bind>:<port>:<container_port>`), default `127.0.0.1`.
+    Set `0.0.0.0` for a service the rest of the fleet consumes; without
+    it the container is unreachable from any other host. Docker mode
+    only — binary mode leaves the listen address to the process, and
+    setting it there is a validation error rather than a no-op.
+    Readiness still probes `127.0.0.1`: the daemon is checking the
+    process it launched, not the address clients use.
+- **Retrieval plane (`internal/vibe/search`, `cmd/vibe-search`).** One
+  service beside the router serving the other two things every harness
+  needs: web search and page extraction, so no client holds a search
+  key. `GET /search` speaks the **SearXNG** JSON contract — an
+  impersonation, because that is the one search endpoint harnesses let
+  you redirect (every other provider hardcodes its host), and speaking
+  it keeps the client's NATIVE search path. `POST /mcp` exposes
+  `fetch_url`, because page fetch has NO redirectable endpoint
+  anywhere; that is the deliberate exception to keeping shared infra out
+  of MCP. Fetch is tiered: free static extraction first, paid extractor
+  only when a LARGE document yields almost no text (a JS shell) or the
+  GET is blocked — page SIZE is the discriminator, since a short page is
+  legitimately short. A failed escalation is reported, never silently
+  downgraded to the thin result.
+- **`search_url` (`~/.config/vibe/config.yaml`)** backs `${VIBE_SEARCH}`
+  in frontend templates and env, so one profile points a harness at
+  models, search, and fetch together. Client-facing only — nothing in
+  the daemon dials it. Unset is not the same as empty: `${VIBE_SEARCH}`
+  is left out of the expansion map entirely so a profile referencing it
+  fails to activate with a message naming `search_url`, instead of
+  rendering an empty URL into a harness config.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.
