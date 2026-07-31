@@ -49,6 +49,21 @@ services:
       SEARXNG_QUERY_URL: http://riff-search:8080/search?q=<query>
       BYPASS_WEB_SEARCH_WEB_LOADER: "True"
       WEB_SEARCH_RESULT_COUNT: "5"
+      # External tool server: subkb (subreddit-knowledge-aggregator) as a
+      # native MCP streamable-HTTP connection — search_knowledge,
+      # get_thread, get_document, list_collections. Declared HERE and not
+      # in the admin UI because persistent config is off: UI-added tool
+      # servers revert to this env value on the next recreate. Both
+      # containers sit on br0, so the macvlan/host gotcha doesn't apply.
+      # Per-expert workspace models attach these tools and pin their
+      # collection in the system prompt (README "Knowledge experts").
+      TOOL_SERVER_CONNECTIONS: >-
+        [{"type":"mcp",
+          "url":"${SUBKB_URL:-http://172.16.3.214:8091}/mcp",
+          "auth_type":"none",
+          "info":{"id":"subkb","name":"Subreddit Knowledge",
+                  "description":"Hybrid RAG over archived subreddit corpora and curated documents"},
+          "config":{"enable":true,"access_control":null}}]
     depends_on: [riff-search]
     networks:
       macvlan:

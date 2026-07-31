@@ -14,7 +14,8 @@ warm models with other clients all come from hum; riff just points at it.
   bridge with no LAN exposure. Needs an `.env` with `HUM_URL` (the front's
   macvlan address, e.g. `http://172.16.3.211:9000` — NOT the unraid host
   IP, which macvlan containers cannot reach), `WEBUI_SECRET_KEY`
-  (`openssl rand -hex 32`), and optionally `RIFF_IPV4`/`RIFF_PUBLIC_URL`.
+  (`openssl rand -hex 32`), and optionally `RIFF_IPV4`/`RIFF_PUBLIC_URL`/
+  `SUBKB_URL` (the subkb MCP host, default `http://172.16.3.214:8091`).
 
 ## Bring-up
 
@@ -45,6 +46,30 @@ auth_request_set $name  $upstream_http_remote_name;
 proxy_set_header Remote-Email $email;
 proxy_set_header Remote-Name  $name;
 ```
+
+## Knowledge experts (subkb)
+
+The compose env registers the subkb MCP server
+(`gallowaysoftware/subreddit-knowledge-aggregator`, running at
+`SUBKB_URL` on the same br0 macvlan) as a native MCP tool server via
+`TOOL_SERVER_CONNECTIONS` — it must live in env, not the admin UI,
+because persistent config is off (UI-added servers revert on recreate).
+
+Each domain expert is then a **workspace model** (Workspace → Models),
+which is DB state and does persist:
+
+1. Base model: a `-tools` def from hum's catalog (`qwen3.6-27b-tools` —
+   the tool-loop rule below), native function calling.
+2. System prompt: declare the domain, pin the collection — "always call
+   search_knowledge with collection=x4" — and set norms (cite permalinks,
+   prefer newer version_tag results over older advice).
+3. Tools: attach the subkb tools to the model.
+
+One MCP server serves every expert; the collection pin is what
+differentiates them. Curated canon (patch notes, manuals) goes into the
+corpus with `kbctl add-doc` on the subkb side — NOT into OWUI's own
+knowledge/RAG store, which would fork retrieval (different embedder, no
+temporal supersession) and hide the docs from other MCP clients.
 
 ## Notes
 
