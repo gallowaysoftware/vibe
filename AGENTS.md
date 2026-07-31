@@ -7,16 +7,7 @@ that fit.
 
 ## Repo at a glance
 
-Three binaries from one Go module (`github.com/gallowaysoftware/vibe`):
-
-- **`recall`** (`cmd/recall`, `internal/recall/`): the fleet's
-  personal-memory service — git-backed markdown memory per domain
-  expert (goals/decisions/session logs/notes), exposed as MCP tools at
-  `/mcp` plus an injection digest at `/digest` for harness hooks. No
-  vector index by design (memory corpora are small; grep + whole-file
-  reads); every write is a git commit; session context is the one
-  non-git piece (ephemeral, 24 h TTL). Deploy: `deploy/recall/`; the
-  Open WebUI injection filter lives in `deploy/riff/functions/`.
+Two binaries from one Go module (`github.com/gallowaysoftware/vibe`):
 
 - **`vibe`** (`cmd/vibe`, `internal/vibe/`): task launcher. One YAML
   profile activates a backend (`llama_server` | `comfyui` | `http_server` |
