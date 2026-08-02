@@ -1,5 +1,7 @@
 # Front config: llama-swap, peers only — the front owns no models and no
-# GPU. Lives at the path the docker-compose.yaml bind-mounts.
+# GPU. Lives as config.yaml inside the directory the docker-compose.yaml
+# bind-mounts (the whole directory is mounted so the watcher sees
+# atomic-rename writes).
 #
 # EXAMPLE VALUES. Peer names, hostnames and model ids below describe a
 # reference fleet; replace them with your own cells. The shape is what

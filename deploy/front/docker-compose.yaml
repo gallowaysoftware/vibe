@@ -17,17 +17,23 @@
 #     another LAN box, not the host's own shell.
 #
 # Prereqs: the external macvlan network exists; the front config file is
-# in place at FRONT_CONFIG. .env (sibling of this file): FRONT_IPV4,
-# FRONT_CONFIG, and ANTHROPIC_API_KEY if a cloud peer is enabled.
+# in place under FRONT_CONFIG_DIR. .env (sibling of this file): FRONT_IPV4,
+# FRONT_CONFIG_DIR, and ANTHROPIC_API_KEY if a cloud peer is enabled.
 
 services:
 
   front:
-    image: ghcr.io/mostlygeek/llama-swap:cpu
+    # Float the tag or pin a digest via FRONT_IMAGE in .env. Pinning
+    # (ghcr.io/mostlygeek/llama-swap:cpu@sha256:...) is recommended: it
+    # makes upgrades deliberate, and it keeps the -watch-config verification
+    # (deploy/front/README.md) meaningful against a known build.
+    image: ${FRONT_IMAGE:-ghcr.io/mostlygeek/llama-swap:cpu}
     container_name: ${FRONT_NAME:-fleet-front}
     restart: unless-stopped
     # The image defaults to listening on 8080; pin the canonical fleet port.
-    command: ["-config", "/app/config.yaml", "-listen", ":9000"]
+    # -watch-config hot-reloads the config, so membership edits stop being
+    # catalog outages.
+    command: ["-config", "/app/config/config.yaml", "-listen", ":9000", "-watch-config"]
     # The image's own healthcheck curls :8080 — the default the command above
     # deliberately overrides — so without this the front reports unhealthy
     # from the moment it starts and never recovers, which means a real outage
@@ -39,8 +45,11 @@ services:
       retries: 3
       start_period: 10s
     volumes:
-      # The peers config (see front-config.example.yaml).
-      - ${FRONT_CONFIG:?set FRONT_CONFIG to the front config.yaml path}:/app/config.yaml:ro
+      # The peers config's parent DIRECTORY (see front-config.example.yaml),
+      # not the file: a single-file bind mount pins the inode, so
+      # atomic-rename (tmp+rename) writes — how renderers write — never
+      # reach the running container. The config is /app/config/config.yaml.
+      - ${FRONT_CONFIG_DIR:?set FRONT_CONFIG_DIR to the front config directory}:/app/config:ro
     environment:
       # Consumed by ${env.ANTHROPIC_API_KEY} in config.yaml if the
       # anthropic peer is enabled there; empty is fine until then.
@@ -52,6 +61,13 @@ services:
       # Unraid convenience labels; harmless elsewhere.
       net.unraid.docker.webui: "http://${FRONT_IPV4}:9000/ui"
       net.unraid.docker.shell: "sh"
+    # This container runs forever on the box that also stores the model
+    # library; the json-file default is unbounded.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 networks:
   macvlan:

@@ -75,7 +75,7 @@ building anything.
 | LAN-reachable cell proxy: `proxy_bind_all` | vibe daemon | shipped (PR #16) |
 | MCP wire pattern: initialize / tools-list / tools-call over HTTP JSON-RPC | `internal/vibe/search/mcp.go` (320 lines) | shipped, clonable |
 | Config render: backend defs → llama-swap config, `--check` drift gate, `--extras` merge, `peers:` emission for `cloud_peer` defs | `internal/vibe/router/render.go`, `vibe router render` | shipped |
-| Outage-free config reload | llama-swap `-watch-config` (fsnotify) | exists upstream; **not yet enabled** in `deploy/front` (single-file `:ro` mount, no flag) |
+| Outage-free config reload | llama-swap `-watch-config` | **enabled** in `deploy/front` (C0, 2026-08-02): dir mount + poll-based watcher (2s); verified live — new config active immediately, in-flight streams drain under a hardcoded 30s shutdown timeout, then force-close (clean EOF) |
 | Wake-on-LAN with request buffering | llama-swap companion `wol-proxy` | exists upstream (upstream docs; unverified here); unadopted |
 
 What does **not** exist anywhere: a place to record *intent* ("GPU
@@ -357,11 +357,14 @@ start-duration history (built for exactly this).
 
 ## 11. Risks and unverified assumptions
 
-- **`-watch-config` is unverified on the pinned deploy image.** C0
-  gates on a live test (config rewrite under a mid-flight slow-start
-  stream) with the status-quo restart as fallback. The fsnotify
-  gotcha: watch the parent *directory* — single-file bind mounts miss
-  atomic-rename writes.
+- **`-watch-config` is verified on the pinned deploy image** (C0,
+  2026-08-02, v239): poll-based watcher (2s) on the config path; the
+  parent-directory mount sees atomic-rename writes; reloads activate
+  the new config immediately and drain in-flight streams on a
+  **hardcoded 30s** shutdown timeout — a longer stream is force-closed
+  (clean EOF) at the grace boundary. Membership edits are rare enough
+  that this beats the restart status quo; a configurable drain is an
+  upstream contribution, not fleet config.
 - **Down-peer catalog behavior** (does the front's `/v1/models` keep
   listing a dead peer's ids?) is unknown upstream; the design depends
   only on request-time `UPSTREAM_DOWN` until C3 makes the catalog
