@@ -65,6 +65,13 @@ type Config struct {
 	// user sets HTTPAddr explicitly (e.g. "0.0.0.0:9001"), that value wins
 	// and BindAll is ignored.
 	BindAll bool `yaml:"bind_all,omitempty"`
+	// ProxyBindAll binds the OpenAI proxy (:ProxyPort) on 0.0.0.0 instead
+	// of loopback, making this box a CELL the fleet front can proxy to as
+	// a peer (topology.md: the front owns no models; cells must listen on
+	// their LAN address). Deliberately separate from BindAll: the proxy
+	// carries no auth — the house posture is LAN/VPN-only — while the
+	// control plane at least enforces a bearer token.
+	ProxyBindAll bool `yaml:"proxy_bind_all,omitempty"`
 	// ClientAPIURL, when set, is what rendered frontend configs get for
 	// ${VIBE_API} instead of the local proxy port — e.g.
 	// "http://<fleet-front-host>:9000" once a fleet front exists, so
@@ -177,10 +184,14 @@ type Daemon struct {
 var _ vibev1connect.ControlServiceHandler = (*Daemon)(nil)
 
 func New(cfg Config) *Daemon {
+	proxyHost := "127.0.0.1"
+	if cfg.ProxyBindAll {
+		proxyHost = "0.0.0.0"
+	}
 	return &Daemon{
 		cfg:          cfg,
 		sup:          supervisor.New(),
-		prx:          proxy.New(fmt.Sprintf("127.0.0.1:%d", cfg.ProxyPort)),
+		prx:          proxy.New(fmt.Sprintf("%s:%d", proxyHost, cfg.ProxyPort)),
 		nvidiaSMI:    vram.DefaultProbe,
 		vramCapacity: vram.DefaultCapacityProbe,
 		vramSlopGiB:  vram.DefaultSlopGiB,
