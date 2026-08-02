@@ -128,13 +128,17 @@ func (s *Server) handleUpstream(cell, payload string) {
 // count. The frame's data is a JSON string carrying {"requests":[…]}
 // (verified on v239; operation add/remove frames carry the full list
 // too), so the count is len(requests) — never an increment guess.
+// Entries also feed per-model activity timestamps (fleetd-side clock),
+// the idle windows C4's warm targets restore on.
 func (s *Server) trackInFlight(cell string, data json.RawMessage) {
 	var inner string
 	if err := json.Unmarshal(data, &inner); err != nil {
 		return
 	}
 	var wrap struct {
-		Requests []json.RawMessage `json:"requests"`
+		Requests []struct {
+			Model string `json:"model"`
+		} `json:"requests"`
 	}
 	if err := json.Unmarshal([]byte(inner), &wrap); err != nil {
 		return
@@ -142,7 +146,23 @@ func (s *Server) trackInFlight(cell string, data json.RawMessage) {
 	s.mu.Lock()
 	s.inFlight[cell] = len(wrap.Requests)
 	s.inFlightSeen[cell] = true
+	for _, r := range wrap.Requests {
+		if r.Model != "" {
+			s.modelActivity[cell+"\x00"+r.Model] = time.Now().UTC()
+		}
+	}
 	s.mu.Unlock()
+}
+
+// modelLastActivity returns when the model last served a request on
+// the cell (fleetd-side clock). The bool is false when no inflight
+// frame has ever mentioned it — callers treat that as "idle since
+// process start", never as "active now".
+func (s *Server) modelLastActivity(cell, model string) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.modelActivity[cell+"\x00"+model]
+	return t, ok
 }
 
 // trackModelStatus measures starting→ready wall time per model. modelStatus

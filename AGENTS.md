@@ -235,6 +235,35 @@ optional.)
     forged announce can fake SERVING, prune a roaming catalog, or
     cancel pending drains. Distribute tokens like cell-root; per-cell
     credentials are a futures item.
+- **Fleet comfort (fleet-control C4).** The pieces an agent must not
+  break:
+  - **Warm targets** (`warm_targets:` in config.yaml,
+    fleetapi/warmtarget.go) restore the default ONLY after the
+    swapped-in model goes request-idle (per-model activity from the
+    inflight SSE stream, fleetd-side clock) — NEVER on a timer
+    (pin/keep-warm evicts the operator's model mid-session; stays
+    unbuilt). Empty-restore requires a time-based grace ≥ one announce
+    interval (presence is heartbeat-stale; a swap mid-cold-start reads
+    as "nothing resident"). Absent/drained cells skip silently, noted
+    in fleet_status's `warm` block.
+  - **Warm schedules** (`warm_schedule:`, fleetapi/warmsched.go): a
+    minimal 5-field cron evaluator (stdlib, minute granularity, DST
+    wall-clock semantics) firing warm through the front, with the
+    eviction-fight guard: skip + note when the target cell has
+    in-flight work or an active lease (the first mechanical lease
+    consumer). TZ is the environment's declared zone (the reference
+    Dockerfile carries tzdata); every schedule's resolved `next_fire`
+    shows in fleet_status so a wrong zone is visible.
+  - **The fleet page** (fleetapi/fleet.html via embed.FS at
+    `GET /ui/fleet`): static, framework-free, bearer-exempt as a static
+    asset ONLY (the ONE middleware exemption — everything else stays
+    gated; token in localStorage). SSE (`/api/fleet/events`) drives
+    debounced state refreshes; action buttons POST `/mcp` tools/call
+    — never add mutation routes for it; if a button needs something
+    new, the MCP facade is what's incomplete.
+  - **Model-set changes are render triggers** (recordAnnounce): a cell
+    that starts/stops serving a model re-renders like a membership
+    transition.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.

@@ -114,6 +114,37 @@ type Config struct {
 	// the fleetd registry it posts intent to after locally-invoked
 	// drains/resumes (and announces to from C3).
 	Fleet FleetConfig `yaml:"fleet,omitempty"`
+	// WarmTargets is the restore-after-idle policy (fleet-control C4):
+	// fleetd returns a cell's default model after an operator swap goes
+	// request-idle — never on a timer.
+	WarmTargets []WarmTarget `yaml:"warm_targets,omitempty"`
+	// WarmSchedule is cron-firing model warming (C4): evaluated in the
+	// daemon's TZ (declared via the environment, not inherited).
+	WarmSchedule []WarmScheduleEntry `yaml:"warm_schedule,omitempty"`
+}
+
+// WarmTarget names a cell's default model and the idle window after
+// which fleetd restores it once whatever the operator swapped in has
+// gone request-idle.
+type WarmTarget struct {
+	// Cell is the fleet cell name (must exist in hosts.yaml when the
+	// fleet registry is enabled).
+	Cell string `yaml:"cell"`
+	// Model is the model id to restore to.
+	Model string `yaml:"model"`
+	// RestoreAfterIdle is the request-idle window (Go duration string,
+	// e.g. "30m"): the swapped-in model must serve NOTHING for this long
+	// before fleetd warms the target back in. Any request to the
+	// swapped-in model resets the window.
+	RestoreAfterIdle string `yaml:"restore_after_idle"`
+}
+
+// WarmScheduleEntry is one cron-firing warm. The five fields are the
+// standard minute/hour/dom/month/dow cron fields, evaluated at minute
+// granularity in the daemon's TZ.
+type WarmScheduleEntry struct {
+	Cron  string `yaml:"cron"`
+	Model string `yaml:"model"`
 }
 
 // CellCmds maps the unified verbs to this box's process regime. Commands
@@ -460,6 +491,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 				Hosts:             d.hosts,
 			})
 		}
+		// C4: warm policy loops ride the same presence/inflight substrate.
+		d.startWarmLoops(d.cfg, d.hosts)
 	}
 
 	// C3: this box announces to fleetd when it has a cell identity and a

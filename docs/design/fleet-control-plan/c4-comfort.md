@@ -1,8 +1,55 @@
 # C4 — Comfort: warm targets, warm schedules, the fleet page
 
-Status: PLANNED (2026-08-02). Scope: ~300 lines — the heavy cell's
-default-model policy, scheduled warming (topology.md §3 item 5), and
-the one-page web UI (topology.md §3 item 4).
+Status: EXECUTED (2026-08-02). All four gates passed; the fleet page is
+live at `GET /ui/fleet` on fleetd, and the warm policy ran end-to-end
+against real cells.
+
+Gate results (live, reference fleet):
+
+1. **Warm-target gate: PASS.** On a real cell (two ~5 GB chat models —
+   small footprint while the 5090 hosted a game): swap loaded through
+   the front, requests marked activity, then quiet — the restore fired
+   at the 1m idle window (`last_restore` + target resident, state
+   `holding / target resident`). The gate first exposed a live race
+   (twice): residency is heartbeat-stale, so a swap mid-cold-start
+   reads as "nothing resident" and the loop restored EARLY (both
+   models warm). The empty-restore now requires the emptiness to
+   persist for a **time-based grace (≥ one announce interval, default
+   30s)**; regression tests cover grace-hold, grace-elapse-fires, and
+   swap-appearing-mid-grace-resets.
+2. **Schedule gate: PASS.** A `21 17`-style entry fired at :46:01
+   (within seconds of its cron time, `last_note: "warmed"`), the model
+   was resident before any organic request, and `next_fire` re-parked
+   to tomorrow. The gate also caught the exact footgun the doc warns
+   about: fleetd's alpine image had no tzdata, so `time.Local` was UTC
+   and `next_fire` printed tomorrow instead of today — **visible at a
+   glance in fleet_status precisely as designed**. tzdata is now in
+   the reference Dockerfile; next_fire resolves in the declared TZ.
+3. **Page gate: PASS.** Real browser: token prompt → table (4 cells,
+   derived displays, per-row actions, status line). CLI drain flipped
+   localmodel's row to DRAINED via SSE without reload; pressing Resume
+   on the page round-tripped through `/mcp` ("Resume requested via
+   announce") and the row flipped to SERVING 6s after the click
+   (desired-serving → cell resume → echo → SSE). JIT round-trip
+   verified after ("OK" through the front). Buttons POST `/mcp` only —
+   the sole new route is static `GET /ui/fleet`. Two fixes landed en
+   route: the static page needed a bearer exemption (a browser can't
+   401-and-then-prompt; everything else stays gated, test-pinned), and
+   the SSE stream now drives debounced state refreshes (it originally
+   fed only the fingerprint-warnings panel — a 30s poll would have
+   been the update path, failing the gate's intent).
+4. **Unit tests: PASS.** Idle-window state machine (request resets,
+   absent/drained skips, nothing-resident restore, empty-grace timing),
+   cron next-fire (leap year, DST spring-gap skip in America/Halifax,
+   exact-minute boundaries), schedule guard (busy in-flight → skip,
+   active lease → skip — the first mechanical lease consumer, clear →
+   fire + re-park), page route served only under the fleet role.
+
+Also landed this phase: a **model-set-change render trigger** (C3 doc
+promised it, the implementation lacked it — a cell that starts or
+stops serving a model now re-renders exactly like a membership
+transition; verified live as def edits propagated to the catalog on
+the next heartbeat).
 
 ## Goal
 

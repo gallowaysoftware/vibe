@@ -129,6 +129,9 @@ type StateSnapshot struct {
 	// process has done (C3) — a flap storm shows up here as a rising
 	// number instead of silently churning the catalog.
 	FrontRenders int `json:"front_renders"`
+	// Warm is the C4 warm policy status (targets + schedule), present
+	// when either is configured.
+	Warm *warmStatus `json:"warm,omitempty"`
 }
 
 // snapshotTimeout bounds the per-cell /running + /v1/models probes so one
@@ -200,6 +203,16 @@ type Server struct {
 	// callers must not invent a count for a cell that never reported.
 	inFlight     map[string]int
 	inFlightSeen map[string]bool
+	// modelActivity records per-model last-request timestamps from the
+	// same frames (key cell+"\x00"+model), fleetd-side clock. The warm
+	// targets' idle windows key off these.
+	modelActivity map[string]time.Time
+
+	// warmStates and schedStates are the C4 warm loops' status surfaces
+	// (fleet_status's warm block). Pointers: the loop goroutines mutate
+	// the entries in place under s.mu.
+	warmStates  []*warmTargetState
+	schedStates []*warmScheduleState
 
 	done      chan struct{}
 	closeOnce sync.Once
@@ -241,6 +254,7 @@ func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Op
 		startedAt:     map[string]time.Time{},
 		inFlight:      map[string]int{},
 		inFlightSeen:  map[string]bool{},
+		modelActivity: map[string]time.Time{},
 		presence:      map[string]*Presence{},
 		commands:      map[string][]AnnounceCommand{},
 		renderTrigger: make(chan string, 64),
@@ -265,6 +279,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 		mux.HandleFunc("POST /api/fleet/intent", s.handleIntent)
 		mux.HandleFunc("POST /api/fleet/wake", s.handleWake)
 		mux.HandleFunc("POST /api/fleet/announce", s.handleAnnounce)
+		s.registerFleetPage(mux)
 	}
 	if s.leasePath != "" {
 		mux.HandleFunc("GET /api/fleet/leases", s.handleLeases)
@@ -346,6 +361,7 @@ func (s *Server) probeSnapshot(ctx context.Context) StateSnapshot {
 		Daemon:       s.daemonInfo(),
 		StartHistory: s.hist.Stats(),
 		FrontRenders: s.RenderCount(),
+		Warm:         s.warmReport(),
 	}
 	var wg sync.WaitGroup
 	for i, c := range s.cells {

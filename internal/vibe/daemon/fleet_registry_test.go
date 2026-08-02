@@ -79,13 +79,14 @@ cells:
 
 	req := func(method, url, tok, body string) *http.Response {
 		t.Helper()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		// No timeout context here: defer-cancel would fire at helper
+		// return and kill the in-flight body stream (multi-segment
+		// bodies — the fleet page — truncate to whatever arrived first).
 		var rdr io.Reader
 		if body != "" {
 			rdr = strings.NewReader(body)
 		}
-		r, err := http.NewRequestWithContext(ctx, method, url, rdr)
+		r, err := http.NewRequest(method, url, rdr)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -197,6 +198,15 @@ cells:
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("intent without token: HTTP %d, want 401", resp.StatusCode)
+	}
+	// The fleet page is the single static exemption (no data in it);
+	// everything else stays gated.
+	resp = req(http.MethodGet, "http://"+httpAddr+"/ui/fleet", "", "")
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	t.Logf("page response: status=%d headers=%v bodylen=%d", resp.StatusCode, resp.Header, len(body))
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "/api/fleet/state") {
+		t.Errorf("page: HTTP %d, want 200 with the page", resp.StatusCode)
 	}
 }
 
