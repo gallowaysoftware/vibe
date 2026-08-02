@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os/exec"
@@ -54,7 +55,7 @@ type wakeResponse struct {
 // error to retry).
 func (s *Server) handleWake(w http.ResponseWriter, r *http.Request) {
 	var req wakeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
@@ -121,6 +122,9 @@ func (s *Server) SendWake(ctx context.Context, cellName string) (*wakeResponse, 
 	mac, err := net.ParseMAC(wake.MAC)
 	if err != nil {
 		return nil, fmt.Errorf("cell %q wake.mac %q is invalid: %v", cellName, wake.MAC, err)
+	}
+	if len(mac) != 6 {
+		return nil, fmt.Errorf("cell %q wake.mac %q must be a 48-bit MAC (got %d bytes)", cellName, wake.MAC, len(mac))
 	}
 	target := wake.Broadcast
 	if target == "" {

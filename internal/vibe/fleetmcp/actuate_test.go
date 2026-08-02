@@ -31,12 +31,21 @@ type fakeCellDaemon struct {
 	drainCalls  int
 	resumeCalls int
 	failDrain   bool
+	drainDelay  time.Duration
 }
 
-func (f *fakeCellDaemon) CellDrain(_ context.Context, req *connect.Request[vibev1.CellDrainRequest]) (*connect.Response[vibev1.CellDrainResponse], error) {
+func (f *fakeCellDaemon) CellDrain(ctx context.Context, req *connect.Request[vibev1.CellDrainRequest]) (*connect.Response[vibev1.CellDrainResponse], error) {
 	f.mu.Lock()
 	f.drainCalls++
+	delay := f.drainDelay
 	f.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if f.failDrain {
 		return nil, connect.NewError(connect.CodeUnavailable, fmt.Errorf("drain command failed: exit 1: unit not found"))
 	}
@@ -154,6 +163,31 @@ backend:
 	_, isErr = toolText(t, resp)
 	if !isErr {
 		t.Error("dry_run=false must fail in C2")
+	}
+}
+
+func TestMCPDrainCellLongWaitNotCappedByProbeTimeout(t *testing.T) {
+	// Regression for the review finding: drain_cell with wait_seconds
+	// must not die at the 10s probe budget. The fake daemon takes 12s
+	// to answer (quiescence wait semantics); the call must succeed.
+	cellDaemon := newFakeCellDaemon(t)
+	cellDaemon.drainDelay = 12 * time.Second
+	front := newFakeLlamaSwap(t)
+	_, ts := newTestFacade(t, map[string]fleetcfg.Cell{
+		"front":    {URL: front.srv.URL, Class: fleetcfg.ClassAlwaysOn},
+		"gpu-cell": {URL: "http://127.0.0.1:1", Class: fleetcfg.ClassOpportunistic, DaemonURL: cellDaemon.srv.URL},
+	}, nil)
+	if testing.Short() {
+		t.Skip("12s delay")
+	}
+	start := time.Now()
+	resp := rpc(t, ts, `{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"drain_cell","arguments":{"cell":"gpu-cell","wait_seconds":30}}}`)
+	text, isErr := toolText(t, resp)
+	if isErr {
+		t.Fatalf("drain with wait_seconds must survive past 10s: %s", text)
+	}
+	if time.Since(start) < 12*time.Second {
+		t.Errorf("returned in %v — the 10s probe cap still applies", time.Since(start))
 	}
 }
 

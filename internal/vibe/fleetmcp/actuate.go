@@ -17,10 +17,13 @@ import (
 // RPC succeeds (the fleetd-invoked writer of the one-writer rule).
 
 // cellClient builds a vibeclient for the named cell's daemon. Token
-// resolution: the cell's token_file in hosts.yaml (a path — the value
-// never enters a repo). A cell without daemon_url is a typed error: C2
-// actuation needs the cell's control plane (C3's piggyback removes the
-// requirement; until then daemon_url is how you reach it).
+// resolution mirrors the CLI's documented order: $VIBE_TOKEN (explicit
+// override) → cells.X.token_file (a path — the value never enters a
+// repo; an unreadable one is a typed error, not a silent 401) → the
+// local token file (right only when X is the local box). A cell without
+// daemon_url is a typed error: C2 actuation needs the cell's control
+// plane (C3's piggyback removes the requirement; until then daemon_url
+// is how you reach it).
 func (s *Server) cellClient(cell string) (*vibeclient.Client, error) {
 	c, ok := s.hosts.Cells[cell]
 	if !ok {
@@ -29,11 +32,16 @@ func (s *Server) cellClient(cell string) (*vibeclient.Client, error) {
 	if c.DaemonURL == "" {
 		return nil, fmt.Errorf("cells.%s has no daemon_url in hosts.yaml — actuation needs the cell's control plane", cell)
 	}
-	token := ""
-	if c.TokenFile != "" {
-		if data, err := os.ReadFile(c.TokenFile); err == nil {
-			token = strings.TrimSpace(string(data))
+	token := strings.TrimSpace(os.Getenv("VIBE_TOKEN"))
+	if token == "" && c.TokenFile != "" {
+		data, err := os.ReadFile(c.TokenFile)
+		if err != nil {
+			return nil, fmt.Errorf("cells.%s token_file %s: %v", cell, c.TokenFile, err)
 		}
+		token = strings.TrimSpace(string(data))
+	}
+	if token == "" {
+		token = vibeclient.ResolveToken()
 	}
 	return vibeclient.NewWithToken(c.DaemonURL, token), nil
 }

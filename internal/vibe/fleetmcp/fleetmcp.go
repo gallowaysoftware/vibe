@@ -324,7 +324,24 @@ func (s *Server) mcpTools() []any {
 }
 
 func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMessage) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, toolTimeout)
+	// Actuation tools get deadlines sized to the work, not the 10s probe
+	// budget: a quiescence wait outlives toolTimeout by design, and a
+	// unit stop routinely runs 30-60s. (The daemon-side verb is also
+	// detach-safe now, but a spurious client-side failure still desyncs
+	// intent reporting — the cell drains while the agent hears
+	// "failed".)
+	timeout := toolTimeout
+	switch name {
+	case "drain_cell":
+		var probe struct {
+			WaitSeconds int32 `json:"wait_seconds"`
+		}
+		_ = json.Unmarshal(rawArgs, &probe)
+		timeout = time.Duration(probe.WaitSeconds)*time.Second + 75*time.Second
+	case "resume_cell", "wake_cell", "render_front":
+		timeout = 90 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	switch name {

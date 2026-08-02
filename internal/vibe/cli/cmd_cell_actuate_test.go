@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -156,6 +157,102 @@ func TestCellDrainLocalUnix(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "drained") || !strings.Contains(out.String(), "qwen") {
 		t.Errorf("out = %q", out.String())
+	}
+}
+
+// cliIntentSink records intent POSTs (fleetd's role) for the remote
+// drain/resume paths.
+type cliIntentSink struct {
+	srv   *httptest.Server
+	mu    sync.Mutex
+	posts []map[string]any
+}
+
+func newCLIIntentSink(t *testing.T) *cliIntentSink {
+	t.Helper()
+	s := &cliIntentSink{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/fleet/intent", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		s.mu.Lock()
+		s.posts = append(s.posts, body)
+		s.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]string{"state": "ok"})
+	})
+	mux.HandleFunc("GET /api/fleet/leases", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"leases":[]}`))
+	})
+	s.srv = httptest.NewServer(mux)
+	t.Cleanup(s.srv.Close)
+	return s
+}
+
+func (s *cliIntentSink) calls() []map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]map[string]any{}, s.posts...)
+}
+
+func TestCellDrainRemoteWritesIntentAtFleetd(t *testing.T) {
+	// The transport split writes nothing for TCP callers, and the CLI is
+	// not fleetd — so a CLI-driven remote drain must POST intent itself,
+	// or the fleet never learns why (review finding C2-SEC-002).
+	sink := newCLIIntentSink(t)
+	fake := &cellVerbFake{}
+	cellSrv := serveCellVerbsTCP(t, fake)
+	writeHosts(t, fmt.Sprintf(`
+fleetd_url: "%s"
+cells:
+  front:    { url: "http://127.0.0.1:1", class: always_on }
+  gpu-cell: { url: "http://127.0.0.1:1", class: opportunistic, daemon_url: "%s" }
+`, sink.srv.URL, cellSrv.URL))
+
+	var out bytes.Buffer
+	if err := drainCell(t.Context(), &out, "gpu-cell", "gaming", "23:00", true, 0); err != nil {
+		t.Fatal(err)
+	}
+	got := sink.calls()
+	if len(got) != 1 || got[0]["cell"] != "gpu-cell" || got[0]["state"] != "drained" || got[0]["reason"] != "gaming" || got[0]["eta"] != "23:00" {
+		t.Errorf("intent posts = %v, want one drained/gaming/23:00", got)
+	}
+
+	// And remote resume clears it.
+	client, _, err := resolveCellClient("gpu-cell")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CellResume(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	postCLIIntent(&out, "gpu-cell", "serving", "", "")
+	got = sink.calls()
+	if len(got) != 2 || got[1]["state"] != "serving" {
+		t.Errorf("after resume: posts = %v, want a serving post", got)
+	}
+}
+
+func TestDrainUntilExitResumesOnContextCancel(t *testing.T) {
+	// The signal path, testable: a canceled parent ctx (what SIGINT
+	// does via NotifyContext) kills the child, and the deferred resume
+	// must still fire.
+	fake := &cellVerbFake{}
+	serveCellVerbsOnUnix(t, fake)
+	ctx, cancel := context.WithCancel(context.Background())
+	var out bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- drainUntilExit(ctx, &out, "", "gaming", "", true, 0, []string{"sleep", "30"})
+	}()
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("wrapper did not exit after cancel")
+	}
+	if fake.drains != 1 || fake.resumes != 1 {
+		t.Errorf("drains=%d resumes=%d — resume must fire when the wrapper is signaled", fake.drains, fake.resumes)
 	}
 }
 

@@ -155,11 +155,21 @@ func (f *File) validate() error {
 			return fmt.Errorf("cells.%s: class must be one of %q, %q, %q (got %q)", name, ClassAlwaysOn, ClassOpportunistic, ClassRoaming, c.Class)
 		}
 		if c.Wake != nil {
-			if c.Wake.MAC == "" {
-				return fmt.Errorf("cells.%s.wake: mac is required", name)
+			// mac is required unless a fallback cmd replaces the packet;
+			// when present it must be a 48-bit MAC — ParseMAC also admits
+			// EUI-64/IPoIB forms, which would build a frame no NIC
+			// recognizes (a silent no-op, the worst config-error outcome).
+			if c.Wake.MAC == "" && c.Wake.Cmd == "" {
+				return fmt.Errorf("cells.%s.wake: mac is required (or set cmd for the fallback path)", name)
 			}
-			if _, err := net.ParseMAC(c.Wake.MAC); err != nil {
-				return fmt.Errorf("cells.%s.wake: mac %q is invalid: %v", name, c.Wake.MAC, err)
+			if c.Wake.MAC != "" {
+				mac, err := net.ParseMAC(c.Wake.MAC)
+				if err != nil {
+					return fmt.Errorf("cells.%s.wake: mac %q is invalid: %v", name, c.Wake.MAC, err)
+				}
+				if len(mac) != 6 {
+					return fmt.Errorf("cells.%s.wake: mac %q must be a 48-bit MAC (got %d bytes — EUI-64 and IPoIB forms don't make magic packets)", name, c.Wake.MAC, len(mac))
+				}
 			}
 		}
 	}

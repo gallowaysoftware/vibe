@@ -230,18 +230,30 @@ func TestCellDrain_LeaseFetchFailureMarkedUnavailable(t *testing.T) {
 	}
 }
 
-func TestCellDrain_TimeoutIsUnavailable(t *testing.T) {
-	d := drainDaemon(t, Config{CellCmds: CellCmds{Drain: "sleep 120"}})
+func TestCellDrain_VerbContextDetachedFromRPC(t *testing.T) {
+	// The verb must outlive the RPC's own deadline: a client
+	// disconnecting mid-verb must not SIGKILL a unit stop in flight.
+	// Here the RPC ctx dies at 50ms while the verb needs 200ms — a
+	// verb tied to the RPC ctx returns its cancellation; a detached
+	// verb finishes and the drain succeeds.
+	d := drainDaemon(t, Config{CellCmds: CellCmds{Drain: "true"}})
+	var verbErr error
 	d.SetCellCmdRunner(func(ctx context.Context, cmd string) (string, error) {
-		// The real runner bounds at cellCmdTimeout; the stub honors the ctx.
-		<-ctx.Done()
-		return "", ctx.Err()
+		select {
+		case <-ctx.Done():
+			verbErr = ctx.Err()
+			return "", ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+			return "", nil
+		}
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	_, err := d.CellDrain(ctx, connect.NewRequest(&vibev1.CellDrainRequest{}))
-	if connect.CodeOf(err) != connect.CodeUnavailable {
-		t.Fatalf("got %v, want Unavailable on timeout", err)
+	if _, err := d.CellDrain(ctx, connect.NewRequest(&vibev1.CellDrainRequest{})); err != nil {
+		t.Fatalf("drain must succeed once the verb finishes: %v", err)
+	}
+	if verbErr != nil {
+		t.Errorf("verb canceled mid-flight with the RPC ctx: %v", verbErr)
 	}
 }
 

@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mattn/go-isatty"
@@ -102,6 +104,9 @@ func cellResumeCmd() *cobra.Command {
 			}
 			if err := client.CellResume(ctx); err != nil {
 				return fmt.Errorf("resume %s: %w", displayCell(name), err)
+			}
+			if cell != "" {
+				postCLIIntent(cmd.OutOrStdout(), cell, "serving", "", "")
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "%s resumed — models return by JIT on next request.\n", displayCell(name))
 			return nil
@@ -229,8 +234,45 @@ func drainCell(ctx context.Context, out io.Writer, cell, reason, eta string, yes
 	if err != nil {
 		return fmt.Errorf("drain %s: %w", displayCell(name), err)
 	}
+	if cell != "" {
+		// Remote invocation: the cell daemon writes no intent for TCP
+		// callers (that path is fleetd's), and the CLI is not fleetd — so
+		// the write lands here, or nowhere does.
+		postCLIIntent(out, cell, "drained", reason, eta)
+	}
 	printDrainReport(out, name, report)
 	return nil
+}
+
+// postCLIIntent records intent at fleetd after a CLI-driven remote verb.
+// Best-effort: the verb already happened, so a failed write warns rather
+// than fails — a missing entry degrades the display to DRAINED?, which a
+// human can correct with one POST.
+func postCLIIntent(out io.Writer, cell, state, reason, eta string) {
+	target, err := resolveFleetd("")
+	if err != nil {
+		fmt.Fprintf(out, "warning: intent not recorded (fleetd resolution: %v)\n", err)
+		return
+	}
+	body, _ := json.Marshal(map[string]string{"cell": cell, "state": state, "reason": reason, "eta": eta})
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, target.base+"/api/fleet/intent", strings.NewReader(string(body)))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if tok := vibeclient.ResolveToken(); tok != "" && !strings.HasPrefix(target.base, "http://vibe.local") {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	resp, err := target.hc.Do(req)
+	if err != nil {
+		fmt.Fprintf(out, "warning: intent not recorded at fleetd (%v)\n", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		fmt.Fprintf(out, "warning: intent post rejected: HTTP %d: %s\n", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
 }
 
 func printDrainReport(out io.Writer, name string, r *vibev1.CellDrainResponse) {
@@ -250,9 +292,12 @@ func printDrainReport(out io.Writer, name string, r *vibev1.CellDrainResponse) {
 }
 
 // drainUntilExit wraps a command with a deterministic drain/resume pair
-// (the gaming session): drain, run, resume on ANY exit. Resume fires on
-// non-zero exits and signals alike — an idle-GPU heuristic never gets a
-// vote (design-rejected alternative).
+// (the gaming session): drain, run, resume on ANY exit. The resume is
+// deferred from the moment the drain succeeds, so every wrapper exit
+// path — non-zero exit, panic, or SIGINT/SIGTERM to the wrapper itself
+// (Ctrl-C targets the foreground process group) — still resumes. Only
+// SIGKILL escapes it, which nothing can guard. An idle-GPU heuristic
+// never gets a vote (design-rejected alternative).
 func drainUntilExit(ctx context.Context, out io.Writer, cell, reason, eta string, yes bool, wait time.Duration, command []string) error {
 	if cell != "" {
 		return fmt.Errorf("--until-exit runs on the local box (resume-on-exit needs it); drain the remote cell separately")
@@ -260,23 +305,35 @@ func drainUntilExit(ctx context.Context, out io.Writer, cell, reason, eta string
 	if err := drainCell(ctx, out, "", reason, eta, yes, wait); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "running: %s\n", strings.Join(command, " "))
+	// Resume is guaranteed from here on. Deferred first so a panic or a
+	// signal-driven abort still fires it; the detached 70s context
+	// survives the wrapper's own cancellation.
+	resume := func() {
+		resumeCtx, cancel := context.WithTimeout(context.Background(), 70*time.Second)
+		defer cancel()
+		client, _, err := resolveCellClient("")
+		if err == nil {
+			err = client.CellResume(resumeCtx)
+		}
+		if err != nil {
+			fmt.Fprintf(out, "warning: resume failed (%v) — run `vibe cell resume` manually\n", err)
+		} else {
+			fmt.Fprintln(out, "cell resumed.")
+		}
+	}
+	defer resume()
 
-	c := exec.Command(command[0], command[1:]...)
+	// SIGINT/SIGTERM to the wrapper cancel sigCtx, which kills the child
+	// (CommandContext) — c.Run() then returns and the deferred resume
+	// runs. The default Go disposition (terminate immediately, skipping
+	// defers) is exactly what NotifyContext replaces.
+	sigCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	fmt.Fprintf(out, "running: %s\n", strings.Join(command, " "))
+	c := exec.CommandContext(sigCtx, command[0], command[1:]...)
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 	runErr := c.Run()
 
-	resumeCtx, cancel := context.WithTimeout(context.Background(), 70*time.Second)
-	defer cancel()
-	client, _, err := resolveCellClient("")
-	if err == nil {
-		err = client.CellResume(resumeCtx)
-	}
-	if err != nil {
-		fmt.Fprintf(out, "warning: resume failed (%v) — run `vibe cell resume` manually\n", err)
-	} else {
-		fmt.Fprintln(out, "cell resumed.")
-	}
 	var exitErr *exec.ExitError
 	if errors.As(runErr, &exitErr) {
 		return exitCodeError{msg: command[0], code: exitErr.ExitCode()}

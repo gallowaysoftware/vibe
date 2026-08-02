@@ -88,11 +88,38 @@ cells:
 model_classes:
   bge-embed: ""
 `,
+		"wake without mac or cmd": `
+cells:
+  front: { url: "http://front.lan:9000", class: always_on, wake: {broadcast: "192.0.2.255:9"} }
+`,
+		"eui-64 mac rejected": `
+cells:
+  front: { url: "http://front.lan:9000", class: always_on, wake: {mac: "aa:bb:cc:dd:ee:ff:00:11"} }
+`,
 	}
 	for name, doc := range cases {
 		if _, err := LoadFrom(writeHosts(t, doc)); err == nil {
 			t.Errorf("%s: want validation error, got nil", name)
 		}
+	}
+}
+
+func TestLoad_WakeValidation(t *testing.T) {
+	// cmd-only wake is valid (the fallback path needs no MAC).
+	p := writeHosts(t, `
+cells:
+  front: { url: "http://front.lan:9000", class: always_on, wake: {cmd: "ssh otherbox wol aa:bb"} }
+`)
+	if _, err := LoadFrom(p); err != nil {
+		t.Fatalf("cmd-only wake must load: %v", err)
+	}
+	// 48-bit MAC alone is valid.
+	p = writeHosts(t, `
+cells:
+  front: { url: "http://front.lan:9000", class: always_on, wake: {mac: "aa:bb:cc:dd:ee:ff"} }
+`)
+	if _, err := LoadFrom(p); err != nil {
+		t.Fatalf("48-bit wake must load: %v", err)
 	}
 }
 

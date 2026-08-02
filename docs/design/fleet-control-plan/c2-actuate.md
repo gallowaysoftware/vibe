@@ -80,6 +80,28 @@ Implementation notes beyond the doc's letter:
   SIGKILL: the house's llama-swap units now set `TimeoutStopSec=45s`
   (private repo record).
 
+Adversarial-review addendum (2026-08-02, two reviewers — 10 findings,
+all fixed pre-merge with regression tests):
+
+- MCP actuation tools no longer inherit the 10s probe timeout:
+  `drain_cell` sizes to `wait_seconds + 75s`, resume/wake/render to
+  90s. Daemon-side, cell verbs run detached from the RPC's
+  cancellation (a client disconnect can no longer SIGKILL a unit stop
+  in flight and desync intent).
+- `vibe cell drain <remote>` / `resume <remote>` now POST intent to
+  fleetd themselves — the transport-based one-writer split assumed
+  TCP == fleetd, but the CLI also arrives over TCP and is not fleetd;
+  `--reason/--eta` previously vanished on that path.
+- `--until-exit` resumes on wrapper signals too (SIGINT/SIGTERM via
+  NotifyContext + deferred resume), not just child exits — the gate
+  now covers a canceled wrapper.
+- Pre-drain lease fetch bounded (3s, degrades to
+  `leases_unavailable`); fleetd-side cell client honors the documented
+  token order with a typed error for an unreadable token_file;
+  wake.mac must be 48-bit (EUI-64 silently built garbage frames) and
+  is optional when wake.cmd replaces the packet; wake endpoint body
+  capped at 1MB like its siblings.
+
 ## Goal
 
 Fleet state changes become verbs instead of YAML edits: reclaim the

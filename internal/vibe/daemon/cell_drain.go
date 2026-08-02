@@ -94,7 +94,9 @@ func (d *Daemon) CellDrain(ctx context.Context, req *connect.Request[vibev1.Cell
 		}
 	}
 
-	if stderr, err := d.cellCmdRunner(ctx, d.cfg.CellCmds.Drain); err != nil {
+	vctx, cancelVerb := verbCtx(ctx)
+	defer cancelVerb()
+	if stderr, err := d.cellCmdRunner(vctx, d.cfg.CellCmds.Drain); err != nil {
 		return nil, connect.NewError(connect.CodeUnavailable,
 			fmt.Errorf("drain command failed: %v: %s", err, strings.TrimSpace(stderr)))
 	}
@@ -116,7 +118,9 @@ func (d *Daemon) CellResume(ctx context.Context, _ *connect.Request[vibev1.CellR
 		return nil, connect.NewError(connect.CodeFailedPrecondition,
 			fmt.Errorf("this daemon has no cell verbs configured (cell_cmds.resume is unset)"))
 	}
-	if stderr, err := d.cellCmdRunner(ctx, d.cfg.CellCmds.Resume); err != nil {
+	vctx, cancelVerb := verbCtx(ctx)
+	defer cancelVerb()
+	if stderr, err := d.cellCmdRunner(vctx, d.cfg.CellCmds.Resume); err != nil {
 		return nil, connect.NewError(connect.CodeUnavailable,
 			fmt.Errorf("resume command failed: %v: %s", err, strings.TrimSpace(stderr)))
 	}
@@ -156,12 +160,19 @@ func (d *Daemon) awaitQuiescence(ctx context.Context) error {
 	}
 }
 
-// runCellCmd executes a cell verb via sh -c with a bounded wait, returning
-// captured stderr for the error path. Assigned to Daemon.cellCmdRunner in
-// New so tests can script verb outcomes.
+// verbCtx builds the context every cell verb runs under: detached from
+// the RPC's cancellation (a client disconnecting mid-verb must not
+// SIGKILL a unit stop in flight — the verb is exactly as atomic as the
+// process regime makes it, and the caller's presence changes nothing
+// about that), bounded by cellCmdTimeout.
+func verbCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), cellCmdTimeout)
+}
+
+// runCellCmd executes a cell verb via sh -c, returning captured stderr for
+// the error path. Assigned to Daemon.cellCmdRunner in New so tests can
+// script verb outcomes.
 func runCellCmd(ctx context.Context, cmd string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, cellCmdTimeout)
-	defer cancel()
 	c := exec.CommandContext(ctx, "sh", "-c", cmd)
 	var stderr bytes.Buffer
 	c.Stderr = &stderr
@@ -208,8 +219,12 @@ func (d *Daemon) probeResidentModels(ctx context.Context) []string {
 }
 
 // fetchCellLeases pulls this cell's active advisory leases from fleetd —
-// the "would I strand a batch job?" half of the pre-drain report.
+// the "would I strand a batch job?" half of the pre-drain report. Bounded
+// like the other pre-drain probes: a wedged fleetd must degrade the
+// report (leases_unavailable), never block the verb.
 func (d *Daemon) fetchCellLeases(ctx context.Context) ([]*vibev1.LeaseView, error) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
 	base := strings.TrimRight(d.cfg.Fleet.RegistryURL, "/")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		base+"/api/fleet/leases?cell="+d.cfg.Fleet.Cell, nil)
