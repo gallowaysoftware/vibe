@@ -65,6 +65,16 @@ Small (days):
 6. **Guest read-only token** — a second bearer honored only on
    `GET /api/fleet/state` + `/events` (interim: reverse-proxy path
    allowlist, zero code). Sharing status today means sharing drain.
+7. **Upstream: llama-swap SIGTERM-time stream grace** (found by C2's
+   drain gate, 2026-08-02). The signal handler calls `CloseStreams()`
+   before the graceful drain, which cancels in-flight inference
+   streams immediately — unit stop is NOT a graceful drain on v239
+   (contrast `-watch-config` reloads, which do drain 30s). C2 works
+   around it with `drain --wait` (quiescence before stop); the real
+   fix is upstream: don't cancel inference streams on SIGTERM, or make
+   the grace configurable. Until it lands, keep `--wait` as the
+   documented answer and don't assume unit-stop is graceful anywhere
+   else in the design.
 
 Medium:
 

@@ -144,6 +144,42 @@ optional.)
     fallback to direct cell probes. `deploy/fleetd/` is the reference
     stack (state-dir volume is REQUIRED — see its README's state
     contract).
+- **Fleet actuation (fleet-control C2).** The pieces an agent must not
+  break:
+  - `CellDrain`/`CellResume` RPCs act on the daemon's OWN cell via
+    `cell_cmds.drain|resume` (config.yaml) — remote reach is calling a
+    remote daemon, never routing. Errors: `FailedPrecondition` (no
+    cell_cmds), `Unavailable`+stderr (command failed),
+    `DeadlineExceeded` (quiescence wait expired, drain NOT run).
+  - **llama-swap's SIGTERM path cancels in-flight streams
+    immediately** (v239 verified: `CloseStreams()` precedes the
+    graceful drain). `vibe cell drain --wait <dur>` /
+    `CellDrainRequest.wait_seconds` is the quiescence wait that lets
+    generations finish BEFORE the unit stops — driven by fleetapi's
+    inflight SSE tracking. Unit `TimeoutStopSec` must exceed
+    llama-swap's 30s internal cap.
+  - **One intent writer per invocation path, transport-distinguished**:
+    TCP-arriving RPCs are fleetd-driven (fleetd writes intent after
+    success, `fleetapi.SetIntent`); unix-socket ones are local (the
+    cell daemon posts to `fleet.registry_url` best-effort). A failed
+    drain never records intent.
+  - **Advisory leases** (`POST/DELETE /api/fleet/lease`,
+    `GET /api/fleet/leases`): keyed (cell, model, holder), Go-duration
+    TTL, lazy expiry at read — they appear in the pre-drain report and
+    fleet_status, never block anything.
+  - **Render `cell:` rules** (`vibe router render --cell <name>`):
+    front renders peers-only (models = def name + alias union,
+    proxy from hosts.yaml); unassigned LLM defs are excluded with a
+    warning; unknown cell names are render errors. cloud_peer follows
+    cell: too — unassigned renders everywhere, assigned renders on its
+    cell (front render only when front-assigned). Non-local `--cell`
+    requires `--out`/`--stdout`. **`cell:` set ⇒ os.Stat validation
+    gated OFF** (fleet.md §4.2's `host:` rule) — the canonical def
+    checkout loads on every box; a def's paths are its cell's
+    business.
+  - MCP tools (fleetmcp): fleet_status, warm_model, unload_model,
+    drain_cell, resume_cell, wake_cell, render_front (dry-run only
+    until C3's apply path).
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.

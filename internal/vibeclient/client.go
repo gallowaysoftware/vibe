@@ -134,6 +134,26 @@ func (c *Client) Status(ctx context.Context) (*vibev1.Status, error) {
 	return resp.Msg.Status, nil
 }
 
+// CellDrain asks the daemon (its OWN local cell) to run its configured
+// drain verb, returning the pre-drain report. Remote cells are reached
+// by pointing a Client at that cell's daemon_url — there is no routing
+// layer by design. waitSeconds bounds a pre-drain quiescence wait (0 =
+// drain immediately; llama-swap's SIGTERM cancels in-flight streams
+// immediately, so only a wait lets generations finish).
+func (c *Client) CellDrain(ctx context.Context, reason, eta string, waitSeconds int32) (*vibev1.CellDrainResponse, error) {
+	resp, err := c.rpc.CellDrain(ctx, connect.NewRequest(&vibev1.CellDrainRequest{Reason: reason, Eta: eta, WaitSeconds: waitSeconds}))
+	if err != nil {
+		return nil, err
+	}
+	return resp.Msg, nil
+}
+
+// CellResume asks the daemon to run its configured resume verb.
+func (c *Client) CellResume(ctx context.Context) error {
+	_, err := c.rpc.CellResume(ctx, connect.NewRequest(&vibev1.CellResumeRequest{}))
+	return err
+}
+
 // StatusFull returns the active-profile Status plus every running
 // service. Used by `vibe ps` to render the whole picture; callers
 // that only care about the active profile can keep using Status().

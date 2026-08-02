@@ -34,6 +34,19 @@ service ControlService {
   // already cached at the expected size, or a stream of PHASE_DOWNLOADING
   // updates while bytes flow in.
   rpc Pull(PullRequest) returns (stream PullProgress) {}
+
+  // CellDrain runs this daemon's configured drain command (cell_cmds.drain)
+  // — the fleet-control "reclaim this box" verb (fleet-control C2). It
+  // reports what was resident/in-flight BEFORE draining so the caller can
+  // show the pre-drain report. FailedPrecondition when the daemon has no
+  // cell verbs configured; Unavailable (with stderr) when the command
+  // fails. Acts on the daemon's OWN local cell — remote reach comes from
+  // calling a remote daemon, not from routing here.
+  rpc CellDrain(CellDrainRequest) returns (CellDrainResponse) {}
+
+  // CellResume runs cell_cmds.resume, restoring JIT service after a drain.
+  // Same error contract as CellDrain.
+  rpc CellResume(CellResumeRequest) returns (CellResumeResponse) {}
 }
 
 message Status {
@@ -166,6 +179,54 @@ message LogsResponse {
 message PullRequest {
   string profile = 1;
 }
+
+message CellDrainRequest {
+  // reason/eta are the declared intent ("gaming, back ~23:00") recorded
+  // alongside the drain — for humans and agents asking why, never for
+  // routing. Both optional.
+  string reason = 1;
+  string eta = 2;
+  // wait_seconds bounds a quiescence wait before the drain command runs:
+  // llama-swap's SIGTERM path cancels in-flight streams immediately
+  // (v239 verified — CloseStreams precedes the graceful drain), so the
+  // only way a generation completes across a drain is to let it finish
+  // FIRST. 0 (default) drains immediately; in-flight requests then die
+  // truncated, which the report's in_flight_requests field warned about.
+  int32 wait_seconds = 3;
+}
+
+// LeaseView is one advisory lease as shown in the pre-drain report: a
+// consumer's "I hold this model mid-batch" note. Advisory only — never
+// blocks anything.
+message LeaseView {
+  string cell = 1;
+  string model = 2;
+  string holder = 3;
+  string note = 4;
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+// CellDrainResponse is the pre-drain report: what the cell was doing when
+// the drain fired.
+message CellDrainResponse {
+  // resident_models are the models llama-swap had loaded (any non-stopped
+  // state) at drain time.
+  repeated string resident_models = 1;
+  // in_flight_requests is llama-swap's reported in-flight count, present
+  // only when the cell's /api/metrics answers — /running carries no
+  // request counts, and inventing them is worse than omitting the field.
+  optional int64 in_flight_requests = 2;
+  // active_leases are the fleet's advisory leases naming this cell,
+  // fetched from fleetd when a registry is configured (empty otherwise).
+  repeated LeaseView active_leases = 3;
+  // leases_unavailable is true when the lease fetch itself failed — the
+  // drain still proceeded (leases are advisory), but the caller knows the
+  // report can't rule out stranded work.
+  bool leases_unavailable = 4;
+}
+
+message CellResumeRequest {}
+message CellResumeResponse {}
 
 message PullProgress {
   enum Phase {

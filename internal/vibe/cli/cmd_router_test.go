@@ -2,11 +2,13 @@ package cli
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 	"github.com/gallowaysoftware/vibe/internal/vibe/router"
 )
 
@@ -104,4 +106,116 @@ func TestRunRouterRender(t *testing.T) {
 			t.Fatalf("post-converge check: %v", err)
 		}
 	})
+}
+
+// setupRenderXDG points the whole config home at a tmp dir and optionally
+// writes a daemon config with fleet.cell set, so planRender's fleet
+// resolution runs against fixtures instead of the developer's box.
+func setupRenderXDG(t *testing.T, daemonConfig string) string {
+	t.Helper()
+	xdg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	if daemonConfig != "" {
+		dir := filepath.Join(xdg, "vibe")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(daemonConfig), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return xdg
+}
+
+func TestPlanRender_NonLocalCellRequiresOut(t *testing.T) {
+	setupRenderXDG(t, "fleet: {cell: gpu1}\n")
+
+	// Another cell with no --out/--stdout would overwrite this box's
+	// llama-swap config with a foreign render.
+	if _, _, _, err := planRender("gpu2", "", false); err == nil ||
+		!strings.Contains(err.Error(), "gpu2") || !strings.Contains(err.Error(), "--out") {
+		t.Errorf("non-local --cell must be refused without --out/--stdout, got %v", err)
+	}
+	// --out or --stdout discharges the safety rule.
+	if _, _, _, err := planRender("gpu2", filepath.Join(t.TempDir(), "front.yaml"), false); err != nil {
+		t.Errorf("--out must allow a non-local render: %v", err)
+	}
+	if _, _, _, err := planRender("gpu2", "", true); err != nil {
+		t.Errorf("--stdout must allow a non-local render: %v", err)
+	}
+	// The box's own cell may write the default path.
+	target, _, cfgPath, err := planRender("gpu1", "", false)
+	if err != nil {
+		t.Fatalf("local --cell must be allowed: %v", err)
+	}
+	if target != "gpu1" || cfgPath != llamaSwapConfigPath() {
+		t.Errorf("local render = (%q, %q), want (gpu1, %q)", target, cfgPath, llamaSwapConfigPath())
+	}
+
+	// Same refusal when the box has no fleet identity at all.
+	setupRenderXDG(t, "")
+	if _, _, _, err := planRender("gpu2", "", false); err == nil {
+		t.Error("--cell on a no-fleet box must still require --out/--stdout")
+	}
+}
+
+func TestPlanRender_FleetCellIsDefaultTarget(t *testing.T) {
+	setupRenderXDG(t, "fleet: {cell: gpu1}\n")
+	target, _, _, err := planRender("", "", false)
+	if err != nil {
+		t.Fatalf("planRender: %v", err)
+	}
+	if target != "gpu1" {
+		t.Errorf("no --cell must default to the daemon config's fleet.cell, got %q", target)
+	}
+
+	// No fleet.cell: the render has no fleet identity (cell-carrying defs
+	// are excluded with a warning at render time, not here).
+	setupRenderXDG(t, "")
+	target, _, _, err = planRender("", "", false)
+	if err != nil {
+		t.Fatalf("planRender: %v", err)
+	}
+	if target != "" {
+		t.Errorf("no fleet config must yield an empty target cell, got %q", target)
+	}
+}
+
+func TestRunRouterRender_FrontCell(t *testing.T) {
+	tmp := t.TempDir()
+	backends := filepath.Join(tmp, "backends")
+	writeRouterFixture(t, backends, "m1", routerFixtureDef)
+	hosts, err := fleetcfg.LoadFrom(writeHostsFixture(t, tmp))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// m1 is unassigned: the front render excludes it (with a warning) and
+	// emits no models: stanza — the front owns no models.
+	var warns []string
+	opts := router.Options{
+		LlamaServerBinary: "/opt/llama-server",
+		Cell:              "front",
+		Hosts:             hosts,
+		Warnf:             func(f string, a ...any) { warns = append(warns, fmt.Sprintf(f, a...)) },
+	}
+	var buf bytes.Buffer
+	if err := runRouterRender(&buf, backends, filepath.Join(tmp, "unused.yaml"), opts, false, true); err != nil {
+		t.Fatalf("front render: %v", err)
+	}
+	if strings.Contains(buf.String(), "models:") {
+		t.Errorf("front render must be peers-only:\n%s", buf.String())
+	}
+	if len(warns) != 1 || !strings.Contains(warns[0], "m1") {
+		t.Errorf("unassigned def must produce one warning naming it, got %v", warns)
+	}
+}
+
+func writeHostsFixture(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "hosts.yaml")
+	if err := os.WriteFile(path, []byte("cells:\n  front: {url: \"http://front.lan:9000\", class: always_on}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

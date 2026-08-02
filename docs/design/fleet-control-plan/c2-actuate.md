@@ -1,8 +1,84 @@
 # C2 — Actuate: drain/resume, wake, and the rendered front
 
-Status: PLANNED (2026-08-02). Scope: ~450 lines — two Connect RPCs +
-proto, `vibe cell drain|resume|wake`, advisory leases, and
-`vibe router render --cell front` (topology.md §3 build item 1).
+Status: EXECUTED (2026-08-02). All six gates passed, with one
+load-bearing design correction (the SIGTERM drain assumption — see gate
+2).
+
+Gate results (live, reference fleet):
+
+1. **Render-parity: PASS.** A fixture of the live fleet's defs (7
+   cell-assigned LLM defs + laptop def + unassigned cloud peer, the
+   house hosts.yaml) rendered a front config semantically identical to
+   the hand-maintained one: same peer set (localmodel 9 models incl.
+   the alias union, laptop-m3pro, kimi), same proxy URLs, same
+   `${env.MOONSHOT_API_KEY}` macro. Authorship can flip to the
+   renderer whenever the house wants (canonical def checkout is the
+   remaining piece, C0 item 4).
+2. **Drain gate: PASS with a design correction.** The doc's assumption
+   — "unit stop lets llama-swap run its documented in-flight drain" —
+   is **false on v239**: the SIGTERM path calls `CloseStreams()` FIRST
+   (llama-swap.go), canceling in-flight inference streams immediately
+   (verified live: truncated 200, not garbage). The 30s shutdown
+   timeout bounds the sequence, not the streams (contrast with
+   `-watch-config` reloads, which lack `CloseStreams` and do drain
+   30s). The fix landed in the verb, not upstream: `CellDrain` gains
+   **`--wait` / `wait_seconds`** — a pre-drain quiescence wait driven
+   by the fleet watcher's inflight SSE tracking (the field the
+   pre-drain report already surfaces). Verified: `drain --wait 60s`
+   with in-flight 1 held ~39s for the essay stream to complete
+   ([DONE], uncorrupted), THEN stopped the unit; new requests failed
+   UPSTREAM_DOWN-class; intent showed DRAINED + reason; resume
+   restored JIT (round-tripped) and cleared intent. A wait that
+   expires with work still in flight returns DeadlineExceeded and does
+   NOT run the drain. The upstream contribution opportunity
+   (SIGTERM-time stream grace) is noted for the futures doc.
+3. **--until-exit: PASS.** Wrapped a non-zero-exiting process: drained
+   at start, resumed on exit (exit code 3 included), cell SERVING
+   after. (Also caught + fixed a dash-indexing off-by-one that dropped
+   the wrapped command's argv[0] when no cell preceded `--`.)
+4. **Lease gate: PASS.** Active lease + drain without `--yes` printed
+   the lease and refused on non-TTY; `--yes` proceeded with the lease
+   in the report; a 5s TTL lease vanished from `fleet_status` on its
+   own; DELETE by key works. The `leases_unavailable` report marker
+   was also observed live before fleetd had the endpoints (pre-C2
+   fleetd build).
+5. **Proto: clean** (`buf generate` produces no drift beyond the new
+   RPCs); full inner loop green.
+6. **Unit tests: PASS** — render cell matrix + front parity + cloud
+   peer placement, drain/resume RPC (order: report → wait → cmd →
+   intent; FailedPrecondition; Unavailable+stderr+no-intent; remote
+   invocations write no intent, proven through the real TCP/unix
+   listener split), quiescence wait (proceeds at zero,
+   DeadlineExceeded + no drain at expiry), lease CRUD/TTL/routes,
+   wake packet shape + delivery + fallback, CLI drain/resume/wake,
+   MCP tool matrix incl. render_front dry-run.
+
+Implementation notes beyond the doc's letter:
+
+- **`cell:` placement for cloud peers.** Unassigned cloud peers render
+  everywhere (status quo); a `cell:`-assigned cloud peer renders on
+  its cell's render and on the front ONLY when front-assigned — the
+  front owns the fleet's shared cloud ids (topology §1's "cells drop
+  their cloud peers" made mechanical). A cell-scoped cloud peer
+  colliding with a fleet cell's peer stanza is a render error.
+- **`cell:` set ⇒ os.Stat validation gated OFF** (fleet.md §4.2's
+  `host:` rule applied to `cell:`). The canonical-def-checkout
+  convention (C0 item 4) puts every def on every box, and a def's
+  paths exist on its cell — gating is what lets a shared checkout load
+  everywhere. Non-path rules still validate.
+- **Intent-writer split is transport-based**: TCP invocations are
+  fleetd-driven (fleetd writes intent after success); unix-socket
+  invocations are local (the cell daemon posts intent to
+  `fleet.registry_url`, best-effort). One writer per path, proven
+  through the real listeners.
+- **`vibe cell drain --wait <duration>`** is the quiescence knob; MCP
+  `drain_cell` takes `wait_seconds` likewise. Default 0 (immediate),
+  which is the honest behavior once the report shows in-flight work:
+  the caller chooses.
+- **Unit stop timeouts must exceed llama-swap's 30s internal cap** so
+  its drain sequence (such as it is) completes before systemd's
+  SIGKILL: the house's llama-swap units now set `TimeoutStopSec=45s`
+  (private repo record).
 
 ## Goal
 

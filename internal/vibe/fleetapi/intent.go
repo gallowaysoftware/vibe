@@ -37,28 +37,55 @@ type intentResponse struct {
 // handleIntent sets or clears one cell's declared intent. Unknown cells
 // and unknown states are 400s — a typo'd cell name must fail loudly, not
 // record intent for a cell that doesn't exist.
-//
-// The whole clone-mutate-persist-swap sequence runs under intentMu: a
-// concurrent pair of POSTs then serializes cleanly, the file can never be
-// marshaled from a map another handler is mutating (a fatal runtime
-// error), and a failed persist leaves the observable state untouched —
-// the 500 and /api/fleet/state never disagree.
 func (s *Server) handleIntent(w http.ResponseWriter, r *http.Request) {
 	var req intentRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
+	if req.State != "drained" && req.State != "serving" {
+		http.Error(w, `state must be "drained" or "serving"`, http.StatusBadRequest)
+		return
+	}
+	in, err := s.SetIntent(req.Cell, req.State, req.Reason, req.ETA)
+	if err != nil {
+		var uk *unknownCellError
+		switch {
+		case errors.As(err, &uk):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		default:
+			slog.Warn("intent persist failed", "err", err)
+			http.Error(w, "persist intent", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	resp := intentResponse{Cell: req.Cell, State: "serving"}
+	if in != nil {
+		resp.Intent = in
+		resp.State = in.State
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// SetIntent records (state "drained") or clears (state "serving") one
+// cell's declared intent, returning the stored entry (nil when cleared).
+// It is the in-process path fleetd's MCP facade uses after driving a
+// drain/resume RPC — the fleetd-invoked writer of the C2 one-writer
+// rule — and shares the HTTP endpoint's validation, serialization, and
+// persistence: the whole clone-mutate-persist-swap runs under intentMu,
+// and a failed persist leaves observable state untouched.
+func (s *Server) SetIntent(cell, state, reason, eta string) (*Intent, error) {
 	known := false
 	for _, c := range s.cells {
-		if c.Name == req.Cell {
+		if c.Name == cell {
 			known = true
 			break
 		}
 	}
 	if !known {
-		http.Error(w, fmt.Sprintf("unknown cell %q (not in the registry)", req.Cell), http.StatusBadRequest)
-		return
+		return nil, &unknownCellError{cell: cell}
 	}
 
 	s.intentMu.Lock()
@@ -70,33 +97,26 @@ func (s *Server) handleIntent(w http.ResponseWriter, r *http.Request) {
 		next[k] = v
 	}
 	s.mu.Unlock()
-	switch req.State {
+
+	var stored *Intent
+	switch state {
 	case "serving":
-		delete(next, req.Cell)
+		delete(next, cell)
 	case "drained":
-		next[req.Cell] = Intent{State: "drained", Reason: req.Reason, ETA: req.ETA, Since: time.Now().UTC()}
+		in := Intent{State: "drained", Reason: reason, ETA: eta, Since: time.Now().UTC()}
+		next[cell] = in
+		stored = &in
 	default:
-		http.Error(w, `state must be "drained" or "serving"`, http.StatusBadRequest)
-		return
+		return nil, fmt.Errorf("state must be \"drained\" or \"serving\"")
 	}
 
 	if err := saveIntents(s.intentPath, next); err != nil {
-		slog.Warn("intent persist failed", "err", err)
-		http.Error(w, "persist intent", http.StatusInternalServerError)
-		return
+		return nil, err
 	}
 	s.mu.Lock()
 	s.intents = next
 	s.mu.Unlock()
-
-	resp := intentResponse{Cell: req.Cell, State: "serving"}
-	if req.State == "drained" {
-		in := next[req.Cell]
-		resp.Intent = &in
-		resp.State = "drained"
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	return stored, nil
 }
 
 // loadIntents reads the intent file; a missing file is an empty store

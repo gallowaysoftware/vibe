@@ -76,6 +76,11 @@ func IntentFile() string { return filepath.Join(StateHome(), "fleet", "intent.js
 // doesn't forget when an absent cell was last sighted.
 func LastSeenFile() string { return filepath.Join(StateHome(), "fleet", "last-seen.json") }
 
+// LeasesFile persists advisory consumer leases ("batch-ingest holds
+// embed-large: mid-batch, 2.1M rows left"). Advisory only — they appear
+// in the pre-drain report and fleet_status, never block anything.
+func LeasesFile() string { return filepath.Join(StateHome(), "fleet", "leases.json") }
+
 // TokenFile is the path to the daemon's bearer-token file. The token lives in
 // $XDG_STATE_HOME/vibe rather than $XDG_CONFIG_HOME because it's a generated
 // runtime secret, not user-authored configuration — same reasoning that puts

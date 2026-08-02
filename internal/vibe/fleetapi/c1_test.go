@@ -27,6 +27,7 @@ func newFleetdServer(t *testing.T, cells []Cell) (*Server, *httptest.Server, Opt
 	opts := Options{
 		IntentPath:   filepath.Join(dir, "intent.json"),
 		LastSeenPath: filepath.Join(dir, "last-seen.json"),
+		LeasePath:    filepath.Join(dir, "leases.json"),
 	}
 	s := New(cells, filepath.Join(dir, "start-history.json"), testDaemonInfo, opts)
 	s.baseBackoff = 10 * time.Millisecond

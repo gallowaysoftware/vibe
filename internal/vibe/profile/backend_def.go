@@ -33,6 +33,14 @@ type BackendDef struct {
 	// Router carries client-facing naming knobs for the rendered llama-swap
 	// entry (extra aliases, alias-collision ownership, catalog visibility).
 	Router *RouterOpts `yaml:"router,omitempty"`
+	// Cell names the fleet cell that owns this backend (fleet-control C2
+	// §6): `vibe router render --cell <name>` places the def on that cell's
+	// llama-swap, and the front render turns every cell-assigned def into a
+	// peers: stanza. Empty means unassigned — rendered wherever the render
+	// runs. The NAME is validated at render time against hosts.yaml, not
+	// here: defs also load standalone for daemon activation, where an
+	// unknown cell is meaningless.
+	Cell string `yaml:"cell,omitempty"`
 }
 
 // Lifecycle is the router-lifecycle block on a backend def. All fields feed
@@ -207,6 +215,19 @@ func (b *Backend) normalize() {
 	}
 }
 
+// markCellScoped flags path-stat-bearing sub-structs when the def is
+// fleet-scoped (cell: set): their paths exist on the cell, so os.Stat
+// validation is gated off at load (fleet.md §4.2's host: rule applied to
+// cell:). Everything non-path still validates.
+func (b *Backend) markCellScoped(scoped bool) {
+	if b.LlamaServer != nil {
+		b.LlamaServer.cellScoped = scoped
+	}
+	if b.ComfyUI != nil {
+		b.ComfyUI.cellScoped = scoped
+	}
+}
+
 // validate enforces the discriminated-union rule (exactly one sub-block set)
 // and runs the per-backend validation.
 func (b Backend) validate() error {
@@ -291,6 +312,13 @@ func LoadBackendFrom(dir, name string) (*BackendDef, error) {
 		return nil, fmt.Errorf("backend %s: name %q does not match filename (rename the file or fix name:)", name, def.Name)
 	}
 	def.Backend.normalize()
+	// cell: set ⇒ os.Stat validation is gated OFF, mirroring fleet.md
+	// §4.2's host: rule: a fleet-scoped def's paths exist on its cell,
+	// not necessarily on the box loading it (the canonical def checkout
+	// puts every def on every box). Everything else — shape, aliases,
+	// hf rules — still validates; the cell's own render/activation
+	// surfaces a bad path where the path is real.
+	def.Backend.markCellScoped(def.Cell != "")
 	if err := def.Backend.validate(); err != nil {
 		return nil, fmt.Errorf("backend %s: %w", name, err)
 	}

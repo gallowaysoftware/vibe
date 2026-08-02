@@ -16,6 +16,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 	"github.com/gallowaysoftware/vibe/internal/vibe/supervisor"
 )
@@ -34,8 +35,31 @@ type Options struct {
 	// (ComfyUI, the smoke rig's slowmodel), peer cells, and routing groups.
 	// Merge is strictly additive — a key that would override anything the
 	// renderer emitted is an error, so defs stay the single source of truth
-	// for everything they can express. Missing file = no extras.
+	// for everything they can express. Missing file = no extras. On a
+	// --cell front render the extras still merge verbatim; whether they
+	// make sense on the adopting front is the adopter's business.
 	ExtrasPath string
+
+	// Cell names the fleet cell this render is for (fleet-control C2 §6),
+	// resolved by the caller: the --cell flag, else the daemon config's
+	// fleet.cell. "" means a render with no fleet identity. Cell "front"
+	// renders the peers-only front config (the front owns no models);
+	// any other cell renders that cell's defs plus unassigned defs as
+	// local models, and defs pinned elsewhere are excluded with a warning
+	// rather than silently rendered or silently dropped.
+	Cell string
+
+	// Hosts is the parsed hosts.yaml the render validates cell:
+	// assignments against and, on the front render, sources peer URLs
+	// from. Nil means no fleet file: a front render is impossible (no
+	// peer addresses), and cell-carrying defs can only be excluded with a
+	// warning, never validated.
+	Hosts *fleetcfg.File
+
+	// Warnf receives one message per def the cell selection excludes.
+	// Nil discards; the CLI wires it to stderr so an excluded def is
+	// always visible to whoever ran the render.
+	Warnf func(format string, args ...any)
 }
 
 const (
@@ -140,9 +164,41 @@ func LoadDefs(dir string) ([]*profile.BackendDef, error) {
 // (non-external defs, vibe-supervised services) is ignored; those stay
 // vibe-managed. External tabby_api defs are rejected: nothing serves them
 // yet, and silently dropping a router-served model would strand its clients.
+//
+// Fleet selection (fleet-control C2 §6) refines which LLM defs render when
+// Options.Cell is set. Rendering for the front cell produces a peers-only
+// config: every cell-assigned LLM def joins its cell's peers: stanza (proxy
+// from hosts.yaml, models = def name + resolved aliases), unassigned defs
+// are excluded with a warning (the front owns no models), and cloud_peer
+// defs render subject to the same cell: placement (unassigned renders
+// everywhere; assigned renders on its cell, or on the front when assigned
+// to it — the front owns the fleet's shared cloud ids). Rendering for any
+// other cell renders that cell's defs plus unassigned defs as local
+// models: entries; defs pinned to a different cell are excluded with a
+// warning. A def whose cell: is not in hosts.yaml is a render error in
+// every mode — the name can only be a typo or stale membership, and either
+// way the model would silently strand.
 func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 	defs = slices.Clone(defs)
 	sort.Slice(defs, func(i, j int) bool { return defs[i].Name < defs[j].Name })
+
+	warn := opts.Warnf
+	if warn == nil {
+		warn = func(string, ...any) {}
+	}
+	front := opts.Cell == fleetcfg.FrontCell
+	if front && !opts.Hosts.HasCells() {
+		// The front render's whole content is peer stanzas; without
+		// hosts.yaml there are no peer addresses to point them at.
+		return "", fmt.Errorf("--cell %s requires hosts.yaml with a cells: section (peer URLs come from fleet membership)", fleetcfg.FrontCell)
+	}
+	if opts.Cell != "" && !front && opts.Hosts.HasCells() {
+		if _, ok := opts.Hosts.Cells[opts.Cell]; !ok {
+			// A typo'd --cell would otherwise render an eerily empty
+			// config that --check then can't distinguish from truth.
+			return "", fmt.Errorf("cell %q is not in hosts.yaml", opts.Cell)
+		}
+	}
 
 	var modelDefs, peerDefs []*profile.BackendDef
 	for _, def := range defs {
@@ -151,8 +207,50 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 		}
 		switch {
 		case def.Backend.LlamaServer != nil, def.Backend.ComfyUI != nil, def.Backend.MLXServer != nil:
+			if def.Cell != "" && opts.Hosts.HasCells() {
+				if _, ok := opts.Hosts.Cells[def.Cell]; !ok {
+					return "", fmt.Errorf("backend %s: cell %q is not in hosts.yaml (fix the def or the fleet membership)", def.Name, def.Cell)
+				}
+			}
+			switch {
+			case front && def.Cell == "":
+				warn("backend %s has no cell: assignment; excluded from the front render (the front owns no models)", def.Name)
+				continue
+			case !front && def.Cell != "" && def.Cell != opts.Cell:
+				if opts.Cell == "" {
+					warn("backend %s declares cell: %q but this render has no fleet cell (no --cell, no fleet.cell in the daemon config); excluded rather than rendered where it doesn't belong", def.Name, def.Cell)
+				} else {
+					warn("backend %s is assigned to cell %q; excluded from the render for cell %q", def.Name, def.Cell, opts.Cell)
+				}
+				continue
+			}
 			modelDefs = append(modelDefs, def)
 		case def.Backend.CloudPeer != nil:
+			// Cloud peers are their own stanzas, but placement still
+			// follows cell:: an assigned cloud peer renders on its cell's
+			// render and on the front render ONLY when assigned to the
+			// front (the front owns the fleet's shared cloud ids — a
+			// cell-scoped cloud peer must not surface there twice).
+			// Unassigned renders everywhere, the status quo for
+			// single-box setups.
+			if def.Cell != "" && opts.Hosts.HasCells() {
+				if _, ok := opts.Hosts.Cells[def.Cell]; !ok {
+					return "", fmt.Errorf("backend %s: cell %q is not in hosts.yaml (fix the def or the fleet membership)", def.Name, def.Cell)
+				}
+			}
+			switch {
+			case front && def.Cell != "" && def.Cell != fleetcfg.FrontCell:
+				// Another cell's cloud peer; the front only carries the
+				// fleet's shared (unassigned) and front-assigned cloud ids.
+				continue
+			case !front && def.Cell != "" && def.Cell != opts.Cell:
+				if opts.Cell == "" {
+					warn("cloud backend %s declares cell: %q but this render has no fleet cell; excluded rather than rendered where it doesn't belong", def.Name, def.Cell)
+				} else {
+					warn("cloud backend %s is assigned to cell %q; excluded from the render for cell %q", def.Name, def.Cell, opts.Cell)
+				}
+				continue
+			}
 			peerDefs = append(peerDefs, def)
 		case def.Backend.TabbyAPI != nil:
 			return "", fmt.Errorf("backend %s: external tabby_api defs are not supported by the renderer yet (serve it via llama_server or keep it vibe-supervised)", def.Name)
@@ -174,61 +272,85 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 	}
 
 	var preload []string
-	for _, def := range modelDefs {
-		if cfg.Models == nil {
-			cfg.Models = map[string]*swapModel{}
+	if front {
+		// The front owns no models: every assigned def becomes a models
+		// entry under its cell's peer stanza, keyed by cell name so
+		// fleetd and the render agree on the peer's identity.
+		for _, def := range modelDefs {
+			if cfg.Peers == nil {
+				cfg.Peers = map[string]*swapPeer{}
+			}
+			p := cfg.Peers[def.Cell]
+			if p == nil {
+				p = &swapPeer{Proxy: opts.Hosts.Cells[def.Cell].URL}
+				cfg.Peers[def.Cell] = p
+			}
+			p.Models = append(p.Models, def.Name)
+			p.Models = append(p.Models, aliases[def.Name]...)
 		}
-		m := &swapModel{
-			Aliases: aliases[def.Name],
-			TTL:     int(DefaultTTL / time.Second),
+	} else {
+		for _, def := range modelDefs {
+			if cfg.Models == nil {
+				cfg.Models = map[string]*swapModel{}
+			}
+			m := &swapModel{
+				Aliases: aliases[def.Name],
+				TTL:     int(DefaultTTL / time.Second),
+			}
+			if c := def.Backend.ComfyUI; c != nil {
+				// ComfyUI as a swap tenant (design §16): fixed port from the def
+				// (its clients dial /upstream/<id>, so ${PORT} indirection buys
+				// nothing), health on /system_stats, cmd re-creates ComfyUISpec's
+				// workdir semantics via cd+exec since llama-swap has no workdir.
+				cmd, err := comfyuiCmd(def)
+				if err != nil {
+					return "", err
+				}
+				m.Cmd = cmd
+				m.Proxy = fmt.Sprintf("http://127.0.0.1:%d", c.Port)
+				m.CheckEndpoint = "/system_stats"
+			} else {
+				cmd, err := modelCmd(def, opts)
+				if err != nil {
+					return "", err
+				}
+				m.Cmd = cmd
+				if mx := def.Backend.MLXServer; mx != nil {
+					// Clients address this by def name; the process only
+					// answers to its snapshot path.
+					m.UseModelName = mx.ModelDir
+				}
+			}
+			if lc := def.Lifecycle; lc != nil {
+				if lc.TTL != nil {
+					m.TTL = lc.TTL.Seconds()
+				}
+				if lc.Preload {
+					preload = append(preload, def.Name)
+				}
+				if lc.StartTimeout != nil && lc.StartTimeout.Seconds() > cfg.HealthCheckTimeout {
+					cfg.HealthCheckTimeout = lc.StartTimeout.Seconds()
+				}
+				// lc.EvictCost is deliberately not rendered: it maps to
+				// llama-swap matrix mode (evict_costs), which this renderer
+				// doesn't emit until multi-model co-residency lands (A6).
+			}
+			if def.Router != nil && def.Router.Unlisted {
+				m.Unlisted = true
+			}
+			cfg.Models[def.Name] = m
 		}
-		if c := def.Backend.ComfyUI; c != nil {
-			// ComfyUI as a swap tenant (design §16): fixed port from the def
-			// (its clients dial /upstream/<id>, so ${PORT} indirection buys
-			// nothing), health on /system_stats, cmd re-creates ComfyUISpec's
-			// workdir semantics via cd+exec since llama-swap has no workdir.
-			cmd, err := comfyuiCmd(def)
-			if err != nil {
-				return "", err
-			}
-			m.Cmd = cmd
-			m.Proxy = fmt.Sprintf("http://127.0.0.1:%d", c.Port)
-			m.CheckEndpoint = "/system_stats"
-		} else {
-			cmd, err := modelCmd(def, opts)
-			if err != nil {
-				return "", err
-			}
-			m.Cmd = cmd
-			if mx := def.Backend.MLXServer; mx != nil {
-				// Clients address this by def name; the process only
-				// answers to its snapshot path.
-				m.UseModelName = mx.ModelDir
-			}
-		}
-		if lc := def.Lifecycle; lc != nil {
-			if lc.TTL != nil {
-				m.TTL = lc.TTL.Seconds()
-			}
-			if lc.Preload {
-				preload = append(preload, def.Name)
-			}
-			if lc.StartTimeout != nil && lc.StartTimeout.Seconds() > cfg.HealthCheckTimeout {
-				cfg.HealthCheckTimeout = lc.StartTimeout.Seconds()
-			}
-			// lc.EvictCost is deliberately not rendered: it maps to
-			// llama-swap matrix mode (evict_costs), which this renderer
-			// doesn't emit until multi-model co-residency lands (A6).
-		}
-		if def.Router != nil && def.Router.Unlisted {
-			m.Unlisted = true
-		}
-		cfg.Models[def.Name] = m
 	}
 
 	for _, def := range peerDefs {
 		if cfg.Peers == nil {
 			cfg.Peers = map[string]*swapPeer{}
+		}
+		if _, clash := cfg.Peers[def.Name]; clash {
+			// Only reachable on the front render, where a cloud_peer def
+			// named after a fleet cell would silently overwrite the
+			// cell's peer stanza (or vice versa).
+			return "", fmt.Errorf("cloud_peer backend %s collides with the peer stanza for fleet cell %q; rename the def", def.Name, def.Name)
 		}
 		cp := def.Backend.CloudPeer
 		p := &swapPeer{Proxy: cp.BaseURL, Models: slices.Clone(cp.Models)}

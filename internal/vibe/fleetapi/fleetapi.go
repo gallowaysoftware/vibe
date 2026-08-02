@@ -35,6 +35,9 @@ type Cell struct {
 	// HostProbe is an optional host:port TCP dial distinguishing "host up,
 	// cell down" from "host down" in the derived display state.
 	HostProbe string `json:"-"`
+	// Wake is the cell's Wake-on-LAN config (nil = no wake configured).
+	// Kept out of the state JSON: the MAC is config, not status.
+	Wake *WakeSpec `json:"-"`
 }
 
 // Intent is a declared operator note about a cell (design doc §4 axis 2):
@@ -98,6 +101,9 @@ type CellSnapshot struct {
 	Class         string     `json:"class,omitempty"`
 	Intent        *Intent    `json:"intent,omitempty"`
 	LastSeen      *time.Time `json:"last_seen,omitempty"`
+	// Leases are the active advisory holds naming this cell (C2) — the
+	// pre-drain "would I strand a batch job?" answer, advisory only.
+	Leases []Lease `json:"leases,omitempty"`
 	// Display is the derived display state (design doc §4 table), computed
 	// at read time: SERVING / DRAINED / DRAINED? / OFF / OFF/AWAY /
 	// OFF/AWAY? / INCONSISTENT.
@@ -155,11 +161,25 @@ type Server struct {
 	lastSeen     map[string]time.Time
 	lastSeenPath string
 
+	// leases is the advisory-lease store (C2): keyed by
+	// cell\x00model\x00holder, TTL-filtered at read. leaseMu serializes
+	// mutations against persist, same discipline as intentMu.
+	leases    map[string]Lease
+	leasePath string
+	leaseMu   sync.Mutex
+
 	// flight is the in-flight Snapshot shared by concurrent callers —
 	// one probe round serves every simultaneous /state consumer instead
 	// of a goroutine fan-out per request.
 	flightMu sync.Mutex
 	flight   *snapshotFlight
+
+	// inFlight tracks each cell's current in-flight request count as
+	// reported by llama-swap's inflight SSE frames. The bool in the
+	// accessor distinguishes "reported zero" from "no frame seen yet" —
+	// callers must not invent a count for a cell that never reported.
+	inFlight     map[string]int
+	inFlightSeen map[string]bool
 
 	done      chan struct{}
 	closeOnce sync.Once
@@ -177,6 +197,9 @@ type Options struct {
 	// restart doesn't forget when an absent cell was last sighted. Empty
 	// keeps last-seen in memory only.
 	LastSeenPath string
+	// LeasePath enables the advisory lease store (POST/DELETE
+	// /api/fleet/lease, GET /api/fleet/leases) backed by this JSON file.
+	LeasePath string
 }
 
 // New builds a Server over the given cell registry. historyPath is the JSON
@@ -196,10 +219,14 @@ func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Op
 		cellUp:       map[string]bool{},
 		lastState:    map[string]string{},
 		startedAt:    map[string]time.Time{},
+		inFlight:     map[string]int{},
+		inFlightSeen: map[string]bool{},
 		intents:      loadIntents(opts.IntentPath),
 		intentPath:   opts.IntentPath,
 		lastSeen:     loadLastSeen(opts.LastSeenPath),
 		lastSeenPath: opts.LastSeenPath,
+		leases:       loadLeases(opts.LeasePath),
+		leasePath:    opts.LeasePath,
 		done:         make(chan struct{}),
 	}
 }
@@ -213,6 +240,12 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/fleet/events", s.handleEvents)
 	if s.intentPath != "" {
 		mux.HandleFunc("POST /api/fleet/intent", s.handleIntent)
+		mux.HandleFunc("POST /api/fleet/wake", s.handleWake)
+	}
+	if s.leasePath != "" {
+		mux.HandleFunc("GET /api/fleet/leases", s.handleLeases)
+		mux.HandleFunc("POST /api/fleet/lease", s.handleLeaseMutate)
+		mux.HandleFunc("DELETE /api/fleet/lease", s.handleLeaseMutate)
 	}
 }
 
@@ -305,6 +338,20 @@ func (s *Server) StartStats(model string) (StartStats, bool) {
 	stats := s.hist.Stats()
 	st, ok := stats[model]
 	return st, ok
+}
+
+// InFlight returns the cell's last reported in-flight request count.
+// The bool is false until llama-swap's events stream has sent one
+// inflight frame — an unreported count must stay distinguishable from a
+// reported zero (the pre-drain report omits the field rather than
+// inventing it).
+func (s *Server) InFlight(cell string) (int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.inFlightSeen[cell] {
+		return 0, false
+	}
+	return s.inFlight[cell], true
 }
 
 // snapshotCell merges the cell's /running (live processes: state/ttl) into
