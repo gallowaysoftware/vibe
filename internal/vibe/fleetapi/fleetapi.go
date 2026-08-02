@@ -268,7 +268,13 @@ func (s *Server) Snapshot(ctx context.Context) StateSnapshot {
 		close(f.done)
 	}()
 
-	f.snap = s.probeSnapshot(ctx)
+	// Detach the probe round from the leader's cancellation: a client
+	// disconnecting mid-round must not poison every follower's snapshot
+	// with a degraded all-unreachable result. The round still completes
+	// (bounded by its own deadline) and followers share the result.
+	probe, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotTimeout)
+	defer cancel()
+	f.snap = s.probeSnapshot(probe)
 	return f.snap
 }
 

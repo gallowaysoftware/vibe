@@ -16,6 +16,7 @@ package fleetcfg
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -93,10 +94,12 @@ func LoadFrom(path string) (*File, error) {
 	var f File
 	// Strict decoding: a typo'd key (host_porbe, fleet_url) must fail
 	// loudly at load, not silently degrade a cell's display semantics —
-	// same discipline as profile.Load's KnownFields.
+	// same discipline as profile.Load's KnownFields. An empty or
+	// comment-only file decodes to io.EOF: that is "no fleet config",
+	// not a parse error.
 	dec := yaml.NewDecoder(strings.NewReader(string(data)))
 	dec.KnownFields(true)
-	if err := dec.Decode(&f); err != nil {
+	if err := dec.Decode(&f); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	if err := f.validate(); err != nil {

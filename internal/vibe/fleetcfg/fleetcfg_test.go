@@ -106,3 +106,21 @@ func TestLoad_NoCellsSectionIsValid(t *testing.T) {
 		t.Fatal("HasCells true for fleetd_url-only file")
 	}
 }
+
+func TestLoad_EmptyOrCommentOnlyIsNotAnError(t *testing.T) {
+	// An empty or comment-only hosts.yaml means "no fleet config", not
+	// a parse failure — the strict decoder's io.EOF must not leak out.
+	for name, doc := range map[string]string{
+		"empty":        "",
+		"comment only": "# nothing here yet\n",
+		"whitespace":   "\n\n",
+	} {
+		f, err := LoadFrom(writeHosts(t, doc))
+		if err != nil {
+			t.Fatalf("%s: got %v, want nil error", name, err)
+		}
+		if f.HasCells() {
+			t.Fatalf("%s: HasCells true", name)
+		}
+	}
+}
