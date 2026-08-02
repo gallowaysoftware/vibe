@@ -646,12 +646,19 @@ func fakeRouter(t *testing.T, ids ...string) int {
 // external backends exist for.
 func externalDaemon(t *testing.T, routerPort int) *daemon.Daemon {
 	t.Helper()
-	return daemon.New(daemon.Config{
+	return daemon.New(externalDaemonConfig(t, routerPort))
+}
+
+// externalDaemonConfig exposes the config so a test can add the fleet-front
+// fields (client_api_url) without duplicating the external deployment shape.
+func externalDaemonConfig(t *testing.T, routerPort int) daemon.Config {
+	t.Helper()
+	return daemon.Config{
 		ProxyPort:    routerPort,
 		DisableProxy: true,
 		HTTPAddr:     fmt.Sprintf("127.0.0.1:%d", pickFreePort(t)),
 		LlamaBinary:  fakeBinary,
-	})
+	}
 }
 
 // TestDaemon_ExternalBackend pins the external-backend start/stop contract:

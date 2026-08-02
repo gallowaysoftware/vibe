@@ -449,15 +449,31 @@ backend:
 		t.Errorf("cloud_peer profile: external=%v cloud_peer=%v", p.Backend.External, p.Backend.CloudPeer)
 	}
 
-	// Frontends are rejected: nothing expands ${MODEL_ALIAS} for a peer.
-	_, err = Load(writeProfile(t, `
+	// A frontend against a peer is the point of a peer: the router already
+	// serves the model, and the profile is what aims a harness at it.
+	fp, err := Load(writeProfile(t, `
 name: claude
 backend:
-  cloud_peer: {base_url: https://api.anthropic.com, models: [claude-sonnet-5]}
+  cloud_peer: {base_url: https://api.anthropic.com, models: [claude-sonnet-5], context: 1000000}
 frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 `))
-	if err == nil || !strings.Contains(err.Error(), "cloud_peer") {
-		t.Fatalf("frontend on cloud_peer: got %v, want rejection", err)
+	if err != nil {
+		t.Fatalf("frontend on cloud_peer: %v", err)
+	}
+	if got := fp.Backend.CloudPeer.Context; got != 1000000 {
+		t.Errorf("cloud_peer.context = %d, want 1000000", got)
+	}
+
+	// The frontend still has to be a valid frontend — accepting the pairing
+	// must not skip the per-kind shape rules.
+	_, err = Load(writeProfile(t, `
+name: claude-bad
+backend:
+  cloud_peer: {base_url: https://api.anthropic.com, models: [claude-sonnet-5]}
+frontend: {kind: external}
+`))
+	if err == nil || !strings.Contains(err.Error(), "write_file") {
+		t.Fatalf("external frontend without write_file: got %v, want a write_file error", err)
 	}
 }
 

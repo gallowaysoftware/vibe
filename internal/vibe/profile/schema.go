@@ -333,7 +333,7 @@ func Schema() *schemaProperty {
 
 	cloudPeer := &schemaProperty{
 		Type:                 "object",
-		Description:          "Remote OpenAI/Anthropic-compatible API served through the router (llama-swap) as a peer. Implies backend.external: there is never a process to launch; `vibe router render` turns the definition into a llama-swap peers: stanza with apiKey: ${env.<api_key_env>} (the key itself lives in the router unit's environment, never in YAML).",
+		Description:          "Remote OpenAI/Anthropic-compatible API served through the router (llama-swap) as a peer. Implies backend.external: there is never a process to launch; `vibe router render` turns the definition into a llama-swap peers: stanza with apiKey: ${env.<api_key_env>} (the key itself lives in the router unit's environment, never in YAML). A frontend may be attached: a single-model peer supplies ${MODEL_ALIAS}, and `context` supplies ${MODEL_CONTEXT}.",
 		AdditionalProperties: false,
 		Required:             []string{"base_url", "models"},
 		Properties: map[string]*schemaProperty{
@@ -355,6 +355,11 @@ func Schema() *schemaProperty {
 				Type:        "array",
 				Description: "API surfaces the peer speaks. Informational — routing is by model id.",
 				Items:       &schemaProperty{Type: "string", Enum: []any{"openai", "anthropic"}},
+			},
+			"context": {
+				Type:        "integer",
+				Minimum:     float64Ptr(1),
+				Description: "Context window advertised to a frontend as ${MODEL_CONTEXT}. Metadata only: the provider owns the real limit. Optional — when unset, ${MODEL_CONTEXT} is left out of the expansion map so a template referencing it fails by name rather than rendering 0.",
 			},
 		},
 	}

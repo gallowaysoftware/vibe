@@ -6,9 +6,9 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"net"
@@ -37,6 +37,7 @@ import (
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetmcp"
 	"github.com/gallowaysoftware/vibe/internal/vibe/frontend"
 	"github.com/gallowaysoftware/vibe/internal/vibe/hfdownload"
+	"github.com/gallowaysoftware/vibe/internal/vibe/modelcat"
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 	"github.com/gallowaysoftware/vibe/internal/vibe/proxy"
@@ -1083,9 +1084,13 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 		}
 	}
 	var fr *frontend.Result
-	// Frontend activation for llama_server and tabby_api — both may have
-	// a separate UI/client process to launch (e.g. Open WebUI via docker-compose).
-	if p.Backend.LlamaServer != nil || p.Backend.TabbyAPI != nil || p.Backend.MLXServer != nil {
+	// Frontend activation for every backend kind that serves an OpenAI
+	// surface a client can be pointed at — each may also have a separate
+	// UI/client process to launch (e.g. Open WebUI via docker-compose).
+	// cloud_peer included: the peer has no local process, but the rendered
+	// config is the entire deliverable there, and omitting it left a start
+	// reporting "ready" with nothing written.
+	if p.Backend.LlamaServer != nil || p.Backend.TabbyAPI != nil || p.Backend.MLXServer != nil || p.Backend.CloudPeer != nil {
 		if p.Frontend.Kind != "" {
 			// Pre-create the per-profile frontend state dir so docker-compose
 			// bind mounts (and any other path the profile points inside it)
@@ -1105,36 +1110,7 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 			if d.cfg.ClientAPIURL != "" {
 				vibeAPI = strings.TrimRight(d.cfg.ClientAPIURL, "/") + "/v1"
 			}
-			alias := ""
-			ctxLen := 0
-			if p.Backend.LlamaServer != nil {
-				alias = p.Backend.LlamaServer.Alias
-				ctxLen = p.Backend.LlamaServer.Context
-			} else if t := p.Backend.TabbyAPI; t != nil {
-				// ${MODEL_ALIAS}/${MODEL_CONTEXT} are always-known expansion
-				// vars, so leaving these unset would not error — the template
-				// would silently render ""/0 and a frontend like pi would fall
-				// back to its paid default model.
-				alias = t.Alias
-				ctxLen = t.Context
-			} else if m := p.Backend.MLXServer; m != nil {
-				// The friendly alias, not ModelDir: clients reach this
-				// backend through the proxy, which rewrites the alias to the
-				// path the server demands.
-				alias = m.Alias
-				ctxLen = m.Context
-			}
-			if external {
-				// The rendered router config keys models by BACKEND DEF
-				// NAME — the canonical model id (router-lifecycle.md §4) —
-				// because a llama_server alias can be shared across def
-				// variants (base + -tools) and the router can attach it to
-				// only one of them. Expanding ${MODEL_ALIAS} to the def name
-				// guarantees a freshly-rendered frontend config routes to
-				// exactly this definition; the old aliases stay in the
-				// router config purely for stale client state.
-				alias = canonicalRouterModelID(p)
-			}
+			alias, ctxLen := frontendModelVars(p, external)
 			ectx := profile.ExpandContext{
 				VibeAPI:      vibeAPI,
 				ModelAlias:   alias,
@@ -1452,6 +1428,15 @@ func (d *Daemon) Pull(ctx context.Context, req *connect.Request[vibev1.PullReque
 		return stream.Send(&vibev1.PullProgress{
 			Phase:   vibev1.PullProgress_PHASE_DONE,
 			Message: "no model file to pull (ComfyUI manages its own model assets)",
+		})
+	}
+	// A cloud peer's weights are the provider's. `vibe start` pulls before it
+	// starts, so without this a peer profile fails there rather than at any
+	// point that has to do with what the user asked for.
+	if p.Backend.CloudPeer != nil {
+		return stream.Send(&vibev1.PullProgress{
+			Phase:   vibev1.PullProgress_PHASE_DONE,
+			Message: "no model file to pull (cloud_peer models live at the provider)",
 		})
 	}
 	// http_server backends bring their own model artefacts (baked into the
@@ -1890,6 +1875,57 @@ func canonicalRouterModelID(p *profile.Profile) string {
 	return p.Name
 }
 
+// frontendModelVars resolves ${MODEL_ALIAS} and ${MODEL_CONTEXT} for a
+// profile's rendered frontend config. Extracted from Start and given a name
+// because it is the exact shape this repo keeps getting wrong — a dispatch
+// over backend kinds where forgetting one kind is silent. Its test walks all
+// six, so a seventh kind fails a test instead of rendering an empty model id
+// into somebody's harness config.
+//
+// Either result may legitimately be zero. That is not a fallback: an unset
+// var drops out of the expansion map (profile.optionalVars) and a template
+// referencing it fails naming the field that fixes it, which is the whole
+// reason "" and 0 must not be rendered.
+func frontendModelVars(p *profile.Profile, external bool) (alias string, ctxLen int) {
+	switch {
+	case p.Backend.LlamaServer != nil:
+		alias, ctxLen = p.Backend.LlamaServer.Alias, p.Backend.LlamaServer.Context
+	case p.Backend.TabbyAPI != nil:
+		alias, ctxLen = p.Backend.TabbyAPI.Alias, p.Backend.TabbyAPI.Context
+	case p.Backend.MLXServer != nil:
+		// The friendly alias, not ModelDir: clients reach this backend
+		// through the proxy, which rewrites the alias to the path the server
+		// demands.
+		alias, ctxLen = p.Backend.MLXServer.Alias, p.Backend.MLXServer.Context
+	case p.Backend.CloudPeer != nil:
+		// A peer's model ids ARE the router's ids — there is no separate
+		// def-name indirection to resolve, so this returns before the
+		// canonicalRouterModelID branch below rather than after it. Only a
+		// single-model peer has an unambiguous answer; with several,
+		// ${MODEL_ALIAS} stays unset and a template that wants one names the
+		// model literally.
+		if c := p.Backend.CloudPeer; len(c.Models) == 1 {
+			alias = c.Models[0]
+		}
+		return alias, p.Backend.CloudPeer.Context
+	}
+	// comfyui and http_server fall through with both unset: neither renders a
+	// frontend config (validateFrontend rejects a frontend block on both), so
+	// there is no template here to expand a model id into.
+	if external {
+		// The rendered router config keys models by BACKEND DEF NAME — the
+		// canonical model id (router-lifecycle.md §4) — because a
+		// llama_server alias can be shared across def variants (base +
+		// -tools) and the router can attach it to only one of them.
+		// Expanding ${MODEL_ALIAS} to the def name guarantees a
+		// freshly-rendered frontend config routes to exactly this
+		// definition; the old aliases stay in the router config purely for
+		// stale client state.
+		alias = canonicalRouterModelID(p)
+	}
+	return alias, ctxLen
+}
+
 // rollbackBackendStart undoes the backend half of a Start whose frontend
 // half failed. For a vibe-supervised backend that means stopping the child
 // and unwiring the proxy; for an external backend there is nothing to undo
@@ -1902,6 +1938,23 @@ func (d *Daemon) rollbackBackendStart(external bool) {
 	d.prx.SetBackend(nil)
 }
 
+// externalCatalogURL is the router whose /v1/models decides whether an
+// external backend is ready: the address CLIENTS will use.
+//
+// This is the one readiness check that is not about a process this box
+// launched — an external backend has none. What it asserts is "the model a
+// rendered frontend is about to request exists where that frontend will ask
+// for it", so it has to follow client_api_url when set. Probing loopback
+// instead makes a fleet model that only the front serves (a cloud peer, or
+// another cell's weights) fail a check it would have passed, while a local
+// cell that shadows the same id passes one it should not.
+func (d *Daemon) externalCatalogURL() string {
+	if d.cfg.ClientAPIURL != "" {
+		return strings.TrimRight(d.cfg.ClientAPIURL, "/")
+	}
+	return fmt.Sprintf("http://127.0.0.1:%d", d.cfg.ProxyPort)
+}
+
 // checkExternalBackendReady is the external-backend replacement for the
 // supervisor's health wait: a GET on the router's /v1/models catalog,
 // verifying the backend's model id (alias, or the backend/profile name) is
@@ -1910,7 +1963,7 @@ func (d *Daemon) rollbackBackendStart(external bool) {
 // would defeat lazy loading; the catalog read is cheap and load-free.
 func (d *Daemon) checkExternalBackendReady(ctx context.Context, p *profile.Profile) error {
 	alias := externalBackendAlias(p)
-	base := fmt.Sprintf("http://127.0.0.1:%d", d.cfg.ProxyPort)
+	base := d.externalCatalogURL()
 	// Short budget independent of the caller's 5-minute start window: a
 	// catalog read answers immediately when the router is up, so anything
 	// slower is "router not there" and should fail fast.
@@ -1922,27 +1975,32 @@ func (d *Daemon) checkExternalBackendReady(ctx context.Context, p *profile.Profi
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("external backend %q: router not reachable at %s (llama-swap not listening on :%d?): %w",
-			p.Name, base, d.cfg.ProxyPort, err)
+		return fmt.Errorf("external backend %q: router not reachable at %s (llama-swap not listening there?): %w", p.Name, base, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("external backend %q: GET %s/v1/models returned %s (is llama-swap the process on :%d?)",
-			p.Name, base, resp.Status, d.cfg.ProxyPort)
+		return fmt.Errorf("external backend %q: GET %s/v1/models returned %s (is a llama-swap router serving that address?)",
+			p.Name, base, resp.Status)
 	}
-	var catalog struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
+	// modelcat, not a local data[] decode: once the probe follows
+	// client_api_url it can land on a front that is not this box's
+	// llama-swap, and an Ollama-shaped body read as data[] yields an EMPTY
+	// catalog — which here reads as "the router serves nothing" and fails a
+	// start that should have passed. Parse also errors on an unreadable body
+	// rather than returning an empty catalog, so "could not read" and "not
+	// serving it" stay different answers.
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("external backend %q: read %s/v1/models: %w", p.Name, base, err)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
+	catalog, err := modelcat.Parse(body)
+	if err != nil {
 		return fmt.Errorf("external backend %q: parse %s/v1/models: %w", p.Name, base, err)
 	}
-	ids := make([]string, 0, len(catalog.Data))
-	have := make(map[string]bool, len(catalog.Data))
-	for _, m := range catalog.Data {
-		ids = append(ids, m.ID)
-		have[m.ID] = true
+	ids := catalog.IDs()
+	have := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		have[id] = true
 	}
 	serving := strings.Join(ids, ", ")
 	if serving == "" {

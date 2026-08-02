@@ -26,16 +26,27 @@ type ExpandContext struct {
 // into a harness config — a client silently pointed at "" is far harder to
 // diagnose than a start that refuses with a reason.
 var optionalVars = map[string]string{
-	"VIBE_SEARCH": "set search_url in the vibe daemon config (~/.config/vibe/config.yaml) to the retrieval plane's base URL",
+	"VIBE_SEARCH":   "set search_url in the vibe daemon config (~/.config/vibe/config.yaml) to the retrieval plane's base URL",
+	"MODEL_ALIAS":   "this backend serves no single model id (a cloud_peer with more than one entry in models:); name the model literally in the template",
+	"MODEL_CONTEXT": "this backend declares no context window; set backend.cloud_peer.context, or write the window literally in the template",
 }
 
 func (c ExpandContext) vars() map[string]any {
 	v := map[string]any{
 		"VIBE_API":       c.VibeAPI,
-		"MODEL_ALIAS":    c.ModelAlias,
-		"MODEL_CONTEXT":  c.ModelContext,
 		"WRITE_FILE":     c.WriteFile,
 		"VIBE_STATE_DIR": c.VibeStateDir,
+	}
+	// The model vars are optional for the same reason VIBE_SEARCH is. Every
+	// backend used to guarantee both, so rendering the zero value was
+	// harmless; a cloud_peer need not, and "" / 0 reaching a harness config
+	// means an unroutable model id or a context window of zero — failures
+	// that surface far from their cause.
+	if c.ModelAlias != "" {
+		v["MODEL_ALIAS"] = c.ModelAlias
+	}
+	if c.ModelContext != 0 {
+		v["MODEL_CONTEXT"] = c.ModelContext
 	}
 	if c.VibeSearch != "" {
 		v["VIBE_SEARCH"] = c.VibeSearch

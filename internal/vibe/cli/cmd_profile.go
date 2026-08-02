@@ -184,20 +184,7 @@ func renderProfileList(out io.Writer) error {
 			})
 			continue
 		}
-		backend := "?"
-		switch {
-		case p.Backend.LlamaServer != nil:
-			backend = "llama_server"
-		case p.Backend.TabbyAPI != nil:
-			backend = "tabby_api"
-		case p.Backend.HTTPServer != nil:
-			backend = "http_server"
-		case p.Backend.ComfyUI != nil:
-			backend = "comfyui"
-		case p.Backend.MLXServer != nil:
-			backend = "mlx_server"
-		}
-		rows = append(rows, row{p.Name, p.ResolvedMode(), backend, p.Description})
+		rows = append(rows, row{p.Name, p.ResolvedMode(), backendKind(p.Backend), p.Description})
 	}
 
 	if len(rows) == 0 {
