@@ -1,7 +1,50 @@
 # C0 — Quick wins: hot reload, autostart, discoverability
 
-Status: PLANNED (2026-08-02). Scope: ~zero code — compose/config/docs
-changes that retire the worst daily frictions before any Go is written.
+Status: EXECUTED (2026-08-02), gates 1+3 passed, gate 2 waived to a user
+maintenance window with enablement evidence.
+
+Gate results (live, against hum-front on the digest-pinned v239 image):
+
+- **Mid-stream reload gate: PASS with a characterized limit.**
+  `-watch-config` on v239 is poll-based (2s interval, config-file path
+  only). Atomic tmp+rename in the watched dir triggers exactly one
+  reload; writing the tmp file itself triggers none. On reload the new
+  config is live for new requests immediately (catalog updated in <2
+  poll intervals, container restarts=0), while the old server drains
+  in-flight streams under a **hardcoded 30s shutdown timeout**
+  (`llama-swap.go`, `const shutdownTimeout`). A stream ending inside
+  the grace completed uncorrupted (123 chunks + terminal timings +
+  `[DONE]`, reload fired +3s in); a stream still running at +30s was
+  force-closed — clean EOF, no corrupt bytes, no panic (the client
+  sees a truncated stream, never garbage). Membership edits are rare,
+  so this is strictly better than the status-quo `docker restart`
+  (instant kill of ALL streams + multi-second catalog outage) and the
+  change was adopted. Long-stream kill-at-30s is recorded here as the
+  known residual; a drain-timeout knob is upstream-contribution
+  territory, not fleet config.
+- **Reloads compose**: a second rename landing during the first
+  reload's drain window was applied cleanly right after.
+- **Env macros survive reloads** (`${env.MOONSHOT_API_KEY}` peer kept
+  resolving across every reload).
+- **Auth-exemption verification** (runbook line): on v239 with
+  `apiKeys` set, `/health` answers 200 WITHOUT a key (exempt by
+  design); `/ui/` and `/v1/models` return 401 without one. The earlier
+  "UI and /health are auth-exempt" note was half right — only
+  `/health` is. LAN-only posture stands regardless.
+- **Reboot gate: WAIVED** (user decision 2026-08-02; rebooting the
+  front host takes down the house, and both other cells were in active
+  use). Enablement verified instead: localmodel `llama-swap.service`
+  enabled + new `vibe-daemon.service` user unit installed and active
+  (the daemon had been running unmanaged); unraid hum-front
+  `restart: unless-stopped` + compose.manager `autostart=true`;
+  novodoo `ca.thegalloways.vibe-daemon` LaunchAgent installed and
+  bootstrapped (RunAtLoad + KeepAlive; bare `vibe daemon` — sleep is
+  pmset's job on AC, profile activation stays manual per the roaming
+  class). Post-change, the laptop served a completion through the
+  front. The live reboot check runs at the next natural reboot of each
+  box.
+- **Runbook lines: landed** in `deploy/front/README.md`
+  ("Operating levers": unload / warm / per-cell UI / reload).
 
 ## Goal
 
