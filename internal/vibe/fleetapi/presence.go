@@ -62,12 +62,18 @@ func (s *Server) persistLastSeen() {
 	_ = saveLastSeen(s.lastSeenPath, snap)
 }
 
-// decorate fills a fresh snapshot's declared-intent, last-seen, and
-// derived display state from the server's stores.
+// decorate fills a fresh snapshot's declared-intent, last-seen, active
+// leases, and derived display state from the server's stores.
 func (s *Server) decorate(snap *CellSnapshot) {
 	s.mu.Lock()
 	intent, hasIntent := s.intents[snap.Name]
 	ls, hasLS := s.lastSeen[snap.Name]
+	var leases []Lease
+	for _, l := range s.activeLeasesLocked() {
+		if l.Cell == snap.Name {
+			leases = append(leases, l)
+		}
+	}
 	s.mu.Unlock()
 	if hasIntent {
 		in := intent
@@ -77,6 +83,7 @@ func (s *Server) decorate(snap *CellSnapshot) {
 		t := ls
 		snap.LastSeen = &t
 	}
+	snap.Leases = leases
 	snap.Display = displayState(snap.HostReachable, snap.Reachable, snap.Intent)
 }
 

@@ -48,6 +48,12 @@ const (
 	ControlServiceLogsProcedure = "/vibe.v1.ControlService/Logs"
 	// ControlServicePullProcedure is the fully-qualified name of the ControlService's Pull RPC.
 	ControlServicePullProcedure = "/vibe.v1.ControlService/Pull"
+	// ControlServiceCellDrainProcedure is the fully-qualified name of the ControlService's CellDrain
+	// RPC.
+	ControlServiceCellDrainProcedure = "/vibe.v1.ControlService/CellDrain"
+	// ControlServiceCellResumeProcedure is the fully-qualified name of the ControlService's CellResume
+	// RPC.
+	ControlServiceCellResumeProcedure = "/vibe.v1.ControlService/CellResume"
 )
 
 // ControlServiceClient is a client for the vibe.v1.ControlService service.
@@ -70,6 +76,17 @@ type ControlServiceClient interface {
 	// already cached at the expected size, or a stream of PHASE_DOWNLOADING
 	// updates while bytes flow in.
 	Pull(context.Context, *connect.Request[v1.PullRequest]) (*connect.ServerStreamForClient[v1.PullProgress], error)
+	// CellDrain runs this daemon's configured drain command (cell_cmds.drain)
+	// — the fleet-control "reclaim this box" verb (fleet-control C2). It
+	// reports what was resident/in-flight BEFORE draining so the caller can
+	// show the pre-drain report. FailedPrecondition when the daemon has no
+	// cell verbs configured; Unavailable (with stderr) when the command
+	// fails. Acts on the daemon's OWN local cell — remote reach comes from
+	// calling a remote daemon, not from routing here.
+	CellDrain(context.Context, *connect.Request[v1.CellDrainRequest]) (*connect.Response[v1.CellDrainResponse], error)
+	// CellResume runs cell_cmds.resume, restoring JIT service after a drain.
+	// Same error contract as CellDrain.
+	CellResume(context.Context, *connect.Request[v1.CellResumeRequest]) (*connect.Response[v1.CellResumeResponse], error)
 }
 
 // NewControlServiceClient constructs a client for the vibe.v1.ControlService service. By default,
@@ -125,6 +142,18 @@ func NewControlServiceClient(httpClient connect.HTTPClient, baseURL string, opts
 			connect.WithSchema(controlServiceMethods.ByName("Pull")),
 			connect.WithClientOptions(opts...),
 		),
+		cellDrain: connect.NewClient[v1.CellDrainRequest, v1.CellDrainResponse](
+			httpClient,
+			baseURL+ControlServiceCellDrainProcedure,
+			connect.WithSchema(controlServiceMethods.ByName("CellDrain")),
+			connect.WithClientOptions(opts...),
+		),
+		cellResume: connect.NewClient[v1.CellResumeRequest, v1.CellResumeResponse](
+			httpClient,
+			baseURL+ControlServiceCellResumeProcedure,
+			connect.WithSchema(controlServiceMethods.ByName("CellResume")),
+			connect.WithClientOptions(opts...),
+		),
 	}
 }
 
@@ -137,6 +166,8 @@ type controlServiceClient struct {
 	shutdown     *connect.Client[v1.ShutdownRequest, v1.ShutdownResponse]
 	logs         *connect.Client[v1.LogsRequest, v1.LogsResponse]
 	pull         *connect.Client[v1.PullRequest, v1.PullProgress]
+	cellDrain    *connect.Client[v1.CellDrainRequest, v1.CellDrainResponse]
+	cellResume   *connect.Client[v1.CellResumeRequest, v1.CellResumeResponse]
 }
 
 // Status calls vibe.v1.ControlService.Status.
@@ -174,6 +205,16 @@ func (c *controlServiceClient) Pull(ctx context.Context, req *connect.Request[v1
 	return c.pull.CallServerStream(ctx, req)
 }
 
+// CellDrain calls vibe.v1.ControlService.CellDrain.
+func (c *controlServiceClient) CellDrain(ctx context.Context, req *connect.Request[v1.CellDrainRequest]) (*connect.Response[v1.CellDrainResponse], error) {
+	return c.cellDrain.CallUnary(ctx, req)
+}
+
+// CellResume calls vibe.v1.ControlService.CellResume.
+func (c *controlServiceClient) CellResume(ctx context.Context, req *connect.Request[v1.CellResumeRequest]) (*connect.Response[v1.CellResumeResponse], error) {
+	return c.cellResume.CallUnary(ctx, req)
+}
+
 // ControlServiceHandler is an implementation of the vibe.v1.ControlService service.
 type ControlServiceHandler interface {
 	// Status returns the daemon's current state.
@@ -194,6 +235,17 @@ type ControlServiceHandler interface {
 	// already cached at the expected size, or a stream of PHASE_DOWNLOADING
 	// updates while bytes flow in.
 	Pull(context.Context, *connect.Request[v1.PullRequest], *connect.ServerStream[v1.PullProgress]) error
+	// CellDrain runs this daemon's configured drain command (cell_cmds.drain)
+	// — the fleet-control "reclaim this box" verb (fleet-control C2). It
+	// reports what was resident/in-flight BEFORE draining so the caller can
+	// show the pre-drain report. FailedPrecondition when the daemon has no
+	// cell verbs configured; Unavailable (with stderr) when the command
+	// fails. Acts on the daemon's OWN local cell — remote reach comes from
+	// calling a remote daemon, not from routing here.
+	CellDrain(context.Context, *connect.Request[v1.CellDrainRequest]) (*connect.Response[v1.CellDrainResponse], error)
+	// CellResume runs cell_cmds.resume, restoring JIT service after a drain.
+	// Same error contract as CellDrain.
+	CellResume(context.Context, *connect.Request[v1.CellResumeRequest]) (*connect.Response[v1.CellResumeResponse], error)
 }
 
 // NewControlServiceHandler builds an HTTP handler from the service implementation. It returns the
@@ -245,6 +297,18 @@ func NewControlServiceHandler(svc ControlServiceHandler, opts ...connect.Handler
 		connect.WithSchema(controlServiceMethods.ByName("Pull")),
 		connect.WithHandlerOptions(opts...),
 	)
+	controlServiceCellDrainHandler := connect.NewUnaryHandler(
+		ControlServiceCellDrainProcedure,
+		svc.CellDrain,
+		connect.WithSchema(controlServiceMethods.ByName("CellDrain")),
+		connect.WithHandlerOptions(opts...),
+	)
+	controlServiceCellResumeHandler := connect.NewUnaryHandler(
+		ControlServiceCellResumeProcedure,
+		svc.CellResume,
+		connect.WithSchema(controlServiceMethods.ByName("CellResume")),
+		connect.WithHandlerOptions(opts...),
+	)
 	return "/vibe.v1.ControlService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case ControlServiceStatusProcedure:
@@ -261,6 +325,10 @@ func NewControlServiceHandler(svc ControlServiceHandler, opts ...connect.Handler
 			controlServiceLogsHandler.ServeHTTP(w, r)
 		case ControlServicePullProcedure:
 			controlServicePullHandler.ServeHTTP(w, r)
+		case ControlServiceCellDrainProcedure:
+			controlServiceCellDrainHandler.ServeHTTP(w, r)
+		case ControlServiceCellResumeProcedure:
+			controlServiceCellResumeHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -296,4 +364,12 @@ func (UnimplementedControlServiceHandler) Logs(context.Context, *connect.Request
 
 func (UnimplementedControlServiceHandler) Pull(context.Context, *connect.Request[v1.PullRequest], *connect.ServerStream[v1.PullProgress]) error {
 	return connect.NewError(connect.CodeUnimplemented, errors.New("vibe.v1.ControlService.Pull is not implemented"))
+}
+
+func (UnimplementedControlServiceHandler) CellDrain(context.Context, *connect.Request[v1.CellDrainRequest]) (*connect.Response[v1.CellDrainResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("vibe.v1.ControlService.CellDrain is not implemented"))
+}
+
+func (UnimplementedControlServiceHandler) CellResume(context.Context, *connect.Request[v1.CellResumeRequest]) (*connect.Response[v1.CellResumeResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("vibe.v1.ControlService.CellResume is not implemented"))
 }

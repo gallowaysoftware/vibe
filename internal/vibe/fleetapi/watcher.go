@@ -118,7 +118,31 @@ func (s *Server) handleUpstream(cell, payload string) {
 	if ev.Type == "modelStatus" {
 		s.trackModelStatus(cell, ev.Data)
 	}
+	if ev.Type == "inflight" {
+		s.trackInFlight(cell, ev.Data)
+	}
 	s.publish(ev)
+}
+
+// trackInFlight folds llama-swap's inflight frames into the per-cell
+// count. The frame's data is a JSON string carrying {"requests":[…]}
+// (verified on v239; operation add/remove frames carry the full list
+// too), so the count is len(requests) — never an increment guess.
+func (s *Server) trackInFlight(cell string, data json.RawMessage) {
+	var inner string
+	if err := json.Unmarshal(data, &inner); err != nil {
+		return
+	}
+	var wrap struct {
+		Requests []json.RawMessage `json:"requests"`
+	}
+	if err := json.Unmarshal([]byte(inner), &wrap); err != nil {
+		return
+	}
+	s.mu.Lock()
+	s.inFlight[cell] = len(wrap.Requests)
+	s.inFlightSeen[cell] = true
+	s.mu.Unlock()
 }
 
 // trackModelStatus measures starting→ready wall time per model. modelStatus

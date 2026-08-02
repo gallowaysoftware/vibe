@@ -222,6 +222,11 @@ type LlamaServerBackend struct {
 	// affecting the others. Tilde-expanded at load; validated to exist
 	// and be executable.
 	Binary string `yaml:"binary,omitempty"`
+
+	// cellScoped gates os.Stat validation OFF (def carries cell:, so its
+	// paths exist on the cell, not necessarily here). Set by
+	// Backend.markCellScoped at def load; never serialized.
+	cellScoped bool
 }
 
 // HTTPServerBackend supervises any HTTP-serving inference engine — typically
@@ -460,6 +465,11 @@ type ComfyUIBackend struct {
 	Listen    string   `yaml:"listen,omitempty"` // default "127.0.0.1"
 	Port      int      `yaml:"port,omitempty"`   // default 8188; 0 picks random
 	ExtraArgs []string `yaml:"extra_args,omitempty"`
+
+	// cellScoped gates os.Stat validation OFF (def carries cell:, so its
+	// paths exist on the cell, not necessarily here). Set by
+	// Backend.markCellScoped at def load; never serialized.
+	cellScoped bool
 }
 
 // Huggingface points at a model file on huggingface.co. When set, vibe
@@ -926,6 +936,9 @@ func validateLlamaServer(m *LlamaServerBackend) error {
 			return errors.New("backend.llama_server.huggingface.file is required when huggingface is set")
 		}
 		// path doesn't need to exist; `vibe pull` will create it.
+	} else if m.cellScoped {
+		// cell: set ⇒ the path exists on the cell, not necessarily here;
+		// fleet.md §4.2's host: rule applied to cell:.
 	} else if _, err := os.Stat(m.Path); err != nil {
 		return fmt.Errorf("backend.llama_server.path %s: %w", m.Path, err)
 	}
@@ -935,7 +948,7 @@ func validateLlamaServer(m *LlamaServerBackend) error {
 	if m.Context <= 0 {
 		return errors.New("backend.llama_server.context must be > 0")
 	}
-	if m.Binary != "" {
+	if m.Binary != "" && !m.cellScoped {
 		if err := validateExecutable("backend.llama_server.binary", m.Binary); err != nil {
 			return err
 		}
@@ -947,7 +960,7 @@ func validateLlamaServer(m *LlamaServerBackend) error {
 		if !m.Jinja {
 			return errors.New("backend.llama_server.chat_template_file requires jinja: true (llama-server rejects a template file unless --jinja precedes it)")
 		}
-		if _, err := os.Stat(m.ChatTemplateFile); err != nil {
+		if _, err := os.Stat(m.ChatTemplateFile); err != nil && !m.cellScoped {
 			return fmt.Errorf("backend.llama_server.chat_template_file %s: %w", m.ChatTemplateFile, err)
 		}
 	}
@@ -959,7 +972,7 @@ func validateLlamaServer(m *LlamaServerBackend) error {
 		// Mirrors the Path/Huggingface relationship above.
 		hasHFPull := m.Huggingface != nil && m.Huggingface.MMProjFile != ""
 		if !hasHFPull {
-			if _, err := os.Stat(m.MMProj); err != nil {
+			if _, err := os.Stat(m.MMProj); err != nil && !m.cellScoped {
 				return fmt.Errorf("backend.llama_server.mmproj %s: %w", m.MMProj, err)
 			}
 		}
@@ -973,7 +986,7 @@ func validateLlamaServer(m *LlamaServerBackend) error {
 	if m.DraftModel != "" {
 		hasHFPull := m.Huggingface != nil && m.Huggingface.DraftFile != ""
 		if !hasHFPull {
-			if _, err := os.Stat(m.DraftModel); err != nil {
+			if _, err := os.Stat(m.DraftModel); err != nil && !m.cellScoped {
 				return fmt.Errorf("backend.llama_server.draft_model %s: %w", m.DraftModel, err)
 			}
 		}
@@ -1041,14 +1054,14 @@ func validateComfyUI(c *ComfyUIBackend) error {
 		return errors.New("backend.comfyui.dir is required")
 	}
 	info, err := os.Stat(c.Dir)
-	if err != nil {
+	if err != nil && !c.cellScoped {
 		return fmt.Errorf("backend.comfyui.dir %s: %w", c.Dir, err)
 	}
-	if !info.IsDir() {
+	if err == nil && !info.IsDir() {
 		return fmt.Errorf("backend.comfyui.dir %s: not a directory", c.Dir)
 	}
 	mainPy := filepath.Join(c.Dir, "main.py")
-	if _, err := os.Stat(mainPy); err != nil {
+	if _, err := os.Stat(mainPy); err != nil && !c.cellScoped {
 		return fmt.Errorf("backend.comfyui.dir %s missing main.py: %w", c.Dir, err)
 	}
 	if c.Port < 0 {

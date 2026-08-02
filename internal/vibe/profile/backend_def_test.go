@@ -460,3 +460,61 @@ frontend: {kind: external, write_file: /tmp/x, template: {a: 1}}
 		t.Fatalf("frontend on cloud_peer: got %v, want rejection", err)
 	}
 }
+
+// cell: names the fleet cell a def renders onto (fleet-control C2 §6). The
+// loader accepts any name — even one hosts.yaml doesn't know — because defs
+// also load standalone for daemon activation; only the router render
+// validates the name against fleet membership.
+// cell: set ⇒ os.Stat validation is gated OFF (fleet.md §4.2's host:
+// rule): a fleet-scoped def's paths exist on its cell, not necessarily
+// on the box loading it. Without cell:, a missing path still fails.
+func TestLoadBackend_CellScopedSkipsPathStat(t *testing.T) {
+	t.Run("missing path passes with cell", func(t *testing.T) {
+		writeBackend(t, "qwen", `
+name: qwen
+cell: gpu-cellar
+backend:
+  llama_server: {path: /nonexistent/on/this/box/m.gguf, alias: q, context: 1024}
+`)
+		if _, err := LoadBackend("qwen"); err != nil {
+			t.Fatalf("cell-scoped def with absent path must load (validated on its cell): %v", err)
+		}
+	})
+	t.Run("missing path fails without cell", func(t *testing.T) {
+		writeBackend(t, "qwen2", `
+name: qwen2
+backend:
+  llama_server: {path: /nonexistent/on/this/box/m.gguf, alias: q, context: 1024}
+`)
+		if _, err := LoadBackend("qwen2"); err == nil {
+			t.Fatal("unscoped def with absent path must fail validation")
+		}
+	})
+	t.Run("non-path rules still apply with cell", func(t *testing.T) {
+		writeBackend(t, "qwen3", `
+name: qwen3
+cell: gpu-cellar
+backend:
+  llama_server: {path: /nonexistent/m.gguf, alias: "", context: 1024}
+`)
+		if _, err := LoadBackend("qwen3"); err == nil {
+			t.Fatal("cell-scoped def still validates non-path rules (alias required)")
+		}
+	})
+}
+
+func TestLoadBackend_CellAcceptedWithoutValidation(t *testing.T) {
+	writeBackend(t, "qwen", `
+name: qwen
+cell: gpu-cellar
+backend:
+  llama_server: {path: ~/m.gguf, huggingface: {repo: a/b, file: m.gguf}, alias: q, context: 1024}
+`)
+	def, err := LoadBackend("qwen")
+	if err != nil {
+		t.Fatalf("LoadBackend: %v", err)
+	}
+	if def.Cell != "gpu-cellar" {
+		t.Errorf("cell = %q, want gpu-cellar", def.Cell)
+	}
+}

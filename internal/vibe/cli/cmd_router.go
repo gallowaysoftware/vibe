@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/daemon"
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"github.com/gallowaysoftware/vibe/internal/vibe/router"
 )
@@ -36,6 +37,8 @@ func routerRenderCmd() *cobra.Command {
 		toStdout bool
 		llamaBin string
 		extras   string
+		cell     string
+		outPath  string
 	)
 	cmd := &cobra.Command{
 		Use:   "render",
@@ -45,21 +48,67 @@ func routerRenderCmd() *cobra.Command {
 			"(llama_server defs become models: entries, cloud_peer defs become peers: " +
 			"stanzas) and writes it atomically to " + llamaSwapConfigPath() + ", " +
 			"printing a unified diff of what changed. llama-swap is never restarted " +
-			"automatically; apply a changed config with `systemctl --user restart llama-swap`.",
+			"automatically; apply a changed config with `systemctl --user restart llama-swap`. " +
+			"With --cell the render targets a fleet cell instead (fleet-control C2 §6): " +
+			"--cell front renders the peers-only front config from hosts.yaml, any other " +
+			"cell renders that cell's defs plus unassigned defs. A render for a cell that " +
+			"isn't this box's requires --out or --stdout so it can never overwrite the " +
+			"local llama-swap config.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			target, hosts, configPath, err := planRender(cell, outPath, toStdout)
+			if err != nil {
+				return err
+			}
 			opts := router.Options{
 				LlamaServerBinary: resolveLlamaServerBinary(llamaBin),
 				ExtrasPath:        extras,
+				Cell:              target,
+				Hosts:             hosts,
+				Warnf: func(format string, args ...any) {
+					fmt.Fprintf(cmd.ErrOrStderr(), "warning: "+format+"\n", args...)
+				},
 			}
-			return runRouterRender(cmd.OutOrStdout(), paths.BackendsDir(), llamaSwapConfigPath(), opts, check, toStdout)
+			return runRouterRender(cmd.OutOrStdout(), paths.BackendsDir(), configPath, opts, check, toStdout)
 		},
 	}
 	cmd.Flags().BoolVar(&check, "check", false, "print the diff and exit 1 on drift without writing")
 	cmd.Flags().BoolVar(&toStdout, "stdout", false, "print the rendered config to stdout instead of writing the file")
 	cmd.Flags().StringVar(&llamaBin, "llama-server", "", "llama-server binary path written into rendered cmds (default: daemon config llama_binary, then ~/.local/bin/llama-server)")
-	cmd.Flags().StringVar(&extras, "extras", routerExtrasPath(), "YAML file merged verbatim into the render for entries defs can't express (smoke models, peer cells, groups); additive only, missing file is fine")
+	cmd.Flags().StringVar(&extras, "extras", routerExtrasPath(), "YAML file merged verbatim into the render for entries defs can't express (smoke models, peer cells, groups); additive only, missing file is fine; on a front render what the adopter does with the merged sections is the adopter's business")
+	cmd.Flags().StringVar(&cell, "cell", "", "fleet cell to render for (default: the daemon config's fleet.cell); \"front\" renders the peers-only front config")
+	cmd.Flags().StringVar(&outPath, "out", "", "destination path (default: the local llama-swap config); required with --cell for a non-local cell unless --stdout")
 	return cmd
+}
+
+// planRender resolves the render's target cell, fleet membership, and
+// destination. The target cell defaults to the daemon config's fleet.cell
+// so a fleet box renders its own cell's config with no flag. Output safety:
+// an explicit --cell naming a NON-LOCAL cell must carry --out or --stdout —
+// the local llamaSwapConfigPath() must never receive another cell's render,
+// or this box's router would start serving a foreign cell's peer map.
+func planRender(cellFlag, outPath string, toStdout bool) (target string, hosts *fleetcfg.File, configPath string, err error) {
+	dCfg, err := daemon.LoadConfig()
+	if err != nil {
+		return "", nil, "", err
+	}
+	localCell := dCfg.Fleet.Cell
+	if cellFlag != "" && cellFlag != localCell && !toStdout && outPath == "" {
+		return "", nil, "", fmt.Errorf("--cell %q is not this box's cell (fleet.cell %q); refusing to write the local llama-swap config — pass --out <path> or --stdout", cellFlag, localCell)
+	}
+	hosts, err = fleetcfg.Load()
+	if err != nil {
+		return "", nil, "", err
+	}
+	target = cellFlag
+	if target == "" {
+		target = localCell
+	}
+	configPath = outPath
+	if configPath == "" {
+		configPath = llamaSwapConfigPath()
+	}
+	return target, hosts, configPath, nil
 }
 
 func runRouterRender(out io.Writer, backendsDir, configPath string, opts router.Options, check, toStdout bool) error {

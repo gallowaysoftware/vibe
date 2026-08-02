@@ -104,6 +104,48 @@ type Config struct {
 	// present on an ordinary box does NOT turn it into fleetd. Startup
 	// fails loudly when the role is set but hosts.yaml has no cells.
 	FleetRegistry bool `yaml:"fleet_registry,omitempty"`
+	// CellCmds are this box's drain/resume verbs (fleet-control C2): the
+	// per-box process regime (systemd unit, launchd, compose) stays, the
+	// VERB unifies. Empty means the daemon has no cell verbs —
+	// CellDrain/CellResume answer FailedPrecondition.
+	CellCmds CellCmds `yaml:"cell_cmds,omitempty"`
+	// Fleet configures this daemon as a fleet CELL (C2): its cell name and
+	// the fleetd registry it posts intent to after locally-invoked
+	// drains/resumes (and announces to from C3).
+	Fleet FleetConfig `yaml:"fleet,omitempty"`
+}
+
+// CellCmds maps the unified verbs to this box's process regime. Commands
+// run via sh -c with a 60s timeout; a failing drain must surface stderr
+// (a stopped-but-reporting unit is the classic silent failure).
+type CellCmds struct {
+	// Drain reclaims the box (e.g. "systemctl --user stop llama-swap") —
+	// unit stop lets llama-swap run its documented in-flight drain; never
+	// a kill, never unload-all (an unloaded model JIT-reloads on the next
+	// stray request, exactly wrong mid-game).
+	Drain string `yaml:"drain,omitempty"`
+	// Resume restores JIT service (e.g. "systemctl --user start
+	// llama-swap"). Models return by JIT on next request; resume does not
+	// preload.
+	Resume string `yaml:"resume,omitempty"`
+}
+
+// FleetConfig is the daemon's cell identity and registry pointer. C3's
+// announce loop reuses this block unchanged.
+type FleetConfig struct {
+	// Cell is this box's cell name in hosts.yaml.
+	Cell string `yaml:"cell,omitempty"`
+	// RegistryURL is fleetd's base URL (where intent posts and, from C3,
+	// announces go).
+	RegistryURL string `yaml:"registry_url,omitempty"`
+	// TokenFile is the path to fleetd's bearer token. The path is config;
+	// the token value never enters a repo. Tilde-expanded at load.
+	TokenFile string `yaml:"token_file,omitempty"`
+	// FrontConfig is the front's rendered llama-swap config path as seen
+	// from THIS daemon — set on fleetd (same-host mount) so the MCP
+	// render_front tool can diff a fresh render against it. Empty means
+	// render-only, no diff.
+	FrontConfig string `yaml:"front_config,omitempty"`
 }
 
 // LoadConfig reads the global vibe config; missing file is not an error.
@@ -126,7 +168,22 @@ func LoadConfig() (Config, error) {
 	if c.ProxyPort == 0 {
 		c.ProxyPort = defaultProxyPort
 	}
+	c.Fleet.TokenFile = expandTilde(c.Fleet.TokenFile)
+	c.Fleet.FrontConfig = expandTilde(c.Fleet.FrontConfig)
 	return c.resolveHTTPAddr(), nil
+}
+
+// expandTilde expands a leading "~/" against the user's home directory
+// (same anchored-prefix shape as the profile package's helper).
+func expandTilde(p string) string {
+	if !strings.HasPrefix(p, "~/") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return p
+	}
+	return home + string(os.PathSeparator) + p[2:]
 }
 
 // resolveHTTPAddr fills in HTTPAddr from BindAll when the user didn't set
@@ -184,6 +241,14 @@ type Daemon struct {
 	// not buried in logs.
 	authRejected atomic.Int64
 
+	// fleet is the fleetapi server, assigned in Run once constructed.
+	// CellDrain reads the local cell's inflight count from it.
+	fleet *fleetapi.Server
+	// cellCmdRunner executes cell verbs; tests swap it to script
+	// drain/resume outcomes without touching real units (same injection
+	// pattern as nvidiaSMI). Defaults to runCellCmd in New.
+	cellCmdRunner func(ctx context.Context, cmd string) (string, error)
+
 	mu        sync.Mutex
 	active    *profile.Profile
 	startTime time.Time
@@ -209,14 +274,15 @@ func New(cfg Config) *Daemon {
 		proxyHost = "0.0.0.0"
 	}
 	return &Daemon{
-		cfg:          cfg,
-		sup:          supervisor.New(),
-		prx:          proxy.New(fmt.Sprintf("%s:%d", proxyHost, cfg.ProxyPort)),
-		nvidiaSMI:    vram.DefaultProbe,
-		vramCapacity: vram.DefaultCapacityProbe,
-		vramSlopGiB:  vram.DefaultSlopGiB,
-		services:     map[string]*serviceInstance{},
-		shutdown:     make(chan struct{}),
+		cfg:           cfg,
+		sup:           supervisor.New(),
+		prx:           proxy.New(fmt.Sprintf("%s:%d", proxyHost, cfg.ProxyPort)),
+		nvidiaSMI:     vram.DefaultProbe,
+		vramCapacity:  vram.DefaultCapacityProbe,
+		vramSlopGiB:   vram.DefaultSlopGiB,
+		services:      map[string]*serviceInstance{},
+		shutdown:      make(chan struct{}),
+		cellCmdRunner: runCellCmd,
 	}
 }
 
@@ -224,6 +290,12 @@ func New(cfg Config) *Daemon {
 // out to nvidia-smi.
 func (d *Daemon) SetVRAMProbe(p vram.Probe) {
 	d.nvidiaSMI = p
+}
+
+// SetCellCmdRunner overrides the drain/resume command runner. Used by
+// tests to script verb outcomes without touching real units.
+func (d *Daemon) SetCellCmdRunner(f func(ctx context.Context, cmd string) (string, error)) {
+	d.cellCmdRunner = f
 }
 
 // SetCapacityProbe overrides the total-capacity probe. Tests must pin this
@@ -342,14 +414,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 		fleetCells = fleetCells[:0]
 		for _, name := range slices.Sorted(maps.Keys(hosts.Cells)) {
 			c := hosts.Cells[name]
-			fleetCells = append(fleetCells, fleetapi.Cell{
+			fc := fleetapi.Cell{
 				Name:      name,
 				URL:       c.URL,
 				Class:     string(c.Class),
 				HostProbe: c.HostProbe,
-			})
+			}
+			if c.Wake != nil {
+				fc.Wake = &fleetapi.WakeSpec{MAC: c.Wake.MAC, Broadcast: c.Wake.Broadcast, Cmd: c.Wake.Cmd}
+			}
+			fleetCells = append(fleetCells, fc)
 		}
-		fleetOpts = fleetapi.Options{IntentPath: paths.IntentFile(), LastSeenPath: paths.LastSeenFile()}
+		fleetOpts = fleetapi.Options{IntentPath: paths.IntentFile(), LastSeenPath: paths.LastSeenFile(), LeasePath: paths.LeasesFile()}
 		d.hosts = hosts
 	}
 	fleet := fleetapi.New(
@@ -358,19 +434,26 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.fleetDaemonInfo,
 		fleetOpts,
 	)
+	d.fleet = fleet
 	fleet.Register(mux)
 	fleet.Start()
 	defer fleet.Close()
 	if d.cfg.FleetRegistry {
-		fleetmcp.New(fleet, d.hosts).Register(mux)
+		fleetmcp.New(fleet, d.hosts, fleetmcp.Options{
+			FrontConfig: d.cfg.Fleet.FrontConfig,
+			BackendsDir: paths.BackendsDir(),
+			LlamaBinary: d.cfg.LlamaBinary,
+		}).Register(mux)
 	}
 
 	unixSrv := &http.Server{Handler: mux}
 	// The TCP server gets a bearer-auth wrapper around the same mux. Two
 	// separate http.Server instances (one per listener) is the cleanest
 	// way to express "only TCP requires auth" without leaking the
-	// distinction into per-RPC interceptors.
-	httpSrv := &http.Server{Handler: bearerAuthMiddleware(token, &d.authRejected, mux)}
+	// distinction into per-RPC interceptors. markRemote distinguishes
+	// fleetd-invoked cell verbs (fleetd writes intent) from local
+	// unix-socket ones (this daemon writes it).
+	httpSrv := &http.Server{Handler: bearerAuthMiddleware(token, &d.authRejected, markRemote(mux))}
 	errCh := make(chan error, 2)
 	serve := func(srv *http.Server, ln net.Listener) {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {

@@ -79,6 +79,16 @@ func (f *fakeControl) Logs(_ context.Context, _ *connect.Request[vibev1.LogsRequ
 	f.record("Logs")
 	return connect.NewResponse(&vibev1.LogsResponse{Lines: []string{"line1", "line2"}}), nil
 }
+func (f *fakeControl) CellDrain(_ context.Context, req *connect.Request[vibev1.CellDrainRequest]) (*connect.Response[vibev1.CellDrainResponse], error) {
+	f.record("CellDrain")
+	return connect.NewResponse(&vibev1.CellDrainResponse{ResidentModels: []string{"qwen"}}), nil
+}
+
+func (f *fakeControl) CellResume(_ context.Context, req *connect.Request[vibev1.CellResumeRequest]) (*connect.Response[vibev1.CellResumeResponse], error) {
+	f.record("CellResume")
+	return connect.NewResponse(&vibev1.CellResumeResponse{}), nil
+}
+
 func (f *fakeControl) Pull(_ context.Context, _ *connect.Request[vibev1.PullRequest], stream *connect.ServerStream[vibev1.PullProgress]) error {
 	f.record("Pull")
 	return stream.Send(&vibev1.PullProgress{Phase: vibev1.PullProgress_PHASE_DONE})

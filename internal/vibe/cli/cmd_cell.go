@@ -32,7 +32,7 @@ func cellCmd() *cobra.Command {
 		Use:   "cell",
 		Short: "Fleet cell observability (status, await).",
 	}
-	cmd.AddCommand(cellStatusCmd(), cellAwaitCmd())
+	cmd.AddCommand(cellStatusCmd(), cellAwaitCmd(), cellDrainCmd(), cellResumeCmd(), cellWakeCmd())
 	return cmd
 }
 

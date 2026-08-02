@@ -71,16 +71,35 @@ type Server struct {
 	// trigger a JIT load, and slow cold starts (minutes) are exactly the
 	// ones the tool is for. The goroutine's context is the only bound.
 	warmHTTP *http.Client
+	// frontConfig is the front's rendered llama-swap config path as seen
+	// from this daemon (a same-host mount) — render_front diffs against
+	// it. Empty means render-only, no diff.
+	frontConfig string
+	// backendsDir and llamaBinary feed the renderer the same inputs the
+	// CLI gives it.
+	backendsDir string
+	llamaBinary string
+}
+
+// Options carries the render_front tool's renderer inputs (the daemon's
+// own config values).
+type Options struct {
+	FrontConfig string
+	BackendsDir string
+	LlamaBinary string
 }
 
 // New builds the facade over the daemon's fleet server and parsed
 // hosts.yaml (both fleet_registry-only, so both always present here).
-func New(fleet *fleetapi.Server, hosts *fleetcfg.File) *Server {
+func New(fleet *fleetapi.Server, hosts *fleetcfg.File, opts Options) *Server {
 	return &Server{
-		fleet:    fleet,
-		hosts:    hosts,
-		http:     &http.Client{Timeout: toolTimeout},
-		warmHTTP: &http.Client{},
+		fleet:       fleet,
+		hosts:       hosts,
+		http:        &http.Client{Timeout: toolTimeout},
+		warmHTTP:    &http.Client{},
+		frontConfig: opts.FrontConfig,
+		backendsDir: opts.BackendsDir,
+		llamaBinary: opts.LlamaBinary,
 	}
 }
 
@@ -246,11 +265,83 @@ func (s *Server) mcpTools() []any {
 				"required": []string{"cell", "model"},
 			},
 		},
+		map[string]any{
+			"name": "drain_cell",
+			"description": "Reclaim a cell (stop its serving stack; llama-swap drains in-flight " +
+				"requests first). Returns the pre-drain report — resident models, in-flight " +
+				"count, active leases — so you can relay \"heads up: X holds a lease\" before " +
+				"confirming. Records intent (reason/eta) at fleetd after the drain succeeds.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"cell":         map[string]any{"type": "string", "description": "Cell name from hosts.yaml."},
+					"reason":       map[string]any{"type": "string", "description": "Why the cell is being reclaimed (e.g. \"gaming\")."},
+					"eta":          map[string]any{"type": "string", "description": "When it's expected back (e.g. \"23:00\")."},
+					"wait_seconds": map[string]any{"type": "integer", "description": "Wait up to this many seconds for in-flight requests to finish before draining (0 = immediate; in-flight work then dies truncated)."},
+				},
+				"required": []string{"cell"},
+			},
+		},
+		map[string]any{
+			"name": "resume_cell",
+			"description": "Resume a drained cell. Models return by JIT on next request; " +
+				"clears the cell's recorded intent.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"cell": map[string]any{"type": "string", "description": "Cell name from hosts.yaml."},
+				},
+				"required": []string{"cell"},
+			},
+		},
+		map[string]any{
+			"name": "wake_cell",
+			"description": "Send a Wake-on-LAN packet to a cell. Always explicit — never " +
+				"triggered by a request. Only works for cells with wake: config in hosts.yaml.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"cell": map[string]any{"type": "string", "description": "Cell name from hosts.yaml."},
+				},
+				"required": []string{"cell"},
+			},
+		},
+		map[string]any{
+			"name": "render_front",
+			"description": "Dry-run the front config render (vibe router render --cell front): " +
+				"renders the peers-only config from backend defs + hosts.yaml and returns the " +
+				"unified diff against the live front config (or the full render when no live " +
+				"path is mounted). DRY-RUN ONLY — the apply path arrives with presence-driven " +
+				"rendering (C3).",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"dry_run": map[string]any{"type": "boolean", "description": "Must be true (the only mode C2 has)."},
+				},
+			},
+		},
 	}
 }
 
 func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMessage) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, toolTimeout)
+	// Actuation tools get deadlines sized to the work, not the 10s probe
+	// budget: a quiescence wait outlives toolTimeout by design, and a
+	// unit stop routinely runs 30-60s. (The daemon-side verb is also
+	// detach-safe now, but a spurious client-side failure still desyncs
+	// intent reporting — the cell drains while the agent hears
+	// "failed".)
+	timeout := toolTimeout
+	switch name {
+	case "drain_cell":
+		var probe struct {
+			WaitSeconds int32 `json:"wait_seconds"`
+		}
+		_ = json.Unmarshal(rawArgs, &probe)
+		timeout = time.Duration(probe.WaitSeconds)*time.Second + 75*time.Second
+	case "resume_cell", "wake_cell", "render_front":
+		timeout = 90 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	switch name {
@@ -273,6 +364,43 @@ func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMess
 			return "", fmt.Errorf("invalid arguments: %v", err)
 		}
 		return s.toolUnloadModel(ctx, args.Cell, args.Model)
+	case "drain_cell":
+		var args struct {
+			Cell        string `json:"cell"`
+			Reason      string `json:"reason"`
+			ETA         string `json:"eta"`
+			WaitSeconds int32  `json:"wait_seconds"`
+		}
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return "", fmt.Errorf("invalid arguments: %v", err)
+		}
+		return s.toolDrainCell(ctx, args.Cell, args.Reason, args.ETA, args.WaitSeconds)
+	case "resume_cell":
+		var args struct {
+			Cell string `json:"cell"`
+		}
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return "", fmt.Errorf("invalid arguments: %v", err)
+		}
+		return s.toolResumeCell(ctx, args.Cell)
+	case "wake_cell":
+		var args struct {
+			Cell string `json:"cell"`
+		}
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return "", fmt.Errorf("invalid arguments: %v", err)
+		}
+		return s.toolWakeCell(ctx, args.Cell)
+	case "render_front":
+		var args struct {
+			DryRun *bool `json:"dry_run"`
+		}
+		if len(rawArgs) > 0 {
+			if err := json.Unmarshal(rawArgs, &args); err != nil {
+				return "", fmt.Errorf("invalid arguments: %v", err)
+			}
+		}
+		return s.toolRenderFront(ctx, args.DryRun)
 	default:
 		return "", fmt.Errorf("unknown tool %q", name)
 	}

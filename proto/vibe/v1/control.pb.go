@@ -74,7 +74,7 @@ func (x PullProgress_Phase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PullProgress_Phase.Descriptor instead.
 func (PullProgress_Phase) EnumDescriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{16, 0}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{21, 0}
 }
 
 type Status struct {
@@ -963,6 +963,306 @@ func (x *PullRequest) GetProfile() string {
 	return ""
 }
 
+type CellDrainRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// reason/eta are the declared intent ("gaming, back ~23:00") recorded
+	// alongside the drain — for humans and agents asking why, never for
+	// routing. Both optional.
+	Reason string `protobuf:"bytes,1,opt,name=reason,proto3" json:"reason,omitempty"`
+	Eta    string `protobuf:"bytes,2,opt,name=eta,proto3" json:"eta,omitempty"`
+	// wait_seconds bounds a quiescence wait before the drain command runs:
+	// llama-swap's SIGTERM path cancels in-flight streams immediately
+	// (v239 verified — CloseStreams precedes the graceful drain), so the
+	// only way a generation completes across a drain is to let it finish
+	// FIRST. 0 (default) drains immediately; in-flight requests then die
+	// truncated, which the report's in_flight_requests field warned about.
+	WaitSeconds   int32 `protobuf:"varint,3,opt,name=wait_seconds,json=waitSeconds,proto3" json:"wait_seconds,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CellDrainRequest) Reset() {
+	*x = CellDrainRequest{}
+	mi := &file_vibe_v1_control_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CellDrainRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CellDrainRequest) ProtoMessage() {}
+
+func (x *CellDrainRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_vibe_v1_control_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CellDrainRequest.ProtoReflect.Descriptor instead.
+func (*CellDrainRequest) Descriptor() ([]byte, []int) {
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *CellDrainRequest) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *CellDrainRequest) GetEta() string {
+	if x != nil {
+		return x.Eta
+	}
+	return ""
+}
+
+func (x *CellDrainRequest) GetWaitSeconds() int32 {
+	if x != nil {
+		return x.WaitSeconds
+	}
+	return 0
+}
+
+// LeaseView is one advisory lease as shown in the pre-drain report: a
+// consumer's "I hold this model mid-batch" note. Advisory only — never
+// blocks anything.
+type LeaseView struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Cell          string                 `protobuf:"bytes,1,opt,name=cell,proto3" json:"cell,omitempty"`
+	Model         string                 `protobuf:"bytes,2,opt,name=model,proto3" json:"model,omitempty"`
+	Holder        string                 `protobuf:"bytes,3,opt,name=holder,proto3" json:"holder,omitempty"`
+	Note          string                 `protobuf:"bytes,4,opt,name=note,proto3" json:"note,omitempty"`
+	ExpiresAt     *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LeaseView) Reset() {
+	*x = LeaseView{}
+	mi := &file_vibe_v1_control_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LeaseView) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LeaseView) ProtoMessage() {}
+
+func (x *LeaseView) ProtoReflect() protoreflect.Message {
+	mi := &file_vibe_v1_control_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LeaseView.ProtoReflect.Descriptor instead.
+func (*LeaseView) Descriptor() ([]byte, []int) {
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *LeaseView) GetCell() string {
+	if x != nil {
+		return x.Cell
+	}
+	return ""
+}
+
+func (x *LeaseView) GetModel() string {
+	if x != nil {
+		return x.Model
+	}
+	return ""
+}
+
+func (x *LeaseView) GetHolder() string {
+	if x != nil {
+		return x.Holder
+	}
+	return ""
+}
+
+func (x *LeaseView) GetNote() string {
+	if x != nil {
+		return x.Note
+	}
+	return ""
+}
+
+func (x *LeaseView) GetExpiresAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ExpiresAt
+	}
+	return nil
+}
+
+// CellDrainResponse is the pre-drain report: what the cell was doing when
+// the drain fired.
+type CellDrainResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// resident_models are the models llama-swap had loaded (any non-stopped
+	// state) at drain time.
+	ResidentModels []string `protobuf:"bytes,1,rep,name=resident_models,json=residentModels,proto3" json:"resident_models,omitempty"`
+	// in_flight_requests is llama-swap's reported in-flight count, present
+	// only when the cell's /api/metrics answers — /running carries no
+	// request counts, and inventing them is worse than omitting the field.
+	InFlightRequests *int64 `protobuf:"varint,2,opt,name=in_flight_requests,json=inFlightRequests,proto3,oneof" json:"in_flight_requests,omitempty"`
+	// active_leases are the fleet's advisory leases naming this cell,
+	// fetched from fleetd when a registry is configured (empty otherwise).
+	ActiveLeases []*LeaseView `protobuf:"bytes,3,rep,name=active_leases,json=activeLeases,proto3" json:"active_leases,omitempty"`
+	// leases_unavailable is true when the lease fetch itself failed — the
+	// drain still proceeded (leases are advisory), but the caller knows the
+	// report can't rule out stranded work.
+	LeasesUnavailable bool `protobuf:"varint,4,opt,name=leases_unavailable,json=leasesUnavailable,proto3" json:"leases_unavailable,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *CellDrainResponse) Reset() {
+	*x = CellDrainResponse{}
+	mi := &file_vibe_v1_control_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CellDrainResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CellDrainResponse) ProtoMessage() {}
+
+func (x *CellDrainResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_vibe_v1_control_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CellDrainResponse.ProtoReflect.Descriptor instead.
+func (*CellDrainResponse) Descriptor() ([]byte, []int) {
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *CellDrainResponse) GetResidentModels() []string {
+	if x != nil {
+		return x.ResidentModels
+	}
+	return nil
+}
+
+func (x *CellDrainResponse) GetInFlightRequests() int64 {
+	if x != nil && x.InFlightRequests != nil {
+		return *x.InFlightRequests
+	}
+	return 0
+}
+
+func (x *CellDrainResponse) GetActiveLeases() []*LeaseView {
+	if x != nil {
+		return x.ActiveLeases
+	}
+	return nil
+}
+
+func (x *CellDrainResponse) GetLeasesUnavailable() bool {
+	if x != nil {
+		return x.LeasesUnavailable
+	}
+	return false
+}
+
+type CellResumeRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CellResumeRequest) Reset() {
+	*x = CellResumeRequest{}
+	mi := &file_vibe_v1_control_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CellResumeRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CellResumeRequest) ProtoMessage() {}
+
+func (x *CellResumeRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_vibe_v1_control_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CellResumeRequest.ProtoReflect.Descriptor instead.
+func (*CellResumeRequest) Descriptor() ([]byte, []int) {
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{19}
+}
+
+type CellResumeResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CellResumeResponse) Reset() {
+	*x = CellResumeResponse{}
+	mi := &file_vibe_v1_control_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CellResumeResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CellResumeResponse) ProtoMessage() {}
+
+func (x *CellResumeResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_vibe_v1_control_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CellResumeResponse.ProtoReflect.Descriptor instead.
+func (*CellResumeResponse) Descriptor() ([]byte, []int) {
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{20}
+}
+
 type PullProgress struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	Phase           PullProgress_Phase     `protobuf:"varint,1,opt,name=phase,proto3,enum=vibe.v1.PullProgress_Phase" json:"phase,omitempty"`
@@ -976,7 +1276,7 @@ type PullProgress struct {
 
 func (x *PullProgress) Reset() {
 	*x = PullProgress{}
-	mi := &file_vibe_v1_control_proto_msgTypes[16]
+	mi := &file_vibe_v1_control_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -988,7 +1288,7 @@ func (x *PullProgress) String() string {
 func (*PullProgress) ProtoMessage() {}
 
 func (x *PullProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[16]
+	mi := &file_vibe_v1_control_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1001,7 +1301,7 @@ func (x *PullProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PullProgress.ProtoReflect.Descriptor instead.
 func (*PullProgress) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{16}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *PullProgress) GetPhase() PullProgress_Phase {
@@ -1095,7 +1395,26 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\fLogsResponse\x12\x14\n" +
 	"\x05lines\x18\x01 \x03(\tR\x05lines\"'\n" +
 	"\vPullRequest\x12\x18\n" +
-	"\aprofile\x18\x01 \x01(\tR\aprofile\"\x98\x02\n" +
+	"\aprofile\x18\x01 \x01(\tR\aprofile\"_\n" +
+	"\x10CellDrainRequest\x12\x16\n" +
+	"\x06reason\x18\x01 \x01(\tR\x06reason\x12\x10\n" +
+	"\x03eta\x18\x02 \x01(\tR\x03eta\x12!\n" +
+	"\fwait_seconds\x18\x03 \x01(\x05R\vwaitSeconds\"\x9c\x01\n" +
+	"\tLeaseView\x12\x12\n" +
+	"\x04cell\x18\x01 \x01(\tR\x04cell\x12\x14\n" +
+	"\x05model\x18\x02 \x01(\tR\x05model\x12\x16\n" +
+	"\x06holder\x18\x03 \x01(\tR\x06holder\x12\x12\n" +
+	"\x04note\x18\x04 \x01(\tR\x04note\x129\n" +
+	"\n" +
+	"expires_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\"\xee\x01\n" +
+	"\x11CellDrainResponse\x12'\n" +
+	"\x0fresident_models\x18\x01 \x03(\tR\x0eresidentModels\x121\n" +
+	"\x12in_flight_requests\x18\x02 \x01(\x03H\x00R\x10inFlightRequests\x88\x01\x01\x127\n" +
+	"\ractive_leases\x18\x03 \x03(\v2\x12.vibe.v1.LeaseViewR\factiveLeases\x12-\n" +
+	"\x12leases_unavailable\x18\x04 \x01(\bR\x11leasesUnavailableB\x15\n" +
+	"\x13_in_flight_requests\"\x13\n" +
+	"\x11CellResumeRequest\"\x14\n" +
+	"\x12CellResumeResponse\"\x98\x02\n" +
 	"\fPullProgress\x121\n" +
 	"\x05phase\x18\x01 \x01(\x0e2\x1b.vibe.v1.PullProgress.PhaseR\x05phase\x12)\n" +
 	"\x10downloaded_bytes\x18\x02 \x01(\x03R\x0fdownloadedBytes\x12\x1f\n" +
@@ -1108,7 +1427,7 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\x11PHASE_DOWNLOADING\x10\x02\x12\x13\n" +
 	"\x0fPHASE_VERIFYING\x10\x03\x12\x0e\n" +
 	"\n" +
-	"PHASE_DONE\x10\x042\xc0\x03\n" +
+	"PHASE_DONE\x10\x042\xcf\x04\n" +
 	"\x0eControlService\x12;\n" +
 	"\x06Status\x12\x16.vibe.v1.StatusRequest\x1a\x17.vibe.v1.StatusResponse\"\x00\x12M\n" +
 	"\fListProfiles\x12\x1c.vibe.v1.ListProfilesRequest\x1a\x1d.vibe.v1.ListProfilesResponse\"\x00\x128\n" +
@@ -1116,7 +1435,10 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\x04Stop\x12\x14.vibe.v1.StopRequest\x1a\x15.vibe.v1.StopResponse\"\x00\x12A\n" +
 	"\bShutdown\x12\x18.vibe.v1.ShutdownRequest\x1a\x19.vibe.v1.ShutdownResponse\"\x00\x125\n" +
 	"\x04Logs\x12\x14.vibe.v1.LogsRequest\x1a\x15.vibe.v1.LogsResponse\"\x00\x127\n" +
-	"\x04Pull\x12\x14.vibe.v1.PullRequest\x1a\x15.vibe.v1.PullProgress\"\x000\x01B7Z5github.com/gallowaysoftware/vibe/proto/vibe/v1;vibev1b\x06proto3"
+	"\x04Pull\x12\x14.vibe.v1.PullRequest\x1a\x15.vibe.v1.PullProgress\"\x000\x01\x12D\n" +
+	"\tCellDrain\x12\x19.vibe.v1.CellDrainRequest\x1a\x1a.vibe.v1.CellDrainResponse\"\x00\x12G\n" +
+	"\n" +
+	"CellResume\x12\x1a.vibe.v1.CellResumeRequest\x1a\x1b.vibe.v1.CellResumeResponse\"\x00B7Z5github.com/gallowaysoftware/vibe/proto/vibe/v1;vibev1b\x06proto3"
 
 var (
 	file_vibe_v1_control_proto_rawDescOnce sync.Once
@@ -1131,7 +1453,7 @@ func file_vibe_v1_control_proto_rawDescGZIP() []byte {
 }
 
 var file_vibe_v1_control_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_vibe_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
+var file_vibe_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
 var file_vibe_v1_control_proto_goTypes = []any{
 	(PullProgress_Phase)(0),       // 0: vibe.v1.PullProgress.Phase
 	(*Status)(nil),                // 1: vibe.v1.Status
@@ -1150,41 +1472,52 @@ var file_vibe_v1_control_proto_goTypes = []any{
 	(*LogsRequest)(nil),           // 14: vibe.v1.LogsRequest
 	(*LogsResponse)(nil),          // 15: vibe.v1.LogsResponse
 	(*PullRequest)(nil),           // 16: vibe.v1.PullRequest
-	(*PullProgress)(nil),          // 17: vibe.v1.PullProgress
-	nil,                           // 18: vibe.v1.Status.FrontendEnvEntry
-	nil,                           // 19: vibe.v1.FrontendInfo.EnvVarsEntry
-	(*timestamppb.Timestamp)(nil), // 20: google.protobuf.Timestamp
+	(*CellDrainRequest)(nil),      // 17: vibe.v1.CellDrainRequest
+	(*LeaseView)(nil),             // 18: vibe.v1.LeaseView
+	(*CellDrainResponse)(nil),     // 19: vibe.v1.CellDrainResponse
+	(*CellResumeRequest)(nil),     // 20: vibe.v1.CellResumeRequest
+	(*CellResumeResponse)(nil),    // 21: vibe.v1.CellResumeResponse
+	(*PullProgress)(nil),          // 22: vibe.v1.PullProgress
+	nil,                           // 23: vibe.v1.Status.FrontendEnvEntry
+	nil,                           // 24: vibe.v1.FrontendInfo.EnvVarsEntry
+	(*timestamppb.Timestamp)(nil), // 25: google.protobuf.Timestamp
 }
 var file_vibe_v1_control_proto_depIdxs = []int32{
-	20, // 0: vibe.v1.Status.started_at:type_name -> google.protobuf.Timestamp
-	18, // 1: vibe.v1.Status.frontend_env:type_name -> vibe.v1.Status.FrontendEnvEntry
-	19, // 2: vibe.v1.FrontendInfo.env_vars:type_name -> vibe.v1.FrontendInfo.EnvVarsEntry
+	25, // 0: vibe.v1.Status.started_at:type_name -> google.protobuf.Timestamp
+	23, // 1: vibe.v1.Status.frontend_env:type_name -> vibe.v1.Status.FrontendEnvEntry
+	24, // 2: vibe.v1.FrontendInfo.env_vars:type_name -> vibe.v1.FrontendInfo.EnvVarsEntry
 	1,  // 3: vibe.v1.StatusResponse.status:type_name -> vibe.v1.Status
 	1,  // 4: vibe.v1.StatusResponse.services:type_name -> vibe.v1.Status
 	2,  // 5: vibe.v1.ListProfilesResponse.profiles:type_name -> vibe.v1.Profile
 	1,  // 6: vibe.v1.StartResponse.status:type_name -> vibe.v1.Status
 	3,  // 7: vibe.v1.StartResponse.frontend:type_name -> vibe.v1.FrontendInfo
 	1,  // 8: vibe.v1.StopResponse.status:type_name -> vibe.v1.Status
-	0,  // 9: vibe.v1.PullProgress.phase:type_name -> vibe.v1.PullProgress.Phase
-	4,  // 10: vibe.v1.ControlService.Status:input_type -> vibe.v1.StatusRequest
-	6,  // 11: vibe.v1.ControlService.ListProfiles:input_type -> vibe.v1.ListProfilesRequest
-	8,  // 12: vibe.v1.ControlService.Start:input_type -> vibe.v1.StartRequest
-	10, // 13: vibe.v1.ControlService.Stop:input_type -> vibe.v1.StopRequest
-	12, // 14: vibe.v1.ControlService.Shutdown:input_type -> vibe.v1.ShutdownRequest
-	14, // 15: vibe.v1.ControlService.Logs:input_type -> vibe.v1.LogsRequest
-	16, // 16: vibe.v1.ControlService.Pull:input_type -> vibe.v1.PullRequest
-	5,  // 17: vibe.v1.ControlService.Status:output_type -> vibe.v1.StatusResponse
-	7,  // 18: vibe.v1.ControlService.ListProfiles:output_type -> vibe.v1.ListProfilesResponse
-	9,  // 19: vibe.v1.ControlService.Start:output_type -> vibe.v1.StartResponse
-	11, // 20: vibe.v1.ControlService.Stop:output_type -> vibe.v1.StopResponse
-	13, // 21: vibe.v1.ControlService.Shutdown:output_type -> vibe.v1.ShutdownResponse
-	15, // 22: vibe.v1.ControlService.Logs:output_type -> vibe.v1.LogsResponse
-	17, // 23: vibe.v1.ControlService.Pull:output_type -> vibe.v1.PullProgress
-	17, // [17:24] is the sub-list for method output_type
-	10, // [10:17] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	25, // 9: vibe.v1.LeaseView.expires_at:type_name -> google.protobuf.Timestamp
+	18, // 10: vibe.v1.CellDrainResponse.active_leases:type_name -> vibe.v1.LeaseView
+	0,  // 11: vibe.v1.PullProgress.phase:type_name -> vibe.v1.PullProgress.Phase
+	4,  // 12: vibe.v1.ControlService.Status:input_type -> vibe.v1.StatusRequest
+	6,  // 13: vibe.v1.ControlService.ListProfiles:input_type -> vibe.v1.ListProfilesRequest
+	8,  // 14: vibe.v1.ControlService.Start:input_type -> vibe.v1.StartRequest
+	10, // 15: vibe.v1.ControlService.Stop:input_type -> vibe.v1.StopRequest
+	12, // 16: vibe.v1.ControlService.Shutdown:input_type -> vibe.v1.ShutdownRequest
+	14, // 17: vibe.v1.ControlService.Logs:input_type -> vibe.v1.LogsRequest
+	16, // 18: vibe.v1.ControlService.Pull:input_type -> vibe.v1.PullRequest
+	17, // 19: vibe.v1.ControlService.CellDrain:input_type -> vibe.v1.CellDrainRequest
+	20, // 20: vibe.v1.ControlService.CellResume:input_type -> vibe.v1.CellResumeRequest
+	5,  // 21: vibe.v1.ControlService.Status:output_type -> vibe.v1.StatusResponse
+	7,  // 22: vibe.v1.ControlService.ListProfiles:output_type -> vibe.v1.ListProfilesResponse
+	9,  // 23: vibe.v1.ControlService.Start:output_type -> vibe.v1.StartResponse
+	11, // 24: vibe.v1.ControlService.Stop:output_type -> vibe.v1.StopResponse
+	13, // 25: vibe.v1.ControlService.Shutdown:output_type -> vibe.v1.ShutdownResponse
+	15, // 26: vibe.v1.ControlService.Logs:output_type -> vibe.v1.LogsResponse
+	22, // 27: vibe.v1.ControlService.Pull:output_type -> vibe.v1.PullProgress
+	19, // 28: vibe.v1.ControlService.CellDrain:output_type -> vibe.v1.CellDrainResponse
+	21, // 29: vibe.v1.ControlService.CellResume:output_type -> vibe.v1.CellResumeResponse
+	21, // [21:30] is the sub-list for method output_type
+	12, // [12:21] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_vibe_v1_control_proto_init() }
@@ -1192,13 +1525,14 @@ func file_vibe_v1_control_proto_init() {
 	if File_vibe_v1_control_proto != nil {
 		return
 	}
+	file_vibe_v1_control_proto_msgTypes[18].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_vibe_v1_control_proto_rawDesc), len(file_vibe_v1_control_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   19,
+			NumMessages:   24,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

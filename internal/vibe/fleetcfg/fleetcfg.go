@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 
@@ -61,6 +62,26 @@ type Cell struct {
 	// TokenFile is the path to that cell daemon's bearer token. The
 	// path is config; the token value never enters a repo.
 	TokenFile string `yaml:"token_file,omitempty"`
+	// Wake carries the cell's Wake-on-LAN config (C2): fleetd sends the
+	// magic packet from its LAN position, or shells to Cmd when L2
+	// broadcast is unreachable from where fleetd runs (macvlan).
+	Wake *Wake `yaml:"wake,omitempty"`
+}
+
+// Wake is a cell's Wake-on-LAN record. Always explicit — waking is never
+// triggered by a request or a heuristic.
+type Wake struct {
+	// MAC is the target NIC's hardware address ("aa:bb:cc:dd:ee:ff").
+	MAC string `yaml:"mac"`
+	// Broadcast overrides the magic packet's destination
+	// (default 255.255.255.255:9) — e.g. a directed subnet broadcast
+	// when the fleetd box and the cell share a subnet.
+	Broadcast string `yaml:"broadcast,omitempty"`
+	// Cmd is a per-cell fallback command run INSTEAD of the packet when
+	// set — the escape hatch for fleetd network positions that can't
+	// reach L2 broadcast (macvlan hides host ports and broadcast domains
+	// from containers). Run via sh -c on the fleetd host.
+	Cmd string `yaml:"cmd,omitempty"`
 }
 
 // File is the parsed hosts.yaml.
@@ -132,6 +153,24 @@ func (f *File) validate() error {
 		case ClassAlwaysOn, ClassOpportunistic, ClassRoaming:
 		default:
 			return fmt.Errorf("cells.%s: class must be one of %q, %q, %q (got %q)", name, ClassAlwaysOn, ClassOpportunistic, ClassRoaming, c.Class)
+		}
+		if c.Wake != nil {
+			// mac is required unless a fallback cmd replaces the packet;
+			// when present it must be a 48-bit MAC — ParseMAC also admits
+			// EUI-64/IPoIB forms, which would build a frame no NIC
+			// recognizes (a silent no-op, the worst config-error outcome).
+			if c.Wake.MAC == "" && c.Wake.Cmd == "" {
+				return fmt.Errorf("cells.%s.wake: mac is required (or set cmd for the fallback path)", name)
+			}
+			if c.Wake.MAC != "" {
+				mac, err := net.ParseMAC(c.Wake.MAC)
+				if err != nil {
+					return fmt.Errorf("cells.%s.wake: mac %q is invalid: %v", name, c.Wake.MAC, err)
+				}
+				if len(mac) != 6 {
+					return fmt.Errorf("cells.%s.wake: mac %q must be a 48-bit MAC (got %d bytes — EUI-64 and IPoIB forms don't make magic packets)", name, c.Wake.MAC, len(mac))
+				}
+			}
 		}
 	}
 	for id, class := range f.ModelClasses {
