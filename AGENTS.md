@@ -500,6 +500,18 @@ planned. The short version an agent needs:
   design's pre-agreed fallback for router gaps is a thin front shim, decided
   deliberately — not ad-hoc daemon features.
 
+## Fleet control (node state / intent / presence, 2026-08-02+)
+
+`docs/design/fleet-control.md` is the design; the C0–C4 execution plan
+lives in `docs/design/fleet-control-plan/` (one phase = one PR, each
+phase doc ends in acceptance gates that are the definition of done).
+The invariants an agent must not violate while implementing or
+touching adjacent code: the data plane (client → front → cell
+llama-swap) gains no new hop; availability is observed, intent is
+declared, model residency stays llama-swap-owned; the `DRAINED?`
+display state is never acted on; mutation goes through the daemon's
+bearer-authed control plane, never SSH-from-a-container.
+
 ## Things to never do
 
 - Don't add `--no-verify`, `--no-gpg-sign`, or any hook-bypass flag to
