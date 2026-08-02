@@ -61,7 +61,10 @@ func TestCellStatusRendersDerivedTable(t *testing.T) {
 	})
 
 	var out bytes.Buffer
-	target := resolveFleetd(ts.URL)
+	target, err := resolveFleetd(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
 	snap, err := target.fetchState(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +141,11 @@ func TestCellAwaitUnblocksOnTransition(t *testing.T) {
 
 	var out bytes.Buffer
 	start := time.Now()
-	err := awaitCell(t.Context(), &out, resolveFleetd(ts.URL), "gpu-cell", true, 5*time.Second, 50*time.Millisecond)
+	target, terr := resolveFleetd(ts.URL)
+	if terr != nil {
+		t.Fatal(terr)
+	}
+	err := awaitCell(t.Context(), &out, target, "gpu-cell", true, 5*time.Second, 50*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +160,11 @@ func TestCellAwaitUnblocksOnTransition(t *testing.T) {
 func TestCellAwaitUnknownCell(t *testing.T) {
 	ts := cannedFleetd(t, func() fleetapi.StateSnapshot { return statusState() })
 	var out bytes.Buffer
-	err := awaitCell(t.Context(), &out, resolveFleetd(ts.URL), "nope", true, 200*time.Millisecond, 50*time.Millisecond)
+	target, terr := resolveFleetd(ts.URL)
+	if terr != nil {
+		t.Fatal(terr)
+	}
+	err := awaitCell(t.Context(), &out, target, "nope", true, 200*time.Millisecond, 50*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "timeout") {
 		t.Errorf("unknown cell: got %v, want timeout (unknown cells keep waiting, not silently succeeding)", err)
 	}
@@ -166,7 +177,11 @@ func TestCellAwaitDown(t *testing.T) {
 		})
 	})
 	var out bytes.Buffer
-	if err := awaitCell(t.Context(), &out, resolveFleetd(ts.URL), "gpu-cell", false, 2*time.Second, 50*time.Millisecond); err != nil {
+	target, terr := resolveFleetd(ts.URL)
+	if terr != nil {
+		t.Fatal(terr)
+	}
+	if err := awaitCell(t.Context(), &out, target, "gpu-cell", false, 2*time.Second, 50*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "gpu-cell is down") {

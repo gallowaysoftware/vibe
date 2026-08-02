@@ -36,8 +36,11 @@ services:
       TZ: ${TZ:-UTC}
     command: ["daemon"]
     volumes:
-      - ${FLEETD_CONFIG_DIR:?set FLEETD_CONFIG_DIR to the fleetd config directory}:/config:ro
-      - ${FLEETD_STATE_DIR:?set FLEETD_STATE_DIR to the fleetd state directory — REQUIRED, see the state contract above}:/state
+      # Config is read-only and lives at $XDG_CONFIG_HOME/vibe inside the
+      # container — pre-create the empty profiles/backends/mcp subdirs in
+      # it (see README.md) or the daemon's startup EnsureDirs fails.
+      - ${FLEETD_CONFIG_DIR:?set FLEETD_CONFIG_DIR to the fleetd config directory}:/config/vibe:ro
+      - ${FLEETD_STATE_DIR:?set FLEETD_STATE_DIR to the fleetd state directory — REQUIRED, see the state contract above}:/state/vibe
     networks:
       macvlan:
         ipv4_address: ${FLEETD_IPV4:?set FLEETD_IPV4 to fleetd's LAN address}

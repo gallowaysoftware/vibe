@@ -3,6 +3,8 @@ package fleetapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -78,23 +80,29 @@ func (s *Server) decorate(snap *CellSnapshot) {
 	snap.Display = displayState(snap.HostReachable, snap.Reachable, snap.Intent)
 }
 
-// loadLastSeen reads the persisted sightings; missing or corrupt
-// degrades to empty (a cell then shows no last_seen until sighted —
-// honest "unknown" rather than a fabricated timestamp).
+// loadLastSeen reads the persisted sightings; missing is empty (a cell
+// then shows no last_seen until sighted — honest "unknown" rather than
+// a fabricated timestamp). Corrupt degrades to empty too, but loudly.
 func loadLastSeen(path string) map[string]time.Time {
 	seen := map[string]time.Time{}
 	if path == "" {
 		return seen
 	}
 	data, err := os.ReadFile(path)
-	if err != nil {
+	if errors.Is(err, os.ErrNotExist) {
 		return seen
 	}
-	_ = json.Unmarshal(data, &seen)
+	if err != nil {
+		slog.Warn("last-seen store unreadable, starting empty", "path", path, "err", err)
+		return seen
+	}
+	if err := json.Unmarshal(data, &seen); err != nil {
+		slog.Warn("last-seen store corrupt, starting empty", "path", path, "err", err)
+	}
 	return seen
 }
 
-// saveLastSeen writes sightings atomically (tmp + rename).
+// saveLastSeen writes sightings atomically (unique tmp + rename).
 func saveLastSeen(path string, seen map[string]time.Time) error {
 	data, err := json.MarshalIndent(seen, "", "  ")
 	if err != nil {
@@ -103,9 +111,23 @@ func saveLastSeen(path string, seen map[string]time.Time) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".lastseen-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Chmod(tmpPath, 0o600); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }

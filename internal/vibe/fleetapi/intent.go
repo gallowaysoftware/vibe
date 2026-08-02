@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -36,6 +37,12 @@ type intentResponse struct {
 // handleIntent sets or clears one cell's declared intent. Unknown cells
 // and unknown states are 400s — a typo'd cell name must fail loudly, not
 // record intent for a cell that doesn't exist.
+//
+// The whole clone-mutate-persist-swap sequence runs under intentMu: a
+// concurrent pair of POSTs then serializes cleanly, the file can never be
+// marshaled from a map another handler is mutating (a fatal runtime
+// error), and a failed persist leaves the observable state untouched —
+// the 500 and /api/fleet/state never disagree.
 func (s *Server) handleIntent(w http.ResponseWriter, r *http.Request) {
 	var req intentRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
@@ -54,32 +61,37 @@ func (s *Server) handleIntent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.intentMu.Lock()
+	defer s.intentMu.Unlock()
+
 	s.mu.Lock()
+	next := make(map[string]Intent, len(s.intents)+1)
+	for k, v := range s.intents {
+		next[k] = v
+	}
+	s.mu.Unlock()
 	switch req.State {
 	case "serving":
-		delete(s.intents, req.Cell)
+		delete(next, req.Cell)
 	case "drained":
-		s.intents[req.Cell] = Intent{State: "drained", Reason: req.Reason, ETA: req.ETA, Since: time.Now().UTC()}
+		next[req.Cell] = Intent{State: "drained", Reason: req.Reason, ETA: req.ETA, Since: time.Now().UTC()}
 	default:
-		s.mu.Unlock()
 		http.Error(w, `state must be "drained" or "serving"`, http.StatusBadRequest)
 		return
 	}
-	intents := s.intents
-	s.mu.Unlock()
 
-	// File IO outside the hub mutex (same discipline as the start-history
-	// recorder): a slow state dir must not stall event publishing.
-	if err := saveIntents(s.intentPath, intents); err != nil {
-		http.Error(w, fmt.Sprintf("persist intent: %v", err), http.StatusInternalServerError)
+	if err := saveIntents(s.intentPath, next); err != nil {
+		slog.Warn("intent persist failed", "err", err)
+		http.Error(w, "persist intent", http.StatusInternalServerError)
 		return
 	}
+	s.mu.Lock()
+	s.intents = next
+	s.mu.Unlock()
 
 	resp := intentResponse{Cell: req.Cell, State: "serving"}
 	if req.State == "drained" {
-		s.mu.Lock()
-		in := s.intents[req.Cell]
-		s.mu.Unlock()
+		in := next[req.Cell]
 		resp.Intent = &in
 		resp.State = "drained"
 	}
@@ -87,23 +99,32 @@ func (s *Server) handleIntent(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// loadIntents reads the intent file; a missing or corrupt file degrades
-// to an empty store (absence means serving — the safe default).
+// loadIntents reads the intent file; a missing file is an empty store
+// (absence means serving — the safe default). A corrupt file also
+// degrades to empty, but loudly: silent rot would flip a drained cell to
+// DRAINED? after a fleetd restart with no explanation.
 func loadIntents(path string) map[string]Intent {
 	intents := map[string]Intent{}
 	if path == "" {
 		return intents
 	}
 	data, err := os.ReadFile(path)
-	if err != nil {
+	if errors.Is(err, os.ErrNotExist) {
 		return intents
 	}
-	_ = json.Unmarshal(data, &intents)
+	if err != nil {
+		slog.Warn("intent store unreadable, starting empty", "path", path, "err", err)
+		return intents
+	}
+	if err := json.Unmarshal(data, &intents); err != nil {
+		slog.Warn("intent store corrupt, starting empty", "path", path, "err", err)
+	}
 	return intents
 }
 
-// saveIntents writes the store atomically (tmp + rename in the same
-// directory) so a crash mid-write never leaves a truncated intent file.
+// saveIntents writes the store atomically (unique tmp file + rename in the
+// same directory) so a crash mid-write never leaves a truncated intent
+// file and concurrent writers can't interleave into one tmp name.
 func saveIntents(path string, intents map[string]Intent) error {
 	if path == "" {
 		return errors.New("intent store disabled")
@@ -115,9 +136,23 @@ func saveIntents(path string, intents map[string]Intent) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".intent-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Chmod(tmpPath, 0o600); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }

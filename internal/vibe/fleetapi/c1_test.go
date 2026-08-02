@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -295,6 +296,55 @@ func TestLastSeenPersistsAcrossRecreate(t *testing.T) {
 	}
 	if c.Display != DisplayOffAwayQ {
 		t.Errorf("display = %s, want OFF/AWAY? (no host_probe)", c.Display)
+	}
+}
+
+func TestIntentConcurrentPostsSerialize(t *testing.T) {
+	// Regression for the map race the adversarial review caught: two
+	// overlapping POSTs must serialize (no fatal concurrent map
+	// iteration/write), and the final state must be one of the two
+	// writers', consistent between memory and file.
+	deadCell := deadAddr(t)
+	_, ts, opts := newFleetdServer(t, []Cell{
+		{Name: "gpu-cell", URL: "http://" + deadCell, Class: "opportunistic"},
+	})
+
+	var wg sync.WaitGroup
+	codes := make([]int, 40)
+	for i := range codes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			state := "drained"
+			if i%2 == 0 {
+				state = "serving"
+			}
+			body := fmt.Sprintf(`{"cell":"gpu-cell","state":%q,"reason":"r%d"}`, state, i)
+			code, _ := postIntent(t, ts, body)
+			codes[i] = code
+		}(i)
+	}
+	wg.Wait()
+	for i, code := range codes {
+		if code != http.StatusOK {
+			t.Fatalf("post %d: HTTP %d", i, code)
+		}
+	}
+
+	// Memory and file agree on the winner.
+	st := getState(t, ts)
+	data, err := os.ReadFile(opts.IntentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var onDisk map[string]Intent
+	if err := json.Unmarshal(data, &onDisk); err != nil {
+		t.Fatal(err)
+	}
+	memDrained := st.Cells[0].Intent != nil
+	_, fileDrained := onDisk["gpu-cell"]
+	if memDrained != fileDrained {
+		t.Errorf("memory/file disagree: memory drained=%v file drained=%v", memDrained, fileDrained)
 	}
 }
 

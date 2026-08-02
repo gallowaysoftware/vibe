@@ -107,4 +107,9 @@ the state dir, which the compose marks required:
   expects. House token values live in the private repo.)
 
 Keep `:9001` on the LAN/VPN like everything else on the control plane;
-external exposure only behind the reverse-proxy auth layer.
+external exposure only behind the reverse-proxy auth layer. The bearer
+token rides plaintext HTTP inside that perimeter (the house posture —
+same as the per-cell daemons); do not point `fleetd_url` at anything
+you would not hand the token to, and keep `hosts.yaml` itself
+user-writable only: any process that can rewrite it can redirect where
+`vibe cell` sends your token.

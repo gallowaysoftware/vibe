@@ -146,11 +146,20 @@ type Server struct {
 	// intents is the declared-intent store (axis 2), nil-safe when
 	// disabled; intentPath is its backing file. lastSeen holds per-cell
 	// last-sighting timestamps, persisted to lastSeenPath on transitions
-	// when set.
+	// when set. intentMu serializes the intent endpoint's
+	// clone-mutate-persist-swap so concurrent POSTs can't race the file
+	// or the observable map.
 	intents      map[string]Intent
 	intentPath   string
+	intentMu     sync.Mutex
 	lastSeen     map[string]time.Time
 	lastSeenPath string
+
+	// flight is the in-flight Snapshot shared by concurrent callers —
+	// one probe round serves every simultaneous /state consumer instead
+	// of a goroutine fan-out per request.
+	flightMu sync.Mutex
+	flight   *snapshotFlight
 
 	done      chan struct{}
 	closeOnce sync.Once
@@ -230,10 +239,42 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(s.Snapshot(ctx))
 }
 
+// snapshotFlight is one in-flight probe round shared by every concurrent
+// Snapshot caller.
+type snapshotFlight struct {
+	done chan struct{}
+	snap StateSnapshot
+}
+
 // Snapshot probes every cell in parallel and assembles the state
 // document. Exported so in-process consumers (fleetmcp) get byte-identical
-// state to what /api/fleet/state serves over HTTP.
+// state to what /api/fleet/state serves over HTTP. Concurrent callers
+// share one probe round rather than fanning out per request.
 func (s *Server) Snapshot(ctx context.Context) StateSnapshot {
+	s.flightMu.Lock()
+	if f := s.flight; f != nil {
+		s.flightMu.Unlock()
+		<-f.done
+		return f.snap
+	}
+	f := &snapshotFlight{done: make(chan struct{})}
+	s.flight = f
+	s.flightMu.Unlock()
+
+	defer func() {
+		s.flightMu.Lock()
+		s.flight = nil
+		s.flightMu.Unlock()
+		close(f.done)
+	}()
+
+	f.snap = s.probeSnapshot(ctx)
+	return f.snap
+}
+
+// probeSnapshot runs one probe round: every cell in parallel, bounded by
+// the caller's context.
+func (s *Server) probeSnapshot(ctx context.Context) StateSnapshot {
 	resp := StateSnapshot{
 		GeneratedAt:  time.Now().UTC(),
 		Cells:        make([]CellSnapshot, len(s.cells)),
@@ -250,6 +291,14 @@ func (s *Server) Snapshot(ctx context.Context) StateSnapshot {
 	}
 	wg.Wait()
 	return resp
+}
+
+// StartStats returns the recorded start-duration stats for one model —
+// the warm path's honest cold-start ETA without a probe round.
+func (s *Server) StartStats(model string) (StartStats, bool) {
+	stats := s.hist.Stats()
+	st, ok := stats[model]
+	return st, ok
 }
 
 // snapshotCell merges the cell's /running (live processes: state/ttl) into

@@ -91,7 +91,12 @@ func LoadFrom(path string) (*File, error) {
 		return nil, err
 	}
 	var f File
-	if err := yaml.Unmarshal(data, &f); err != nil {
+	// Strict decoding: a typo'd key (host_porbe, fleet_url) must fail
+	// loudly at load, not silently degrade a cell's display semantics —
+	// same discipline as profile.Load's KnownFields.
+	dec := yaml.NewDecoder(strings.NewReader(string(data)))
+	dec.KnownFields(true)
+	if err := dec.Decode(&f); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	if err := f.validate(); err != nil {

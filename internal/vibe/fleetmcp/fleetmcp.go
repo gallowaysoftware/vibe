@@ -10,11 +10,14 @@
 package fleetmcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -64,12 +67,21 @@ type Server struct {
 	fleet *fleetapi.Server
 	hosts *fleetcfg.File
 	http  *http.Client
+	// warmHTTP has no client-level Timeout: the warm request exists to
+	// trigger a JIT load, and slow cold starts (minutes) are exactly the
+	// ones the tool is for. The goroutine's context is the only bound.
+	warmHTTP *http.Client
 }
 
 // New builds the facade over the daemon's fleet server and parsed
 // hosts.yaml (both fleet_registry-only, so both always present here).
 func New(fleet *fleetapi.Server, hosts *fleetcfg.File) *Server {
-	return &Server{fleet: fleet, hosts: hosts, http: &http.Client{Timeout: toolTimeout}}
+	return &Server{
+		fleet:    fleet,
+		hosts:    hosts,
+		http:     &http.Client{Timeout: toolTimeout},
+		warmHTTP: &http.Client{},
+	}
 }
 
 // Register mounts the MCP endpoint on the daemon mux.
@@ -305,33 +317,44 @@ func (s *Server) toolWarmModel(ctx context.Context, model string) (string, error
 
 	// Fire-and-forget with its own deadline: the request exists to trigger
 	// the JIT load, not to be answered. A detached context because the MCP
-	// call returns (and cancels ctx) immediately.
+	// call returns (and cancels ctx) immediately; a dedicated client with
+	// no Timeout so a multi-minute cold start isn't aborted mid-load.
 	go func() {
 		warmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
-		body := fmt.Sprintf(`{"model":%q,"max_tokens":1,"messages":[{"role":"user","content":"warm"}]}`, model)
+		body, err := json.Marshal(map[string]any{
+			"model":      model,
+			"max_tokens": 1,
+			"messages":   []map[string]string{{"role": "user", "content": "warm"}},
+		})
+		if err != nil {
+			slog.Warn("warm_model body build failed", "model", model, "err", err)
+			return
+		}
 		req, err := http.NewRequestWithContext(warmCtx, http.MethodPost,
 			strings.TrimRight(front.URL, "/")+"/v1/chat/completions",
-			strings.NewReader(body))
+			bytes.NewReader(body))
 		if err != nil {
+			slog.Warn("warm_model request build failed", "model", model, "err", err)
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := s.http.Do(req)
-		if err == nil {
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-			_ = resp.Body.Close()
+		resp, err := s.warmHTTP.Do(req)
+		if err != nil {
+			slog.Warn("warm_model request failed", "model", model, "err", err)
+			return
 		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
 	}()
 
-	eta := ""
-	if stats, ok := s.fleet.Snapshot(ctx).StartHistory[model]; ok && stats.Count > 0 {
-		eta = fmt.Sprintf(" ETA from history: ~%.0fs (p50 over %d starts, last %.0fs).",
-			stats.P50S, stats.Count, stats.LastS)
-	} else {
-		eta = " No start history for this model yet — first recorded cold start sets the ETA."
+	if stats, ok := s.fleet.StartStats(model); ok && stats.Count > 0 {
+		return fmt.Sprintf("Warming %s through the front (JIT load started in the background)."+
+			" ETA from history: ~%.0fs (p50 over %d starts, last %.0fs).",
+			model, stats.P50S, stats.Count, stats.LastS), nil
 	}
-	return fmt.Sprintf("Warming %s through the front (JIT load started in the background).%s", model, eta), nil
+	return fmt.Sprintf("Warming %s through the front (JIT load started in the background)."+
+		" No start history for this model yet — first recorded cold start sets the ETA.", model), nil
 }
 
 // modelInCatalog checks the model id against the front's /v1/models.
@@ -363,7 +386,7 @@ func (s *Server) toolUnloadModel(ctx context.Context, cell, model string) (strin
 	if model == "" {
 		return "", fmt.Errorf("model is required")
 	}
-	url := fmt.Sprintf("%s/api/models/unload/%s", strings.TrimRight(c.URL, "/"), model)
+	url := fmt.Sprintf("%s/api/models/unload/%s", strings.TrimRight(c.URL, "/"), url.PathEscape(model))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 	if err != nil {
 		return "", err

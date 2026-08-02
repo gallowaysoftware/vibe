@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/spf13/cobra"
 
@@ -43,14 +44,20 @@ type fleetdTarget struct {
 }
 
 // resolveFleetd applies the resolution order; explicit --api beats env
-// beats hosts.yaml fleetd_url beats the local daemon.
-func resolveFleetd(apiFlag string) fleetdTarget {
+// beats hosts.yaml fleetd_url beats the local daemon. A hosts.yaml that
+// exists but fails to parse is surfaced via the returned error so a
+// broken registry is never misreported as an absent one.
+func resolveFleetd(apiFlag string) (fleetdTarget, error) {
 	base := apiFlag
 	if base == "" {
 		base = strings.TrimSpace(os.Getenv("VIBE_API"))
 	}
 	if base == "" {
-		if hosts, err := fleetcfg.Load(); err == nil && hosts != nil {
+		hosts, err := fleetcfg.Load()
+		if err != nil {
+			return fleetdTarget{}, fmt.Errorf("parse %s: %w", paths.HostsFile(), err)
+		}
+		if hosts != nil {
 			base = hosts.FleetdURL
 		}
 	}
@@ -58,18 +65,19 @@ func resolveFleetd(apiFlag string) fleetdTarget {
 		// Local daemon over the unix socket (no token — the socket's 0600
 		// perms are the boundary), same dial trick as the RPC client.
 		return fleetdTarget{hc: &http.Client{
+			Timeout: 10 * time.Second,
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 					var d net.Dialer
 					return d.DialContext(ctx, "unix", paths.Socket())
 				},
 			},
-		}, base: "http://vibe.local"}
+		}, base: "http://vibe.local"}, nil
 	}
 	return fleetdTarget{
 		base: strings.TrimRight(base, "/"),
 		hc:   &http.Client{Timeout: 10 * time.Second},
-	}
+	}, nil
 }
 
 // fetchState GETs /api/fleet/state from the resolved fleetd.
@@ -108,7 +116,10 @@ func cellStatusCmd() *cobra.Command {
 			if ctx == nil {
 				ctx = context.Background()
 			}
-			target := resolveFleetd(apiFlag)
+			target, err := resolveFleetd(apiFlag)
+			if err != nil {
+				return err
+			}
 			snap, err := target.fetchState(ctx)
 			out := cmd.OutOrStdout()
 			if err != nil {
@@ -122,9 +133,25 @@ func cellStatusCmd() *cobra.Command {
 	return cmd
 }
 
+// termSafe strips control characters from server-supplied strings
+// before they hit the terminal: cell names, intent reasons, and model
+// ids all originate off-box, and a malicious or garbled one must not
+// inject escape sequences into the operator's tty.
+func termSafe(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\t' {
+			return ' '
+		}
+		if !unicode.IsPrint(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 // renderStatus prints the derived table plus per-cell deep links.
 func renderStatus(out io.Writer, base string, snap *fleetapi.StateSnapshot) {
-	fmt.Fprintf(out, "fleetd: %s", base)
+	fmt.Fprintf(out, "fleetd: %s", termSafe(base))
 	if snap.Daemon.AuthRejected > 0 {
 		fmt.Fprintf(out, "  (auth rejections since start: %d — a client somewhere holds a stale token)", snap.Daemon.AuthRejected)
 	}
@@ -132,10 +159,10 @@ func renderStatus(out io.Writer, base string, snap *fleetapi.StateSnapshot) {
 	fmt.Fprintf(out, "%-14s %-13s %-14s %-34s %s\n", "CELL", "DISPLAY", "CLASS", "MODELS", "INTENT / LAST SEEN")
 	for _, c := range snap.Cells {
 		fmt.Fprintf(out, "%-14s %-13s %-14s %-34s %s\n",
-			c.Name, c.Display, dash(c.Class), modelSummary(c), intentLastSeen(c))
+			termSafe(c.Name), termSafe(c.Display), dash(termSafe(c.Class)), termSafe(modelSummary(c)), termSafe(intentLastSeen(c)))
 	}
 	for _, c := range snap.Cells {
-		fmt.Fprintf(out, "  %-12s ui: %s/ui\n", c.Name, strings.TrimRight(c.URL, "/"))
+		fmt.Fprintf(out, "  %-12s ui: %s/ui\n", termSafe(c.Name), termSafe(strings.TrimRight(c.URL, "/")))
 	}
 }
 
@@ -195,7 +222,10 @@ func intentLastSeen(c fleetapi.CellSnapshot) string {
 // output says so rather than guessing.
 func renderDegraded(out io.Writer, fleetdErr error) error {
 	hosts, err := fleetcfg.Load()
-	if err != nil || !hosts.HasCells() {
+	if err != nil {
+		return fmt.Errorf("fleetd unreachable (%v) and %s is invalid: %w", fleetdErr, paths.HostsFile(), err)
+	}
+	if !hosts.HasCells() {
 		return fmt.Errorf("fleetd unreachable (%v) and no hosts.yaml cells for the degraded fallback", fleetdErr)
 	}
 	fmt.Fprintf(out, "DEGRADED (fleetd unreachable: %v)\n", fleetdErr)
@@ -221,7 +251,7 @@ func renderDegraded(out io.Writer, fleetdErr error) error {
 		if cellUp {
 			cell = "up"
 		}
-		fmt.Fprintf(out, "%-14s %-10s %-10s %s\n", n, cell, host, models)
+		fmt.Fprintf(out, "%-14s %-10s %-10s %s\n", termSafe(n), cell, host, termSafe(models))
 	}
 	return nil
 }
@@ -285,7 +315,14 @@ func cellAwaitCmd() *cobra.Command {
 			} else {
 				up = true // default
 			}
-			return awaitCell(ctx, cmd.OutOrStdout(), resolveFleetd(apiFlag), args[0], up, timeout, interval)
+			if interval <= 0 {
+				return fmt.Errorf("--interval must be > 0")
+			}
+			target, err := resolveFleetd(apiFlag)
+			if err != nil {
+				return err
+			}
+			return awaitCell(ctx, cmd.OutOrStdout(), target, args[0], up, timeout, interval)
 		},
 	}
 	cmd.Flags().StringVar(&apiFlag, "api", "", "fleetd base URL (default: $VIBE_API, hosts.yaml fleetd_url, or the local daemon)")
