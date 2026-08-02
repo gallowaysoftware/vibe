@@ -18,6 +18,7 @@ roles and the rules are the transferable part.
 | **GPU cell** | a workstation-class card | opportunistic | Chat/vision/coder models JIT-loaded, plus ComfyUI. Explicitly allowed to be off, or full of game. |
 | **utility cell** | a small always-on GPU | always-on | The utility plane: embed/rerank/classifier/STT/TTS pinned (`ttl: 0` + preload), a small swap pool in the remainder. |
 | **heavy cell** | large unified memory, fast interconnect | always-on | The big models — including multi-node serving where the interconnect allows. |
+| **roaming cell** | a laptop that docks | roaming | Serves like a GPU cell while docked on AC; leaves the building without notice. Absence is normal, not an incident — its catalog entries prune when it goes (fleet-control.md §4). |
 | **cloud** | — | always | `cloud_peer` defs on the front. Never a silent fallback — always an explicit model id. |
 
 The central move: **the front lives on the box that is never off**, not
@@ -130,19 +131,25 @@ Off the shelf (no code):
 
 Build (all small, and all already roadmapped except the first):
 1. **Per-cell rendering** — `vibe router render --cell <name>`:
-   hosts.yaml (fleet.md §4.1) gains a `cell:` assignment per backend
-   def; the front render emits peers-only (cells + cloud), each GPU cell
-   render emits its local defs. Extends the A2 renderer; the alias/owner
-   rules already exist.
+   backend defs gain a `cell:` assignment (hosts.yaml, fleet.md §4.1,
+   lists the cells); the front render emits peers-only (cells + cloud),
+   each GPU cell render emits its local defs. Extends the A2 renderer;
+   the alias/owner rules already exist. *Scheduled: fleet-control C2.*
 2. **Config distribution** — fleet.md P2 converge (render → hash → scp →
    restart unit), with a docker-host variant (docker restart over SSH
    instead of a systemd user unit).
 3. **Model distribution** — fleet.md P4 `vibe model ensure` unchanged.
 4. **Fleet dashboard** — the A8a substrate (`/api/fleet/state` +
-   `/events`) needs its web UI.
+   `/events`) needs its web UI. *Scheduled: fleet-control C4.*
 5. **Warm schedules (optional)** — a cron hitting the front with a
    1-token request warms a model before waking hours; llama-swap `hooks`
    only cover startup, so scheduled warming lives outside it.
+   *Scheduled: fleet-control C4.*
+
+Items 1, 4 and 5 — plus node state, intent, and cell presence, which
+this doc never covered — are designed in
+[fleet-control.md](fleet-control.md) and phased in
+[fleet-control-plan/](fleet-control-plan/) (C0–C4).
 
 ## 4. Sequencing
 
