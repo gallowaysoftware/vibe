@@ -56,6 +56,9 @@ func TestDaemon_AnnounceLoop(t *testing.T) {
 	cellMux.HandleFunc("GET /running", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"running":[{"model":"qwen","state":"ready"}]}`))
 	})
+	cellMux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"qwen","object":"model"}]}`))
+	})
 	cellMux.HandleFunc("GET /api/events", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)

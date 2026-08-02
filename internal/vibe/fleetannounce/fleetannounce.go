@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -91,8 +92,11 @@ type Client struct {
 	mu          sync.Mutex
 	localIntent fleetapi.AnnounceIntent
 	// registryFailureLogged gates log-once-then-quiet on registry
-	// outages; reset on the next successful announce.
+	// outages; reset on the next successful announce. authRejected
+	// marks when the failure was auth (401), not reachability — the
+	// once-log says which.
 	registryFailureLogged bool
+	authRejected          bool
 	// deflessWarned gates log-once for catalog models with no def.
 	deflessWarned map[string]bool
 }
@@ -183,7 +187,11 @@ func (c *Client) Run(ctx context.Context) error {
 		err := c.announceOnce(ctx)
 		if err != nil {
 			if !c.registryFailureLogged {
-				c.logger.Warn("announce failed (registry unreachable?); quiet retry with backoff", "err", err)
+				if c.authRejected {
+					c.logger.Warn("announce failed (auth rejected — check the token file); quiet retry with backoff", "err", err)
+				} else {
+					c.logger.Warn("announce failed (registry unreachable?); quiet retry with backoff", "err", err)
+				}
 				c.registryFailureLogged = true
 			}
 			select {
@@ -199,6 +207,7 @@ func (c *Client) Run(ctx context.Context) error {
 			}
 			continue
 		}
+		c.authRejected = false
 		if c.registryFailureLogged {
 			c.logger.Info("announce succeeded; registry reachable again")
 			c.registryFailureLogged = false
@@ -265,12 +274,16 @@ func (c *Client) announceOnce(ctx context.Context) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		c.authRejected = true
+		return fmt.Errorf("announce: HTTP 401 (auth rejected — check the token file: %s)", c.tokenProblem())
+	}
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("announce: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	var out fleetapi.AnnounceResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
 		return fmt.Errorf("decode announce response: %w", err)
 	}
 	if out.IntervalS > 0 {
@@ -289,20 +302,36 @@ func (c *Client) intentEcho() *fleetapi.AnnounceIntent {
 }
 
 // reconcile applies the conflict rule to the registry's desired intent
-// (newer wins, ties to the cell) and executes queued commands.
+// (newer wins, ties to the cell) and executes queued commands. Intent
+// only changes on a SUCCESSFUL verb — a failed or unconfigured verb
+// leaves the echo alone so the request stays pending and the mismatch
+// keeps showing (the C2 one-writer rule: a failed drain never records).
 func (c *Client) reconcile(ctx context.Context, resp *fleetapi.AnnounceResponse) {
 	if d := resp.DesiredIntent; d != nil {
 		c.mu.Lock()
 		local := c.localIntent
 		c.mu.Unlock()
 		if d.Since.After(local.Since) {
-			switch {
-			case d.State == "drained" && local.State != "drained":
-				c.runVerb(ctx, "drain", c.cfg.CellCmds.Drain)
-				_ = c.SetLocalIntent("drained")
-			case d.State == "serving" && local.State == "drained":
-				c.runVerb(ctx, "resume", c.cfg.CellCmds.Resume)
-				_ = c.SetLocalIntent("serving")
+			switch d.State {
+			case local.State:
+				// Already in the requested state: ack by advancing the
+				// echo, or the request is handed back on every heartbeat
+				// forever (the ghost-request livelock).
+				if err := c.SetLocalIntent(d.State); err != nil {
+					c.logger.Warn("intent ack not persisted; the request stays pending", "err", err)
+				}
+			case "drained":
+				if c.runVerb(ctx, "drain", c.cfg.CellCmds.Drain) {
+					if err := c.SetLocalIntent("drained"); err != nil {
+						c.logger.Warn("drained intent not persisted", "err", err)
+					}
+				}
+			case "serving":
+				if c.runVerb(ctx, "resume", c.cfg.CellCmds.Resume) {
+					if err := c.SetLocalIntent("serving"); err != nil {
+						c.logger.Warn("serving intent not persisted", "err", err)
+					}
+				}
 			}
 		}
 		// Older or same: the cell wins (we echo ours; fleetd drops its
@@ -314,21 +343,23 @@ func (c *Client) reconcile(ctx context.Context, resp *fleetapi.AnnounceResponse)
 }
 
 // runVerb executes a drain/resume verb via sh -c (same semantics as the
-// daemon's cell_cmds: bounded, stderr reported). A failing verb leaves
-// intent unchanged so the next announce keeps flagging the mismatch.
-func (c *Client) runVerb(ctx context.Context, name, cmd string) {
+// daemon's cell_cmds: bounded, stderr reported), returning whether it
+// RAN successfully — intent is stamped only then, so a failed or
+// unconfigured verb keeps the request pending and the mismatch visible.
+func (c *Client) runVerb(ctx context.Context, name, cmd string) bool {
 	if cmd == "" {
-		c.logger.Info("desired intent arrived but no cell verb is configured", "verb", name)
-		return
+		c.logger.Info("desired intent arrived but no cell verb is configured; request stays pending", "verb", name)
+		return false
 	}
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	out, err := execSh(ctx, cmd)
 	if err != nil {
 		c.logger.Warn("desired-intent verb failed", "verb", name, "err", err, "output", out)
-		return
+		return false
 	}
 	c.logger.Info("executed desired-intent verb", "verb", name)
+	return true
 }
 
 // executeCommand runs one piggybacked verb (unload/warm) against the
@@ -339,7 +370,7 @@ func (c *Client) executeCommand(ctx context.Context, cmd fleetapi.AnnounceComman
 	var err error
 	switch cmd.Verb {
 	case "unload":
-		err = c.postNoContent(ctx, c.cfg.LlamaSwapURL+"/api/models/unload/"+cmd.Model)
+		err = c.postNoContent(ctx, c.cfg.LlamaSwapURL+"/api/models/unload/"+url.PathEscape(cmd.Model))
 	case "warm":
 		body := `{"model":` + strconv.Quote(cmd.Model) + `,"max_tokens":1,"messages":[{"role":"user","content":"warm"}]}`
 		err = c.postNoContent(ctx, c.cfg.LlamaSwapURL+"/v1/chat/completions", body)
@@ -505,6 +536,22 @@ func (c *Client) runningStates(ctx context.Context) (map[string]string, error) {
 		out[m.Model] = m.State
 	}
 	return out, nil
+}
+
+// tokenProblem describes the token situation for the 401 log line:
+// missing file vs unreadable vs empty vs present-but-rejected.
+func (c *Client) tokenProblem() string {
+	if c.cfg.TokenFile == "" {
+		return "no token_file configured"
+	}
+	data, err := os.ReadFile(c.cfg.TokenFile)
+	if err != nil {
+		return fmt.Sprintf("%s: %v", c.cfg.TokenFile, err)
+	}
+	if strings.TrimSpace(string(data)) == "" {
+		return c.cfg.TokenFile + " is empty"
+	}
+	return "token present but rejected (wrong token? rotate or re-provision)"
 }
 
 func (c *Client) token() string {

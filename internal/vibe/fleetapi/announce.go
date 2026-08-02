@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+	"unicode"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 )
@@ -146,10 +147,83 @@ func (s *Server) handleAnnounce(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("unknown cell %q (not in the registry)", req.Cell), http.StatusBadRequest)
 		return
 	}
+	if err := validateAnnounce(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	clampEchoClock(&req)
 
 	resp := s.recordAnnounce(&req)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// maxAnnounceFieldLen bounds announce-supplied strings; they land in
+// fleet_status (human and agent contexts alike).
+const maxAnnounceFieldLen = 256
+
+// validateAnnounce enforces enum values and field hygiene (length,
+// control characters) on the parts of an announce that flow into
+// status surfaces. Unknown FIELDS stay tolerated (the version-skew
+// rule); unknown VALUES of defined fields are rejected.
+func validateAnnounce(req *AnnounceRequest) error {
+	clean := func(label, v string) error {
+		if len(v) > maxAnnounceFieldLen {
+			return fmt.Errorf("%s exceeds %d bytes", label, maxAnnounceFieldLen)
+		}
+		for _, r := range v {
+			if !unicode.IsPrint(r) {
+				return fmt.Errorf("%s contains a control character", label)
+			}
+		}
+		return nil
+	}
+	if req.Intent != nil {
+		switch req.Intent.State {
+		case "serving", "drained", "withdrawing":
+		default:
+			return fmt.Errorf("intent.state %q must be one of serving, drained, withdrawing", req.Intent.State)
+		}
+	}
+	for _, m := range req.Models {
+		if err := clean("models[].id", m.ID); err != nil {
+			return err
+		}
+		if err := clean("models[].state", m.State); err != nil {
+			return err
+		}
+	}
+	if req.Versions != nil {
+		for label, v := range map[string]string{
+			"versions.llama_swap": req.Versions.LlamaSwap,
+			"versions.vibe":       req.Versions.Vibe,
+			"versions.defs_sha":   req.Versions.DefsSHA,
+		} {
+			if err := clean(label, v); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// echoFutureSkew bounds how far ahead of fleetd's clock an echo's
+// timestamp may be. The announce client stamps time.Now(), so a small
+// allowance covers jitter; a skewed or forged clock (year-2999) gets
+// CLAMPED to now, preserving reconciliation without letting a cell
+// timestamp cancel requests from the future.
+const echoFutureSkew = 2 * time.Minute
+
+// clampEchoClock caps echo.Since at now+echoFutureSkew. Everything else
+// in the protocol is fleetd-clock-only (staleness); this is the one
+// place a cell clock is consulted, so it's the one place it's bounded.
+func clampEchoClock(req *AnnounceRequest) {
+	if req.Intent == nil || req.Intent.Since.IsZero() {
+		return
+	}
+	if max := time.Now().UTC().Add(echoFutureSkew); req.Intent.Since.After(max) {
+		req.Intent.Since = max
+	}
 }
 
 // recordAnnounce upserts the presence entry, fires transition events,
@@ -168,6 +242,7 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 
 	firstEver := !p.Announcing
 	wasStaleOrWithdrawn := p.Stale || p.Withdrawn
+	wasWithdrawing := p.Withdrawn
 	p.Announcing = true
 	p.Seq = req.Seq
 	p.IntervalS = intervalS
@@ -191,14 +266,18 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	p.Capacity = req.Capacity
 	p.Versions = req.Versions
 
+	// Transition-gated events: named transitions fire on transitions,
+	// not on every steady-state heartbeat.
 	var events []Event
-	if firstEver {
+	switch {
+	case firstEver:
 		events = append(events, Event{Cell: req.Cell, Type: EventCellReturned})
-	} else if wasStaleOrWithdrawn {
-		events = append(events, Event{Cell: req.Cell, Type: EventCellReturned})
-	}
-	if p.Withdrawn {
+	case p.Withdrawn && wasWithdrawing:
+		// Steady-state withdraw: no new transition, no event drip.
+	case p.Withdrawn:
 		events = append(events, Event{Cell: req.Cell, Type: EventCellWithdrawn})
+	case wasStaleOrWithdrawn:
+		events = append(events, Event{Cell: req.Cell, Type: EventCellReturned})
 	}
 	s.mu.Unlock()
 
@@ -276,13 +355,24 @@ func (s *Server) drainCommands(cell string) []AnnounceCommand {
 	return cmds
 }
 
+// maxQueuedCommands bounds the per-cell command queue; beyond it the
+// oldest drop off with a log (a cell that never announces must not
+// grow memory, and any future producer must validate against the def
+// set rather than trust this bound).
+const maxQueuedCommands = 64
+
 // queueCommand piggybacks a verb for the cell's next announce. Used
 // when the cell can't be reached interactively (after C3, daemon_url
 // is an optimization, not a requirement).
 func (s *Server) queueCommand(cell string, cmd AnnounceCommand) {
 	s.mu.Lock()
-	s.commands[cell] = append(s.commands[cell], cmd)
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	q := s.commands[cell]
+	if len(q) >= maxQueuedCommands {
+		slog.Warn("command queue full; dropping oldest", "cell", cell)
+		q = q[1:]
+	}
+	s.commands[cell] = append(q, cmd)
 }
 
 // presenceSnapshot returns a copy of the presence table (read-side,

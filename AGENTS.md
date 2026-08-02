@@ -191,9 +191,19 @@ optional.)
   - **The conflict rule**: registry intent is a REQUEST until the
     cell echoes it; a NEWER echo resolves it either way (complied or
     human override); older echo gets desired_intent handed back. The
-    cell-side mirror (fleetannounce) executes only newer requests and
-    stamps local intent on every local verb. Split-brain always
-    resolves toward the box.
+    cell-side mirror (fleetannounce) executes only newer requests,
+    **stamps intent only on a successful verb** (a failed/missing verb
+    keeps the request pending — a false ack once let a lie resolve),
+    and re-stamps already-in-state requests (ghost livelock). The
+    daemon skips its C2-era intent POST when announcing (the echo IS
+    the record). Split-brain always resolves toward the box. Echo
+    `since` is clamped to now+2min at ingest — the one place a cell
+    clock is consulted.
+    `"serving"` on an announcing cell stores a resolvable resume
+    request; on never-announced cells it deletes (C1 semantics).
+  - **Availability honors evidence over declaration**: a probe that
+    just answered stands over a drained echo (INCONSISTENT nags); the
+    echo decides only when probes can't reach the cell.
   - **Announce-side model truth**: `gatherModels` = defs ∩ the cell's
     own llama-swap catalog (a multi-cell box must not leak defs across
     cells); defless catalog ids announce hashless + log-once.
@@ -203,7 +213,9 @@ optional.)
     argv[0] and --port, NORMALIZE home-anchored paths to `~` (fleetd
     runs root, cells run users — tilde expansion otherwise false-
     mismatches every def), sort flag groups, join `\x00`. Weights-path
-    swaps must still mismatch.
+    swaps must still mismatch. Enforcement binds to the def's HOME
+    cell (a cross-cell announce can't yank a strict def); unassigned
+    defs skip enforcement.
   - **Presence-derived render** (fleetapi/render_loop.go): roaming
     prunes on stale/withdrawn, always_on/opportunistic hold; re-add
     needs `MinHealthyStreak` consecutive fresh announces (default 3);
@@ -218,6 +230,11 @@ optional.)
   - `vibe fleet announce` is the slim announcer (cells without a full
     daemon); the daemon's own loop is internal/vibe/daemon/announce.go
     — same fleetannounce.Client both ways.
+  - **The fleet token is every cell's voice** (design §6 threat note):
+    announce authenticates the connection, never the cell name — a
+    forged announce can fake SERVING, prune a roaming catalog, or
+    cancel pending drains. Distribute tokens like cell-root; per-cell
+    credentials are a futures item.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.

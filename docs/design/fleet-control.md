@@ -260,12 +260,26 @@ it at the registry." Two rules keep it honest:
   the cell echoes it; the UI shows "drain requested, awaiting ack."
   No split-brain: the box you're standing at is always right.
 - **Fingerprints become a contract.** `flags_sha256` is computed from
-  the rendered serving argv (minus binary path and port). Mismatch
-  always raises a loud event; it excludes the model from the front
-  render (**fail-closed**) only for defs marked `fingerprint: strict` —
-  embedding-class models, where drift is silent retrieval damage. Chat
-  models stay fail-open: a hash-normalization bug must not yank a
-  working model from the catalog.
+  the rendered serving argv (minus binary path and port, home paths
+  normalized). Mismatch always raises a loud event; it excludes the
+  model from the front render (**fail-closed**) only for defs marked
+  `fingerprint: strict` — embed-class models, where drift is silent
+  retrieval damage — and only when the mismatch comes from the def's
+  OWN cell (another cell's announce can never yank it). Chat models
+  stay fail-open: a hash-normalization bug must not yank a working
+  model from the catalog.
+
+**The trust note (written down because it's easy to miss):** the fleet
+bearer token is *every cell's voice*. `POST /api/fleet/announce`
+authenticates the connection, never the cell name — any token holder
+can announce as any registered cell, and a forged announce can fake
+SERVING for a dead box, prune a roaming cell's catalog entries (via a
+fake `withdrawing`), and cancel pending drain/resume requests (via a
+forged newer echo — bounded by a future-skew clamp at ingest). This is
+parity with the token's existing powers (MCP drain_cell, unload_model,
+intent POST) for the documented LAN posture, but treat token
+distribution as cell-root. Per-cell announce credentials are a futures
+item (both-direction per-cell auth).
 
 The front render becomes presence-derived (with the class-based
 hold/prune policy above), debounced, written to the watched config —

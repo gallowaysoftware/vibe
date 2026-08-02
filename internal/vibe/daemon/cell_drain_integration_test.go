@@ -21,10 +21,12 @@ import (
 	"github.com/gallowaysoftware/vibe/proto/vibe/v1/vibev1connect"
 )
 
-// intentSink records intent POSTs the way fleetd would.
+// intentSink records intent POSTs the way fleetd would, and captures
+// announces the way fleetd's presence table does.
 type intentSink struct {
-	mu    sync.Mutex
-	posts []map[string]any
+	mu        sync.Mutex
+	posts     []map[string]any
+	announces []map[string]any
 }
 
 func (s *intentSink) handler() http.Handler {
@@ -40,6 +42,15 @@ func (s *intentSink) handler() http.Handler {
 	mux.HandleFunc("GET /api/fleet/leases", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"leases":[]}`))
 	})
+	mux.HandleFunc("POST /api/fleet/announce", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		s.mu.Lock()
+		s.announces = append(s.announces, body)
+		s.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"interval_s": 1})
+	})
 	return mux
 }
 
@@ -47,6 +58,18 @@ func (s *intentSink) calls() []map[string]any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]map[string]any{}, s.posts...)
+}
+
+func (s *intentSink) echoes() []map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []map[string]any
+	for _, a := range s.announces {
+		if intent, ok := a["intent"].(map[string]any); ok {
+			out = append(out, intent)
+		}
+	}
+	return out
 }
 
 // TestDaemon_CellDrain_IntentWriterByListener proves the C2 one-writer
@@ -86,7 +109,9 @@ func TestDaemon_CellDrain_IntentWriterByListener(t *testing.T) {
 		t.Errorf("TCP (fleetd) invocation wrote intent from the cell daemon: %v", got)
 	}
 
-	// Unix invocation (the local operator): intent posted.
+	// Unix invocation (the local operator): intent lands via the
+	// announce ECHO (C3 — the echo is the cell-side record; the C2-era
+	// direct POST is skipped for announcing cells).
 	unixClient := vibev1connect.NewControlServiceClient(&http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -98,28 +123,40 @@ func TestDaemon_CellDrain_IntentWriterByListener(t *testing.T) {
 	if _, err := unixClient.CellDrain(context.Background(), connect.NewRequest(&vibev1.CellDrainRequest{Reason: "gaming", Eta: "23:00"})); err != nil {
 		t.Fatalf("unix drain: %v", err)
 	}
-	deadline := time.Now().Add(3 * time.Second)
-	for len(sink.calls()) == 0 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
+	if got := sink.calls(); len(got) != 0 {
+		t.Errorf("announcing cell still POSTed intent directly: %v", got)
 	}
-	got := sink.calls()
-	if len(got) != 1 {
-		t.Fatalf("unix invocation: intent posts = %v, want 1", got)
-	}
-	if got[0]["cell"] != "gpu-cell" || got[0]["state"] != "drained" || got[0]["reason"] != "gaming" || got[0]["eta"] != "23:00" {
-		t.Errorf("intent = %v", got[0])
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		found := false
+		for _, e := range sink.echoes() {
+			if e["state"] == "drained" {
+				found = true
+			}
+		}
+		if found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no drained echo within 5s; announces: %v", sink.echoes())
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 
-	// Unix resume clears it.
+	// Unix resume: the echo flips back to serving.
 	if _, err := unixClient.CellResume(context.Background(), connect.NewRequest(&vibev1.CellResumeRequest{})); err != nil {
 		t.Fatalf("unix resume: %v", err)
 	}
-	deadline = time.Now().Add(3 * time.Second)
-	for len(sink.calls()) < 2 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if got := sink.calls(); len(got) != 2 || got[1]["state"] != "serving" {
-		t.Errorf("resume: posts = %v, want a serving post", got)
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		last := sink.echoes()
+		if len(last) > 0 && last[len(last)-1]["state"] == "serving" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no serving echo after resume; echoes: %v", sink.echoes())
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

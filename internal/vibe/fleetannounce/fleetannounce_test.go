@@ -211,6 +211,96 @@ func TestConflictRule_NewerDesiredExecutes(t *testing.T) {
 	}
 }
 
+func TestConflictRule_FailingVerbNeverAcks(t *testing.T) {
+	// The false-ack finding: a drain whose verb FAILS must not stamp
+	// intent — the echo stays serving and the request stays pending.
+	reg := newFakeRegistry(t)
+	swap := newFakeLlamaSwap(t, `{"running":[]}`)
+	reg.response.DesiredIntent = &fleetapi.Intent{
+		State: "drained", Reason: "via MCP", Since: time.Now().UTC().Add(time.Minute),
+	}
+	cfg := testConfig(reg, swap)
+	cfg.CellCmds = CellCmds{Drain: "false"}
+	c, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := execCmd
+	execCmd = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return nil, fmt.Errorf("exit status 4")
+	}
+	defer func() { execCmd = orig }()
+
+	if err := c.announceOnce(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.LocalIntent(); got.State != "serving" {
+		t.Errorf("failed verb stamped intent: %s — a failed drain never records", got.State)
+	}
+	last := reg.calls()[len(reg.calls())-1]
+	if last.Intent.State != "serving" {
+		t.Errorf("echo = %s, want serving (request stays pending)", last.Intent.State)
+	}
+}
+
+func TestConflictRule_NoVerbsNeverAcks(t *testing.T) {
+	// The slim-cell case: no cell_cmds at all. The drain request must
+	// stay pending forever (visible, actionable) — never a fake ack.
+	reg := newFakeRegistry(t)
+	swap := newFakeLlamaSwap(t, `{"running":[]}`)
+	reg.response.DesiredIntent = &fleetapi.Intent{
+		State: "drained", Reason: "via MCP", Since: time.Now().UTC().Add(time.Minute),
+	}
+	c, err := New(testConfig(reg, swap)) // no CellCmds
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.announceOnce(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.LocalIntent(); got.State != "serving" {
+		t.Errorf("verb-less cell acked a drain: %s", got.State)
+	}
+}
+
+func TestConflictRule_AlreadyInStateReStamps(t *testing.T) {
+	// The ghost-request livelock: the cell is already drained with an
+	// OLDER stamp than the request — reconcile must advance the echo
+	// (no verb runs) or the request is handed back forever.
+	reg := newFakeRegistry(t)
+	swap := newFakeLlamaSwap(t, `{"running":[]}`)
+	c, err := New(testConfig(reg, swap))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetLocalIntent("drained"); err != nil {
+		t.Fatal(err)
+	}
+	// The request is NEWER than the local stamp (same state).
+	reg.response.DesiredIntent = &fleetapi.Intent{
+		State: "drained", Reason: "x", Since: time.Now().UTC().Add(time.Minute),
+	}
+	verbs := 0
+	orig := execCmd
+	execCmd = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		verbs++
+		return nil, nil
+	}
+	defer func() { execCmd = orig }()
+
+	before := c.LocalIntent().Since
+	if err := c.announceOnce(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if verbs != 0 {
+		t.Error("a verb ran for an already-in-state request")
+	}
+	after := c.LocalIntent()
+	if after.State != "drained" || !after.Since.After(before) {
+		t.Errorf("local intent did not advance: before %v after %+v — the request never resolves", before, after)
+	}
+}
+
 func TestConflictRule_OlderDesiredIgnored(t *testing.T) {
 	reg := newFakeRegistry(t)
 	swap := newFakeLlamaSwap(t, `{"running":[]}`)

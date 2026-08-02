@@ -69,6 +69,46 @@ Implementation notes beyond the doc's letter:
   -watch-config applies. The dry-run path (C2's render_front) verified
   parity before authorship flipped.
 
+Adversarial-review addendum (2026-08-02, two reviewers — 11+ findings,
+all fixed pre-merge with regression tests):
+
+- **False acks (HIGH)**: reconcile stamped intent regardless of verb
+  outcome — a failed or unconfigured drain verb still echoed drained,
+  which fleetd then resolved as satisfied, while the drained echo
+  suppressed the INCONSISTENT detector. Verbs now return success and
+  intent stamps only then; a verb-less cell's requests stay pending
+  (visible, actionable) forever instead of lying.
+- **Ghost requests (MAJOR)**: every local `vibe cell drain` on an
+  announcing cell manufactured an eternal "requested, awaiting ack"
+  (the C2 POST stamped a newer request than the cell's own). The POST
+  is now skipped for announcing cells (the echo IS the record), and
+  reconcile re-stamps an already-in-state request so it resolves.
+- **Resume via announce was a silent no-op (BLOCKER)**: "serving"
+  deleted the intent entry, so desired_intent could never carry it.
+  The intent store now keeps a resolvable serving REQUEST for
+  announcing cells (dropped when the cell echoes serving newer); for
+  never-announced cells, "serving" still deletes (C1 semantics).
+- **Probe evidence beats declaration**: a probe that just answered now
+  stands over a drained echo (INCONSISTENT nags again); the echo
+  decides availability only when probes can't reach the cell.
+- **Echo clock clamp**: cell-supplied `since` is capped at now+2min —
+  a forged/skewed future can't cancel requests from the future (and
+  the "cell clocks are never consulted" rule holds except here).
+- **Fingerprint binding**: enforcement only fires for the def's HOME
+  cell — an announce from another cell carrying a garbage hash can't
+  yank a strict def. Unassigned defs skip enforcement (the front's own
+  checkout is their render truth).
+- **Impersonation documented**: the fleet token is every cell's voice
+  (announce authenticates the connection, never the name) — threat
+  note added to design §6 and the fleetd README; per-cell credentials
+  remain a futures item.
+- Smaller: transition-gated events (no steady-state withdraw drip),
+  intent.state enum + field hygiene at ingest (length, control
+  chars), 64-deep command queue cap, PathEscape on piggyback unload,
+  capped announce response decode, 401-distinct client logging, and
+  decorate() copying presence under the lock (a torn slice read could
+  panic the state handler).
+
 ## Goal
 
 Cells dial **out** and say what they serve; the front's peer config

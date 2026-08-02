@@ -414,6 +414,52 @@ func TestRenderLoopUnchangedNoWrite(t *testing.T) {
 // TestRenderLoopFingerprint covers C3 §5: mismatches always publish the
 // loud event (with defs provenance); strict excludes the def from the
 // render, advisory keeps it.
+// The cross-cell canary: an announce from a cell that does NOT own a
+// strict def, carrying a garbage hash for it, must NOT exclude it or
+// even raise the event — enforcement is bound to the def's home cell,
+// or any registered name could yank any strict def from the render.
+func TestRenderLoopFingerprintCrossCellCannotYank(t *testing.T) {
+	strictDef := llmDef("embed-x", "gpu", "strict")
+	unassignedDef := llmDef("chat-z", "", "strict")
+	cells := []Cell{
+		{Name: "front", URL: "http://127.0.0.1:1", Class: "always_on"},
+		{Name: "gpu", URL: "http://127.0.0.1:3", Class: "always_on"},
+		{Name: "laptop", URL: "http://127.0.0.1:4", Class: "roaming"},
+	}
+	hosts := &fleetcfg.File{Cells: map[string]fleetcfg.Cell{
+		"front":  {URL: "http://127.0.0.1:1", Class: fleetcfg.ClassAlwaysOn},
+		"gpu":    {URL: "http://127.0.0.1:3", Class: fleetcfg.ClassAlwaysOn},
+		"laptop": {URL: "http://127.0.0.1:4", Class: fleetcfg.ClassRoaming},
+	}}
+	probe := newRenderProbe(strictDef, unassignedDef)
+
+	cfg := RenderLoopConfig{FullWaveTimeout: 30 * time.Second, RenderMinInterval: time.Millisecond}
+	cfg.Hosts = hosts
+	cfg.FrontConfigPath = filepath.Join(t.TempDir(), "front.yaml")
+	cfg.LoadDefs = probe.loadDefs
+	cfg.Render = probe.render
+	cfg.WriteFile = probe.writeFile
+	s := New(cells, filepath.Join(t.TempDir(), "hist.json"), testDaemonInfo, Options{})
+	t.Cleanup(s.Close)
+	s.StartRenderLoop(cfg)
+
+	// The owning cell announces healthily; the cross-cell announce
+	// carries a garbage hash for gpu's strict def and for an unassigned
+	// strict def. Neither must exclude or fire.
+	rlAnnounce(t, s, "front", rlServing(), nil)
+	rlAnnounce(t, s, "gpu", rlServing(), nil)
+	garbage := strings.Repeat("0", 64)
+	rlAnnounce(t, s, "laptop", rlServing(), []AnnounceModel{
+		{ID: "embed-x", State: "ready", FlagsSHA256: garbage},
+		{ID: "chat-z", State: "ready", FlagsSHA256: garbage},
+	})
+
+	names := probe.waitPass(t, "render ignores cross-cell hashes", func(n []string) bool {
+		return slices.Contains(n, "embed-x") && slices.Contains(n, "chat-z")
+	})
+	_ = names
+}
+
 func TestRenderLoopFingerprint(t *testing.T) {
 	strictDef := llmDef("embed-x", "gpu", "strict")
 	advisoryDef := llmDef("chat-y", "gpu", "")

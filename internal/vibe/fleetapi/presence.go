@@ -65,12 +65,13 @@ func (s *Server) persistLastSeen() {
 // decorate fills a fresh snapshot's declared-intent, last-seen, active
 // leases, presence, and derived display state from the server's stores.
 //
-// Availability semantics with presence (C3): once a cell announces, its
-// heartbeat is truth — a fresh announce proves the box is up (beating a
-// firewalled host_probe), and the intent ECHO decides the serving axis
-// (serving-with-no-loaded-models is up-cold, drained is stack-down).
-// Stale/withdrawn presence reads as down. Never-announced cells keep
-// the C1 probe behavior (host_probe + cell probes).
+// Availability semantics with presence (C3): a fresh announce proves the
+// box is up (beating a firewalled host_probe). The serving axis honors
+// EVIDENCE over declaration: a probe that just answered is proof of life
+// a drained echo can't retract (the cell is mid-stop, or its ack is a
+// lie — either way INCONSISTENT nags, per the design table). The echo
+// decides availability only when probes can't reach the cell (the
+// no-inbound-port case presence exists for).
 func (s *Server) decorate(snap *CellSnapshot) {
 	s.mu.Lock()
 	intent, hasIntent := s.intents[snap.Name]
@@ -81,20 +82,36 @@ func (s *Server) decorate(snap *CellSnapshot) {
 			leases = append(leases, l)
 		}
 	}
-	p := s.presence[snap.Name]
+	// Copy presence under the lock — recordAnnounce and the staleness
+	// loop mutate the same entry, and a torn copy can panic the handler
+	// (slice-header swap mid-read) or serialize a half-mixed state.
+	var p *Presence
+	if sp := s.presence[snap.Name]; sp != nil {
+		cp := *sp
+		p = &cp
+	}
 	s.mu.Unlock()
 
 	var echo *AnnounceIntent
 	probeOK := snap.Reachable
 	if p != nil && p.Announcing {
-		cp := *p
-		snap.Presence = &cp
+		snap.Presence = p
 		echo = p.IntentEcho
 		fresh := !p.Stale && !p.Withdrawn
 		if fresh {
 			snap.HostReachable = new(bool)
 			*snap.HostReachable = true
-			snap.Reachable = echo == nil || echo.State != "drained"
+			switch {
+			case probeOK:
+				// Proof of life wins: a drained echo while the stack
+				// still answers renders INCONSISTENT (nag), never a
+				// silent DRAINED.
+				snap.Reachable = true
+			case echo != nil && echo.State == "drained":
+				snap.Reachable = false
+			default:
+				snap.Reachable = true
+			}
 			// The announce IS the catalog when probes can't reach the
 			// cell (C3's no-inbound-port destination): serving cells
 			// report their models heartbeats-over-heartbeats.
@@ -118,20 +135,23 @@ func (s *Server) decorate(snap *CellSnapshot) {
 	// Effective intent: the registry REQUEST unless the cell's echo is
 	// newer (the conflict rule — the box you're standing at is always
 	// right). A drained echo with no registry request is intent too
-	// (the cell declared it locally).
+	// (the cell declared it locally). A serving-state entry is a resume
+	// REQUEST, not a display intent (serving is the default state).
 	effective := intent
-	if echo != nil && echo.State == "drained" && (!hasIntent || intent.Since.Before(echo.Since)) {
+	servingRequest := hasIntent && intent.State == "serving"
+	if echo != nil && echo.State == "drained" && (!hasIntent || intent.Since.Before(echo.Since) || servingRequest) {
 		effective = Intent{State: "drained", Since: echo.Since}
 		hasIntent = true
+		servingRequest = false
 	}
-	if hasIntent {
+	if hasIntent && !servingRequest {
 		in := effective
 		snap.Intent = &in
-		// Pending: a drained request the cell hasn't caught up to —
-		// requested, not truth.
-		if intent.State == "drained" && (echo == nil || echo.Since.Before(intent.Since)) {
-			snap.IntentPending = true
-		}
+	}
+	if hasIntent && (servingRequest || (intent.State == "drained" && (echo == nil || echo.Since.Before(intent.Since)))) {
+		// Pending: a request the cell hasn't caught up to — requested,
+		// not truth.
+		snap.IntentPending = true
 	}
 	if hasLS {
 		t := ls

@@ -113,3 +113,12 @@ same as the per-cell daemons); do not point `fleetd_url` at anything
 you would not hand the token to, and keep `hosts.yaml` itself
 user-writable only: any process that can rewrite it can redirect where
 `vibe cell` sends your token.
+
+**The token is every cell's voice** (fleet-control §6): announce
+authenticates the connection, never the cell name. A stolen token can
+announce as any registered cell — fake SERVING for a dead box, prune a
+roaming cell's catalog entries (fake `withdrawing`), or cancel pending
+drains (forged newer echo, bounded by the ingest skew clamp). Same
+blast radius as the token's other powers (drain/resume/unload via
+MCP); distribute it like cell-root. Per-cell credentials are a
+futures item.

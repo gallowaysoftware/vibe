@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -309,6 +310,17 @@ func (rl *renderLoop) applyFingerprints(defs []*profile.BackendDef, pres map[str
 			if def == nil {
 				continue
 			}
+			// Enforcement is bound to the def's home cell: a mismatch is
+			// only meaningful from the cell that owns the def (its flags
+			// are what's actually serving). Any other cell's announce
+			// carrying this id is ignored — an announcing cell can never
+			// yank another cell's def from the render. Unassigned defs
+			// skip enforcement: every cell announces them, and the
+			// front's own checkout is their render truth (defs_sha in
+			// the announce reports checkout drift instead).
+			if def.Cell == "" || def.Cell != p.Cell {
+				continue
+			}
 			cmd, err := router.ModelCmd(def, router.Options{Hosts: rl.cfg.Hosts, LlamaServerBinary: rl.cfg.LlamaServerBinary})
 			if err != nil {
 				return nil, fmt.Errorf("fingerprint %s: %w", m.ID, err)
@@ -317,7 +329,7 @@ func (rl *renderLoop) applyFingerprints(defs []*profile.BackendDef, pres map[str
 			if err != nil {
 				return nil, fmt.Errorf("fingerprint %s: %w", m.ID, err)
 			}
-			if expected == m.FlagsSHA256 {
+			if strings.EqualFold(expected, m.FlagsSHA256) {
 				continue
 			}
 			mode := def.Fingerprint
