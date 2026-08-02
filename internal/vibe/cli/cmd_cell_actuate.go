@@ -431,8 +431,8 @@ func wakeCell(ctx context.Context, out io.Writer, apiFlag, cell string) error {
 	if !ok {
 		return fmt.Errorf("unknown cell %q (not in hosts.yaml)", cell)
 	}
-	if c.Wake == nil || c.Wake.MAC == "" {
-		return fmt.Errorf("cells.%s has no wake.mac in hosts.yaml", cell)
+	if c.Wake == nil {
+		return fmt.Errorf("cells.%s has no wake: config in hosts.yaml", cell)
 	}
 	if c.Wake.Cmd != "" {
 		cmd := exec.CommandContext(ctx, "sh", "-c", c.Wake.Cmd)
@@ -441,6 +441,9 @@ func wakeCell(ctx context.Context, out io.Writer, apiFlag, cell string) error {
 		}
 		fmt.Fprintf(out, "wake sent to %s directly (cmd)\n", cell)
 		return nil
+	}
+	if c.Wake.MAC == "" {
+		return fmt.Errorf("cells.%s has no wake.mac in hosts.yaml", cell)
 	}
 	mac, err := net.ParseMAC(c.Wake.MAC)
 	if err != nil {

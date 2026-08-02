@@ -213,6 +213,12 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 				}
 			}
 			switch {
+			case front && def.Cell == fleetcfg.FrontCell:
+				// A model def pinned to the front would self-peer: the
+				// front proxying to itself is a loop, and the front owns
+				// no models by design. Exclude loudly.
+				warn("backend %s is assigned to the front cell itself; excluded (the front owns no models — a self-peer is a proxy loop)", def.Name)
+				continue
 			case front && def.Cell == "":
 				warn("backend %s has no cell: assignment; excluded from the front render (the front owns no models)", def.Name)
 				continue

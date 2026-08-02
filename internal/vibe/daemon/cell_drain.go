@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -227,7 +228,7 @@ func (d *Daemon) fetchCellLeases(ctx context.Context) ([]*vibev1.LeaseView, erro
 	defer cancel()
 	base := strings.TrimRight(d.cfg.Fleet.RegistryURL, "/")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		base+"/api/fleet/leases?cell="+d.cfg.Fleet.Cell, nil)
+		base+"/api/fleet/leases?cell="+url.QueryEscape(d.cfg.Fleet.Cell), nil)
 	if err != nil {
 		return nil, err
 	}

@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
+	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"github.com/gallowaysoftware/vibe/internal/vibe/router"
 	"github.com/gallowaysoftware/vibe/internal/vibeclient"
 )
@@ -138,6 +140,9 @@ func (s *Server) toolRenderFront(ctx context.Context, dryRun *bool) (string, err
 		Cell:              fleetcfg.FrontCell,
 		Hosts:             s.hosts,
 		LlamaServerBinary: s.llamaBinary,
+		// Same extras default as the CLI (missing file = none), so the
+		// dry-run diff can't disagree with a CLI render that merged them.
+		ExtrasPath: filepath.Join(paths.ConfigHome(), "router-extras.yaml"),
 		Warnf: func(format string, args ...any) {
 			warnings = append(warnings, fmt.Sprintf(format, args...))
 		},

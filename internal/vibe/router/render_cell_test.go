@@ -264,6 +264,7 @@ func TestRenderCell_FrontPeersOnly(t *testing.T) {
 // cell's render only; the front carries just unassigned and
 // front-assigned cloud ids (the front owns the fleet's shared clouds).
 func TestRenderCell_CloudPeerPlacement(t *testing.T) {
+	var warns warnCapture
 	cloudFor := func(name, cell string) *profile.BackendDef {
 		d := &profile.BackendDef{
 			Name: name,
@@ -338,6 +339,27 @@ func TestRenderCell_CloudPeerPlacement(t *testing.T) {
 		}
 		if !warns.contains("anthropic", "gpu2", "gpu1") {
 			t.Errorf("exclusion must warn, got %v", warns.msgs)
+		}
+	})
+
+	t.Run("front-assigned LLM def self-peers (excluded with warning)", func(t *testing.T) {
+		d := llamaDef("front-local", "")
+		d.Cell = fleetcfg.FrontCell
+		out, err := Render([]*profile.BackendDef{d}, Options{
+			LlamaServerBinary: testBinary,
+			Cell:              fleetcfg.FrontCell,
+			Hosts:             testHosts(t, cellTestHosts),
+			Warnf:             warns.warnf,
+		})
+		if err != nil {
+			t.Fatalf("Render: %v", err)
+		}
+		cfg := parseRendered(t, out)
+		if _, ok := cfg.Peers[fleetcfg.FrontCell]; ok {
+			t.Errorf("a front-assigned model def must not self-peer: %v", cfg.Peers)
+		}
+		if !warns.contains("front-local", "front owns no models") && !warns.contains("front-local", "proxy loop") {
+			t.Errorf("self-peer exclusion must warn, got %v", warns.msgs)
 		}
 	})
 
