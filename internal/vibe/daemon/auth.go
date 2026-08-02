@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 )
@@ -31,28 +32,31 @@ const tokenByteLen = 32
 // LoadOrCreateToken returns the bearer token at paths.TokenFile(), creating
 // it (with 0600 perms) if it doesn't exist. The token survives daemon
 // restarts; regeneration is an explicit user action via `vibe token
-// --regenerate`.
-func LoadOrCreateToken() (string, error) {
+// --regenerate`. The bool reports whether the token was CREATED fresh on
+// this call — fleetd operators need that distinction loud in the logs,
+// because a container recreate over an unmounted state dir silently mints
+// a new token and every future client then 401s (fleet-control C1).
+func LoadOrCreateToken() (string, bool, error) {
 	path := paths.TokenFile()
 	data, err := os.ReadFile(path)
 	if err == nil {
 		tok := strings.TrimSpace(string(data))
 		if tok == "" {
-			return "", fmt.Errorf("token file %s is empty; delete it and restart the daemon to regenerate", path)
+			return "", false, fmt.Errorf("token file %s is empty; delete it and restart the daemon to regenerate", path)
 		}
-		return tok, nil
+		return tok, false, nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("read token file: %w", err)
+		return "", false, fmt.Errorf("read token file: %w", err)
 	}
 	tok, err := generateToken()
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if err := writeTokenFile(path, tok); err != nil {
-		return "", err
+		return "", false, err
 	}
-	return tok, nil
+	return tok, true, nil
 }
 
 // RegenerateToken overwrites paths.TokenFile() with a fresh random value.
@@ -117,19 +121,28 @@ func writeTokenFile(path, tok string) error {
 // bearerAuthMiddleware returns an http.Handler that enforces
 // `Authorization: Bearer <token>` on every request, returning 401 with a
 // plain-text body when the header is missing or wrong. Constant-time
-// comparison guards against timing oracles.
+// comparison guards against timing oracles. rejected (when non-nil)
+// counts the 401s — on fleetd that count is a status field, so a client
+// holding a stale token is visible from `vibe cell status` instead of
+// buried in cell-side logs (fleet-control C1).
 //
 // Used as the TCP listener's outermost handler; the unix listener bypasses
 // it entirely (the socket's 0600 perms are the auth boundary there).
-func bearerAuthMiddleware(token string, next http.Handler) http.Handler {
+func bearerAuthMiddleware(token string, rejected *atomic.Int64, next http.Handler) http.Handler {
 	tokenBytes := []byte(token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got, ok := extractBearer(r.Header.Get("Authorization"))
 		if !ok {
+			if rejected != nil {
+				rejected.Add(1)
+			}
 			unauthorized(w, "missing or malformed Authorization header (expected `Bearer <token>`)")
 			return
 		}
 		if subtle.ConstantTimeCompare([]byte(got), tokenBytes) != 1 {
+			if rejected != nil {
+				rejected.Add(1)
+			}
 			unauthorized(w, "invalid token")
 			return
 		}

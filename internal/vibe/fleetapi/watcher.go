@@ -176,13 +176,19 @@ func (s *Server) trackModelStatus(cell string, data json.RawMessage) {
 // setCellUp records cell reachability and publishes a synthetic
 // fleet.cellUp/fleet.cellDown event on transition (first observation
 // included — a subscriber should learn "the cell is down" even if it was
-// never up).
+// never up). Transitions also persist last-seen, so a fleetd restart
+// keeps an absent cell's last sighting.
 func (s *Server) setCellUp(name string, up bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if prev, known := s.cellUp[name]; known && prev == up {
+		s.mu.Unlock()
 		return
 	}
 	s.cellUp[name] = up
+	if up {
+		s.lastSeen[name] = time.Now().UTC()
+	}
 	s.publishLocked(Event{Cell: name, Type: cellTransitionType(up)})
+	s.mu.Unlock()
+	s.persistLastSeen()
 }

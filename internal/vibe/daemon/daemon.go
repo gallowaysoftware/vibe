@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -17,10 +18,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,6 +32,8 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetmcp"
 	"github.com/gallowaysoftware/vibe/internal/vibe/frontend"
 	"github.com/gallowaysoftware/vibe/internal/vibe/hfdownload"
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
@@ -93,6 +98,12 @@ type Config struct {
 	// references ${VIBE_SEARCH} then fails to activate with that reason
 	// rather than rendering an empty URL into a harness config.
 	SearchURL string `yaml:"search_url,omitempty"`
+	// FleetRegistry makes this daemon fleetd (fleet-control C1): the
+	// multi-cell registry from hosts.yaml, the intent store, and the /mcp
+	// facade activate. Explicit role, not file-sniffing — a hosts.yaml
+	// present on an ordinary box does NOT turn it into fleetd. Startup
+	// fails loudly when the role is set but hosts.yaml has no cells.
+	FleetRegistry bool `yaml:"fleet_registry,omitempty"`
 }
 
 // LoadConfig reads the global vibe config; missing file is not an error.
@@ -163,6 +174,15 @@ type Daemon struct {
 
 	// startMu serializes start/stop operations against each other.
 	startMu sync.Mutex
+
+	// hosts is the parsed hosts.yaml, set only under fleet_registry —
+	// fleetmcp reads cell URLs and model classes from it.
+	hosts *fleetcfg.File
+
+	// authRejected counts bearer-auth 401s on the TCP listener; surfaced
+	// in /api/fleet/state so a stale-token client is visible as a number,
+	// not buried in logs.
+	authRejected atomic.Int64
 
 	mu        sync.Mutex
 	active    *profile.Profile
@@ -274,38 +294,83 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Generate or load the bearer token before binding the TCP server.
 	// The unix socket reuses the same Connect handler but skips token
 	// validation (0600 socket perms are the auth boundary there).
-	token, err := LoadOrCreateToken()
+	// The created/loaded distinction is logged LOUDLY: on fleetd a
+	// container recreate over an unmounted state dir mints a fresh token,
+	// and every client then 401s until someone notices (fleet-control C1).
+	token, created, err := LoadOrCreateToken()
 	if err != nil {
 		unixLn.Close()
 		httpLn.Close()
 		return fmt.Errorf("load token: %w", err)
+	}
+	if created {
+		slog.Warn("control-plane token CREATED (new) — no existing token file; clients must be re-provisioned with this token", "path", paths.TokenFile())
+	} else {
+		slog.Info("control-plane token loaded", "path", paths.TokenFile())
 	}
 
 	mux := http.NewServeMux()
 	mountPath, connectHandler := vibev1connect.NewControlServiceHandler(d)
 	mux.Handle(mountPath, connectHandler)
 
-	// Fleet observability surface (docs/design/router-lifecycle.md §11).
-	// Shares the Connect mux, so the TCP listener's bearer middleware covers
-	// it and the unix socket serves it unauthenticated — same boundary as
-	// the RPCs. The front cell is whatever serves the proxy port (llama-swap
-	// under disable_proxy, else vibe's own proxy); an absent router degrades
-	// to reachable:false + fleet.cellDown, never an error.
+	// Fleet observability surface (docs/design/router-lifecycle.md §11,
+	// fleet-control C1). Shares the Connect mux, so the TCP listener's
+	// bearer middleware covers it and the unix socket serves it
+	// unauthenticated — same boundary as the RPCs.
+	//
+	// Default (no fleet_registry): the registry is the one-element front
+	// cell — whatever serves the proxy port (llama-swap under
+	// disable_proxy, else vibe's own proxy); an absent router degrades to
+	// reachable:false + fleet.cellDown, never an error. With
+	// fleet_registry the cells come from hosts.yaml (missing/invalid is a
+	// startup failure: the role was explicitly requested), and the intent
+	// store + /mcp facade activate.
+	fleetCells := []fleetapi.Cell{{Name: "front", URL: fmt.Sprintf("http://127.0.0.1:%d", d.cfg.ProxyPort)}}
+	fleetOpts := fleetapi.Options{}
+	if d.cfg.FleetRegistry {
+		hosts, err := fleetcfg.Load()
+		if err != nil {
+			unixLn.Close()
+			httpLn.Close()
+			return fmt.Errorf("fleet_registry: %w", err)
+		}
+		if !hosts.HasCells() {
+			unixLn.Close()
+			httpLn.Close()
+			return fmt.Errorf("fleet_registry: %s has no cells: section (the role needs the registry)", paths.HostsFile())
+		}
+		fleetCells = fleetCells[:0]
+		for _, name := range slices.Sorted(maps.Keys(hosts.Cells)) {
+			c := hosts.Cells[name]
+			fleetCells = append(fleetCells, fleetapi.Cell{
+				Name:      name,
+				URL:       c.URL,
+				Class:     string(c.Class),
+				HostProbe: c.HostProbe,
+			})
+		}
+		fleetOpts = fleetapi.Options{IntentPath: paths.IntentFile(), LastSeenPath: paths.LastSeenFile()}
+		d.hosts = hosts
+	}
 	fleet := fleetapi.New(
-		[]fleetapi.Cell{{Name: "front", URL: fmt.Sprintf("http://127.0.0.1:%d", d.cfg.ProxyPort)}},
+		fleetCells,
 		paths.StartHistoryFile(),
 		d.fleetDaemonInfo,
+		fleetOpts,
 	)
 	fleet.Register(mux)
 	fleet.Start()
 	defer fleet.Close()
+	if d.cfg.FleetRegistry {
+		fleetmcp.New(fleet, d.hosts).Register(mux)
+	}
 
 	unixSrv := &http.Server{Handler: mux}
 	// The TCP server gets a bearer-auth wrapper around the same mux. Two
 	// separate http.Server instances (one per listener) is the cleanest
 	// way to express "only TCP requires auth" without leaking the
 	// distinction into per-RPC interceptors.
-	httpSrv := &http.Server{Handler: bearerAuthMiddleware(token, mux)}
+	httpSrv := &http.Server{Handler: bearerAuthMiddleware(token, &d.authRejected, mux)}
 	errCh := make(chan error, 2)
 	serve := func(srv *http.Server, ln net.Listener) {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -1329,7 +1394,7 @@ func (d *Daemon) servicesStatus() []*vibev1.Status {
 // profile plus every running service. Same data protoStatus/servicesStatus
 // expose over Connect, reshaped for the JSON surface.
 func (d *Daemon) fleetDaemonInfo() fleetapi.DaemonInfo {
-	info := fleetapi.DaemonInfo{Services: []fleetapi.ServiceInfo{}}
+	info := fleetapi.DaemonInfo{Services: []fleetapi.ServiceInfo{}, AuthRejected: d.authRejected.Load()}
 	d.mu.Lock()
 	if d.active != nil {
 		info.ActiveProfile = d.active.Name

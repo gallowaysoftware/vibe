@@ -60,6 +60,22 @@ func FrontendStateDir(profile string) string {
 // runtime data, same as the PID file and token.
 func StartHistoryFile() string { return filepath.Join(StateHome(), "fleet", "start-history.json") }
 
+// HostsFile is the fleet membership registry ($XDG_CONFIG_HOME/vibe/
+// hosts.yaml): the cells map every fleet-aware component reads — fleetd's
+// multi-cell registry, the CLI's degraded fallback, and the front render's
+// peer addresses (C2). Config, not state: humans author it, it changes
+// rarely, through git.
+func HostsFile() string { return filepath.Join(ConfigHome(), "hosts.yaml") }
+
+// IntentFile persists declared cell intent ("drained for gaming, eta 23:00")
+// for the fleetd role. Absence of an entry means serving — the file is
+// empty almost always.
+func IntentFile() string { return filepath.Join(StateHome(), "fleet", "intent.json") }
+
+// LastSeenFile persists per-cell last-seen timestamps so a fleetd restart
+// doesn't forget when an absent cell was last sighted.
+func LastSeenFile() string { return filepath.Join(StateHome(), "fleet", "last-seen.json") }
+
 // TokenFile is the path to the daemon's bearer-token file. The token lives in
 // $XDG_STATE_HOME/vibe rather than $XDG_CONFIG_HOME because it's a generated
 // runtime secret, not user-authored configuration — same reasoning that puts

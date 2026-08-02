@@ -24,7 +24,7 @@ func setupXDGForToken(t *testing.T) string {
 
 func TestLoadOrCreateToken_GeneratesFreshTokenOnFirstCall(t *testing.T) {
 	setupXDGForToken(t)
-	tok, err := LoadOrCreateToken()
+	tok, _, err := LoadOrCreateToken()
 	if err != nil {
 		t.Fatalf("LoadOrCreateToken: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestLoadOrCreateToken_GeneratesFreshTokenOnFirstCall(t *testing.T) {
 
 func TestLoadOrCreateToken_WritesFileWith0600(t *testing.T) {
 	setupXDGForToken(t)
-	if _, err := LoadOrCreateToken(); err != nil {
+	if _, _, err := LoadOrCreateToken(); err != nil {
 		t.Fatalf("LoadOrCreateToken: %v", err)
 	}
 	info, err := os.Stat(paths.TokenFile())
@@ -57,11 +57,11 @@ func TestLoadOrCreateToken_WritesFileWith0600(t *testing.T) {
 
 func TestLoadOrCreateToken_StableAcrossCalls(t *testing.T) {
 	setupXDGForToken(t)
-	a, err := LoadOrCreateToken()
+	a, _, err := LoadOrCreateToken()
 	if err != nil {
 		t.Fatalf("first LoadOrCreateToken: %v", err)
 	}
-	b, err := LoadOrCreateToken()
+	b, _, err := LoadOrCreateToken()
 	if err != nil {
 		t.Fatalf("second LoadOrCreateToken: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestLoadOrCreateToken_StableAcrossCalls(t *testing.T) {
 
 func TestRegenerateToken_OverwritesAndPreservesMode(t *testing.T) {
 	setupXDGForToken(t)
-	first, err := LoadOrCreateToken()
+	first, _, err := LoadOrCreateToken()
 	if err != nil {
 		t.Fatalf("LoadOrCreateToken: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestRegenerateToken_OverwritesAndPreservesMode(t *testing.T) {
 	}
 	// Subsequent LoadOrCreateToken must return the regenerated value, not
 	// the original.
-	got, err := LoadOrCreateToken()
+	got, _, err := LoadOrCreateToken()
 	if err != nil {
 		t.Fatalf("post-regen LoadOrCreateToken: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestLoadOrCreateToken_RejectsEmptyFile(t *testing.T) {
 	if err := os.WriteFile(paths.TokenFile(), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadOrCreateToken(); err == nil {
+	if _, _, err := LoadOrCreateToken(); err == nil {
 		t.Errorf("LoadOrCreateToken accepted empty token file; want error")
 	}
 }
@@ -154,7 +154,7 @@ func TestBearerAuthMiddleware_AcceptsCorrectToken(t *testing.T) {
 		called = true
 		w.WriteHeader(http.StatusOK)
 	})
-	srv := httptest.NewServer(bearerAuthMiddleware("s3cret", next))
+	srv := httptest.NewServer(bearerAuthMiddleware("s3cret", nil, next))
 	t.Cleanup(srv.Close)
 
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
@@ -175,7 +175,7 @@ func TestBearerAuthMiddleware_AcceptsCorrectToken(t *testing.T) {
 func TestBearerAuthMiddleware_RejectsMissingHeader(t *testing.T) {
 	called := false
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true })
-	srv := httptest.NewServer(bearerAuthMiddleware("s3cret", next))
+	srv := httptest.NewServer(bearerAuthMiddleware("s3cret", nil, next))
 	t.Cleanup(srv.Close)
 
 	resp, err := srv.Client().Get(srv.URL + "/")
@@ -196,7 +196,7 @@ func TestBearerAuthMiddleware_RejectsMissingHeader(t *testing.T) {
 
 func TestBearerAuthMiddleware_RejectsWrongToken(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
-	srv := httptest.NewServer(bearerAuthMiddleware("s3cret", next))
+	srv := httptest.NewServer(bearerAuthMiddleware("s3cret", nil, next))
 	t.Cleanup(srv.Close)
 
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)

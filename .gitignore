@@ -2,6 +2,7 @@
 /vibe
 /bin/
 /dist/
+/deploy/fleetd/vibe
 
 # Go
 *.test

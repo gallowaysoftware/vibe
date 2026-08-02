@@ -1,8 +1,55 @@
 # C1 — Observe + intent: fleetd, the cells registry, `vibe cell`, MCP
 
-Status: PLANNED (2026-08-02). Scope: ~450 lines across fleetapi
-extensions, one new CLI command file, one new MCP package. No proto
-changes, no actuation — this phase only *observes* and *records*.
+Status: EXECUTED (2026-08-02). All five gates passed; fleetd is deployed
+and serving in the reference fleet (compose instance on the front host,
+private repo).
+
+Gate results:
+
+1. **Automated: PASS.** `fleetapi` covers multi-cell registry from
+   config, the one-element default (route-absence + field-absence
+   guards), intent CRUD + the full display-state table (incl. the
+   host-down-but-cell-up proof-of-life row), host-probe vs cell-probe
+   disagreement, intent/last-seen persistence across Server recreation,
+   and the dual-shape catalog parse (below). Daemon integration covers
+   the fleet_registry role (multi-cell state, intent + /mcp behind the
+   bearer boundary) and its absence (no /mcp, no intent route — the
+   regression gate).
+2. **Manual: PASS.** A sighted-then-vanished test cell showed OFF/AWAY
+   with its pre-vanish last_seen across three fleetd restarts; host up
+   + cell down + no intent showed `DRAINED?`.
+3. **await: PASS.** `vibe cell await test-cell --up` parked through a
+   fleetd restart (connection-refused → retrying) and unblocked on the
+   cell's return.
+4. **MCP: PASS.** curl'd initialize / tools-list / tools-call against
+   the live fleetd: `fleet_status` returned the derived table;
+   `warm_model(qwen2.5-coder-7b)` JIT-loaded through the front (ready
+   in 8s); `warm_model(bge-embed)` rejected with the typed embed-class
+   error and fired no request; `unload_model` evicted (verified via
+   `/running`). The token-visibility mitigations are live-proven too:
+   "token CREATED (new)" WARN fired on first boot, and a tokenless curl
+   showed up as `auth rejections: 1` in `vibe cell status`.
+5. **Regression: PASS** (daemon tests above).
+
+Implementation notes beyond the doc's letter:
+
+- **`model_classes` in hosts.yaml** is the warm_model class source. The
+  doc requires rejecting embed/rerank ids "with a typed error naming
+  the class" but names no mechanism; backend defs have no reliable
+  class marker (embed is an `extra_args` convention), so the class
+  lives in config where membership lives.
+- **Dual-shape catalog parse.** A vibe-daemon-proxy cell (the roaming
+  laptop before C3) answers `/v1/models` with OpenAI `data[]` AND the
+  Ollama passthrough `models[]`, and 404s `/running`. With no
+  `/running` to merge, `data[]`'s default "stopped" is a lie;
+  llama.cpp only advertises what it has loaded, so when `/running`
+  fails and the Ollama shape is present, entries report `ready`.
+  llama-swap cells are unaffected (their transient `/running` failures
+  carry no Ollama shape).
+- **fleetd deploy note:** the reference compose mounts config read-only
+  at `/config/vibe` — the daemon's `EnsureDirs` then needs
+  `profiles/`, `backends/`, `mcp/` pre-created in that dir (empty dirs,
+  host side). Recorded in deploy/fleetd/README.md.
 
 ## Goal
 
