@@ -15,24 +15,23 @@ import (
 
 // The C2 actuation tools. fleetd drives a cell by calling THAT cell's
 // daemon (daemon_url + token_file from hosts.yaml) — remote reach is a
-// client call, not routing — and writes intent at fleetd only after the
-// RPC succeeds (the fleetd-invoked writer of the one-writer rule).
+// client call, not routing — and writes intent at fleetd only after
+// success (the fleetd-invoked writer of the one-writer rule).
 
 // cellClient builds a vibeclient for the named cell's daemon. Token
 // resolution mirrors the CLI's documented order: $VIBE_TOKEN (explicit
 // override) → cells.X.token_file (a path — the value never enters a
 // repo; an unreadable one is a typed error, not a silent 401) → the
 // local token file (right only when X is the local box). A cell without
-// daemon_url is a typed error: C2 actuation needs the cell's control
-// plane (C3's piggyback removes the requirement; until then daemon_url
-// is how you reach it).
+// daemon_url gets (nil, nil): the announce path is its actuation
+// channel (C3 — daemon_url is an optimization, not a requirement).
 func (s *Server) cellClient(cell string) (*vibeclient.Client, error) {
 	c, ok := s.hosts.Cells[cell]
 	if !ok {
 		return nil, fmt.Errorf("unknown cell %q (not in hosts.yaml)", cell)
 	}
 	if c.DaemonURL == "" {
-		return nil, fmt.Errorf("cells.%s has no daemon_url in hosts.yaml — actuation needs the cell's control plane", cell)
+		return nil, nil
 	}
 	token := strings.TrimSpace(os.Getenv("VIBE_TOKEN"))
 	if token == "" && c.TokenFile != "" {
@@ -48,14 +47,37 @@ func (s *Server) cellClient(cell string) (*vibeclient.Client, error) {
 	return vibeclient.NewWithToken(c.DaemonURL, token), nil
 }
 
-// toolDrainCell drives the drain RPC and, on success, records intent at
-// fleetd — one writer, and only after the drain actually happened. The
-// pre-drain report comes back as text so the agent can relay lease
-// warnings before a human confirms.
+// drainViaAnnounce records the drain request for the announce path:
+// the cell reconciles it on its next heartbeat (executing its own
+// cell_cmds), and surfaces show "drain requested, awaiting cell ack"
+// until the echo lands. Used when the cell has no daemon_url — after
+// C3, commissioning a cell never requires fleetd to reach it inbound.
+func (s *Server) drainViaAnnounce(cell, reason, eta string) (string, error) {
+	if _, err := s.fleet.SetIntent(cell, "drained", reason, eta); err != nil {
+		return "", fmt.Errorf("record drain request: %v", err)
+	}
+	announcing := false
+	if p := s.fleet.PresenceFor(cell); p != nil && p.Announcing {
+		announcing = true
+	}
+	if !announcing {
+		return fmt.Sprintf("Drain requested for %s (reason: %s) — but the cell is not announcing, so the request sits pending until it does. Consider cell_cmds via a local daemon or SSH.", cell, reason), nil
+	}
+	return fmt.Sprintf("Drain requested for %s via announce (reason: %s). The cell executes on its next heartbeat (≤ its announce interval) and echoes back; status shows 'requested' until the ack. A human at the box can override with `vibe cell resume`.", cell, reason), nil
+}
+
+// toolDrainCell drives the drain: interactive RPC when the cell has a
+// daemon_url, else the desired-intent announce path (the cell picks the
+// request up next heartbeat and reconciles — the human at the box can
+// still override it). Intent records at fleetd after success on both
+// paths (the fleetd-invoked writer of the one-writer rule).
 func (s *Server) toolDrainCell(ctx context.Context, cell, reason, eta string, waitSeconds int32) (string, error) {
 	client, err := s.cellClient(cell)
 	if err != nil {
 		return "", err
+	}
+	if client == nil {
+		return s.drainViaAnnounce(cell, reason, eta)
 	}
 	report, err := client.CellDrain(ctx, reason, eta, waitSeconds)
 	if err != nil {
@@ -99,11 +121,18 @@ func (s *Server) toolDrainCell(ctx context.Context, cell, reason, eta string, wa
 	return b.String(), nil
 }
 
-// toolResumeCell drives the resume RPC and clears intent at fleetd.
+// toolResumeCell drives the resume RPC, or the desired-intent announce
+// path when the cell has no daemon_url. Clears intent at fleetd.
 func (s *Server) toolResumeCell(ctx context.Context, cell string) (string, error) {
 	client, err := s.cellClient(cell)
 	if err != nil {
 		return "", err
+	}
+	if client == nil {
+		if _, err := s.fleet.SetIntent(cell, "serving", "", ""); err != nil {
+			return "", fmt.Errorf("record resume request: %v", err)
+		}
+		return fmt.Sprintf("Resume requested for %s via announce (the cell resumes on its next heartbeat).", cell), nil
 	}
 	if err := client.CellResume(ctx); err != nil {
 		return "", fmt.Errorf("resume %s: %v", cell, err)

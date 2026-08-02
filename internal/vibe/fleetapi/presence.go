@@ -63,7 +63,14 @@ func (s *Server) persistLastSeen() {
 }
 
 // decorate fills a fresh snapshot's declared-intent, last-seen, active
-// leases, and derived display state from the server's stores.
+// leases, presence, and derived display state from the server's stores.
+//
+// Availability semantics with presence (C3): once a cell announces, its
+// heartbeat is truth — a fresh announce proves the box is up (beating a
+// firewalled host_probe), and the intent ECHO decides the serving axis
+// (serving-with-no-loaded-models is up-cold, drained is stack-down).
+// Stale/withdrawn presence reads as down. Never-announced cells keep
+// the C1 probe behavior (host_probe + cell probes).
 func (s *Server) decorate(snap *CellSnapshot) {
 	s.mu.Lock()
 	intent, hasIntent := s.intents[snap.Name]
@@ -74,10 +81,57 @@ func (s *Server) decorate(snap *CellSnapshot) {
 			leases = append(leases, l)
 		}
 	}
+	p := s.presence[snap.Name]
 	s.mu.Unlock()
+
+	var echo *AnnounceIntent
+	probeOK := snap.Reachable
+	if p != nil && p.Announcing {
+		cp := *p
+		snap.Presence = &cp
+		echo = p.IntentEcho
+		fresh := !p.Stale && !p.Withdrawn
+		if fresh {
+			snap.HostReachable = new(bool)
+			*snap.HostReachable = true
+			snap.Reachable = echo == nil || echo.State != "drained"
+			// The announce IS the catalog when probes can't reach the
+			// cell (C3's no-inbound-port destination): serving cells
+			// report their models heartbeats-over-heartbeats.
+			if !probeOK && len(p.Models) > 0 {
+				snap.Models = nil
+				for _, m := range p.Models {
+					snap.Models = append(snap.Models, ModelState{ID: m.ID, State: m.State})
+				}
+			}
+		} else {
+			snap.Reachable = false
+			if p.Withdrawn {
+				// A clean withdraw is the box saying goodbye: the host
+				// itself is gone for our purposes.
+				snap.HostReachable = new(bool)
+				*snap.HostReachable = false
+			}
+		}
+	}
+
+	// Effective intent: the registry REQUEST unless the cell's echo is
+	// newer (the conflict rule — the box you're standing at is always
+	// right). A drained echo with no registry request is intent too
+	// (the cell declared it locally).
+	effective := intent
+	if echo != nil && echo.State == "drained" && (!hasIntent || intent.Since.Before(echo.Since)) {
+		effective = Intent{State: "drained", Since: echo.Since}
+		hasIntent = true
+	}
 	if hasIntent {
-		in := intent
+		in := effective
 		snap.Intent = &in
+		// Pending: a drained request the cell hasn't caught up to —
+		// requested, not truth.
+		if intent.State == "drained" && (echo == nil || echo.Since.Before(intent.Since)) {
+			snap.IntentPending = true
+		}
 	}
 	if hasLS {
 		t := ls

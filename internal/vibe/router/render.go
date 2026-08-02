@@ -316,7 +316,7 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 				m.Proxy = fmt.Sprintf("http://127.0.0.1:%d", c.Port)
 				m.CheckEndpoint = "/system_stats"
 			} else {
-				cmd, err := modelCmd(def, opts)
+				cmd, err := ModelCmd(def, opts)
 				if err != nil {
 					return "", err
 				}
@@ -518,7 +518,10 @@ func resolveAliases(modelDefs []*profile.BackendDef) (map[string][]string, error
 // profile.LlamaServerSpec — the exact spec the vibe daemon would launch —
 // so router-served and vibe-supervised starts can never drift flag-by-flag.
 // The daemon-picked port becomes llama-swap's ${PORT} macro.
-func modelCmd(def *profile.BackendDef, opts Options) (string, error) {
+// ModelCmd renders the llama-swap cmd for one model def. Exported so the
+// announce client fingerprints the exact argv the router renders — a hash
+// computed any other way would be a second convention.
+func ModelCmd(def *profile.BackendDef, opts Options) (string, error) {
 	p := &profile.Profile{Name: def.Name, Backend: def.Backend}
 	var (
 		spec supervisor.LaunchSpec

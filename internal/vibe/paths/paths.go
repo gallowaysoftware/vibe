@@ -76,6 +76,11 @@ func IntentFile() string { return filepath.Join(StateHome(), "fleet", "intent.js
 // doesn't forget when an absent cell was last sighted.
 func LastSeenFile() string { return filepath.Join(StateHome(), "fleet", "last-seen.json") }
 
+// CellIntentFile persists the cell's own intent state ({state, since})
+// for the announce client's conflict rule (fleet-control C3): the
+// human-at-the-box timestamp that newer-registry-requests must beat.
+func CellIntentFile() string { return filepath.Join(StateHome(), "fleet", "cell-intent.json") }
+
 // LeasesFile persists advisory consumer leases ("batch-ingest holds
 // embed-large: mid-batch, 2.1M rows left"). Advisory only — they appear
 // in the pre-drain report and fleet_status, never block anything.

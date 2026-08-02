@@ -271,14 +271,25 @@ func TestMCPResumeCellClearsIntent(t *testing.T) {
 
 func TestMCPDrainCellNoDaemonURL(t *testing.T) {
 	front := newFakeLlamaSwap(t)
-	_, ts := newTestFacade(t, map[string]fleetcfg.Cell{
+	s, ts := newTestFacade(t, map[string]fleetcfg.Cell{
 		"front":  {URL: front.srv.URL, Class: fleetcfg.ClassAlwaysOn},
 		"laptop": {URL: "http://127.0.0.1:1", Class: fleetcfg.ClassRoaming},
 	}, nil)
-	resp := rpc(t, ts, `{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"drain_cell","arguments":{"cell":"laptop"}}}`)
+	// C3: no daemon_url is no longer an error — the request records at
+	// fleetd and rides the next announce (drain via desired intent).
+	resp := rpc(t, ts, `{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"drain_cell","arguments":{"cell":"laptop","reason":"gaming"}}}`)
 	text, isErr := toolText(t, resp)
-	if !isErr || !strings.Contains(text, "daemon_url") {
-		t.Errorf("missing daemon_url must be a typed error: isErr=%v text=%q", isErr, text)
+	if isErr {
+		t.Fatalf("daemon_url-less drain must not error post-C3: %s", text)
+	}
+	if !strings.Contains(text, "not announcing") && !strings.Contains(text, "next heartbeat") {
+		t.Errorf("text = %q", text)
+	}
+	snap := s.fleet.Snapshot(t.Context())
+	for _, c := range snap.Cells {
+		if c.Name == "laptop" && (c.Intent == nil || c.Intent.State != "drained" || c.Intent.Reason != "gaming") {
+			t.Errorf("drain request not recorded: %+v", c.Intent)
+		}
 	}
 }
 

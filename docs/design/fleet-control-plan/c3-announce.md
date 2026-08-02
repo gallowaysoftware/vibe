@@ -1,9 +1,73 @@
 # C3 — The inversion: cells announce, the catalog is derived
 
-Status: PLANNED (2026-08-02). Scope: ~600 lines — announce
-client+server, presence table, presence-derived front render,
-fingerprints, command piggyback. The destination shape (design doc §6),
-built last because C1–C2 already banked most of the value.
+Status: EXECUTED (2026-08-02). All six gates passed; the reference
+fleet's front config is now a presence-derived artifact (authorship
+flipped during gating with zero catalog disturbance).
+
+Gate results (live, reference fleet):
+
+1. **Ungraceful vanish: PASS.** SIGSTOP'd announcers: roaming cell
+   marked stale at ~50s and pruned from the front catalog at ~65s
+   (stale + render); opportunistic cell went stale and HELD (its ids
+   stayed listed). `fleet.cellStale`/`fleet.cellReturned` on the events
+   stream; last_seen accurate to the last heartbeat. Re-add followed
+   the hysteresis exactly: healthy_streak climbed 1→2→3 over ~30s and
+   the re-add render landed inside the 1/min cap window (~80s after
+   resume) — prune fast, re-add slow, renders coalesced.
+2. **Mid-stream membership render: PASS.** A streaming essay through
+   the front completed uncorrupted ([DONE]) across the roaming-prune
+   render (C0's 30s drain semantics cover the -watch-config apply).
+3. **Conflict rule: PASS.** `drain_cell` via MCP on a cell without
+   daemon_url went the announce path: status showed `INCONSISTENT` +
+   "intent: … (requested, awaiting cell ack)"; `vibe cell resume` on
+   the box between request and ack kept the cell serving, and the
+   newer serving echo dropped the registry request — no retry, no
+   split-brain. (MCP drain_cell/resume_cell now fall back to
+   desired-intent when daemon_url is absent — the C3 "daemon_url is an
+   optimization" made real.)
+4. **Commissioning dry-run: PASS.** Scratch cell (llama-swap on a
+   spare port + `vibe fleet announce` slim + a hosts.yaml entry + one
+   shared def) appeared in fleet_status and the front catalog with
+   zero front-side hand edits; teardown pruned it per class. Caught
+   one real leak en route: a slim announcer on a multi-cell box
+   inherited the box's unassigned defs — `gatherModels` now intersects
+   defs with the cell's own llama-swap catalog (defless catalog ids
+   announce hashless + log-once).
+5. **Fingerprint: PASS.** Strict-marked def mutated on the cell: loud
+   `fleet.fingerprintMismatch` event (expected/got/mode/defs_sha
+   payload) + model excluded from the render. Advisory def mutated:
+   event only, model kept serving. The gate first caught a systematic
+   false mismatch on EVERY def: tilde expansion — `~/models` renders
+   `/root/models` on fleetd (root) and `/home/<user>/models` on cells.
+   Canonicalization now normalizes home-anchored paths to `~` (a real
+   weights-path swap still mismatches — test covers both sides).
+6. **Unit tests: PASS** — announce schema/validation, presence
+   transitions + staleness, conflict rule both directions, command
+   drain, client seq/echo/backoff/persistence, def∩catalog
+   intersection, canonicalization (flag order, port strip, quoting,
+   home normalization), render loop (cold-start hold, class policy,
+   hysteresis, cap, unchanged-no-write, strict/advisory, never-
+   announced untouched), daemon announce wiring + intent echo through
+   the real listeners.
+
+Implementation notes beyond the doc's letter:
+
+- **desired_intent vs commands:** drain/resume ride desired_intent
+  (they carry reason/eta/since and the reconciliation rule); the
+  commands[] queue carries one-off verbs (unload/warm) for cells that
+  can't be reached interactively. MCP drain/resume fall back to
+  desired-intent when daemon_url is absent.
+- **Announce-side defs load once at client start** (daemon or slim):
+  a def edit takes effect on the next announcer/daemon restart. Defs
+  change via git + converge, so this is the natural cadence.
+- **RenderCount is held in a package-level sync.Map keyed by *Server**
+  (the render loop couldn't extend the Server struct under its
+  contract) — one Server per process in practice; noted for a future
+  tidy.
+- **fleet.front_config is the render mount contract**: fleetd sees the
+  front's watched config dir (rw) and writes atomically into it;
+  -watch-config applies. The dry-run path (C2's render_front) verified
+  parity before authorship flipped.
 
 ## Goal
 

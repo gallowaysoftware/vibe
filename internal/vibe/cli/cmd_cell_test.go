@@ -157,6 +157,50 @@ func TestCellAwaitUnblocksOnTransition(t *testing.T) {
 	}
 }
 
+func TestCellAwaitViaEventsStream(t *testing.T) {
+	// fleetd with an SSE stream: the transition event must unblock the
+	// await before the poll interval matters.
+	state := fleetapi.StateSnapshot{
+		GeneratedAt: time.Now(),
+		Cells: []fleetapi.CellSnapshot{{
+			Name: "gpu-cell", URL: "http://gpu.lan:9000", Reachable: false,
+		}},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/fleet/state", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(state)
+	})
+	mux.HandleFunc("GET /api/fleet/events", func(w http.ResponseWriter, r *http.Request) {
+		flusher := w.(http.Flusher)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		time.Sleep(200 * time.Millisecond)
+		fmt.Fprintf(w, "event:message\ndata:{\"cell\":\"gpu-cell\",\"type\":\"fleet.cellReturned\"}\n\n")
+		flusher.Flush()
+		<-r.Context().Done()
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	var out bytes.Buffer
+	target, terr := resolveFleetd(ts.URL)
+	if terr != nil {
+		t.Fatal(terr)
+	}
+	start := time.Now()
+	err := awaitCell(t.Context(), &out, target, "gpu-cell", true, 5*time.Second, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("took %v — the events stream didn't drive the unblock (poll fallback did)", elapsed)
+	}
+	if !strings.Contains(out.String(), "gpu-cell is up") {
+		t.Errorf("out = %q", out.String())
+	}
+}
+
 func TestCellAwaitUnknownCell(t *testing.T) {
 	ts := cannedFleetd(t, func() fleetapi.StateSnapshot { return statusState() })
 	var out bytes.Buffer

@@ -103,6 +103,7 @@ func (d *Daemon) CellDrain(ctx context.Context, req *connect.Request[vibev1.Cell
 	}
 
 	if !isRemoteInvocation(ctx) {
+		d.noteLocalIntent("drained")
 		d.postIntentBestEffort(fleetapi.Intent{
 			State:  "drained",
 			Reason: req.Msg.Reason,
@@ -126,6 +127,7 @@ func (d *Daemon) CellResume(ctx context.Context, _ *connect.Request[vibev1.CellR
 			fmt.Errorf("resume command failed: %v: %s", err, strings.TrimSpace(stderr)))
 	}
 	if !isRemoteInvocation(ctx) {
+		d.noteLocalIntent("serving")
 		d.postIntentBestEffort(fleetapi.Intent{State: "serving"})
 	}
 	return connect.NewResponse(&vibev1.CellResumeResponse{}), nil
