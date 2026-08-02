@@ -22,12 +22,31 @@ import (
 	"time"
 )
 
-// Cell is one llama-swap instance in the fleet registry. Today the registry
-// holds only {front, http://127.0.0.1:<proxy_port>}, but every code path
-// iterates the slice so remote cells are additive.
+// Cell is one llama-swap instance in the fleet registry. A single-box
+// daemon holds only {front, http://127.0.0.1:<proxy_port>}; a fleetd
+// (fleet_registry: true) builds the slice from hosts.yaml and every code
+// path iterates it, so remote cells were additive from day one.
 type Cell struct {
 	Name string `json:"name"`
 	URL  string `json:"url"`
+	// Class qualifies absence semantics (always_on | opportunistic |
+	// roaming, fleetcfg.Class); empty on the single-box default cell.
+	Class string `json:"class,omitempty"`
+	// HostProbe is an optional host:port TCP dial distinguishing "host up,
+	// cell down" from "host down" in the derived display state.
+	HostProbe string `json:"-"`
+}
+
+// Intent is a declared operator note about a cell (design doc §4 axis 2):
+// written by `vibe cell drain`, the MCP drain_cell tool, or a bare POST.
+// Absence of an entry means serving. Intent is for humans and agents
+// asking WHY; it is never consulted for request routing, and never
+// inferred from observations.
+type Intent struct {
+	State  string    `json:"state"` // "drained"; absence means serving
+	Reason string    `json:"reason,omitempty"`
+	ETA    string    `json:"eta,omitempty"`
+	Since  time.Time `json:"since"`
 }
 
 // ServiceInfo mirrors the daemon's service-mode status for the snapshot.
@@ -42,6 +61,10 @@ type ServiceInfo struct {
 type DaemonInfo struct {
 	ActiveProfile string        `json:"active_profile"`
 	Services      []ServiceInfo `json:"services"`
+	// AuthRejected counts bearer-auth 401s on the TCP listener since
+	// daemon start — a stale-token client shows up here as a rising
+	// number instead of being invisible until someone reads logs.
+	AuthRejected int64 `json:"auth_rejected"`
 }
 
 // Event is one frame on /api/fleet/events: an upstream llama-swap message
@@ -63,16 +86,30 @@ type ModelState struct {
 	Name  string `json:"name,omitempty"`
 }
 
-type cellSnapshot struct {
+// CellSnapshot is one cell's merged state in the fleet snapshot.
+type CellSnapshot struct {
 	Name      string       `json:"name"`
 	URL       string       `json:"url"`
 	Reachable bool         `json:"reachable"`
 	Models    []ModelState `json:"models"`
+	// HostReachable is nil when the cell has no host_probe configured —
+	// without it the host/cell distinction is unknowable (OFF/AWAY?).
+	HostReachable *bool      `json:"host_reachable,omitempty"`
+	Class         string     `json:"class,omitempty"`
+	Intent        *Intent    `json:"intent,omitempty"`
+	LastSeen      *time.Time `json:"last_seen,omitempty"`
+	// Display is the derived display state (design doc §4 table), computed
+	// at read time: SERVING / DRAINED / DRAINED? / OFF / OFF/AWAY /
+	// OFF/AWAY? / INCONSISTENT.
+	Display string `json:"display"`
 }
 
-type stateResponse struct {
+// StateSnapshot is the full /api/fleet/state document. fleetmcp serves
+// the same struct to MCP clients, so the CLI, the page, and agents can
+// never disagree about what the fleet looks like.
+type StateSnapshot struct {
 	GeneratedAt  time.Time             `json:"generated_at"`
-	Cells        []cellSnapshot        `json:"cells"`
+	Cells        []CellSnapshot        `json:"cells"`
 	Daemon       DaemonInfo            `json:"daemon"`
 	StartHistory map[string]StartStats `json:"start_history"`
 }
@@ -106,16 +143,47 @@ type Server struct {
 	lastState map[string]string
 	startedAt map[string]time.Time
 
+	// intents is the declared-intent store (axis 2), nil-safe when
+	// disabled; intentPath is its backing file. lastSeen holds per-cell
+	// last-sighting timestamps, persisted to lastSeenPath on transitions
+	// when set. intentMu serializes the intent endpoint's
+	// clone-mutate-persist-swap so concurrent POSTs can't race the file
+	// or the observable map.
+	intents      map[string]Intent
+	intentPath   string
+	intentMu     sync.Mutex
+	lastSeen     map[string]time.Time
+	lastSeenPath string
+
+	// flight is the in-flight Snapshot shared by concurrent callers —
+	// one probe round serves every simultaneous /state consumer instead
+	// of a goroutine fan-out per request.
+	flightMu sync.Mutex
+	flight   *snapshotFlight
+
 	done      chan struct{}
 	closeOnce sync.Once
 	wg        sync.WaitGroup
+}
+
+// Options tunes a Server's fleetd-role features. The zero value is the
+// single-box default: no intent store, in-memory last-seen only.
+type Options struct {
+	// IntentPath enables the intent store (POST /api/fleet/intent) backed
+	// by this JSON file. Empty disables it (the single-box default has no
+	// fleet role to record intent for).
+	IntentPath string
+	// LastSeenPath persists per-cell last-seen timestamps so a fleetd
+	// restart doesn't forget when an absent cell was last sighted. Empty
+	// keeps last-seen in memory only.
+	LastSeenPath string
 }
 
 // New builds a Server over the given cell registry. historyPath is the JSON
 // file backing start-duration persistence (loaded now, rewritten on every
 // recorded start); a missing or corrupt file degrades to empty history.
 // daemonInfo is called per snapshot so the daemon half is never stale.
-func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo) *Server {
+func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Options) *Server {
 	return &Server{
 		cells:        cells,
 		daemonInfo:   daemonInfo,
@@ -128,15 +196,24 @@ func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo) *Server
 		cellUp:       map[string]bool{},
 		lastState:    map[string]string{},
 		startedAt:    map[string]time.Time{},
+		intents:      loadIntents(opts.IntentPath),
+		intentPath:   opts.IntentPath,
+		lastSeen:     loadLastSeen(opts.LastSeenPath),
+		lastSeenPath: opts.LastSeenPath,
 		done:         make(chan struct{}),
 	}
 }
 
 // Register mounts the fleet endpoints on the daemon's existing mux. Auth is
 // the mux wrapper's business (bearer middleware on TCP, none on unix).
+// The intent endpoint exists only when the intent store is enabled
+// (fleetd role) — a single-box daemon has no fleet intent to record.
 func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/fleet/state", s.handleState)
 	mux.HandleFunc("GET /api/fleet/events", s.handleEvents)
+	if s.intentPath != "" {
+		mux.HandleFunc("POST /api/fleet/intent", s.handleIntent)
+	}
 }
 
 // Start launches one watcher goroutine per cell.
@@ -158,10 +235,55 @@ func (s *Server) Close() {
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), snapshotTimeout)
 	defer cancel()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.Snapshot(ctx))
+}
 
-	resp := stateResponse{
+// snapshotFlight is one in-flight probe round shared by every concurrent
+// Snapshot caller.
+type snapshotFlight struct {
+	done chan struct{}
+	snap StateSnapshot
+}
+
+// Snapshot probes every cell in parallel and assembles the state
+// document. Exported so in-process consumers (fleetmcp) get byte-identical
+// state to what /api/fleet/state serves over HTTP. Concurrent callers
+// share one probe round rather than fanning out per request.
+func (s *Server) Snapshot(ctx context.Context) StateSnapshot {
+	s.flightMu.Lock()
+	if f := s.flight; f != nil {
+		s.flightMu.Unlock()
+		<-f.done
+		return f.snap
+	}
+	f := &snapshotFlight{done: make(chan struct{})}
+	s.flight = f
+	s.flightMu.Unlock()
+
+	defer func() {
+		s.flightMu.Lock()
+		s.flight = nil
+		s.flightMu.Unlock()
+		close(f.done)
+	}()
+
+	// Detach the probe round from the leader's cancellation: a client
+	// disconnecting mid-round must not poison every follower's snapshot
+	// with a degraded all-unreachable result. The round still completes
+	// (bounded by its own deadline) and followers share the result.
+	probe, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotTimeout)
+	defer cancel()
+	f.snap = s.probeSnapshot(probe)
+	return f.snap
+}
+
+// probeSnapshot runs one probe round: every cell in parallel, bounded by
+// the caller's context.
+func (s *Server) probeSnapshot(ctx context.Context) StateSnapshot {
+	resp := StateSnapshot{
 		GeneratedAt:  time.Now().UTC(),
-		Cells:        make([]cellSnapshot, len(s.cells)),
+		Cells:        make([]CellSnapshot, len(s.cells)),
 		Daemon:       s.daemonInfo(),
 		StartHistory: s.hist.Stats(),
 	}
@@ -174,9 +296,15 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		}(i, c)
 	}
 	wg.Wait()
+	return resp
+}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+// StartStats returns the recorded start-duration stats for one model —
+// the warm path's honest cold-start ETA without a probe round.
+func (s *Server) StartStats(model string) (StartStats, bool) {
+	stats := s.hist.Stats()
+	st, ok := stats[model]
+	return st, ok
 }
 
 // snapshotCell merges the cell's /running (live processes: state/ttl) into
@@ -184,8 +312,13 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 // llama-swap's own default in its modelStatus payloads. The cell is
 // reachable when either probe answered 200: llama-swap serves both, so one
 // succeeding is proof of life even if the other transiently fails.
-func (s *Server) snapshotCell(ctx context.Context, c Cell) cellSnapshot {
-	snap := cellSnapshot{Name: c.Name, URL: c.URL, Models: []ModelState{}}
+func (s *Server) snapshotCell(ctx context.Context, c Cell) CellSnapshot {
+	snap := CellSnapshot{Name: c.Name, URL: c.URL, Class: c.Class, Models: []ModelState{}}
+
+	if c.HostProbe != "" {
+		snap.HostReachable = new(bool)
+		*snap.HostReachable = probeTCP(ctx, c.HostProbe)
+	}
 
 	var runWrap struct {
 		Running []struct {
@@ -200,11 +333,22 @@ func (s *Server) snapshotCell(ctx context.Context, c Cell) cellSnapshot {
 			ID   string `json:"id"`
 			Name string `json:"name"`
 		} `json:"data"`
+		// A vibe-daemon-proxy cell (the roaming class before C3) answers
+		// /v1/models with the Ollama passthrough shape instead — llama.cpp
+		// only advertises what it has loaded, so entries here mean ready.
+		Ollama []struct {
+			Name  string `json:"name"`
+			Model string `json:"model"`
+		} `json:"models"`
 	}
 	runErr := s.getJSON(ctx, c.URL+"/running", &runWrap)
 	modErr := s.getJSON(ctx, c.URL+"/v1/models", &modWrap)
 	running, models := runWrap.Running, modWrap.Data
 	snap.Reachable = runErr == nil || modErr == nil
+	if snap.Reachable {
+		s.noteSighting(c.Name)
+	}
+	s.decorate(&snap)
 
 	idx := map[string]int{}
 	for _, m := range models {
@@ -213,6 +357,29 @@ func (s *Server) snapshotCell(ctx context.Context, c Cell) cellSnapshot {
 		}
 		idx[m.ID] = len(snap.Models)
 		snap.Models = append(snap.Models, ModelState{ID: m.ID, Name: m.Name, State: "stopped"})
+	}
+	// A llama.cpp-family cell (vibe daemon proxy, bare llama-server — the
+	// roaming class before C3) has no /running: it failed here while the
+	// catalog answered. Its ollama-shape entries ARE the residency truth —
+	// llama.cpp only advertises what it has loaded. (A llama-swap cell
+	// whose /running transiently failed carries no ollama shape, so its
+	// data[] entries honestly stay "stopped".)
+	if runErr != nil {
+		for _, m := range modWrap.Ollama {
+			id := m.Model
+			if id == "" {
+				id = m.Name
+			}
+			if id == "" {
+				continue
+			}
+			if i, ok := idx[id]; ok {
+				snap.Models[i].State = "ready"
+				continue
+			}
+			idx[id] = len(snap.Models)
+			snap.Models = append(snap.Models, ModelState{ID: id, Name: m.Name, State: "ready"})
+		}
 	}
 	for _, r := range running {
 		if i, ok := idx[r.Model]; ok {

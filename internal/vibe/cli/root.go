@@ -45,6 +45,7 @@ func rootCmd() *cobra.Command {
 		backendCmd(),
 		routerCmd(),
 		tokenCmd(),
+		cellCmd(),
 	)
 	return root
 }

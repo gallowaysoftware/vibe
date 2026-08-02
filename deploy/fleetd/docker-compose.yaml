@@ -1,0 +1,60 @@
+# fleetd: the fleet control plane (docs/design/fleet-control.md §3). One
+# always-on deployment of the ordinary vibe daemon binary with the
+# fleet_registry role — fleet observability (/api/fleet/state + /events),
+# the intent store, and the MCP facade at /mcp. READ-AND-REQUEST-ONLY: if
+# it dies, inference is unaffected (invariant 4).
+#
+# REFERENCE STACK. Same conventions as deploy/front: macvlan networking so
+# fleetd gets its own LAN IP, .env holds the values, no real addresses in
+# the repo.
+#
+# STATE CONTRACT (containers get recreated): the bearer token, intent.json,
+# leases.json (C2), last-seen.json, and start-history.json MUST survive —
+# that is one rw mount covering the state dir, marked required below.
+# After an unmounted recreate the daemon silently mints a FRESH token and
+# every client 401s; the startup log says "token CREATED (new)" vs "token
+# loaded" to make that visible, and auth rejections surface in
+# /api/fleet/state.
+#
+# Config dir contents (see README.md):
+#   config.yaml  — disable_proxy + bind_all + fleet_registry: true
+#   hosts.yaml   — the cells: registry (single source of membership)
+
+services:
+
+  fleetd:
+    image: ${FLEETD_IMAGE:-vibe-fleetd:latest}
+    container_name: ${FLEETD_NAME:-fleetd}
+    restart: unless-stopped
+    # The daemon reads XDG locations from the environment; point both at
+    # the mounted dirs so config and state land where the mounts are.
+    environment:
+      XDG_CONFIG_HOME: /config
+      XDG_STATE_HOME: /state
+      # Warm schedules (C4) evaluate in this zone, not the container
+      # default UTC — set it in .env so a 06:30 warm fires at 06:30 local.
+      TZ: ${TZ:-UTC}
+    command: ["daemon"]
+    volumes:
+      # Config is read-only and lives at $XDG_CONFIG_HOME/vibe inside the
+      # container — pre-create the empty profiles/backends/mcp subdirs in
+      # it (see README.md) or the daemon's startup EnsureDirs fails.
+      - ${FLEETD_CONFIG_DIR:?set FLEETD_CONFIG_DIR to the fleetd config directory}:/config/vibe:ro
+      - ${FLEETD_STATE_DIR:?set FLEETD_STATE_DIR to the fleetd state directory — REQUIRED, see the state contract above}:/state/vibe
+    networks:
+      macvlan:
+        ipv4_address: ${FLEETD_IPV4:?set FLEETD_IPV4 to fleetd's LAN address}
+    labels:
+      # Unraid convenience labels; harmless elsewhere.
+      net.unraid.docker.webui: "http://${FLEETD_IPV4}:9001/ui/fleet"
+      net.unraid.docker.shell: "sh"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  macvlan:
+    external: true
+    name: ${MACVLAN_NETWORK:-br0}

@@ -115,6 +115,35 @@ optional.)
   is left out of the expansion map entirely so a profile referencing it
   fails to activate with a message naming `search_url`, instead of
   rendering an empty URL into a harness config.
+- **Fleet control plane (fleet-control C1+).** `docs/design/fleet-control.md`
+  is the design; the phase plan (C0–C4) is
+  `docs/design/fleet-control-plan/`. The pieces an agent must not break:
+  - `internal/vibe/fleetcfg` parses `$XDG_CONFIG_HOME/vibe/hosts.yaml`
+    (cells registry + `fleetd_url` + optional `model_classes`) — the
+    **single source of cell membership**; never introduce a second cell
+    list. yaml.v3 only, no daemon imports, so CLI and daemon both load
+    it. A `cells:` section requires a cell named `front`.
+  - The daemon becomes **fleetd** only via `fleet_registry: true` in
+    config.yaml (explicit role, never file-sniffing): multi-cell
+    fleetapi registry, intent store (`POST /api/fleet/intent`), and the
+    `internal/vibe/fleetmcp` facade at `/mcp` activate. Without it the
+    daemon keeps the one-element front-cell registry and none of those
+    routes — that regression is test-gated.
+  - State axes (design §4): availability is OBSERVED, intent is
+    DECLARED (`$XDG_STATE_HOME/vibe/fleet/intent.json`), residency is
+    llama-swap-owned. The derived display states (SERVING / DRAINED /
+    `DRAINED?` / OFF / OFF/AWAY / OFF/AWAY? / INCONSISTENT) are computed
+    at read time in `fleetapi/display.go`. **Never act on `DRAINED?`**
+    or inferred intent — display states are for humans.
+  - Token visibility (fleetd runs containerized): the daemon logs
+    "token CREATED (new)" vs "token loaded" at startup, and bearer 401s
+    count into `/api/fleet/state`'s `daemon.auth_rejected` — a
+    stale-token client must be visible as a number.
+  - `vibe cell status|await` resolves fleetd via `--api` → `$VIBE_API`
+    → `hosts.yaml fleetd_url` → local daemon, with a labeled degraded
+    fallback to direct cell probes. `deploy/fleetd/` is the reference
+    stack (state-dir volume is REQUIRED — see its README's state
+    contract).
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.

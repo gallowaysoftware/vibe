@@ -92,7 +92,7 @@ func testDaemonInfo() DaemonInfo {
 func newTestServer(t *testing.T, cellURL string) (*Server, *httptest.Server, string) {
 	t.Helper()
 	histPath := filepath.Join(t.TempDir(), "start-history.json")
-	s := New([]Cell{{Name: "front", URL: cellURL}}, histPath, testDaemonInfo)
+	s := New([]Cell{{Name: "front", URL: cellURL}}, histPath, testDaemonInfo, Options{})
 	s.baseBackoff = 10 * time.Millisecond
 	s.maxBackoff = 50 * time.Millisecond
 	mux := http.NewServeMux()
@@ -103,7 +103,7 @@ func newTestServer(t *testing.T, cellURL string) (*Server, *httptest.Server, str
 	return s, ts, histPath
 }
 
-func getState(t *testing.T, ts *httptest.Server) stateResponse {
+func getState(t *testing.T, ts *httptest.Server) StateSnapshot {
 	t.Helper()
 	resp, err := http.Get(ts.URL + "/api/fleet/state")
 	if err != nil {
@@ -113,7 +113,7 @@ func getState(t *testing.T, ts *httptest.Server) stateResponse {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET state: status %d", resp.StatusCode)
 	}
-	var st stateResponse
+	var st StateSnapshot
 	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
 		t.Fatalf("decode state: %v", err)
 	}
