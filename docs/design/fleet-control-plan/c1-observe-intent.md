@@ -143,9 +143,13 @@ Changes:
   state-dir convention fleet.md already names), guarded by the
   server's existing mutex discipline. `POST /api/fleet/intent` body:
   `{"cell": "...", "state": "drained"|"serving", "reason": "...",
-  "eta": "..."}` — `"serving"` deletes the entry. Registered on the
-  same mux via `Register`, behind the same auth as the rest of `:9001`.
-  Malformed cell names (not in the registry) → 400.
+  "eta": "..."}` — `"serving"` deletes the entry for
+  never-announced cells; from C3, for announcing cells it stores a
+  resolvable resume REQUEST (dropped when the cell echoes serving
+  newer — desired_intent could otherwise never carry a resume).
+  Registered on the same mux via `Register`, behind the same auth as
+  the rest of `:9001`. Malformed cell names (not in the registry) →
+  400.
 - `/api/fleet/state` output gains per-cell `class`, `intent`,
   `last_seen`, and the **derived display state** (design doc §4 table,
   computed at read time — SERVING / DRAINED / `DRAINED?` / OFF /

@@ -31,6 +31,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"gopkg.in/yaml.v3"
 
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetannounce"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetmcp"
@@ -244,6 +245,10 @@ type Daemon struct {
 	// fleet is the fleetapi server, assigned in Run once constructed.
 	// CellDrain reads the local cell's inflight count from it.
 	fleet *fleetapi.Server
+	// announce is the cell's C3 announce loop, started in Run when
+	// fleet.cell + fleet.registry_url are set. CellDrain/CellResume stamp
+	// local intent through it (the conflict rule's cell side).
+	announce *fleetannounce.Client
 	// cellCmdRunner executes cell verbs; tests swap it to script
 	// drain/resume outcomes without touching real units (same injection
 	// pattern as nvidiaSMI). Defaults to runCellCmd in New.
@@ -444,6 +449,26 @@ func (d *Daemon) Run(ctx context.Context) error {
 			BackendsDir: paths.BackendsDir(),
 			LlamaBinary: d.cfg.LlamaBinary,
 		}).Register(mux)
+		// C3: the front config is a derived artifact once fleetd can see
+		// its path (same-host mount). Without front_config the registry
+		// stays observe-only (C1/C2 behavior, unchanged).
+		if d.cfg.Fleet.FrontConfig != "" {
+			fleet.StartRenderLoop(fleetapi.RenderLoopConfig{
+				BackendsDir:       paths.BackendsDir(),
+				LlamaServerBinary: d.cfg.LlamaBinary,
+				FrontConfigPath:   d.cfg.Fleet.FrontConfig,
+				Hosts:             d.hosts,
+			})
+		}
+	}
+
+	// C3: this box announces to fleetd when it has a cell identity and a
+	// registry. The loop is best-effort by construction — an unreachable
+	// registry must never affect serving.
+	if d.cfg.Fleet.Cell != "" && d.cfg.Fleet.RegistryURL != "" {
+		if err := d.startAnnounce(ctx); err != nil {
+			slog.Warn("announce loop not started (cell keeps serving; fleetd sees probes only)", "err", err)
+		}
 	}
 
 	unixSrv := &http.Server{Handler: mux}

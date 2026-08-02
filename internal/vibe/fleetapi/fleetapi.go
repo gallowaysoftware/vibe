@@ -104,6 +104,13 @@ type CellSnapshot struct {
 	// Leases are the active advisory holds naming this cell (C2) — the
 	// pre-drain "would I strand a batch job?" answer, advisory only.
 	Leases []Lease `json:"leases,omitempty"`
+	// IntentPending marks a registry intent REQUEST the cell hasn't
+	// echoed yet (C3): surfaces show "drain requested, awaiting cell
+	// ack" — never treated as truth. The cell's echo always wins.
+	IntentPending bool `json:"intent_pending,omitempty"`
+	// Presence is the cell's announce-derived state (C3), present once
+	// the cell has announced at least once.
+	Presence *Presence `json:"presence,omitempty"`
 	// Display is the derived display state (design doc §4 table), computed
 	// at read time: SERVING / DRAINED / DRAINED? / OFF / OFF/AWAY /
 	// OFF/AWAY? / INCONSISTENT.
@@ -118,6 +125,10 @@ type StateSnapshot struct {
 	Cells        []CellSnapshot        `json:"cells"`
 	Daemon       DaemonInfo            `json:"daemon"`
 	StartHistory map[string]StartStats `json:"start_history"`
+	// FrontRenders counts presence-driven front-config writes this
+	// process has done (C3) — a flap storm shows up here as a rising
+	// number instead of silently churning the catalog.
+	FrontRenders int `json:"front_renders"`
 }
 
 // snapshotTimeout bounds the per-cell /running + /v1/models probes so one
@@ -174,6 +185,15 @@ type Server struct {
 	flightMu sync.Mutex
 	flight   *snapshotFlight
 
+	// presence is the announce-derived state per cell (C3): availability
+	// and last_seen come from here once a cell announces, probes stay
+	// the fallback. commands queues piggyback verbs for the announce
+	// response. renderTrigger coalesces membership transitions for the
+	// presence-derived render loop.
+	presence      map[string]*Presence
+	commands      map[string][]AnnounceCommand
+	renderTrigger chan string
+
 	// inFlight tracks each cell's current in-flight request count as
 	// reported by llama-swap's inflight SSE frames. The bool in the
 	// accessor distinguishes "reported zero" from "no frame seen yet" —
@@ -208,26 +228,29 @@ type Options struct {
 // daemonInfo is called per snapshot so the daemon half is never stale.
 func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Options) *Server {
 	return &Server{
-		cells:        cells,
-		daemonInfo:   daemonInfo,
-		hist:         loadHistory(historyPath),
-		snapClient:   &http.Client{Timeout: snapshotTimeout},
-		streamClient: &http.Client{},
-		baseBackoff:  500 * time.Millisecond,
-		maxBackoff:   30 * time.Second,
-		subs:         map[chan Event]struct{}{},
-		cellUp:       map[string]bool{},
-		lastState:    map[string]string{},
-		startedAt:    map[string]time.Time{},
-		inFlight:     map[string]int{},
-		inFlightSeen: map[string]bool{},
-		intents:      loadIntents(opts.IntentPath),
-		intentPath:   opts.IntentPath,
-		lastSeen:     loadLastSeen(opts.LastSeenPath),
-		lastSeenPath: opts.LastSeenPath,
-		leases:       loadLeases(opts.LeasePath),
-		leasePath:    opts.LeasePath,
-		done:         make(chan struct{}),
+		cells:         cells,
+		daemonInfo:    daemonInfo,
+		hist:          loadHistory(historyPath),
+		snapClient:    &http.Client{Timeout: snapshotTimeout},
+		streamClient:  &http.Client{},
+		baseBackoff:   500 * time.Millisecond,
+		maxBackoff:    30 * time.Second,
+		subs:          map[chan Event]struct{}{},
+		cellUp:        map[string]bool{},
+		lastState:     map[string]string{},
+		startedAt:     map[string]time.Time{},
+		inFlight:      map[string]int{},
+		inFlightSeen:  map[string]bool{},
+		presence:      map[string]*Presence{},
+		commands:      map[string][]AnnounceCommand{},
+		renderTrigger: make(chan string, 64),
+		intents:       loadIntents(opts.IntentPath),
+		intentPath:    opts.IntentPath,
+		lastSeen:      loadLastSeen(opts.LastSeenPath),
+		lastSeenPath:  opts.LastSeenPath,
+		leases:        loadLeases(opts.LeasePath),
+		leasePath:     opts.LeasePath,
+		done:          make(chan struct{}),
 	}
 }
 
@@ -241,6 +264,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	if s.intentPath != "" {
 		mux.HandleFunc("POST /api/fleet/intent", s.handleIntent)
 		mux.HandleFunc("POST /api/fleet/wake", s.handleWake)
+		mux.HandleFunc("POST /api/fleet/announce", s.handleAnnounce)
 	}
 	if s.leasePath != "" {
 		mux.HandleFunc("GET /api/fleet/leases", s.handleLeases)
@@ -249,12 +273,14 @@ func (s *Server) Register(mux *http.ServeMux) {
 	}
 }
 
-// Start launches one watcher goroutine per cell.
+// Start launches one watcher goroutine per cell plus the announce
+// staleness loop.
 func (s *Server) Start() {
 	for _, c := range s.cells {
 		s.wg.Add(1)
 		go s.watchCell(c)
 	}
+	go s.stalenessLoop()
 }
 
 // Close stops the watchers and unblocks every open SSE response. Idempotent.
@@ -319,6 +345,7 @@ func (s *Server) probeSnapshot(ctx context.Context) StateSnapshot {
 		Cells:        make([]CellSnapshot, len(s.cells)),
 		Daemon:       s.daemonInfo(),
 		StartHistory: s.hist.Stats(),
+		FrontRenders: s.RenderCount(),
 	}
 	var wg sync.WaitGroup
 	for i, c := range s.cells {

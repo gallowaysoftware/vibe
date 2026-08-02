@@ -33,6 +33,12 @@ type BackendDef struct {
 	// Router carries client-facing naming knobs for the rendered llama-swap
 	// entry (extra aliases, alias-collision ownership, catalog visibility).
 	Router *RouterOpts `yaml:"router,omitempty"`
+	// Fingerprint selects the flags_sha256 failure mode at announce (C3):
+	// "strict" EXCLUDES the model from the front render on mismatch
+	// (embed-class models, where flag drift is silent retrieval damage);
+	// "advisory" (default) raises the loud event and keeps serving — a
+	// hash-normalization bug must not yank a working chat model.
+	Fingerprint string `yaml:"fingerprint,omitempty"`
 	// Cell names the fleet cell that owns this backend (fleet-control C2
 	// §6): `vibe router render --cell <name>` places the def on that cell's
 	// llama-swap, and the front render turns every cell-assigned def into a
@@ -327,6 +333,11 @@ func LoadBackendFrom(dir, name string) (*BackendDef, error) {
 	}
 	if err := def.Router.validate(); err != nil {
 		return nil, fmt.Errorf("backend %s: %w", name, err)
+	}
+	switch def.Fingerprint {
+	case "", "strict", "advisory":
+	default:
+		return nil, fmt.Errorf("backend %s: fingerprint %q must be \"strict\" or \"advisory\"", name, def.Fingerprint)
 	}
 	// Mirrors Profile.validateMode: backend defs are also activated directly
 	// (StartRequest.backend synthesizes a profile without running Validate),

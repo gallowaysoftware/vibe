@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -209,7 +211,14 @@ func intentLastSeen(c fleetapi.CellSnapshot) string {
 		if in == "" {
 			in = c.Intent.State
 		}
+		if c.IntentPending {
+			in += " (requested, awaiting cell ack)"
+		}
 		parts = append(parts, "intent: "+in)
+	} else if c.IntentPending {
+		// A resume request has no drained intent to show, but the
+		// pending marker is the point.
+		parts = append(parts, "intent: resume requested, awaiting cell ack")
 	}
 	if c.LastSeen != nil && !c.Reachable {
 		parts = append(parts, "last seen "+time.Since(*c.LastSeen).Round(time.Second).String()+" ago")
@@ -333,9 +342,11 @@ func cellAwaitCmd() *cobra.Command {
 	return cmd
 }
 
-// awaitCell polls until the named cell's reachability matches wantUp.
-// Exit is non-zero on timeout; intent is never consulted — a drained
-// cell that answers is up (routing truth rule).
+// awaitCell blocks until the named cell's reachability matches wantUp.
+// C3 made transitions subscribable: it rides /api/fleet/events when the
+// stream works (cellUp/cellDown, cellReturned/cellStale/cellWithdrawn)
+// and falls back to the 5s poll when it doesn't. Intent is never
+// consulted — a drained cell that answers is up (routing truth rule).
 func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell string, wantUp bool, timeout, interval time.Duration) error {
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -345,21 +356,33 @@ func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell str
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 
-	check := func() (bool, error) {
-		snap, err := target.fetchState(ctx)
-		if err != nil {
-			return false, err
+	// Events channel: the stream goroutine reports liveness so a dead
+	// stream can't be mistaken for "no transitions happening".
+	events := make(chan fleetEvent, 16)
+	var streamAlive atomic.Bool
+	streamAlive.Store(true)
+	go func() {
+		if err := streamFleetEvents(ctx, target, events); err != nil {
+			streamAlive.Store(false)
 		}
-		for _, c := range snap.Cells {
-			if c.Name == cell {
-				return c.Reachable == wantUp, nil
-			}
+	}()
+
+	matches := func(reachable bool) bool { return reachable == wantUp }
+	eventMatches := func(ev fleetEvent) bool {
+		if ev.Cell != cell {
+			return false
 		}
-		return false, fmt.Errorf("unknown cell %q (not in fleetd's registry)", cell)
+		switch ev.Type {
+		case "fleet.cellUp", "fleet.cellReturned":
+			return wantUp
+		case "fleet.cellDown", "fleet.cellStale", "fleet.cellWithdrawn":
+			return !wantUp
+		}
+		return false
 	}
 
 	for {
-		ok, err := check()
+		ok, err := checkCellReachable(ctx, target, cell, matches)
 		if err == nil && ok {
 			state := "up"
 			if !wantUp {
@@ -377,7 +400,77 @@ func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell str
 				return fmt.Errorf("timeout waiting for %s to come %s", cell, map[bool]string{true: "up", false: "down"}[wantUp])
 			}
 			return ctx.Err()
+		case ev := <-events:
+			if streamAlive.Load() && eventMatches(ev) {
+				state := "up"
+				if !wantUp {
+					state = "down"
+				}
+				fmt.Fprintf(out, "%s is %s (%s)\n", cell, state, ev.Type)
+				return nil
+			}
 		case <-tick.C:
 		}
 	}
+}
+
+// fleetEvent is the CLI's minimal decode of one /api/fleet/events frame.
+type fleetEvent struct {
+	Cell string `json:"cell"`
+	Type string `json:"type"`
+}
+
+// checkCellReachable runs one /state poll for the cell.
+func checkCellReachable(ctx context.Context, target fleetdTarget, cell string, matches func(bool) bool) (bool, error) {
+	snap, err := target.fetchState(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, c := range snap.Cells {
+		if c.Name == cell {
+			return matches(c.Reachable), nil
+		}
+	}
+	return false, fmt.Errorf("unknown cell %q (not in fleetd's registry)", cell)
+}
+
+// streamFleetEvents reads the SSE stream, decoding data: frames until
+// ctx or the stream dies. An establishment failure or mid-stream error
+// returns non-nil so the caller falls back to polling.
+func streamFleetEvents(ctx context.Context, target fleetdTarget, out chan<- fleetEvent) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.base+"/api/fleet/events", nil)
+	if err != nil {
+		return err
+	}
+	if tok := vibeclient.ResolveToken(); tok != "" && !strings.HasPrefix(target.base, "http://vibe.local") {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	// No client timeout: the stream is long-lived by definition.
+	hc := &http.Client{Transport: target.hc.Transport}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("events: HTTP %d", resp.StatusCode)
+	}
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64<<10), 8<<20) // llama-swap's logData frames run megabytes
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		var ev fleetEvent
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data:")), &ev); err != nil {
+			continue // non-JSON frame (comment, keepalive): not a transition
+		}
+		select {
+		case out <- ev:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return scanner.Err()
 }

@@ -103,6 +103,7 @@ func (d *Daemon) CellDrain(ctx context.Context, req *connect.Request[vibev1.Cell
 	}
 
 	if !isRemoteInvocation(ctx) {
+		d.noteLocalIntent("drained")
 		d.postIntentBestEffort(fleetapi.Intent{
 			State:  "drained",
 			Reason: req.Msg.Reason,
@@ -126,6 +127,7 @@ func (d *Daemon) CellResume(ctx context.Context, _ *connect.Request[vibev1.CellR
 			fmt.Errorf("resume command failed: %v: %s", err, strings.TrimSpace(stderr)))
 	}
 	if !isRemoteInvocation(ctx) {
+		d.noteLocalIntent("serving")
 		d.postIntentBestEffort(fleetapi.Intent{State: "serving"})
 	}
 	return connect.NewResponse(&vibev1.CellResumeResponse{}), nil
@@ -268,7 +270,15 @@ func (d *Daemon) fetchCellLeases(ctx context.Context) ([]*vibev1.LeaseView, erro
 // fleetd being down must not fail the verb itself, so failures log and
 // move on — a missing entry degrades the display to DRAINED?, which a
 // human can correct with one POST.
+//
+// When this daemon announces (C3), the POST is skipped: the announce
+// echo IS the cell-side record, and a POST would stamp a NEWER request
+// than the cell's own — a ghost 'requested, awaiting ack' that only
+// the next heartbeat could clear.
 func (d *Daemon) postIntentBestEffort(intent fleetapi.Intent) {
+	if d.announce != nil {
+		return
+	}
 	if d.cfg.Fleet.RegistryURL == "" || d.cfg.Fleet.Cell == "" {
 		slog.Info("no fleet registry configured; intent not recorded", "state", intent.State)
 		return

@@ -76,6 +76,12 @@ func (s *Server) handleIntent(w http.ResponseWriter, r *http.Request) {
 // rule — and shares the HTTP endpoint's validation, serialization, and
 // persistence: the whole clone-mutate-persist-swap runs under intentMu,
 // and a failed persist leaves observable state untouched.
+//
+// "serving" semantics with presence (C3): for an ANNOUNCING cell the
+// serving request must ride desired_intent to the cell, so it is
+// STORED ({state: serving, since}) and resolved — deleted — when the
+// cell echoes serving at a newer time. For never-announced cells it
+// keeps the C1 meaning: delete (absence means serving).
 func (s *Server) SetIntent(cell, state, reason, eta string) (*Intent, error) {
 	known := false
 	for _, c := range s.cells {
@@ -96,12 +102,22 @@ func (s *Server) SetIntent(cell, state, reason, eta string) (*Intent, error) {
 	for k, v := range s.intents {
 		next[k] = v
 	}
+	announcing := false
+	if p := s.presence[cell]; p != nil && p.Announcing {
+		announcing = true
+	}
 	s.mu.Unlock()
 
 	var stored *Intent
 	switch state {
 	case "serving":
-		delete(next, cell)
+		if announcing {
+			in := Intent{State: "serving", Since: time.Now().UTC()}
+			next[cell] = in
+			stored = &in
+		} else {
+			delete(next, cell)
+		}
 	case "drained":
 		in := Intent{State: "drained", Reason: reason, ETA: eta, Since: time.Now().UTC()}
 		next[cell] = in

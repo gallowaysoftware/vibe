@@ -1,0 +1,418 @@
+// The presence-derived front render loop (fleet-control C3 §4): the
+// front's peers config stops being a hand-run render and becomes a
+// derived artifact of the presence table. Membership transitions
+// (withdraw/stale/return) land on renderTrigger; the loop coalesces
+// them into re-renders through the same router.Render code path the
+// CLI uses (import, not shell-out), applying the design-doc §4 class
+// policy: roaming cells prune fast and re-add slow, always_on and
+// opportunistic cells hold — their ids never 404, requests get typed
+// UPSTREAM_DOWN instead.
+
+package fleetapi
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
+	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
+	"github.com/gallowaysoftware/vibe/internal/vibe/router"
+)
+
+// Default hysteresis/rate values (fleet-control C3 §4: prune fast,
+// re-add slow, cap renders at ~1/min).
+const (
+	defaultMinHealthyStreak  = 3
+	defaultRenderMinInterval = time.Minute
+	// defaultFullWaveTimeout matches the staleness bound at the default
+	// cadence: by ~50s every live cell has either announced or missed
+	// its window, so holding the previous config longer helps nobody.
+	defaultFullWaveTimeout = 50 * time.Second
+)
+
+// RenderLoopConfig wires the presence-derived render. BackendsDir is
+// the canonical def checkout; FrontConfigPath is the front llama-swap's
+// -watch-config file (writes are atomic tmp+rename inside its
+// directory, so the watcher never reads a half-written config).
+type RenderLoopConfig struct {
+	BackendsDir       string
+	LlamaServerBinary string
+	FrontConfigPath   string
+	Hosts             *fleetcfg.File
+	// MinHealthyStreak is the re-add hysteresis: a pruned roaming cell's
+	// defs return only after this many consecutive fresh announces.
+	MinHealthyStreak int
+	// RenderMinInterval caps render frequency; transitions inside the
+	// window coalesce into one trailing render.
+	RenderMinInterval time.Duration
+	// FullWaveTimeout is the cold-start hold: the loop renders nothing
+	// until every registered cell has announced or this elapses —
+	// fleetd rebooting must never write an empty-peers config over the
+	// last known-good one.
+	FullWaveTimeout time.Duration
+
+	// Test seams; nil selects the production default (router.LoadDefs,
+	// router.Render, atomic tmp+rename).
+	LoadDefs  func(dir string) ([]*profile.BackendDef, error)
+	Render    func(defs []*profile.BackendDef, opts router.Options) (string, error)
+	WriteFile func(path string, data []byte) error
+}
+
+// renderCounts holds the per-server write counters out-of-line: the
+// Server struct lives in fleetapi.go and this file cannot extend it,
+// and fleet_status needs the flap-storm signal (renders-per-day)
+// without a second ownership of the hub mutex.
+var renderCounts sync.Map // map[*Server]*atomic.Int64
+
+// RenderCount returns how many front-config writes this server's
+// render loop has performed (renders that produced unchanged content
+// don't count — they never touched the watched file).
+func (s *Server) RenderCount() int {
+	if c, ok := renderCounts.Load(s); ok {
+		return int(c.(*atomic.Int64).Load())
+	}
+	return 0
+}
+
+// StartRenderLoop launches the presence-derived render loop. It
+// returns immediately; the loop exits when the server closes.
+func (s *Server) StartRenderLoop(cfg RenderLoopConfig) {
+	if cfg.MinHealthyStreak <= 0 {
+		cfg.MinHealthyStreak = defaultMinHealthyStreak
+	}
+	if cfg.RenderMinInterval <= 0 {
+		cfg.RenderMinInterval = defaultRenderMinInterval
+	}
+	if cfg.FullWaveTimeout <= 0 {
+		cfg.FullWaveTimeout = defaultFullWaveTimeout
+	}
+	if cfg.LoadDefs == nil {
+		cfg.LoadDefs = router.LoadDefs
+	}
+	if cfg.Render == nil {
+		cfg.Render = router.Render
+	}
+	if cfg.WriteFile == nil {
+		cfg.WriteFile = writeAtomic
+	}
+	counter := new(atomic.Int64)
+	renderCounts.Store(s, counter)
+
+	s.wg.Add(1)
+	go (&renderLoop{srv: s, cfg: cfg, counter: counter, pruned: map[string]bool{}}).run()
+}
+
+// renderLoop carries the mutable hysteresis state: the pruned set is
+// loop-owned (not derived per pass) because re-add must be slower than
+// prune — a cell pruned at prune-time stays pruned until its healthy
+// streak clears, even if a single fresh announce lands first.
+type renderLoop struct {
+	srv     *Server
+	cfg     RenderLoopConfig
+	counter *atomic.Int64
+	pruned  map[string]bool
+}
+
+func (rl *renderLoop) run() {
+	defer rl.srv.wg.Done()
+
+	// Cold start: an empty presence table is "fleetd rebooted", not
+	// "the fleet withdrew" — the on-disk config stays truth until the
+	// full announce wave lands or the hold times out.
+	holding := !rl.fullWave()
+	holdTimer := time.NewTimer(rl.cfg.FullWaveTimeout)
+	defer holdTimer.Stop()
+
+	// The cap is a trailing-edge throttle: a trigger renders
+	// immediately when no render happened inside the last
+	// RenderMinInterval; triggers inside the window coalesce into one
+	// trailing render when it expires. A flap storm churns the catalog
+	// at the cap, never faster.
+	var (
+		pending   bool
+		cooldown  *time.Timer
+		cooldownC <-chan time.Time
+	)
+	defer func() {
+		if cooldown != nil {
+			cooldown.Stop()
+		}
+	}()
+
+	tryRender := func() {
+		if cooldownC != nil {
+			return
+		}
+		if err := rl.renderPass(); err != nil {
+			slog.Warn("presence-derived render failed", "err", err)
+		}
+		pending = false
+		if cooldown == nil {
+			cooldown = time.NewTimer(rl.cfg.RenderMinInterval)
+		} else {
+			cooldown.Reset(rl.cfg.RenderMinInterval)
+		}
+		cooldownC = cooldown.C
+	}
+
+	for {
+		select {
+		case <-rl.srv.done:
+			return
+		case <-holdTimer.C:
+			holding = false
+			if pending {
+				tryRender()
+			}
+		case <-rl.srv.renderTrigger:
+			if holding && !rl.fullWave() {
+				// Partial wave: remember that a render is owed; only
+				// the full wave (or the timeout) ends the hold.
+				pending = true
+				continue
+			}
+			holding = false
+			pending = true
+			tryRender()
+		case <-cooldownC:
+			cooldownC = nil
+			if pending {
+				tryRender()
+			}
+		}
+	}
+}
+
+// fullWave reports whether every registered cell has announced at
+// least once — the signal that the presence table is whole again after
+// a fleetd reboot.
+func (rl *renderLoop) fullWave() bool {
+	pres := rl.srv.presenceSnapshot()
+	for _, c := range rl.srv.cells {
+		if !pres[c.Name].Announcing {
+			return false
+		}
+	}
+	return true
+}
+
+// renderPass runs one full derive-render-write cycle. The fingerprint
+// check rides every pass (not per trigger): drift is a property of the
+// defs-vs-cell pair, so any render must re-verify it.
+func (rl *renderLoop) renderPass() error {
+	defs, err := rl.cfg.LoadDefs(rl.cfg.BackendsDir)
+	if err != nil {
+		return fmt.Errorf("load defs: %w", err)
+	}
+	pres := rl.srv.presenceSnapshot()
+
+	defs = rl.applyClassPolicy(defs, pres)
+	defs, err = rl.applyFingerprints(defs, pres)
+	if err != nil {
+		return err
+	}
+
+	opts := router.Options{
+		Cell:              fleetcfg.FrontCell,
+		Hosts:             rl.cfg.Hosts,
+		LlamaServerBinary: rl.cfg.LlamaServerBinary,
+		Warnf: func(format string, args ...any) {
+			slog.Warn(fmt.Sprintf("front render: "+format, args...))
+		},
+	}
+	content, err := rl.cfg.Render(defs, opts)
+	if err != nil {
+		return fmt.Errorf("render: %w", err)
+	}
+
+	current, err := os.ReadFile(rl.cfg.FrontConfigPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read current config: %w", err)
+	}
+	// Unchanged content means no write: llama-swap's -watch-config
+	// reloads on every touch, and a churned catalog invalidates
+	// consumers' cached model lists for nothing.
+	if string(current) == content {
+		return nil
+	}
+	if err := rl.cfg.WriteFile(rl.cfg.FrontConfigPath, []byte(content)); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	rl.counter.Add(1)
+	slog.Info("front config re-rendered from presence", "path", rl.cfg.FrontConfigPath, "renders", rl.counter.Load())
+	return nil
+}
+
+// applyClassPolicy prunes roaming cells' defs per presence (design doc
+// §4). Hold is the default: always_on/opportunistic defs stay rendered
+// no matter what presence says, and a roaming cell that has NEVER
+// announced keeps its defs too — presence-derived rendering only
+// applies once presence exists (probe-era behavior otherwise).
+func (rl *renderLoop) applyClassPolicy(defs []*profile.BackendDef, pres map[string]Presence) []*profile.BackendDef {
+	for name, p := range pres {
+		if rl.classOf(name) != fleetcfg.ClassRoaming || !p.Announcing {
+			continue
+		}
+		switch {
+		case p.Stale || p.Withdrawn:
+			if !rl.pruned[name] {
+				slog.Info("pruning roaming cell from front render", "cell", name, "stale", p.Stale, "withdrawn", p.Withdrawn)
+			}
+			rl.pruned[name] = true
+		case rl.pruned[name] && p.HealthyStreak >= rl.cfg.MinHealthyStreak:
+			slog.Info("roaming cell re-added to front render", "cell", name, "healthy_streak", p.HealthyStreak)
+			delete(rl.pruned, name)
+		}
+	}
+	if len(rl.pruned) == 0 {
+		return defs
+	}
+	kept := make([]*profile.BackendDef, 0, len(defs))
+	for _, d := range defs {
+		if d.Cell != "" && rl.pruned[d.Cell] {
+			continue
+		}
+		kept = append(kept, d)
+	}
+	return kept
+}
+
+// applyFingerprints verifies every announced flags_sha256 against
+// fleetd's own render of the same def. A mismatch ALWAYS raises the
+// loud event (with the cell's defs provenance, so "N commits behind"
+// replaces guesswork); strict-mode defs additionally leave the render
+// — embed-class drift is silent retrieval damage, while advisory
+// (default) stays fail-open so a hash-normalization bug can never yank
+// a working chat model.
+func (rl *renderLoop) applyFingerprints(defs []*profile.BackendDef, pres map[string]Presence) ([]*profile.BackendDef, error) {
+	byName := make(map[string]*profile.BackendDef, len(defs))
+	for _, d := range defs {
+		byName[d.Name] = d
+	}
+	excluded := map[string]bool{}
+	for _, p := range pres {
+		if !p.Announcing {
+			continue
+		}
+		for _, m := range p.Models {
+			if m.FlagsSHA256 == "" {
+				continue
+			}
+			def := byName[m.ID]
+			if def == nil {
+				continue
+			}
+			// Enforcement is bound to the def's home cell: a mismatch is
+			// only meaningful from the cell that owns the def (its flags
+			// are what's actually serving). Any other cell's announce
+			// carrying this id is ignored — an announcing cell can never
+			// yank another cell's def from the render. Unassigned defs
+			// skip enforcement: every cell announces them, and the
+			// front's own checkout is their render truth (defs_sha in
+			// the announce reports checkout drift instead).
+			if def.Cell == "" || def.Cell != p.Cell {
+				continue
+			}
+			cmd, err := router.ModelCmd(def, router.Options{Hosts: rl.cfg.Hosts, LlamaServerBinary: rl.cfg.LlamaServerBinary})
+			if err != nil {
+				return nil, fmt.Errorf("fingerprint %s: %w", m.ID, err)
+			}
+			expected, err := router.FlagsSHA256(cmd)
+			if err != nil {
+				return nil, fmt.Errorf("fingerprint %s: %w", m.ID, err)
+			}
+			if strings.EqualFold(expected, m.FlagsSHA256) {
+				continue
+			}
+			mode := def.Fingerprint
+			if mode == "" {
+				mode = "advisory"
+			}
+			var defsSHA string
+			var defsDirty bool
+			if p.Versions != nil {
+				defsSHA = p.Versions.DefsSHA
+				defsDirty = p.Versions.DefsDirty
+			}
+			data, err := json.Marshal(map[string]any{
+				"model":      m.ID,
+				"cell":       p.Cell,
+				"expected":   expected,
+				"got":        m.FlagsSHA256,
+				"mode":       mode,
+				"defs_sha":   defsSHA,
+				"defs_dirty": defsDirty,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("fingerprint event %s: %w", m.ID, err)
+			}
+			slog.Warn("flags fingerprint mismatch", "model", m.ID, "cell", p.Cell, "mode", mode, "defs_sha", defsSHA, "defs_dirty", defsDirty)
+			rl.srv.publish(Event{Cell: p.Cell, Type: EventFingerprint, Data: data})
+			if mode == "strict" {
+				excluded[def.Name] = true
+			}
+		}
+	}
+	if len(excluded) == 0 {
+		return defs, nil
+	}
+	kept := make([]*profile.BackendDef, 0, len(defs))
+	for _, d := range defs {
+		if excluded[d.Name] {
+			slog.Warn("excluding strict-fingerprint def from front render", "model", d.Name, "cell", d.Cell)
+			continue
+		}
+		kept = append(kept, d)
+	}
+	return kept, nil
+}
+
+// classOf resolves a cell's absence-semantics class from hosts.yaml,
+// falling back to the registry slice (the two are built from the same
+// file, but the config value wins: it is the fleet's membership truth).
+func (rl *renderLoop) classOf(cell string) fleetcfg.Class {
+	if rl.cfg.Hosts != nil {
+		if c, ok := rl.cfg.Hosts.Cells[cell]; ok {
+			return c.Class
+		}
+	}
+	for _, c := range rl.srv.cells {
+		if c.Name == cell {
+			return fleetcfg.Class(c.Class)
+		}
+	}
+	return ""
+}
+
+// writeAtomic replaces path via a tmp file in the SAME directory
+// (rename across filesystems fails, and llama-swap's watcher must only
+// ever see complete configs).
+func writeAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".render-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
