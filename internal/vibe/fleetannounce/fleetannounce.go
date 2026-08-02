@@ -99,6 +99,8 @@ type Client struct {
 	authRejected          bool
 	// deflessWarned gates log-once for catalog models with no def.
 	deflessWarned map[string]bool
+	// lastNoVerbLog gates log-once for verb-less desired intents.
+	lastNoVerbLog string
 }
 
 // New builds the client and loads the persisted local intent (zero
@@ -124,7 +126,9 @@ func New(cfg Config) (*Client, error) {
 
 // loadLocalIntent reads the cell's persisted intent; missing/corrupt
 // means serving-since-epoch (any request outranks it, and a never-touched
-// box has nothing to defend).
+// box has nothing to defend). An unreadable STATE (hand edit, schema
+// drift) also normalizes to serving — a junk state would otherwise fail
+// fleetd's ingest enum on every heartbeat.
 func loadLocalIntent(path string) fleetapi.AnnounceIntent {
 	in := fleetapi.AnnounceIntent{State: "serving"}
 	if path == "" {
@@ -135,7 +139,9 @@ func loadLocalIntent(path string) fleetapi.AnnounceIntent {
 		return in
 	}
 	_ = json.Unmarshal(data, &in)
-	if in.State == "" {
+	switch in.State {
+	case "serving", "drained", "withdrawing":
+	default:
 		in.State = "serving"
 	}
 	return in
@@ -348,7 +354,14 @@ func (c *Client) reconcile(ctx context.Context, resp *fleetapi.AnnounceResponse)
 // unconfigured verb keeps the request pending and the mismatch visible.
 func (c *Client) runVerb(ctx context.Context, name, cmd string) bool {
 	if cmd == "" {
-		c.logger.Info("desired intent arrived but no cell verb is configured; request stays pending", "verb", name)
+		// Log once per unique request (the heartbeat would otherwise
+		// drip this every interval forever).
+		c.mu.Lock()
+		if c.lastNoVerbLog != name {
+			c.logger.Info("desired intent arrived but no cell verb is configured; request stays pending", "verb", name)
+			c.lastNoVerbLog = name
+		}
+		c.mu.Unlock()
 		return false
 	}
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)

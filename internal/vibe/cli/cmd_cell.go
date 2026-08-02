@@ -215,6 +215,10 @@ func intentLastSeen(c fleetapi.CellSnapshot) string {
 			in += " (requested, awaiting cell ack)"
 		}
 		parts = append(parts, "intent: "+in)
+	} else if c.IntentPending {
+		// A resume request has no drained intent to show, but the
+		// pending marker is the point.
+		parts = append(parts, "intent: resume requested, awaiting cell ack")
 	}
 	if c.LastSeen != nil && !c.Reachable {
 		parts = append(parts, "last seen "+time.Since(*c.LastSeen).Round(time.Second).String()+" ago")

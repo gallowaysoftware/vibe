@@ -322,6 +322,9 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	cmds := s.drainCommands(req.Cell)
 	resp := &AnnounceResponse{IntervalS: intervalS, DesiredIntent: desired, Commands: cmds}
 
+	// withdrawn was assigned in the first critical section; reading the
+	// shared pointer's field here is safe from torn state but the
+	// trigger fires on the value as of this announce by construction.
 	if p.Withdrawn || firstEver || wasStaleOrWithdrawn {
 		s.noteRenderTrigger(req.Cell)
 	} else if s.cellClass(req.Cell) == string(fleetcfg.ClassRoaming) {
@@ -333,6 +336,33 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 		s.noteRenderTrigger(req.Cell)
 	}
 	return resp
+}
+
+// pruneStaleServingRequest drops a serving-state intent entry when
+// its cell goes stale: a dead cell can't reconcile a resume, and the
+// entry would otherwise linger forever (a permanently-gone cell's
+// pending resume is noise, not signal). Drained entries survive — a
+// stale drained cell is exactly what the display needs to say.
+func (s *Server) pruneStaleServingRequest(cell string) {
+	s.intentMu.Lock()
+	defer s.intentMu.Unlock()
+	s.mu.Lock()
+	in, ok := s.intents[cell]
+	if !ok || in.State != "serving" {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.intents, cell)
+	snap := make(map[string]Intent, len(s.intents))
+	for k, v := range s.intents {
+		snap[k] = v
+	}
+	s.mu.Unlock()
+	if err := saveIntents(s.intentPath, snap); err != nil {
+		slog.Warn("serving-request prune persist failed", "cell", cell, "err", err)
+		return
+	}
+	slog.Info("dropped unresolvable serving request (cell went stale)", "cell", cell)
 }
 
 // cellClass resolves a cell's class from the registry (empty when unset).
@@ -430,6 +460,7 @@ func (s *Server) stalenessLoop() {
 				slog.Info("cell announce went stale", "cell", name)
 				s.publish(Event{Cell: name, Type: EventCellStale})
 				s.noteRenderTrigger(name)
+				s.pruneStaleServingRequest(name)
 			}
 		}
 	}
