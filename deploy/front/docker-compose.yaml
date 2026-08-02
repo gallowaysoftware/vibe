@@ -28,6 +28,16 @@ services:
     restart: unless-stopped
     # The image defaults to listening on 8080; pin the canonical fleet port.
     command: ["-config", "/app/config.yaml", "-listen", ":9000"]
+    # The image's own healthcheck curls :8080 — the default the command above
+    # deliberately overrides — so without this the front reports unhealthy
+    # from the moment it starts and never recovers, which means a real outage
+    # looks exactly like steady state.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     volumes:
       # The peers config (see front-config.example.yaml).
       - ${FRONT_CONFIG:?set FRONT_CONFIG to the front config.yaml path}:/app/config.yaml:ro
