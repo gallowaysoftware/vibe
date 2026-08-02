@@ -3,7 +3,8 @@
 Status: EXECUTED (2026-08-02), gates 1+3 passed, gate 2 waived to a user
 maintenance window with enablement evidence.
 
-Gate results (live, against hum-front on the digest-pinned v239 image):
+Gate results (live, against the reference fleet's front container on
+the digest-pinned v239 image):
 
 - **Mid-stream reload gate: PASS with a characterized limit.**
   `-watch-config` on v239 is poll-based (2s interval, config-file path
@@ -35,9 +36,9 @@ Gate results (live, against hum-front on the digest-pinned v239 image):
   front host takes down the house, and both other cells were in active
   use). Enablement verified instead: localmodel `llama-swap.service`
   enabled + new `vibe-daemon.service` user unit installed and active
-  (the daemon had been running unmanaged); unraid hum-front
-  `restart: unless-stopped` + compose.manager `autostart=true`;
-  novodoo `ca.thegalloways.vibe-daemon` LaunchAgent installed and
+  (the daemon had been running unmanaged); the front container's
+  `restart: unless-stopped` + compose-manager autostart verified; the
+  laptop cell gained a `vibe-daemon` LaunchAgent, installed and
   bootstrapped (RunAtLoad + KeepAlive; bare `vibe daemon` — sleep is
   pmset's job on AC, profile activation stays manual per the roaming
   class). Post-change, the laptop served a completion through the

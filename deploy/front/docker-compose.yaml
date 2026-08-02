@@ -46,9 +46,9 @@ services:
       start_period: 10s
     volumes:
       # The peers config's parent DIRECTORY (see front-config.example.yaml),
-      # not the file: fsnotify misses atomic-rename (tmp+rename) writes
-      # through single-file bind mounts, and renderers write exactly that
-      # way. The config itself is /app/config/config.yaml.
+      # not the file: a single-file bind mount pins the inode, so
+      # atomic-rename (tmp+rename) writes — how renderers write — never
+      # reach the running container. The config is /app/config/config.yaml.
       - ${FRONT_CONFIG_DIR:?set FRONT_CONFIG_DIR to the front config directory}:/app/config:ro
     environment:
       # Consumed by ${env.ANTHROPIC_API_KEY} in config.yaml if the
