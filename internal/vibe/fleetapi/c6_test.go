@@ -451,3 +451,139 @@ func filepathJoinIntent(t *testing.T, s *Server) string {
 	}
 	return s.intentPath
 }
+
+// TestRecordAnnounce_PersistsLastSeen pins MIN-E: an announce-only cell
+// (no inbound port — C3's whole destination) must leave a persisted
+// sighting, and steady-state heartbeats must not rewrite the file every
+// time.
+func TestRecordAnnounce_PersistsLastSeen(t *testing.T) {
+	s, _, opts := newFleetdServer(t, c6Cells())
+	s.recordAnnounce(&AnnounceRequest{V: AnnounceVersion, Cell: "laptop", Seq: 1, Intent: &AnnounceIntent{State: "serving"}})
+
+	first, ok := loadLastSeen(opts.LastSeenPath)["laptop"]
+	if !ok || first.IsZero() {
+		t.Fatal("first announce left no persisted sighting")
+	}
+
+	// A steady-state heartbeat inside the age window must not rewrite:
+	// at 15s cadence x N cells that is a full-file write per heartbeat.
+	s.recordAnnounce(&AnnounceRequest{V: AnnounceVersion, Cell: "laptop", Seq: 2, Intent: &AnnounceIntent{State: "serving"}})
+	if got := loadLastSeen(opts.LastSeenPath)["laptop"]; !got.Equal(first) {
+		t.Errorf("steady-state heartbeat rewrote the file (%v then %v)", first, got)
+	}
+
+	// A transition (return from stale) forces the write.
+	s.mu.Lock()
+	s.presence["laptop"].Stale = true
+	s.mu.Unlock()
+	s.recordAnnounce(&AnnounceRequest{V: AnnounceVersion, Cell: "laptop", Seq: 3, Intent: &AnnounceIntent{State: "serving"}})
+	if got := loadLastSeen(opts.LastSeenPath)["laptop"]; !got.After(first) {
+		t.Errorf("a return transition did not persist the new sighting: %v", got)
+	}
+}
+
+// TestDrainCommands_AtLeastOnce pins MIN-H: the batch is retired only by
+// an announce with a HIGHER seq (proof the cell read the response), and
+// a seq reset (cell reboot) cannot pin the slot forever.
+func TestDrainCommands_AtLeastOnce(t *testing.T) {
+	s, _, _ := newFleetdServer(t, c6Cells())
+	s.recordAnnounce(&AnnounceRequest{V: AnnounceVersion, Cell: "laptop", Seq: 1,
+		Models: []AnnounceModel{{ID: "qwen", State: "ready"}}})
+	if err := s.QueueCommand("laptop", AnnounceCommand{Verb: "unload", Model: "qwen"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seq 2 collects the batch; a retried POST at the same seq (the
+	// response the cell never read) gets it again.
+	if got := s.drainCommands("laptop", 2); len(got) != 1 {
+		t.Fatalf("first delivery = %+v, want 1 command", got)
+	}
+	if got := s.drainCommands("laptop", 2); len(got) != 1 {
+		t.Errorf("retry at the same seq lost the command: %+v", got)
+	}
+	// A reboot resets seq; the batch is redelivered, not pinned.
+	if got := s.drainCommands("laptop", 0); len(got) != 1 {
+		t.Errorf("seq reset lost the command: %+v", got)
+	}
+	// Seq 1 > 0 now retires it.
+	if got := s.drainCommands("laptop", 1); len(got) != 0 {
+		t.Errorf("a higher seq must retire the batch: %+v", got)
+	}
+}
+
+// TestQueueCommand_ValidatesAgainstAnnouncedModels: a verb nothing would
+// ever execute is a caller error, not a queue entry.
+func TestQueueCommand_ValidatesAgainstAnnouncedModels(t *testing.T) {
+	s, _, _ := newFleetdServer(t, c6Cells())
+	if err := s.QueueCommand("laptop", AnnounceCommand{Verb: "unload", Model: "qwen"}); err == nil {
+		t.Error("queued a command for a cell that has never announced")
+	}
+	s.recordAnnounce(&AnnounceRequest{V: AnnounceVersion, Cell: "laptop", Seq: 1,
+		Models: []AnnounceModel{{ID: "qwen", State: "ready"}}})
+	if err := s.QueueCommand("laptop", AnnounceCommand{Verb: "unload", Model: "typo"}); err == nil {
+		t.Error("queued a command for a model the cell does not announce")
+	}
+	if err := s.QueueCommand("laptop", AnnounceCommand{Verb: "explode", Model: "qwen"}); err == nil {
+		t.Error("queued an unknown verb")
+	}
+	if err := s.QueueCommand("laptop", AnnounceCommand{Verb: "warm", Model: "qwen"}); err != nil {
+		t.Errorf("valid command rejected: %v", err)
+	}
+}
+
+// TestWriteAtomic_ModeIsReadable pins MIN-A: the front config exists to
+// be read by another process, and an operator's wider mode survives.
+func TestWriteAtomic_ModeIsReadable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "front.yaml")
+	if err := writeAtomic(path, []byte("a: 1\n")); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o644 {
+		t.Errorf("mode = %v, want 0644 (llama-swap reads it as another user)", st.Mode().Perm())
+	}
+	if err := os.Chmod(path, 0o664); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAtomic(path, []byte("a: 2\n")); err != nil {
+		t.Fatal(err)
+	}
+	st, err = os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o664 {
+		t.Errorf("mode = %v, want the operator's 0664 preserved", st.Mode().Perm())
+	}
+}
+
+// TestLeaseIngestValidated pins MIN-J: the lease endpoint sanitises what
+// it prints into the same status tables the announce ingest guards, and
+// bounds the TTL.
+func TestLeaseIngestValidated(t *testing.T) {
+	_, ts, _ := newFleetdServer(t, c6Cells())
+	post := func(body string) int {
+		resp, err := http.Post(ts.URL+"/api/fleet/lease", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+	cases := map[string]string{
+		"control char in note": `{"cell":"laptop","model":"qwen","holder":"batch","note":"a\u0001b","ttl":"1h"}`,
+		"oversize holder":      `{"cell":"laptop","model":"qwen","holder":"` + strings.Repeat("h", 300) + `","ttl":"1h"}`,
+		"absurd ttl":           `{"cell":"laptop","model":"qwen","holder":"batch","ttl":"9000h"}`,
+	}
+	for name, body := range cases {
+		if code := post(body); code != http.StatusBadRequest {
+			t.Errorf("%s: HTTP %d, want 400", name, code)
+		}
+	}
+	if code := post(`{"cell":"laptop","model":"qwen","holder":"batch","note":"mid-batch","ttl":"2h"}`); code != http.StatusOK {
+		t.Errorf("clean lease rejected: HTTP %d", code)
+	}
+}

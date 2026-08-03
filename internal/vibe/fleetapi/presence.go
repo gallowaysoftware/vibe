@@ -32,17 +32,33 @@ func probeTCP(ctx context.Context, addr string) bool {
 	return true
 }
 
+// lastSeenPersistAge bounds how stale the on-disk last_seen may be. A
+// per-heartbeat write would rewrite the whole file every 15s per cell
+// for a value that only matters once the cell is GONE; a never-written
+// one loses the sighting entirely for exactly the no-inbound-port cells
+// presence exists for.
+const lastSeenPersistAge = 5 * time.Minute
+
 // noteSighting records a fresh observation of a cell being reachable,
-// from any source (watcher connect, on-demand snapshot). Persisted only
-// on transitions and first sightings — the value that matters is the
-// last sighting of a cell that is now absent, and a steadily-up cell's
-// "last seen" is always "now" anyway.
+// from any source (watcher connect, on-demand snapshot, announce).
 func (s *Server) noteSighting(name string) {
+	s.recordSighting(name, time.Now().UTC(), false)
+}
+
+// recordSighting updates last_seen and persists it when the on-disk copy
+// has aged out, on the first sighting, or when the caller knows this is a
+// transition (returned/stale/withdrawn) — the moments whose timestamp a
+// human actually reads.
+func (s *Server) recordSighting(name string, at time.Time, transition bool) {
 	s.mu.Lock()
-	_, known := s.lastSeen[name]
-	s.lastSeen[name] = time.Now().UTC()
+	s.lastSeen[name] = at
+	written, known := s.lastSeenPersisted[name]
+	due := transition || !known || at.Sub(written) >= lastSeenPersistAge
+	if due {
+		s.lastSeenPersisted[name] = at
+	}
 	s.mu.Unlock()
-	if !known {
+	if due {
 		s.persistLastSeen()
 	}
 }

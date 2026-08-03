@@ -56,14 +56,23 @@ Implementation notes beyond the doc's letter:
   (they carry reason/eta/since and the reconciliation rule); the
   commands[] queue carries one-off verbs (unload/warm) for cells that
   can't be reached interactively. MCP drain/resume fall back to
-  desired-intent when daemon_url is absent.
+  desired-intent when daemon_url is absent. *(C6: the queue's producer
+  landed with MIN-G — the MCP `unload_model` tool falls back to
+  `QueueCommand` when the cell's admin port doesn't answer, validating
+  the model against the cell's ANNOUNCED set first. Delivery is
+  at-least-once, retired by an announce with a higher seq: deleting the
+  batch at hand-off lost it whenever the response never arrived.)*
 - **Announce-side defs load once at client start** (daemon or slim):
   a def edit takes effect on the next announcer/daemon restart. Defs
   change via git + converge, so this is the natural cadence.
-- **RenderCount is held in a package-level sync.Map keyed by *Server**
-  (the render loop couldn't extend the Server struct under its
-  contract) — one Server per process in practice; noted for a future
-  tidy.
+- **RenderCount was held in a package-level sync.Map keyed by *Server**,
+  and this doc claimed the render loop "couldn't extend the Server
+  struct under its contract". No such contract ever existed — the same
+  commit added three fields to that struct. It was an accident of
+  authoring order dressed up as a constraint, and the invented
+  justification is worth recording because it is the only one the C0–C4
+  run produced. C6/NIT-B moved it to `Server.renderWrites`
+  (`atomic.Int64`) and deleted the map and the fiction together.
 - **fleet.front_config is the render mount contract**: fleetd sees the
   front's watched config dir (rw) and writes atomically into it;
   -watch-config applies. The dry-run path (C2's render_front) verified
@@ -201,8 +210,13 @@ registry must never affect serving (invariant: control plane failure
   `received_at`** — `seq` is a per-boot hint only (it resets on cell
   reboot) and cell-reported clocks are never consulted, which also
   retires clock skew as a failure class. Transitions publish on
-  `/api/fleet/events` (the existing SSE stream) — `cell_stale`,
-  `cell_withdrawn`, `cell_returned`, `model_degraded` (reserved).
+  `/api/fleet/events` (the existing SSE stream). The emitted type
+  strings are dotted camelCase — `fleet.cellStale`,
+  `fleet.cellWithdrawn`, `fleet.cellReturned`,
+  `fleet.fingerprintMismatch`, plus the probe-path
+  `fleet.cellUp`/`fleet.cellDown` — and the CLI and live SSE consumers
+  depend on those names, so the doc follows the code here, never the
+  reverse (C6/DOC-3). `model_degraded` stays reserved with no emitter.
 - **Cold start:** on fleetd startup the presence table is empty and
   must not be mistaken for a withdrawn fleet — hold the last-rendered
   front config and defer any presence-driven re-render until

@@ -532,14 +532,26 @@ func (s *Server) toolUnloadModel(ctx context.Context, cell, model string) (strin
 	}
 	resp, err := s.http.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("POST %s: %v", url, err)
+		return s.queueUnload(cell, model, fmt.Sprintf("POST %s: %v", url, err))
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("unload %s on %s: HTTP %d: %s", model, cell, resp.StatusCode, strings.TrimSpace(string(body)))
+		return s.queueUnload(cell, model, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
 	}
 	return fmt.Sprintf("Unloaded %s on %s. The next request naming it JIT-loads again.", model, cell), nil
+}
+
+// queueUnload is the piggyback fallback: after C3 a cell fleetd cannot
+// reach directly still collects verbs on its next heartbeat, so an
+// unreachable llama-swap admin port is a DELAY, not a failure. It stays
+// an error when the cell doesn't announce — nothing would ever collect
+// the command, and pretending otherwise is worse than failing.
+func (s *Server) queueUnload(cell, model, why string) (string, error) {
+	if qerr := s.fleet.QueueCommand(cell, fleetapi.AnnounceCommand{Verb: "unload", Model: model}); qerr != nil {
+		return "", fmt.Errorf("unload %s on %s: %s (piggyback also unavailable: %v)", model, cell, why, qerr)
+	}
+	return fmt.Sprintf("%s's admin port did not answer (%s), so the unload of %s is queued for its next announce (≤ one heartbeat).", cell, why, model), nil
 }
 
 func (s *Server) getJSON(ctx context.Context, url string, out any) error {

@@ -158,26 +158,31 @@ func (s *Server) handleAnnounce(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// maxAnnounceFieldLen bounds announce-supplied strings; they land in
-// fleet_status (human and agent contexts alike).
+// maxAnnounceFieldLen bounds off-box strings; they land in fleet_status
+// (human and agent contexts alike).
 const maxAnnounceFieldLen = 256
+
+// clean rejects an off-box string that is oversized or carries control
+// characters. Shared by every ingest that feeds a status surface — the
+// announce endpoint sanitised exactly this class of data while the lease
+// endpoint, whose entries print in the same tables, did not.
+func clean(label, v string) error {
+	if len(v) > maxAnnounceFieldLen {
+		return fmt.Errorf("%s exceeds %d bytes", label, maxAnnounceFieldLen)
+	}
+	for _, r := range v {
+		if !unicode.IsPrint(r) {
+			return fmt.Errorf("%s contains a control character", label)
+		}
+	}
+	return nil
+}
 
 // validateAnnounce enforces enum values and field hygiene (length,
 // control characters) on the parts of an announce that flow into
 // status surfaces. Unknown FIELDS stay tolerated (the version-skew
 // rule); unknown VALUES of defined fields are rejected.
 func validateAnnounce(req *AnnounceRequest) error {
-	clean := func(label, v string) error {
-		if len(v) > maxAnnounceFieldLen {
-			return fmt.Errorf("%s exceeds %d bytes", label, maxAnnounceFieldLen)
-		}
-		for _, r := range v {
-			if !unicode.IsPrint(r) {
-				return fmt.Errorf("%s contains a control character", label)
-			}
-		}
-		return nil
-	}
 	if req.Intent != nil {
 		switch req.Intent.State {
 		case "serving", "drained", "withdrawing":
@@ -341,16 +346,17 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	}
 	s.intentMu.Unlock()
 
-	// Presence makes last_seen truth: a fresh announce IS a sighting.
-	s.mu.Lock()
-	s.lastSeen[req.Cell] = now
-	s.mu.Unlock()
+	// Presence makes last_seen truth: a fresh announce IS a sighting. The
+	// persist is age-gated with a forced write on transitions — a cell
+	// that only ever announces (no inbound port, C3's whole destination)
+	// otherwise had NO persisted sighting at all.
+	s.recordSighting(req.Cell, now, firstEver || wasStaleOrWithdrawn || withdrawn)
 
 	for _, ev := range events {
 		s.publish(ev)
 	}
 
-	cmds := s.drainCommands(req.Cell)
+	cmds := s.drainCommands(req.Cell, req.Seq)
 	resp := &AnnounceResponse{IntervalS: intervalS, DesiredIntent: desired, Commands: cmds}
 
 	if withdrawn || firstEver || wasStaleOrWithdrawn {
@@ -432,14 +438,58 @@ func (s *Server) cellClass(name string) string {
 	return ""
 }
 
-// drainCommands returns (and clears) the queued piggyback commands for
-// a cell — verbs fleetd couldn't deliver interactively.
-func (s *Server) drainCommands(cell string) []AnnounceCommand {
+// drainCommands hands the cell its queued piggyback verbs. Delivery is
+// AT-LEAST-ONCE, keyed on the announce seq: the batch moves to an
+// in-flight slot stamped with this announce's seq instead of being
+// deleted, and only an announce with a HIGHER seq — proof the cell read
+// the response it was attached to — retires it. Deleting at hand-off
+// lost the batch whenever the response never arrived. Both verbs
+// (unload/warm) are idempotent, so a duplicate is harmless.
+func (s *Server) drainCommands(cell string, seq uint64) []AnnounceCommand {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if pend, ok := s.cmdInflight[cell]; ok {
+		if seq > pend.seq {
+			delete(s.cmdInflight, cell)
+		} else {
+			// Same seq (a retried POST) or lower (seq resets per cell
+			// boot): redeliver and re-stamp, so a reboot can't pin the
+			// slot forever.
+			pend.seq = seq
+			s.cmdInflight[cell] = pend
+			return pend.cmds
+		}
+	}
 	cmds := s.commands[cell]
+	if len(cmds) == 0 {
+		return nil
+	}
 	delete(s.commands, cell)
+	s.cmdInflight[cell] = inflightCommands{seq: seq, cmds: cmds}
 	return cmds
+}
+
+// QueueCommand piggybacks a verb for a cell that fleetd cannot reach
+// interactively. The model is validated against what the cell ANNOUNCED
+// (the comment on queueCommand's bound demands it): a typo must fail at
+// the caller rather than sit in a queue nothing will ever execute.
+func (s *Server) QueueCommand(cell string, cmd AnnounceCommand) error {
+	switch cmd.Verb {
+	case "unload", "warm":
+	default:
+		return fmt.Errorf("unknown verb %q (want unload or warm)", cmd.Verb)
+	}
+	p := s.PresenceFor(cell)
+	if p == nil || !p.Announcing {
+		return fmt.Errorf("cell %q has never announced; nothing would collect the command", cell)
+	}
+	for _, m := range p.Models {
+		if m.ID == cmd.Model {
+			s.queueCommand(cell, cmd)
+			return nil
+		}
+	}
+	return fmt.Errorf("cell %q does not announce a model %q", cell, cmd.Model)
 }
 
 // maxQueuedCommands bounds the per-cell command queue; beyond it the
@@ -531,4 +581,11 @@ func (s *Server) noteRenderTrigger(cell string) {
 		// A pending trigger already covers this cell — coalescing is
 		// the point (flap storms render at most the cap).
 	}
+}
+
+// inflightCommands is one cell's handed-over command batch, stamped with
+// the announce seq it rode out on.
+type inflightCommands struct {
+	seq  uint64
+	cmds []AnnounceCommand
 }

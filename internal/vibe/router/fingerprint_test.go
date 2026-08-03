@@ -115,3 +115,45 @@ func TestTokenizeCmd_Escapes(t *testing.T) {
 		t.Error("unterminated quote must error")
 	}
 }
+
+// TestFlagsSHA256_ForeignHomeNormalized pins MIN-B: the def carries a
+// LITERAL absolute path (no tilde in the yaml), so the two sides never
+// share a $HOME to anchor on. Anchoring only on the local home made such
+// a def hash differently on cell and fleetd forever — fail-closed on a
+// strict def, which yanks a working model.
+func TestFlagsSHA256_ForeignHomeNormalized(t *testing.T) {
+	const literal = `/usr/bin/llama-server --model /home/pequalsnp/models/q.gguf --ctx-size 4096`
+
+	t.Setenv("HOME", "/root") // fleetd, containerized
+	asRoot, err := FlagsSHA256(literal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", "/home/pequalsnp") // the cell
+	asUser, err := FlagsSHA256(literal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if asRoot != asUser {
+		t.Errorf("a literal /home path hashed differently by box: %s vs %s", asRoot, asUser)
+	}
+
+	// A root-anchored literal folds the same way, and macOS cells too.
+	t.Setenv("HOME", "/home/pequalsnp")
+	rootPath, _ := FlagsSHA256(`/usr/bin/llama-server --model /root/models/q.gguf --ctx-size 4096`)
+	macPath, _ := FlagsSHA256(`/usr/bin/llama-server --model /Users/kyle/models/q.gguf --ctx-size 4096`)
+	if rootPath != asUser || macPath != asUser {
+		t.Errorf("home folding is not box-independent: root=%s mac=%s want=%s", rootPath, macPath, asUser)
+	}
+
+	// Still blind to nothing that matters: a path OUTSIDE any home, and a
+	// weights swap inside one, both mismatch.
+	outside, _ := FlagsSHA256(`/usr/bin/llama-server --model /srv/models/q.gguf --ctx-size 4096`)
+	if outside == asUser {
+		t.Error("a non-home path folded into the home form")
+	}
+	swapped, _ := FlagsSHA256(`/usr/bin/llama-server --model /home/pequalsnp/models/OTHER.gguf --ctx-size 4096`)
+	if swapped == asUser {
+		t.Error("weights swap produced the same hash")
+	}
+}

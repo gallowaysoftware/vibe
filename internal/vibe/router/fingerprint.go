@@ -47,11 +47,8 @@ func canonicalFlagPairs(argv []string) []string {
 		return nil
 	}
 	argv = argv[1:] // argv[0] is the binary path
-	home, _ := os.UserHomeDir()
 	for i, tok := range argv {
-		if home != "" && strings.HasPrefix(tok, home+string(os.PathSeparator)) {
-			argv[i] = "~" + tok[len(home):]
-		}
+		argv[i] = normalizeHome(tok)
 	}
 	var groups []string
 	for i := 0; i < len(argv); {
@@ -76,6 +73,42 @@ func canonicalFlagPairs(argv []string) []string {
 	}
 	sort.Strings(groups)
 	return groups
+}
+
+// normalizeHome folds a home-anchored path to "~/…" INDEPENDENTLY of
+// which box computes it. Anchoring on the local $HOME alone (fleetd runs
+// root, cells run users) made a def carrying a literal /home/<user>/…
+// path hash differently on the two sides forever — and on a strict def
+// that fail-closed yanks a working model.
+//
+// The trade, stated plainly: two users' trees on one box now hash
+// identically, so this fails OPEN. That is the right bias. A false
+// mismatch pulls a healthy model out of the catalog; a false match only
+// misses one flavour of drift, and weights-path swaps outside a home
+// directory still mismatch.
+func normalizeHome(tok string) string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if rest, ok := strings.CutPrefix(tok, home+"/"); ok {
+			return "~/" + rest
+		}
+	}
+	if rest, ok := strings.CutPrefix(tok, "/root/"); ok {
+		return "~/" + rest
+	}
+	if rest, ok := strings.CutPrefix(tok, "/home/"); ok {
+		// /home/<user>/rest → ~/rest; a bare /home/<user> is not a
+		// home-anchored PATH, so leave it alone.
+		if i := strings.Index(rest, "/"); i > 0 {
+			return "~/" + rest[i+1:]
+		}
+	}
+	if rest, ok := strings.CutPrefix(tok, "/Users/"); ok {
+		// macOS cells (the mlx_server class) anchor here.
+		if i := strings.Index(rest, "/"); i > 0 {
+			return "~/" + rest[i+1:]
+		}
+	}
+	return tok
 }
 
 // tokenizeCmd splits a rendered cmd string on whitespace outside double
