@@ -376,17 +376,23 @@ func (s *Server) pruneStaleServingRequest(cell string) {
 	slog.Info("dropped unresolvable serving request (cell went stale)", "cell", cell)
 }
 
-// modelSetChanged compares model id sets (order-insensitive).
+// modelSetChanged compares model id SETS (order-insensitive). Announces
+// are untrusted input, so duplicate ids must not hide a change: comparing
+// slice lengths and then only next⊆prev misses [A,B] → [A,A].
 func modelSetChanged(prev, next []AnnounceModel) bool {
-	if len(prev) != len(next) {
+	ids := func(ms []AnnounceModel) map[string]bool {
+		out := make(map[string]bool, len(ms))
+		for _, m := range ms {
+			out[m.ID] = true
+		}
+		return out
+	}
+	prevIDs, nextIDs := ids(prev), ids(next)
+	if len(prevIDs) != len(nextIDs) {
 		return true
 	}
-	prevIDs := make(map[string]bool, len(prev))
-	for _, m := range prev {
-		prevIDs[m.ID] = true
-	}
-	for _, m := range next {
-		if !prevIDs[m.ID] {
+	for id := range nextIDs {
+		if !prevIDs[id] {
 			return true
 		}
 	}

@@ -182,6 +182,22 @@ into fleet config, where `--check`/git see it. Two rules:
   when any model on the target cell is non-idle or holds an active
   lease. This is also the first mechanical consumer the lease store
   gets.
+  - **A guard that cannot be EVALUATED is a skip too** (C5). Resolving
+    the model's cell goes through `router.LoadDefs`, which fails on an
+    unreadable dir *or any one malformed YAML in it*; collapsing that
+    into "no cell" silently converted every scheduled warm into an
+    unguarded one. Resolve failure skips. An in-flight count that has
+    never been REPORTED skips as well — unknown is not zero.
+    Resolved-but-unassigned (a front-only alias) still fires, labelled
+    `warmed (unguarded: no def/cell)`.
+  - **Live check owed on that last rule.** `inFlightSeen` turns true the
+    first time llama-swap sends an `inflight` frame for the cell. If
+    llama-swap emits one on SSE connect, the skip window is empty in
+    practice. If it emits only on add/remove edges, a fleetd restarted
+    overnight would skip the 06:30 warm on a cell that served nothing
+    since — visible in `fleet_status` as `skipped (cell X in-flight
+    unknown)`, not silent, but wrong. Verify against a real cell before
+    trusting scheduled warms after a fleetd restart.
 - **Timezone is declared, not inherited.** fleetd runs in a container
   that defaults to UTC; `"30 6 * * *"` evaluated in UTC warms at
   ~23:30 local. Set `TZ` in the `deploy/fleetd` `.env` contract, and

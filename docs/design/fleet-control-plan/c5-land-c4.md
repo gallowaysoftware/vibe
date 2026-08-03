@@ -705,6 +705,72 @@ that will mislead one.
 10. **CI re-run.** Push and re-run CI; do not trust PR #22's existing
     green check (measured 50%+ failure before gate 1). Then merge #22.
 
+### Gate results (2026-08-03)
+
+| gate | result |
+|---|---|
+| 1 — race | **PASS.** `-race -count=20 -run TestWarmTarget` clean (43.9s). The pre-fix code was confirmed racy the same way: stashing the test fix reproduced a `DATA RACE` inside 20 runs. `-race -count=5 ./...` clean. |
+| 2 — panic | **PASS.** `TestRenderLoopNonLlamaDefWithAnnouncedHashDoesNotPanic`, five sub-cases (comfyui / http_server / tabby_api / cloud_peer / unpulled mlx). Each completes, keeps the unverifiable def (fail-open), writes, and re-renders on the next transition. |
+| 3 — config integrity | **PASS.** `TestRenderLoopEmptyDefsRefusesToOverwriteFrontConfig` (no write, `RenderCount` 0, file byte-identical) and `TestRenderLoopAllDefsExcludedStillWrites` (input-side proof). |
+| 4 — warm policy | **NOT RUN (live).** Needs a real cell. Every sub-case has a unit regression instead — drained skip, mid-generation eviction + completion-edge restart, `>1h` window, no-activity-evidence — but the live run is still owed. |
+| 5 — cron | **PASS.** Twelve-row table incl. all six both-restricted cases, `dow=7`, the century non-leap Feb-29. Cross-checked against Python `croniter`: nine of eleven checked rows agree exactly. The two that differ are the stepped-star rows, and croniter is the one out of step — it reads `*/2` as restricted, while cronie's `entry.c` sets `DOM_STAR`/`DOW_STAR` on any field whose first character is `*` (verified against cronie master). We follow the C implementation the format comes from; the divergence is recorded in the test. |
+| 6 — schedule guard | **PARTIAL.** The unit half passes (`TestScheduleGuardSkipsWhenTheGuardCannotBeEvaluated`: resolve failure skips, unknown in-flight skips, front-only alias fires labelled). The end-to-end run with a real malformed YAML in a live backends dir is **NOT RUN**. |
+| 7 — shutdown | **PASS.** `TestCloseUnblocksAnInFlightWarm` — `Close()` returns well inside 3s against a warm that blocks until its context dies. |
+| 8 — inner loop | **PASS.** `go build ./...`, `go vet ./...`, `gofmt -l .` (empty), `go mod tidy` (clean), `golangci-lint run` (0 issues), `go test -race -count=5 ./...`. |
+| 9 — adversarial pass | **DONE**, addendum below. |
+| 10 — CI re-run | **NOT RUN** — this phase does not push. |
+
+## Addendum: the adversarial review pass (2026-08-03)
+
+Gate 9, run over the whole C4 + C5 diff (`322712f..HEAD`) after §1–§8
+landed. Six findings beyond the 35 this document lists; four fixed here,
+two recorded as known limits.
+
+1. **`warmCtx`'s cancel was not idempotent** (minor, C5-introduced).
+   `context.CancelFunc` is documented as safe to call more than once; the
+   returned closure did `close(stop)`, so a second call would panic. Both
+   current call sites call it once, which is exactly how this survives
+   until someone adds a third. Wrapped in a `sync.Once`.
+2. **`modelSetChanged` misses a duplicate-id transition** (minor, C4).
+   It compared slice lengths and then checked next⊆prev, so
+   `[A,B] → [A,A]` reported "unchanged" and the render trigger was
+   dropped. Duplicate ids are a protocol violation, but announces are
+   untrusted input by C3's own threat note. Now compares id SETS.
+3. **The fleet page's warnings panel grows without bound** (minor, C4).
+   `$("warnings").prepend(w)` on every fingerprint-mismatch event, and a
+   flapping strict def emits one per render (up to 1/min) — a tab left
+   open for days accumulates DOM forever. Capped at 50.
+4. **`boot()` rejections were unhandled** (nit, C4). `saveToken()` and
+   the bottom-of-file `if (token) boot();` both called an async function
+   without a catch, so a 401 during boot surfaced as an unhandled
+   promise rejection in the console instead of the token gate the code
+   already shows.
+5. **Unknown in-flight now hard-skips a scheduled warm — and that rests
+   on an unverified upstream behaviour** (known limit, C5-introduced by
+   CC-3's mandate). `inFlightSeen[cell]` turns true on the first
+   `inflight` frame. If llama-swap emits one on SSE connect, this never
+   bites. If it emits only on add/remove edges, a fleetd restarted
+   overnight would skip the 06:30 warm on a cell that served nothing
+   since. It fails *visible* (`skipped (cell X in-flight unknown)` in
+   fleet_status), not silent, and skipping is the safe direction — but
+   it is a live check that is owed, and it is now written into
+   `c4-comfort.md` §2 rather than left in a commit message.
+6. **`warmViaFront` sends no Authorization header** (known limit, C4).
+   If the front llama-swap is configured with `apiKeys`, every warm —
+   target and schedule alike — fails with a 401 recorded as `warm
+   failed: ... HTTP 401`. The reference front has no `apiKeys`, which is
+   why the C4 live gate passed. Out of scope to fix here: it needs a
+   front credential in `hosts.yaml`, which is config-surface design, not
+   a review fix. Recorded so the next agent does not debug it from
+   scratch.
+
+Two items the audit reported were re-confirmed as **not defects** and
+deliberately left alone: the `/ui/fleet` bearer exemption (exact-match,
+GET-only, evaluated before mux path-cleaning — widening it to a prefix
+match or `path.Clean` would be the actual vulnerability; the boundary is
+now test-pinned in `daemon/fleet_registry_test.go`) and the page's
+single-route surface.
+
 ## Out of scope
 
 The C1–C3 substrate findings — presence discarding probe evidence, drain

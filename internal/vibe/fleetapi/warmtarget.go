@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -267,8 +268,12 @@ func (s *Server) warmCtx(d time.Duration) (context.Context, context.CancelFunc) 
 		case <-stop:
 		}
 	}()
+	// context.CancelFunc is documented as safe to call more than once, so
+	// the returned one must be too — the close(stop) would otherwise
+	// panic on a second call.
+	var once sync.Once
 	return ctx, func() {
-		close(stop)
+		once.Do(func() { close(stop) })
 		cancel()
 	}
 }

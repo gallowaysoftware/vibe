@@ -77,7 +77,7 @@ function saveToken() {
   token = $("token-input").value.trim();
   localStorage.setItem("vibeFleetToken", token);
   $("token-gate").style.display = "none";
-  boot();
+  boot().catch(() => {});
 }
 if (!token) { $("token-gate").style.display = "flex"; }
 
@@ -251,7 +251,11 @@ async function streamEvents(signal) {
               w.innerHTML = `fingerprint mismatch: <code>${esc(d.model)}</code> on <b>${esc(d.cell)}</b> ` +
                             `(${esc(d.mode)}) expected ${esc((d.expected||"").slice(0,12))}… got ${esc((d.got||"").slice(0,12))}…` +
                             (d.defs_sha ? ` defs ${esc(d.defs_sha)}${d.defs_dirty ? " (dirty)" : ""}` : "");
-              $("warnings").prepend(w);
+              const warns = $("warnings");
+              warns.prepend(w);
+              // A flapping mismatch fires up to once a render; a tab left
+              // open for days must not grow an unbounded DOM.
+              while (warns.childElementCount > 50) warns.lastElementChild.remove();
             }
           } catch (e) { /* keepalive / partial */ }
         }
@@ -283,7 +287,7 @@ async function boot() {
   streamEvents(signal);
   pollTimer = setInterval(() => refresh().catch(() => {}), 30000);
 }
-if (token) boot();
+if (token) boot().catch(() => {});
 </script>
 </body>
 </html>
