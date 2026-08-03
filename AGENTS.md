@@ -246,24 +246,65 @@ optional.)
     interval (presence is heartbeat-stale; a swap mid-cold-start reads
     as "nothing resident"). Absent/drained cells skip silently, noted
     in fleet_status's `warm` block.
+  - **Four ways the warm policy reaches that rejected behaviour**, each
+    now guarded and test-pinned (C5) — do not undo any of them:
+    *drain* is checked before presence AND probes via
+    `effectiveIntent` (a drained cell announces an empty model list by
+    design, which the nothing-resident branch reads as "restore");
+    *in-flight* blocks the restore (`InFlight(cell) > 0`) and
+    `trackInFlight` stamps activity on the completion edge as well as
+    the start, or one generation longer than the window reads as idle;
+    *unknown activity* measures idleness from the fleetd process's own
+    start (`Server.started`) — never a fabricated floor, and the status
+    names the missing evidence; *`swapIdleFor` returns the real idle*
+    (shortest across residents, unbounded above) so a window over an
+    hour is not silently inert.
   - **Warm schedules** (`warm_schedule:`, fleetapi/warmsched.go): a
     minimal 5-field cron evaluator (stdlib, minute granularity, DST
     wall-clock semantics) firing warm through the front, with the
-    eviction-fight guard: skip + note when the target cell has
-    in-flight work or an active lease (the first mechanical lease
-    consumer). TZ is the environment's declared zone (the reference
-    Dockerfile carries tzdata); every schedule's resolved `next_fire`
-    shows in fleet_status so a wrong zone is visible.
+    eviction-fight guard. TZ is the environment's declared zone (the
+    reference Dockerfile carries tzdata); every schedule's resolved
+    `next_fire` shows in fleet_status so a wrong zone is visible.
+    - **Vixie dom/dow, exactly**: both fields restricted ⇒ OR; either
+      one a star ⇒ AND. "Star" is TEXTUAL (the raw field's first byte,
+      like cronie's `entry.c`), so `*/2` is a star and `1-31` is not —
+      never derive it from set cardinality. `dow=7` is Sunday, folded
+      at parse time (`time.Weekday()` never returns 7). Names (`sun`,
+      `jan`) are unsupported. Fall-back DST fires the repeated minute
+      twice; that is documented and pinned, not "fixed" silently.
+    - **A guard that cannot be EVALUATED is a skip**: `CellOfModel`
+      returns an error so a `LoadDefs` failure (one malformed YAML in
+      the backends dir) skips instead of firing unguarded, and an
+      unreported in-flight count is not a zero one. Resolved-but-no-cell
+      (a front-only alias) still fires, labelled `unguarded` in the
+      status.
+    - Warms run under `warmCtx`, whose cancellation is linked to
+      `s.done` — both warm loops call `warmFn` synchronously from
+      `s.wg` goroutines, so an unlinked timeout blocks `Close()`.
   - **The fleet page** (fleetapi/fleet.html via embed.FS at
     `GET /ui/fleet`): static, framework-free, bearer-exempt as a static
-    asset ONLY (the ONE middleware exemption — everything else stays
-    gated; token in localStorage). SSE (`/api/fleet/events`) drives
-    debounced state refreshes; action buttons POST `/mcp` tools/call
-    — never add mutation routes for it; if a button needs something
-    new, the MCP facade is what's incomplete.
+    asset ONLY (the ONE middleware exemption — exact-match, GET-only,
+    evaluated before mux path-cleaning, boundary test-pinned in
+    daemon/fleet_registry_test.go; do NOT widen it to a prefix match or
+    `path.Clean`). SSE (`/api/fleet/events`) drives debounced state
+    refreshes; action buttons POST `/mcp` tools/call — never add
+    mutation routes for it; if a button needs something new, the MCP
+    facade is what's incomplete. `esc()` is the TEXT escaper and
+    `attr()` the attribute one — they stay separate because esc()'s
+    output also feeds `textContent`.
   - **Model-set changes are render triggers** (recordAnnounce): a cell
     that starts/stops serving a model re-renders like a membership
     transition.
+  - **The render loop treats announces as untrusted input** (C5, in
+    C3-authored code): `applyFingerprints` skips defs that are neither
+    llama_server nor mlx_server before calling `router.ModelCmd`, and
+    `ModelCmd` returns an error instead of dereferencing; a
+    per-model verification failure warns and CONTINUES, because an
+    aborted pass leaves `p.Announcing` uncleared and freezes prune,
+    re-add and enforcement fleet-wide. `renderPass` refuses to render
+    when ZERO defs loaded and a non-empty front config exists — the
+    guard is INPUT-side, since a peerless render is legitimate when
+    every def is unassigned or every roaming cell is pruned.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.

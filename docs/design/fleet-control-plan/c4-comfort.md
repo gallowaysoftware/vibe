@@ -1,13 +1,51 @@
 # C4 — Comfort: warm targets, warm schedules, the fleet page
 
-Status: EXECUTED (2026-08-02). All four gates passed; the fleet page is
-live at `GET /ui/fleet` on fleetd, and the warm policy ran end-to-end
-against real cells.
+Status: EXECUTED WITH FOLLOW-UPS (2026-08-03). The three live gates
+below are real runs and stand. Gate 4 as originally written did not:
+post-gate review found a data race, a warm policy that reached the
+design-rejected mid-session eviction four ways, and a cron evaluator
+that ANDed dom/dow where Vixie ORs. All of it is fixed in
+[C5](c5-land-c4.md), whose commits are on this branch.
+
+> **Correction (2026-08-02, post-implementation audit; C5 landed
+> 2026-08-03).** This phase is the only one of C0–C4 whose adversarial
+> self-review never ran — the implementing agent's budget ran out
+> mid-review. A 9-agent verification pass afterwards confirmed 64
+> defects across C0–C4 — 2 blockers, 19 majors, 43 minors and nits —
+> concentrated in this phase's warm policy. Against the claims
+> originally on this page:
+>
+> - **"Unit tests: PASS" (gate 4) was false.** The suite passed at
+>   `-count=1`; `-race -count=10` reproduced a data race in
+>   `c4_test.go` in 30–50% of runs (measured 6/20 isolated, 6/12
+>   full-package). PR #22's green CI check was a coin flip, not a merge
+>   signal. **This is the lesson the gate wording now carries: a gate
+>   claim is a claim about a repeated mechanical run.**
+> - **"absent/drained skips" (gate 4) was never implemented.**
+>   `evalWarmTarget` checked only `Stale`/`Withdrawn`; the drained
+>   branch did not exist, and
+>   `TestWarmTarget_SkipsAbsentAndDrainedCells` set only `Stale`
+>   despite its name — the test's NAME carried the claim its body never
+>   proved, and that false claim then propagated into three other
+>   documents. The test is now `TestWarmTarget_SkipsStaleCells`, and
+>   the drained case is `TestWarmTarget_SkipsDrainedCell`.
+> - **The warm policy reached the design-rejected mid-session eviction
+>   four separate ways** (drained cells warmed; unknown activity read as
+>   a fabricated hour of idleness; a long request stamped only at its
+>   start, so it read as idle and was evicted mid-generation; and any
+>   `restore_after_idle` above 1h silently inert). §1 below says *"do
+>   not build that, even as an option"* — the code built it by accident.
+> - **Cron ANDed dom/dow where Vixie ORs**, so `0 9 1 * 1` next-fired
+>   2027-02-01 instead of tomorrow, and the one interesting rule in cron
+>   semantics had no test — which is how it passed a gate reported PASS.
+> - **§3 described EventSource**; the implementation is a fetch-streamed
+>   reader because EventSource cannot carry the bearer header. The code
+>   was right, this page was wrong (fixed below).
 
 Gate results (live, reference fleet):
 
 1. **Warm-target gate: PASS.** On a real cell (two ~5 GB chat models —
-   small footprint while the 5090 hosted a game): swap loaded through
+   small footprint while the heavy cell's GPU hosted a game): swap loaded through
    the front, requests marked activity, then quiet — the restore fired
    at the 1m idle window (`last_restore` + target resident, state
    `holding / target resident`). The gate first exposed a live race
@@ -27,7 +65,7 @@ Gate results (live, reference fleet):
    the reference Dockerfile; next_fire resolves in the declared TZ.
 3. **Page gate: PASS.** Real browser: token prompt → table (4 cells,
    derived displays, per-row actions, status line). CLI drain flipped
-   localmodel's row to DRAINED via SSE without reload; pressing Resume
+   the gpu cell's row to DRAINED via SSE without reload; pressing Resume
    on the page round-tripped through `/mcp` ("Resume requested via
    announce") and the row flipped to SERVING 6s after the click
    (desired-serving → cell resume → echo → SSE). JIT round-trip
@@ -38,12 +76,20 @@ Gate results (live, reference fleet):
    the SSE stream now drives debounced state refreshes (it originally
    fed only the fingerprint-warnings panel — a 30s poll would have
    been the update path, failing the gate's intent).
-4. **Unit tests: PASS.** Idle-window state machine (request resets,
-   absent/drained skips, nothing-resident restore, empty-grace timing),
-   cron next-fire (leap year, DST spring-gap skip in America/Halifax,
+4. **Unit tests: PASS at `-count=1` only — FAILED the real gate, fixed
+   in C5.** As shipped: idle-window state machine (request resets,
+   stale skips, nothing-resident restore, empty-grace timing), cron
+   next-fire (leap year, DST spring-gap skip in America/Halifax,
    exact-minute boundaries), schedule guard (busy in-flight → skip,
    active lease → skip — the first mechanical lease consumer, clear →
-   fire + re-park), page route served only under the fleet role.
+   fire + re-park), page route served only under the fleet role. What
+   the gate missed: `-race -count=10` reproduced a data race in the
+   warm-target test; the "absent/drained skips" case only ever
+   exercised *stale*; the idle-window INPUT path (`trackInFlight`) had
+   zero coverage, so replacing it with a no-op left the repo green; and
+   the cron table had no both-restricted dom/dow case. Post-C5 the gate
+   is `-race -count=20 -run TestWarmTarget` plus `-race -count=5 ./...`,
+   and every item above is covered.
 
 Also landed this phase: a **model-set-change render trigger** (C3 doc
 promised it, the implementation lacked it — a cell that starts or
@@ -89,6 +135,32 @@ never on a clock**:
   policy layered on top, and it must tolerate the cell being drained
   or absent (skip silently; note in status).
 
+**Activity evidence (decided in C5, was left implicit).** "Request-idle"
+needs a source of truth for last-request time. Today that is
+`modelActivity`, fed only by the cell's own `/api/events` inflight
+frames — both edges (a model appearing in the frame's request list AND
+disappearing from it, so a long generation's completion restarts the
+window rather than its start). When a model has **no** entry, fleetd
+measures idleness from **its own process start**, never from a fabricated
+floor: fleetd must not claim silence it was not running to observe. The
+status detail names the missing evidence so the operator can see the
+policy is running on weak data.
+
+The stronger options were considered and deferred:
+
+- *Require `inFlightSeen[cell]` before restoring at all.* Correct only
+  if llama-swap emits an inflight frame **on connect** and not solely on
+  add/remove — unverified, and if it is add/remove-only a genuinely
+  quiet cell would never restore. Needs a live check before adopting.
+- *Announce the truth* — extend `AnnounceModel` with `last_request_at` /
+  `in_flight` (additive and v1-safe; the reserved `Probe` field sits
+  right there), populate them cell-side from llama-swap, and prefer the
+  announced value. This is the durable answer for announce-only cells
+  (the no-inbound-port case C3 exists for), where fleetd has no inflight
+  stream at all and the from-start floor is the only evidence there is.
+  Deferred to a later phase, not because it is wrong but because it
+  changes the wire protocol.
+
 ### 2. Warm schedules
 
 ```yaml
@@ -123,15 +195,16 @@ One static HTML file, embedded via `embed.FS` (house convention),
 served by fleetd at `GET /ui/fleet` (path chosen to avoid any
 collision with llama-swap's `/ui` on cells):
 
-- Renders the derived-state table live: EventSource on
-  `/api/fleet/events`, initial fill from `/api/fleet/state`. Per cell:
-  display state (SERVING / DRAINED + reason/eta / OFF/AWAY +
-  last-seen / …), class badge, resident models with states, leases,
-  fingerprint warnings.
+- Renders the derived-state table live: a **fetch-streamed reader** on
+  `/api/fleet/events` (not `EventSource` — it cannot carry the bearer
+  header, and the token is the whole auth story here), initial fill from
+  `/api/fleet/state`. Per cell: display state (SERVING / DRAINED +
+  reason/eta / OFF/AWAY + last-seen / …), class badge, resident models
+  with states, leases, fingerprint warnings.
 - Thin action buttons — drain / resume / wake / unload / warm — POSTing
-  to the same endpoints the MCP tools use. No new mutation surface:
-  if a button needs an endpoint the MCP facade doesn't have, the
-  facade is incomplete, fix that first.
+  `tools/call` to `/mcp`, the same facade the MCP clients use. No new
+  mutation surface: if a button needs a tool the MCP facade doesn't
+  have, the facade is incomplete, fix that first.
 - Deep links to each cell's llama-swap `/ui` (the model-level detail
   view stays there deliberately).
 - Auth: the page and its API calls sit behind the daemon's bearer

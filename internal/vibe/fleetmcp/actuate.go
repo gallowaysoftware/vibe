@@ -156,13 +156,14 @@ func (s *Server) toolWakeCell(ctx context.Context, cell string) (string, error) 
 // toolRenderFront dry-runs `vibe router render --cell front` in-process:
 // same renderer, same inputs, no shell-out. Returns the unified diff
 // against the mounted live config, or the full render when fleetd can't
-// see the front's file. Apply is deliberately absent in C2 — the
-// presence-driven render loop (C3) owns the write path and its mount
-// contract.
+// see the front's file. Apply stays deliberately absent: fleetd's
+// presence-driven render loop OWNS the write path, and two writers to
+// one -watch-config file is exactly what its atomic-write contract
+// forbids. This tool is the "what would change" question, not a lever.
 func (s *Server) toolRenderFront(ctx context.Context, dryRun *bool) (string, error) {
 	_ = ctx // the dry-run path has no cancellation semantics of its own
 	if dryRun != nil && !*dryRun {
-		return "", fmt.Errorf("render_front is dry-run-only in C2 — the presence-driven apply path arrives with C3")
+		return "", fmt.Errorf("render_front is dry-run-only: the presence-driven render loop owns the write path (a second writer breaks the atomic-write contract)")
 	}
 	var warnings []string
 	opts := router.Options{
