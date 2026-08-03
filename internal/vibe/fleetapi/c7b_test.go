@@ -1,0 +1,900 @@
+package fleetapi
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
+	"github.com/gallowaysoftware/vibe/internal/vibe/prices"
+)
+
+// C7b — the savings screen. The gates these tests pin are the ones that
+// decide whether the number is honest: the equivalence choice (72x), the
+// cache tier (5x), dated prices, and every state where the screen is
+// supposed to say "I don't know" instead of "$0.00".
+
+// savingsFixture is the price table these tests price against: a chat
+// twin at three hosts, an embedding twin, and a frontier model that
+// costs two orders of magnitude more. Frozen here, never read from the
+// vendored artifact — a table refresh must not move these numbers.
+func savingsFixture() *prices.Table {
+	return &prices.Table{
+		Schema: prices.SchemaVersion,
+		Snapshots: []prices.Snapshot{{
+			EffectiveFrom: "2026-01-01",
+			Base:          true,
+			Rows: []prices.Row{
+				{Provider: "host-a", Model: "acme/chat-30b", Key: "chat30b", In: 0.10, Out: 0.40, CacheRead: 0.01, Open: true},
+				{Provider: "host-b", Model: "acme/chat-30b", Key: "chat30b", In: 0.20, Out: 0.80, CacheRead: 0.02, Open: true},
+				{Provider: "host-c", Model: "acme/chat-30b", Key: "chat30b", In: 0.30, Out: 1.20, CacheRead: 0.03, Open: true},
+				{Provider: "host-a", Model: "acme/embed-1", Key: "embed1", In: 0.02, Open: true, Mode: prices.ModeEmbedding},
+				{Provider: "frontier-inc", Model: "frontier-1", Key: "frontier1", In: 15, Out: 75, CacheRead: 1.5},
+				{Provider: "frontier-inc", Model: "cloud-chat", Key: "cloudchat", In: 3, Out: 15, CacheRead: 0.3},
+			},
+		}},
+	}
+}
+
+func savingsHosts() *fleetcfg.File {
+	return &fleetcfg.File{
+		Cells: map[string]fleetcfg.Cell{
+			fleetcfg.FrontCell: {URL: "http://front:9000", Class: fleetcfg.ClassAlwaysOn},
+			"gpu-cell": {
+				URL: "http://gpu:9000", Class: fleetcfg.ClassOpportunistic,
+				Power:       &fleetcfg.Power{Source: fleetcfg.PowerDeclared, WattsIdle: 100, WattsBusy: 400},
+				CapitalCost: 3100,
+				CapitalNote: "example: dual-use GPU, upgrade delta over a gaming-adequate card",
+			},
+			"laptop": {URL: "http://laptop:9000", Class: fleetcfg.ClassRoaming},
+		},
+		Pricing: &fleetcfg.Pricing{
+			ElectricityPricePerKWh: 0.15,
+			Models: map[string]fleetcfg.ModelPricing{
+				"qwen-coder": {Twin: "acme/chat-30b"},
+				"bge-embed":  {Twin: "acme/embed-1"},
+			},
+		},
+	}
+}
+
+// newSavingsServer builds a fleetd-shaped server with an empty ledger.
+func newSavingsServer(t *testing.T, hosts *fleetcfg.File) *Server {
+	t.Helper()
+	dir := t.TempDir()
+	cells := []Cell{}
+	for name, c := range hosts.Cells {
+		cells = append(cells, Cell{Name: name, URL: c.URL, Class: string(c.Class)})
+	}
+	s := New(cells, filepath.Join(dir, "hist.json"), testDaemonInfo, Options{
+		UsagePath: filepath.Join(dir, "usage.jsonl"),
+		Timezone:  time.UTC,
+		Hosts:     hosts,
+		Prices:    savingsFixture(),
+	})
+	t.Cleanup(s.Close)
+	return s
+}
+
+// seedTokens writes one token bucket straight into the ledger. The fold
+// path is C7a's and is tested there; here the ledger is the INPUT.
+func seedTokens(s *Server, day, cell, model, basis string, c counts) {
+	b := s.usage.bucketLocked(usageKey{Day: day, Cell: cell, Model: model, Basis: basis}, "UTC")
+	b.Req += c.Req
+	b.InFresh += c.InFresh
+	b.InCached += c.InCached
+	b.Out += c.Out
+	b.UnmeasuredReq += c.Unmeasured
+	b.ErrReq += c.ErrReq
+	b.BusyMS += c.BusyMS
+}
+
+func seedResidency(s *Server, day, cell, model string, secs int64) {
+	b := s.usage.bucketLocked(usageKey{Day: day, Cell: cell, Model: model, Basis: usageBasisResident}, "UTC")
+	b.ResidentS += secs
+}
+
+func mustSavings(t *testing.T, s *Server, window string) SavingsReport {
+	t.Helper()
+	rep, err := s.Savings(context.Background(), window)
+	if err != nil {
+		t.Fatalf("Savings(%q): %v", window, err)
+	}
+	return rep
+}
+
+func cellRow(t *testing.T, rep SavingsReport, name string) CellSavings {
+	t.Helper()
+	for _, c := range rep.Cells {
+		if c.Cell == name {
+			return c
+		}
+	}
+	t.Fatalf("cell %q not in the report (%d rows)", name, len(rep.Cells))
+	return CellSavings{}
+}
+
+func money2(t *testing.T, v *float64) string {
+	t.Helper()
+	if v == nil {
+		return "—"
+	}
+	return fmt.Sprintf("%.2f", *v)
+}
+
+func today() string { return time.Now().In(time.UTC).Format("2006-01-02") }
+
+// TestSavings_TwinPricedHeadlineToTheCent walks the whole engine: twin
+// median across three hosts, the cache split, declared-wattage
+// electricity, and the net.
+func TestSavings_TwinPricedHeadlineToTheCent(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	day := today()
+	// 1M fresh, 12M cached, 0.5M out. At the MEDIAN host (host-b):
+	//   1.0 * 0.20 + 12 * 0.02 + 0.5 * 0.80 = 0.20 + 0.24 + 0.40 = $0.84
+	seedTokens(s, day, "gpu-cell", "qwen-coder", prices.BasisChat, counts{
+		Req: 100, InFresh: 1_000_000, InCached: 12_000_000, Out: 500_000, BusyMS: 3_600_000,
+	})
+	// 20h resident, 1h busy:
+	//   100W * 72000s + 300W * 3600s = 2000Wh + 300Wh = 2.3kWh * $0.15 = $0.345
+	seedResidency(s, day, "gpu-cell", "", 72_000)
+
+	rep := mustSavings(t, s, "30d")
+	row := cellRow(t, rep, "gpu-cell")
+	if !row.Measured {
+		t.Fatalf("gpu-cell unmeasured: %s", row.Reason)
+	}
+	if got := money2(t, row.Gross); got != "0.84" {
+		t.Errorf("gross = $%s, want $0.84 (median of three hosts)", got)
+	}
+	if got := money2(t, row.GrossLow); got != "0.42" {
+		t.Errorf("gross low = $%s, want $0.42 (cheapest host)", got)
+	}
+	if got := money2(t, row.GrossHigh); got != "1.26" {
+		t.Errorf("gross high = $%s, want $1.26 (dearest host)", got)
+	}
+	if got := money2(t, row.Power); got != "0.34" {
+		t.Errorf("power = $%s, want $0.34 (idle and busy billed separately)", got)
+	}
+	if got := money2(t, row.Net); got != "0.49" {
+		t.Errorf("net = $%s, want $0.49", got)
+	}
+	if row.NetLabel != "net" {
+		t.Errorf("net label = %q, want %q", row.NetLabel, "net")
+	}
+	if !row.PowerDeclared {
+		t.Error("declared wattage must be marked declared so the page can render it with a ~")
+	}
+	if rep.Totals.CachedPct == nil || fmt.Sprintf("%.0f", *rep.Totals.CachedPct) != "92" {
+		t.Errorf("cached pct = %v, want 92", rep.Totals.CachedPct)
+	}
+	if rep.Totals.TokensPricedPct != 100 {
+		t.Errorf("tokens priced = %.1f%%, want 100", rep.Totals.TokensPricedPct)
+	}
+	if len(row.Models) != 1 || row.Models[0].Hosts != 3 {
+		t.Fatalf("model row = %+v, want one row quoting 3 hosts", row.Models)
+	}
+	if m := row.Models[0]; m.RateLow != 0.10 || m.RateHigh != 0.30 {
+		t.Errorf("rate range = %g-%g /MTok, want 0.10-0.30", m.RateLow, m.RateHigh)
+	}
+	if rep.Caveat == "" || !strings.Contains(rep.Caveat, "upper bound") {
+		t.Error("the caveat must travel with the number, in the payload")
+	}
+}
+
+// TestSavings_FrontierIsTheSeventyFoldError pins gate 3: the same window
+// priced against a frontier model differs from the twin by an order of
+// magnitude, which is exactly why the twin is the default and the
+// frontier row is a config-declared claim with a written rationale.
+func TestSavings_FrontierIsTheSeventyFoldError(t *testing.T) {
+	hosts := savingsHosts()
+	twinOnly := mustSavingsFor(t, hosts)
+
+	hosts.Pricing.Frontier = &fleetcfg.Frontier{
+		Model:     "frontier-1",
+		Rationale: "example: the agentic refactors I would actually have paid for",
+	}
+	withFrontier := mustSavingsFor(t, hosts)
+
+	if twinOnly.Frontier != nil {
+		t.Error("a frontier line rendered with no frontier configured")
+	}
+	fr := withFrontier.Frontier
+	if fr == nil || fr.Cost == nil {
+		t.Fatalf("frontier line missing: %+v", fr)
+	}
+	if fr.Rationale == "" {
+		t.Error("the frontier line must carry its rationale to the screen")
+	}
+	ratio := *fr.Cost / *withFrontier.Totals.Gross
+	if ratio < 20 {
+		t.Errorf("frontier/twin ratio = %.1fx, want the documented order of magnitude (>=20x)", ratio)
+	}
+	// And the headline itself is the TWIN price, not the frontier one.
+	if money2(t, withFrontier.Totals.Gross) != money2(t, twinOnly.Totals.Gross) {
+		t.Error("declaring a frontier comparable changed the headline; the headline is always the twin")
+	}
+}
+
+func mustSavingsFor(t *testing.T, hosts *fleetcfg.File) SavingsReport {
+	t.Helper()
+	s := newSavingsServer(t, hosts)
+	seedTokens(s, today(), "gpu-cell", "qwen-coder", prices.BasisChat, counts{
+		Req: 100, InFresh: 1_000_000, InCached: 12_000_000, Out: 500_000,
+	})
+	return mustSavings(t, s, "30d")
+}
+
+// TestNoDefaultFrontierMappingShips pins gate 3's third clause: the repo
+// ships no frontier mapping of its own. A shipped mapping would be an
+// unearned claim BY THE REPO; a config field with a written rationale is
+// the owner's claim, which is a claim someone can argue with.
+func TestNoDefaultFrontierMappingShips(t *testing.T) {
+	// Nothing in the zero config names a frontier model.
+	if (&fleetcfg.Pricing{}).Frontier != nil {
+		t.Error("fleetcfg.Pricing has a default frontier")
+	}
+	var empty fleetcfg.File
+	if empty.Pricing != nil {
+		t.Error("an empty hosts.yaml carries pricing config")
+	}
+	// And no shipped example config sets one outside a comment.
+	root := repoRoot(t)
+	for _, rel := range []string{
+		"deploy/fleetd/README.md",
+		"README.md",
+		"AGENTS.md",
+	} {
+		data, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			continue
+		}
+		for i, line := range strings.Split(string(data), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "//") {
+				continue
+			}
+			if regexp.MustCompile(`^frontier:\s*\S`).MatchString(trimmed) {
+				t.Errorf("%s:%d ships a frontier mapping: %q", rel, i+1, trimmed)
+			}
+		}
+	}
+}
+
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		dir = filepath.Dir(dir)
+	}
+	t.Fatal("repo root not found")
+	return ""
+}
+
+// TestSavings_RepricesFromTheSameLedger pins gate 5: bumping the
+// vendored snapshot re-prices the whole history from the same raw
+// counts, with no re-collection anywhere.
+func TestSavings_RepricesFromTheSameLedger(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	seedTokens(s, today(), "gpu-cell", "qwen-coder", prices.BasisChat, counts{
+		Req: 10, InFresh: 1_000_000, InCached: 0, Out: 0,
+	})
+	before := mustSavings(t, s, "all")
+	if got := money2(t, before.Totals.Gross); got != "0.20" {
+		t.Fatalf("gross = $%s, want $0.20", got)
+	}
+	ledgerBefore := len(s.UsageReport("").Buckets)
+
+	// A new snapshot halves every host's input rate, effective today.
+	cut := savingsFixture()
+	cutRows := []prices.Row{}
+	for _, r := range cut.Snapshots[0].Rows {
+		r.In /= 2
+		r.Out /= 2
+		r.CacheRead /= 2
+		cutRows = append(cutRows, r)
+	}
+	cut.Snapshots = append(cut.Snapshots, prices.Snapshot{EffectiveFrom: today(), Rows: cutRows})
+	s.prices = cut
+
+	after := mustSavings(t, s, "all")
+	if got := money2(t, after.Totals.Gross); got != "0.10" {
+		t.Errorf("re-priced gross = $%s, want $0.10", got)
+	}
+	if got := len(s.UsageReport("").Buckets); got != ledgerBefore {
+		t.Errorf("ledger buckets changed on re-price: %d → %d; re-pricing must not touch the counts", ledgerBefore, got)
+	}
+}
+
+// TestSavings_DatedPricesDoNotRewriteHistory is gate 4 through the whole
+// report: yesterday keeps yesterday's rate even after a price cut.
+func TestSavings_DatedPricesDoNotRewriteHistory(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	now := time.Now().UTC()
+	yesterday := dayKey(now.AddDate(0, 0, -1), time.UTC)
+	seedTokens(s, yesterday, "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000})
+	seedTokens(s, today(), "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000})
+
+	tbl := savingsFixture()
+	cheap := []prices.Row{}
+	for _, r := range tbl.Snapshots[0].Rows {
+		r.In /= 10
+		r.Out /= 10
+		cheap = append(cheap, r)
+	}
+	tbl.Snapshots = append(tbl.Snapshots, prices.Snapshot{EffectiveFrom: today(), Rows: cheap})
+	s.prices = tbl
+
+	rep := mustSavings(t, s, "all")
+	// yesterday at 0.20/MTok + today at 0.02/MTok = 0.22
+	if got := money2(t, rep.Totals.Gross); got != "0.22" {
+		t.Errorf("gross = $%s, want $0.22 (each day at the rate in effect that day)", got)
+	}
+}
+
+// TestSavings_EmptyLedgerRendersTheInstallPanel pins gate 6's
+// fresh-install case: NOT a $0.00 hero.
+func TestSavings_EmptyLedgerRendersTheInstallPanel(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	rep := mustSavings(t, s, "30d")
+	if !rep.Empty {
+		t.Fatal("an empty ledger must report empty")
+	}
+	if rep.Totals.Gross != nil || rep.Totals.Net != nil {
+		t.Errorf("empty ledger produced money: gross=%v net=%v", rep.Totals.Gross, rep.Totals.Net)
+	}
+	if len(rep.Payback) != 0 {
+		t.Error("empty ledger produced a payback bar")
+	}
+}
+
+// TestSavings_UnpricedModelKeepsItsTokens pins gate 6: an unmapped model
+// keeps its tokens in the token column and leaves the money column, and
+// the header says what fraction was priced.
+func TestSavings_UnpricedModelKeepsItsTokens(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	day := today()
+	seedTokens(s, day, "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000, Out: 0})
+	seedTokens(s, day, "gpu-cell", "mystery-model", prices.BasisChat, counts{Req: 1, InFresh: 3_000_000, Out: 0})
+
+	rep := mustSavings(t, s, "30d")
+	row := cellRow(t, rep, "gpu-cell")
+	if row.InFresh != 4_000_000 {
+		t.Errorf("in_fresh = %d, want 4,000,000 (unpriced tokens stay in the token column)", row.InFresh)
+	}
+	if got := money2(t, row.Gross); got != "0.20" {
+		t.Errorf("gross = $%s, want $0.20 (only the priced model)", got)
+	}
+	var unpriced *ModelSavings
+	for i := range row.Models {
+		if row.Models[i].Model == "mystery-model" {
+			unpriced = &row.Models[i]
+		}
+	}
+	if unpriced == nil {
+		t.Fatal("the unpriced model is missing from the table entirely")
+	}
+	if unpriced.Priced || unpriced.Cost != nil {
+		t.Errorf("unpriced model carries money: %+v", unpriced)
+	}
+	if unpriced.Unpriced == "" {
+		t.Error("an unpriced model must say WHY")
+	}
+	if got := fmt.Sprintf("%.0f", rep.Totals.TokensPricedPct); got != "25" {
+		t.Errorf("tokens priced = %s%%, want 25%%", got)
+	}
+}
+
+// TestSavings_NoWattageMeansEmDashNotZero pins gate 6: a cell with no
+// declared power renders POWER as an em dash (nil) and labels its net
+// "net (power not counted)".
+func TestSavings_NoWattageMeansEmDashNotZero(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	day := today()
+	seedTokens(s, day, "laptop", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000, BusyMS: 60_000})
+	seedResidency(s, day, "laptop", "", 3600)
+
+	rep := mustSavings(t, s, "30d")
+	row := cellRow(t, rep, "laptop")
+	if row.Power != nil {
+		t.Errorf("power = %v, want nil (no declared wattage is not zero watts)", *row.Power)
+	}
+	if row.NetLabel != "net (power not counted)" {
+		t.Errorf("net label = %q, want %q", row.NetLabel, "net (power not counted)")
+	}
+	if row.Net == nil || money2(t, row.Net) != money2(t, row.Gross) {
+		t.Error("with no power counted the net equals the gross")
+	}
+}
+
+// TestSavings_NoCapitalCostNoPaybackBar pins gate 6: not 0%, not
+// infinity, not an invented denominator — no bar.
+func TestSavings_NoCapitalCostNoPaybackBar(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	day := today()
+	seedTokens(s, day, "laptop", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000})
+	seedTokens(s, day, "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000})
+
+	rep := mustSavings(t, s, "all")
+	for _, p := range rep.Payback {
+		if p.Cell == "laptop" {
+			t.Errorf("laptop has no capital_cost but got a payback bar: %+v", p)
+		}
+	}
+	if len(rep.Payback) != 1 || rep.Payback[0].Cell != "gpu-cell" {
+		t.Fatalf("payback = %+v, want exactly the cell with a capital_cost", rep.Payback)
+	}
+	if rep.Payback[0].CapitalNote == "" {
+		t.Error("the capital note is required and renders beside the bar")
+	}
+}
+
+// TestSavings_PaybackIsAllowedToBeEmbarrassing pins gate 6's clamp: on
+// honest arithmetic a real cell reads "3% of $3,100 · >10 years at this
+// rate", and the screen must be able to say so.
+func TestSavings_PaybackIsAllowedToBeEmbarrassing(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	now := time.Now().UTC()
+	// 40 days of very small savings: enough days to project, nowhere near
+	// enough money.
+	for i := 0; i < 40; i++ {
+		day := dayKey(now.AddDate(0, 0, -i), time.UTC)
+		seedTokens(s, day, "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 5, InFresh: 1_000_000, Out: 100_000})
+	}
+	rep := mustSavings(t, s, "all")
+	if len(rep.Payback) != 1 {
+		t.Fatalf("payback rows = %d, want 1", len(rep.Payback))
+	}
+	p := rep.Payback[0]
+	if p.RecoveredPct > 5 {
+		t.Fatalf("fixture recovered %.1f%%; this test needs an unflattering one", p.RecoveredPct)
+	}
+	if p.Projection != ">10 years at this rate" {
+		t.Errorf("projection = %q, want %q", p.Projection, ">10 years at this rate")
+	}
+	if p.BreakEvenDay != "" {
+		t.Errorf("break-even day = %q, want none", p.BreakEvenDay)
+	}
+}
+
+// TestSavings_TooEarlyToProject pins gate 6: under two weeks of covered
+// days, the screen refuses to extrapolate.
+func TestSavings_TooEarlyToProject(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	now := time.Now().UTC()
+	for i := 0; i < 3; i++ {
+		seedTokens(s, dayKey(now.AddDate(0, 0, -i), time.UTC), "gpu-cell", "qwen-coder", prices.BasisChat,
+			counts{Req: 5, InFresh: 1_000_000})
+	}
+	rep := mustSavings(t, s, "all")
+	if len(rep.Payback) != 1 || rep.Payback[0].Projection != "too early to project" {
+		t.Errorf("projection = %+v, want \"too early to project\"", rep.Payback)
+	}
+}
+
+// TestSavings_BreakEvenIsADateFromTheDailySeries: the scoreboard reports
+// the exact day the running total crossed the capital number — which is
+// the second argument for daily buckets (a rolled-up total can give the
+// percentage but never the date).
+func TestSavings_BreakEvenIsADateFromTheDailySeries(t *testing.T) {
+	hosts := savingsHosts()
+	c := hosts.Cells["gpu-cell"]
+	c.CapitalCost = 1
+	c.Power = nil
+	hosts.Cells["gpu-cell"] = c
+	s := newSavingsServer(t, hosts)
+	now := time.Now().UTC()
+	// $0.20/day; crosses $1 on the fifth day.
+	for i := 0; i < 8; i++ {
+		seedTokens(s, dayKey(now.AddDate(0, 0, -(7-i)), time.UTC), "gpu-cell", "qwen-coder", prices.BasisChat,
+			counts{Req: 1, InFresh: 1_000_000})
+	}
+	rep := mustSavings(t, s, "all")
+	want := dayKey(now.AddDate(0, 0, -3), time.UTC)
+	if len(rep.Payback) != 1 || rep.Payback[0].BreakEvenDay != want {
+		t.Errorf("break-even = %+v, want %s", rep.Payback, want)
+	}
+	if rep.Payback[0].Projection != "paid for itself" {
+		t.Errorf("projection = %q, want %q", rep.Payback[0].Projection, "paid for itself")
+	}
+}
+
+// TestSavings_UnmeasuredCellIsExcludedFromTheTotals pins gate 6: a cell
+// with no measured requests renders a reason and contributes nothing —
+// it is not a zero.
+func TestSavings_UnmeasuredCellIsExcludedFromTheTotals(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	seedTokens(s, today(), "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000})
+
+	rep := mustSavings(t, s, "30d")
+	laptop := cellRow(t, rep, "laptop")
+	if laptop.Measured || laptop.Gross != nil || laptop.Net != nil {
+		t.Errorf("unmeasured cell carries figures: %+v", laptop)
+	}
+	if laptop.Reason == "" {
+		t.Error("an unmeasured cell must say why")
+	}
+	if rep.Totals.CellsMeasured != 1 || rep.Totals.CellsTotal != 2 {
+		t.Errorf("cells measured = %d of %d, want 1 of 2 (the front is not a serving cell)",
+			rep.Totals.CellsMeasured, rep.Totals.CellsTotal)
+	}
+}
+
+// TestSavings_PartialMeasurementIsStatedNotEstimated: 200s that reported
+// no tokens are counted and named, never estimated from duration.
+func TestSavings_PartialMeasurementIsStatedNotEstimated(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	seedTokens(s, today(), "gpu-cell", "qwen-coder", prices.BasisChat, counts{
+		Req: 41, InFresh: 1_000_000, Unmeasured: 75, ErrReq: 3,
+	})
+	rep := mustSavings(t, s, "30d")
+	row := cellRow(t, rep, "gpu-cell")
+	if !strings.Contains(row.Partial, "41 of 116 requests reported tokens") {
+		t.Errorf("partial note = %q, want the measured/total request counts", row.Partial)
+	}
+	if !strings.Contains(row.Partial, "3 errored requests") {
+		t.Errorf("partial note = %q, want the error count", row.Partial)
+	}
+}
+
+// TestSavings_EnergyBillsIdleAndBusySeparately pins §4: a cell holding a
+// warm model all day is mostly reporting its idle constant, and C4's
+// warm targets deliberately increase exactly that.
+func TestSavings_EnergyBillsIdleAndBusySeparately(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	day := today()
+	seedTokens(s, day, "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000, BusyMS: 0})
+	seedResidency(s, day, "gpu-cell", "", 86_400)
+	idleOnly := mustSavings(t, s, "30d")
+	// 100W * 86400s = 2.4kWh * 0.15 = $0.36
+	if got := money2(t, cellRow(t, idleOnly, "gpu-cell").Power); got != "0.36" {
+		t.Errorf("idle-only power = $%s, want $0.36", got)
+	}
+
+	s2 := newSavingsServer(t, savingsHosts())
+	seedTokens(s2, day, "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000, BusyMS: 86_400_000})
+	seedResidency(s2, day, "gpu-cell", "", 86_400)
+	busy := mustSavings(t, s2, "30d")
+	// (100W + 300W delta) * 86400s = 9.6kWh * 0.15 = $1.44
+	if got := money2(t, cellRow(t, busy, "gpu-cell").Power); got != "1.44" {
+		t.Errorf("fully-busy power = $%s, want $1.44", got)
+	}
+}
+
+// TestSavings_BusyTimeCannotExceedResidency: concurrent requests each
+// report their own wall time, so the sum can exceed the day. A cell
+// cannot be busy longer than it was on.
+func TestSavings_BusyTimeCannotExceedResidency(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	day := today()
+	seedTokens(s, day, "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 8, InFresh: 1_000_000, BusyMS: 8 * 86_400_000})
+	seedResidency(s, day, "gpu-cell", "", 86_400)
+	rep := mustSavings(t, s, "30d")
+	if got := money2(t, cellRow(t, rep, "gpu-cell").Power); got != "1.44" {
+		t.Errorf("power with 8x-oversubscribed busy time = $%s, want the capped $1.44", got)
+	}
+}
+
+// TestSavings_CloudSpendIsBesideTheSavingsNotInside pins §6: actual
+// cloud spend is a bill reconstruction and never enters the savings sum.
+func TestSavings_CloudSpendIsBesideTheSavingsNotInside(t *testing.T) {
+	hosts := savingsHosts()
+	hosts.Pricing.Models["cloud-chat"] = fleetcfg.ModelPricing{PricedAs: "cloud-chat"}
+	s := newSavingsServer(t, hosts)
+	day := today()
+	seedTokens(s, day, "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000})
+	seedTokens(s, day, fleetcfg.FrontCell, "cloud-chat", usageBasisCloud, counts{
+		Req: 20, InFresh: 2_000_000, InCached: 1_000_000, Out: 100_000,
+	})
+
+	rep := mustSavings(t, s, "30d")
+	if !rep.Cloud.Measured || rep.Cloud.Cost == nil {
+		t.Fatalf("cloud spend not measured: %+v", rep.Cloud)
+	}
+	// 2M * 3 + 1M * 0.3 + 0.1M * 15 = 6.00 + 0.30 + 1.50 = $7.80
+	if got := money2(t, rep.Cloud.Cost); got != "7.80" {
+		t.Errorf("cloud spend = $%s, want $7.80", got)
+	}
+	if got := money2(t, rep.Totals.Gross); got != "0.20" {
+		t.Errorf("savings total = $%s, want $0.20 — cloud spend must not enter it", got)
+	}
+	for _, c := range rep.Cells {
+		if c.Cell == fleetcfg.FrontCell {
+			t.Error("the front must not appear as a serving cell row")
+		}
+	}
+}
+
+// TestFoldCloudUsage_IsCumulativeAndFrontKeyed: the same delta discipline
+// C7a's announce fold uses — a duplicate poll adds nothing.
+func TestFoldCloudUsage_IsCumulativeAndFrontKeyed(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	at := time.Now().UTC()
+	u := &AnnounceUsage{Epoch: "e1", Models: []AnnounceUsageModel{
+		{Model: "cloud-chat", Basis: "chat", Req: 5, InFresh: 1000, Out: 100},
+		{Model: "cloud-chat", Basis: "other", Req: 1, InFresh: 10},
+	}}
+	s.FoldCloudUsage(u, at)
+	s.FoldCloudUsage(u, at) // duplicate poll
+
+	day := dayKey(at, time.UTC)
+	b := bucketFor(s.usage, usageKey{Day: day, Cell: fleetcfg.FrontCell, Model: "cloud-chat", Basis: usageBasisCloud, Epoch: "e1"})
+	if b.Req != 6 || b.InFresh != 1010 || b.Out != 100 {
+		t.Errorf("folded bucket = %+v, want the merged totals counted exactly once", b)
+	}
+
+	u2 := &AnnounceUsage{Epoch: "e1", Models: []AnnounceUsageModel{
+		{Model: "cloud-chat", Basis: "chat", Req: 9, InFresh: 2000, Out: 100},
+		{Model: "cloud-chat", Basis: "other", Req: 1, InFresh: 10},
+	}}
+	s.FoldCloudUsage(u2, at)
+	b = bucketFor(s.usage, usageKey{Day: day, Cell: fleetcfg.FrontCell, Model: "cloud-chat", Basis: usageBasisCloud, Epoch: "e1"})
+	if b.Req != 10 || b.InFresh != 2010 {
+		t.Errorf("second fold = %+v, want the delta against the cumulative cursor", b)
+	}
+}
+
+// TestCloudBasisIsClosedToCells: a cell announcing "cloud" rows would
+// key onto exactly the bucket fleetd writes itself.
+func TestCloudBasisIsClosedToCells(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	at := time.Now().UTC()
+	s.usage.fold("gpu-cell", &AnnounceUsage{Epoch: "e1", Models: []AnnounceUsageModel{
+		{Model: "cloud-chat", Basis: usageBasisCloud, Req: 99, InFresh: 9_000_000},
+		{Model: "qwen-coder", Basis: "chat", Req: 1, InFresh: 10},
+	}}, at)
+	day := dayKey(at, time.UTC)
+	if b := bucketFor(s.usage, usageKey{Day: day, Cell: "gpu-cell", Model: "cloud-chat", Basis: usageBasisCloud, Epoch: "e1"}); b.Req != 0 {
+		t.Errorf("a cell-announced cloud row landed in the ledger: %+v", b)
+	}
+	if b := bucketFor(s.usage, usageKey{Day: day, Cell: "gpu-cell", Model: "qwen-coder", Basis: "chat", Epoch: "e1"}); b.Req != 1 {
+		t.Error("one rejected entry cost the announce its other rows")
+	}
+}
+
+// TestCellLevelResidencyIsTheEnergyDenominator: per-model residency rows
+// cannot serve as one (summing bills a multi-resident box twice), so
+// foldResidency writes a cell-level row.
+func TestCellLevelResidencyIsTheEnergyDenominator(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	at := time.Now().UTC()
+	s.usage.foldResidency("gpu-cell", []AnnounceModel{{ID: "a", State: "ready"}, {ID: "b", State: "ready"}}, 15, at.Add(-30*time.Second))
+	s.usage.foldResidency("gpu-cell", []AnnounceModel{{ID: "a", State: "ready"}, {ID: "b", State: "ready"}}, 15, at)
+
+	day := dayKey(at, time.UTC)
+	cellRow := bucketFor(s.usage, usageKey{Day: day, Cell: "gpu-cell", Basis: usageBasisResident})
+	perModel := bucketFor(s.usage, usageKey{Day: day, Cell: "gpu-cell", Model: "a", Basis: usageBasisResident})
+	if cellRow.ResidentS != perModel.ResidentS {
+		t.Errorf("cell-level residency %ds != per-model %ds; two resident models must not double the box's wall clock",
+			cellRow.ResidentS, perModel.ResidentS)
+	}
+	if cellRow.ResidentS == 0 {
+		t.Fatal("no cell-level residency row written")
+	}
+}
+
+// TestSavings_WindowValidation: a malformed window is a 400, not a
+// silently empty document.
+func TestSavings_WindowValidation(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	for _, w := range []string{"7", "sevendays", "-3d", "0d", "12h"} {
+		if _, err := s.Savings(context.Background(), w); err == nil {
+			t.Errorf("window %q accepted", w)
+		}
+	}
+	for _, w := range []string{"", "7d", "30d", "all"} {
+		if _, err := s.Savings(context.Background(), w); err != nil {
+			t.Errorf("window %q rejected: %v", w, err)
+		}
+	}
+}
+
+// TestSavings_WindowExcludesOlderDaysButPaybackIsLifetime.
+func TestSavings_WindowExcludesOlderDaysButPaybackIsLifetime(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	now := time.Now().UTC()
+	seedTokens(s, dayKey(now.AddDate(0, 0, -20), time.UTC), "gpu-cell", "qwen-coder", prices.BasisChat,
+		counts{Req: 1, InFresh: 1_000_000})
+	seedTokens(s, dayKey(now, time.UTC), "gpu-cell", "qwen-coder", prices.BasisChat,
+		counts{Req: 1, InFresh: 1_000_000})
+
+	week := mustSavings(t, s, "7d")
+	if got := money2(t, week.Totals.Gross); got != "0.20" {
+		t.Errorf("7d gross = $%s, want $0.20 (one day in the window)", got)
+	}
+	month := mustSavings(t, s, "30d")
+	if got := money2(t, month.Totals.Gross); got != "0.40" {
+		t.Errorf("30d gross = $%s, want $0.40", got)
+	}
+	// Payback is lifetime regardless of the window: a scoreboard is a
+	// running total against a fixed threshold.
+	if week.Payback[0].Recovered != month.Payback[0].Recovered {
+		t.Errorf("payback moved with the window: %v vs %v", week.Payback[0].Recovered, month.Payback[0].Recovered)
+	}
+}
+
+// TestSavings_HTTPEndpointIsReadOnlyJSON.
+func TestSavings_HTTPEndpointIsReadOnlyJSON(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	seedTokens(s, today(), "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000})
+	mux := http.NewServeMux()
+	s.Register(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/fleet/savings?window=7d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("HTTP %d", resp.StatusCode)
+	}
+	var rep SavingsReport
+	if err := json.NewDecoder(resp.Body).Decode(&rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.Totals.Gross == nil {
+		t.Error("the served document has no money in it")
+	}
+	bad, err := http.Get(srv.URL + "/api/fleet/savings?window=lol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad.Body.Close()
+	if bad.StatusCode != http.StatusBadRequest {
+		t.Errorf("malformed window: HTTP %d, want 400", bad.StatusCode)
+	}
+	// POST is not a method this route has.
+	post, err := http.Post(srv.URL+"/api/fleet/savings", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	post.Body.Close()
+	if post.StatusCode == http.StatusOK {
+		t.Error("POST /api/fleet/savings succeeded; the savings surface is read-only")
+	}
+}
+
+// ─── gate 7: page invariants ────────────────────────────────────────────────
+
+// TestFleetPage_SavingsIsAViewNotARoute pins gate 7: the page still
+// registers exactly ONE route, and the savings screen is a hash-routed
+// view inside it. A second server route would force the bearer
+// middleware's exact-match exemption to widen to a prefix, which C5 §7
+// forbids.
+func TestFleetPage_SavingsIsAViewNotARoute(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	mux := http.NewServeMux()
+	s.registerFleetPage(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ok, err := http.Get(srv.URL + "/ui/fleet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok.Body.Close()
+	if ok.StatusCode != http.StatusOK {
+		t.Fatalf("/ui/fleet: HTTP %d", ok.StatusCode)
+	}
+	for _, path := range []string{"/ui/fleet/savings", "/ui/savings", "/ui/fleet/"} {
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("%s: HTTP %d, want 404 — the page adds exactly one route", path, resp.StatusCode)
+		}
+	}
+}
+
+func fleetPageSource(t *testing.T) string {
+	t.Helper()
+	data, err := fleetPageFS.ReadFile("fleet.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// TestFleetPage_SavingsViewInvariants pins the rest of gate 7: hash
+// routing, no external assets, no build step, bar widths set on the
+// element, and every figure coming from the authed GET.
+func TestFleetPage_SavingsViewInvariants(t *testing.T) {
+	page := fleetPageSource(t)
+
+	for _, want := range []string{
+		`id="view-savings"`,
+		`id="view-fleet"`,
+		`function showView(`,
+		`"hashchange"`,
+		`location.hash === "#savings"`,
+		`api("/api/fleet/savings`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("page is missing %q", want)
+		}
+	}
+	// Bar widths come from el.style.width, never an interpolated
+	// style="…" attribute (which would need attr() and is the shape C5's
+	// PAGE-1 test forbids).
+	if !strings.Contains(page, ".style.width =") {
+		t.Error("payback bars must set width via el.style.width")
+	}
+	if regexp.MustCompile(`style\s*=\s*["'][^"']*\$\{`).MatchString(page) {
+		t.Error("an interpolated style=\"…\" attribute appeared on the page")
+	}
+	// No external asset, CDN or build step.
+	for _, forbidden := range []string{"<script src", "<link ", "http://", "https://", "import(", "require("} {
+		if strings.Contains(page, forbidden) {
+			t.Errorf("page references %q; it must load on a LAN with no internet", forbidden)
+		}
+	}
+	// The savings view has no action buttons — that is what keeps "no new
+	// mutation surface" trivially true.
+	start := strings.Index(page, `<section id="view-savings"`)
+	end := strings.Index(page[start:], "</section>")
+	if start < 0 || end < 0 {
+		t.Fatal("savings section not found")
+	}
+	section := page[start : start+end]
+	if strings.Contains(section, "<button") || strings.Contains(section, "onclick") {
+		t.Error("the savings view has action buttons; it is a read-only screen")
+	}
+	if strings.Contains(page, `rpc("`) && strings.Contains(section, "rpc(") {
+		t.Error("the savings view calls an MCP tool; it must not mutate anything")
+	}
+}
+
+// TestFleetPage_SavingsTimerIsClearedInBoot pins gate 8: re-entering the
+// token must not stack a fourth timer.
+func TestFleetPage_SavingsTimerIsClearedInBoot(t *testing.T) {
+	page := fleetPageSource(t)
+	start := strings.Index(page, "async function boot()")
+	if start < 0 {
+		t.Fatal("boot() not found")
+	}
+	body := page[start:]
+	if end := strings.Index(body, "\n}"); end > 0 {
+		body = body[:end]
+	}
+	for _, want := range []string{"streamAbort.abort()", "clearInterval(pollTimer)", "clearInterval(savingsTimer)"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("boot() does not %s; a token rotation would leave the old one running", want)
+		}
+	}
+	if strings.Index(body, "clearInterval(savingsTimer)") > strings.Index(body, "savingsTimer = setInterval") {
+		t.Error("savingsTimer is assigned before it is cleared")
+	}
+}
+
+// TestSavingsCaveatIsRenderedFromThePayload: the page shows the caveat
+// text the server sends, so the two can never drift.
+func TestSavingsCaveatIsRenderedFromThePayload(t *testing.T) {
+	page := fleetPageSource(t)
+	if !strings.Contains(page, `$("sv-caveat-text").textContent = sv.caveat`) {
+		t.Error("the page does not render the server's caveat")
+	}
+	if !strings.Contains(savingsCaveat, "same open-weight model rented from a real host") {
+		t.Error("the caveat no longer states the equivalence choice")
+	}
+	if !strings.Contains(savingsCaveat, "fresh and cache-read") {
+		t.Error("the caveat no longer states the cache split")
+	}
+}

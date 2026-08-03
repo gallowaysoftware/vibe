@@ -1,7 +1,11 @@
 # C7b — The savings screen: what the fleet didn't spend
 
-Status: PLANNED (2026-08-02). Depends on [C7a](c7a-usage-ledger.md) for
-the ledger and on C4 for the page.
+Status: EXECUTED (2026-08-03) on `feat/c7b-savings-screen`. Unit gates
+1–8 and 10 are green; gate 9 (live plausibility) needs a real week of
+ledger data and is unrun. Depends on [C7a](c7a-usage-ledger.md) for the
+ledger and on C4 for the page. Implementation notes, including where the
+code deviates from this document, are in the
+[addendum](#implementation-addendum-2026-08-03).
 
 C7a counts tokens. C7b prices them and draws the screen: *did my
 hardware sort of pay for itself?*
@@ -380,3 +384,128 @@ contradicting it — say so in the PR.)* Any mutation surface. Per-user,
 per-project or per-harness attribution. The word "saved".
 
 Estimated ~690 lines + tests + a ~100 KB vendored data file.
+
+## Implementation addendum (2026-08-03)
+
+What shipped, and where the code diverged from the plan above. Ground
+rule 8: the code wins, so this section is the truth.
+
+### Where it lives
+
+| piece | file |
+|---|---|
+| price table + arithmetic | `internal/vibe/prices/prices.go` |
+| vendoring tool | `internal/vibe/prices/vendor.go`, `vibe fleet prices vendor` (`internal/vibe/cli/cmd_fleet.go`) |
+| vendored artifact | `internal/vibe/prices/prices.json` (4,853 rows, 480 KB) |
+| pricing / power / capital config | `internal/vibe/fleetcfg/fleetcfg.go` (`pricing:`, `power:`, `capital_cost`) |
+| the engine | `internal/vibe/fleetapi/savings.go` (`Savings(ctx, window)`, `GET /api/fleet/savings`) |
+| cloud spend | `internal/vibe/daemon/cloudspend.go` + `fleetapi.StartCloudSpendLoop` |
+| the view | `internal/vibe/fleetapi/fleet.html` (`#savings`) |
+| agent surface | `fleetmcp` tool `fleet_savings` |
+
+The table is embedded in its own package rather than "next to
+fleet.html" as §2 says. The vendoring tool and the runtime must share
+one schema, the tool lives in the CLI, and `fleetapi` importing the CLI
+is not a thing — so the shared artifact went to the package both of them
+import. Nothing else about §2 changed.
+
+### The vendored table is REAL, not the example
+
+The box that ran this phase had network, so `vibe fleet prices vendor`
+fetched both upstreams for real:
+
+- models.dev `api.json` @ `774d80647eb03527c0a3cbdb3f10b0395cdae9c4` (MIT)
+- LiteLLM `model_prices_and_context_window.json` @
+  `bf1a8fe40329eb018ef420057766ce95a43baaa3` (MIT)
+
+Both licences and both commits ride in the artifact, per snapshot. 336
+OpenRouter rows were excluded at vendor time (its terms bar
+redistribution, and a row sourced from models.dev's mirror of it is the
+same content). 31 cross-source disagreements past 2× were reviewed and
+their rows DROPPED — mostly LiteLLM entries carrying per-MTok values in
+a per-token field (wandb), which is exactly the units error the check
+exists for. The artifact carries the dropped conflicts so the drop is
+auditable.
+
+Deviations from §2 worth naming:
+
+- **The prune is "keep every priced row", not ~500 rows.** Pruning to
+  500 would have meant choosing which hosts count, which is the exact
+  judgement the median exists to avoid. The cost is 480 KB of embedded
+  data instead of ~100 KB.
+- **Snapshots after the first are OVERLAYS** (changed/new rows plus a
+  removed list) rather than full tables, so a multi-year price history
+  stays inside one embedded file. `Table.At(day)` applies the base plus
+  every overlay up to that day.
+- **A disagreement DROPS the row** as well as failing the run.
+  `--max-disagreements <n>` is how a human who has read the list
+  proceeds; the dropped rows never silently resolve to one source's
+  number.
+- **A day older than the base snapshot prices at the base** and is
+  flagged `BeforeBase`. Refusing to price it would report a fleet that
+  served traffic as having saved zero, which is a stronger claim than
+  "we don't know what the rates were that far back".
+
+### Qualification is mode-aware
+
+§1 says the twin median takes rows with "both prices > 0". That is right
+for chat and wrong for the other two modes: an embedding row has no
+output price and a rerank row's token price is literally 0 because it
+bills per query. So the filter is per mode — chat needs input and output,
+embedding needs input, rerank needs a per-query rate. A price of exactly
+0 still means UNKNOWN everywhere.
+
+Related: a workload's `basis` and a row's `mode` must agree. Chat counts
+priced against an embedding row (or the reverse) is a config error, and
+it renders "unpriced" rather than inventing a number.
+
+### C7a additions this phase needed
+
+Two, both additive:
+
+- **A cell-level residency row** (`model: ""`, basis `resident`).
+  Per-model rows cannot be the energy denominator: summing them bills a
+  multi-resident box's idle watts once per model, and taking the max
+  under-counts a cell that alternated models through the day. The
+  max-across-models fallback still covers ledgers written before this
+  phase.
+- **A `cloud` basis**, reserved to fleetd like `resident` and `cell`,
+  keyed on the FRONT cell. It is the one place the front legitimately
+  appears in the ledger: cloud models are served by no cell, so there is
+  nothing to double-count. `FoldCloudUsage` merges a model's bases before
+  folding, because two bases for one cloud model would otherwise resolve
+  against the same cursor twice in one pass.
+
+`busy_seconds` is capped at the day's residency: concurrent requests each
+report their own wall time, and a cell cannot be busy longer than it was
+on.
+
+### Gate status
+
+| gate | state |
+|---|---|
+| 1 golden pricing (exact to the cent, 0 = unpriced) | PASS — `prices_test.go:TestGoldenPricing_ExactToTheCent`, `TestZeroRateIsUnpricedNotFree` |
+| 2 cache tier (~5×, basis changes the bill) | PASS — `TestCacheTier_SplitVsSingleRate`, `TestBasisChangesTheBill` |
+| 3 equivalence (twin vs frontier, rationale required, no default mapping) | PASS — `c7b_test.go:TestSavings_FrontierIsTheSeventyFoldError`, `fleetcfg_test.go:TestLoad_FrontierRequiresARationale`, `TestNoDefaultFrontierMappingShips` |
+| 4 dated prices | PASS — `TestDatedSnapshots_PriceTheDayNotToday`, `TestSavings_DatedPricesDoNotRewriteHistory` |
+| 5 re-price from the same ledger | PASS — `TestSavings_RepricesFromTheSameLedger` |
+| 6 empty and unflattering states | PASS — six tests, including the `>10 years at this rate` clamp and the missing-`capital_cost` no-bar case |
+| 7 page invariants (one route, exact-match exemption, no external asset) | PASS — `TestFleetPage_SavingsIsAViewNotARoute`, `TestFleetPage_SavingsViewInvariants`, `daemon/fleet_registry_test.go` |
+| 8 timer hygiene | PASS — `TestFleetPage_SavingsTimerIsClearedInBoot` |
+| 9 live plausibility | NOT RUN — needs a real week of ledger data on real cells |
+| 10 full inner loop, no new module | PASS — build, vet, gofmt, `go mod tidy` (clean), `golangci-lint` (0 issues), `go test -race -count=5 ./...` |
+
+### The rule restatement, verbatim (§7 asks for it in the PR)
+
+The *page* still adds zero routes: the savings screen is a hash-routed
+view inside the same embedded `fleet.html` at the same `GET /ui/fleet`.
+*fleetapi* adds one read-only GET — `/api/fleet/savings`, its fourth
+after state/events/leases. Every mutation stays on `POST /mcp`. The
+savings view has no action buttons, which is what makes that trivially
+true.
+
+And the C4 boundary restated: if a panel answers "how fast / how loaded /
+what's resident right now", it is not C7 and llama-swap's `/ui` and
+Prometheus keep it. C7 adds one derived, retained, money-shaped rollup
+that neither can produce, because neither knows a price, neither
+aggregates across cells, and both forget on restart.

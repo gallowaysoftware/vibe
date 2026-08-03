@@ -87,6 +87,15 @@ func CellIntentFile() string { return filepath.Join(StateHome(), "fleet", "cell-
 // the arrears.
 func CellUsageFile() string { return filepath.Join(StateHome(), "fleet", "cell-usage.json") }
 
+// FrontCloudUsageFile persists fleetd's cursor and cumulative counters
+// for the FRONT's cloud_peer traffic (fleet-control C7b §6) — actual
+// spend, reconstructed from the front's own activity log. Separate from
+// CellUsageFile because it is a different collector against a different
+// llama-swap with a different filter.
+func FrontCloudUsageFile() string {
+	return filepath.Join(StateHome(), "fleet", "front-cloud-usage.json")
+}
+
 // UsageLedgerFile is fleetd's append-only per-(day, cell, model, basis)
 // token ledger (fleet-control C7a §6). Raw counts only — never dollars;
 // storing counts is what lets a price table change re-price the whole

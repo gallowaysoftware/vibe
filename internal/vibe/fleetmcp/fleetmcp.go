@@ -330,6 +330,22 @@ func (s *Server) mcpTools() []any {
 			},
 		},
 		map[string]any{
+			"name": "fleet_savings",
+			"description": "What the fleet did NOT spend, priced from the usage ledger: tokens per cell " +
+				"priced against the SAME open-weight model rented from a real host (median across hosts, " +
+				"rendered as a range), minus declared-wattage electricity, against each cell's declared " +
+				"capital cost. Includes actual cloud spend in the same window beside it. Every figure is " +
+				"an upper bound and the payload carries the caveat that says why — quote the caveat with " +
+				"the number, never the number alone. Unpriced models keep their tokens and leave the " +
+				"money column.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"window": map[string]any{"type": "string", "description": "Window: \"7d\", \"30d\" (default) or \"all\"."},
+				},
+			},
+		},
+		map[string]any{
 			"name": "render_front",
 			"description": "Dry-run the front config render (vibe router render --cell front): " +
 				"renders the peers-only config from backend defs + hosts.yaml and returns the " +
@@ -425,6 +441,16 @@ func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMess
 			}
 		}
 		return s.toolFleetUsage(args.Days)
+	case "fleet_savings":
+		var args struct {
+			Window string `json:"window"`
+		}
+		if len(rawArgs) > 0 {
+			if err := json.Unmarshal(rawArgs, &args); err != nil {
+				return "", fmt.Errorf("invalid arguments: %v", err)
+			}
+		}
+		return s.toolFleetSavings(ctx, args.Window)
 	case "render_front":
 		var args struct {
 			DryRun *bool `json:"dry_run"`
@@ -487,6 +513,23 @@ func (s *Server) toolFleetUsage(days *int) (string, error) {
 		since = fmt.Sprintf("%04d-%02d-%02d", y, int(m), d)
 	}
 	data, err := json.Marshal(s.fleet.UsageReport(since))
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// toolFleetSavings serves the identical document GET
+// /api/fleet/savings serves, so an agent and the page can never disagree
+// about the money. The caveat travels IN the payload for the same
+// reason: an agent quoting the headline without it is the failure mode
+// this whole phase exists to avoid.
+func (s *Server) toolFleetSavings(ctx context.Context, window string) (string, error) {
+	rep, err := s.fleet.Savings(ctx, window)
+	if err != nil {
+		return "", err
+	}
+	data, err := json.Marshal(rep)
 	if err != nil {
 		return "", err
 	}

@@ -2,14 +2,18 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetannounce"
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
+	"github.com/gallowaysoftware/vibe/internal/vibe/prices"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 	"github.com/gallowaysoftware/vibe/internal/vibe/router"
 	"github.com/gallowaysoftware/vibe/internal/vibe/usagemeter"
@@ -27,7 +31,179 @@ func fleetCmd() *cobra.Command {
 		Short: "Fleet announcer (slim cells).",
 	}
 	cmd.AddCommand(fleetAnnounceCmd())
+	cmd.AddCommand(fleetPricesCmd())
 	return cmd
+}
+
+// `vibe fleet prices vendor` is the C7b §2 refresh path: a dev-only
+// subcommand a human runs on an internet-connected box in a checkout.
+// The savings screen must render on a LAN with no internet and CI never
+// has network, so the price table is a vendored artifact — this is how
+// it gets rewritten.
+func fleetPricesCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "prices",
+		Short: "The vendored model price table (dev tooling).",
+	}
+	cmd.AddCommand(fleetPricesVendorCmd(), fleetPricesShowCmd())
+	return cmd
+}
+
+func fleetPricesVendorCmd() *cobra.Command {
+	var (
+		out              string
+		effectiveFrom    string
+		modelsDev        string
+		litellm          string
+		maxDisagreements int
+		ratio            float64
+		dryRun           bool
+	)
+	cmd := &cobra.Command{
+		Use:   "vendor",
+		Short: "Refresh the vendored price table from models.dev + LiteLLM (needs network).",
+		Long: "Fetch both upstream price tables (both MIT), prune and normalize them to USD " +
+			"per million tokens, cross-check them against each other, and append a new dated " +
+			"snapshot to the vendored artifact. Dated snapshots are load-bearing: a day bucket " +
+			"is priced at the rates in effect on that day, so a price cut never retroactively " +
+			"erases money that was not spent at the time.\n\n" +
+			"Run this from a vibe checkout on a box with internet. CI never has network and " +
+			"never runs it.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			if out == "" {
+				out = filepath.Join("internal", "vibe", "prices", prices.TableFile)
+			}
+			var prev *prices.Table
+			if data, err := os.ReadFile(out); err == nil {
+				prev, err = prices.Parse(data)
+				if err != nil {
+					return fmt.Errorf("read %s: %w", out, err)
+				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("read %s: %w", out, err)
+			} else {
+				return fmt.Errorf("%s does not exist: run this from a vibe checkout, or pass --out", out)
+			}
+
+			cfg := prices.VendorConfig{
+				ModelsDevURL:     modelsDev,
+				LiteLLMURL:       litellm,
+				EffectiveFrom:    effectiveFrom,
+				MaxDisagreements: maxDisagreements,
+				Ratio:            ratio,
+			}
+			table, rep, err := cfg.Vendor(ctx, prev)
+			if err != nil {
+				return err
+			}
+			data, err := prices.Encode(table)
+			if err != nil {
+				return err
+			}
+			w := cmd.OutOrStdout()
+			fmt.Fprintf(w, "snapshot %s (%s): %d rows\n", rep.EffectiveFrom, snapshotKind(rep.Base), rep.Rows)
+			fmt.Fprintf(w, "  added %d · changed %d · removed %d · unchanged %d\n",
+				len(rep.Added), len(rep.Changed), len(rep.Removed), rep.Unchanged)
+			for _, s := range rep.Sources {
+				fmt.Fprintf(w, "  source %s (%s) commit %s\n", s.Name, s.Licence, orDash(s.Commit))
+			}
+			for prov, n := range rep.Excluded {
+				fmt.Fprintf(w, "  excluded %d rows from %s (redistribution not permitted)\n", n, prov)
+			}
+			if len(rep.Disagreements) > 0 {
+				fmt.Fprintf(w, "  %d cross-source disagreements past %gx — those rows were DROPPED\n", len(rep.Disagreements), ratio)
+			}
+			for _, warn := range rep.Warnings {
+				fmt.Fprintf(cmd.ErrOrStderr(), "  warning: %s\n", warn)
+			}
+			for _, line := range rep.Changed {
+				fmt.Fprintf(w, "  ~ %s\n", line)
+			}
+			if dryRun {
+				fmt.Fprintf(w, "dry run: %s not written (%d bytes)\n", out, len(data))
+				return nil
+			}
+			if err := os.WriteFile(out, data, 0o644); err != nil {
+				return err
+			}
+			fmt.Fprintf(w, "wrote %s (%d bytes)\n", out, len(data))
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&out, "out", "", "path to the vendored artifact (default internal/vibe/prices/prices.json)")
+	cmd.Flags().StringVar(&effectiveFrom, "effective-from", "", "date the new snapshot takes effect (YYYY-MM-DD, default today UTC)")
+	cmd.Flags().StringVar(&modelsDev, "models-dev-url", prices.DefaultModelsDevURL, "models.dev api.json URL")
+	cmd.Flags().StringVar(&litellm, "litellm-url", prices.DefaultLiteLLMURL, "LiteLLM model_prices_and_context_window.json URL")
+	cmd.Flags().IntVar(&maxDisagreements, "max-disagreements", 0, "how many >ratio cross-source price conflicts to tolerate (they are dropped either way; 0 fails the run)")
+	cmd.Flags().Float64Var(&ratio, "ratio", 2, "cross-source disagreement bound")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the summary without writing the artifact")
+	return cmd
+}
+
+func fleetPricesShowCmd() *cobra.Command {
+	var day string
+	cmd := &cobra.Command{
+		Use:   "show [model]",
+		Short: "What the vendored table says a model costs (as of a day).",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			table, err := prices.Embedded()
+			if err != nil {
+				return err
+			}
+			w := cmd.OutOrStdout()
+			if table.Example {
+				fmt.Fprintln(w, "EXAMPLE DATA — these are synthetic prices, not real rates.")
+			}
+			fmt.Fprintf(w, "as of %s (oldest snapshot %s, %d snapshots)\n", table.AsOf(), table.Oldest(), len(table.Snapshots))
+			if len(args) == 0 {
+				return nil
+			}
+			if day == "" {
+				day = table.AsOf()
+			}
+			res := table.At(day)
+			rows := res.Hosts(args[0], false)
+			if len(rows) == 0 {
+				fmt.Fprintf(w, "%s: no host in the table serves it\n", args[0])
+				return nil
+			}
+			fmt.Fprintf(w, "%s priced at %s: %d hosts\n", args[0], res.EffectiveFrom, len(rows))
+			for _, r := range rows {
+				fmt.Fprintf(w, "  %-24s %-44s in %8.4f  cache %8.4f  out %8.4f  %s\n",
+					r.Provider, r.Model, r.In, r.CacheRead, r.Out, openLabel(r.Open))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&day, "day", "", "price it as of this day (YYYY-MM-DD, default the newest snapshot)")
+	return cmd
+}
+
+func snapshotKind(base bool) string {
+	if base {
+		return "base"
+	}
+	return "overlay"
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func openLabel(open bool) string {
+	if open {
+		return "open-weights"
+	}
+	return ""
 }
 
 func fleetAnnounceCmd() *cobra.Command {
