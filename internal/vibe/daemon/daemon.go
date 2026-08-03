@@ -121,9 +121,12 @@ type Config struct {
 // (a stopped-but-reporting unit is the classic silent failure).
 type CellCmds struct {
 	// Drain reclaims the box (e.g. "systemctl --user stop llama-swap") —
-	// unit stop lets llama-swap run its documented in-flight drain; never
-	// a kill, never unload-all (an unloaded model JIT-reloads on the next
-	// stray request, exactly wrong mid-game).
+	// a unit stop, never a kill, and never unload-all (an unloaded model
+	// JIT-reloads on the next stray request, exactly wrong mid-game).
+	// The stop does NOT let generations finish: llama-swap's SIGTERM
+	// calls CloseStreams() before its graceful drain (v239, C2's live
+	// gate), so in-flight streams die at the stop. `--wait` is what
+	// drains them first.
 	Drain string `yaml:"drain,omitempty"`
 	// Resume restores JIT service (e.g. "systemctl --user start
 	// llama-swap"). Models return by JIT on next request; resume does not
