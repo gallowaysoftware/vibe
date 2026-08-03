@@ -401,8 +401,8 @@ with. Unset keeps the old behavior exactly.
 | 8. Epoch | **PASS** (`TestPoll_IDResetMintsANewEpochAndReingests`, `TestUsageFold_SameEpoch*`, `TestUsageFold_NewEpochStartsANewRowAndKeepsTheOld`) |
 | 9. Timezone | **PASS** (`TestUsageDayKey_SplitsAtLocalMidnightNotUTCMidnight`, `TestUsageDayKey_HandlesBothDSTDiscontinuities`, `TestNoTruncateBasedDayBucketing`) |
 | 10. MTP | **PASS** (`TestClassify_DraftTokensNeverEnterAnySum`) |
-| 11. Streaming contract | **PASS** — `git diff --stat internal/vibe/proxy/` empty; `stream_options` absent from the diff |
-| 12. Inner loop | **PASS** — build / vet / gofmt / mod tidy / `test -race -count=5` / golangci-lint |
+| 11. Streaming contract | **PASS** — `git diff --stat internal/vibe/proxy/` empty; `git diff -- '*.go' \| grep -c stream_options` = 0 across the phase. Stated precisely: the phrase occurs exactly once in the whole diff, in the row above this one, naming the gate. Zero code occurrences. |
+| 12. Inner loop | **PASS** — build / vet / gofmt / mod tidy / `test -race -count=5` / golangci-lint, all run on the final tree |
 
 ### Adversarial self-review (ground rule 9)
 
