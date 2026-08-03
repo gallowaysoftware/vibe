@@ -190,11 +190,11 @@ func TestSavings_TwinPricedHeadlineToTheCent(t *testing.T) {
 	}
 }
 
-// TestSavings_FrontierIsTheSeventyFoldError pins gate 3: the same window
+// TestSavings_FrontierComparableIsOrdersOfMagnitudeAboveTheTwin pins gate 3: the same window
 // priced against a frontier model differs from the twin by an order of
 // magnitude, which is exactly why the twin is the default and the
 // frontier row is a config-declared claim with a written rationale.
-func TestSavings_FrontierIsTheSeventyFoldError(t *testing.T) {
+func TestSavings_FrontierComparableIsOrdersOfMagnitudeAboveTheTwin(t *testing.T) {
 	hosts := savingsHosts()
 	twinOnly := mustSavingsFor(t, hosts)
 
@@ -233,11 +233,11 @@ func mustSavingsFor(t *testing.T, hosts *fleetcfg.File) SavingsReport {
 	return mustSavings(t, s, "30d")
 }
 
-// TestNoDefaultFrontierMappingShips pins gate 3's third clause: the repo
+// TestNoDefaultFrontierMappingInConfigOrShippedExamples pins gate 3's third clause: the repo
 // ships no frontier mapping of its own. A shipped mapping would be an
 // unearned claim BY THE REPO; a config field with a written rationale is
 // the owner's claim, which is a claim someone can argue with.
-func TestNoDefaultFrontierMappingShips(t *testing.T) {
+func TestNoDefaultFrontierMappingInConfigOrShippedExamples(t *testing.T) {
 	// Nothing in the zero config names a frontier model.
 	if (&fleetcfg.Pricing{}).Frontier != nil {
 		t.Error("fleetcfg.Pricing has a default frontier")
@@ -896,5 +896,142 @@ func TestSavingsCaveatIsRenderedFromThePayload(t *testing.T) {
 	}
 	if !strings.Contains(savingsCaveat, "fresh and cache-read") {
 		t.Error("the caveat no longer states the cache split")
+	}
+}
+
+// ─── review pass (ground rule 9) ────────────────────────────────────────────
+
+// TestSavings_MeasuredButUnpricedCloudSaysSo: cloud traffic that was
+// measured and could not be priced must not read "not measured". The
+// requests happened and the bill exists; what is missing is a rate, and
+// saying otherwise is a lie in the flattering direction.
+func TestSavings_MeasuredButUnpricedCloudSaysSo(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	seedTokens(s, today(), fleetcfg.FrontCell, "some-vendor-model", usageBasisCloud, counts{
+		Req: 12, InFresh: 500_000, Out: 50_000,
+	})
+	rep := mustSavings(t, s, "30d")
+	if !rep.Cloud.Measured {
+		t.Fatal("cloud traffic was recorded but reads as unmeasured")
+	}
+	if rep.Cloud.Cost != nil {
+		t.Errorf("cloud cost = %v, want nil (no rate for that model)", *rep.Cloud.Cost)
+	}
+	if !strings.Contains(rep.Cloud.Reason, "some-vendor-model") {
+		t.Errorf("reason = %q, want the unpriced model named", rep.Cloud.Reason)
+	}
+	if len(rep.Cloud.Unpriced) != 1 {
+		t.Errorf("unpriced = %v, want the one model", rep.Cloud.Unpriced)
+	}
+	if rep.Cloud.Req != 12 {
+		t.Errorf("req = %d, want 12 — unpriced cloud traffic still counts as traffic", rep.Cloud.Req)
+	}
+}
+
+// TestSavings_ElectricityThatLooksFreeIsFlagged pins §4's inverted rule:
+// against an honest same-model-rented comparable, energy lands around
+// 11-16% of the figure. A power line that looks like a rounding error is
+// evidence the COMPARABLE is wrong.
+func TestSavings_ElectricityThatLooksFreeIsFlagged(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	day := today()
+	// A huge notional saving against one minute of residency.
+	seedTokens(s, day, "gpu-cell", "qwen-coder", prices.BasisChat, counts{
+		Req: 10, InFresh: 500_000_000, Out: 10_000_000,
+	})
+	seedResidency(s, day, "gpu-cell", "", 60)
+
+	rep := mustSavings(t, s, "30d")
+	found := false
+	for _, n := range rep.Notes {
+		if strings.Contains(n, "comparable is too expensive") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("notes = %v, want the inverted electricity rule", rep.Notes)
+	}
+}
+
+// TestSavings_ContextCancellationIsAnErrorNotAShortReport: a savings
+// document missing three days would be indistinguishable from a fleet
+// that served nothing those days.
+func TestSavings_ContextCancellationIsAnErrorNotAShortReport(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	seedTokens(s, today(), "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := s.Savings(ctx, "30d"); err == nil {
+		t.Error("a cancelled context produced a report instead of an error")
+	}
+}
+
+// TestFleetPage_DeepLinkPicksTheViewBeforeTheFirstFetch: a #savings deep
+// link must land on the savings view even when the first state fetch
+// fails, or one unreachable cell sends the reader to the wrong screen.
+func TestFleetPage_DeepLinkPicksTheViewBeforeTheFirstFetch(t *testing.T) {
+	page := fleetPageSource(t)
+	start := strings.Index(page, "async function boot()")
+	if start < 0 {
+		t.Fatal("boot() not found")
+	}
+	body := page[start:]
+	if end := strings.Index(body, "\n}"); end > 0 {
+		body = body[:end]
+	}
+	showAt := strings.Index(body, "showView()")
+	awaitAt := strings.Index(body, "await refresh()")
+	if showAt < 0 || awaitAt < 0 {
+		t.Fatalf("boot() no longer both awaits and picks a view: %q", body)
+	}
+	if showAt > awaitAt {
+		t.Error("boot() picks the view only after the first fetch; a failed fetch strands a #savings deep link on the fleet view")
+	}
+	// And a tab with no token still resolves its view (the gate then asks
+	// for the token).
+	if !strings.Contains(page, "showView();\nif (token) boot()") {
+		t.Error("a bare tab with no token does not resolve its view before the token gate")
+	}
+}
+
+// TestSavings_MeasuredButUnpricedCellIsNotAZero: a cell that served
+// requests none of which could be priced must render money as an em dash
+// with a reason — not $0.00 — while its TOKENS stay in every token
+// column, which is what makes "N% of tokens priced" mean anything.
+func TestSavings_MeasuredButUnpricedCellIsNotAZero(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	day := today()
+	seedTokens(s, day, "gpu-cell", "mystery-model", prices.BasisChat, counts{
+		Req: 12, InFresh: 4_000_000, InCached: 1_000_000, Out: 200_000,
+	})
+	seedResidency(s, day, "gpu-cell", "", 3600)
+
+	rep := mustSavings(t, s, "30d")
+	row := cellRow(t, rep, "gpu-cell")
+	if !row.Measured {
+		t.Fatal("the cell served measured requests; it is measured")
+	}
+	if row.Gross != nil || row.Net != nil {
+		t.Errorf("unpriced cell reported money: gross=%v net=%v", row.Gross, row.Net)
+	}
+	if row.Reason == "" || row.NetLabel != "net (nothing priced)" {
+		t.Errorf("reason=%q net_label=%q, want both to say nothing was priced", row.Reason, row.NetLabel)
+	}
+	if row.InFresh != 4_000_000 || row.Req != 12 {
+		t.Errorf("tokens left the token column: %+v", row)
+	}
+	if rep.Totals.Gross != nil {
+		t.Errorf("fleet total = %v, want nil — a fleet that priced nothing did not save $0.00", *rep.Totals.Gross)
+	}
+	if rep.Totals.InFresh != 4_000_000 {
+		t.Errorf("fleet in_fresh = %d, want the unpriced tokens counted", rep.Totals.InFresh)
+	}
+	if rep.Totals.TokensPricedPct != 0 {
+		t.Errorf("tokens priced = %.1f%%, want 0", rep.Totals.TokensPricedPct)
+	}
+	// Power is still known and still declared: what is missing is a price
+	// for the work, not a measurement of the box.
+	if row.Power == nil {
+		t.Error("declared power dropped out because the tokens were unpriced")
 	}
 }

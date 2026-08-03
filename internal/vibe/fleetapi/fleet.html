@@ -56,7 +56,10 @@
   .hero { font-size: 20px; margin: 6px 0 2px; }
   .hero .sep { color: var(--dim); font-size: 15px; margin: 0 6px; }
   .hero-sub { color: var(--dim); font-size: 13px; margin-bottom: 14px; }
-  .hero-sub b { color: var(--text); font-weight: 600; font-size: 15px; }
+  /* Actual cloud spend renders at the SAME type size as the hero: it is
+     the induced-demand control, and shrinking it would make the
+     counterfactual look bigger than the fact. */
+  .hero-sub b { color: var(--text); font-weight: 600; font-size: 20px; }
   details#sv-caveat { margin: 12px 0 20px; color: var(--dim); font-size: 12px; max-width: 70em; }
   details#sv-caveat summary { cursor: pointer; }
   .sv-model { color: var(--dim); font-size: 12px; }
@@ -348,8 +351,18 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) refr
 let savingsAt = 0, savingsWindow = "30d", savingsBusy = false;
 
 function usd(v) { return v == null ? "—" : (v < 0 ? "-$" : "$") + Math.abs(v).toFixed(2); }
+// Capital numbers are whole-dollar and grouped: "$3,100", not "$3100.00".
+function usd0(v) { return v == null ? "—" : "$" + Math.round(Math.abs(v)).toLocaleString(); }
 function mtok(n) { return (Number(n || 0) / 1e6).toFixed(2) + "M"; }
-function pct1(v) { return (Number(v) || 0).toFixed(0) + "%"; }
+// A percentage that rounds to zero but is not zero reads "<1%": "0% of
+// $3,100" would look like a bug in a screen whose whole job is to be
+// believable when the answer is small.
+function pct1(v) {
+  const n = Number(v) || 0;
+  if (n > 0 && n < 1) return "<1%";
+  if (n < 0 && n > -1) return ">-1%";
+  return n.toFixed(0) + "%";
+}
 function cellText(row, text, cls) {
   const td = document.createElement("td");
   td.textContent = text;
@@ -424,7 +437,7 @@ function renderSavings(sv) {
   line.appendChild(document.createTextNode(usd(t.gross) + " not spent"));
   const sep1 = document.createElement("span");
   sep1.className = "sep";
-  sep1.textContent = t.power == null ? "· power not counted ·" : "− " + usd(t.power) + " power =";
+  sep1.textContent = t.power == null ? " · power not counted · " : " − " + usd(t.power) + " power = ";
   line.appendChild(sep1);
   line.appendChild(document.createTextNode(usd(t.net) + " " + (t.net_label || "net")));
   hero.appendChild(line);
@@ -434,8 +447,12 @@ function renderSavings(sv) {
   const cloud = sv.cloud || {};
   const cloudBit = document.createElement("span");
   if (cloud.measured && cloud.cost != null) {
-    cloudBit.innerHTML = "actual cloud spend, same window: <b></b>";
-    cloudBit.querySelector("b").textContent = usd(cloud.cost);
+    // Actual spend renders at the same size as the notional headline —
+    // it is the induced-demand control, not a footnote.
+    cloudBit.appendChild(document.createTextNode("actual cloud spend, same window: "));
+    const amount = document.createElement("b");
+    amount.textContent = usd(cloud.cost);
+    cloudBit.appendChild(amount);
   } else {
     cloudBit.textContent = "actual cloud spend: not measured (" + (cloud.reason || "no data") + ")";
   }
@@ -547,7 +564,7 @@ function renderSavings(sv) {
       bar.appendChild(fill);
       row.appendChild(bar);
       const label = document.createElement("span");
-      label.textContent = pct1(p.recovered_pct) + " of " + usd(p.capital_cost) + "   " + p.projection;
+      label.textContent = pct1(p.recovered_pct) + " of " + usd0(p.capital_cost) + "   ·   " + p.projection;
       row.appendChild(label);
       const note = document.createElement("div");
       note.className = "pb-note";
@@ -596,16 +613,19 @@ async function boot() {
   streamAbort = new AbortController();
   retryDelay = 0;
   const signal = streamAbort.signal;
-  await refresh();
-  streamEvents(signal);
+  // Pick the view BEFORE the first await: a deep link to #savings must
+  // land on the savings view even when that first state fetch fails, or
+  // one unreachable cell sends the reader to the wrong screen.
+  showView();
   pollTimer = setInterval(() => refresh().catch(() => {}), 30000);
   savingsTimer = setInterval(() => { if (location.hash === "#savings") loadSavings(true); }, 60000);
-  showView();
+  await refresh();
+  streamEvents(signal);
 }
+// A bare tab with no token still lands on the right view; boot() (and
+// with it the data) waits for the token.
+showView();
 if (token) boot().catch(() => {});
-// A deep link to #savings in a bare tab still lands on the right view;
-// boot() (and with it the data) waits for the token.
-if (!token) showView();
 </script>
 </body>
 </html>

@@ -486,7 +486,7 @@ on.
 |---|---|
 | 1 golden pricing (exact to the cent, 0 = unpriced) | PASS — `prices_test.go:TestGoldenPricing_ExactToTheCent`, `TestZeroRateIsUnpricedNotFree` |
 | 2 cache tier (~5×, basis changes the bill) | PASS — `TestCacheTier_SplitVsSingleRate`, `TestBasisChangesTheBill` |
-| 3 equivalence (twin vs frontier, rationale required, no default mapping) | PASS — `c7b_test.go:TestSavings_FrontierIsTheSeventyFoldError`, `fleetcfg_test.go:TestLoad_FrontierRequiresARationale`, `TestNoDefaultFrontierMappingShips` |
+| 3 equivalence (twin vs frontier, rationale required, no default mapping) | PASS — `c7b_test.go:TestSavings_FrontierComparableIsOrdersOfMagnitudeAboveTheTwin`, `fleetcfg_test.go:TestLoad_FrontierRequiresARationale`, `TestNoDefaultFrontierMappingInConfigOrShippedExamples` |
 | 4 dated prices | PASS — `TestDatedSnapshots_PriceTheDayNotToday`, `TestSavings_DatedPricesDoNotRewriteHistory` |
 | 5 re-price from the same ledger | PASS — `TestSavings_RepricesFromTheSameLedger` |
 | 6 empty and unflattering states | PASS — six tests, including the `>10 years at this rate` clamp and the missing-`capital_cost` no-bar case |
@@ -509,3 +509,66 @@ what's resident right now", it is not C7 and llama-swap's `/ui` and
 Prometheus keep it. C7 adds one derived, retained, money-shaped rollup
 that neither can produce, because neither knows a price, neither
 aggregates across cells, and both forget on restart.
+
+### Adversarial review addendum (ground rule 9, 2026-08-03)
+
+Eight findings against the feature commit, all fixed in the review
+commit. Three were honesty defects — the class of bug this phase exists
+to prevent — and one was found by executing the page rather than reading
+it.
+
+1. **A measured-but-unpriced cell reported `$0.00`.** A cell whose every
+   model was unpriced still got `Gross = money(0)`, so §8's "$0 renders
+   only for a genuine measured zero" was violated in the flattering
+   direction on the most likely first-run configuration (no `pricing:`
+   block at all). Money is now absent with a reason, the tokens stay in
+   every token column, and the fleet total stays `nil` rather than
+   summing to zero. Pinned by
+   `TestSavings_MeasuredButUnpricedCellIsNotAZero`.
+2. **Cloud spend that was measured but unpriceable read "not
+   measured".** The requests happened and the bill exists; what was
+   missing was a rate. It now says so and names the models, with the
+   `priced_as` fix in the message. Pinned by
+   `TestSavings_MeasuredButUnpricedCloudSaysSo`.
+3. **§4's inverted rule was missing from the page.** "If the electricity
+   line looks like 1% of savings, the comparable is too expensive" is a
+   design requirement, not a footnote — it is the reader's cross-check on
+   the equivalence choice. Now a note whenever power is under 3% of
+   gross. Pinned by `TestSavings_ElectricityThatLooksFreeIsFlagged`.
+4. **`Savings(ctx, …)` ignored its context.** A whole-history walk on an
+   HTTP request now aborts with an ERROR rather than returning a short
+   report: a document missing three days is indistinguishable from a
+   fleet that served nothing those days.
+5. **A `#savings` deep link landed on the fleet view when the first
+   state fetch failed** — `showView()` ran after `await refresh()`. One
+   unreachable cell would have sent the reader to the wrong screen. The
+   view is now picked before the first await, and a token-less tab
+   resolves its view before the gate.
+6. **The page had never been executed.** A DOM stub run of
+   `renderSavings()` against a real report caught an `innerHTML` →
+   `querySelector` round trip and confirmed the unflattering path renders
+   ("<1% of $3,100 · >10 years at this rate"), the empty panel swaps in,
+   and the payback fill width lands on the element. Two presentation
+   bugs fell out: a sub-1% recovery rendered as a flat "0%" (now "<1%",
+   because a screen whose job is believability at small numbers must not
+   look broken there), and capital rendered as "$3100.00" instead of
+   "$3,100".
+7. **Actual cloud spend rendered smaller than the notional headline.**
+   §6 says "at the same size" for a reason: shrinking the fact makes the
+   counterfactual look bigger than it is.
+8. **Two test names overclaimed** (ground rule 10).
+   `TestSavings_FrontierIsTheSeventyFoldError` asserted an order of
+   magnitude, not 72×, and `TestNoDefaultFrontierMappingShips` checks the
+   zero config plus the shipped example docs, not the whole repo. Both
+   renamed to what their bodies prove.
+
+Not fixed, recorded instead:
+
+- A same-day re-vendor appends a second snapshot with the same
+  `effective_from` rather than merging into it. Resolution is
+  last-wins, so the prices are right; the artifact is just untidier than
+  it needs to be.
+- Power is counted only for days that carry a residency sample, so a
+  cell that served traffic with no residency rows shows an em dash
+  rather than an estimate. That is the honest reading, but it errs
+  toward a LARGER net — the one place in this screen that does.

@@ -361,7 +361,6 @@ func (d dayNet) net() float64 { return d.Gross - d.Power }
 // fleet_status, and Snapshot runs under a 3s probe budget a ledger read
 // would eat.
 func (s *Server) Savings(ctx context.Context, window string) (SavingsReport, error) {
-	_ = ctx
 	window = strings.TrimSpace(strings.ToLower(window))
 	if window == "" {
 		window = defaultSavingsWindow
@@ -445,14 +444,16 @@ func (s *Server) Savings(ctx context.Context, window string) (SavingsReport, err
 		}
 	}
 
-	s.priceLedger(&rep, byDay, table, now, loc)
+	if err := s.priceLedger(ctx, &rep, byDay, table, now, loc); err != nil {
+		return SavingsReport{}, err
+	}
 	return rep, nil
 }
 
 // priceLedger walks the aggregated ledger, prices every cell-day, and
 // fills the window table, the totals, the cloud line and the payback
 // strip.
-func (s *Server) priceLedger(rep *SavingsReport, byDay map[string]map[string]*cellDay, table *prices.Table, now time.Time, loc *time.Location) {
+func (s *Server) priceLedger(ctx context.Context, rep *SavingsReport, byDay map[string]map[string]*cellDay, table *prices.Table, now time.Time, loc *time.Location) error {
 	hosts := s.hosts
 	resolved := map[string]*prices.Resolved{}
 	resolveAt := func(day string) *prices.Resolved {
@@ -473,6 +474,7 @@ func (s *Server) priceLedger(rep *SavingsReport, byDay map[string]map[string]*ce
 		powerKnown bool
 		priced     int64
 		total      int64
+		anyPriced  bool
 		req        int64
 		fresh      int64
 		cached     int64
@@ -511,6 +513,13 @@ func (s *Server) priceLedger(rep *SavingsReport, byDay map[string]map[string]*ce
 	frontierHosts := 0
 
 	for _, day := range slices.Sorted(maps.Keys(byDay)) {
+		// A whole-history walk is cheap but not free, and the caller is an
+		// HTTP request. Abandoning it on disconnect returns an ERROR rather
+		// than a short report: a savings document missing three days would
+		// be indistinguishable from a fleet that served nothing those days.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		res := resolveAt(day)
 		inWindow := rep.SinceDay == "" || day >= rep.SinceDay
 		for cell, cd := range byDay[day] {
@@ -565,6 +574,7 @@ func (s *Server) priceLedger(rep *SavingsReport, byDay map[string]map[string]*ce
 				}
 				row.Priced = true
 				row.Unpriced = ""
+				agg.anyPriced = true
 				row.Hosts = spread.N
 				row.RateLow, row.RateHigh = spread.InRateMin, spread.InRateMax
 				row.NoCacheDiscount = spread.NoCacheDiscount
@@ -639,14 +649,26 @@ func (s *Server) priceLedger(rep *SavingsReport, byDay map[string]map[string]*ce
 		row.Measured = true
 		totals.CellsMeasured++
 		row.Req, row.InFresh, row.InCached, row.Out = agg.req, agg.fresh, agg.cached, agg.out
-		row.Gross, row.GrossLow, row.GrossHigh = money(agg.gross), money(agg.low), money(agg.high)
 		if agg.powerKnown {
 			row.Power = money(agg.power)
 			row.PowerDeclared = true
+			powerCounted = true
+		}
+		// A cell that served requests none of which could be PRICED is not
+		// a cell that saved $0.00. Money stays absent and the reason says
+		// so — while the TOKENS stay in every token column, which is the
+		// whole point of "N% of tokens priced". $0 renders only for a
+		// genuine measured zero.
+		switch {
+		case !agg.anyPriced:
+			row.Reason = "nothing priced in this window (no twin declared, or no published rate)"
+			row.NetLabel = "net (nothing priced)"
+		case agg.powerKnown:
+			row.Gross, row.GrossLow, row.GrossHigh = money(agg.gross), money(agg.low), money(agg.high)
 			row.Net = money(agg.gross - agg.power)
 			row.NetLabel = "net"
-			powerCounted = true
-		} else {
+		default:
+			row.Gross, row.GrossLow, row.GrossHigh = money(agg.gross), money(agg.low), money(agg.high)
 			row.Net = money(agg.gross)
 			row.NetLabel = "net (power not counted)"
 		}
@@ -663,9 +685,11 @@ func (s *Server) priceLedger(rep *SavingsReport, byDay map[string]map[string]*ce
 		totals.InFresh += agg.fresh
 		totals.InCached += agg.cached
 		totals.Out += agg.out
-		addMoney(&totals.Gross, agg.gross)
-		addMoney(&totals.GrossLow, agg.low)
-		addMoney(&totals.GrossHigh, agg.high)
+		if agg.anyPriced {
+			addMoney(&totals.Gross, agg.gross)
+			addMoney(&totals.GrossLow, agg.low)
+			addMoney(&totals.GrossHigh, agg.high)
+		}
 		if agg.powerKnown {
 			addMoney(&totals.Power, agg.power)
 		}
@@ -703,22 +727,42 @@ func (s *Server) priceLedger(rep *SavingsReport, byDay map[string]map[string]*ce
 	}
 	rep.Totals = totals
 
-	if !cloud.Measured {
-		cloud.Reason = "no cloud_peer traffic recorded at the front"
-	}
 	for id := range cloudUnpriced {
 		cloud.Unpriced = append(cloud.Unpriced, id)
 	}
 	sort.Strings(cloud.Unpriced)
+	switch {
+	case !cloud.Measured:
+		cloud.Reason = "no cloud_peer traffic recorded at the front"
+	case cloud.Cost == nil:
+		// Traffic WAS measured and none of it could be priced. Saying
+		// "not measured" here would be a lie in the flattering direction:
+		// the requests happened, the bill exists, and what is missing is a
+		// rate. Name the models so the fix is obvious.
+		cloud.Reason = "cloud traffic measured but no rate in the price table for " + strings.Join(cloud.Unpriced, ", ") +
+			" (map it with pricing.models.<id>.priced_as)"
+	}
 	rep.Cloud = cloud
 
 	rep.Payback = s.payback(lifetime, now, loc)
+	// The inverted rule, on the page (C7b §4): energy lands around 11-16%
+	// of net savings against an honest twin-priced headline, so an
+	// electricity line that looks like a rounding error is evidence the
+	// COMPARABLE is wrong, not evidence that power is free.
+	if totals.Power != nil && totals.Gross != nil && *totals.Gross > 0 {
+		if share := *totals.Power / *totals.Gross * 100; share < 3 {
+			rep.Notes = append(rep.Notes, fmt.Sprintf(
+				"electricity is %.1f%% of the gross figure; against an honest same-model-rented comparable it lands around 11-16%%, so a power line this small usually means the comparable is too expensive",
+				share))
+		}
+	}
 	if rep.Totals.Power == nil && anyCellHasPower(s.hosts) {
 		rep.Notes = append(rep.Notes, "electricity is not counted for every cell — cells without a power: block render an em dash")
 	}
 	if rep.Prices.Stale {
 		rep.Notes = append(rep.Notes, "the vendored price table is more than "+strconv.Itoa(prices.StaleAfterDays)+" days old; re-run `vibe fleet prices vendor`")
 	}
+	return nil
 }
 
 // priceCloudRow reconstructs actual spend for one cloud_peer model. It
@@ -863,6 +907,9 @@ func project(series map[string]*dayNet, days []string, cum, capital float64, cov
 	if n == 0 || recent <= 0 {
 		return "—"
 	}
+	// Divide by the WINDOW, not by the days that had traffic: a day the
+	// fleet served nothing earned nothing, and averaging only over busy
+	// days would project the fleet's best fortnight forever.
 	perDay := recent / float64(projectionWindowDays)
 	remaining := capital - cum
 	daysLeft := remaining / perDay
