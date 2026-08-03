@@ -101,6 +101,55 @@ cells:
   enter a repo.
 - The cell named `front` is required when `cells:` exists.
 
+### Savings config (C7b, optional)
+
+The savings screen (`/ui/fleet#savings`, `GET /api/fleet/savings`, the
+`fleet_savings` MCP tool) prices the usage ledger. Without this block it
+renders tokens and no money — which is the correct output for a fleet
+that has declared no equivalence.
+
+```yaml
+cells:
+  gpu-cell:
+    url: "http://<gpu-host>:9000"
+    class: opportunistic
+    # Declared wattage only. nvidia_smi / ha_entity are named future
+    # values and fail validation today — this repo ships no power
+    # sampler. Idle and busy are billed separately.
+    power: { source: declared, watts_idle: 100, watts_busy: 400 }
+    # EXAMPLE NUMBER. The real one lives in the private fleet repo.
+    # Convention for dual-use hardware: the upgrade delta over a
+    # gaming-adequate card. capital_note is REQUIRED and renders beside
+    # the payback bar; no capital_cost means no payback bar at all.
+    capital_cost: 2100
+    capital_note: "example: dual-use GPU, upgrade delta over a gaming-adequate card"
+
+pricing:
+  electricity_price_per_kwh: 0.15          # example rate
+  models:
+    # twin: the SAME open-weight model as a real host spells it. The
+    # headline is the median across the hosts that serve it. Naming a
+    # frontier model here instead moves the answer about 72x.
+    qwen3.6-27b: { twin: "Qwen/Qwen3-Coder-30B-A3B-Instruct" }
+    # counterfactual scales by the tier the work would really have run
+    # at: interactive (default, 1.0) | batch (0.5) | free (0.0).
+    nightly-sweeper: { twin: "Qwen/Qwen3-32B", counterfactual: batch }
+    # priced_as: an exact price-table id, for cloud_peer ids whose
+    # actual spend fleetd reconstructs from the front's activity log.
+    claude-opus-5: { priced_as: "claude-opus-5" }
+  # Optional second line. There is deliberately NO default: a frontier
+  # comparable is a claim about work you would actually have paid for,
+  # and it will not render without a written rationale.
+  # frontier:
+  #   model: "<a frontier model id>"
+  #   rationale: "why this workload would really have gone there"
+```
+
+Refresh the vendored price table with `vibe fleet prices vendor` from a
+checkout on a networked box (`vibe fleet prices show <model>` prints what
+the table says today). The daemon never fetches anything: the page has to
+load on a LAN with no internet.
+
 ## State contract
 
 Containers get recreated; these files MUST survive — one rw mount for
@@ -113,6 +162,8 @@ the state dir, which the compose marks required:
 | `last-seen.json` | Absent cells' last sightings. |
 | `start-history.json` | Cold-start ETAs for `warm_model` and the UI. |
 | `leases.json` (C2) | Advisory consumer leases. |
+| `usage.jsonl` (C7a) | The token ledger, append-only. Losing it loses the fleet's whole accounting history — cells announce CUMULATIVE totals, so a fresh ledger starts the running total over rather than back-filling. C7b's payback bars are computed from this file. |
+| `front-cloud-usage.json` (C7b) | fleetd's cursor for the front's `cloud_peer` traffic. Losing it re-ingests whatever the front's activity log still holds, which double-counts that window's actual cloud spend. |
 
 The **backends defs mount** (`/config/vibe/backends`) is not state, but
 it is load-bearing the same way: fleetd renders the front config from

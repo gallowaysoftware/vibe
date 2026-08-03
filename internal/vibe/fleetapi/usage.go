@@ -2,6 +2,7 @@ package fleetapi
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,12 +39,18 @@ const (
 	// usageBasisCell carries cell-level bookkeeping with no model at all
 	// (today: lost_rows).
 	usageBasisCell = "cell"
+	// usageBasisCloud carries the front's cloud_peer traffic (C7b §6):
+	// actual spend, reconstructed from the FRONT's activity log, keyed on
+	// the front cell. It is the one place the front legitimately appears
+	// in the ledger — cloud models are served by nobody in the fleet, so
+	// there is no cell row to double-count against.
+	usageBasisCloud = "cloud"
 )
 
 // reservedBases are fleetd's own basis values, closed to cells. An
 // unknown basis from a newer cell is welcome (it is a pricing question,
 // C7b's); one of THESE is a collision with a bucket fleetd writes itself.
-var reservedBases = map[string]bool{usageBasisResident: true, usageBasisCell: true}
+var reservedBases = map[string]bool{usageBasisResident: true, usageBasisCell: true, usageBasisCloud: true}
 
 // clampUsage folds a negative counter to zero. The cell already clamps
 // llama-swap's -1 sentinels, but the ledger is APPEND-ONLY and fed by
@@ -369,6 +376,7 @@ func (l *usageLedger) foldResidency(cell string, models []AnnounceModel, interva
 	if secs <= 0 {
 		return
 	}
+	credited := false
 	for _, m := range models {
 		if m.ID == "" || m.State == "" || m.State == "stopped" {
 			continue
@@ -376,6 +384,86 @@ func (l *usageLedger) foldResidency(cell string, models []AnnounceModel, interva
 		b := l.bucketLocked(usageKey{Day: day, Cell: cell, Model: m.ID, Basis: usageBasisResident}, tz)
 		b.ResidentS += secs
 		l.dirty[b.key()] = true
+		credited = true
+	}
+	if credited {
+		// The cell-level residency row (model "") is the ENERGY
+		// denominator (C7b §4). Per-model rows cannot serve as one: summing
+		// them bills a multi-resident box's idle watts once per model, and
+		// taking the max under-counts a cell that alternated models through
+		// the day. This row is the cell's own wall time with anything
+		// resident, credited once.
+		b := l.bucketLocked(usageKey{Day: day, Cell: cell, Basis: usageBasisResident}, tz)
+		b.ResidentS += secs
+		l.dirty[b.key()] = true
+	}
+}
+
+// FoldCloudUsage folds the FRONT's cloud_peer token counters into the
+// ledger (C7b §6). It is fleetd's own write, like residency: the cell
+// whitelist in fold() exists to stop double counting local traffic, and
+// cloud models are served by no cell in the fleet, so there is nothing
+// to double.
+//
+// Totals are cumulative, exactly like an announce's, so the same delta
+// rule makes a missed poll lose nothing and a duplicate poll add
+// nothing.
+func (s *Server) FoldCloudUsage(u *AnnounceUsage, at time.Time) {
+	if s == nil || s.usage == nil || u == nil {
+		return
+	}
+	s.usage.foldCloud(u, at)
+}
+
+func (l *usageLedger) foldCloud(u *AnnounceUsage, at time.Time) {
+	day := dayKey(at, l.loc)
+	tz := l.loc.String()
+
+	// Merge per model BEFORE folding: the collector reports one row per
+	// (model, basis), and two bases for one cloud model would otherwise
+	// resolve against the same cursor twice in one pass and cancel each
+	// other out. Summing cumulative counters is still cumulative.
+	merged := map[string]AnnounceUsageModel{}
+	order := []string{}
+	for _, m := range u.Models {
+		if m.Model == "" {
+			continue
+		}
+		m = clampUsage(m)
+		prev, seen := merged[m.Model]
+		if !seen {
+			order = append(order, m.Model)
+			prev = AnnounceUsageModel{Model: m.Model, Basis: usageBasisCloud}
+		}
+		prev.Req += m.Req
+		prev.InFresh += m.InFresh
+		prev.InCached += m.InCached
+		prev.Out += m.Out
+		prev.PokeReq += m.PokeReq
+		prev.ErrReq += m.ErrReq
+		prev.UnmeasuredReq += m.UnmeasuredReq
+		prev.BusyMS += m.BusyMS
+		merged[m.Model] = prev
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, model := range order {
+		m := merged[model]
+		key := usageKey{Day: day, Cell: fleetcfg.FrontCell, Model: model, Basis: usageBasisCloud, Epoch: u.Epoch}
+		delta := l.deltaLocked(cursorKey{Cell: fleetcfg.FrontCell, Model: model, Basis: usageBasisCloud, Epoch: u.Epoch}, m, day)
+		b := l.bucketLocked(key, tz)
+		b.Req += delta.Req
+		b.InFresh += delta.InFresh
+		b.InCached += delta.InCached
+		b.Out += delta.Out
+		b.PokeReq += delta.PokeReq
+		b.ErrReq += delta.ErrReq
+		b.UnmeasuredReq += delta.UnmeasuredReq
+		b.BusyMS += delta.BusyMS
+		total := m
+		b.LastTotal = &total
+		l.dirty[key] = true
 	}
 }
 
@@ -648,6 +736,47 @@ func (s *Server) UsageReport(sinceDay string) UsageReport {
 		rep.Buckets = append(rep.Buckets, b)
 	}
 	return rep
+}
+
+// cloudPollInterval is how often fleetd re-reads the front's activity
+// log for cloud_peer traffic. Slower than an announce on purpose: this
+// is a bill reconstruction nobody watches live, and the counters are
+// cumulative so cadence costs nothing but freshness.
+const cloudPollInterval = 60 * time.Second
+
+// StartCloudSpendLoop polls the front for cloud_peer usage and folds it
+// into the ledger (C7b §6). poll returns CUMULATIVE totals, the same
+// contract an announce carries, and nil when it has nothing to say —
+// including when it could not tell cloud models from local ones, which
+// must never fold.
+func (s *Server) StartCloudSpendLoop(poll func(context.Context) *AnnounceUsage) {
+	if s.usage == nil || poll == nil {
+		return
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		// Cancellation is linked to s.done so Close() cannot block behind
+		// an HTTP round trip against an unreachable front.
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			<-s.done
+			cancel()
+		}()
+		tick := time.NewTicker(cloudPollInterval)
+		defer tick.Stop()
+		for {
+			if u := poll(ctx); u != nil {
+				s.FoldCloudUsage(u, time.Now())
+			}
+			select {
+			case <-s.done:
+				return
+			case <-tick.C:
+			}
+		}
+	}()
 }
 
 // usageFlushInterval is the ledger's write cadence. Coalescing in memory

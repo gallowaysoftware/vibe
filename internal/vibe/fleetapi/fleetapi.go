@@ -21,6 +21,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
+	"github.com/gallowaysoftware/vibe/internal/vibe/prices"
 )
 
 // Cell is one llama-swap instance in the fleet registry. A single-box
@@ -241,6 +244,14 @@ type Server struct {
 	// for).
 	usage *usageLedger
 
+	// hosts is the parsed hosts.yaml — read here for C7b's pricing,
+	// power and capital config only. Cell MEMBERSHIP still travels
+	// through s.cells; this is not a second cell list.
+	hosts *fleetcfg.File
+	// prices overrides the embedded price table (tests only). nil uses
+	// the vendored artifact.
+	prices *prices.Table
+
 	// warmStates and schedStates are the C4 warm loops' status surfaces
 	// (fleet_status's warm block). Pointers: the loop goroutines mutate
 	// the entries in place under s.mu.
@@ -280,6 +291,12 @@ type Options struct {
 	// container is UTC, splitting an evening session across two days.
 	// Declare it.
 	Timezone *time.Location
+	// Hosts is the parsed hosts.yaml, for C7b's pricing/power/capital
+	// blocks. Nil leaves the savings screen priceless: tokens render,
+	// money does not.
+	Hosts *fleetcfg.File
+	// Prices overrides the embedded price table (tests only).
+	Prices *prices.Table
 }
 
 // New builds a Server over the given cell registry. historyPath is the JSON
@@ -321,6 +338,8 @@ func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Op
 		leases:             loadLeases(opts.LeasePath),
 		leasePath:          opts.LeasePath,
 		usage:              usage,
+		hosts:              opts.Hosts,
+		prices:             opts.Prices,
 		done:               make(chan struct{}),
 	}
 }
@@ -345,6 +364,12 @@ func (s *Server) Register(mux *http.ServeMux) {
 	}
 	if s.usage != nil {
 		mux.HandleFunc("GET /api/fleet/usage", s.handleUsage)
+		// The page's fourth read-only GET (after state/events/leases).
+		// Deliberately its own route rather than a field on
+		// /api/fleet/state: every SSE line debounce-refreshes state, and a
+		// ledger aggregate would recompute for a screen nobody is looking
+		// at. Every mutation still goes through POST /mcp.
+		mux.HandleFunc("GET /api/fleet/savings", s.handleSavings)
 	}
 }
 

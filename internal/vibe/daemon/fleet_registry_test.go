@@ -219,6 +219,11 @@ cells:
 		{http.MethodGet, "/ui/fleet/../api/fleet/state"},
 		{http.MethodGet, "/ui/fleet%2f"},
 		{http.MethodGet, "//ui/fleet"},
+		// C7b's savings screen is a hash-routed VIEW inside the one page,
+		// so this is not a route at all — and if someone ever makes it
+		// one, it must not inherit the page's exemption.
+		{http.MethodGet, "/ui/fleet/savings"},
+		{http.MethodGet, "/api/fleet/savings"},
 	} {
 		resp = req(tc.method, "http://"+httpAddr+tc.path, "", "")
 		resp.Body.Close()
@@ -279,6 +284,8 @@ func TestDaemon_FleetRegistryOff_NoMCP(t *testing.T) {
 		// C7a's ledger is fleetd state: a single-box daemon has no
 		// announces to fold and must not serve a usage document.
 		{http.MethodGet, "/api/fleet/usage"},
+		// C7b prices that ledger; same role, same rule.
+		{http.MethodGet, "/api/fleet/savings"},
 	} {
 		req, _ := http.NewRequest(probe.method, "http://"+httpAddr+probe.path, strings.NewReader("{}"))
 		req.Header.Set("Authorization", "Bearer "+token)

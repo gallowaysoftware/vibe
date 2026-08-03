@@ -213,3 +213,130 @@ model_classes:
 		t.Error("KnownModelClass accepted a value outside the vocabulary")
 	}
 }
+
+// ─── C7b: pricing, power and capital ────────────────────────────────────────
+
+const c7bCells = `
+cells:
+  front: {url: "http://front:9000", class: always_on}
+  gpu:
+    url: "http://gpu:9000"
+    class: opportunistic
+`
+
+func TestLoad_PricingBlock(t *testing.T) {
+	f, err := LoadFrom(writeHosts(t, c7bCells+`
+pricing:
+  electricity_price_per_kwh: 0.15
+  models:
+    qwen-coder:
+      twin: "Acme/Acme-Coder-30B"
+      counterfactual: batch
+    cloud-chat:
+      priced_as: "vendor-chat-1"
+  frontier:
+    model: "vendor-frontier-1"
+    rationale: "example: the agentic refactors I would actually have paid for"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mp, ok := f.ModelPricingFor("qwen-coder")
+	if !ok || mp.Twin != "Acme/Acme-Coder-30B" {
+		t.Fatalf("model pricing = %+v (ok=%v)", mp, ok)
+	}
+	if mp.Multiplier() != 0.5 {
+		t.Errorf("batch multiplier = %g, want 0.5 (Anthropic's Batch API is a flat 50%%)", mp.Multiplier())
+	}
+	if def, _ := f.ModelPricingFor("cloud-chat"); def.Multiplier() != 1 {
+		t.Errorf("unset counterfactual multiplier = %g, want 1 (interactive)", def.Multiplier())
+	}
+	if f.Pricing.Frontier == nil || f.Pricing.Frontier.Rationale == "" {
+		t.Error("frontier rationale lost on load")
+	}
+}
+
+// TestLoad_FrontierRequiresARationale: the frontier row is a claim about
+// work you would actually have paid a frontier model to do. Without a
+// written rationale it is an unarguable number, which is the one thing
+// this screen must never render.
+func TestLoad_FrontierRequiresARationale(t *testing.T) {
+	_, err := LoadFrom(writeHosts(t, c7bCells+`
+pricing:
+  frontier:
+    model: "vendor-frontier-1"
+`))
+	if err == nil || !strings.Contains(err.Error(), "rationale") {
+		t.Fatalf("err = %v, want a rationale requirement", err)
+	}
+	if _, err := LoadFrom(writeHosts(t, c7bCells+"pricing:\n  frontier:\n    rationale: \"because\"\n")); err == nil {
+		t.Error("accepted a frontier with a rationale and no model")
+	}
+}
+
+func TestLoad_CapitalCostRequiresANote(t *testing.T) {
+	_, err := LoadFrom(writeHosts(t, `
+cells:
+  front: {url: "http://front:9000", class: always_on}
+  gpu: {url: "http://gpu:9000", class: opportunistic, capital_cost: 3100}
+`))
+	if err == nil || !strings.Contains(err.Error(), "capital_note") {
+		t.Fatalf("err = %v, want a capital_note requirement", err)
+	}
+	// And a note with no number is equally wrong: no capital number means
+	// no payback bar at all.
+	_, err = LoadFrom(writeHosts(t, `
+cells:
+  front: {url: "http://front:9000", class: always_on}
+  gpu: {url: "http://gpu:9000", class: opportunistic, capital_note: "a GPU"}
+`))
+	if err == nil {
+		t.Error("accepted a capital_note with no capital_cost")
+	}
+}
+
+// TestLoad_PowerSourceOnlyDeclared: nvidia_smi and ha_entity are named
+// future values, not built ones. A config that asks for a sampler must
+// fail loudly rather than silently reporting declared numbers.
+func TestLoad_PowerSourceOnlyDeclared(t *testing.T) {
+	ok := writeHosts(t, `
+cells:
+  front: {url: "http://front:9000", class: always_on}
+  gpu:
+    url: "http://gpu:9000"
+    class: opportunistic
+    power: {source: declared, watts_idle: 100, watts_busy: 400}
+`)
+	f, err := LoadFrom(ok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := f.Cells["gpu"].Power; p == nil || p.WattsIdle != 100 || p.WattsBusy != 400 {
+		t.Fatalf("power = %+v", p)
+	}
+	for _, bad := range []string{
+		`power: {source: nvidia_smi, watts_idle: 100}`,
+		`power: {source: ha_entity, watts_idle: 100}`,
+		`power: {source: guess, watts_idle: 100}`,
+		`power: {watts_idle: 100}`,
+		`power: {source: declared}`,
+		`power: {source: declared, watts_idle: 400, watts_busy: 100}`,
+	} {
+		doc := "cells:\n  front: {url: \"http://front:9000\", class: always_on}\n  gpu: {url: \"http://gpu:9000\", class: opportunistic, " + bad + "}\n"
+		if _, err := LoadFrom(writeHosts(t, doc)); err == nil {
+			t.Errorf("accepted %s", bad)
+		}
+	}
+}
+
+func TestLoad_PricingRejectsNonsense(t *testing.T) {
+	for _, bad := range []string{
+		"pricing:\n  electricity_price_per_kwh: -1\n",
+		"pricing:\n  models:\n    m: {twin: \"t\", counterfactual: sometimes}\n",
+		"pricing:\n  models:\n    m: {counterfactual: batch}\n",
+	} {
+		if _, err := LoadFrom(writeHosts(t, c7bCells+bad)); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+}

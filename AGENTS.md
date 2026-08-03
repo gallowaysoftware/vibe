@@ -443,6 +443,74 @@ optional.)
     of fleet tokens. Requires `store: {path: …}` in each cell's
     llama-swap extras (private fleet repo) or the activity log is a
     1000-row in-memory ring.
+- **Savings screen (fleet-control C7b).** C7a's counts, priced.
+  `internal/vibe/prices` (the vendored table + the arithmetic),
+  `fleetapi/savings.go` (`Savings(ctx, window)`,
+  `GET /api/fleet/savings`, fleetmcp's `fleet_savings`), and the
+  `#savings` view inside the same `fleet.html`. Two levers decide
+  whether the number is honest and both are load-bearing forever:
+  - **Equivalence is the same open-weight model RENTED**, priced at the
+    median across hosts that serve it (`open_weights == true`) and
+    rendered as a range. Pricing a 27B local model as a frontier model
+    moves the answer ~72x. The frontier comparable exists only as a
+    config-declared line that **requires** a written `rationale`
+    rendered beside it; **this repo ships no default frontier mapping**
+    and a test greps for one.
+  - **Prompt tokens are priced fresh + cache-read, separately, always**,
+    from C7a's measurement (~5x). The direction inverts by endpoint,
+    which is what `basis` is for: chat/cloud bill `in_fresh + in_cached`,
+    embed/other bill `in_fresh` alone.
+  - **A rate of exactly 0 means UNKNOWN, never free**, and an unpriced
+    model keeps its tokens while leaving the money column. Every money
+    field on the report is a POINTER: an unmeasured cell renders an em
+    dash plus a reason and is excluded from the totals, so `$0` renders
+    only for a genuine measured zero. No `capital_cost` → no payback bar
+    at all; under 14 covered days → "too early to project"; a hopeless
+    rate → ">10 years at this rate". The screen is allowed to be
+    unflattering — one that can only render triumph will.
+  - **The price table is vendored, dated and embedded**
+    (`prices.json`, models.dev + LiteLLM, both MIT, commits recorded).
+    Refresh with `vibe fleet prices vendor` on a networked box; CI never
+    has network. Snapshots are append-only (base + overlays) and a day is
+    priced at the newest snapshot on or before it — re-pricing history at
+    today's rates would erase money that genuinely was not spent. A
+    cross-source disagreement past 2x DROPS the row and fails the run
+    unless `--max-disagreements` records a reviewed count.
+  - **Energy is declared, never sampled** (`power: {source: declared}`
+    per cell; `nvidia_smi`/`ha_entity` are named future values that fail
+    validation today). Idle and busy are billed separately because C4's
+    warm targets deliberately increase the idle term. Four rules the
+    review pass had to restore, all in the same direction:
+    **electricity is a COST, not a saving**, so a cell with no measured
+    requests still bills its watts (a box holding a warm target resident
+    all day IS the case §4 was written for, and the payback strip was
+    already charging them); the energy denominator is the **cell-level**
+    residency row, falling back to the **MAX** across per-model rows,
+    never the sum; a **partial** power term (some cells declared, some
+    not) is stated on the page, because it is the one place this screen
+    errs LARGE; and the note names the actual missing field — an unset
+    `pricing.electricity_price_per_kwh` blanks every cell that declared
+    wattage perfectly well.
+  - **The front never gets a payback bar.** C7a folds no token rows for
+    it, so its numerator is defined to be zero; a `capital_cost` on the
+    front becomes a note, not a bar that reads "0% of $N" forever. Same
+    structural exclusion as the savings table.
+  - **The page adds no route**: `#savings` is a hash-routed view, because
+    `/ui/fleet/savings` would force C5's exact-match bearer exemption to
+    widen. Bar widths via `el.style.width`, never an interpolated
+    `style="…"`. No action buttons on that view, no external asset.
+  - **Price the ledger through `Table.Resolver()`, never `At()` per day.**
+    Payback is lifetime, so every window walks the whole history, and
+    resolving the vendored table costs ~3 ms; per-day resolution made the
+    endpoint cost ~1.3 s at 400 days and grow forever. Days inside one
+    snapshot generation resolve identically, so the cache is exact.
+  - Two additive C7a ledger changes belong to this phase: a **cell-level
+    residency row** (`model: ""`) as the energy denominator, and the
+    fleetd-reserved **`cloud` basis** on the front cell, fed by
+    `daemon/cloudspend.go` tailing the FRONT's activity log for
+    `cloud_peer` ids only — actual spend beside notional savings, the
+    induced-demand control. A defs read that fails skips the poll
+    entirely rather than folding unfiltered.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.

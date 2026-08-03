@@ -66,6 +66,118 @@ type Cell struct {
 	// magic packet from its LAN position, or shells to Cmd when L2
 	// broadcast is unreachable from where fleetd runs (macvlan).
 	Wake *Wake `yaml:"wake,omitempty"`
+	// Power is the cell's declared wattage (C7b §4). Absent means the
+	// savings screen renders an em dash for this cell's electricity and
+	// labels its net "net (power not counted)" — never a zero.
+	Power *Power `yaml:"power,omitempty"`
+	// CapitalCost is what this cell's hardware cost, in the same currency
+	// as the price table (USD). Absent means NO payback bar for the cell:
+	// not 0%, not infinity, not an invented denominator.
+	//
+	// For dual-use hardware the convention is the UPGRADE DELTA — the
+	// card's price minus what a gaming-adequate card would have cost.
+	// Usage-weighted attribution (serving hours over powered hours) is
+	// rejected by name: llama-swap holding a model resident means an idle
+	// cell attributes ~90% of the GPU to AI for sitting there, so the
+	// metric rewards idling.
+	CapitalCost float64 `yaml:"capital_cost,omitempty"`
+	// CapitalNote is REQUIRED alongside CapitalCost and is rendered beside
+	// the bar. A capital number with no stated basis is unarguable, and
+	// this screen's whole value is being arguable.
+	CapitalNote string `yaml:"capital_note,omitempty"`
+}
+
+// Power is a cell's declared power draw. Declared is sufficient because
+// ±40% on a term that lands around 12% of net savings is ±5% of the
+// answer — inside the noise of the equivalence choice (72x) and the
+// cache tier (5x). Measurement is genuinely unattractive: nvidia-smi has
+// no cumulative energy field on query-gpu, RAPL is root-only post
+// PLATYPUS, and the Apple path needs cgo into a private framework.
+type Power struct {
+	// Source is the discriminator. Only "declared" is BUILT. "nvidia_smi"
+	// and "ha_entity" are named here as the future values so the field
+	// shape does not change when one of them lands — Home Assistant's
+	// GET /api/states/<entity> is the one honest measurement path and is
+	// stdlib-trivial.
+	Source string `yaml:"source"`
+	// WattsIdle is the draw while a model is resident but idle; WattsBusy
+	// while generating. They are billed separately, because a cell
+	// holding a warm model 20h/day is mostly reporting its idle constant
+	// — and C4's warm targets deliberately increase exactly that.
+	WattsIdle float64 `yaml:"watts_idle"`
+	WattsBusy float64 `yaml:"watts_busy"`
+}
+
+// PowerSources. Only PowerDeclared is implemented.
+const (
+	PowerDeclared  = "declared"
+	PowerNvidiaSMI = "nvidia_smi"
+	PowerHAEntity  = "ha_entity"
+)
+
+// Pricing is the fleet-level half of the savings screen's config
+// (C7b §1). Everything here is a claim the fleet's owner is making, not
+// one this repo ships: there is deliberately NO default twin mapping and
+// NO default frontier mapping.
+type Pricing struct {
+	// ElectricityPricePerKWh prices the energy term (reference example
+	// 0.15). Zero means electricity is not counted and the page says so.
+	ElectricityPricePerKWh float64 `yaml:"electricity_price_per_kwh,omitempty"`
+	// Models maps a LOCAL model id (the canonical backend def name C7a
+	// keys the ledger on) to its pricing claim.
+	Models map[string]ModelPricing `yaml:"models,omitempty"`
+	// Frontier is the optional "if I'd used a frontier model instead"
+	// row. It requires a written rationale, which is rendered beside the
+	// number: a shipped default mapping would be an unearned claim by
+	// this repo, while a config field with a rationale is the owner's
+	// claim — and a claim someone can argue with.
+	Frontier *Frontier `yaml:"frontier,omitempty"`
+}
+
+// ModelPricing is one local model's pricing claim.
+type ModelPricing struct {
+	// Twin is the same open-weight model as a real host spells it
+	// (e.g. "Qwen/Qwen3-Coder-30B-A3B-Instruct"). The headline is the
+	// MEDIAN across hosts that serve it, rendered as a range. Comparing
+	// against a frontier model instead moves the answer about 72x.
+	Twin string `yaml:"twin,omitempty"`
+	// PricedAs is an exact price-table model id, for ids that ARE a
+	// hosted model rather than a local one: cloud_peer traffic through
+	// the front is a bill reconstruction, not a counterfactual.
+	PricedAs string `yaml:"priced_as,omitempty"`
+	// Counterfactual scales the notional cost by the tier the work would
+	// really have run at: interactive (1.0), batch (0.5 — Anthropic's
+	// Batch API is a flat 50%, and overnight sweeps are batch-shaped), or
+	// free (0.0). Default interactive.
+	Counterfactual string `yaml:"counterfactual,omitempty"`
+}
+
+// Counterfactual tiers.
+const (
+	CounterfactualInteractive = "interactive"
+	CounterfactualBatch       = "batch"
+	CounterfactualFree        = "free"
+)
+
+// Multiplier is the counterfactual's scale factor. An unset tier is
+// interactive, the most expensive and therefore the reading most likely
+// to be argued with.
+func (m ModelPricing) Multiplier() float64 {
+	switch m.Counterfactual {
+	case CounterfactualBatch:
+		return 0.5
+	case CounterfactualFree:
+		return 0
+	default:
+		return 1
+	}
+}
+
+// Frontier is the optional frontier comparable.
+type Frontier struct {
+	Model string `yaml:"model"`
+	// Rationale is REQUIRED and rendered on screen beside the number.
+	Rationale string `yaml:"rationale"`
 }
 
 // Wake is a cell's Wake-on-LAN record. Always explicit — waking is never
@@ -104,6 +216,18 @@ type File struct {
 	// strict decoding off instead would let a typo'd cell key silently
 	// degrade display semantics, which is what it exists to prevent.
 	Hosts map[string]yaml.Node `yaml:"hosts,omitempty"`
+	// Pricing is the savings screen's equivalence and energy config
+	// (C7b). Absent means the screen renders tokens and no money.
+	Pricing *Pricing `yaml:"pricing,omitempty"`
+}
+
+// ModelPricingFor returns the pricing claim for a local model id.
+func (f *File) ModelPricingFor(model string) (ModelPricing, bool) {
+	if f == nil || f.Pricing == nil {
+		return ModelPricing{}, false
+	}
+	mp, ok := f.Pricing.Models[model]
+	return mp, ok
 }
 
 // Load reads paths.HostsFile(). A missing file is not an error — it
@@ -180,6 +304,22 @@ func (f *File) validate() error {
 			}
 		}
 	}
+	for name, c := range f.Cells {
+		if err := validatePower(name, c.Power); err != nil {
+			return err
+		}
+		switch {
+		case c.CapitalCost < 0:
+			return fmt.Errorf("cells.%s: capital_cost must not be negative", name)
+		case c.CapitalCost > 0 && strings.TrimSpace(c.CapitalNote) == "":
+			return fmt.Errorf("cells.%s: capital_cost requires capital_note (what the number covers — e.g. \"dual-use GPU, upgrade delta over a gaming-adequate card\"); it is rendered beside the payback bar", name)
+		case c.CapitalCost == 0 && strings.TrimSpace(c.CapitalNote) != "":
+			return fmt.Errorf("cells.%s: capital_note without capital_cost (no capital number means no payback bar at all)", name)
+		}
+	}
+	if err := f.validatePricing(); err != nil {
+		return err
+	}
 	for id, class := range f.ModelClasses {
 		if strings.TrimSpace(id) == "" {
 			return errors.New("model_classes: empty model id")
@@ -213,6 +353,67 @@ func KnownModelClass(class string) bool {
 		}
 	}
 	return false
+}
+
+func validatePower(cell string, p *Power) error {
+	if p == nil {
+		return nil
+	}
+	switch p.Source {
+	case PowerDeclared:
+	case PowerNvidiaSMI, PowerHAEntity:
+		return fmt.Errorf("cells.%s.power.source %q is a named future value, not implemented: use %q "+
+			"(C7b ships no power sampler — declared wattage is ±40%% on a ~12%% term, which is inside the noise of the equivalence choice)",
+			cell, p.Source, PowerDeclared)
+	case "":
+		return fmt.Errorf("cells.%s.power.source is required (only %q is implemented)", cell, PowerDeclared)
+	default:
+		return fmt.Errorf("cells.%s.power.source must be %q (got %q)", cell, PowerDeclared, p.Source)
+	}
+	if p.WattsIdle < 0 || p.WattsBusy < 0 {
+		return fmt.Errorf("cells.%s.power: watts must not be negative", cell)
+	}
+	if p.WattsIdle == 0 && p.WattsBusy == 0 {
+		return fmt.Errorf("cells.%s.power: declared power needs watts_idle and/or watts_busy (a zero-watt cell is not a measurement, it is a missing one)", cell)
+	}
+	if p.WattsBusy > 0 && p.WattsBusy < p.WattsIdle {
+		return fmt.Errorf("cells.%s.power: watts_busy (%g) is below watts_idle (%g)", cell, p.WattsBusy, p.WattsIdle)
+	}
+	return nil
+}
+
+func (f *File) validatePricing() error {
+	p := f.Pricing
+	if p == nil {
+		return nil
+	}
+	if p.ElectricityPricePerKWh < 0 {
+		return errors.New("pricing.electricity_price_per_kwh must not be negative")
+	}
+	for id, mp := range p.Models {
+		if strings.TrimSpace(id) == "" {
+			return errors.New("pricing.models: empty model id")
+		}
+		switch mp.Counterfactual {
+		case "", CounterfactualInteractive, CounterfactualBatch, CounterfactualFree:
+		default:
+			return fmt.Errorf("pricing.models.%s.counterfactual must be one of %q, %q, %q (got %q)",
+				id, CounterfactualInteractive, CounterfactualBatch, CounterfactualFree, mp.Counterfactual)
+		}
+		if strings.TrimSpace(mp.Twin) == "" && strings.TrimSpace(mp.PricedAs) == "" {
+			return fmt.Errorf("pricing.models.%s: set twin (the same open-weight model as a real host spells it) or priced_as (an exact price-table id)", id)
+		}
+	}
+	if fr := p.Frontier; fr != nil {
+		if strings.TrimSpace(fr.Model) == "" {
+			return errors.New("pricing.frontier.model is required when a frontier comparable is declared")
+		}
+		if strings.TrimSpace(fr.Rationale) == "" {
+			return errors.New("pricing.frontier.rationale is required: the frontier row is a claim about work you would actually have paid a frontier model to do, " +
+				"and it renders beside the number so it can be argued with")
+		}
+	}
+	return nil
 }
 
 // expandTilde expands a leading "~/" against the user's home directory.

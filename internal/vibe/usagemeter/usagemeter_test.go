@@ -491,3 +491,39 @@ func TestPoll_StateWriteFailureIsWarnedNotSwallowed(t *testing.T) {
 		t.Errorf("an unwritable state path cost the cell its counts: %+v", snap)
 	}
 }
+
+// TestPoll_ModelFilterKeepsOnlyTheAskedForModels pins C7b §6's one new
+// knob: fleetd tails the FRONT's activity log for cloud_peer ids only,
+// because every other row there is a request some cell also counted. The
+// cursor still advances past rejected rows — they were read, they just
+// are not this collector's business.
+func TestPoll_ModelFilterKeepsOnlyTheAskedForModels(t *testing.T) {
+	swap := &fakeSwap{}
+	swap.set([]ActivityRow{
+		chatRow(1, "vendor-chat-1", 500, -1, 100),
+		chatRow(2, "qwen-coder", 9_000_000, -1, 500_000),
+		chatRow(3, "vendor-chat-1", 1000, -1, 200),
+	})
+	c := newCollector(t, swap.start(t), func(cfg *Config) {
+		cfg.ModelFilter = func(m string) bool { return m == "vendor-chat-1" }
+	})
+	if err := c.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := totalsFor(t, c, "qwen-coder", BasisChat); got.Req != 0 || got.InFresh != 0 {
+		t.Errorf("a filtered-out model was counted: %+v", got)
+	}
+	cloud := totalsFor(t, c, "vendor-chat-1", BasisChat)
+	if cloud.Req != 2 || cloud.InFresh != 1500 || cloud.Out != 300 {
+		t.Errorf("cloud counters = %+v, want 2 req / 1500 in / 300 out", cloud)
+	}
+	c.mu.Lock()
+	cursor, lost := c.cursor, c.lost
+	c.mu.Unlock()
+	if cursor != 3 {
+		t.Errorf("cursor = %d, want 3 — filtered rows were still READ", cursor)
+	}
+	if lost != 0 {
+		t.Errorf("lost = %d, want 0 — a filtered row is not a lost row", lost)
+	}
+}

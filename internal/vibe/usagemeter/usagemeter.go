@@ -292,6 +292,14 @@ type Config struct {
 	// MaxPages bounds one poll's walk back through the activity log
 	// (0 → defaultMaxPages). Each page is up to activityLimit rows.
 	MaxPages int
+	// ModelFilter, when set, keeps only the rows whose model it accepts.
+	// It exists for exactly one caller: fleetd tailing the FRONT's
+	// activity log for cloud_peer model ids (C7b §6), where the point is
+	// to reconstruct a real cloud bill and every local model's row on
+	// that log is a duplicate of a cell's own count. The cursor still
+	// advances past rejected rows — they were read, they just are not
+	// this collector's business.
+	ModelFilter func(model string) bool
 }
 
 // activityLimit is llama-swap's per-page maximum: parseActivityLimit
@@ -494,6 +502,9 @@ func (c *Collector) Poll(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, row := range rows {
+		if c.cfg.ModelFilter != nil && !c.cfg.ModelFilter(row.Model) {
+			continue
+		}
 		basis, delta := Classify(row)
 		k := entryKey{Model: row.Model, Basis: basis}
 		t := c.totals[k]

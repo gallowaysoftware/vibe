@@ -45,18 +45,54 @@
   .warn-item code { color: var(--red); }
   #status-line { color: var(--dim); font-size: 12px; margin-top: 18px; }
   .pending { color: var(--amber); font-style: italic; }
+  nav#views { display: flex; gap: 14px; }
+  nav#views a { color: var(--dim); text-decoration: none; font-size: 13px; padding-bottom: 2px; border-bottom: 2px solid transparent; }
+  nav#views a.on { color: var(--text); border-bottom-color: var(--blue); }
+  #sv-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  #sv-head select { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: 3px 8px; font: inherit; font-size: 12px; }
+  .chip { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; border: 1px solid var(--line); color: var(--dim); }
+  .chip-warn { color: var(--amber); border-color: var(--amber); }
+  .chip-bad { color: var(--red); border-color: var(--red); }
+  .hero { font-size: 20px; margin: 6px 0 2px; }
+  .hero .sep { color: var(--dim); font-size: 15px; margin: 0 6px; }
+  .hero-sub { color: var(--dim); font-size: 13px; margin-bottom: 14px; }
+  /* Actual cloud spend renders at the SAME type size as the hero: it is
+     the induced-demand control, and shrinking it would make the
+     counterfactual look bigger than the fact. */
+  .hero-sub b { color: var(--text); font-weight: 600; font-size: 20px; }
+  details#sv-caveat { margin: 12px 0 20px; color: var(--dim); font-size: 12px; max-width: 70em; }
+  details#sv-caveat summary { cursor: pointer; }
+  .sv-model { color: var(--dim); font-size: 12px; }
+  .sv-model code { color: var(--text); }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .dash { color: var(--dim); }
+  .unpriced { color: var(--amber); }
+  #sv-payback h2, #sv-empty h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--dim); font-weight: 500; margin: 24px 0 10px; }
+  .pb-row { display: flex; align-items: center; gap: 12px; margin: 6px 0; flex-wrap: wrap; }
+  .pb-cell { width: 10em; font-weight: 600; }
+  .bar { width: 220px; height: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 3px; overflow: hidden; }
+  .bar .fill { height: 100%; background: var(--green); }
+  .pb-note { color: var(--dim); font-size: 12px; width: 100%; padding-left: calc(10em + 12px); }
+  #sv-notes { color: var(--dim); font-size: 12px; margin-top: 20px; }
+  #sv-notes div { margin: 4px 0; }
+  #sv-empty p { max-width: 60em; color: var(--dim); }
 </style>
 </head>
 <body>
 <header>
   <h1>fleet</h1>
   <span class="meta" id="fleetd-addr"></span>
+  <nav id="views">
+    <a href="#fleet" id="nav-fleet">fleet</a>
+    <a href="#savings" id="nav-savings">savings</a>
+  </nav>
   <span id="token-gate">
     <input id="token-input" type="password" placeholder="bearer token (stored in this browser only)">
     <button onclick="saveToken()">save</button>
   </span>
 </header>
 <main>
+  <section id="view-fleet">
   <table>
     <thead><tr><th>cell</th><th>display</th><th>class</th><th>models</th><th>intent / last seen</th><th>actions</th></tr></thead>
     <tbody id="cells"></tbody>
@@ -68,6 +104,37 @@
   </div>
   <div id="warnings"></div>
   <div id="status-line"></div>
+  </section>
+  <!-- The savings view has NO action buttons. That is what keeps "the
+       page adds exactly one route and no mutation surface" literally
+       true: every figure here comes from one authed read-only GET. -->
+  <section id="view-savings" hidden>
+    <div id="sv-head"></div>
+    <div id="sv-hero"></div>
+    <details id="sv-caveat">
+      <summary>what this number is, and why it is an upper bound</summary>
+      <p id="sv-caveat-text"></p>
+    </details>
+    <div id="sv-empty" hidden>
+      <h2>nothing measured yet</h2>
+      <p>No cell has announced any usage. The ledger fills in as cells announce
+         (a cell needs <code>store: {path: …}</code> in its llama-swap config, or its
+         activity log is a 1000-row in-memory ring). This panel is here instead of a
+         $0.00 headline because a zero would be a claim about the fleet, and there is
+         nothing to claim yet.</p>
+    </div>
+    <table id="sv-table">
+      <thead><tr>
+        <th>cell</th><th>priced as</th>
+        <th class="num">in (fresh/cached)</th><th class="num">out</th>
+        <th class="num">cloud-eq</th><th class="num">power</th><th class="num">net</th>
+      </tr></thead>
+      <tbody id="sv-cells"></tbody>
+      <tfoot id="sv-total"></tfoot>
+    </table>
+    <div id="sv-payback"></div>
+    <div id="sv-notes"></div>
+  </section>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -219,7 +286,7 @@ let refreshTimer = 0;
 // boot() can run more than once (a mid-session token rotation: 401 →
 // gate → save → boot). Without these handles each rotation would leave
 // another live reader and another poller behind.
-let pollTimer = 0, streamAbort = null, retryDelay = 0;
+let pollTimer = 0, streamAbort = null, retryDelay = 0, savingsTimer = 0;
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => refresh().catch(() => {}), 300);
@@ -276,17 +343,298 @@ async function streamEvents(signal) {
 
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh().catch(() => {}); });
 
+// ── savings view ───────────────────────────────────────────────────────────
+// A second VIEW at the same single route, selected by the URL fragment.
+// A fragment never reaches the server, so r.URL.Path stays /ui/fleet and
+// the bearer middleware's exact-match exemption does not have to widen
+// to a prefix — which C5 §7 forbids in as many words.
+let savingsAt = 0, savingsWindow = "30d", savingsBusy = false;
+
+function usd(v) { return v == null ? "—" : (v < 0 ? "-$" : "$") + Math.abs(v).toFixed(2); }
+// Capital numbers are whole-dollar and grouped: "$3,100", not "$3100.00".
+function usd0(v) { return v == null ? "—" : "$" + Math.round(Math.abs(v)).toLocaleString(); }
+function mtok(n) { return (Number(n || 0) / 1e6).toFixed(2) + "M"; }
+// A percentage that rounds to zero but is not zero reads "<1%": "0% of
+// $3,100" would look like a bug in a screen whose whole job is to be
+// believable when the answer is small.
+function pct1(v) {
+  const n = Number(v) || 0;
+  if (n > 0 && n < 1) return "<1%";
+  if (n < 0 && n > -1) return ">-1%";
+  return n.toFixed(0) + "%";
+}
+function cellText(row, text, cls) {
+  const td = document.createElement("td");
+  td.textContent = text;
+  if (cls) td.className = cls;
+  row.appendChild(td);
+  return td;
+}
+
+async function loadSavings(force) {
+  // Lazily on first entry, at most once a minute after that, and
+  // deliberately NOT wired to the state refresh: every SSE line would
+  // otherwise recompute a ledger aggregate for a screen nobody is
+  // looking at.
+  if (savingsBusy) return;
+  if (!force && Date.now() - savingsAt < 60000) return;
+  savingsBusy = true;
+  try {
+    const r = await api("/api/fleet/savings?window=" + encodeURIComponent(savingsWindow));
+    const sv = await r.json();
+    savingsAt = Date.now();
+    renderSavings(sv);
+  } catch (e) {
+    savingsAt = 0;
+  } finally {
+    savingsBusy = false;
+  }
+}
+
+function renderSavings(sv) {
+  const head = $("sv-head");
+  head.innerHTML = "";
+  const sel = document.createElement("select");
+  for (const w of ["7d", "30d", "all"]) {
+    const o = document.createElement("option");
+    o.value = w; o.textContent = "window: " + w; o.selected = w === savingsWindow;
+    sel.appendChild(o);
+  }
+  sel.onchange = () => { savingsWindow = sel.value; loadSavings(true); };
+  head.appendChild(sel);
+  const asOf = document.createElement("span");
+  asOf.className = "chip";
+  asOf.textContent = "prices as of " + (sv.prices && sv.prices.as_of ? sv.prices.as_of : "unknown");
+  head.appendChild(asOf);
+  if (sv.prices && sv.prices.example_data) {
+    const c = document.createElement("span");
+    c.className = "chip chip-bad";
+    c.textContent = "EXAMPLE DATA — synthetic prices";
+    head.appendChild(c);
+  }
+  if (sv.prices && sv.prices.stale) {
+    const c = document.createElement("span");
+    c.className = "chip chip-warn";
+    c.textContent = "price table is stale";
+    head.appendChild(c);
+  }
+  $("sv-caveat-text").textContent = sv.caveat || "";
+
+  const empty = !!sv.empty;
+  $("sv-empty").hidden = !empty;
+  $("sv-table").hidden = empty;
+  $("sv-hero").hidden = empty;
+  $("sv-payback").hidden = empty;
+  if (empty) { $("sv-notes").innerHTML = ""; return; }
+
+  const t = sv.totals || {};
+  const hero = $("sv-hero");
+  hero.innerHTML = "";
+  const line = document.createElement("div");
+  line.className = "hero";
+  // Gross and net always render on the same line: never gross alone,
+  // never net alone.
+  line.appendChild(document.createTextNode(usd(t.gross) + " not spent"));
+  const sep1 = document.createElement("span");
+  sep1.className = "sep";
+  sep1.textContent = t.power == null ? " · power not counted · " : " − " + usd(t.power) + " power = ";
+  line.appendChild(sep1);
+  line.appendChild(document.createTextNode(usd(t.net) + " " + (t.net_label || "net")));
+  hero.appendChild(line);
+
+  const sub = document.createElement("div");
+  sub.className = "hero-sub";
+  const cloud = sv.cloud || {};
+  const cloudBit = document.createElement("span");
+  if (cloud.measured && cloud.cost != null) {
+    // Actual spend renders at the same size as the notional headline —
+    // it is the induced-demand control, not a footnote.
+    cloudBit.appendChild(document.createTextNode("actual cloud spend, same window: "));
+    const amount = document.createElement("b");
+    amount.textContent = usd(cloud.cost);
+    cloudBit.appendChild(amount);
+  } else {
+    cloudBit.textContent = "actual cloud spend: not measured (" + (cloud.reason || "no data") + ")";
+  }
+  sub.appendChild(cloudBit);
+  const bits = [];
+  if (t.cached_pct != null) bits.push(pct1(t.cached_pct) + " of your prompt tokens were cache reads");
+  bits.push(pct1(t.tokens_priced_pct) + " of tokens priced");
+  bits.push(t.cells_measured + " of " + t.cells_total + " cells measured");
+  if (sv.since_day) bits.push("since " + sv.since_day);
+  const rest = document.createElement("span");
+  rest.textContent = "  ·  " + bits.join("  ·  ");
+  sub.appendChild(rest);
+  hero.appendChild(sub);
+  if (sv.frontier) {
+    const f = document.createElement("div");
+    f.className = "hero-sub";
+    f.textContent = "if I'd used " + sv.frontier.model + " instead: " +
+      (sv.frontier.cost != null ? usd(sv.frontier.cost) : "unpriced — " + (sv.frontier.unpriced || "")) +
+      " — " + sv.frontier.rationale;
+    hero.appendChild(f);
+  }
+
+  const tb = $("sv-cells");
+  tb.innerHTML = "";
+  for (const c of sv.cells || []) {
+    const tr = document.createElement("tr");
+    cellText(tr, c.cell, "cellname");
+    if (!c.measured) {
+      // An unmeasured cell still shows its POWER: electricity is a cost,
+      // not a saving, and a box holding a warm model resident all day
+      // spends it whether or not anyone asked it for a token.
+      const td = cellText(tr, c.reason || "unmeasured", "dash");
+      td.colSpan = 4;
+      cellText(tr, c.power == null ? "—" : (c.power_declared ? "~" : "") + usd(c.power), c.power == null ? "num dash" : "num");
+      cellText(tr, usd(c.net), c.net == null ? "num dash" : "num");
+      tb.appendChild(tr);
+      continue;
+    }
+    const priced = (c.models || []).filter(m => m.priced).map(m => m.twin || m.model);
+    cellText(tr, priced.length ? priced[0] + (priced.length > 1 ? " +" + (priced.length - 1) : "") : "—", priced.length ? "" : "dash");
+    cellText(tr, mtok(c.in_fresh) + " / " + mtok(c.in_cached), "num");
+    cellText(tr, mtok(c.out), "num");
+    cellText(tr, usd(c.gross), "num");
+    cellText(tr, c.power == null ? "—" : (c.power_declared ? "~" : "") + usd(c.power), c.power == null ? "num dash" : "num");
+    cellText(tr, usd(c.net), "num");
+    tb.appendChild(tr);
+    for (const m of c.models || []) {
+      const mrow = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = 7;
+      td.className = "sv-model";
+      const code = document.createElement("code");
+      code.textContent = m.model + " (" + pct1(m.share_pct) + ")";
+      td.appendChild(document.createTextNode("↳ "));
+      td.appendChild(code);
+      const note = document.createElement("span");
+      if (m.priced) {
+        let s = "  median of " + m.hosts + " host" + (m.hosts === 1 ? "" : "s") +
+          ", $" + Number(m.rate_low).toFixed(2) + "–$" + Number(m.rate_high).toFixed(2) + " /MTok in" +
+          "  ·  " + usd(m.cost_low) + "–" + usd(m.cost_high);
+        if (m.no_cache_discount) s += "  ·  no cache discount published for this host";
+        if (m.multiplier != null && m.multiplier !== 1) s += "  ·  " + m.counterfactual + " ×" + m.multiplier;
+        note.textContent = s;
+      } else {
+        note.className = "unpriced";
+        note.textContent = "  unpriced — " + (m.unpriced || "no rate");
+      }
+      td.appendChild(note);
+      mrow.appendChild(td);
+      tb.appendChild(mrow);
+    }
+    // A MEASURED cell can still carry a reason — "nothing priced in this
+    // window" is why its money column is an em dash. Rendering it only in
+    // the unmeasured branch left the reader with a dash and no
+    // explanation, which is the same silence the em dash exists to break.
+    for (const note of [c.reason, c.partial]) {
+      if (!note) continue;
+      const prow = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = 7; td.className = "sv-model unpriced";
+      td.textContent = "↳ " + note;
+      prow.appendChild(td);
+      tb.appendChild(prow);
+    }
+  }
+  const tf = $("sv-total");
+  tf.innerHTML = "";
+  const tr = document.createElement("tr");
+  cellText(tr, "FLEET", "cellname");
+  cellText(tr, pct1(t.tokens_priced_pct) + " of tokens priced");
+  cellText(tr, mtok(t.in_fresh) + " / " + mtok(t.in_cached), "num");
+  cellText(tr, mtok(t.out), "num");
+  cellText(tr, usd(t.gross), "num");
+  cellText(tr, t.power == null ? "—" : usd(t.power), t.power == null ? "num dash" : "num");
+  cellText(tr, usd(t.net), "num");
+  tf.appendChild(tr);
+
+  const pb = $("sv-payback");
+  pb.innerHTML = "";
+  if ((sv.payback || []).length) {
+    const h = document.createElement("h2");
+    h.textContent = "payback (lifetime)";
+    pb.appendChild(h);
+    for (const p of sv.payback) {
+      const row = document.createElement("div");
+      row.className = "pb-row";
+      const name = document.createElement("span");
+      name.className = "pb-cell";
+      name.textContent = p.cell;
+      row.appendChild(name);
+      const bar = document.createElement("div");
+      bar.className = "bar";
+      const fill = document.createElement("div");
+      fill.className = "fill";
+      // Bar widths are set on the ELEMENT, never interpolated into a
+      // style="…" attribute — an attribute would need attr() escaping and
+      // is the exact shape C5's PAGE-1 test forbids.
+      fill.style.width = Math.max(0, Math.min(100, Number(p.recovered_pct) || 0)).toFixed(1) + "%";
+      bar.appendChild(fill);
+      row.appendChild(bar);
+      const label = document.createElement("span");
+      label.textContent = pct1(p.recovered_pct) + " of " + usd0(p.capital_cost) + "   ·   " + p.projection;
+      row.appendChild(label);
+      const note = document.createElement("div");
+      note.className = "pb-note";
+      note.textContent = p.capital_note + (p.break_even_day ? "  ·  broke even " + p.break_even_day : "");
+      row.appendChild(note);
+      pb.appendChild(row);
+    }
+  }
+
+  const notes = $("sv-notes");
+  notes.innerHTML = "";
+  for (const n of sv.notes || []) {
+    const d = document.createElement("div");
+    d.textContent = n;
+    notes.appendChild(d);
+  }
+  for (const src of (sv.prices && sv.prices.sources) || []) {
+    const d = document.createElement("div");
+    d.textContent = "priced from " + src.name + " (" + src.licence + ")" + (src.commit ? " @ " + src.commit.slice(0, 12) : "");
+    notes.appendChild(d);
+  }
+  if ((cloud.unpriced || []).length) {
+    const d = document.createElement("div");
+    d.textContent = "cloud models with no rate in the table: " + cloud.unpriced.join(", ");
+    notes.appendChild(d);
+  }
+}
+
+function showView() {
+  const savings = location.hash === "#savings";
+  $("view-fleet").hidden = savings;
+  $("view-savings").hidden = !savings;
+  $("nav-fleet").className = savings ? "" : "on";
+  $("nav-savings").className = savings ? "on" : "";
+  // The live table keeps rendering while hidden, so switching back never
+  // stalls on a fresh fetch.
+  if (savings) loadSavings(false);
+}
+window.addEventListener("hashchange", showView);
+
 async function boot() {
   $("fleetd-addr").textContent = location.host;
   if (streamAbort) streamAbort.abort();
   clearInterval(pollTimer);
+  clearInterval(savingsTimer);
   streamAbort = new AbortController();
   retryDelay = 0;
   const signal = streamAbort.signal;
+  // Pick the view BEFORE the first await: a deep link to #savings must
+  // land on the savings view even when that first state fetch fails, or
+  // one unreachable cell sends the reader to the wrong screen.
+  showView();
+  pollTimer = setInterval(() => refresh().catch(() => {}), 30000);
+  savingsTimer = setInterval(() => { if (location.hash === "#savings") loadSavings(true); }, 60000);
   await refresh();
   streamEvents(signal);
-  pollTimer = setInterval(() => refresh().catch(() => {}), 30000);
 }
+// A bare tab with no token still lands on the right view; boot() (and
+// with it the data) waits for the token.
+showView();
 if (token) boot().catch(() => {});
 </script>
 </body>

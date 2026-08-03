@@ -499,6 +499,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			LeasePath:    paths.LeasesFile(),
 			UsagePath:    paths.UsageLedgerFile(),
 			Timezone:     d.cfg.FleetLocation(),
+			// C7b: pricing, declared wattage and capital numbers live in
+			// hosts.yaml beside the cells they describe. Membership still
+			// comes from fleetCells above — this is the same file, not a
+			// second cell list.
+			Hosts: hosts,
 		}
 		d.hosts = hosts
 	}
@@ -531,6 +536,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		// C4: warm policy loops ride the same presence/inflight substrate.
 		d.startWarmLoops(d.cfg, d.hosts)
+		// C7b: actual cloud spend, tailed off the front's own activity log.
+		d.startCloudSpendLoop(d.hosts)
 	}
 
 	// C3: this box announces to fleetd when it has a cell identity and a
