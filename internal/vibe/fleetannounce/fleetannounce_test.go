@@ -588,3 +588,61 @@ func TestSetLocalIntentConcurrent(t *testing.T) {
 		t.Errorf("leftover temp files: %v", entries)
 	}
 }
+
+// TestWithdrawConcurrentWithRun pins the mutex behind seq/authRejected:
+// a shutdown path can call Withdraw while the loop is still in flight,
+// and under -race the unsynchronised version fails here. Seqs must also
+// stay UNIQUE — fleetd retires a piggybacked command batch only on a
+// higher seq, so two announces sharing a number redeliver forever.
+func TestWithdrawConcurrentWithRun(t *testing.T) {
+	swap := newFakeLlamaSwap(t, `{"running":[]}`)
+	var mu sync.Mutex
+	seen := map[uint64]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req fleetapi.AnnounceRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		seen[req.Seq]++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"interval_s":1}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c, err := New(Config{
+		Cell:         "laptop",
+		RegistryURL:  srv.URL,
+		LlamaSwapURL: swap.srv.URL,
+		Interval:     time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			wctx, wcancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer wcancel()
+			_ = c.Withdraw(wctx)
+		}()
+	}
+	wg.Wait()
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned %v, want nil on cancel", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for seq, n := range seen {
+		if n > 1 {
+			t.Errorf("seq %d was handed out %d times", seq, n)
+		}
+	}
+}

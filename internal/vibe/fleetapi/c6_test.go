@@ -7,6 +7,7 @@ package fleetapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -558,6 +559,23 @@ func TestWriteAtomic_ModeIsReadable(t *testing.T) {
 	if st.Mode().Perm() != 0o664 {
 		t.Errorf("mode = %v, want the operator's 0664 preserved", st.Mode().Perm())
 	}
+
+	// The upgrade case: every fleetd deployed before this fix left a 0600
+	// file behind. Inheriting that mode would keep the bug alive on
+	// exactly the boxes that have it, so the read bits come back.
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAtomic(path, []byte("a: 3\n")); err != nil {
+		t.Fatal(err)
+	}
+	st, err = os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o644 {
+		t.Errorf("mode = %v, want 0644 (a pre-fix 0600 config must be repaired, not inherited)", st.Mode().Perm())
+	}
 }
 
 // TestLeaseIngestValidated pins MIN-J: the lease endpoint sanitises what
@@ -585,5 +603,46 @@ func TestLeaseIngestValidated(t *testing.T) {
 	}
 	if code := post(`{"cell":"laptop","model":"qwen","holder":"batch","note":"mid-batch","ttl":"2h"}`); code != http.StatusOK {
 		t.Errorf("clean lease rejected: HTTP %d", code)
+	}
+}
+
+// TestLeaseCapGatesGrowthOnly: the cap must never refuse the DELETE that
+// drains an over-cap store — its own message tells the caller to delete.
+func TestLeaseCapGatesGrowthOnly(t *testing.T) {
+	s, ts, _ := newFleetdServer(t, c6Cells())
+	over := map[string]Lease{}
+	for i := range maxLeases + 5 {
+		l := Lease{Cell: "laptop", Model: fmt.Sprintf("m%d", i), Holder: "batch",
+			ExpiresAt: time.Now().UTC().Add(time.Hour)}
+		over[leaseKey(l.Cell, l.Model, l.Holder)] = l
+	}
+	s.mu.Lock()
+	s.leases = over
+	s.mu.Unlock()
+
+	do := func(method, body string) int {
+		req, err := http.NewRequest(method, ts.URL+"/api/fleet/lease", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := do(http.MethodDelete, `{"cell":"laptop","model":"m0","holder":"batch"}`); code != http.StatusOK {
+		t.Errorf("DELETE against a full store: HTTP %d, want 200 (delete is the way out)", code)
+	}
+	if code := do(http.MethodPost, `{"cell":"laptop","model":"new","holder":"batch","ttl":"1h"}`); code != http.StatusConflict {
+		t.Errorf("POST against a full store: HTTP %d, want 409", code)
+	}
+	s.mu.Lock()
+	n := len(s.leases)
+	s.mu.Unlock()
+	if n != maxLeases+4 {
+		t.Errorf("store size = %d, want %d (the delete landed, the add did not)", n, maxLeases+4)
 	}
 }

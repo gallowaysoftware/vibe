@@ -459,3 +459,70 @@ func TestLocalCellKey(t *testing.T) {
 		})
 	}
 }
+
+// TestWithdrawAnnounceStopsLoopFirst pins the shutdown ORDER: the
+// goodbye is the last thing fleetd hears. Cancelling the loop and
+// withdrawing concurrently let an in-flight heartbeat land after the
+// withdraw and resurrect the cell — and on the shutdown-RPC path (ctx
+// still alive) the loop never stopped at all.
+func TestWithdrawAnnounceStopsLoopFirst(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	var mu sync.Mutex
+	var states []string
+	reg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req fleetapi.AnnounceRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		state := "serving"
+		if req.Intent != nil {
+			state = req.Intent.State
+		}
+		mu.Lock()
+		states = append(states, state)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"interval_s":1}`))
+	}))
+	t.Cleanup(reg.Close)
+
+	d := drainDaemon(t, Config{Fleet: FleetConfig{Cell: "gpu-cell", RegistryURL: reg.URL}})
+	// A context that stays ALIVE, like the shutdown-RPC path: only the
+	// loop's own cancel may stop it.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := d.startAnnounce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(states)
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the announce loop never announced")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	d.withdrawAnnounce()
+
+	mu.Lock()
+	got := append([]string(nil), states...)
+	mu.Unlock()
+	if len(got) == 0 || got[len(got)-1] != "withdrawing" {
+		t.Fatalf("announce states = %v, want the withdraw last", got)
+	}
+
+	// The loop is stopped, so nothing can undo the goodbye.
+	time.Sleep(1500 * time.Millisecond)
+	mu.Lock()
+	after := append([]string(nil), states...)
+	mu.Unlock()
+	if len(after) != len(got) {
+		t.Errorf("announces continued after the withdraw: %v", after)
+	}
+}

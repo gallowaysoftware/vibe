@@ -151,3 +151,65 @@ func TestLoad_EmptyOrCommentOnlyIsNotAnError(t *testing.T) {
 		}
 	}
 }
+
+// TestLoad_ToleratesHostInventory pins C6/MIN-R: fleet.md §4.1's
+// top-level `hosts:` inventory shares this filename, and KnownFields
+// (which must STAY on) would otherwise abort fleetd's startup on a file
+// that is perfectly valid for the other reader.
+func TestLoad_ToleratesHostInventory(t *testing.T) {
+	p := writeHosts(t, `
+hosts:
+  localmodel:
+    local: true
+    gpu: {kind: cuda, vram_gb: 32}
+  spark-1:
+    addr: 10.0.40.11
+    ssh: {user: kyle, key: ~/.ssh/id_ed25519_fleet}
+cells:
+  front: { url: "http://front.lan:9000", class: always_on }
+`)
+	f, err := LoadFrom(p)
+	if err != nil {
+		t.Fatalf("a hosts.yaml carrying both schemas must load: %v", err)
+	}
+	if !f.HasCells() {
+		t.Error("cells section lost")
+	}
+	// Still strict about the keys it DOES own (a mistyped cell field).
+	if _, err := LoadFrom(writeHosts(t, `
+cells:
+  front: { url: "http://front.lan:9000", host_prob: "front.lan:22", class: always_on }
+`)); err == nil {
+		t.Error("a typo'd cell key must still fail: KnownFields(true) is what keeps display semantics honest")
+	}
+}
+
+// TestLoad_ModelClassVocabulary pins C6/MIN-Q's config half: warm_model's
+// guard keys on the class string, so a typo'd class would silently stop
+// gating an embed id.
+func TestLoad_ModelClassVocabulary(t *testing.T) {
+	for _, class := range ModelClasses {
+		p := writeHosts(t, `
+cells:
+  front: { url: "http://front.lan:9000", class: always_on }
+model_classes:
+  some-model: `+class+`
+`)
+		if _, err := LoadFrom(p); err != nil {
+			t.Errorf("class %q must be accepted: %v", class, err)
+		}
+	}
+	p := writeHosts(t, `
+cells:
+  front: { url: "http://front.lan:9000", class: always_on }
+model_classes:
+  bge-embed: embeddings
+`)
+	_, err := LoadFrom(p)
+	if err == nil || !strings.Contains(err.Error(), "embeddings") {
+		t.Errorf("typo'd class: got %v, want a validation error naming it", err)
+	}
+	if KnownModelClass("embeddings") {
+		t.Error("KnownModelClass accepted a value outside the vocabulary")
+	}
+}

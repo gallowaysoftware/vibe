@@ -536,8 +536,15 @@ func (s *Server) toolUnloadModel(ctx context.Context, cell, model string) (strin
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode >= 500 {
 		return s.queueUnload(cell, model, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
+	}
+	if resp.StatusCode != http.StatusOK {
+		// A 4xx is the admin API ANSWERING (no such model, bad request).
+		// Queueing it would tell the agent "done on its next heartbeat"
+		// about a verb the cell will refuse identically — the piggyback
+		// fallback is for delivery failures, not for definitive answers.
+		return "", fmt.Errorf("unload %s on %s: HTTP %d: %s", model, cell, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return fmt.Sprintf("Unloaded %s on %s. The next request naming it JIT-loads again.", model, cell), nil
 }

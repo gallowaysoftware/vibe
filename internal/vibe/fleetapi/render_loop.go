@@ -386,10 +386,13 @@ func (rl *renderLoop) classOf(cell string) fleetcfg.Class {
 func writeAtomic(path string, data []byte) error {
 	// The front config exists to be READ by another process (llama-swap,
 	// often another user), so CreateTemp's 0600 is wrong here. An
-	// existing file's mode wins — an operator who widened it meant it.
+	// existing file's mode wins — an operator who widened it meant it —
+	// but read bits are forced back on: every fleetd deployed before this
+	// fix left a 0600 file behind, and inheriting THAT mode would keep
+	// the bug alive forever on exactly the boxes that have it.
 	mode := os.FileMode(0o644)
 	if st, err := os.Stat(path); err == nil {
-		mode = st.Mode().Perm()
+		mode = st.Mode().Perm() | 0o044
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".render-*.tmp")
 	if err != nil {

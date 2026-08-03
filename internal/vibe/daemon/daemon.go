@@ -251,7 +251,12 @@ type Daemon struct {
 	// announce is the cell's C3 announce loop, started in Run when
 	// fleet.cell + fleet.registry_url are set. CellDrain/CellResume stamp
 	// local intent through it (the conflict rule's cell side).
-	announce *fleetannounce.Client
+	// announceCancel/announceDone let shutdown stop the loop BEFORE the
+	// withdrawing goodbye; all three are written once in startAnnounce,
+	// before the listeners serve.
+	announce       *fleetannounce.Client
+	announceCancel context.CancelFunc
+	announceDone   <-chan struct{}
 	// cellCmdRunner executes cell verbs; tests swap it to script
 	// drain/resume outcomes without touching real units (same injection
 	// pattern as nvidiaSMI). Defaults to runCellCmd in New.
@@ -516,13 +521,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// stale_after, which is the whole reason the withdrawing state
 	// exists. Best-effort — an unreachable fleetd must not delay
 	// shutdown past the announce timeout.
-	if d.announce != nil {
-		wctx, wcancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := d.announce.Withdraw(wctx); err != nil {
-			slog.Info("withdraw announce failed; fleetd will prune on staleness", "err", err)
-		}
-		wcancel()
-	}
+	d.withdrawAnnounce()
 	// Tear down the active frontend (if any) first; otherwise a
 	// docker-compose stack outlives the daemon and keeps serving stale
 	// requests at the (now-dead) proxy.

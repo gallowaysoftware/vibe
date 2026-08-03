@@ -155,8 +155,10 @@ func (s *Server) handleLeaseMutate(w http.ResponseWriter, r *http.Request) {
 	}
 	// The cap applies AFTER the prune, so expired entries never count
 	// against a live holder. A store this size is a runaway producer, not
-	// a fleet.
-	if len(next) > maxLeases {
+	// a fleet. It gates GROWTH only: refusing a DELETE because the store
+	// is full contradicts its own message and leaves an over-cap file
+	// (a downgrade, a hand edit) with no way back down.
+	if r.Method == http.MethodPost && len(next) > maxLeases {
 		http.Error(w, fmt.Sprintf("lease store is full (%d active); expire or delete some first", maxLeases), http.StatusConflict)
 		return
 	}

@@ -273,7 +273,19 @@ optional.)
   - **`Client.Withdraw`** is the `withdrawing` producer (daemon
     shutdown + `vibe fleet announce`). It does NOT persist: a
     `withdrawing` echo read back at next boot would lie or erase a live
-    drain.
+    drain. **Stop the loop before withdrawing** — the daemon holds the
+    loop's own cancel + done channel (`Daemon.withdrawAnnounce`) because
+    the shutdown-RPC path never cancels `ctx`, and a heartbeat still in
+    flight lands after the goodbye and resurrects the cell. `seq` is
+    mutex-owned for the same reason.
+  - **The piggyback fallback is for DELIVERY failures.** `unload_model`
+    queues on a transport error or a 5xx; a 4xx is llama-swap answering
+    and stays an error — telling an agent a refused verb is "queued for
+    the next announce" is worse than failing.
+  - **`writeAtomic` forces the front config's read bits back on**
+    (`perm | 0o044`): every fleetd deployed before C6 left a 0600 file,
+    and inheriting that mode would keep the bug alive on exactly the
+    boxes that have it. Operator widening still survives.
   - `vibe cell await` fails fast on an unknown cell (`errUnknownCell`)
     and keeps retrying transport errors; `--timeout 0` stays the
     overnight-batch idiom.

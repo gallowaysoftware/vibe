@@ -80,8 +80,14 @@ type CellCmds struct {
 // resets on cell reboot; fleetd's staleness derives from received_at,
 // never from seq or the cell's clock).
 type Client struct {
-	cfg    Config
-	http   *http.Client
+	cfg  Config
+	http *http.Client
+	// seq and authRejected are touched by Run's loop AND by Withdraw,
+	// which a shutdown path can call while the loop is still in flight —
+	// so they are mutex-owned rather than loop-owned. seq under seqMu
+	// (never taken with mu held) so a goodbye can't hand fleetd the same
+	// seq as the heartbeat it races.
+	seqMu  sync.Mutex
 	seq    uint64
 	rng    *rand.Rand
 	logger *slog.Logger
@@ -96,9 +102,10 @@ type Client struct {
 	mu          sync.Mutex
 	localIntent fleetapi.AnnounceIntent
 	// registryFailureLogged gates log-once-then-quiet on registry
-	// outages; reset on the next successful announce. authRejected
-	// marks when the failure was auth (401), not reachability — the
-	// once-log says which.
+	// outages; reset on the next successful announce (loop-owned).
+	// authRejected marks when the failure was auth (401), not
+	// reachability — the once-log says which; it is written by post, so
+	// it belongs to mu like everything else Withdraw can touch.
 	registryFailureLogged bool
 	authRejected          bool
 	// deflessWarned gates log-once for catalog models with no def.
@@ -169,6 +176,18 @@ func (c *Client) SetLocalIntent(state string) error {
 	return c.saveLocalIntent(in)
 }
 
+func (c *Client) setAuthRejected(v bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.authRejected = v
+}
+
+func (c *Client) authWasRejected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.authRejected
+}
+
 // LocalIntent returns the cell's current intent (echo side).
 func (c *Client) LocalIntent() fleetapi.AnnounceIntent {
 	c.mu.Lock()
@@ -227,7 +246,7 @@ func (c *Client) Run(ctx context.Context) error {
 		err := c.announceOnce(ctx)
 		if err != nil {
 			if !c.registryFailureLogged {
-				if c.authRejected {
+				if c.authWasRejected() {
 					c.logger.Warn("announce failed (auth rejected — check the token file); quiet retry with backoff", "err", err)
 				} else {
 					c.logger.Warn("announce failed (registry unreachable?); quiet retry with backoff", "err", err)
@@ -247,7 +266,7 @@ func (c *Client) Run(ctx context.Context) error {
 			}
 			continue
 		}
-		c.authRejected = false
+		c.setAuthRejected(false)
 		if c.registryFailureLogged {
 			c.logger.Info("announce succeeded; registry reachable again")
 			c.registryFailureLogged = false
@@ -277,10 +296,9 @@ func (c *Client) announceOnce(ctx context.Context) error {
 	req := fleetapi.AnnounceRequest{
 		V:      fleetapi.AnnounceVersion,
 		Cell:   c.cfg.Cell,
-		Seq:    c.seq,
+		Seq:    c.nextSeq(),
 		Intent: c.intentEcho(),
 	}
-	c.seq++
 	models, err := c.gatherModels(ctx)
 	if err != nil {
 		// A llama-swap that's down answers nothing: the cell still
@@ -317,16 +335,30 @@ func (c *Client) announceOnce(ctx context.Context) error {
 // response: the echo file is the cell's durable drained-vs-serving
 // record, and a "withdrawing" entry read back at next boot would either
 // lie (the box is here) or erase a drain the operator still means.
+//
+// Callers must stop Run first (the daemon cancels the loop and waits):
+// a heartbeat still in flight lands AFTER the goodbye and resurrects the
+// cell. The locking here only makes the overlap safe, not correct.
 func (c *Client) Withdraw(ctx context.Context) error {
 	req := fleetapi.AnnounceRequest{
 		V:      fleetapi.AnnounceVersion,
 		Cell:   c.cfg.Cell,
-		Seq:    c.seq,
+		Seq:    c.nextSeq(),
 		Intent: &fleetapi.AnnounceIntent{State: "withdrawing", Since: time.Now().UTC()},
 	}
-	c.seq++
 	_, err := c.post(ctx, req)
 	return err
+}
+
+// nextSeq hands out this heartbeat's seq. Monotonic per boot: fleetd
+// retires a piggybacked command batch only on a HIGHER seq, so two
+// announces sharing one number would redeliver it forever.
+func (c *Client) nextSeq() uint64 {
+	c.seqMu.Lock()
+	defer c.seqMu.Unlock()
+	seq := c.seq
+	c.seq++
+	return seq
 }
 
 // post sends one announce and decodes the response.
@@ -350,7 +382,7 @@ func (c *Client) post(ctx context.Context, req fleetapi.AnnounceRequest) (*fleet
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized {
-		c.authRejected = true
+		c.setAuthRejected(true)
 		return nil, fmt.Errorf("announce: HTTP 401 (auth rejected — check the token file: %s)", c.tokenProblem())
 	}
 	if resp.StatusCode != http.StatusOK {

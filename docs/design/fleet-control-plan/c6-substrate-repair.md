@@ -1,11 +1,12 @@
 # C6 — Substrate repair: the C1–C3 findings against merged code
 
-Status: EXECUTED (2026-08-03) on `fix/c6-substrate-repair`, branched off
-`main` at `322712f` per this doc's own rule. Depends on
+Status: EXECUTED + REVIEWED (2026-08-03) on `fix/c6-substrate-repair`,
+branched off `main` at `322712f` per this doc's own rule. Depends on
 [C5](c5-land-c4.md) only for merge order — none of this blocks landing
 PR #22. Every finding is implemented except NIT-D, which does not exist
 in merged code; gates 1 and 2 are live and NOT run. See the execution
-addendum at the end.
+addendum and the adversarial-review addendum at the end (8 further
+findings, all fixed with mutation-verified tests).
 
 Everything here is in **merged** code (`main` at `322712f`, PRs
 #19–#21). It was found by the same verification pass that produced C5,
@@ -516,5 +517,89 @@ weakened):
    real cell is folded into gate 2's live session.
 6. Full inner loop — PASS, including `buf generate` for
    `CellDrainResponse.wait_status`.
-7. Adversarial self-review — pending (ground rule 9): it is its own
-   funded step and has not been run on this branch.
+7. Adversarial self-review — PASS, landed as its own `review:` commit;
+   see the addendum below.
+
+## Adversarial-review addendum (2026-08-03, 8 findings, all fixed with
+regression tests)
+
+Every fix below is mutation-verified: the production change was reverted
+and the named test was watched to FAIL, then restored.
+
+- **Withdraw raced the live announce loop, and its goodbye was
+  undone (MAJOR)** — `daemon.go`'s shutdown called
+  `announce.Withdraw` while `ann.Run(ctx)` was still in flight.
+  `Client.seq` and `authRejected` were loop-owned and unsynchronised, so
+  the two paths were a **data race** (`-race` reproduces it); worse, on
+  the `shutdown rpc` path `ctx` is never cancelled, so the loop kept
+  heartbeating after the withdraw — observed as
+  `[serving withdrawing serving]` — and leaked past `Run`'s return. The
+  loop now owns a cancel + done channel; `Daemon.withdrawAnnounce`
+  stops it (bounded 3s) and only then says goodbye, and seq/authRejected
+  moved under mutexes so the exported API is safe either way.
+  `TestWithdrawAnnounceStopsLoopFirst`, `TestWithdrawConcurrentWithRun`.
+- **The announce loop never started without a backends dir (MAJOR,
+  pre-existing C3)** — `startAnnounce` guarded with `os.IsNotExist`,
+  which does NOT unwrap, while `router.LoadDefs` wraps its `ReadDir`
+  error. A cell with no `~/.config/vibe/backends` (defless catalog, defs
+  not yet converged) logged "announce loop not started" and stayed
+  invisible to fleetd — the exact cell C3 exists for. Now `errors.Is`.
+  Found by writing the withdraw test against a clean XDG dir.
+- **MIN-A was a no-op on every box that had the bug (MAJOR)** —
+  `writeAtomic` preserved an existing file's mode, and every fleetd
+  deployed before C6 left a **0600** front config behind, so the fix
+  inherited 0600 forever on exactly the machines it was written for.
+  Mode is now `perm | 0o044`: an operator's widening survives, a pre-fix
+  0600 is repaired. `TestWriteAtomic_ModeIsReadable` grew the upgrade
+  case.
+- **The lease cap refused the DELETE that drains it (MINOR)** — the
+  `len(next) > maxLeases` check ran for both verbs, so an over-cap store
+  (a downgrade, a hand edit, a pre-cap file) answered
+  `409 ... expire or delete some first` to the delete that was the way
+  out. The cap now gates growth only. `TestLeaseCapGatesGrowthOnly`.
+- **A definitive 4xx was queued as a piggyback (MINOR)** — MIN-G's
+  fallback fired on any non-200, so llama-swap answering "no such model"
+  told the agent the unload was "queued for its next announce" about a
+  verb the cell will refuse identically. Transport errors and 5xx still
+  fall back (that is the delivery failure the queue is for); 4xx is now
+  the error it is. `TestMCPUnloadDefiniteAnswerIsNotQueued` plus its
+  mirror `TestMCPUnloadUnreachableCellQueues`, which is also the first
+  end-to-end test of the queue → announce-response path.
+- **MIN-Q's actual fix had no test (test truth)** — reverting
+  `class != ModelClassChat` left the whole suite green: the existing
+  warm test uses an *unpinned* id. `TestMCPWarmModelChatClassIsAllowed`
+  covers both halves (chat warms, embed still refuses loudly).
+- **MIN-Q's config half and MIN-R had no tests at all (test truth)** —
+  nothing exercised the class vocabulary or the inert `hosts:` key, so
+  deleting either from `fleetcfg` kept the suite green.
+  `TestLoad_ModelClassVocabulary`, `TestLoad_ToleratesHostInventory`
+  (which also pins that `KnownFields(true)` stays strict about the keys
+  it owns).
+- **MIN-P/NIT-E had no tests (test truth)** — the two token orders are
+  *deliberately opposite*, which is exactly the pair a later refactor
+  unifies by accident. `TestResolveCellClientTokenPrecedence` (CLI:
+  `$VIBE_TOKEN` wins, unreadable file is a named error) and
+  `TestCellClientTokenPrecedence` (fleetd: the per-cell file wins).
+
+**Verified, not changed.** `TestRenderLoop_SteadyStateFingerprintDriftEnforced`
+really does fail when `modelFingerprintChanged` is short-circuited (gate
+3 re-confirmed here, since gate 4 is the only one the doc proved that
+way); M5, M6 and MIN-C likewise fail under mutation. `decorate` copies
+presence under the lock and `recordAnnounce` no longer dereferences the
+live `*Presence` after unlocking (the C4-class bug is absent).
+`modelFingerprintChanged`'s deliberate blind spot — an id the cell was
+NOT already announcing — is covered by C4's `modelSetChanged` on merge,
+so it was left as the doc specifies.
+
+**Judgement call, recorded not fixed.** A daemon *restart* on a roaming
+cell now sends a withdraw, which prunes its defs from the front render
+until `MinHealthyStreak` fresh announces (~45s). That is the documented
+prune-fast/re-add-slow policy meeting MIN-F's shutdown hook; a restart
+is indistinguishable from an undock from inside the process. Worth
+knowing before someone debugs a 45s catalog gap after `systemctl restart
+vibe` on the laptop.
+
+**Gates after the review pass.** Full inner loop re-run: `go build`,
+`go vet`, `gofmt -l` (silent), `go mod tidy` (clean), `golangci-lint run`
+(0 issues), `go test -race -count=5 ./...` — all green. Gates 1 and 2
+remain live and NOT run.
