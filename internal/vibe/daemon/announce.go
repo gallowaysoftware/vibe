@@ -20,6 +20,7 @@ import (
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 	"github.com/gallowaysoftware/vibe/internal/vibe/router"
+	"github.com/gallowaysoftware/vibe/internal/vibe/usagemeter"
 )
 
 // The C3 announce wiring: a cell daemon announces to fleetd from Run
@@ -45,11 +46,13 @@ func (d *Daemon) startAnnounce(ctx context.Context) error {
 		}
 	}
 
+	llamaSwapURL := "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(d.cfg.ProxyPort))
+
 	ann, err := fleetannounce.New(fleetannounce.Config{
 		Cell:              d.cfg.Fleet.Cell,
 		RegistryURL:       d.cfg.Fleet.RegistryURL,
 		TokenFile:         d.cfg.Fleet.TokenFile,
-		LlamaSwapURL:      "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(d.cfg.ProxyPort)),
+		LlamaSwapURL:      llamaSwapURL,
 		Defs:              cellDefs,
 		LlamaServerBinary: d.cfg.LlamaBinary,
 		IntentPath:        paths.CellIntentFile(),
@@ -59,6 +62,7 @@ func (d *Daemon) startAnnounce(ctx context.Context) error {
 		},
 		Versions: d.fleetVersions,
 		Capacity: d.fleetCapacity,
+		Usage:    usagemeter.Snapshotter(llamaSwapURL, paths.CellUsageFile()),
 	})
 	if err != nil {
 		return err

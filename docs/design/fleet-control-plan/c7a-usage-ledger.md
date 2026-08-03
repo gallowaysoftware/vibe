@@ -1,7 +1,10 @@
 # C7a — The usage ledger: counting tokens per cell, per model, per day
 
-Status: PLANNED (2026-08-02). Depends on C4 (announce + presence). No
-dependency on C5/C6 beyond merge order.
+Status: EXECUTED (2026-08-03) on `feat/c7a-usage-ledger`, branched off
+the C4/C5 line. Every mechanically verifiable gate is green; the seven
+live gates need real cells and are listed unrun in
+[§Execution](#execution-2026-08-03). Depends on C4 (announce +
+presence). No dependency on C5/C6 beyond merge order.
 
 C7a produces a durable, per-(cell, model, day) token ledger with **zero
 price knowledge and zero UI**. [C7b](c7b-savings-screen.md) turns it
@@ -36,9 +39,9 @@ llama-swap swaps a model out mid-burst.
 
 - **Not `internal/vibe/proxy`.** Ground rule 1 was relaxed to permit
   instrumenting it. That permission is deliberately **left unspent**:
-  `AGENTS.md:620-626` records that `:9000 is llama-swap, not vibe` and
-  cells run `disable_proxy: true`, so vibe's proxy is not in the fleet
-  request path. A flawless tee would measure ~0% of fleet tokens. The
+  AGENTS.md's "Router / model lifecycle" section records that `:9000 is
+  llama-swap, not vibe` and cells run `disable_proxy: true`, so vibe's
+  proxy is not in the fleet request path. A flawless tee would measure ~0% of fleet tokens. The
   strongest form of the surviving invariant is a gate:
   `git diff --stat internal/vibe/proxy/` is **empty** for this phase.
 - **Not llama-server `/metrics`.** Its `server_metrics` struct has no
@@ -221,7 +224,7 @@ price table updates.
 
 **Day bucketing uses an explicit `*time.Location`** from a new
 fleet-level `timezone` config field, following the precedent
-`cronSpec.nextFire` already sets (`warmsched.go:118-131`):
+`cronSpec.nextFire` already sets (`warmsched.go:144-157`):
 `y, m, d := ts.In(loc).Date()`. **Never `Truncate(24*time.Hour)`** — it
 truncates against absolute time since the epoch and always lands on UTC
 midnight regardless of the Location the value carries, silently. fleetd
@@ -301,3 +304,111 @@ per-harness attribution.
 
 Estimated ~710 lines + tests. Note the plan's own calibration: C0–C4 ran
 3.6–4.5× their line estimates.
+
+## Execution (2026-08-03)
+
+Branched off `feat/c4-fleet-comfort` (C4 + C5 landed).
+
+### What shipped
+
+| piece | where |
+|---|---|
+| cell-side collector | `internal/vibe/usagemeter/usagemeter.go` (new package) |
+| announce wire field | `fleetapi/announce.go` — `AnnounceRequest.Usage *AnnounceUsage` |
+| cell-side hook | `fleetannounce.Config.Usage func(context.Context) *AnnounceUsage`, wired from `daemon/announce.go` and `vibe fleet announce` via `usagemeter.Snapshotter` |
+| fleetd ledger | `fleetapi/usage.go` — fold, day bucketing, JSONL flush/compact |
+| config | `fleet.timezone` (`daemon.FleetConfig`), `Config.FleetLocation()` |
+| paths | `paths.CellUsageFile()`, `paths.UsageLedgerFile()` |
+| exposure | `GET /api/fleet/usage?since=YYYY-MM-DD` + MCP `fleet_usage` |
+
+Two deliberate deviations from the doc, both narrower than what the
+text implied:
+
+- **Basis is a three-value vocabulary, not two.** `chat` (llama.cpp
+  `timings`), `embed` (OpenAI `usage` on embeddings/rerank), and
+  `other` for the remaining model-dispatched endpoints llama-swap
+  meters (audio, images, `/props`, `count_tokens`). `other` uses the
+  embed arithmetic — whatever prompt figure arrives is taken as
+  complete. The doc's third table row ("any mlx row") needs **no branch
+  at all**: mlx answers chat paths from `usage`, so `input_tokens` is
+  already the full prompt AND no cache figure is reported, so
+  `max(cache, 0)` is 0 and `fresh + cached` degenerates to exactly the
+  right answer. Branching on backend kind would have been both wrong
+  and unnecessary.
+- **`resident_s` and `lost_rows` are their own basis values**
+  (`resident`, `cell`) rather than columns on a token row. §6's example
+  line shows `resident_s` beside the token counts, but residency is
+  fleetd-observed and basis-independent, and loss is a property of the
+  cell's READ, not of any model. Separate basis values keep the
+  `(day, cell, model, basis, epoch)` keyspace and the replay rule
+  uniform while making it impossible for either number to land in a
+  token sum.
+
+Two things the doc did not spell out and the code had to decide:
+
+- **The cursor is keyed WITHOUT the day.** `last_total` lives on the
+  bucket line as §6 requires, but the in-memory cursor is
+  `(cell, model, basis, epoch)`. Keyed by day, the first fold after
+  local midnight would read `last_total` as zero and bill the cell's
+  entire lifetime again — a silent 100× on the first bar of every day.
+  Test: `TestUsageFold_DayRolloverBillsTheDeltaNotTheLifetime`.
+- **The id-reset check runs BEFORE the walk-back, not after.** Resetting
+  the cursor after reading rows would leave the shortfall arithmetic
+  comparing rows-read (measured against the old cursor) with a span
+  measured from the new one, reporting a phantom `lost_rows` of every id
+  on the box.
+
+`fleet.timezone` also now feeds C4's warm schedule (`StartScheduleLoop`
+previously got `nil` → process zone). C4 §2's rule is that a schedule's
+zone is declared; before this phase there was nothing to declare it
+with. Unset keeps the old behavior exactly.
+
+### Doc drift found (ground rule 8)
+
+- `AGENTS.md:620-626` → the `:9000 is llama-swap, not vibe` bullet is at
+  **AGENTS.md:666** (the "Router / model lifecycle" section). C5's doc
+  pass shifted it. Fixed above.
+- `warmsched.go:118-131` → `cronSpec.nextFire` is at
+  **warmsched.go:136-157** (comment 136-143, func 144-157). Fixed above.
+- `router/render.go:33-41` → `Options.ExtrasPath` is at **32-41**
+  (comment 32-40, field 41). Close enough to leave.
+- `llama-swap@v239 internal/store/store.go:22-45` and the routes at
+  `internal/server/server.go:261-270` → verified against a checkout at
+  `1f3c68e`: `TokenMetrics` at store.go:22-31, `ActivityLogEntry` at
+  33-46, `ActivityPage` at 82-88; routes at **server.go:303-304**. All
+  the field names and semantics the doc asserts are correct, including
+  the two that matter most: `buildMetrics` overwrites `inputTokens` with
+  `timings.prompt_n` when `timings` exists (store.go's parser, metrics.go
+  442-457), and `cachedTokens`/`draftTokens`/`draftAccTokens` all default
+  to **-1**. Confirmed too: `PruneActivity` runs only when
+  `store.IsInMemory()` (metrics.go:76-80), so §0's `store: {path:}` does
+  retire the 1000-row ring; and `shared.FetchContext` calls
+  `cfg.RealModelName` and falls back to the client's string when it
+  misses (shared/http.go:117-127) — which is exactly why collection is
+  cell-side.
+
+### Gates
+
+| gate | result |
+|---|---|
+| 1. Store gate (24 h soak) | **NOT RUN** — live, needs real cells |
+| 2. No-double-count | unit half **PASS** (`TestUsageFold_FrontCellIsSkippedStructurallyByName`); live half **NOT RUN** |
+| 3. Cache semantics | unit half **PASS** (`TestClassify_ChatAddsCacheAndEmbedDoesNot`, `TestClassify_NegativeCacheSentinelClampsToZero`); live half **NOT RUN** |
+| 4. Unmeasured | unit half **PASS** (`TestClassify_ZeroTokenTwoHundredIsUnmeasuredNotZero`, `TestClassify_NonTwoHundredIsErrorAndContributesNothing`); live half **NOT RUN** |
+| 5. Self-traffic | unit half **PASS** (`TestClassify_OneTokenChatRowIsAPokeExcludedFromBillableSums`); live half **NOT RUN** |
+| 6. Offline | unit analogue **PASS** (cumulative totals + `TestUsageLedger_FlushAndReplayAreIdempotent`); live **NOT RUN** |
+| 7. Restart idempotency | **PASS** (`TestUsageLedger_FlushAndReplayAreIdempotent`, incl. the kill-between-fold-and-flush case) |
+| 8. Epoch | **PASS** (`TestPoll_IDResetMintsANewEpochAndReingests`, `TestUsageFold_SameEpoch*`, `TestUsageFold_NewEpochStartsANewRowAndKeepsTheOld`) |
+| 9. Timezone | **PASS** (`TestUsageDayKey_SplitsAtLocalMidnightNotUTCMidnight`, `TestUsageDayKey_HandlesBothDSTDiscontinuities`, `TestNoTruncateBasedDayBucketing`) |
+| 10. MTP | **PASS** (`TestClassify_DraftTokensNeverEnterAnySum`) |
+| 11. Streaming contract | **PASS** — `git diff --stat internal/vibe/proxy/` empty; `stream_options` absent from the diff |
+| 12. Inner loop | **PASS** — build / vet / gofmt / mod tidy / `test -race -count=5` / golangci-lint |
+
+### §0 is an operator step, not a code change
+
+The `store: {path: …}` extras block is per-cell llama-swap config and
+lands in the private fleet repo (ground rule 3). Nothing in this repo
+renders it: `router.Options.ExtrasPath` merges the file verbatim. Until
+each cell has it, that cell's activity log is the 1000-row in-memory
+ring and the collector will honestly report `lost_rows` and mint a new
+epoch on every llama-swap restart.

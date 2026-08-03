@@ -63,6 +63,12 @@ type Config struct {
 	Versions func() *fleetapi.AnnounceVersions
 	// Capacity supplies VRAM/disk numbers. Nil-safe: block omitted.
 	Capacity func() *fleetapi.AnnounceCapacity
+	// Usage supplies the C7a cumulative token counters, refreshed from
+	// the local llama-swap activity log on each heartbeat. Nil-safe:
+	// block omitted, and fleetd renders the cell as unmeasured rather
+	// than as zero. It takes the announce's ctx so a slow local poll
+	// cannot outlive the heartbeat that asked for it.
+	Usage func(context.Context) *fleetapi.AnnounceUsage
 	// Logger; nil → slog.Default.
 	Logger *slog.Logger
 	// Interval override for tests (0 = follow the registry's interval_s).
@@ -312,6 +318,9 @@ func (c *Client) announceOnce(ctx context.Context) error {
 	}
 	if c.cfg.Versions != nil {
 		req.Versions = c.cfg.Versions()
+	}
+	if c.cfg.Usage != nil {
+		req.Usage = c.cfg.Usage(ctx)
 	}
 
 	out, err := c.post(ctx, req)

@@ -314,6 +314,22 @@ func (s *Server) mcpTools() []any {
 			},
 		},
 		map[string]any{
+			"name": "fleet_usage",
+			"description": "Token usage per cell, per model, per day, from the fleet's own " +
+				"llama-swap activity logs. RAW COUNTS ONLY — this tool knows no prices and " +
+				"returns no dollars. Prompt tokens are split into in_fresh (actually processed) " +
+				"and in_cached (served from KV cache) because they are not worth the same. " +
+				"Fleet self-traffic (warm pokes) is counted separately in poke_req and excluded " +
+				"from every token sum; 200s that reported no tokens are counted in " +
+				"unmeasured_req and are never summed as zero.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"days": map[string]any{"type": "integer", "description": "How many days back to include (default 30, 0 = everything)."},
+				},
+			},
+		},
+		map[string]any{
 			"name": "render_front",
 			"description": "Dry-run the front config render (vibe router render --cell front): " +
 				"renders the peers-only config from backend defs + hosts.yaml and returns the " +
@@ -399,6 +415,16 @@ func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMess
 			return "", fmt.Errorf("invalid arguments: %v", err)
 		}
 		return s.toolWakeCell(ctx, args.Cell)
+	case "fleet_usage":
+		var args struct {
+			Days *int `json:"days"`
+		}
+		if len(rawArgs) > 0 {
+			if err := json.Unmarshal(rawArgs, &args); err != nil {
+				return "", fmt.Errorf("invalid arguments: %v", err)
+			}
+		}
+		return s.toolFleetUsage(args.Days)
 	case "render_front":
 		var args struct {
 			DryRun *bool `json:"dry_run"`
@@ -420,6 +446,37 @@ func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMess
 func (s *Server) toolFleetStatus(ctx context.Context) (string, error) {
 	snap := s.fleet.Snapshot(ctx)
 	data, err := json.Marshal(snap)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// defaultUsageDays bounds the default window so an agent's first call
+// doesn't paste two years of buckets into its context.
+const defaultUsageDays = 30
+
+// toolFleetUsage returns the raw ledger. It deliberately computes
+// nothing: no totals, no rates, no money. C7b prices these counts, and
+// keeping the pricing out of C7a is what lets the whole history be
+// re-priced when the price table changes.
+func (s *Server) toolFleetUsage(days *int) (string, error) {
+	n := defaultUsageDays
+	if days != nil {
+		n = *days
+	}
+	if n < 0 {
+		return "", fmt.Errorf("days must be >= 0 (0 = everything)")
+	}
+	since := ""
+	if n > 0 {
+		// The window is computed in the LEDGER's zone, not the process
+		// zone: asking for "the last 7 days" in UTC against Toronto
+		// buckets silently clips or pads the edge day.
+		y, m, d := time.Now().In(s.fleet.UsageTZ()).AddDate(0, 0, -(n - 1)).Date()
+		since = fmt.Sprintf("%04d-%02d-%02d", y, int(m), d)
+	}
+	data, err := json.Marshal(s.fleet.UsageReport(since))
 	if err != nil {
 		return "", err
 	}

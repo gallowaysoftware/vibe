@@ -646,3 +646,57 @@ func TestWithdrawConcurrentWithRun(t *testing.T) {
 		}
 	}
 }
+
+// C7a: the usage block is additive and rides the heartbeat. A nil Usage
+// hook must leave the field absent — old cells announce no usage and
+// fleetd renders them unmeasured, which is the truth, not zero.
+func TestAnnounce_UsageBlockRidesTheHeartbeatAndIsOptional(t *testing.T) {
+	reg := newFakeRegistry(t)
+	swap := newFakeLlamaSwap(t, `{"running":[]}`)
+
+	base := Config{
+		Cell:         "gpu",
+		RegistryURL:  reg.srv.URL,
+		LlamaSwapURL: swap.srv.URL,
+		IntentPath:   filepath.Join(t.TempDir(), "cell-intent.json"),
+	}
+
+	silent, err := New(base)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := silent.announceOnce(context.Background()); err != nil {
+		t.Fatalf("announceOnce: %v", err)
+	}
+	if got := reg.calls(); len(got) != 1 || got[0].Usage != nil {
+		t.Fatalf("nil Usage hook must omit the block, got %+v", got[0].Usage)
+	}
+
+	withUsage := base
+	var sawCtx bool
+	withUsage.Usage = func(ctx context.Context) *fleetapi.AnnounceUsage {
+		sawCtx = ctx != nil
+		return &fleetapi.AnnounceUsage{
+			Epoch:  "e1",
+			Models: []fleetapi.AnnounceUsageModel{{Model: "qwen", Basis: "chat", Req: 3, InFresh: 30, InCached: 900, Out: 12}},
+		}
+	}
+	c, err := New(withUsage)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := c.announceOnce(context.Background()); err != nil {
+		t.Fatalf("announceOnce: %v", err)
+	}
+	calls := reg.calls()
+	last := calls[len(calls)-1]
+	if last.Usage == nil || last.Usage.Epoch != "e1" || len(last.Usage.Models) != 1 {
+		t.Fatalf("usage block did not reach the registry: %+v", last.Usage)
+	}
+	if m := last.Usage.Models[0]; m.InFresh != 30 || m.InCached != 900 || m.Basis != "chat" {
+		t.Errorf("usage model = %+v", m)
+	}
+	if !sawCtx {
+		t.Error("Usage hook was called without the announce context")
+	}
+}
