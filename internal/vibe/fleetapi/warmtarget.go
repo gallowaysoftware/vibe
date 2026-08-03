@@ -135,7 +135,10 @@ func (s *Server) evalWarmTarget(t WarmTarget, st *warmTargetState, cfg warmLoopC
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
+	// warmCtx, not context.Background(): the probe is on an s.wg
+	// goroutine, so an unlinked one holds Close() for the full
+	// snapshotTimeout the same way CC-2's warm did for warmTimeout.
+	ctx, cancel := s.warmCtx(snapshotTimeout)
 	snap := s.snapshotCell(ctx, Cell{Name: t.Cell, URL: s.cellURL(t.Cell)})
 	cancel()
 	if !snap.Reachable {
@@ -145,9 +148,8 @@ func (s *Server) evalWarmTarget(t WarmTarget, st *warmTargetState, cfg warmLoopC
 	s.applyWarmEval(t, st, cfg, snap)
 }
 
-// applyWarmEval runs the policy against a fresh cell snapshot,
-// returning true when the evaluation completed (vs. skip for absence).
-func (s *Server) applyWarmEval(t WarmTarget, st *warmTargetState, cfg warmLoopConfig, snap CellSnapshot) bool {
+// applyWarmEval runs the policy against a fresh cell snapshot.
+func (s *Server) applyWarmEval(t WarmTarget, st *warmTargetState, cfg warmLoopConfig, snap CellSnapshot) {
 	var targetResident bool
 	var residents []string
 	for _, m := range snap.Models {
@@ -165,7 +167,6 @@ func (s *Server) applyWarmEval(t WarmTarget, st *warmTargetState, cfg warmLoopCo
 		st.emptySince = time.Time{}
 		s.mu.Unlock()
 		s.setWarmState(st, "holding", "target resident")
-		return true
 	case len(residents) == 0:
 		s.mu.Lock()
 		if st.emptySince.IsZero() {
@@ -182,13 +183,12 @@ func (s *Server) applyWarmEval(t WarmTarget, st *warmTargetState, cfg warmLoopCo
 		}
 		if emptyFor < grace {
 			s.setWarmState(st, "waiting", "nothing resident (confirming)")
-			return true
+			return
 		}
 		s.mu.Lock()
 		st.emptySince = time.Time{}
 		s.mu.Unlock()
 		s.restore(t, st, cfg, "nothing resident")
-		return true
 	default:
 		s.mu.Lock()
 		st.emptySince = time.Time{}
@@ -200,23 +200,43 @@ func (s *Server) applyWarmEval(t WarmTarget, st *warmTargetState, cfg warmLoopCo
 		// between its start and its completion.
 		if n, reported := s.InFlight(t.Cell); reported && n > 0 {
 			s.setWarmState(st, "waiting", fmt.Sprintf("cell busy (%d in-flight)", n))
-			return true
+			return
 		}
 		// An operator swap is resident: restore only after EVERY
 		// resident has been request-idle for the window. Any request to
 		// any of them resets it.
 		idle, idleFor, unknown := s.swapIdleFor(t.Cell, residents)
+		// A resident with no recorded activity is evidence of idleness
+		// only where fleetd is WATCHING the cell. With no events stream —
+		// the announce-only case C3 exists for — "no requests seen" is
+		// absence of observation, and restoring on it makes fleetd's own
+		// uptime the clock §1 forbids: once uptime passes the window,
+		// every resident swap is evicted on the first tick.
+		if len(unknown) > 0 && !s.observesActivity(t.Cell) {
+			s.setWarmState(st, "skipped", fmt.Sprintf("no activity evidence for %s (no events stream to %s)", strings.Join(unknown, ","), t.Cell))
+			return
+		}
 		if idle >= t.RestoreAfterIdle {
 			s.restore(t, st, cfg, fmt.Sprintf("swap idle %s", idleFor))
-			return true
+			return
 		}
 		detail := fmt.Sprintf("swap %s active (idle %s of %s)", strings.Join(residents, ","), idleFor, t.RestoreAfterIdle)
 		if len(unknown) > 0 {
 			detail += fmt.Sprintf("; no activity evidence for %s (idle measured from fleetd start)", strings.Join(unknown, ","))
 		}
 		s.setWarmState(st, "waiting", detail)
-		return true
 	}
+}
+
+// observesActivity reports whether fleetd has an activity-observation
+// channel to the cell at all: an inflight frame ever received, or the
+// cell's /api/events stream open right now. It is the difference between
+// "fleetd watched and saw nothing" (evidence of idleness) and "fleetd
+// never looked" (no evidence), which the warm policy must not conflate.
+func (s *Server) observesActivity(cell string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inFlightSeen[cell] || s.cellUp[cell]
 }
 
 // swapIdleFor reports the SHORTEST idle window across the resident

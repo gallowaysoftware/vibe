@@ -4,7 +4,8 @@ Status: EXECUTED (2026-08-03), on `feat/c4-fleet-comfort` alongside C4
 itself. Every §1–§8 item below is implemented; the live gates (gate 4's
 warm-policy run, gate 6's malformed-def run) are NOT run — they need
 real cells, and are listed as such in the acceptance-gate section. See
-the addendum at the end for the adversarial pass (gate 9). This phase
+the two addenda at the end for gate 9 — the implementing agent's own
+review pass and an independent one over the same diff. This phase
 exists because C4 shipped without the adversarial self-review step its
 three siblings each got.
 
@@ -716,11 +717,11 @@ that will mislead one.
 | 5 — cron | **PASS.** Twelve-row table incl. all six both-restricted cases, `dow=7`, the century non-leap Feb-29. Cross-checked against Python `croniter`: nine of eleven checked rows agree exactly. The two that differ are the stepped-star rows, and croniter is the one out of step — it reads `*/2` as restricted, while cronie's `entry.c` sets `DOM_STAR`/`DOW_STAR` on any field whose first character is `*` (verified against cronie master). We follow the C implementation the format comes from; the divergence is recorded in the test. |
 | 6 — schedule guard | **PARTIAL.** The unit half passes (`TestScheduleGuardSkipsWhenTheGuardCannotBeEvaluated`: resolve failure skips, unknown in-flight skips, front-only alias fires labelled). The end-to-end run with a real malformed YAML in a live backends dir is **NOT RUN**. |
 | 7 — shutdown | **PASS.** `TestCloseUnblocksAnInFlightWarm` — `Close()` returns well inside 3s against a warm that blocks until its context dies. |
-| 8 — inner loop | **PASS.** `go build ./...`, `go vet ./...`, `gofmt -l .` (empty), `go mod tidy` (clean), `golangci-lint run` (0 issues), `go test -race -count=5 ./...`. |
-| 9 — adversarial pass | **DONE**, addendum below. |
+| 8 — inner loop | **PASS**, re-run after addendum 2's fixes: `go build ./...`, `go vet ./...`, `gofmt -l .` (empty), `go mod tidy` (go.mod/go.sum clean), `golangci-lint run` (0 issues), `go test -race -count=5 ./...` (24 packages ok, 0 failures), plus `-race -count=20 -run TestWarmTarget ./internal/vibe/fleetapi/` (44.1s, clean). |
+| 9 — adversarial pass | **DONE**, twice — the implementing agent's own pass (first addendum) and an independent one over the whole `3854d84..HEAD` diff (second addendum). The independent pass found 6 more, including two the first pass's own fixes had shipped untested. |
 | 10 — CI re-run | **NOT RUN** — this phase does not push. |
 
-## Addendum: the adversarial review pass (2026-08-03)
+## Addendum 1: the implementing agent's own review pass (2026-08-03)
 
 Gate 9, run over the whole C4 + C5 diff (`322712f..HEAD`) after §1–§8
 landed. Six findings beyond the 35 this document lists; four fixed here,
@@ -770,6 +771,83 @@ GET-only, evaluated before mux path-cleaning — widening it to a prefix
 match or `path.Clean` would be the actual vulnerability; the boundary is
 now test-pinned in `daemon/fleet_registry_test.go`) and the page's
 single-route surface.
+
+## Addendum 2: the independent adversarial-review pass (2026-08-03)
+
+Gate 9 again, run by a second agent over the whole `3854d84..HEAD` diff
+(the four C5 commits plus addendum 1's `review:` commit), after §1–§8
+landed. Method: read the diff, then **mutation-test** every important
+production predicate — revert the fix, run the named test, confirm it
+fails. Six findings; all six fixed here, all six mutation-verified in
+both directions. Two of them are the same failure this whole phase
+exists to correct: a fix landed with no test, so reverting it left the
+package green.
+
+1. **Warm targets still restore on a clock where fleetd cannot watch the
+   cell** (major, C5's own M2 fix incomplete). `swapIdleFor` substitutes
+   `now.Sub(s.started)` for a resident with no `modelActivity` entry.
+   That defends the **first** `restore_after_idle` of fleetd's life and
+   nothing after: once uptime passes the window, any resident swap on a
+   cell fleetd has no `/api/events` stream to — the announce-only case
+   C3 exists for — reads as fully idle and is evicted on the first tick.
+   That is §1's rejected pin/keep-warm behaviour with fleetd's uptime as
+   the timer. "fleetd watched and saw nothing" and "fleetd never looked"
+   are different facts and were conflated.
+   Fixed with `Server.observesActivity(cell)` = an inflight frame ever
+   received **or** the cell's events stream open now; unknown-activity
+   residents on a cell with neither produce
+   `skipped (no activity evidence for X (no events stream to Y))`
+   instead of a restore. A watched-but-quiet cell is unchanged, so this
+   deliberately does **not** depend on whether llama-swap emits an
+   inflight frame on connect (the open question addendum 1 recorded as
+   known limit 5 — that limit still stands for the *schedule* guard).
+   Test: `TestWarmTarget_NoActivityEvidence`, three cases — fresh fleetd
+   holds, watched cell still restores after the window (M2's fix stays
+   live where it is honest), unwatched cell is never evicted on uptime.
+2. **`TestWarmTarget_SkipsDrainedCell`'s registry-request case proved
+   nothing** (major, test defect — ground rule 10). The subtest never
+   announced, so `evalWarmTarget` took the probe branch and skipped with
+   *"cell unreachable"*; deleting the entire `effectiveIntent` drain
+   check left it green (mutation-proven). The one subtest that did fail
+   under that mutation was the echo case, so M1's second half — an
+   operator drain requested through fleetd that the cell has not echoed
+   — was unpinned. Rewritten: the cell announces serving + resident with
+   activity evidence, so every other guard says "restore" and only the
+   registry intent can produce the skip, and the skip reason is asserted.
+3. **`modelSetChanged`'s duplicate-id fix shipped with no test**
+   (minor, addendum 1 finding 2). Reverting it to the length+subset form
+   left the whole package green. Test:
+   `TestModelSetChangedDetectsDuplicateIDs`, a ten-row table including
+   `[A,B] → [A,A]` and `[A,A] → [A,B]`.
+4. **`TestScheduleLoopSkipsNeverFiringSpec` claimed a proof it does not
+   have** (minor, test defect). Its comment reads *"the goroutine was
+   never registered: Close returns without waiting on a minute ticker"* —
+   but `scheduleEntryLoop` exits on `s.done` immediately, so `Close()`
+   returns fast whether or not the goroutine was started, and deleting
+   CC-4's `live = false` gate left the test green (mutation-proven).
+   Comment corrected, and the mechanical proof added as
+   `TestScheduleLoopStartsNoGoroutineForAnUnfireableSpec`, which greps
+   the runtime goroutine profile for the `scheduleEntryLoop` frame and
+   carries a fireable-spec control so it cannot pass blind.
+5. **`evalWarmTarget`'s probe path built its context from
+   `context.Background()`** (minor, C4, same class as CC-2). The probe
+   runs on an `s.wg` goroutine, so `Close()` could block for the full
+   `snapshotTimeout` per warm target — the exact shape CC-2 fixed for
+   `warmTimeout`. Now uses `s.warmCtx(snapshotTimeout)`.
+6. **`applyWarmEval`'s `bool` return was dead and its comment described
+   behaviour that no longer existed** (nit). Every path returned true
+   and no caller read it, while the doc comment promised "true when the
+   evaluation completed (vs. skip for absence)". Return dropped.
+
+Also added, since addendum 1's own fixes were otherwise untested:
+`TestWarmCtxCancelIsIdempotent` (finding 1 there — the `sync.Once`) and
+`TestWarmCtxCancelsOnClose` (the `s.done` link CC-2 added). Both fail
+against the pre-fix code.
+
+Deliberately **not** changed: the `stalenessLoop`'s `s.wg.Add(1)` inside
+its own goroutine (`fleetapi.go:Start` → `announce.go:stalenessLoop`) is
+a real `WaitGroup` misuse, but it is C1-era code untouched by C4/C5 —
+it belongs to [C6](c6-substrate-repair.md), not to landing #22.
 
 ## Out of scope
 

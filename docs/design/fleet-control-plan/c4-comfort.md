@@ -146,20 +146,38 @@ floor: fleetd must not claim silence it was not running to observe. The
 status detail names the missing evidence so the operator can see the
 policy is running on weak data.
 
+**…and only where fleetd is watching** (amended by the adversarial pass).
+The from-start floor is honest evidence *only* when fleetd holds an
+observation channel to the cell. Where it does not — an announce-only
+cell, the no-inbound-port case C3 exists for — "no requests seen" is
+absence of observation, and measuring from process start makes fleetd's
+own **uptime** the clock this section forbids: once uptime passes
+`restore_after_idle`, every resident swap reads as fully idle and is
+evicted on the first tick. `observesActivity(cell)` is the
+discriminator: an inflight frame ever received, or the cell's
+`/api/events` stream open right now. Without one the target is
+`skipped (no activity evidence …)` in `fleet_status` — visible, and in
+the safe direction. A watched-but-quiet cell keeps working exactly as
+before, so this does **not** depend on whether llama-swap emits an
+inflight frame on connect.
+
 The stronger options were considered and deferred:
 
 - *Require `inFlightSeen[cell]` before restoring at all.* Correct only
   if llama-swap emits an inflight frame **on connect** and not solely on
   add/remove — unverified, and if it is add/remove-only a genuinely
-  quiet cell would never restore. Needs a live check before adopting.
+  quiet cell would never restore. The `observesActivity` rule above is
+  the half of this that needs no such verification (the stream being
+  open is itself the evidence fleetd is looking); the strict form still
+  needs a live check.
 - *Announce the truth* — extend `AnnounceModel` with `last_request_at` /
   `in_flight` (additive and v1-safe; the reserved `Probe` field sits
   right there), populate them cell-side from llama-swap, and prefer the
   announced value. This is the durable answer for announce-only cells
   (the no-inbound-port case C3 exists for), where fleetd has no inflight
-  stream at all and the from-start floor is the only evidence there is.
-  Deferred to a later phase, not because it is wrong but because it
-  changes the wire protocol.
+  stream at all — today those cells' warm targets simply skip, which is
+  safe but is the feature not working. Deferred to a later phase, not
+  because it is wrong but because it changes the wire protocol.
 
 ### 2. Warm schedules
 

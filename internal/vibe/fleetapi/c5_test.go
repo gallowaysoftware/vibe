@@ -174,6 +174,16 @@ func warmTarget(t *testing.T, cell, model string, after time.Duration) (*Server,
 	return s, probe, WarmTarget{Cell: cell, Model: model, RestoreAfterIdle: after}
 }
 
+// warmStateOf copies a test-owned warm state under the hub mutex — the
+// same copy-under-lock idiom warmReport uses, so handing this st to a
+// loop later can never turn the assertion into a race (B2's shape).
+// warmTargetStateOf is the equivalent for states the loop registered.
+func warmStateOf(s *Server, st *warmTargetState) warmTargetState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return *st
+}
+
 // TestWarmTarget_SkipsDrainedCell pins M1. A drained cell keeps
 // announcing an EMPTY model list by design, which the nothing-resident
 // branch read as "restore the default" — and where the drain leaves
@@ -203,7 +213,19 @@ func TestWarmTarget_SkipsDrainedCell(t *testing.T) {
 	t.Run("drain requested through fleetd, not yet echoed", func(t *testing.T) {
 		// The registry request alone must skip: an operator drain the cell
 		// hasn't acked is still a drain in progress.
+		//
+		// The cell ANNOUNCES, serving and resident, and has activity
+		// evidence — so every other guard says "restore" and only the
+		// registry intent can produce the skip. Without that setup the
+		// probe path's "cell unreachable" skip carries the test and
+		// deleting the whole drain check leaves it green (mutation-proven).
 		s, probe, target := warmTarget(t, "heavy", "default-model", time.Millisecond)
+		s.recordAnnounce(&AnnounceRequest{
+			V: AnnounceVersion, Cell: "heavy", Seq: 1,
+			Intent: &AnnounceIntent{State: "serving", Since: time.Now().UTC().Add(-time.Hour)},
+			Models: []AnnounceModel{{ID: "challenger", State: "ready"}},
+		})
+		s.trackInFlight("heavy", inflightFrame(t))
 		s.mu.Lock()
 		s.intents["heavy"] = Intent{State: "drained", Since: time.Now().UTC()}
 		s.mu.Unlock()
@@ -214,6 +236,9 @@ func TestWarmTarget_SkipsDrainedCell(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 		if got := probe.got(); len(got) != 0 {
 			t.Fatalf("warmed a cell with a pending drain request: %v", got)
+		}
+		if got := warmTargetStateOf(s, 0); got.State != "skipped" || !strings.Contains(got.Detail, "drained") {
+			t.Errorf("state = %s/%q, want skipped/drained", got.State, got.Detail)
 		}
 	})
 
@@ -230,6 +255,9 @@ func TestWarmTarget_SkipsDrainedCell(t *testing.T) {
 			Intent: &AnnounceIntent{State: "serving", Since: time.Now().UTC()},
 			Models: []AnnounceModel{{ID: "challenger", State: "ready"}},
 		})
+		// fleetd has watched this cell, so the resident's missing activity
+		// stamp is observed silence rather than absence of observation.
+		s.trackInFlight("heavy", inflightFrame(t))
 		if in, ok := s.effectiveIntent("heavy"); ok && in.State == "drained" {
 			t.Fatal("newer serving echo did not resolve the drain request")
 		}
@@ -287,27 +315,64 @@ func TestWarmTarget_InFlightRequestBlocksRestore(t *testing.T) {
 	}
 }
 
-// TestWarmTarget_NoActivityEvidenceMeasuresFromFleetdStart pins M2: the
+// TestWarmTarget_NoActivityEvidence pins M2 and its follow-up. M2: the
 // unknown-activity branch claimed a fabricated hour of silence, so any
-// restore_after_idle <= 1h fired on the first tick — on announce-only
-// cells (the no-inbound-port case C3 exists for) and after every fleetd
-// restart.
-func TestWarmTarget_NoActivityEvidenceMeasuresFromFleetdStart(t *testing.T) {
-	s, probe, target := warmTarget(t, "heavy", "default-model", time.Hour)
-	st := &warmTargetState{Cell: target.Cell, Model: target.Model}
-	cfg := warmLoopConfig{targets: []WarmTarget{target}, frontURL: "http://front.test", warmFn: probe.warm}
-
+// restore_after_idle <= 1h fired on the first tick. The follow-up: the
+// minimum fix (measure from fleetd's own start) only defends the first
+// window of fleetd's life — after that, uptime IS the clock §1 forbids,
+// and on a cell fleetd has no events stream to (the announce-only case
+// C3 exists for) every resident swap reads as fully idle and is evicted.
+// "fleetd watched and saw nothing" and "fleetd never looked" are
+// different facts.
+func TestWarmTarget_NoActivityEvidence(t *testing.T) {
 	snap := CellSnapshot{Models: []ModelState{{ID: "challenger", State: "ready"}}}
-	s.applyWarmEval(target, st, cfg, snap)
-	if got := probe.got(); len(got) != 0 {
-		t.Fatalf("warmed on the first eval with zero activity evidence: %v", got)
-	}
-	s.mu.Lock()
-	detail := st.Detail
-	s.mu.Unlock()
-	if !strings.Contains(detail, "no activity evidence") {
-		t.Errorf("detail = %q, want the missing evidence named", detail)
-	}
+
+	t.Run("fresh fleetd does not claim silence it never observed", func(t *testing.T) {
+		s, probe, target := warmTarget(t, "heavy", "default-model", time.Hour)
+		st := &warmTargetState{Cell: target.Cell, Model: target.Model}
+		cfg := warmLoopConfig{targets: []WarmTarget{target}, frontURL: "http://front.test", warmFn: probe.warm}
+		s.setCellUp("heavy", true) // fleetd IS watching: silence is observed
+		s.applyWarmEval(target, st, cfg, snap)
+		if got := probe.got(); len(got) != 0 {
+			t.Fatalf("warmed on the first eval with zero activity evidence: %v", got)
+		}
+		if detail := warmStateOf(s, st).Detail; !strings.Contains(detail, "no activity evidence") {
+			t.Errorf("detail = %q, want the missing evidence named", detail)
+		}
+	})
+
+	t.Run("watched cell still restores once the window passes", func(t *testing.T) {
+		// The M2 minimum fix must stay live where it is honest: fleetd
+		// holds the cell's events stream, so "no frame since start" is
+		// real observed silence and the restore is allowed.
+		s, probe, target := warmTarget(t, "heavy", "default-model", time.Millisecond)
+		st := &warmTargetState{Cell: target.Cell, Model: target.Model}
+		cfg := warmLoopConfig{targets: []WarmTarget{target}, frontURL: "http://front.test", warmFn: probe.warm}
+		s.setCellUp("heavy", true)
+		time.Sleep(5 * time.Millisecond)
+		s.applyWarmEval(target, st, cfg, snap)
+		if got := probe.got(); len(got) != 1 {
+			t.Fatalf("watched cell did not restore after the window: %v (%+v)", got, warmStateOf(s, st))
+		}
+	})
+
+	t.Run("unwatched cell is never evicted on fleetd uptime", func(t *testing.T) {
+		// No events stream and no inflight frame ever: fleetd has no
+		// activity channel to this cell, so its uptime must not become the
+		// restore clock no matter how long it has been running.
+		s, probe, target := warmTarget(t, "heavy", "default-model", time.Millisecond)
+		st := &warmTargetState{Cell: target.Cell, Model: target.Model}
+		cfg := warmLoopConfig{targets: []WarmTarget{target}, frontURL: "http://front.test", warmFn: probe.warm}
+		time.Sleep(5 * time.Millisecond)
+		s.applyWarmEval(target, st, cfg, snap)
+		if got := probe.got(); len(got) != 0 {
+			t.Fatalf("evicted the operator's swap on fleetd uptime alone: %v", got)
+		}
+		got := warmStateOf(s, st)
+		if got.State != "skipped" || !strings.Contains(got.Detail, "no activity evidence") {
+			t.Errorf("state = %s/%q, want skipped naming the missing evidence", got.State, got.Detail)
+		}
+	})
 }
 
 // TestSwapIdleForAboveTheHourFloor pins M3: swapIdleFor seeded its
@@ -496,8 +561,10 @@ func TestScheduleLoopSkipsNeverFiringSpec(t *testing.T) {
 	if !strings.Contains(got.LastNote, "no fire time") {
 		t.Errorf("note = %q, want the never-fires note", got.LastNote)
 	}
-	// The goroutine was never registered: Close returns without waiting on
-	// a minute ticker.
+	// Close returns promptly. This is NOT proof the goroutine was skipped
+	// — scheduleEntryLoop exits on s.done immediately either way; the
+	// mechanical proof of the gate is
+	// TestScheduleLoopStartsNoGoroutineForAnUnfireableSpec.
 	done := make(chan struct{})
 	go func() { s.Close(); close(done) }()
 	select {

@@ -255,8 +255,12 @@ optional.)
     `trackInFlight` stamps activity on the completion edge as well as
     the start, or one generation longer than the window reads as idle;
     *unknown activity* measures idleness from the fleetd process's own
-    start (`Server.started`) — never a fabricated floor, and the status
-    names the missing evidence; *`swapIdleFor` returns the real idle*
+    start (`Server.started`) — never a fabricated floor — and only where
+    fleetd actually WATCHES the cell (`observesActivity`: an inflight
+    frame ever seen, or the events stream open now); with no observation
+    channel the target is skipped, because otherwise fleetd's uptime
+    becomes the clock the rule forbids. The status names the missing
+    evidence either way; *`swapIdleFor` returns the real idle*
     (shortest across residents, unbounded above) so a window over an
     hour is not silently inert.
   - **Warm schedules** (`warm_schedule:`, fleetapi/warmsched.go): a
