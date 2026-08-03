@@ -1,9 +1,11 @@
 # C5 — Land C4: the review pass C4 never got
 
-Status: EXECUTED (2026-08-03), on `feat/c4-fleet-comfort` alongside C4
+Status: MERGED (2026-08-03, PR #22, squashed as `28a8073`), on
+`feat/c4-fleet-comfort` alongside C4
 itself. Every §1–§8 item below is implemented; the live gates (gate 4's
-warm-policy run, gate 6's malformed-def run) are NOT run — they need
-real cells, and are listed as such in the acceptance-gate section. See
+warm-policy run, gate 6's malformed-def run) are still NOT run — they
+need real cells, merging did not change that, and they are listed as
+unrun in the acceptance-gate section. See
 the two addenda at the end for gate 9 — the implementing agent's own
 review pass and an independent one over the same diff. This phase
 exists because C4 shipped without the adversarial self-review step its

@@ -1,12 +1,24 @@
 # C6 — Substrate repair: the C1–C3 findings against merged code
 
-Status: EXECUTED + REVIEWED (2026-08-03) on `fix/c6-substrate-repair`,
+Status: MERGED (2026-08-03, PR #23, squashed as `cc98389`), EXECUTED +
+REVIEWED, off `fix/c6-substrate-repair`,
 branched off `main` at `322712f` per this doc's own rule. Depends on
 [C5](c5-land-c4.md) only for merge order — none of this blocks landing
-PR #22. Every finding is implemented except NIT-D, which does not exist
-in merged code; gates 1 and 2 are live and NOT run. See the execution
+PR #22. Gates 1 and 2 are live and still NOT run.
+See the execution
 addendum and the adversarial-review addendum at the end (8 further
 findings, all fixed with mutation-verified tests).
+
+Two findings were only *half* landable here and were finished by the
+post-merge reconciliation PR (#26), once C4's files were on `main`:
+
+- **MIN-G** wired the piggyback producer for fleetmcp's `unload_model`
+  only; `warmtarget`/`warmsched` are the other two producers the C3 doc
+  names, and they were C4 files absent from this branch. #26 adds the
+  same fallback there — same announced-model validation, same rule that
+  a definitive 4xx is a real error and is not reported as "queued".
+- **NIT-D** was correctly refused here (the line did not exist in merged
+  code). It exists now; #26 folds it into the assertion below it.
 
 Everything here is in **merged** code (`main` at `322712f`, PRs
 #19–#21). It was found by the same verification pass that produced C5,
@@ -462,7 +474,10 @@ Two anchors did not exist in merged code at all:
   rewrite.
 - **NIT-D** (`daemon/fleet_registry_test.go:207`, a leftover `t.Logf`)
   is in C4's fleet-page auth test. It is not on `main`. **Not fixed
-  here — it belongs to PR #22.**
+  here — it belongs to PR #22.** *(It did not land with #22 either; the
+  post-merge reconciliation PR #26 folded the body length into the
+  `t.Errorf` below it, where it is diagnostic on failure instead of
+  noise on every run.)*
 
 **Judgement calls, stated because they diverge from the letter of the
 doc:**
@@ -476,7 +491,11 @@ doc:**
   daemon's shutdown path and `vibe fleet announce`.
 - **MIN-G** wired the producer rather than amending the doc, but only
   for `unload_model` — `warmtarget`/`warmsched` are C4 code and not on
-  this branch. MIN-H landed first, as instructed.
+  this branch. MIN-H landed first, as instructed. *(Finished in PR #26
+  once C4 was on `main`: both warm loops now fall back to
+  `QueueCommand`, and the warm path grew a typed `warmHTTPError` so the
+  4xx-is-not-a-delay rule is decidable there too rather than parsed out
+  of a string.)*
 - **MIN-B** folds `/home/<user>/…`, `/root/…` and `/Users/<user>/…` in
   addition to the local `$HOME`, and says in the comment that this fails
   open.

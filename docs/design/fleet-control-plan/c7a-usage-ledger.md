@@ -1,11 +1,12 @@
 # C7a — The usage ledger: counting tokens per cell, per model, per day
 
-Status: EXECUTED + REVIEWED (2026-08-03) on `feat/c7a-usage-ledger`,
+Status: MERGED (2026-08-03, PR #24, squashed as `1a768f2`), EXECUTED +
+REVIEWED, off `feat/c7a-usage-ledger`,
 branched off the C4/C5 line. Feature commit, self-review commit, and an
 independent adversarial pass (ground rule 9) whose findings are in
 [§Adversarial-review addendum](#adversarial-review-addendum-second-independent-pass).
 Every mechanically verifiable gate is green; the seven live gates need
-real cells and are listed unrun in
+real cells, are **still UNRUN** after the merge, and are listed as such in
 [§Execution](#execution-2026-08-03). Depends on C4 (announce +
 presence). No dependency on C5/C6 beyond merge order.
 

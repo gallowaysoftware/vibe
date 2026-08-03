@@ -56,12 +56,24 @@ Implementation notes beyond the doc's letter:
   (they carry reason/eta/since and the reconciliation rule); the
   commands[] queue carries one-off verbs (unload/warm) for cells that
   can't be reached interactively. MCP drain/resume fall back to
-  desired-intent when daemon_url is absent. *(C6: the queue's producer
-  landed with MIN-G — the MCP `unload_model` tool falls back to
-  `QueueCommand` when the cell's admin port doesn't answer, validating
-  the model against the cell's ANNOUNCED set first. Delivery is
-  at-least-once, retired by an announce with a higher seq: deleting the
-  batch at hand-off lost it whenever the response never arrived.)*
+  desired-intent when daemon_url is absent. *(C6 + the post-merge
+  reconciliation PR: the queue has **three** producers, all of them
+  fallbacks and all validating the model against the cell's ANNOUNCED
+  set first. MIN-G landed the first in C6 — the MCP `unload_model` tool
+  queues when the cell's llama-swap admin port does not answer. #26
+  landed the other two, which are C4 files and could not be touched
+  from C6's branch: the warm-target restore and the warm-schedule fire
+  queue a `warm` when the cell has no front route at all (it is known
+  only through its announces, so the front — whose peers are rendered
+  from `hosts.yaml` — cannot reach it) or when the front warm fails to
+  deliver.*
+  *All three share one rule: the queue is for DELIVERY failures.
+  Transport errors and 5xx fall back; a definitive 4xx is the far side
+  ANSWERING, and the cell would refuse the same verb identically, so it
+  stays the error it is rather than being reported as "queued for the
+  next heartbeat". Delivery is at-least-once, retired by an announce
+  with a higher seq: deleting the batch at hand-off lost it whenever
+  the response never arrived.)*
 - **Announce-side defs load once at client start** (daemon or slim):
   a def edit takes effect on the next announcer/daemon restart. Defs
   change via git + converge, so this is the natural cadence.

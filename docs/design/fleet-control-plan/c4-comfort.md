@@ -1,6 +1,7 @@
 # C4 — Comfort: warm targets, warm schedules, the fleet page
 
-Status: EXECUTED WITH FOLLOW-UPS (2026-08-03). The three live gates
+Status: MERGED (2026-08-03, PR #22, squashed as `28a8073`), WITH
+FOLLOW-UPS. The three live gates
 below are real runs and stand. Gate 4 as originally written did not:
 post-gate review found a data race, a warm policy that reached the
 design-rejected mid-session eviction four ways, and a cron evaluator

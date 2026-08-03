@@ -1,11 +1,13 @@
 # C7b — The savings screen: what the fleet didn't spend
 
-Status: EXECUTED + REVIEWED TWICE (2026-08-03) on
+Status: MERGED (2026-08-03, PR #25, squashed as `64f3391`), EXECUTED +
+REVIEWED TWICE, off
 `feat/c7b-savings-screen` — feature commit, the implementer's own
 adversarial pass, and an independent second pass (ground rule 9). Unit
 gates 1–8 and 10 are green under `-race -count=5`; gate 9 (live
 plausibility) needs a real week of ledger data on real cells and is
-UNRUN. Depends on [C7a](c7a-usage-ledger.md) for the ledger and on C4
+**still UNRUN** — merging did not run it. Depends on
+[C7a](c7a-usage-ledger.md) for the ledger and on C4
 for the page. Implementation notes, including where the code deviates
 from this document, are in the
 [addendum](#implementation-addendum-2026-08-03); the two review passes'

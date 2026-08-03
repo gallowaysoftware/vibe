@@ -11,11 +11,17 @@ to be implementable on its own after that.
 | [C1](c1-observe-intent.md) | Observe + intent: fleetd, cells registry, `vibe cell status/await`, MCP facade | ~450 lines | C0 optional | merged (#19) |
 | [C2](c2-actuate.md) | Actuate: drain/resume RPCs, wake, `render --cell front` | ~450 lines | C1 | merged (#20) |
 | [C3](c3-announce.md) | The inversion: announce heartbeats, presence-derived render | ~600 lines | C2 | merged (#21) |
-| [C4](c4-comfort.md) | Comfort: warm targets, warm schedules, the fleet page | ~300 lines | C3 (a read-only page could ship after C1; its action buttons need C2, fingerprint badges C3) | merged (#22) |
-| [C5](c5-land-c4.md) | Land C4: the adversarial review pass C4 never got | ~400 lines | C4 | merged (#22) |
-| [C6](c6-substrate-repair.md) | Substrate repair: the C1–C3 findings against merged code | ~500 lines | independent of C5 | merged (#23) |
-| [C7a](c7a-usage-ledger.md) | The usage ledger: tokens per cell, per model, per day | ~710 lines | C4 | executed + reviewed (unit gates green; 7 live gates unrun) |
-| [C7b](c7b-savings-screen.md) | The savings screen: what the fleet didn't spend | ~690 lines + ~100 KB data | C7a, C5 | executed + reviewed twice (unit gates green; live plausibility gate unrun) |
+| [C4](c4-comfort.md) | Comfort: warm targets, warm schedules, the fleet page | ~300 lines | C3 (a read-only page could ship after C1; its action buttons need C2, fingerprint badges C3) | merged (#22); its 3 live gates ran, gate 4 superseded by C5 |
+| [C5](c5-land-c4.md) | Land C4: the adversarial review pass C4 never got | ~400 lines | C4 | merged (#22); unit gates green, live gates 4 + 6 UNRUN |
+| [C6](c6-substrate-repair.md) | Substrate repair: the C1–C3 findings against merged code | ~500 lines | independent of C5 | merged (#23); unit gates green, live gates 1 + 2 UNRUN |
+| [C7a](c7a-usage-ledger.md) | The usage ledger: tokens per cell, per model, per day | ~710 lines | C4 | merged (#24); unit gates green, 7 live gates UNRUN |
+| [C7b](c7b-savings-screen.md) | The savings screen: what the fleet didn't spend | ~690 lines + ~100 KB data | C7a, C5 | merged (#25); unit gates green, live plausibility gate UNRUN |
+
+**Merged is not live-gated.** Every C0–C7b PR merged on a green CI run
+of the mechanical inner loop. The live gates — the ones that need real
+cells, a real GPU and a real week of traffic — are UNRUN for C5, C6,
+C7a and C7b, and each phase doc lists exactly which. Ground rule 10
+applies to this table: a status cell is a claim about a mechanical run.
 
 Line counts are order-of-magnitude scoping signals, not budgets. Actual
 C0–C4 spend ran 3.6–4.5× the estimate in every phase; price that in.
@@ -33,6 +39,14 @@ number can be *silly* lives in C7b (pricing, equivalence, energy,
 payback) and none of it can be judged until real counts exist to look
 at. C7a needs no new measurement mechanism — llama-swap already logs
 per-request token counts to SQLite.
+
+A **post-merge reconciliation PR** (#26, 2026-08-03) closed the three
+items no single phase branch could reach, because each needed code from
+two branches at once: C6's MIN-G producer finished for
+`warmtarget`/`warmsched` (C6 could only wire `unload_model` — the warm
+loops were C4 files absent from its branch), C6's NIT-D (a debug
+`t.Logf` in a C4 test C6 correctly refused to touch), and this table's
+own status truth. It adds no new phase scope.
 
 ## Ground rules for the implementing agent
 
