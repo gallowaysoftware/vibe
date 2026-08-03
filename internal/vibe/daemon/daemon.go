@@ -152,9 +152,12 @@ type WarmScheduleEntry struct {
 // (a stopped-but-reporting unit is the classic silent failure).
 type CellCmds struct {
 	// Drain reclaims the box (e.g. "systemctl --user stop llama-swap") —
-	// unit stop lets llama-swap run its documented in-flight drain; never
-	// a kill, never unload-all (an unloaded model JIT-reloads on the next
-	// stray request, exactly wrong mid-game).
+	// a unit stop, never a kill, and never unload-all (an unloaded model
+	// JIT-reloads on the next stray request, exactly wrong mid-game).
+	// The stop does NOT let generations finish: llama-swap's SIGTERM
+	// calls CloseStreams() before its graceful drain (v239, C2's live
+	// gate), so in-flight streams die at the stop. `--wait` is what
+	// drains them first.
 	Drain string `yaml:"drain,omitempty"`
 	// Resume restores JIT service (e.g. "systemctl --user start
 	// llama-swap"). Models return by JIT on next request; resume does not
@@ -279,7 +282,12 @@ type Daemon struct {
 	// announce is the cell's C3 announce loop, started in Run when
 	// fleet.cell + fleet.registry_url are set. CellDrain/CellResume stamp
 	// local intent through it (the conflict rule's cell side).
-	announce *fleetannounce.Client
+	// announceCancel/announceDone let shutdown stop the loop BEFORE the
+	// withdrawing goodbye; all three are written once in startAnnounce,
+	// before the listeners serve.
+	announce       *fleetannounce.Client
+	announceCancel context.CancelFunc
+	announceDone   <-chan struct{}
 	// cellCmdRunner executes cell verbs; tests swap it to script
 	// drain/resume outcomes without touching real units (same injection
 	// pattern as nvidiaSMI). Defaults to runCellCmd in New.
@@ -541,6 +549,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	slog.Info("daemon shutting down", "reason", shutReason)
 	shCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	// Say goodbye before anything else stops: a clean withdraw lets
+	// fleetd prune this cell's catalog now instead of waiting out
+	// stale_after, which is the whole reason the withdrawing state
+	// exists. Best-effort — an unreachable fleetd must not delay
+	// shutdown past the announce timeout.
+	d.withdrawAnnounce()
 	// Tear down the active frontend (if any) first; otherwise a
 	// docker-compose stack outlives the daemon and keeps serving stale
 	// requests at the (now-dead) proxy.

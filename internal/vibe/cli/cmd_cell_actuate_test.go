@@ -405,3 +405,96 @@ func TestWakeCellViaFleetd(t *testing.T) {
 		t.Errorf("packet: n=%d err=%v", n, err)
 	}
 }
+
+// TestPrintDrainReport_WaitStatus pins MIN-N's human-facing half: the
+// operator who asked for quiescence sees whether it happened.
+func TestPrintDrainReport_WaitStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status *string
+		want   string
+		absent string
+	}{
+		{name: "skipped", status: strPtr(fleetapi.DrainWaitSkippedNoInflight), want: "--wait was SKIPPED"},
+		{name: "waited", status: strPtr(fleetapi.DrainWaitWaited), want: "waited for in-flight requests"},
+		{name: "not requested", status: strPtr(fleetapi.DrainWaitNotRequested), absent: "wait"},
+		{name: "absent field (old daemon)", status: nil, absent: "wait"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			printDrainReport(&out, "gpu-cell", &vibev1.CellDrainResponse{WaitStatus: tc.status})
+			s := out.String()
+			if tc.want != "" && !strings.Contains(s, tc.want) {
+				t.Errorf("output %q missing %q", s, tc.want)
+			}
+			if tc.absent != "" && strings.Contains(s, tc.absent) {
+				t.Errorf("output %q mentions %q when it should say nothing", s, tc.absent)
+			}
+		})
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
+// TestResolveCellClientTokenPrecedence pins MIN-P and the deliberate
+// divergence from fleetd (NIT-E): for a human typing one command an
+// explicit $VIBE_TOKEN wins, and an unreadable token_file is a hard
+// error — the old `err == nil` swallow turned a typo'd path into an
+// opaque 401 from the remote cell.
+func TestResolveCellClientTokenPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	tok := filepath.Join(dir, "cell-token")
+	if err := os.WriteFile(tok, []byte("from-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	authCh := make(chan string, 4)
+	cellDaemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authCh <- r.Header.Get("Authorization")
+		http.Error(w, "no", http.StatusNotFound)
+	}))
+	t.Cleanup(cellDaemon.Close)
+	writeHosts(t, fmt.Sprintf(`
+cells:
+  front:    { url: "http://127.0.0.1:1", class: always_on }
+  gpu-cell: { url: "http://127.0.0.1:1", class: opportunistic,
+              daemon_url: "%s", token_file: "%s" }
+  bad-cell: { url: "http://127.0.0.1:1", class: opportunistic,
+              daemon_url: "%s", token_file: "%s" }
+`, cellDaemon.URL, tok, cellDaemon.URL, filepath.Join(dir, "missing")))
+
+	// The CLI's order: an explicit override wins over the file.
+	t.Setenv("VIBE_TOKEN", "from-env")
+	c, _, err := resolveCellClient("gpu-cell")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = c.Status(t.Context())
+	select {
+	case got := <-authCh:
+		if got != "Bearer from-env" {
+			t.Errorf("Authorization = %q, want $VIBE_TOKEN to win for a human command", got)
+		}
+	default:
+		t.Fatal("the cell daemon saw no request")
+	}
+
+	// Without the override the file is used, and an unreadable one is a
+	// named error rather than a silent fall-through to the local token.
+	t.Setenv("VIBE_TOKEN", "")
+	c, _, err = resolveCellClient("gpu-cell")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = c.Status(t.Context())
+	select {
+	case got := <-authCh:
+		if got != "Bearer from-file" {
+			t.Errorf("Authorization = %q, want the per-cell token_file", got)
+		}
+	default:
+		t.Fatal("the cell daemon saw no request")
+	}
+	if _, _, err := resolveCellClient("bad-cell"); err == nil || !strings.Contains(err.Error(), "token_file") {
+		t.Errorf("unreadable token_file: got %v, want a typed error naming it", err)
+	}
+}

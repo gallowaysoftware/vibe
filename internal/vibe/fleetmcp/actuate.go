@@ -3,10 +3,12 @@ package fleetmcp
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"github.com/gallowaysoftware/vibe/internal/vibe/router"
@@ -19,12 +21,17 @@ import (
 // success (the fleetd-invoked writer of the one-writer rule).
 
 // cellClient builds a vibeclient for the named cell's daemon. Token
-// resolution mirrors the CLI's documented order: $VIBE_TOKEN (explicit
-// override) → cells.X.token_file (a path — the value never enters a
-// repo; an unreadable one is a typed error, not a silent 401) → the
-// local token file (right only when X is the local box). A cell without
-// daemon_url gets (nil, nil): the announce path is its actuation
-// channel (C3 — daemon_url is an optimization, not a requirement).
+// resolution: cells.X.token_file (a path — the value never enters a
+// repo; an unreadable one is a typed error, not a silent 401) →
+// $VIBE_TOKEN → the local token file (right only when X is the local
+// box). A cell without daemon_url gets (nil, nil): the announce path is
+// its actuation channel (C3 — daemon_url is an optimization, not a
+// requirement).
+//
+// The order deliberately DIVERGES from the CLI's (cmd_cell_actuate.go),
+// which puts $VIBE_TOKEN first: a human typing one command means the
+// override, but in a long-lived fleetd one env var must not silently
+// void every per-cell token_file in hosts.yaml.
 func (s *Server) cellClient(cell string) (*vibeclient.Client, error) {
 	c, ok := s.hosts.Cells[cell]
 	if !ok {
@@ -33,18 +40,34 @@ func (s *Server) cellClient(cell string) (*vibeclient.Client, error) {
 	if c.DaemonURL == "" {
 		return nil, nil
 	}
-	token := strings.TrimSpace(os.Getenv("VIBE_TOKEN"))
-	if token == "" && c.TokenFile != "" {
+	envToken := strings.TrimSpace(os.Getenv("VIBE_TOKEN"))
+	var token string
+	switch {
+	case c.TokenFile != "":
 		data, err := os.ReadFile(c.TokenFile)
 		if err != nil {
 			return nil, fmt.Errorf("cells.%s token_file %s: %v", cell, c.TokenFile, err)
 		}
 		token = strings.TrimSpace(string(data))
-	}
-	if token == "" {
+		s.warnTokenShadowOnce(cell, envToken != "")
+	case envToken != "":
+		token = envToken
+	default:
 		token = vibeclient.ResolveToken()
 	}
 	return vibeclient.NewWithToken(c.DaemonURL, token), nil
+}
+
+// warnTokenShadowOnce logs once when both $VIBE_TOKEN and a per-cell
+// token_file are present, so the precedence is discoverable from a log
+// rather than from a 401.
+func (s *Server) warnTokenShadowOnce(cell string, envSet bool) {
+	if !envSet {
+		return
+	}
+	s.tokenWarnOnce.Do(func() {
+		slog.Info("both $VIBE_TOKEN and cells.*.token_file are set; the per-cell file wins in fleetd", "cell", cell)
+	})
 }
 
 // drainViaAnnounce records the drain request for the announce path:
@@ -106,6 +129,13 @@ func (s *Server) toolDrainCell(ctx context.Context, cell, reason, eta string, wa
 	}
 	if report.InFlightRequests != nil {
 		fmt.Fprintf(&b, "\n- in-flight requests at drain: %d", *report.InFlightRequests)
+	}
+	switch {
+	case report.WaitStatus == nil || *report.WaitStatus == fleetapi.DrainWaitNotRequested:
+	case *report.WaitStatus == fleetapi.DrainWaitSkippedNoInflight:
+		b.WriteString("\n- WARNING: the requested wait was SKIPPED (the cell never reported in-flight counts); the drain ran immediately and cancelled any streams")
+	case *report.WaitStatus == fleetapi.DrainWaitWaited:
+		b.WriteString("\n- waited for in-flight requests to reach zero before draining")
 	}
 	if report.LeasesUnavailable {
 		b.WriteString("\n- WARNING: lease list was unavailable — stranded-work check could not run")

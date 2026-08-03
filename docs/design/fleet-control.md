@@ -298,20 +298,24 @@ for cells that don't announce.
 **Workstation GPU reclaim (intent-driven).** `vibe cell drain --reason
 gaming --eta 23:00` — or the same sentence to an agent, which calls
 `drain_cell`. The pre-drain report shows in-flight work and any
-advisory leases first; then the cell's llama-swap unit stops
-(in-flight requests drain — llama-swap's WaitGroup → cmdStop → grace
-sequence), requests for that cell's ids immediately fail with the
-gateway errors consumers already classify as `UPSTREAM_DOWN`, batch
-consumers defer by design, chat users pick another model. Intent
-(reason + ETA) is visible in every status surface. One writer per
-invocation path: when the drain is invoked through fleetd/MCP, fleetd
-records intent only after the drain RPC succeeds; a drain invoked
-locally at the box writes intent itself, best-effort. A failed drain
-never records intent. `vibe cell drain --until-exit --
-<game>` wraps the session and resumes deterministically on exit —
-resume is *never* triggered by a GPU-idle heuristic (rejected: a
-2 a.m. surprise generator). Powered off? Nothing to do: OFF/AWAY with
-last-seen. `wake_cell` sends WoL when explicitly asked.
+advisory leases first; then the cell's llama-swap unit stops. The stop
+does **not** let generations finish: llama-swap's SIGTERM path calls
+`CloseStreams()` *before* its graceful drain (v239, established by C2's
+live gate), so in-flight streams are cancelled at the stop and
+`--wait <dur>` is what lets them finish first — the response now says
+whether that wait actually happened (C6). Requests for that cell's ids
+then fail with the gateway errors consumers already classify as
+`UPSTREAM_DOWN`, batch consumers defer by design, chat users pick
+another model. Intent (reason + ETA) is visible in every status
+surface. One writer per invocation path: when the drain is invoked
+through fleetd/MCP, fleetd records intent only after the drain RPC
+succeeds; a drain invoked locally at the box writes intent itself,
+best-effort. A failed drain never records intent.
+`vibe cell drain --until-exit -- <game>` wraps the session and resumes
+deterministically on exit — resume is *never* triggered by a GPU-idle
+heuristic (rejected: a 2 a.m. surprise generator). Powered off? Nothing
+to do: OFF/AWAY with last-seen. `wake_cell` sends WoL when explicitly
+asked.
 
 **Laptop undock (availability-driven).** Zero control-plane actions per
 dock cycle, by construction: absence is detected, not declared. C0

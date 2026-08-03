@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
@@ -79,6 +80,9 @@ type Server struct {
 	// CLI gives it.
 	backendsDir string
 	llamaBinary string
+	// tokenWarnOnce keeps the $VIBE_TOKEN-vs-token_file precedence note to
+	// one line per process instead of one per actuation.
+	tokenWarnOnce sync.Once
 }
 
 // Options carries the render_front tool's renderer inputs (the daemon's
@@ -267,10 +271,13 @@ func (s *Server) mcpTools() []any {
 		},
 		map[string]any{
 			"name": "drain_cell",
-			"description": "Reclaim a cell (stop its serving stack; llama-swap drains in-flight " +
-				"requests first). Returns the pre-drain report — resident models, in-flight " +
-				"count, active leases — so you can relay \"heads up: X holds a lease\" before " +
-				"confirming. Records intent (reason/eta) at fleetd after the drain succeeds.",
+			"description": "Reclaim a cell (stop its serving stack). llama-swap's SIGTERM " +
+				"CANCELS in-flight streams immediately — a drain without wait_seconds " +
+				"truncates whatever is generating, so never tell an operator their stream " +
+				"is safe. Returns the pre-drain report — resident models, in-flight count, " +
+				"active leases, and whether a requested wait actually happened — so you can " +
+				"relay \"heads up: X holds a lease\" before confirming. Records intent " +
+				"(reason/eta) at fleetd after the drain succeeds.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -427,7 +434,11 @@ func (s *Server) toolWarmModel(ctx context.Context, model string) (string, error
 	if model == "" {
 		return "", fmt.Errorf("model is required")
 	}
-	if class, pinned := s.hosts.ModelClasses[model]; pinned {
+	// The guard exists to refuse firing a CHAT completion at an
+	// embed/rerank id. A chat-class entry documents ownership and must
+	// not be caught by it — the old blanket refusal told the caller a
+	// chat model "is not chat".
+	if class, pinned := s.hosts.ModelClasses[model]; pinned && class != fleetcfg.ModelClassChat {
 		return "", fmt.Errorf("%s is %s-class (per hosts.yaml model_classes), not chat: "+
 			"warming it with a chat completion would load it for nothing — its pinned cell's "+
 			"config is what needs fixing", model, class)
@@ -522,14 +533,33 @@ func (s *Server) toolUnloadModel(ctx context.Context, cell, model string) (strin
 	}
 	resp, err := s.http.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("POST %s: %v", url, err)
+		return s.queueUnload(cell, model, fmt.Sprintf("POST %s: %v", url, err))
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode >= 500 {
+		return s.queueUnload(cell, model, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
+	}
 	if resp.StatusCode != http.StatusOK {
+		// A 4xx is the admin API ANSWERING (no such model, bad request).
+		// Queueing it would tell the agent "done on its next heartbeat"
+		// about a verb the cell will refuse identically — the piggyback
+		// fallback is for delivery failures, not for definitive answers.
 		return "", fmt.Errorf("unload %s on %s: HTTP %d: %s", model, cell, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return fmt.Sprintf("Unloaded %s on %s. The next request naming it JIT-loads again.", model, cell), nil
+}
+
+// queueUnload is the piggyback fallback: after C3 a cell fleetd cannot
+// reach directly still collects verbs on its next heartbeat, so an
+// unreachable llama-swap admin port is a DELAY, not a failure. It stays
+// an error when the cell doesn't announce — nothing would ever collect
+// the command, and pretending otherwise is worse than failing.
+func (s *Server) queueUnload(cell, model, why string) (string, error) {
+	if qerr := s.fleet.QueueCommand(cell, fleetapi.AnnounceCommand{Verb: "unload", Model: model}); qerr != nil {
+		return "", fmt.Errorf("unload %s on %s: %s (piggyback also unavailable: %v)", model, cell, why, qerr)
+	}
+	return fmt.Sprintf("%s's admin port did not answer (%s), so the unload of %s is queued for its next announce (≤ one heartbeat).", cell, why, model), nil
 }
 
 func (s *Server) getJSON(ctx context.Context, url string, out any) error {

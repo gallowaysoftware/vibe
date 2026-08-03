@@ -28,10 +28,11 @@ the values are meant to be replaced rather than inherited.
   network, so it is a real host on the network with no port NAT.
 - `front-config.example.yaml` — the peers-only llama-swap config. Copy
   it into the directory you set as `FRONT_CONFIG_DIR` as `config.yaml`
-  and fill in real cell addresses and model lists. The whole directory
-  is mounted (not the file) so `-watch-config` sees atomic-rename
-  (tmp+rename) writes — editing or re-rendering the config reloads it
-  with no container restart and no catalog outage.
+  and fill in real cell addresses and model lists — the bring-up seed
+  only; once fleetd runs with `fleet.front_config` pointing here, it
+  owns this file. The whole directory is mounted (not the file) so
+  `-watch-config` sees atomic-rename (tmp+rename) writes — a re-render
+  reloads the catalog with no container restart and no outage.
 - `.env.example` — copy to `.env`; every `REPLACE-` marker is required.
 
 ## Bring-up order
@@ -72,23 +73,24 @@ otherwise gated, give the peer an `apiKey`.
   when `apiKeys` is set (and deployments like this reference stack run
   default-allow with no keys at all). External exposure goes through
   the reverse-proxy auth layer only.
-- **Reload the front config:** edit/re-render `config.yaml` in
-  `FRONT_CONFIG_DIR`; `-watch-config` picks it up in place — no
-  restart, and the new catalog is live within seconds. Verified on
-  v239: in-flight streams keep flowing on the old server while it
-  drains, but the drain grace is a **hardcoded 30s** — a stream still
-  running 30s after the reload is force-closed (clean EOF, never
-  corrupted bytes). Membership edits are rare; `docker restart` is only
-  needed for flag/image changes.
+- **Reload the front config:** fleetd re-renders and writes
+  `config.yaml` in `FRONT_CONFIG_DIR` atomically; `-watch-config` picks
+  it up in place — no restart, and the new catalog is live within
+  seconds. Verified on v239: in-flight streams keep flowing on the old
+  server while it drains, but the drain grace is a **hardcoded 30s** — a
+  stream still running 30s after the reload is force-closed (clean EOF,
+  never corrupted bytes). `docker restart` is only needed for flag or
+  image changes.
 
 ## Notes
 
-- The per-peer `models:` lists are explicit, so adding a backend def on
-  a cell means adding its id here too. That duplication is why
-  `vibe router render --cell front` (topology.md §3 item 1) is the first
-  build item — once it lands, vibe renders and pushes this config and
-  hand-editing stops. Until then, hand edits at least stop being
-  outages: `-watch-config` reloads in place.
+- The per-peer `models:` lists are DERIVED, not maintained: fleetd
+  renders them from the backend defs plus the presence table and writes
+  this file on every membership transition (C2 built the renderer, C3
+  made presence its trigger). Adding a backend def on a cell is the
+  whole edit — the front's catalog follows on the cell's next announce.
+  Hand edits are an emergency tool only: the next render overwrites
+  them, and `-watch-config` means even that costs no outage.
 - The image floats on `:cpu` by default; pin a digest with `FRONT_IMAGE`
   in `.env` once you have verified a build (see `.env.example`).
 - Cold models "just work" through the front: it relays the owning cell's

@@ -18,8 +18,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
@@ -66,20 +64,13 @@ type RenderLoopConfig struct {
 	WriteFile func(path string, data []byte) error
 }
 
-// renderCounts holds the per-server write counters out-of-line: the
-// Server struct lives in fleetapi.go and this file cannot extend it,
-// and fleet_status needs the flap-storm signal (renders-per-day)
-// without a second ownership of the hub mutex.
-var renderCounts sync.Map // map[*Server]*atomic.Int64
-
 // RenderCount returns how many front-config writes this server's
 // render loop has performed (renders that produced unchanged content
-// don't count — they never touched the watched file).
+// don't count — they never touched the watched file). Atomic, never
+// taken under s.mu, so fleet_status gets the flap-storm signal without
+// a second claim on the hub mutex.
 func (s *Server) RenderCount() int {
-	if c, ok := renderCounts.Load(s); ok {
-		return int(c.(*atomic.Int64).Load())
-	}
-	return 0
+	return int(s.renderWrites.Load())
 }
 
 // StartRenderLoop launches the presence-derived render loop. It
@@ -103,11 +94,8 @@ func (s *Server) StartRenderLoop(cfg RenderLoopConfig) {
 	if cfg.WriteFile == nil {
 		cfg.WriteFile = writeAtomic
 	}
-	counter := new(atomic.Int64)
-	renderCounts.Store(s, counter)
-
 	s.wg.Add(1)
-	go (&renderLoop{srv: s, cfg: cfg, counter: counter, pruned: map[string]bool{}}).run()
+	go (&renderLoop{srv: s, cfg: cfg, pruned: map[string]bool{}}).run()
 }
 
 // renderLoop carries the mutable hysteresis state: the pruned set is
@@ -115,10 +103,9 @@ func (s *Server) StartRenderLoop(cfg RenderLoopConfig) {
 // prune — a cell pruned at prune-time stays pruned until its healthy
 // streak clears, even if a single fresh announce lands first.
 type renderLoop struct {
-	srv     *Server
-	cfg     RenderLoopConfig
-	counter *atomic.Int64
-	pruned  map[string]bool
+	srv    *Server
+	cfg    RenderLoopConfig
+	pruned map[string]bool
 }
 
 func (rl *renderLoop) run() {
@@ -255,8 +242,7 @@ func (rl *renderLoop) renderPass() error {
 	if err := rl.cfg.WriteFile(rl.cfg.FrontConfigPath, []byte(content)); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
-	rl.counter.Add(1)
-	slog.Info("front config re-rendered from presence", "path", rl.cfg.FrontConfigPath, "renders", rl.counter.Load())
+	slog.Info("front config re-rendered from presence", "path", rl.cfg.FrontConfigPath, "renders", rl.srv.renderWrites.Add(1))
 	return nil
 }
 
@@ -418,14 +404,31 @@ func (rl *renderLoop) classOf(cell string) fleetcfg.Class {
 
 // writeAtomic replaces path via a tmp file in the SAME directory
 // (rename across filesystems fails, and llama-swap's watcher must only
-// ever see complete configs).
+// ever see complete configs). The mode is set BEFORE the rename: a
+// chmod afterwards leaves a window where the watcher reads a file it
+// cannot open, which is the failure the atomic swap exists to prevent.
 func writeAtomic(path string, data []byte) error {
+	// The front config exists to be READ by another process (llama-swap,
+	// often another user), so CreateTemp's 0600 is wrong here. An
+	// existing file's mode wins — an operator who widened it meant it —
+	// but read bits are forced back on: every fleetd deployed before this
+	// fix left a 0600 file behind, and inheriting THAT mode would keep
+	// the bug alive forever on exactly the boxes that have it.
+	mode := os.FileMode(0o644)
+	if st, err := os.Stat(path); err == nil {
+		mode = st.Mode().Perm() | 0o044
+	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".render-*.tmp")
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
 		return err

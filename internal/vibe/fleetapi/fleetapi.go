@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -138,6 +139,15 @@ type StateSnapshot struct {
 // dead cell can't stall the whole state response.
 const snapshotTimeout = 3 * time.Second
 
+// Drain wait-status values carried in CellDrainResponse.wait_status.
+// They live here rather than in the daemon because the CLI and the MCP
+// facade both render them and neither may import the daemon.
+const (
+	DrainWaitNotRequested      = "not_requested"
+	DrainWaitWaited            = "waited"
+	DrainWaitSkippedNoInflight = "skipped_no_inflight_data"
+)
+
 // Server aggregates the cell registry, the event hub, and the start-duration
 // history. Construct with New, mount with Register, then Start the per-cell
 // watchers; Close is idempotent and required for the SSE handlers to unblock
@@ -174,6 +184,9 @@ type Server struct {
 	intentMu     sync.Mutex
 	lastSeen     map[string]time.Time
 	lastSeenPath string
+	// lastSeenPersisted mirrors what the file already carries, so the
+	// age gate on writes needs no stat.
+	lastSeenPersisted map[string]time.Time
 
 	// leases is the advisory-lease store (C2): keyed by
 	// cell\x00model\x00holder, TTL-filtered at read. leaseMu serializes
@@ -193,9 +206,19 @@ type Server struct {
 	// the fallback. commands queues piggyback verbs for the announce
 	// response. renderTrigger coalesces membership transitions for the
 	// presence-derived render loop.
-	presence      map[string]*Presence
-	commands      map[string][]AnnounceCommand
+	presence map[string]*Presence
+	commands map[string][]AnnounceCommand
+	// cmdInflight holds each cell's handed-over-but-unacked command
+	// batch (at-least-once delivery, retired by a higher announce seq).
+	cmdInflight   map[string]inflightCommands
 	renderTrigger chan string
+	// stalenessTick paces stalenessLoop. Injectable so tests drive the
+	// REAL loop instead of re-implementing its predicate — a test-file
+	// copy of that predicate hid a disabled production one.
+	stalenessTick time.Duration
+	// renderWrites counts the presence-derived render loop's front-config
+	// writes (fleet_status's flap-storm signal).
+	renderWrites atomic.Int64
 
 	// inFlight tracks each cell's current in-flight request count as
 	// reported by llama-swap's inflight SSE frames. The bool in the
@@ -252,30 +275,32 @@ type Options struct {
 // daemonInfo is called per snapshot so the daemon half is never stale.
 func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Options) *Server {
 	return &Server{
-		cells:         cells,
-		daemonInfo:    daemonInfo,
-		hist:          loadHistory(historyPath),
-		snapClient:    &http.Client{Timeout: snapshotTimeout},
-		streamClient:  &http.Client{},
-		baseBackoff:   500 * time.Millisecond,
-		maxBackoff:    30 * time.Second,
-		subs:          map[chan Event]struct{}{},
-		cellUp:        map[string]bool{},
-		lastState:     map[string]string{},
-		startedAt:     map[string]time.Time{},
-		inFlight:      map[string]int{},
-		inFlightSeen:  map[string]bool{},
-		modelActivity: map[string]time.Time{},
-
+		cells:              cells,
+		daemonInfo:         daemonInfo,
+		hist:               loadHistory(historyPath),
+		snapClient:         &http.Client{Timeout: snapshotTimeout},
+		streamClient:       &http.Client{},
+		baseBackoff:        500 * time.Millisecond,
+		maxBackoff:         30 * time.Second,
+		subs:               map[chan Event]struct{}{},
+		cellUp:             map[string]bool{},
+		lastState:          map[string]string{},
+		startedAt:          map[string]time.Time{},
+		inFlight:           map[string]int{},
+		inFlightSeen:       map[string]bool{},
+		modelActivity:      map[string]time.Time{},
 		lastInFlightModels: map[string][]string{},
 		started:            time.Now(),
 		presence:           map[string]*Presence{},
 		commands:           map[string][]AnnounceCommand{},
+		cmdInflight:        map[string]inflightCommands{},
 		renderTrigger:      make(chan string, 64),
+		stalenessTick:      5 * time.Second,
 		intents:            loadIntents(opts.IntentPath),
 		intentPath:         opts.IntentPath,
 		lastSeen:           loadLastSeen(opts.LastSeenPath),
 		lastSeenPath:       opts.LastSeenPath,
+		lastSeenPersisted:  map[string]time.Time{},
 		leases:             loadLeases(opts.LeasePath),
 		leasePath:          opts.LeasePath,
 		done:               make(chan struct{}),
@@ -309,6 +334,10 @@ func (s *Server) Start() {
 		s.wg.Add(1)
 		go s.watchCell(c)
 	}
+	// Add before the go, like every sibling loop: adding inside the
+	// goroutine races Close's Wait, which can return while the loop still
+	// touches the hub.
+	s.wg.Add(1)
 	go s.stalenessLoop()
 }
 

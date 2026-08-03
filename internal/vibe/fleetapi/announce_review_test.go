@@ -22,14 +22,22 @@ func TestResumeViaAnnounceEndToEnd(t *testing.T) {
 	if _, err := s.SetIntent("laptop", "drained", "gaming", ""); err != nil {
 		t.Fatal(err)
 	}
-	// 2. Cell drains and echoes drained (newer): request resolved.
+	// 2. Cell drains and echoes drained (newer): the request is resolved
+	// and BECOMES the record — it stops being pending, and the reason
+	// survives the ack (C6 M6; deleting it here erased the WHY one
+	// heartbeat after every drain).
 	drainTime := time.Now().UTC()
 	postAnnounce(t, ts, `{"v":1,"cell":"laptop","seq":1,"intent":{"state":"drained","since":"`+drainTime.Format(time.RFC3339Nano)+`"}}`)
 	s.mu.Lock()
-	_, drainedThere := s.intents["laptop"]
+	rec, drainedThere := s.intents["laptop"]
 	s.mu.Unlock()
-	if drainedThere {
-		t.Fatal("drained request survived its echo")
+	if !drainedThere || rec.State != "drained" || rec.Reason != "gaming" || !rec.Since.Equal(drainTime) {
+		t.Fatalf("resolved drain record = %+v (present=%v)", rec, drainedThere)
+	}
+	drainedSnap := CellSnapshot{Name: "laptop"}
+	s.decorate(&drainedSnap)
+	if drainedSnap.IntentPending {
+		t.Fatal("a complied drain still reads as a pending request")
 	}
 
 	// 3. Resume request: stored as a serving request (announcing cell).

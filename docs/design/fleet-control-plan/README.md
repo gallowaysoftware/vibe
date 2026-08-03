@@ -11,9 +11,9 @@ to be implementable on its own after that.
 | [C1](c1-observe-intent.md) | Observe + intent: fleetd, cells registry, `vibe cell status/await`, MCP facade | ~450 lines | C0 optional | merged (#19) |
 | [C2](c2-actuate.md) | Actuate: drain/resume RPCs, wake, `render --cell front` | ~450 lines | C1 | merged (#20) |
 | [C3](c3-announce.md) | The inversion: announce heartbeats, presence-derived render | ~600 lines | C2 | merged (#21) |
-| [C4](c4-comfort.md) | Comfort: warm targets, warm schedules, the fleet page | ~300 lines | C3 (a read-only page could ship after C1; its action buttons need C2, fingerprint badges C3) | in review (#22 open) |
-| [C5](c5-land-c4.md) | Land C4: the adversarial review pass C4 never got | ~400 lines | C4 | executed, in review (#22 open) |
-| [C6](c6-substrate-repair.md) | Substrate repair: the C1–C3 findings against merged code | ~500 lines | independent of C5 | planned |
+| [C4](c4-comfort.md) | Comfort: warm targets, warm schedules, the fleet page | ~300 lines | C3 (a read-only page could ship after C1; its action buttons need C2, fingerprint badges C3) | merged (#22) |
+| [C5](c5-land-c4.md) | Land C4: the adversarial review pass C4 never got | ~400 lines | C4 | merged (#22) |
+| [C6](c6-substrate-repair.md) | Substrate repair: the C1–C3 findings against merged code | ~500 lines | independent of C5 | executed + reviewed, in review |
 | [C7a](c7a-usage-ledger.md) | The usage ledger: tokens per cell, per model, per day | ~710 lines | C4 | planned |
 | [C7b](c7b-savings-screen.md) | The savings screen: what the fleet didn't spend | ~690 lines + ~100 KB data | C7a, C5 | planned |
 

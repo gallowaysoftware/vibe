@@ -32,17 +32,33 @@ func probeTCP(ctx context.Context, addr string) bool {
 	return true
 }
 
+// lastSeenPersistAge bounds how stale the on-disk last_seen may be. A
+// per-heartbeat write would rewrite the whole file every 15s per cell
+// for a value that only matters once the cell is GONE; a never-written
+// one loses the sighting entirely for exactly the no-inbound-port cells
+// presence exists for.
+const lastSeenPersistAge = 5 * time.Minute
+
 // noteSighting records a fresh observation of a cell being reachable,
-// from any source (watcher connect, on-demand snapshot). Persisted only
-// on transitions and first sightings — the value that matters is the
-// last sighting of a cell that is now absent, and a steadily-up cell's
-// "last seen" is always "now" anyway.
+// from any source (watcher connect, on-demand snapshot, announce).
 func (s *Server) noteSighting(name string) {
+	s.recordSighting(name, time.Now().UTC(), false)
+}
+
+// recordSighting updates last_seen and persists it when the on-disk copy
+// has aged out, on the first sighting, or when the caller knows this is a
+// transition (returned/stale/withdrawn) — the moments whose timestamp a
+// human actually reads.
+func (s *Server) recordSighting(name string, at time.Time, transition bool) {
 	s.mu.Lock()
-	_, known := s.lastSeen[name]
-	s.lastSeen[name] = time.Now().UTC()
+	s.lastSeen[name] = at
+	written, known := s.lastSeenPersisted[name]
+	due := transition || !known || at.Sub(written) >= lastSeenPersistAge
+	if due {
+		s.lastSeenPersisted[name] = at
+	}
 	s.mu.Unlock()
-	if !known {
+	if due {
 		s.persistLastSeen()
 	}
 }
@@ -122,10 +138,16 @@ func (s *Server) decorate(snap *CellSnapshot) {
 				}
 			}
 		} else {
-			snap.Reachable = false
-			if p.Withdrawn {
+			// Staleness retires the ANNOUNCE as evidence — not the probe.
+			// An announcer that died (crashed unit, rotated token ⇒ 401,
+			// renamed cell ⇒ 400) leaves a healthy cell serving; forcing
+			// Reachable=false here reported it OFF/AWAY? beside its own
+			// live model list and parked `vibe cell await --up` forever.
+			snap.Reachable = probeOK
+			if p.Withdrawn && !probeOK {
 				// A clean withdraw is the box saying goodbye: the host
-				// itself is gone for our purposes.
+				// itself is gone for our purposes. A probe that just
+				// answered outranks the goodbye — it is demonstrably here.
 				snap.HostReachable = new(bool)
 				*snap.HostReachable = false
 			}
@@ -160,7 +182,16 @@ func resolveIntent(intent Intent, hasIntent bool, echo *AnnounceIntent) (eff Int
 	effective := intent
 	servingRequest := hasIntent && intent.State == "serving"
 	if echo != nil && echo.State == "drained" && (!hasIntent || intent.Since.Before(echo.Since) || servingRequest) {
-		effective = Intent{State: "drained", Since: echo.Since}
+		eff := Intent{State: "drained", Since: echo.Since}
+		if hasIntent && intent.State == "drained" {
+			// The WHY is axis 2's whole point (design §4): reason and ETA
+			// live only in the registry entry, so rebuilding a bare intent
+			// here erased them the moment the cell acked — and again on
+			// every fleetd restart of a locally-drained cell.
+			eff.Reason = intent.Reason
+			eff.ETA = intent.ETA
+		}
+		effective = eff
 		hasIntent = true
 		servingRequest = false
 	}

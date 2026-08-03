@@ -19,6 +19,15 @@ import (
 // fleet_status; they never block anything. TTL expiry is enforced at read
 // time, so a crashed consumer cannot haunt the fleet.
 
+// Bounds on the lease store. A lease is a HOLD a running consumer
+// refreshes, so a week is already generous; the count cap keeps a
+// runaway producer from turning an advisory note into an unbounded file
+// that every status surface then renders.
+const (
+	maxLeaseTTL = 168 * time.Hour
+	maxLeases   = 512
+)
+
 // Lease is one advisory hold, keyed by (cell, model, holder) with
 // last-write-wins per key (re-POST to refresh).
 type Lease struct {
@@ -86,6 +95,12 @@ func (s *Server) handleLeaseMutate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cell, model, and holder are required", http.StatusBadRequest)
 		return
 	}
+	for label, v := range map[string]string{"model": req.Model, "holder": req.Holder, "note": req.Note} {
+		if err := clean(label, v); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 	known := false
 	for _, c := range s.cells {
 		if c.Name == req.Cell {
@@ -116,6 +131,10 @@ func (s *Server) handleLeaseMutate(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `ttl must be a positive Go duration string (e.g. "2h")`, http.StatusBadRequest)
 			return
 		}
+		if ttl > maxLeaseTTL {
+			http.Error(w, fmt.Sprintf("ttl exceeds the %s bound (a lease is a hold, not a reservation)", maxLeaseTTL), http.StatusBadRequest)
+			return
+		}
 		l := Lease{Cell: req.Cell, Model: req.Model, Holder: req.Holder, Note: req.Note,
 			ExpiresAt: time.Now().UTC().Add(ttl)}
 		next[leaseKey(l.Cell, l.Model, l.Holder)] = l
@@ -133,6 +152,15 @@ func (s *Server) handleLeaseMutate(w http.ResponseWriter, r *http.Request) {
 		if !l.ExpiresAt.After(now) {
 			delete(next, k)
 		}
+	}
+	// The cap applies AFTER the prune, so expired entries never count
+	// against a live holder. A store this size is a runaway producer, not
+	// a fleet. It gates GROWTH only: refusing a DELETE because the store
+	// is full contradicts its own message and leaves an over-cap file
+	// (a downgrade, a hand edit) with no way back down.
+	if r.Method == http.MethodPost && len(next) > maxLeases {
+		http.Error(w, fmt.Sprintf("lease store is full (%d active); expire or delete some first", maxLeases), http.StatusConflict)
+		return
 	}
 
 	if err := saveLeases(s.leasePath, next); err != nil {

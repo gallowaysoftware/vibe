@@ -2,7 +2,9 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -201,16 +203,22 @@ func TestCellAwaitViaEventsStream(t *testing.T) {
 	}
 }
 
-func TestCellAwaitUnknownCell(t *testing.T) {
+// TestCellAwaitUnknownCellFailsFast: fleetd answering "no such cell" can
+// only be a typo, and `--timeout 0` is the documented overnight-batch
+// idiom — so it errors immediately instead of parking until reboot. The
+// 3s context is the regression detector: the old behaviour waits it out.
+func TestCellAwaitUnknownCellFailsFast(t *testing.T) {
 	ts := cannedFleetd(t, func() fleetapi.StateSnapshot { return statusState() })
 	var out bytes.Buffer
 	target, terr := resolveFleetd(ts.URL)
 	if terr != nil {
 		t.Fatal(terr)
 	}
-	err := awaitCell(t.Context(), &out, target, "nope", true, 200*time.Millisecond, 50*time.Millisecond)
-	if err == nil || !strings.Contains(err.Error(), "timeout") {
-		t.Errorf("unknown cell: got %v, want timeout (unknown cells keep waiting, not silently succeeding)", err)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	err := awaitCell(ctx, &out, target, "nope", true, 0, 50*time.Millisecond)
+	if !errors.Is(err, errUnknownCell) {
+		t.Errorf("unknown cell: got %v, want errUnknownCell", err)
 	}
 }
 

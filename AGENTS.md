@@ -309,6 +309,72 @@ optional.)
     when ZERO defs loaded and a non-empty front config exists — the
     guard is INPUT-side, since a peerless render is legitimate when
     every def is unassigned or every roaming cell is pruned.
+- **Fleet substrate repair (fleet-control C6).** Landed against merged
+  C1–C5 code; each of these is a promise the substrate broke, so do not
+  undo them:
+  - **Staleness retires the ANNOUNCE, never the probe** (presence.go's
+    not-fresh branch): a cell whose announcer died while llama-swap
+    keeps serving stays `reachable`, or `vibe cell await --up` parks
+    forever against a working cell. The withdraw's
+    `HostReachable=false` is gated on the probe failing too.
+  - **A complied drain becomes the RECORD, not a deletion**
+    (recordAnnounce): a newer echo that AGREES re-stores the intent with
+    its reason/ETA and `Since == echo.Since` exactly — that equality is
+    what keeps it from reading as a pending request — and `decorate`
+    carries reason/ETA through the echo override. Deleting it erased
+    axis 2's headline feature one heartbeat after every ack. A diverging
+    echo still clears the request.
+  - **Every intent writer clones → persists → swaps.** A failed write
+    must leave memory unresolved so the next heartbeat retries. But a
+    DISABLED store is not a failed write: the RESOLUTION writers (the
+    announce conflict rule, `pruneStaleServingRequest`) go through
+    `persistIntents`, which no-ops when `intentPath == ""` — with no file
+    there is nothing for memory to diverge from, and gating on a persist
+    that can never succeed stops the C3 conflict rule dead (a resume at
+    the box would stay pending forever, and C4's warm loops read
+    `s.intents` regardless). `setIntent` still calls `saveIntents`
+    directly: an operator POST to a disabled store must fail loudly.
+  - **Fingerprint drift is a render trigger**
+    (`modelFingerprintChanged`): enforcement only runs inside a render
+    pass, so a steady-state `flags_sha256` change with a stable id set
+    raised nothing. Compare the HASH only — `State` flips constantly.
+  - **`flags_sha256` home-folding is box-independent**
+    (router/fingerprint.go `normalizeHome`): local `$HOME`,
+    `/home/<user>/`, `/root/`, `/Users/<user>/`. It fails OPEN by
+    design — a false mismatch yanks a working model.
+  - **Piggyback commands are at-least-once**, retired only by an
+    announce with a higher seq; `QueueCommand` validates the model
+    against what the cell ANNOUNCED. A seq reset (cell reboot)
+    redelivers rather than pinning the slot.
+  - **`CellDrainResponse.wait_status`** reports `not_requested` /
+    `waited` / `skipped_no_inflight_data`, rendered by the CLI and the
+    MCP tool: an operator who asked for quiescence and silently got a
+    stream-cancelling drain must be able to see it. The local cell key
+    is `Daemon.localCellKey()`, not the literal `"front"` — on a
+    fleetd-role box that literal reads another cell's counter.
+  - **`Client.Withdraw`** is the `withdrawing` producer (daemon
+    shutdown + `vibe fleet announce`). It does NOT persist: a
+    `withdrawing` echo read back at next boot would lie or erase a live
+    drain. **Stop the loop before withdrawing** — the daemon holds the
+    loop's own cancel + done channel (`Daemon.withdrawAnnounce`) because
+    the shutdown-RPC path never cancels `ctx`, and a heartbeat still in
+    flight lands after the goodbye and resurrects the cell. `seq` is
+    mutex-owned for the same reason.
+  - **The piggyback fallback is for DELIVERY failures.** `unload_model`
+    queues on a transport error or a 5xx; a 4xx is llama-swap answering
+    and stays an error — telling an agent a refused verb is "queued for
+    the next announce" is worse than failing.
+  - **`writeAtomic` forces the front config's read bits back on**
+    (`perm | 0o044`): every fleetd deployed before C6 left a 0600 file,
+    and inheriting that mode would keep the bug alive on exactly the
+    boxes that have it. Operator widening still survives.
+  - `vibe cell await` fails fast on an unknown cell (`errUnknownCell`)
+    and keeps retrying transport errors; `--timeout 0` stays the
+    overnight-batch idiom.
+  - `model_classes` has a closed vocabulary (`fleetcfg.ModelClasses`);
+    `warm_model` skips `chat`-class entries and still refuses the rest.
+    hosts.yaml tolerates fleet.md's top-level `hosts:` inventory as an
+    inert key — `KnownFields(true)` stays on.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.

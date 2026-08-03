@@ -158,26 +158,31 @@ func (s *Server) handleAnnounce(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// maxAnnounceFieldLen bounds announce-supplied strings; they land in
-// fleet_status (human and agent contexts alike).
+// maxAnnounceFieldLen bounds off-box strings; they land in fleet_status
+// (human and agent contexts alike).
 const maxAnnounceFieldLen = 256
+
+// clean rejects an off-box string that is oversized or carries control
+// characters. Shared by every ingest that feeds a status surface — the
+// announce endpoint sanitised exactly this class of data while the lease
+// endpoint, whose entries print in the same tables, did not.
+func clean(label, v string) error {
+	if len(v) > maxAnnounceFieldLen {
+		return fmt.Errorf("%s exceeds %d bytes", label, maxAnnounceFieldLen)
+	}
+	for _, r := range v {
+		if !unicode.IsPrint(r) {
+			return fmt.Errorf("%s contains a control character", label)
+		}
+	}
+	return nil
+}
 
 // validateAnnounce enforces enum values and field hygiene (length,
 // control characters) on the parts of an announce that flow into
 // status surfaces. Unknown FIELDS stay tolerated (the version-skew
 // rule); unknown VALUES of defined fields are rejected.
 func validateAnnounce(req *AnnounceRequest) error {
-	clean := func(label, v string) error {
-		if len(v) > maxAnnounceFieldLen {
-			return fmt.Errorf("%s exceeds %d bytes", label, maxAnnounceFieldLen)
-		}
-		for _, r := range v {
-			if !unicode.IsPrint(r) {
-				return fmt.Errorf("%s contains a control character", label)
-			}
-		}
-		return nil
-	}
 	if req.Intent != nil {
 		switch req.Intent.State {
 		case "serving", "drained", "withdrawing":
@@ -272,9 +277,17 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	// model triggers a re-render exactly like a cell that left or
 	// returned.
 	modelChanged := modelSetChanged(prevModels, req.Models)
+	// Fingerprint drift with a stable id set is NOT a membership change,
+	// but enforcement runs ONLY inside a render pass — so without this
+	// second trigger a strict mismatch on an always_on or opportunistic
+	// cell (exactly where strict embed defs live) raised nothing until
+	// some unrelated transition happened, against the design's "a
+	// mismatch always raises a loud event". Two independent reasons to
+	// re-render, one trigger.
+	fingerprintChanged := modelFingerprintChanged(prevModels, req.Models)
 	withdrawn := p.Withdrawn
 	s.mu.Unlock()
-	if modelChanged {
+	if modelChanged || fingerprintChanged {
 		s.noteRenderTrigger(req.Cell)
 	}
 
@@ -298,44 +311,62 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	// the request) or the human at the box overrode it (echo diverges).
 	// Only an older echo hands the request back as desired_intent.
 	var desired *Intent
-	var intentSnapshot map[string]Intent
+	var next map[string]Intent
 	s.intentMu.Lock()
 	s.mu.Lock()
 	req2, hasRequest := s.intents[req.Cell]
 	echo := p.IntentEcho
 	if hasRequest && echo != nil && !echo.Since.IsZero() && req2.Since.Before(echo.Since) {
-		delete(s.intents, req.Cell)
-		intentSnapshot = make(map[string]Intent, len(s.intents))
+		next = make(map[string]Intent, len(s.intents))
 		for k, v := range s.intents {
-			intentSnapshot[k] = v
+			next[k] = v
+		}
+		if req2.State == "drained" && echo.State == "drained" {
+			// The cell complied, so the request BECOMES the record —
+			// deleting it dropped the operator's reason and ETA one
+			// heartbeat after every ack. Since is the echo's exactly, so
+			// decorate's echo override never fires and the entry can't
+			// read as a pending request.
+			next[req.Cell] = Intent{State: "drained", Reason: req2.Reason, ETA: req2.ETA, Since: echo.Since}
+		} else {
+			delete(next, req.Cell)
 		}
 	} else if hasRequest {
 		d := req2
 		desired = &d
 	}
 	s.mu.Unlock()
-	if intentSnapshot != nil {
-		if err := saveIntents(s.intentPath, intentSnapshot); err != nil {
-			slog.Warn("intent persist failed (stale-request drop)", "err", err)
+	if next != nil {
+		// Clone → persist → swap (C1's discipline): a failed write must not
+		// leave memory claiming a resolution the file doesn't carry, or a
+		// restart resurrects a resolved drain. The unresolved request stays
+		// in memory and the next heartbeat retries.
+		if err := s.persistIntents(next); err != nil {
+			slog.Warn("intent persist failed (echo resolution); retrying next announce", "cell", req.Cell, "err", err)
+		} else {
+			s.mu.Lock()
+			s.intents = next
+			s.mu.Unlock()
 		}
 	}
 	s.intentMu.Unlock()
 
-	// Presence makes last_seen truth: a fresh announce IS a sighting.
-	s.mu.Lock()
-	s.lastSeen[req.Cell] = now
-	s.mu.Unlock()
+	// Presence makes last_seen truth: a fresh announce IS a sighting. The
+	// persist is age-gated with a forced write on transitions — a cell
+	// that only ever announces (no inbound port, C3's whole destination)
+	// otherwise had NO persisted sighting at all.
+	s.recordSighting(req.Cell, now, firstEver || wasStaleOrWithdrawn || withdrawn)
 
 	for _, ev := range events {
 		s.publish(ev)
 	}
 
-	cmds := s.drainCommands(req.Cell)
+	cmds := s.drainCommands(req.Cell, req.Seq)
 	resp := &AnnounceResponse{IntervalS: intervalS, DesiredIntent: desired, Commands: cmds}
 
-	// withdrawn was assigned in the first critical section; reading the
-	// shared pointer's field here is safe from torn state but the
-	// trigger fires on the value as of this announce by construction.
+	// withdrawn is the value captured under the first critical section, not
+	// a re-read of the shared pointer: the trigger fires on the state as of
+	// THIS announce even if a concurrent one has already moved p.
 	if withdrawn || firstEver || wasStaleOrWithdrawn {
 		s.noteRenderTrigger(req.Cell)
 	} else if s.cellClass(req.Cell) == string(fleetcfg.ClassRoaming) {
@@ -363,17 +394,46 @@ func (s *Server) pruneStaleServingRequest(cell string) {
 		s.mu.Unlock()
 		return
 	}
-	delete(s.intents, cell)
-	snap := make(map[string]Intent, len(s.intents))
+	next := make(map[string]Intent, len(s.intents))
 	for k, v := range s.intents {
-		snap[k] = v
+		next[k] = v
 	}
+	delete(next, cell)
 	s.mu.Unlock()
-	if err := saveIntents(s.intentPath, snap); err != nil {
+	// Clone → persist → swap: mutating in place first means a failed write
+	// resurrects the dropped request on the next restart.
+	if err := s.persistIntents(next); err != nil {
 		slog.Warn("serving-request prune persist failed", "cell", cell, "err", err)
 		return
 	}
+	s.mu.Lock()
+	s.intents = next
+	s.mu.Unlock()
 	slog.Info("dropped unresolvable serving request (cell went stale)", "cell", cell)
+}
+
+// modelFingerprintChanged reports whether any model's announced
+// flags_sha256 changed for an id the cell was ALREADY announcing. Only
+// the hash is compared: State flips running/stopped constantly, so
+// folding the whole model struct in would turn every load and TTL
+// unload into a membership transition.
+func modelFingerprintChanged(prev, next []AnnounceModel) bool {
+	if len(prev) == 0 || len(next) == 0 {
+		return false
+	}
+	prevSHA := make(map[string]string, len(prev))
+	for _, m := range prev {
+		prevSHA[m.ID] = m.FlagsSHA256
+	}
+	for _, m := range next {
+		if m.FlagsSHA256 == "" {
+			continue
+		}
+		if was, known := prevSHA[m.ID]; known && was != m.FlagsSHA256 {
+			return true
+		}
+	}
+	return false
 }
 
 // modelSetChanged compares model id SETS (order-insensitive). Announces
@@ -409,14 +469,58 @@ func (s *Server) cellClass(name string) string {
 	return ""
 }
 
-// drainCommands returns (and clears) the queued piggyback commands for
-// a cell — verbs fleetd couldn't deliver interactively.
-func (s *Server) drainCommands(cell string) []AnnounceCommand {
+// drainCommands hands the cell its queued piggyback verbs. Delivery is
+// AT-LEAST-ONCE, keyed on the announce seq: the batch moves to an
+// in-flight slot stamped with this announce's seq instead of being
+// deleted, and only an announce with a HIGHER seq — proof the cell read
+// the response it was attached to — retires it. Deleting at hand-off
+// lost the batch whenever the response never arrived. Both verbs
+// (unload/warm) are idempotent, so a duplicate is harmless.
+func (s *Server) drainCommands(cell string, seq uint64) []AnnounceCommand {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if pend, ok := s.cmdInflight[cell]; ok {
+		if seq > pend.seq {
+			delete(s.cmdInflight, cell)
+		} else {
+			// Same seq (a retried POST) or lower (seq resets per cell
+			// boot): redeliver and re-stamp, so a reboot can't pin the
+			// slot forever.
+			pend.seq = seq
+			s.cmdInflight[cell] = pend
+			return pend.cmds
+		}
+	}
 	cmds := s.commands[cell]
+	if len(cmds) == 0 {
+		return nil
+	}
 	delete(s.commands, cell)
+	s.cmdInflight[cell] = inflightCommands{seq: seq, cmds: cmds}
 	return cmds
+}
+
+// QueueCommand piggybacks a verb for a cell that fleetd cannot reach
+// interactively. The model is validated against what the cell ANNOUNCED
+// (the comment on queueCommand's bound demands it): a typo must fail at
+// the caller rather than sit in a queue nothing will ever execute.
+func (s *Server) QueueCommand(cell string, cmd AnnounceCommand) error {
+	switch cmd.Verb {
+	case "unload", "warm":
+	default:
+		return fmt.Errorf("unknown verb %q (want unload or warm)", cmd.Verb)
+	}
+	p := s.PresenceFor(cell)
+	if p == nil || !p.Announcing {
+		return fmt.Errorf("cell %q has never announced; nothing would collect the command", cell)
+	}
+	for _, m := range p.Models {
+		if m.ID == cmd.Model {
+			s.queueCommand(cell, cmd)
+			return nil
+		}
+	}
+	return fmt.Errorf("cell %q does not announce a model %q", cell, cmd.Model)
 }
 
 // maxQueuedCommands bounds the per-cell command queue; beyond it the
@@ -471,9 +575,8 @@ func (s *Server) presenceFor(cell string) *Presence { return s.PresenceFor(cell)
 // keeps running underneath — presence wins while fresh, probes are the
 // fallback for non-announcing cells.
 func (s *Server) stalenessLoop() {
-	s.wg.Add(1)
 	defer s.wg.Done()
-	tick := time.NewTicker(5 * time.Second)
+	tick := time.NewTicker(s.stalenessTick)
 	defer tick.Stop()
 	for {
 		select {
@@ -509,4 +612,11 @@ func (s *Server) noteRenderTrigger(cell string) {
 		// A pending trigger already covers this cell — coalescing is
 		// the point (flap storms render at most the cap).
 	}
+}
+
+// inflightCommands is one cell's handed-over command batch, stamped with
+// the announce seq it rode out on.
+type inflightCommands struct {
+	seq  uint64
+	cmds []AnnounceCommand
 }

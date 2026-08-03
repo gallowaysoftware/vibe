@@ -23,9 +23,10 @@ import (
 type fakeFleetd struct {
 	srv *httptest.Server
 
-	mu      sync.Mutex
-	intents []map[string]any
-	leases  string
+	mu       sync.Mutex
+	intents  []map[string]any
+	leases   string
+	onIntent func()
 }
 
 func newFakeFleetd(t *testing.T) *fakeFleetd {
@@ -37,7 +38,11 @@ func newFakeFleetd(t *testing.T) *fakeFleetd {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.mu.Lock()
 		f.intents = append(f.intents, body)
+		hook := f.onIntent
 		f.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
 		_ = json.NewEncoder(w).Encode(map[string]string{"state": "ok"})
 	})
 	mux.HandleFunc("GET /api/fleet/leases", func(w http.ResponseWriter, r *http.Request) {
@@ -87,9 +92,13 @@ func TestCellDrain_ReportThenCmdThenIntent(t *testing.T) {
 		mu.Unlock()
 	}
 
-	// Fake llama-swap with two residents.
+	// Fake llama-swap with two residents. Only the FIRST /running is the
+	// pre-drain report; a later probe (a watcher, a retry) must not
+	// re-order the recorded sequence.
+	var reportOnce sync.Once
 	llama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/running" {
+			reportOnce.Do(func() { mark("report") })
 			_, _ = w.Write([]byte(`{"running":[{"model":"qwen","state":"ready"},{"model":"old","state":"stopped"}]}`))
 			return
 		}
@@ -107,9 +116,9 @@ func TestCellDrain_ReportThenCmdThenIntent(t *testing.T) {
 		mark("cmd:" + cmd)
 		return "", nil
 	})
-	// Wrap the fleetd to note intent arrival order.
-	origSrv := fleetd.srv
-	_ = origSrv
+	fleetd.mu.Lock()
+	fleetd.onIntent = func() { mark("intent") }
+	fleetd.mu.Unlock()
 
 	resp, err := d.CellDrain(context.Background(), connect.NewRequest(&vibev1.CellDrainRequest{Reason: "gaming", Eta: "23:00"}))
 	if err != nil {
@@ -140,13 +149,9 @@ func TestCellDrain_ReportThenCmdThenIntent(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(order) != 1 || order[0] != "cmd:true" {
-		t.Errorf("order = %v", order)
+	if want := []string{"report", "cmd:true", "intent"}; strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Errorf("order = %v, want %v", order, want)
 	}
-	// Intent must come after the command: the fake fleetd recorded it
-	// after SetCellCmdRunner returned (both are synchronous in the RPC),
-	// which the intents slice ordering confirms by existing at all only
-	// post-success — a failed command writes nothing (next test).
 }
 
 func TestCellDrain_RemoteInvocationWritesNoIntent(t *testing.T) {
@@ -382,5 +387,142 @@ func TestCellDrain_WaitTimeoutSkipsDrain(t *testing.T) {
 	}
 	if cmdRan {
 		t.Error("drain command ran after a failed quiescence wait")
+	}
+}
+
+// newFleetForDrain builds a bare fleet server (no watchers) so the drain
+// path has an InFlight source that has never seen a frame.
+func newFleetForDrain(t *testing.T, cells ...fleetapi.Cell) *fleetapi.Server {
+	t.Helper()
+	f := fleetapi.New(cells, filepath.Join(t.TempDir(), "hist.json"),
+		func() fleetapi.DaemonInfo { return fleetapi.DaemonInfo{} }, fleetapi.Options{})
+	t.Cleanup(f.Close)
+	return f
+}
+
+// TestCellDrain_WaitSkipIsReported pins MIN-N: --wait against a cell that
+// never reported in-flight counts drains immediately — and the response
+// SAYS the wait was skipped instead of only logging it.
+func TestCellDrain_WaitSkipIsReported(t *testing.T) {
+	d := drainDaemon(t, Config{CellCmds: CellCmds{Drain: "true"}})
+	ran := false
+	d.SetCellCmdRunner(func(ctx context.Context, cmd string) (string, error) { ran = true; return "", nil })
+	d.fleet = newFleetForDrain(t, fleetapi.Cell{Name: "front", URL: "http://127.0.0.1:1"})
+
+	resp, err := d.CellDrain(context.Background(), connect.NewRequest(&vibev1.CellDrainRequest{WaitSeconds: 30}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.Msg.GetWaitStatus(); got != fleetapi.DrainWaitSkippedNoInflight {
+		t.Errorf("wait_status = %q, want %q", got, fleetapi.DrainWaitSkippedNoInflight)
+	}
+	if !ran {
+		t.Error("drain command never ran")
+	}
+}
+
+// TestCellDrain_WaitNotRequestedIsReported: no --wait, no warning to
+// relay — the field says so rather than being absent and ambiguous.
+func TestCellDrain_WaitNotRequestedIsReported(t *testing.T) {
+	d := drainDaemon(t, Config{CellCmds: CellCmds{Drain: "true"}})
+	d.SetCellCmdRunner(func(ctx context.Context, cmd string) (string, error) { return "", nil })
+	d.fleet = newFleetForDrain(t, fleetapi.Cell{Name: "front", URL: "http://127.0.0.1:1"})
+
+	resp, err := d.CellDrain(context.Background(), connect.NewRequest(&vibev1.CellDrainRequest{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.Msg.GetWaitStatus(); got != fleetapi.DrainWaitNotRequested {
+		t.Errorf("wait_status = %q, want %q", got, fleetapi.DrainWaitNotRequested)
+	}
+}
+
+// TestLocalCellKey pins MIN-N's other half: on a fleetd-role box the
+// local cell is addressed by its configured NAME, since that registry
+// holds every cell in hosts.yaml and "front" is a different one.
+func TestLocalCellKey(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+		want string
+	}{
+		{name: "plain cell daemon", cfg: Config{}, want: "front"},
+		{name: "cell daemon with a name", cfg: Config{Fleet: FleetConfig{Cell: "gpu-cell"}}, want: "front"},
+		{name: "fleetd role", cfg: Config{FleetRegistry: true, Fleet: FleetConfig{Cell: "hum"}}, want: "hum"},
+		{name: "fleetd role without a name", cfg: Config{FleetRegistry: true}, want: "front"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := drainDaemon(t, tc.cfg)
+			if got := d.localCellKey(); got != tc.want {
+				t.Errorf("localCellKey = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWithdrawAnnounceStopsLoopFirst pins the shutdown ORDER: the
+// goodbye is the last thing fleetd hears. Cancelling the loop and
+// withdrawing concurrently let an in-flight heartbeat land after the
+// withdraw and resurrect the cell — and on the shutdown-RPC path (ctx
+// still alive) the loop never stopped at all.
+func TestWithdrawAnnounceStopsLoopFirst(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	var mu sync.Mutex
+	var states []string
+	reg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req fleetapi.AnnounceRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		state := "serving"
+		if req.Intent != nil {
+			state = req.Intent.State
+		}
+		mu.Lock()
+		states = append(states, state)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"interval_s":1}`))
+	}))
+	t.Cleanup(reg.Close)
+
+	d := drainDaemon(t, Config{Fleet: FleetConfig{Cell: "gpu-cell", RegistryURL: reg.URL}})
+	// A context that stays ALIVE, like the shutdown-RPC path: only the
+	// loop's own cancel may stop it.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := d.startAnnounce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(states)
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the announce loop never announced")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	d.withdrawAnnounce()
+
+	mu.Lock()
+	got := append([]string(nil), states...)
+	mu.Unlock()
+	if len(got) == 0 || got[len(got)-1] != "withdrawing" {
+		t.Fatalf("announce states = %v, want the withdraw last", got)
+	}
+
+	// The loop is stopped, so nothing can undo the goodbye.
+	time.Sleep(1500 * time.Millisecond)
+	mu.Lock()
+	after := append([]string(nil), states...)
+	mu.Unlock()
+	if len(after) != len(got) {
+		t.Errorf("announces continued after the withdraw: %v", after)
 	}
 }

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -30,7 +31,11 @@ import (
 // a local render) so fingerprints cover exactly what this box serves.
 func (d *Daemon) startAnnounce(ctx context.Context) error {
 	defs, err := router.LoadDefs(paths.BackendsDir())
-	if err != nil && !os.IsNotExist(err) {
+	// errors.Is, not os.IsNotExist: LoadDefs WRAPS the ReadDir error and
+	// os.IsNotExist predates unwrapping, so a box with no backends dir
+	// (defless catalog, or defs not yet converged) failed to start its
+	// announce loop at all and went invisible to fleetd.
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("load backend defs: %w", err)
 	}
 	var cellDefs []*profile.BackendDef
@@ -58,9 +63,51 @@ func (d *Daemon) startAnnounce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The loop gets its own cancel and a done channel: shutdown must be
+	// able to STOP it before withdrawing. Deriving from ctx alone was not
+	// enough — the shutdown-RPC path never cancels ctx, so the loop kept
+	// heartbeating (and leaked) past Run's return, and a heartbeat still
+	// in flight lands after the goodbye and resurrects the cell.
+	annCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
 	d.announce = ann
-	go func() { _ = ann.Run(ctx) }()
+	d.announceCancel = cancel
+	d.announceDone = done
+	go func() {
+		defer close(done)
+		_ = ann.Run(annCtx)
+	}()
 	return nil
+}
+
+// announceStopTimeout bounds the shutdown wait for the announce loop. It
+// exits on ctx cancellation, so this only covers a request already in
+// flight — an unreachable registry must not hold shutdown open.
+const announceStopTimeout = 3 * time.Second
+
+// withdrawAnnounce stops the announce loop and sends the goodbye
+// heartbeat, in that order: a heartbeat racing the withdraw would land
+// after it and re-announce the cell as serving. Best-effort throughout —
+// fleetd's staleness is the fallback for every failure here.
+func (d *Daemon) withdrawAnnounce() {
+	if d.announce == nil {
+		return
+	}
+	if d.announceCancel != nil {
+		d.announceCancel()
+	}
+	if d.announceDone != nil {
+		select {
+		case <-d.announceDone:
+		case <-time.After(announceStopTimeout):
+			slog.Info("announce loop still running at shutdown; withdrawing anyway")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := d.announce.Withdraw(ctx); err != nil {
+		slog.Info("withdraw announce failed; fleetd will prune on staleness", "err", err)
+	}
 }
 
 // fleetVersions fills the announce versions block: the vibe build and

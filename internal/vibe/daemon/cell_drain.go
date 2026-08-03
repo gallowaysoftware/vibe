@@ -20,6 +20,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 	vibev1 "github.com/gallowaysoftware/vibe/proto/vibe/v1"
 )
 
@@ -65,7 +66,7 @@ func (d *Daemon) CellDrain(ctx context.Context, req *connect.Request[vibev1.Cell
 	report := &vibev1.CellDrainResponse{ActiveLeases: []*vibev1.LeaseView{}}
 	report.ResidentModels = d.probeResidentModels(ctx)
 	if d.fleet != nil {
-		if n, ok := d.fleet.InFlight("front"); ok {
+		if n, ok := d.fleet.InFlight(d.localCellKey()); ok {
 			n64 := int64(n)
 			report.InFlightRequests = &n64
 		}
@@ -86,14 +87,18 @@ func (d *Daemon) CellDrain(ctx context.Context, req *connect.Request[vibev1.Cell
 	// drain), so "let the stream finish" only happens BEFORE the unit
 	// stop. Without --wait the drain is immediate and in-flight work
 	// dies truncated — the report above is what warned the caller.
+	waitStatus := fleetapi.DrainWaitNotRequested
 	if req.Msg.WaitSeconds > 0 {
 		drainCtx, cancel := context.WithTimeout(ctx, time.Duration(req.Msg.WaitSeconds)*time.Second)
 		defer cancel()
-		if err := d.awaitQuiescence(drainCtx); err != nil {
+		status, err := d.awaitQuiescence(drainCtx)
+		if err != nil {
 			return nil, connect.NewError(connect.CodeDeadlineExceeded,
 				fmt.Errorf("in-flight requests did not finish within %ds: %v (drain NOT run; retry with a longer wait or none)", req.Msg.WaitSeconds, err))
 		}
+		waitStatus = status
 	}
+	report.WaitStatus = &waitStatus
 
 	vctx, cancelVerb := verbCtx(ctx)
 	defer cancelVerb()
@@ -134,33 +139,50 @@ func (d *Daemon) CellResume(ctx context.Context, _ *connect.Request[vibev1.CellR
 }
 
 // awaitQuiescence polls the fleet watcher's inflight tracking until the
-// local cell reports zero in-flight requests. The count is SSE-driven
-// (llama-swap's inflight frames), so an unreachable or non-reporting
-// cell reads as "never reported" — that case returns immediately:
-// draining a cell we can't measure is the operator's explicit choice
-// (they set --wait; the absence of data must not hang the verb).
-func (d *Daemon) awaitQuiescence(ctx context.Context) error {
+// local cell reports zero in-flight requests, returning what became of
+// the wait. The count is SSE-driven (llama-swap's inflight frames), so an
+// unreachable or non-reporting cell reads as "never reported" — that case
+// returns immediately: draining a cell we can't measure is the operator's
+// explicit choice (they set --wait; the absence of data must not hang the
+// verb). It is REPORTED rather than only logged, because otherwise an
+// operator who asked for quiescence gets a stream-cancelling drain and no
+// sign the wait never happened.
+func (d *Daemon) awaitQuiescence(ctx context.Context) (string, error) {
 	if d.fleet == nil {
-		return nil
+		return fleetapi.DrainWaitSkippedNoInflight, nil
 	}
-	if _, reported := d.fleet.InFlight("front"); !reported {
-		slog.Info("no inflight report from the local cell; proceeding without waiting")
-		return nil
+	cell := d.localCellKey()
+	if _, reported := d.fleet.InFlight(cell); !reported {
+		slog.Info("no inflight report from the local cell; proceeding without waiting", "cell", cell)
+		return fleetapi.DrainWaitSkippedNoInflight, nil
 	}
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
-		n, _ := d.fleet.InFlight("front")
+		n, _ := d.fleet.InFlight(cell)
 		if n == 0 {
-			return nil
+			return fleetapi.DrainWaitWaited, nil
 		}
 		slog.Info("drain waiting for in-flight requests", "in_flight", n)
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return "", ctx.Err()
 		case <-tick.C:
 		}
 	}
+}
+
+// localCellKey is the registry key for THIS box's cell in the fleet
+// server's per-cell maps. On an ordinary cell daemon the registry holds
+// exactly one entry keyed fleetcfg.FrontCell (its own llama-swap). On a
+// fleetd-role box the registry holds every cell in hosts.yaml, so the
+// local one must be addressed by its configured name or the drain reads a
+// DIFFERENT cell's in-flight counter.
+func (d *Daemon) localCellKey() string {
+	if d.cfg.FleetRegistry && d.cfg.Fleet.Cell != "" {
+		return d.cfg.Fleet.Cell
+	}
+	return fleetcfg.FrontCell
 }
 
 // verbCtx builds the context every cell verb runs under: detached from

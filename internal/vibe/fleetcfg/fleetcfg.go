@@ -97,6 +97,13 @@ type File struct {
 	// misconfigured, and a chat completion would load it for nothing.
 	// Membership is config; the class of a model is part of it.
 	ModelClasses map[string]string `yaml:"model_classes,omitempty"`
+	// Hosts is fleet.md §4.1's SSH/systemd host inventory: parsed and
+	// ignored here so one hosts.yaml can carry both schemas. Declared
+	// because KnownFields(true) would otherwise abort fleetd startup on
+	// a file that is perfectly valid for the other reader — and turning
+	// strict decoding off instead would let a typo'd cell key silently
+	// degrade display semantics, which is what it exists to prevent.
+	Hosts map[string]yaml.Node `yaml:"hosts,omitempty"`
 }
 
 // Load reads paths.HostsFile(). A missing file is not an error — it
@@ -180,8 +187,32 @@ func (f *File) validate() error {
 		if strings.TrimSpace(class) == "" {
 			return fmt.Errorf("model_classes.%s: empty class", id)
 		}
+		// Closed vocabulary: warm_model's guard keys on the class, so a
+		// typo'd "embeddings" would silently stop gating an embed id.
+		if !KnownModelClass(class) {
+			return fmt.Errorf("model_classes.%s: class %q is not one of %s", id, class, strings.Join(ModelClasses, ", "))
+		}
 	}
 	return nil
+}
+
+// ModelClasses is the closed vocabulary of model_classes values.
+// ModelClassChat is the one class warm_model may still poke — it is a
+// chat model, which is exactly what a warm request loads.
+var ModelClasses = []string{ModelClassChat, "embed", "rerank", "classify", "stt", "tts", "vision"}
+
+// ModelClassChat marks an id that is a normal chat model; listing it
+// documents ownership without gating the warm path.
+const ModelClassChat = "chat"
+
+// KnownModelClass reports whether class is in the closed vocabulary.
+func KnownModelClass(class string) bool {
+	for _, c := range ModelClasses {
+		if c == class {
+			return true
+		}
+	}
+	return false
 }
 
 // expandTilde expands a leading "~/" against the user's home directory.

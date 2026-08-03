@@ -80,8 +80,14 @@ type CellCmds struct {
 // resets on cell reboot; fleetd's staleness derives from received_at,
 // never from seq or the cell's clock).
 type Client struct {
-	cfg    Config
-	http   *http.Client
+	cfg  Config
+	http *http.Client
+	// seq and authRejected are touched by Run's loop AND by Withdraw,
+	// which a shutdown path can call while the loop is still in flight —
+	// so they are mutex-owned rather than loop-owned. seq under seqMu
+	// (never taken with mu held) so a goodbye can't hand fleetd the same
+	// seq as the heartbeat it races.
+	seqMu  sync.Mutex
 	seq    uint64
 	rng    *rand.Rand
 	logger *slog.Logger
@@ -89,12 +95,17 @@ type Client struct {
 	// each successful announce).
 	lastInterval time.Duration
 
+	// persistMu serialises (mutate, write) on the intent echo file so the
+	// announce loop's reconcile and a concurrent local verb can't land in
+	// the reverse order on disk. Always taken OUTSIDE mu.
+	persistMu   sync.Mutex
 	mu          sync.Mutex
 	localIntent fleetapi.AnnounceIntent
 	// registryFailureLogged gates log-once-then-quiet on registry
-	// outages; reset on the next successful announce. authRejected
-	// marks when the failure was auth (401), not reachability — the
-	// once-log says which.
+	// outages; reset on the next successful announce (loop-owned).
+	// authRejected marks when the failure was auth (401), not
+	// reachability — the once-log says which; it is written by post, so
+	// it belongs to mu like everything else Withdraw can touch.
 	registryFailureLogged bool
 	authRejected          bool
 	// deflessWarned gates log-once for catalog models with no def.
@@ -150,12 +161,31 @@ func loadLocalIntent(path string) fleetapi.AnnounceIntent {
 // SetLocalIntent records a local operator intent change (drain/resume
 // verbs at the box) and persists it — the human-at-the-box side of the
 // conflict rule. The daemon calls this from CellDrain/CellResume.
+//
+// persistMu is held across (mutate, write): unique tmp names stop the
+// file from tearing but not the last-writer-wins inversion between the
+// announce loop's reconcile and a concurrent drain RPC, which would
+// leave the file claiming the state the box is NOT in.
 func (c *Client) SetLocalIntent(state string) error {
+	c.persistMu.Lock()
+	defer c.persistMu.Unlock()
 	c.mu.Lock()
 	c.localIntent = fleetapi.AnnounceIntent{State: state, Since: time.Now().UTC()}
 	in := c.localIntent
 	c.mu.Unlock()
 	return c.saveLocalIntent(in)
+}
+
+func (c *Client) setAuthRejected(v bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.authRejected = v
+}
+
+func (c *Client) authWasRejected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.authRejected
 }
 
 // LocalIntent returns the cell's current intent (echo side).
@@ -165,6 +195,10 @@ func (c *Client) LocalIntent() fleetapi.AnnounceIntent {
 	return c.localIntent
 }
 
+// saveLocalIntent writes the echo file atomically. The tmp name is
+// UNIQUE (os.CreateTemp), not a fixed ".tmp": two writers sharing one
+// tmp path interleave into a torn file that then fails to parse, which
+// normalizes to "serving" and silently cancels a drain.
 func (c *Client) saveLocalIntent(in fleetapi.AnnounceIntent) error {
 	if c.cfg.IntentPath == "" {
 		return nil
@@ -173,14 +207,33 @@ func (c *Client) saveLocalIntent(in fleetapi.AnnounceIntent) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(c.cfg.IntentPath), 0o755); err != nil {
+	dir := filepath.Dir(c.cfg.IntentPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp := c.cfg.IntentPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	tmp, err := os.CreateTemp(dir, ".intent-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, c.cfg.IntentPath)
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Chmod(tmpPath, 0o600); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, c.cfg.IntentPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 // Run loops until ctx dies: announce, sleep the registry's interval
@@ -193,7 +246,7 @@ func (c *Client) Run(ctx context.Context) error {
 		err := c.announceOnce(ctx)
 		if err != nil {
 			if !c.registryFailureLogged {
-				if c.authRejected {
+				if c.authWasRejected() {
 					c.logger.Warn("announce failed (auth rejected — check the token file); quiet retry with backoff", "err", err)
 				} else {
 					c.logger.Warn("announce failed (registry unreachable?); quiet retry with backoff", "err", err)
@@ -213,7 +266,7 @@ func (c *Client) Run(ctx context.Context) error {
 			}
 			continue
 		}
-		c.authRejected = false
+		c.setAuthRejected(false)
 		if c.registryFailureLogged {
 			c.logger.Info("announce succeeded; registry reachable again")
 			c.registryFailureLogged = false
@@ -243,10 +296,9 @@ func (c *Client) announceOnce(ctx context.Context) error {
 	req := fleetapi.AnnounceRequest{
 		V:      fleetapi.AnnounceVersion,
 		Cell:   c.cfg.Cell,
-		Seq:    c.seq,
+		Seq:    c.nextSeq(),
 		Intent: c.intentEcho(),
 	}
-	c.seq++
 	models, err := c.gatherModels(ctx)
 	if err != nil {
 		// A llama-swap that's down answers nothing: the cell still
@@ -262,14 +314,63 @@ func (c *Client) announceOnce(ctx context.Context) error {
 		req.Versions = c.cfg.Versions()
 	}
 
-	body, err := json.Marshal(req)
+	out, err := c.post(ctx, req)
 	if err != nil {
 		return err
+	}
+	if out.IntervalS > 0 {
+		c.lastInterval = time.Duration(out.IntervalS) * time.Second
+	}
+	c.reconcile(ctx, out)
+	return nil
+}
+
+// Withdraw announces a clean undock: one final heartbeat carrying
+// intent {withdrawing, now}. It is what makes the design's prune-without-
+// waiting-out-stale_after reachable — otherwise the state has validators
+// and consumers but no producer, and an undocking laptop's catalog
+// entries linger until staleness catches up.
+//
+// It deliberately does NOT persist the state and does NOT reconcile the
+// response: the echo file is the cell's durable drained-vs-serving
+// record, and a "withdrawing" entry read back at next boot would either
+// lie (the box is here) or erase a drain the operator still means.
+//
+// Callers must stop Run first (the daemon cancels the loop and waits):
+// a heartbeat still in flight lands AFTER the goodbye and resurrects the
+// cell. The locking here only makes the overlap safe, not correct.
+func (c *Client) Withdraw(ctx context.Context) error {
+	req := fleetapi.AnnounceRequest{
+		V:      fleetapi.AnnounceVersion,
+		Cell:   c.cfg.Cell,
+		Seq:    c.nextSeq(),
+		Intent: &fleetapi.AnnounceIntent{State: "withdrawing", Since: time.Now().UTC()},
+	}
+	_, err := c.post(ctx, req)
+	return err
+}
+
+// nextSeq hands out this heartbeat's seq. Monotonic per boot: fleetd
+// retires a piggybacked command batch only on a HIGHER seq, so two
+// announces sharing one number would redeliver it forever.
+func (c *Client) nextSeq() uint64 {
+	c.seqMu.Lock()
+	defer c.seqMu.Unlock()
+	seq := c.seq
+	c.seq++
+	return seq
+}
+
+// post sends one announce and decodes the response.
+func (c *Client) post(ctx context.Context, req fleetapi.AnnounceRequest) (*fleetapi.AnnounceResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
 	}
 	url := strings.TrimRight(c.cfg.RegistryURL, "/") + "/api/fleet/announce"
 	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	hreq.Header.Set("Content-Type", "application/json")
 	if tok := c.token(); tok != "" {
@@ -277,26 +378,22 @@ func (c *Client) announceOnce(ctx context.Context) error {
 	}
 	resp, err := c.http.Do(hreq)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized {
-		c.authRejected = true
-		return fmt.Errorf("announce: HTTP 401 (auth rejected — check the token file: %s)", c.tokenProblem())
+		c.setAuthRejected(true)
+		return nil, fmt.Errorf("announce: HTTP 401 (auth rejected — check the token file: %s)", c.tokenProblem())
 	}
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("announce: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return nil, fmt.Errorf("announce: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	var out fleetapi.AnnounceResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
-		return fmt.Errorf("decode announce response: %w", err)
+		return nil, fmt.Errorf("decode announce response: %w", err)
 	}
-	if out.IntervalS > 0 {
-		c.lastInterval = time.Duration(out.IntervalS) * time.Second
-	}
-	c.reconcile(ctx, &out)
-	return nil
+	return &out, nil
 }
 
 // intentEcho builds the intent block for this heartbeat.

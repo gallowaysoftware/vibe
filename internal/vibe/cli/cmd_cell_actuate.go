@@ -42,7 +42,8 @@ func cellDrainCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "drain [cell] [-- command...]",
 		Short: "Reclaim a cell (stop its serving stack) with a pre-drain report.",
-		Long: "Drain reclaims a cell: its unit stops (llama-swap drains in-flight first), " +
+		Long: "Drain reclaims a cell: its unit stops (llama-swap's SIGTERM cancels in-flight " +
+			"streams immediately — only --wait lets generations finish first), " +
 			"requests for its ids fail as UPSTREAM_DOWN, and intent (reason/eta) is recorded. " +
 			"With --until-exit, drain, run the command, then resume deterministically on its exit " +
 			"— the gaming-session wrapper. Resume is never triggered by a GPU-idle heuristic.",
@@ -183,13 +184,21 @@ func resolveCellClient(cell string) (*vibeclient.Client, string, error) {
 	if c.DaemonURL == "" {
 		return nil, "", fmt.Errorf("cells.%s has no daemon_url in hosts.yaml — the remote verb needs the cell's control plane", cell)
 	}
+	// Precedence here deliberately DIFFERS from fleetmcp's (actuate.go):
+	// for a human typing one command an explicit $VIBE_TOKEN must win, and
+	// an unreadable token_file is a hard error rather than a silent
+	// fallthrough to the local token — that swallow turned a typo'd path
+	// into an opaque 401 from the remote cell.
 	token := strings.TrimSpace(os.Getenv("VIBE_TOKEN"))
-	if token == "" && c.TokenFile != "" {
-		if data, err := os.ReadFile(c.TokenFile); err == nil {
-			token = strings.TrimSpace(string(data))
+	switch {
+	case token != "":
+	case c.TokenFile != "":
+		data, err := os.ReadFile(c.TokenFile)
+		if err != nil {
+			return nil, "", fmt.Errorf("read cells.%s.token_file: %w", cell, err)
 		}
-	}
-	if token == "" {
+		token = strings.TrimSpace(string(data))
+	default:
 		token = vibeclient.ResolveToken()
 	}
 	return vibeclient.NewWithToken(c.DaemonURL, token), cell, nil
@@ -282,6 +291,13 @@ func printDrainReport(out io.Writer, name string, r *vibev1.CellDrainResponse) {
 	}
 	if r.InFlightRequests != nil {
 		fmt.Fprintf(out, "  in-flight requests at drain: %d\n", *r.InFlightRequests)
+	}
+	switch {
+	case r.WaitStatus == nil || *r.WaitStatus == fleetapi.DrainWaitNotRequested:
+	case *r.WaitStatus == fleetapi.DrainWaitSkippedNoInflight:
+		fmt.Fprintln(out, "  warning: --wait was SKIPPED (the cell never reported in-flight counts) — the drain ran immediately and cancelled any streams")
+	case *r.WaitStatus == fleetapi.DrainWaitWaited:
+		fmt.Fprintln(out, "  waited for in-flight requests to reach zero before draining")
 	}
 	if r.LeasesUnavailable {
 		fmt.Fprintln(out, "  warning: lease list unavailable — stranded-work check could not run")
