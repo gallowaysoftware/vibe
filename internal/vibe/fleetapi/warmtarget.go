@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -298,13 +299,28 @@ func (s *Server) warmCtx(d time.Duration) (context.Context, context.CancelFunc) 
 	}
 }
 
-// restore fires the warm and marks the state.
+// restore fires the warm and marks the state. A warm fleetd cannot
+// deliver through the front falls back to the announce piggyback; the
+// state stays "waiting" either way, because a QUEUED warm has not
+// restored anything yet and LastRestore must not claim it did.
 func (s *Server) restore(t WarmTarget, st *warmTargetState, cfg warmLoopConfig, why string) {
 	ctx, cancel := s.warmCtx(warmTimeout)
 	defer cancel()
-	if err := cfg.warmFn(ctx, cfg.frontURL, t.Model); err != nil {
-		s.setWarmState(st, "waiting", "warm failed: "+err.Error())
-		slog.Warn("warm-target restore failed", "cell", t.Cell, "model", t.Model, "err", err)
+	var err error
+	if s.frontCanRoute(t.Cell) {
+		err = cfg.warmFn(ctx, cfg.frontURL, t.Model)
+	} else {
+		err = fmt.Errorf("cell %q has no front route (announce-only)", t.Cell)
+	}
+	if err != nil {
+		note, qerr := s.queueWarm(t.Cell, t.Model, err)
+		if qerr != nil {
+			s.setWarmState(st, "waiting", "warm failed: "+qerr.Error())
+			slog.Warn("warm-target restore failed", "cell", t.Cell, "model", t.Model, "err", qerr)
+			return
+		}
+		s.setWarmState(st, "waiting", "warm "+note)
+		slog.Info("warm-target restore piggybacked on the announce", "cell", t.Cell, "model", t.Model, "why", why, "err", err)
 		return
 	}
 	slog.Info("warm-target restored", "cell", t.Cell, "model", t.Model, "why", why)
@@ -356,11 +372,80 @@ func warmViaFront(ctx context.Context, frontURL, model string) error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("warm through front: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return &warmHTTPError{Status: resp.StatusCode, Body: strings.TrimSpace(string(b))}
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	return nil
 }
+
+// warmHTTPError is a warm the front ANSWERED with a non-200. It is a
+// type rather than a formatted string so the piggyback fallback below
+// can tell a delivery failure (transport error, 5xx) from a definitive
+// refusal (4xx) — the distinction fleetmcp's unload fallback already
+// draws against a cell's admin port.
+type warmHTTPError struct {
+	Status int
+	Body   string
+}
+
+func (e *warmHTTPError) Error() string {
+	return fmt.Sprintf("warm through front: HTTP %d: %s", e.Status, e.Body)
+}
+
+// definitiveWarmRefusal reports whether the front ANSWERED the warm
+// with a 4xx. Anything else — a transport error, a 5xx, an injected
+// test error — is a failure to DELIVER, which is what the piggyback
+// queue exists for.
+func definitiveWarmRefusal(err error) bool {
+	var he *warmHTTPError
+	if errors.As(err, &he) {
+		return he.Status >= 400 && he.Status < 500
+	}
+	return false
+}
+
+// queueWarm is the warm loops' half of the piggyback producer (C6's
+// MIN-G finished: fleetmcp's unload landed on the C6 branch, these two
+// files were C4's and not on it). It mirrors fleetmcp's queueUnload
+// exactly:
+//
+//   - the model is validated against what the cell ANNOUNCED
+//     (QueueCommand's own rule), so a typo fails here rather than
+//     sitting in a queue nothing will execute;
+//   - a cell that never announces stays an error — nothing would ever
+//     collect the command, and pretending otherwise is worse than
+//     failing;
+//   - a DEFINITIVE 4xx from the front is a real error and is NOT
+//     queued. The front answering "no such model" means the cell will
+//     refuse the same verb identically, and reporting that as "queued
+//     for the next heartbeat" is a lie about a warm that will never
+//     happen.
+//
+// On success it returns the status note; on failure an error naming
+// BOTH the original cause and why the piggyback was unavailable.
+func (s *Server) queueWarm(cell, model string, cause error) (string, error) {
+	if cell == "" {
+		return "", fmt.Errorf("%w (piggyback unavailable: no cell resolved for %s)", cause, model)
+	}
+	if definitiveWarmRefusal(cause) {
+		// Not wrapped with a piggyback note: there is nothing unavailable
+		// here, the front gave an answer.
+		return "", cause
+	}
+	if qerr := s.QueueCommand(cell, AnnounceCommand{Verb: "warm", Model: model}); qerr != nil {
+		return "", fmt.Errorf("%w (piggyback also unavailable: %v)", cause, qerr)
+	}
+	return fmt.Sprintf("queued for %s's next announce (≤ one heartbeat) after the front did not answer: %v", cell, cause), nil
+}
+
+// frontCanRoute reports whether the front could route a warm to this
+// cell at all. The front's peer config is rendered from hosts.yaml
+// (render_loop.go), so a cell fleetd knows only through its announces
+// has no front route — the warm-loop analog of fleetmcp's "cell has no
+// daemon_url", and the case the piggyback queue exists for. Sending the
+// warm anyway would earn a definitive 404 from the front and, by the
+// rule above, correctly refuse the queue for the one cell that needs it.
+func (s *Server) frontCanRoute(cell string) bool { return s.cellURL(cell) != "" }
 
 // warmStatus is the fleet_status surface for the warm loops.
 type warmStatus struct {

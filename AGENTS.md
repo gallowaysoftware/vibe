@@ -360,10 +360,21 @@ optional.)
     the shutdown-RPC path never cancels `ctx`, and a heartbeat still in
     flight lands after the goodbye and resurrects the cell. `seq` is
     mutex-owned for the same reason.
-  - **The piggyback fallback is for DELIVERY failures.** `unload_model`
-    queues on a transport error or a 5xx; a 4xx is llama-swap answering
-    and stays an error — telling an agent a refused verb is "queued for
-    the next announce" is worse than failing.
+  - **The piggyback fallback is for DELIVERY failures.** Three
+    producers, one rule. `unload_model` (fleetmcp) queues on a transport
+    error or a 5xx from the cell's admin port; the warm-target restore
+    and the warm-schedule fire (`fleetapi.queueWarm`) queue a `warm`
+    when the front cannot deliver, or when the cell has **no front
+    route at all** — the front's peers are rendered from `hosts.yaml`,
+    so a cell known only through its announces is the warm-loop analog
+    of "no daemon_url" and is queued without a pointless round trip. In
+    every case a **4xx is the far side answering** and stays an error:
+    telling an agent a refused verb is "queued for the next announce"
+    is worse than failing. That decision needs a status, so
+    `warmViaFront` returns a typed `*warmHTTPError` — do not collapse
+    it back into a formatted string. A QUEUED warm never stamps
+    `last_restore`/`last_fire`; those are records of a warm that
+    happened.
   - **`writeAtomic` forces the front config's read bits back on**
     (`perm | 0o044`): every fleetd deployed before C6 left a 0600 file,
     and inheriting that mode would keep the bug alive on exactly the

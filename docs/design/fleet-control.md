@@ -1,11 +1,12 @@
 # Fleet control: node state, intent, and the control plane
 
-Status: IMPLEMENTED THROUGH C4 (2026-08-03). C0–C3 are merged on `main`
-(#18, #19, #20, #21); C4 is in flight on `feat/c4-fleet-comfort` (PR #22)
-together with [C5](fleet-control-plan/c5-land-c4.md), the review pass
-that lands it. C5–C7 in
-[fleet-control-plan/](fleet-control-plan/) carry the remaining work;
-that README's status column is the authoritative per-phase state.
+Status: MERGED THROUGH C7b (2026-08-03). Every phase C0–C7b is on `main`
+(#18–#25), plus one post-merge reconciliation PR for the three items no
+single phase branch could reach. **Merged is not live-gated:** C5's,
+C6's, C7a's and C7b's live gates need real cells and were NOT run — the
+phase docs and the README's status column say per phase which gates are
+mechanical (green, repeated under `-race`) and which are still owed.
+That README's status column is the authoritative per-phase state.
 
 Synthesized from a five-reader research pass
 (the three design docs, this codebase, the private house repo's ops

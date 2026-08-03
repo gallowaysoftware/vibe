@@ -302,16 +302,35 @@ func (s *Server) evalScheduleEntry(e WarmScheduleEntry, spec cronSpec, st *warmS
 
 	fired := false
 	if note == "" {
-		ctx, cancel := s.warmCtx(warmTimeout)
-		err := warmFn(ctx, frontURL, e.Model)
-		cancel()
-		if err != nil {
-			note = "warm failed: " + err.Error()
-			slog.Warn("warm schedule fire failed", "cron", e.Cron, "model", e.Model, "err", err)
+		var err error
+		if cell == "" || s.frontCanRoute(cell) {
+			// cell == "" is the front-only alias: the front IS its home,
+			// so the front warm is the only channel it has.
+			ctx, cancel := s.warmCtx(warmTimeout)
+			err = warmFn(ctx, frontURL, e.Model)
+			cancel()
 		} else {
+			err = fmt.Errorf("cell %q has no front route (announce-only)", cell)
+		}
+		// The failure path is the piggyback fallback (C6 MIN-G's
+		// remaining half). `fired` stays FALSE when it queues: a queued
+		// warm has not warmed anything, and LastFire is the record of a
+		// warm that actually happened.
+		qnote, qerr := "", error(nil)
+		if err != nil {
+			qnote, qerr = s.queueWarm(cell, e.Model, err)
+		}
+		switch {
+		case err == nil:
 			fired = true
 			note = "warmed" + unguarded
 			slog.Info("warm schedule fired", "cron", e.Cron, "model", e.Model)
+		case qerr != nil:
+			note = "warm failed: " + qerr.Error()
+			slog.Warn("warm schedule fire failed", "cron", e.Cron, "model", e.Model, "err", qerr)
+		default:
+			note = "warm " + qnote
+			slog.Info("warm schedule piggybacked on the announce", "cron", e.Cron, "model", e.Model, "cell", cell, "err", err)
 		}
 	}
 

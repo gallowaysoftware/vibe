@@ -204,9 +204,11 @@ cells:
 	resp = req(http.MethodGet, "http://"+httpAddr+"/ui/fleet", "", "")
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
-	t.Logf("page response: status=%d headers=%v bodylen=%d", resp.StatusCode, resp.Header, len(body))
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "/api/fleet/state") {
-		t.Errorf("page: HTTP %d, want 200 with the page", resp.StatusCode)
+		// Body length is the half that separates the two failure shapes:
+		// gated (401/403, tiny body) versus served-but-wrong (200 carrying
+		// something that is not the page).
+		t.Errorf("page: HTTP %d, %d body bytes, want 200 with the page", resp.StatusCode, len(body))
 	}
 	// The exemption is exact-match and GET-only, evaluated before mux
 	// path-cleaning. Pin the boundary so nobody "hardens" it into a
