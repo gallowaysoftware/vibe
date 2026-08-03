@@ -9,9 +9,9 @@ Gate results (live, reference fleet):
 1. **Render-parity: PASS.** A fixture of the live fleet's defs (7
    cell-assigned LLM defs + laptop def + unassigned cloud peer, the
    house hosts.yaml) rendered a front config semantically identical to
-   the hand-maintained one: same peer set (localmodel 9 models incl.
-   the alias union, laptop-m3pro, kimi), same proxy URLs, same
-   `${env.MOONSHOT_API_KEY}` macro. Authorship can flip to the
+   the hand-maintained one: same peer set (gpu-cell 9 models incl.
+   the alias union, laptop, <cloud-peer>), same proxy URLs, same
+   `${env.<CLOUD>_API_KEY}` macro. Authorship can flip to the
    renderer whenever the house wants (canonical def checkout is the
    remaining piece, C0 item 4).
 2. **Drain gate: PASS with a design correction.** The doc's assumption

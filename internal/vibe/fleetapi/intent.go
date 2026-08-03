@@ -158,6 +158,25 @@ func loadIntents(path string) map[string]Intent {
 	return intents
 }
 
+// persistIntents is saveIntents for the RESOLUTION writers (the announce
+// conflict rule, the stale-serving prune), whose clone→persist→swap must
+// still swap when no store is configured. A disabled store is not a
+// failed write: there is no file for memory to diverge from and no
+// restart to resurrect a resolved drain, so gating the swap on a persist
+// that can NEVER succeed would stop the C3 conflict rule dead — a resume
+// performed at the box would leave the request pending forever, and the
+// C4 warm loops read s.intents whether or not a store exists.
+//
+// setIntent deliberately keeps calling saveIntents directly: an operator
+// POST to a disabled store must still fail loudly rather than record an
+// intent nothing will remember.
+func (s *Server) persistIntents(next map[string]Intent) error {
+	if s.intentPath == "" {
+		return nil
+	}
+	return saveIntents(s.intentPath, next)
+}
+
 // saveIntents writes the store atomically (unique tmp file + rename in the
 // same directory) so a crash mid-write never leaves a truncated intent
 // file and concurrent writers can't interleave into one tmp name.

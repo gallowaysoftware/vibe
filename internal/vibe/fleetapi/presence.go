@@ -154,11 +154,31 @@ func (s *Server) decorate(snap *CellSnapshot) {
 		}
 	}
 
-	// Effective intent: the registry REQUEST unless the cell's echo is
-	// newer (the conflict rule — the box you're standing at is always
-	// right). A drained echo with no registry request is intent too
-	// (the cell declared it locally). A serving-state entry is a resume
-	// REQUEST, not a display intent (serving is the default state).
+	eff, hasEff, pending := resolveIntent(intent, hasIntent, echo)
+	if hasEff {
+		in := eff
+		snap.Intent = &in
+	}
+	snap.IntentPending = pending
+	if hasLS {
+		t := ls
+		snap.LastSeen = &t
+	}
+	snap.Leases = leases
+	snap.Display = displayState(snap.HostReachable, snap.Reachable, snap.Intent)
+}
+
+// resolveIntent is the declared-intent axis in one place: the registry
+// REQUEST unless the cell's echo is newer (the conflict rule — the box
+// you're standing at is always right). A drained echo with no registry
+// request is intent too (the cell declared it locally). A serving-state
+// entry is a resume REQUEST, not a display intent (serving is the
+// default state). ok=false means "serving"; pending marks a request the
+// cell hasn't caught up to — requested, not truth.
+//
+// Shared with the C4 warm loops, which must skip a drained cell whether
+// the drain was requested through fleetd or performed at the box.
+func resolveIntent(intent Intent, hasIntent bool, echo *AnnounceIntent) (eff Intent, ok, pending bool) {
 	effective := intent
 	servingRequest := hasIntent && intent.State == "serving"
 	if echo != nil && echo.State == "drained" && (!hasIntent || intent.Since.Before(echo.Since) || servingRequest) {
@@ -175,21 +195,25 @@ func (s *Server) decorate(snap *CellSnapshot) {
 		hasIntent = true
 		servingRequest = false
 	}
-	if hasIntent && !servingRequest {
-		in := effective
-		snap.Intent = &in
+	pending = hasIntent && (servingRequest || (intent.State == "drained" && (echo == nil || echo.Since.Before(intent.Since))))
+	if !hasIntent || servingRequest {
+		return Intent{}, false, pending
 	}
-	if hasIntent && (servingRequest || (intent.State == "drained" && (echo == nil || echo.Since.Before(intent.Since)))) {
-		// Pending: a request the cell hasn't caught up to — requested,
-		// not truth.
-		snap.IntentPending = true
+	return effective, true, pending
+}
+
+// effectiveIntent resolves one cell's declared intent from the stores.
+func (s *Server) effectiveIntent(cell string) (Intent, bool) {
+	s.mu.Lock()
+	intent, hasIntent := s.intents[cell]
+	var echo *AnnounceIntent
+	if p := s.presence[cell]; p != nil && p.Announcing && p.IntentEcho != nil {
+		e := *p.IntentEcho
+		echo = &e
 	}
-	if hasLS {
-		t := ls
-		snap.LastSeen = &t
-	}
-	snap.Leases = leases
-	snap.Display = displayState(snap.HostReachable, snap.Reachable, snap.Intent)
+	s.mu.Unlock()
+	eff, ok, _ := resolveIntent(intent, hasIntent, echo)
+	return eff, ok
 }
 
 // loadLastSeen reads the persisted sightings; missing is empty (a cell

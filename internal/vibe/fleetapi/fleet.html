@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fleet</title>
+<style>
+  :root { --bg: #14171c; --panel: #1c2129; --text: #d8dee6; --dim: #8b95a3; --line: #2a313d;
+          --green: #4caf7d; --amber: #d9a13b; --gray: #6b7686; --red: #d95f5f; --blue: #5b9bd5; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif; }
+  header { display: flex; align-items: baseline; gap: 16px; padding: 14px 20px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  header .meta { color: var(--dim); font-size: 12px; }
+  #token-gate { display: none; margin-left: auto; gap: 8px; }
+  #token-gate input { width: 320px; }
+  main { padding: 16px 20px 40px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--dim); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .cellname { font-weight: 600; }
+  .cellname a { color: var(--blue); text-decoration: none; font-weight: 400; font-size: 12px; margin-left: 8px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+  .b-serving { background: rgba(76,175,125,.15); color: var(--green); }
+  .b-drained { background: rgba(217,161,59,.15); color: var(--amber); }
+  .b-drainedq { background: rgba(217,161,59,.08); color: var(--amber); border: 1px dashed var(--amber); }
+  .b-off { background: rgba(107,118,134,.15); color: var(--gray); }
+  .b-inconsistent { background: rgba(217,95,95,.15); color: var(--red); }
+  .cls { color: var(--dim); font-size: 12px; }
+  .models { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+  .m-ready { color: var(--green); } .m-starting { color: var(--amber); } .m-other { color: var(--dim); }
+  .intent { color: var(--amber); } .lastseen { color: var(--dim); }
+  .leases { color: var(--blue); font-size: 12px; }
+  button { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 4px;
+           padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer; }
+  button:hover { border-color: var(--blue); }
+  button:disabled { opacity: .4; cursor: default; }
+  .actions { white-space: nowrap; }
+  .actions button { margin-right: 4px; }
+  #warmrow { margin: 16px 0; display: flex; gap: 8px; align-items: center; }
+  #warmrow input { background: var(--panel); border: 1px solid var(--line); color: var(--text);
+                   border-radius: 4px; padding: 5px 10px; font: inherit; width: 260px; }
+  #warnings { margin-top: 20px; }
+  .warn-item { background: rgba(217,95,95,.10); border-left: 3px solid var(--red); padding: 8px 12px; margin: 6px 0; font-size: 12px; }
+  .warn-item code { color: var(--red); }
+  #status-line { color: var(--dim); font-size: 12px; margin-top: 18px; }
+  .pending { color: var(--amber); font-style: italic; }
+</style>
+</head>
+<body>
+<header>
+  <h1>fleet</h1>
+  <span class="meta" id="fleetd-addr"></span>
+  <span id="token-gate">
+    <input id="token-input" type="password" placeholder="bearer token (stored in this browser only)">
+    <button onclick="saveToken()">save</button>
+  </span>
+</header>
+<main>
+  <table>
+    <thead><tr><th>cell</th><th>display</th><th>class</th><th>models</th><th>intent / last seen</th><th>actions</th></tr></thead>
+    <tbody id="cells"></tbody>
+  </table>
+  <div id="warmrow">
+    <input id="warm-model" placeholder="model id to warm (JIT is the start verb)">
+    <button onclick="warmModel()">warm</button>
+    <span class="meta">warm goes through the front; ETA from start history</span>
+  </div>
+  <div id="warnings"></div>
+  <div id="status-line"></div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let token = localStorage.getItem("vibeFleetToken") || "";
+
+function saveToken() {
+  token = $("token-input").value.trim();
+  localStorage.setItem("vibeFleetToken", token);
+  $("token-gate").style.display = "none";
+  boot().catch(() => {});
+}
+if (!token) { $("token-gate").style.display = "flex"; }
+
+function hdrs() { return token ? { "Authorization": "Bearer " + token } : {}; }
+
+async function api(path, opts) {
+  const r = await fetch(path, Object.assign({ headers: hdrs() }, opts || {}));
+  if (r.status === 401) { $("token-gate").style.display = "flex"; throw new Error("401"); }
+  return r;
+}
+
+function rpc(tool, args) {
+  return api("/mcp", {
+    method: "POST",
+    headers: Object.assign({ "Content-Type": "application/json" }, hdrs()),
+    body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method: "tools/call",
+                           params: { name: tool, arguments: args || {} } }),
+  }).then(r => r.json());
+}
+
+function esc(s) { const d = document.createElement("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML; }
+// esc() is a TEXT escaper: it leaves " and ' alone, which is fine for
+// element content and wrong inside an attribute value. Quote-escaping
+// does not belong in esc() itself — its output also feeds textContent,
+// where entities would show up as visible artifacts.
+function attr(s) { return esc(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;"); }
+// A javascript: URL in hosts.yaml would otherwise be a clickable script
+// link; only http(s) origins become hrefs.
+function safeURL(u) { return /^https?:\/\//.test(u || "") ? u : ""; }
+function ago(ts) {
+  if (!ts) return "";
+  const s = Math.max(0, (Date.now() - new Date(ts).getTime()) / 1000 | 0);
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return (s / 60 | 0) + "m ago";
+  if (s < 86400) return (s / 3600 | 0) + "h ago";
+  return (s / 86400 | 0) + "d ago";
+}
+function badgeClass(d) {
+  if (d === "SERVING") return "b-serving";
+  if (d === "DRAINED") return "b-drained";
+  if (d === "DRAINED?") return "b-drainedq";
+  if (d === "INCONSISTENT") return "b-inconsistent";
+  return "b-off";
+}
+function modelSpan(m) {
+  const cls = m.state === "ready" ? "m-ready" : (m.state === "starting" ? "m-starting" : "m-other");
+  return `<span class="${cls}">${esc(m.id)}:${esc(m.state)}</span>`;
+}
+
+async function refresh() {
+  const r = await api("/api/fleet/state");
+  const st = await r.json();
+  render(st);
+}
+
+function render(st) {
+  const tb = $("cells");
+  tb.innerHTML = "";
+  for (const c of st.cells || []) {
+    const tr = document.createElement("tr");
+    const models = (c.models || []).filter(m => m.state && m.state !== "stopped").map(modelSpan).join(" ") ||
+      (c.reachable ? '<span class="m-other">(none resident)</span>' : '<span class="m-other">-</span>');
+    const intentBits = [];
+    if (c.intent) {
+      let t = esc(c.intent.reason || c.intent.state);
+      if (c.intent.eta) t += ", eta " + esc(c.intent.eta);
+      intentBits.push('<span class="intent">intent: ' + t + (c.intent_pending ? ' <span class="pending">(requested, awaiting ack)</span>' : "") + "</span>");
+    } else if (c.intent_pending) {
+      intentBits.push('<span class="intent pending">resume requested, awaiting ack</span>');
+    }
+    if (c.last_seen && !c.reachable) intentBits.push('<span class="lastseen">last seen ' + ago(c.last_seen) + "</span>");
+    const leases = (c.leases || []).map(l => `<div class="leases">${esc(l.holder)} holds ${esc(l.model)}${l.note ? ": " + esc(l.note) : ""}</div>`).join("");
+    const ui = safeURL(c.url);
+    const uiLink = ui ? `<a href="${attr(ui)}/ui" target="_blank" rel="noopener">ui ↗</a>` : "";
+    tr.innerHTML =
+      `<td class="cellname">${esc(c.name)}${uiLink}${leases}</td>` +
+      `<td><span class="badge ${badgeClass(c.display)}">${esc(c.display)}</span></td>` +
+      `<td class="cls">${esc(c.class || "-")}</td>` +
+      `<td class="models">${models}</td>` +
+      `<td>${intentBits.join(" ") || '<span class="lastseen">—</span>'}</td>` +
+      `<td class="actions"></td>`;
+    const actions = tr.querySelector(".actions");
+    const mk = (label, tool, args) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.onclick = () => runTool(b, tool, args);
+      actions.appendChild(b);
+    };
+    mk("drain", "drain_cell", { cell: c.name });
+    mk("resume", "resume_cell", { cell: c.name });
+    if (c.presence || c.class) mk("wake", "wake_cell", { cell: c.name });
+    for (const m of (c.models || []).filter(m => m.state && m.state !== "stopped")) {
+      mk("unload " + m.id, "unload_model", { cell: c.name, model: m.id });
+    }
+    tb.appendChild(tr);
+  }
+  const bits = [];
+  bits.push("generated " + new Date(st.generated_at).toLocaleTimeString());
+  if (st.front_renders != null) bits.push("front renders: " + st.front_renders);
+  if (st.daemon && st.daemon.auth_rejected > 0) bits.push("auth rejections: " + st.daemon.auth_rejected);
+  if (st.warm && (st.warm.targets || []).length) {
+    // textContent below is the safe sink; escaping here would show the
+    // entities as literal text.
+    bits.push("warm targets: " + st.warm.targets.map(t => `${t.model}@${t.cell} ${t.state}`).join(" · "));
+  }
+  if (st.warm && (st.warm.schedule || []).length) {
+    bits.push("schedules: " + st.warm.schedule.map(s =>
+      `${s.model} ${s.cron}${s.next_fire ? " next " + new Date(s.next_fire).toLocaleString() : " (never)"}`).join(" · "));
+  }
+  $("status-line").textContent = bits.join("  ·  ");
+}
+
+async function runTool(btn, tool, args) {
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = "…";
+  try {
+    const r = await rpc(tool, args);
+    const text = (((r.result || {}).content || [])[0] || {}).text || JSON.stringify(r);
+    const isErr = (r.result || {}).isError;
+    flash(btn, old, text.slice(0, 60), isErr);
+  } catch (e) {
+    flash(btn, old, "failed", true);
+  }
+}
+function flash(btn, old, msg, isErr) {
+  btn.textContent = isErr ? "✗" : "✓";
+  btn.title = msg;
+  setTimeout(() => { btn.textContent = old; btn.disabled = false; refresh().catch(() => {}); }, 1500);
+}
+function warmModel() {
+  const id = $("warm-model").value.trim();
+  if (!id) return;
+  runTool(document.querySelector("#warmrow button"), "warm_model", { model: id });
+}
+
+// Live updates: fetch-streamed SSE (EventSource can't carry the bearer header).
+let refreshTimer = 0;
+// boot() can run more than once (a mid-session token rotation: 401 →
+// gate → save → boot). Without these handles each rotation would leave
+// another live reader and another poller behind.
+let pollTimer = 0, streamAbort = null, retryDelay = 0;
+function scheduleRefresh() {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => refresh().catch(() => {}), 300);
+}
+async function streamEvents(signal) {
+  let gated = false;
+  try {
+    const r = await api("/api/fleet/events", { signal });
+    retryDelay = 0;
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        for (const line of frame.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          scheduleRefresh(); // any fleet event nudges a state refresh (debounced)
+          try {
+            const ev = JSON.parse(line.slice(5));
+            if (ev.type === "fleet.fingerprintMismatch") {
+              const d = typeof ev.data === "string" ? JSON.parse(ev.data) : ev.data;
+              const w = document.createElement("div");
+              w.className = "warn-item";
+              w.innerHTML = `fingerprint mismatch: <code>${esc(d.model)}</code> on <b>${esc(d.cell)}</b> ` +
+                            `(${esc(d.mode)}) expected ${esc((d.expected||"").slice(0,12))}… got ${esc((d.got||"").slice(0,12))}…` +
+                            (d.defs_sha ? ` defs ${esc(d.defs_sha)}${d.defs_dirty ? " (dirty)" : ""}` : "");
+              const warns = $("warnings");
+              warns.prepend(w);
+              // A flapping mismatch fires up to once a render; a tab left
+              // open for days must not grow an unbounded DOM.
+              while (warns.childElementCount > 50) warns.lastElementChild.remove();
+            }
+          } catch (e) { /* keepalive / partial */ }
+        }
+      }
+    }
+  } catch (e) {
+    // An aborted stream is this page replacing itself — do not retry it.
+    if (e && e.name === "AbortError") return;
+    // A 401 means the gate is already showing and saveToken() will
+    // re-boot; retrying would re-attack the endpoint with a dead token
+    // every 3s forever.
+    gated = String(e && e.message) === "401";
+  }
+  if (gated || (signal && signal.aborted)) return;
+  retryDelay = retryDelay ? Math.min(retryDelay * 2, 30000) : 3000;
+  setTimeout(() => streamEvents(signal), retryDelay);
+}
+
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh().catch(() => {}); });
+
+async function boot() {
+  $("fleetd-addr").textContent = location.host;
+  if (streamAbort) streamAbort.abort();
+  clearInterval(pollTimer);
+  streamAbort = new AbortController();
+  retryDelay = 0;
+  const signal = streamAbort.signal;
+  await refresh();
+  streamEvents(signal);
+  pollTimer = setInterval(() => refresh().catch(() => {}), 30000);
+}
+if (token) boot().catch(() => {});
+</script>
+</body>
+</html>

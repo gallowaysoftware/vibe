@@ -126,11 +126,20 @@ func writeTokenFile(path, tok string) error {
 // holding a stale token is visible from `vibe cell status` instead of
 // buried in cell-side logs (fleet-control C1).
 //
+// GET /ui/fleet is the ONE exemption: the fleet page is a static asset
+// with no fleet data in it — it must load in a bare browser tab so its
+// token prompt can run; every byte of actual state still requires the
+// token. Nothing else is exempt.
+//
 // Used as the TCP listener's outermost handler; the unix listener bypasses
 // it entirely (the socket's 0600 perms are the auth boundary there).
 func bearerAuthMiddleware(token string, rejected *atomic.Int64, next http.Handler) http.Handler {
 	tokenBytes := []byte(token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/ui/fleet" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		got, ok := extractBearer(r.Header.Get("Authorization"))
 		if !ok {
 			if rejected != nil {

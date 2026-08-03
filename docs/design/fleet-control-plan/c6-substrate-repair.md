@@ -603,3 +603,61 @@ vibe` on the laptop.
 `go vet`, `gofmt -l` (silent), `go mod tidy` (clean), `golangci-lint run`
 (0 issues), `go test -race -count=5 ./...` — all green. Gates 1 and 2
 remain live and NOT run.
+
+## Merge addendum — C6 against main with C4+C5 landed (2026-08-03)
+
+`main` moved to `28a8073` (PR #22, C4+C5 squashed) while this branch sat
+at `322712f`. Merged main IN (no rebase — one resolution, and the PR
+squashes anyway). Four conflicted files, plus two that auto-merged in
+regions worth naming.
+
+**`recordAnnounce` — the forecast conflict, resolved as a union.** C4
+added `modelSetChanged` (id-set membership) and C6 added
+`modelFingerprintChanged` (hash drift at a stable id set). Both capture
+the same `prevModels`; both are re-render reasons. One capture, one
+trigger: `if modelChanged || fingerprintChanged`. The unlock sits where
+C4 put it (before the events switch, which reads only locals), so the
+trigger never fires under `s.mu`.
+
+**`Server` struct + `New`.** Additive both ways, no semantic overlap:
+C4's `modelActivity` / `lastInFlightModels` / `started` / `warmStates` /
+`schedStates` alongside C6's `stalenessTick` / `renderWrites` /
+`cmdInflight` / `lastSeenPersisted`.
+
+**`presence.go`, auto-merged, verified by hand.** C5 factored the
+declared-intent rule into the free function `resolveIntent` and made
+`decorate` delegate; C6 changed the same function's echo-override branch
+to carry the operator's reason/ETA (M6) and changed `decorate`'s
+not-fresh branch to stop retiring probe evidence (M5). The result has
+exactly ONE copy of the rule, and it is the copy carrying M6 — which
+matters because the C4 warm loops read it through `effectiveIntent`.
+
+**`render_loop.go`, auto-merged, verified by hand.** C5's backend-kind
+guard in `applyFingerprints` (the `ModelCmd` nil-deref) and C6's
+`writeAtomic` mode repair are both present; C5's error-tolerant
+`applyFingerprints` signature composes with C6's `renderWrites` counter.
+
+**One real defect the merge created, found by C5's test suite.** C6's
+clone → persist → swap made the in-memory swap conditional on
+`saveIntents` succeeding. `saveIntents` treats an EMPTY path as the
+error `"intent store disabled"`, so on a server with no intent store the
+C3 conflict rule stopped resolving anything: a resume performed at the
+box left the request pending forever, and C4's warm loops — which read
+`s.intents` whether or not a store exists — kept the target skipped.
+`TestWarmTarget_SkipsDrainedCell/newer_serving_echo_resolves_the_drain_request`
+caught it.
+
+Fixed by distinguishing a write that FAILED from a write that can never
+succeed: `Server.persistIntents` returns nil when `intentPath == ""`
+(nothing on disk for memory to diverge from, no restart to resurrect a
+resolved drain) and both resolution writers — the announce conflict rule
+and `pruneStaleServingRequest` — go through it. `setIntent` still calls
+`saveIntents` directly, so an operator POST to a disabled store keeps
+failing loudly. C6's MIN-C guarantee is untouched: its test drives a
+genuine write failure against a non-empty path, and still passes.
+
+**Gates after the merge.** `go build`, `go vet`, `gofmt -l` (silent),
+`go mod tidy` (clean), `golangci-lint run` at CI's pinned v2.12.2
+(0 issues), `go test -race -timeout 240s ./...` and
+`go test -race -count=2 ./...` — all green. Gates 1 and 2 remain live
+and NOT run: nothing in this merge was exercised against real hardware.

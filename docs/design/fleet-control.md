@@ -1,6 +1,13 @@
 # Fleet control: node state, intent, and the control plane
 
-Status: DESIGN (2026-08-02). Synthesized from a five-reader research pass
+Status: IMPLEMENTED THROUGH C4 (2026-08-03). C0–C3 are merged on `main`
+(#18, #19, #20, #21); C4 is in flight on `feat/c4-fleet-comfort` (PR #22)
+together with [C5](fleet-control-plan/c5-land-c4.md), the review pass
+that lands it. C5–C7 in
+[fleet-control-plan/](fleet-control-plan/) carry the remaining work;
+that README's status column is the authoritative per-phase state.
+
+Synthesized from a five-reader research pass
 (the three design docs, this codebase, the private house repo's ops
 history, the flagship consumer, and a llama-swap / orchestrator-landscape
 web pass), then a four-designer panel (reuse-maximal, purpose-built
@@ -8,7 +15,7 @@ panel service, automation-first, registration-first) scored by an
 adversarial judge against a real night-long ops friction log. The
 reuse-maximal design won as the base; the registration inversion is
 folded in as the destination. Implementation is phased in
-[fleet-control-plan/](fleet-control-plan/) (C0–C4); the year-two
+[fleet-control-plan/](fleet-control-plan/) (C0–C7); the year-two
 backlog and adoption notes from a four-lens futurespective live in
 [fleet-control-futures.md](fleet-control-futures.md).
 
@@ -375,8 +382,11 @@ start-duration history (built for exactly this).
 
 ## 11. Risks and unverified assumptions
 
-- **`-watch-config` is verified on the pinned deploy image** (C0,
-  2026-08-02, v239): poll-based watcher (2s) on the config path; the
+- **`-watch-config` is verified on llama-swap v239** (C0,
+  2026-08-02) — and that guarantee is conditional on actually pinning:
+  `deploy/front`'s compose floats the `:cpu` tag and the digest pin is
+  opt-in, so an unpinned pull can move off the verified build. Behaviour
+  as verified on v239: poll-based watcher (2s) on the config path; the
   parent-directory mount sees atomic-rename writes; reloads activate
   the new config immediately and drain in-flight streams on a
   **hardcoded 30s** shutdown timeout — a longer stream is force-closed

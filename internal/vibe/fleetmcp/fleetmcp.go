@@ -318,12 +318,13 @@ func (s *Server) mcpTools() []any {
 			"description": "Dry-run the front config render (vibe router render --cell front): " +
 				"renders the peers-only config from backend defs + hosts.yaml and returns the " +
 				"unified diff against the live front config (or the full render when no live " +
-				"path is mounted). DRY-RUN ONLY — the apply path arrives with presence-driven " +
-				"rendering (C3).",
+				"path is mounted). DRY-RUN ONLY — fleetd's presence-driven render loop owns the " +
+				"write path; a second writer to the same -watch-config file breaks its " +
+				"atomic-write contract.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"dry_run": map[string]any{"type": "boolean", "description": "Must be true (the only mode C2 has)."},
+					"dry_run": map[string]any{"type": "boolean", "description": "Must be true (dry-run is the only mode)."},
 				},
 			},
 		},

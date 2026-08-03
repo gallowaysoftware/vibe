@@ -130,6 +130,9 @@ type StateSnapshot struct {
 	// process has done (C3) — a flap storm shows up here as a rising
 	// number instead of silently churning the catalog.
 	FrontRenders int `json:"front_renders"`
+	// Warm is the C4 warm policy status (targets + schedule), present
+	// when either is configured.
+	Warm *warmStatus `json:"warm,omitempty"`
 }
 
 // snapshotTimeout bounds the per-cell /running + /v1/models probes so one
@@ -223,6 +226,27 @@ type Server struct {
 	// callers must not invent a count for a cell that never reported.
 	inFlight     map[string]int
 	inFlightSeen map[string]bool
+	// modelActivity records per-model last-request timestamps from the
+	// same frames (key cell+"\x00"+model), fleetd-side clock. The warm
+	// targets' idle windows key off these.
+	modelActivity map[string]time.Time
+	// lastInFlightModels is the previous frame's model list per cell, so
+	// a model that DISAPPEARS from the list gets a completion stamp —
+	// without it a long generation produces one stamp at start and reads
+	// as idle for its whole duration.
+	lastInFlightModels map[string][]string
+
+	// warmStates and schedStates are the C4 warm loops' status surfaces
+	// (fleet_status's warm block). Pointers: the loop goroutines mutate
+	// the entries in place under s.mu.
+	warmStates  []*warmTargetState
+	schedStates []*warmScheduleState
+
+	// started is this process's boot instant, immutable after New. The
+	// warm policy uses it as the idle floor for a model no inflight frame
+	// has ever mentioned: fleetd must never claim more silence than it
+	// was running to observe.
+	started time.Time
 
 	done      chan struct{}
 	closeOnce sync.Once
@@ -251,32 +275,35 @@ type Options struct {
 // daemonInfo is called per snapshot so the daemon half is never stale.
 func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Options) *Server {
 	return &Server{
-		cells:             cells,
-		daemonInfo:        daemonInfo,
-		hist:              loadHistory(historyPath),
-		snapClient:        &http.Client{Timeout: snapshotTimeout},
-		streamClient:      &http.Client{},
-		baseBackoff:       500 * time.Millisecond,
-		maxBackoff:        30 * time.Second,
-		subs:              map[chan Event]struct{}{},
-		cellUp:            map[string]bool{},
-		lastState:         map[string]string{},
-		startedAt:         map[string]time.Time{},
-		inFlight:          map[string]int{},
-		inFlightSeen:      map[string]bool{},
-		presence:          map[string]*Presence{},
-		commands:          map[string][]AnnounceCommand{},
-		cmdInflight:       map[string]inflightCommands{},
-		renderTrigger:     make(chan string, 64),
-		stalenessTick:     5 * time.Second,
-		intents:           loadIntents(opts.IntentPath),
-		intentPath:        opts.IntentPath,
-		lastSeen:          loadLastSeen(opts.LastSeenPath),
-		lastSeenPath:      opts.LastSeenPath,
-		lastSeenPersisted: map[string]time.Time{},
-		leases:            loadLeases(opts.LeasePath),
-		leasePath:         opts.LeasePath,
-		done:              make(chan struct{}),
+		cells:              cells,
+		daemonInfo:         daemonInfo,
+		hist:               loadHistory(historyPath),
+		snapClient:         &http.Client{Timeout: snapshotTimeout},
+		streamClient:       &http.Client{},
+		baseBackoff:        500 * time.Millisecond,
+		maxBackoff:         30 * time.Second,
+		subs:               map[chan Event]struct{}{},
+		cellUp:             map[string]bool{},
+		lastState:          map[string]string{},
+		startedAt:          map[string]time.Time{},
+		inFlight:           map[string]int{},
+		inFlightSeen:       map[string]bool{},
+		modelActivity:      map[string]time.Time{},
+		lastInFlightModels: map[string][]string{},
+		started:            time.Now(),
+		presence:           map[string]*Presence{},
+		commands:           map[string][]AnnounceCommand{},
+		cmdInflight:        map[string]inflightCommands{},
+		renderTrigger:      make(chan string, 64),
+		stalenessTick:      5 * time.Second,
+		intents:            loadIntents(opts.IntentPath),
+		intentPath:         opts.IntentPath,
+		lastSeen:           loadLastSeen(opts.LastSeenPath),
+		lastSeenPath:       opts.LastSeenPath,
+		lastSeenPersisted:  map[string]time.Time{},
+		leases:             loadLeases(opts.LeasePath),
+		leasePath:          opts.LeasePath,
+		done:               make(chan struct{}),
 	}
 }
 
@@ -291,6 +318,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 		mux.HandleFunc("POST /api/fleet/intent", s.handleIntent)
 		mux.HandleFunc("POST /api/fleet/wake", s.handleWake)
 		mux.HandleFunc("POST /api/fleet/announce", s.handleAnnounce)
+		s.registerFleetPage(mux)
 	}
 	if s.leasePath != "" {
 		mux.HandleFunc("GET /api/fleet/leases", s.handleLeases)
@@ -376,6 +404,7 @@ func (s *Server) probeSnapshot(ctx context.Context) StateSnapshot {
 		Daemon:       s.daemonInfo(),
 		StartHistory: s.hist.Stats(),
 		FrontRenders: s.RenderCount(),
+		Warm:         s.warmReport(),
 	}
 	var wg sync.WaitGroup
 	for i, c := range s.cells {

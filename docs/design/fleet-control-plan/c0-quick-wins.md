@@ -25,7 +25,7 @@ the digest-pinned v239 image):
   territory, not fleet config.
 - **Reloads compose**: a second rename landing during the first
   reload's drain window was applied cleanly right after.
-- **Env macros survive reloads** (`${env.MOONSHOT_API_KEY}` peer kept
+- **Env macros survive reloads** (`${env.<CLOUD>_API_KEY}` peer kept
   resolving across every reload).
 - **Auth-exemption verification** (runbook line): on v239 with
   `apiKeys` set, `/health` answers 200 WITHOUT a key (exempt by
@@ -34,7 +34,7 @@ the digest-pinned v239 image):
   `/health` is. LAN-only posture stands regardless.
 - **Reboot gate: WAIVED** (user decision 2026-08-02; rebooting the
   front host takes down the house, and both other cells were in active
-  use). Enablement verified instead: localmodel `llama-swap.service`
+  use). Enablement verified instead: the gpu cell's `llama-swap.service`
   enabled + new `vibe-daemon.service` user unit installed and active
   (the daemon had been running unmanaged); the front container's
   `restart: unless-stopped` + compose-manager autostart verified; the

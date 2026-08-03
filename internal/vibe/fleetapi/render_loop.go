@@ -199,13 +199,22 @@ func (rl *renderLoop) renderPass() error {
 	if err != nil {
 		return fmt.Errorf("load defs: %w", err)
 	}
+	// LoadDefs returns (nil, nil) for an empty dir, Render then succeeds
+	// with a header-only config, and the write below replaces a good
+	// front config with it. The shipped deploy makes this reachable: the
+	// fleetd README tells operators to mkdir the defs mount. Gate on the
+	// INPUT (zero defs loaded), never on the output — a peerless render
+	// is legitimate when every def is unassigned or every roaming cell is
+	// pruned, and gating there would deadlock the empty-fleet case.
+	if len(defs) == 0 {
+		if fi, statErr := os.Stat(rl.cfg.FrontConfigPath); statErr == nil && fi.Size() > 0 {
+			return fmt.Errorf("refusing to render an empty front config: no backend defs under %s (fix the defs mount)", rl.cfg.BackendsDir)
+		}
+	}
 	pres := rl.srv.presenceSnapshot()
 
 	defs = rl.applyClassPolicy(defs, pres)
-	defs, err = rl.applyFingerprints(defs, pres)
-	if err != nil {
-		return err
-	}
+	defs = rl.applyFingerprints(defs, pres)
 
 	opts := router.Options{
 		Cell:              fleetcfg.FrontCell,
@@ -278,7 +287,7 @@ func (rl *renderLoop) applyClassPolicy(defs []*profile.BackendDef, pres map[stri
 // — embed-class drift is silent retrieval damage, while advisory
 // (default) stays fail-open so a hash-normalization bug can never yank
 // a working chat model.
-func (rl *renderLoop) applyFingerprints(defs []*profile.BackendDef, pres map[string]Presence) ([]*profile.BackendDef, error) {
+func (rl *renderLoop) applyFingerprints(defs []*profile.BackendDef, pres map[string]Presence) []*profile.BackendDef {
 	byName := make(map[string]*profile.BackendDef, len(defs))
 	for _, d := range defs {
 		byName[d.Name] = d
@@ -296,6 +305,15 @@ func (rl *renderLoop) applyFingerprints(defs []*profile.BackendDef, pres map[str
 			if def == nil {
 				continue
 			}
+			// Mirror the announcer's own guard (fleetannounce: fingerprints
+			// cover spec-rendered kinds only). The SENDING side has it; the
+			// RECEIVING side, which by construction must not trust the
+			// sender, needs it more — a comfyui/http_server/tabby_api/
+			// cloud_peer def named by an announce carrying a hash would
+			// otherwise reach ModelCmd's llama_server deref.
+			if def.Backend.LlamaServer == nil && def.Backend.MLXServer == nil {
+				continue
+			}
 			// Enforcement is bound to the def's home cell: a mismatch is
 			// only meaningful from the cell that owns the def (its flags
 			// are what's actually serving). Any other cell's announce
@@ -307,13 +325,18 @@ func (rl *renderLoop) applyFingerprints(defs []*profile.BackendDef, pres map[str
 			if def.Cell == "" || def.Cell != p.Cell {
 				continue
 			}
+			// A verification error skips this model, never the pass: an
+			// aborted pass leaves p.Announcing uncleared, so one bad def
+			// would freeze prune, re-add and enforcement fleet-wide forever.
 			cmd, err := router.ModelCmd(def, router.Options{Hosts: rl.cfg.Hosts, LlamaServerBinary: rl.cfg.LlamaServerBinary})
 			if err != nil {
-				return nil, fmt.Errorf("fingerprint %s: %w", m.ID, err)
+				slog.Warn("fingerprint check skipped: cannot render def", "model", m.ID, "cell", p.Cell, "err", err)
+				continue
 			}
 			expected, err := router.FlagsSHA256(cmd)
 			if err != nil {
-				return nil, fmt.Errorf("fingerprint %s: %w", m.ID, err)
+				slog.Warn("fingerprint check skipped: cannot hash flags", "model", m.ID, "cell", p.Cell, "err", err)
+				continue
 			}
 			if strings.EqualFold(expected, m.FlagsSHA256) {
 				continue
@@ -338,7 +361,8 @@ func (rl *renderLoop) applyFingerprints(defs []*profile.BackendDef, pres map[str
 				"defs_dirty": defsDirty,
 			})
 			if err != nil {
-				return nil, fmt.Errorf("fingerprint event %s: %w", m.ID, err)
+				slog.Warn("fingerprint event not published", "model", m.ID, "cell", p.Cell, "err", err)
+				data = nil
 			}
 			slog.Warn("flags fingerprint mismatch", "model", m.ID, "cell", p.Cell, "mode", mode, "defs_sha", defsSHA, "defs_dirty", defsDirty)
 			rl.srv.publish(Event{Cell: p.Cell, Type: EventFingerprint, Data: data})
@@ -348,7 +372,7 @@ func (rl *renderLoop) applyFingerprints(defs []*profile.BackendDef, pres map[str
 		}
 	}
 	if len(excluded) == 0 {
-		return defs, nil
+		return defs
 	}
 	kept := make([]*profile.BackendDef, 0, len(defs))
 	for _, d := range defs {
@@ -358,7 +382,7 @@ func (rl *renderLoop) applyFingerprints(defs []*profile.BackendDef, pres map[str
 		}
 		kept = append(kept, d)
 	}
-	return kept, nil
+	return kept
 }
 
 // classOf resolves a cell's absence-semantics class from hosts.yaml,

@@ -272,14 +272,24 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	p.Capacity = req.Capacity
 	p.Versions = req.Versions
 
-	// Fingerprint drift with a stable id set is not a membership change,
+	// A model-set change IS a membership transition (C3 §4): the catalog
+	// derives from presence, so a cell that starts or stops serving a
+	// model triggers a re-render exactly like a cell that left or
+	// returned.
+	modelChanged := modelSetChanged(prevModels, req.Models)
+	// Fingerprint drift with a stable id set is NOT a membership change,
 	// but enforcement runs ONLY inside a render pass — so without this
-	// trigger a strict mismatch on an always_on or opportunistic cell
-	// (exactly where strict embed defs live) raised nothing until some
-	// unrelated transition happened, against the design's "a mismatch
-	// always raises a loud event".
+	// second trigger a strict mismatch on an always_on or opportunistic
+	// cell (exactly where strict embed defs live) raised nothing until
+	// some unrelated transition happened, against the design's "a
+	// mismatch always raises a loud event". Two independent reasons to
+	// re-render, one trigger.
 	fingerprintChanged := modelFingerprintChanged(prevModels, req.Models)
 	withdrawn := p.Withdrawn
+	s.mu.Unlock()
+	if modelChanged || fingerprintChanged {
+		s.noteRenderTrigger(req.Cell)
+	}
 
 	// Transition-gated events: named transitions fire on transitions,
 	// not on every steady-state heartbeat.
@@ -293,11 +303,6 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 		events = append(events, Event{Cell: req.Cell, Type: EventCellWithdrawn})
 	case wasStaleOrWithdrawn:
 		events = append(events, Event{Cell: req.Cell, Type: EventCellReturned})
-	}
-	s.mu.Unlock()
-
-	if fingerprintChanged {
-		s.noteRenderTrigger(req.Cell)
 	}
 
 	// The conflict rule, registry side (intentMu orders this against
@@ -336,7 +341,7 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 		// leave memory claiming a resolution the file doesn't carry, or a
 		// restart resurrects a resolved drain. The unresolved request stays
 		// in memory and the next heartbeat retries.
-		if err := saveIntents(s.intentPath, next); err != nil {
+		if err := s.persistIntents(next); err != nil {
 			slog.Warn("intent persist failed (echo resolution); retrying next announce", "cell", req.Cell, "err", err)
 		} else {
 			s.mu.Lock()
@@ -359,6 +364,9 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	cmds := s.drainCommands(req.Cell, req.Seq)
 	resp := &AnnounceResponse{IntervalS: intervalS, DesiredIntent: desired, Commands: cmds}
 
+	// withdrawn is the value captured under the first critical section, not
+	// a re-read of the shared pointer: the trigger fires on the state as of
+	// THIS announce even if a concurrent one has already moved p.
 	if withdrawn || firstEver || wasStaleOrWithdrawn {
 		s.noteRenderTrigger(req.Cell)
 	} else if s.cellClass(req.Cell) == string(fleetcfg.ClassRoaming) {
@@ -394,7 +402,7 @@ func (s *Server) pruneStaleServingRequest(cell string) {
 	s.mu.Unlock()
 	// Clone → persist → swap: mutating in place first means a failed write
 	// resurrects the dropped request on the next restart.
-	if err := saveIntents(s.intentPath, next); err != nil {
+	if err := s.persistIntents(next); err != nil {
 		slog.Warn("serving-request prune persist failed", "cell", cell, "err", err)
 		return
 	}
@@ -422,6 +430,29 @@ func modelFingerprintChanged(prev, next []AnnounceModel) bool {
 			continue
 		}
 		if was, known := prevSHA[m.ID]; known && was != m.FlagsSHA256 {
+			return true
+		}
+	}
+	return false
+}
+
+// modelSetChanged compares model id SETS (order-insensitive). Announces
+// are untrusted input, so duplicate ids must not hide a change: comparing
+// slice lengths and then only next⊆prev misses [A,B] → [A,A].
+func modelSetChanged(prev, next []AnnounceModel) bool {
+	ids := func(ms []AnnounceModel) map[string]bool {
+		out := make(map[string]bool, len(ms))
+		for _, m := range ms {
+			out[m.ID] = true
+		}
+		return out
+	}
+	prevIDs, nextIDs := ids(prev), ids(next)
+	if len(prevIDs) != len(nextIDs) {
+		return true
+	}
+	for id := range nextIDs {
+		if !prevIDs[id] {
 			return true
 		}
 	}
