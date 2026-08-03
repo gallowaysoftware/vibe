@@ -117,15 +117,32 @@ func TestWarmTarget_SkipsAbsentAndDrainedCells(t *testing.T) {
 	if len(probe.got()) != 0 {
 		t.Fatal("warmed a stale cell")
 	}
-	var st *warmTargetState
-	s.mu.Lock()
-	for i := range s.warmStates {
-		st = s.warmStates[i]
+	// Read through the production accessor: it copies by VALUE under the
+	// hub mutex. Capturing the *warmTargetState and reading it after the
+	// unlock races the warm loop's own writes.
+	if got := warmTargetStateOf(s, 0); got.State != "skipped" {
+		t.Errorf("state = %s, want skipped", got.State)
 	}
-	s.mu.Unlock()
-	if st.State != "skipped" {
-		t.Errorf("state = %s, want skipped", st.State)
+}
+
+// warmTargetStateOf copies one warm-target state out of the server. Tests
+// must never hold a loop-owned pointer past the lock — warmReport is the
+// production copy-under-lock path.
+func warmTargetStateOf(s *Server, i int) warmTargetState {
+	rep := s.warmReport()
+	if rep == nil || i >= len(rep.Targets) {
+		return warmTargetState{}
 	}
+	return rep.Targets[i]
+}
+
+// schedStateOf is the same idiom for schedule states.
+func schedStateOf(s *Server, i int) warmScheduleState {
+	rep := s.warmReport()
+	if rep == nil || i >= len(rep.Schedule) {
+		return warmScheduleState{}
+	}
+	return rep.Schedule[i]
 }
 
 func TestWarmTarget_EmptyRestoreNeedsTwoEvals(t *testing.T) {
@@ -237,6 +254,8 @@ func TestCronNextFire(t *testing.T) {
 		{"*/20 * * * *", at(2026, 8, 2, 6, 40), at(2026, 8, 2, 7, 0)},
 		{"0 0 29 2 *", at(2026, 3, 1, 0, 0), at(2028, 2, 29, 0, 0)}, // 2027 not a leap year
 		{"0 9 * * 1", at(2026, 8, 2, 10, 0), at(2026, 8, 3, 9, 0)},  // Sunday → Monday
+		{"0 9 1 * 1", at(2026, 8, 2, 10, 0), at(2026, 8, 3, 9, 0)},  // Vixie OR: Monday matches first (not Sep 1, the next 1st-Monday)
+		{"0 9 1 * *", at(2026, 8, 3, 10, 0), at(2026, 9, 1, 9, 0)},  // dow=* → dom decides
 	}
 	for _, tc := range cases {
 		spec, err := parseCron(tc.spec)
@@ -250,6 +269,23 @@ func TestCronNextFire(t *testing.T) {
 		if !got.Equal(tc.want) {
 			t.Errorf("%s from %v: got %v, want %v", tc.spec, tc.from, got, tc.want)
 		}
+	}
+}
+
+func TestCronNextFireDomDowOr(t *testing.T) {
+	// Vixie rule: both restricted ⇒ EITHER matches. Sep 1 2026 is a
+	// Tuesday: "0 9 1 * 1" fires there (dom), not the next Monday.
+	spec, err := parseCron("0 9 1 * 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := spec.nextFire(time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC), time.UTC)
+	if !ok {
+		t.Fatal("no fire")
+	}
+	want := time.Date(2026, 8, 17, 9, 0, 0, 0, time.UTC) // Monday Aug 17 beats Sep 1
+	if !got.Equal(want) {
+		t.Errorf("got %v, want %v (Vixie OR: first Monday OR first-of-month)", got, want)
 	}
 }
 
@@ -293,13 +329,15 @@ func TestScheduleGuardSkipsBusyAndLeased(t *testing.T) {
 	s.inFlightSeen["heavy"] = true
 	s.schedStates = []*warmScheduleState{{Cron: entry.Cron, Model: entry.Model, NextFire: &now}}
 	s.mu.Unlock()
-	st := s.schedStates[0]
+	s.mu.Lock()
+	st := s.schedStates[0] // the loop-owned pointer evalScheduleEntry mutates
+	s.mu.Unlock()
 	s.evalScheduleEntry(entry, spec, st, cellOf, time.UTC, probe.warm, "http://front.test", now)
 	if len(probe.got()) != 0 {
 		t.Fatal("fired into a busy cell — the eviction fight the guard exists to prevent")
 	}
-	if !strings.Contains(st.LastNote, "in-flight") {
-		t.Errorf("note = %q, want the busy skip", st.LastNote)
+	if note := schedStateOf(s, 0).LastNote; !strings.Contains(note, "in-flight") {
+		t.Errorf("note = %q, want the busy skip", note)
 	}
 
 	// Idle but leased → still skipped (the first mechanical lease consumer).
@@ -311,8 +349,8 @@ func TestScheduleGuardSkipsBusyAndLeased(t *testing.T) {
 	if len(probe.got()) != 0 {
 		t.Fatal("fired into a leased cell")
 	}
-	if !strings.Contains(st.LastNote, "leases") {
-		t.Errorf("note = %q, want the lease skip", st.LastNote)
+	if note := schedStateOf(s, 0).LastNote; !strings.Contains(note, "leases") {
+		t.Errorf("note = %q, want the lease skip", note)
 	}
 
 	// Clear → fires.
@@ -323,11 +361,12 @@ func TestScheduleGuardSkipsBusyAndLeased(t *testing.T) {
 	if got := probe.got(); len(got) != 1 || got[0] != "default-model" {
 		t.Fatalf("unguarded fire = %v, want [default-model]", got)
 	}
-	if st.LastFire == nil {
+	final := schedStateOf(s, 0)
+	if final.LastFire == nil {
 		t.Error("last_fire not recorded")
 	}
-	if st.NextFire == nil || !st.NextFire.After(now.Add(2*time.Minute)) {
-		t.Errorf("next_fire not re-parked: %+v", st.NextFire)
+	if final.NextFire == nil || !final.NextFire.After(now.Add(2*time.Minute)) {
+		t.Errorf("next_fire not re-parked: %+v", final.NextFire)
 	}
 }
 
