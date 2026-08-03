@@ -262,9 +262,19 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	} else {
 		p.HealthyStreak++
 	}
+	prevModels := p.Models
 	p.Models = req.Models
 	p.Capacity = req.Capacity
 	p.Versions = req.Versions
+
+	// Fingerprint drift with a stable id set is not a membership change,
+	// but enforcement runs ONLY inside a render pass — so without this
+	// trigger a strict mismatch on an always_on or opportunistic cell
+	// (exactly where strict embed defs live) raised nothing until some
+	// unrelated transition happened, against the design's "a mismatch
+	// always raises a loud event".
+	fingerprintChanged := modelFingerprintChanged(prevModels, req.Models)
+	withdrawn := p.Withdrawn
 
 	// Transition-gated events: named transitions fire on transitions,
 	// not on every steady-state heartbeat.
@@ -272,14 +282,18 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	switch {
 	case firstEver:
 		events = append(events, Event{Cell: req.Cell, Type: EventCellReturned})
-	case p.Withdrawn && wasWithdrawing:
+	case withdrawn && wasWithdrawing:
 		// Steady-state withdraw: no new transition, no event drip.
-	case p.Withdrawn:
+	case withdrawn:
 		events = append(events, Event{Cell: req.Cell, Type: EventCellWithdrawn})
 	case wasStaleOrWithdrawn:
 		events = append(events, Event{Cell: req.Cell, Type: EventCellReturned})
 	}
 	s.mu.Unlock()
+
+	if fingerprintChanged {
+		s.noteRenderTrigger(req.Cell)
+	}
 
 	// The conflict rule, registry side (intentMu orders this against
 	// concurrent SetIntent calls — mu stays the leaf): a NEWER echo
@@ -287,25 +301,42 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	// the request) or the human at the box overrode it (echo diverges).
 	// Only an older echo hands the request back as desired_intent.
 	var desired *Intent
-	var intentSnapshot map[string]Intent
+	var next map[string]Intent
 	s.intentMu.Lock()
 	s.mu.Lock()
 	req2, hasRequest := s.intents[req.Cell]
 	echo := p.IntentEcho
 	if hasRequest && echo != nil && !echo.Since.IsZero() && req2.Since.Before(echo.Since) {
-		delete(s.intents, req.Cell)
-		intentSnapshot = make(map[string]Intent, len(s.intents))
+		next = make(map[string]Intent, len(s.intents))
 		for k, v := range s.intents {
-			intentSnapshot[k] = v
+			next[k] = v
+		}
+		if req2.State == "drained" && echo.State == "drained" {
+			// The cell complied, so the request BECOMES the record —
+			// deleting it dropped the operator's reason and ETA one
+			// heartbeat after every ack. Since is the echo's exactly, so
+			// decorate's echo override never fires and the entry can't
+			// read as a pending request.
+			next[req.Cell] = Intent{State: "drained", Reason: req2.Reason, ETA: req2.ETA, Since: echo.Since}
+		} else {
+			delete(next, req.Cell)
 		}
 	} else if hasRequest {
 		d := req2
 		desired = &d
 	}
 	s.mu.Unlock()
-	if intentSnapshot != nil {
-		if err := saveIntents(s.intentPath, intentSnapshot); err != nil {
-			slog.Warn("intent persist failed (stale-request drop)", "err", err)
+	if next != nil {
+		// Clone → persist → swap (C1's discipline): a failed write must not
+		// leave memory claiming a resolution the file doesn't carry, or a
+		// restart resurrects a resolved drain. The unresolved request stays
+		// in memory and the next heartbeat retries.
+		if err := saveIntents(s.intentPath, next); err != nil {
+			slog.Warn("intent persist failed (echo resolution); retrying next announce", "cell", req.Cell, "err", err)
+		} else {
+			s.mu.Lock()
+			s.intents = next
+			s.mu.Unlock()
 		}
 	}
 	s.intentMu.Unlock()
@@ -322,10 +353,7 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	cmds := s.drainCommands(req.Cell)
 	resp := &AnnounceResponse{IntervalS: intervalS, DesiredIntent: desired, Commands: cmds}
 
-	// withdrawn was assigned in the first critical section; reading the
-	// shared pointer's field here is safe from torn state but the
-	// trigger fires on the value as of this announce by construction.
-	if p.Withdrawn || firstEver || wasStaleOrWithdrawn {
+	if withdrawn || firstEver || wasStaleOrWithdrawn {
 		s.noteRenderTrigger(req.Cell)
 	} else if s.cellClass(req.Cell) == string(fleetcfg.ClassRoaming) {
 		// The hysteresis-clearing announce (the Mth consecutive fresh one
@@ -352,17 +380,46 @@ func (s *Server) pruneStaleServingRequest(cell string) {
 		s.mu.Unlock()
 		return
 	}
-	delete(s.intents, cell)
-	snap := make(map[string]Intent, len(s.intents))
+	next := make(map[string]Intent, len(s.intents))
 	for k, v := range s.intents {
-		snap[k] = v
+		next[k] = v
 	}
+	delete(next, cell)
 	s.mu.Unlock()
-	if err := saveIntents(s.intentPath, snap); err != nil {
+	// Clone → persist → swap: mutating in place first means a failed write
+	// resurrects the dropped request on the next restart.
+	if err := saveIntents(s.intentPath, next); err != nil {
 		slog.Warn("serving-request prune persist failed", "cell", cell, "err", err)
 		return
 	}
+	s.mu.Lock()
+	s.intents = next
+	s.mu.Unlock()
 	slog.Info("dropped unresolvable serving request (cell went stale)", "cell", cell)
+}
+
+// modelFingerprintChanged reports whether any model's announced
+// flags_sha256 changed for an id the cell was ALREADY announcing. Only
+// the hash is compared: State flips running/stopped constantly, so
+// folding the whole model struct in would turn every load and TTL
+// unload into a membership transition.
+func modelFingerprintChanged(prev, next []AnnounceModel) bool {
+	if len(prev) == 0 || len(next) == 0 {
+		return false
+	}
+	prevSHA := make(map[string]string, len(prev))
+	for _, m := range prev {
+		prevSHA[m.ID] = m.FlagsSHA256
+	}
+	for _, m := range next {
+		if m.FlagsSHA256 == "" {
+			continue
+		}
+		if was, known := prevSHA[m.ID]; known && was != m.FlagsSHA256 {
+			return true
+		}
+	}
+	return false
 }
 
 // cellClass resolves a cell's class from the registry (empty when unset).
@@ -437,9 +494,8 @@ func (s *Server) presenceFor(cell string) *Presence { return s.PresenceFor(cell)
 // keeps running underneath — presence wins while fresh, probes are the
 // fallback for non-announcing cells.
 func (s *Server) stalenessLoop() {
-	s.wg.Add(1)
 	defer s.wg.Done()
-	tick := time.NewTicker(5 * time.Second)
+	tick := time.NewTicker(s.stalenessTick)
 	defer tick.Stop()
 	for {
 		select {

@@ -69,12 +69,14 @@ func TestAnnouncePresenceTransitions(t *testing.T) {
 		t.Errorf("presence = %+v", p)
 	}
 
-	// Stale after the interval lapses (test clock: shrink the bound by
-	// back-dating received_at).
+	// Stale after the interval lapses (test clock: back-date received_at
+	// and let the REAL loop run at a test cadence).
+	s.stalenessTick = 10 * time.Millisecond
+	s.Start()
 	s.mu.Lock()
 	s.presence["laptop"].ReceivedAt = time.Now().Add(-time.Hour)
 	s.mu.Unlock()
-	s.markStaleOnce(time.Now())
+	waitStale(t, s, "laptop")
 	p = s.presenceFor("laptop")
 	if !p.Stale || p.HealthyStreak != 0 {
 		t.Errorf("after stale window: %+v", p)
@@ -168,16 +170,4 @@ func newAnnounceServerWithFleet(t *testing.T) (*Server, *httptest.Server) {
 	}
 	s, ts, _ := newFleetdServer(t, cells)
 	return s, ts
-}
-
-// markStaleOnce runs one staleness pass (the loop's body, test-paced).
-func (s *Server) markStaleOnce(now time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, p := range s.presence {
-		if p.Announcing && !p.Stale && !p.Withdrawn && now.Sub(p.ReceivedAt) > staleAfter(p.IntervalS) {
-			p.Stale = true
-			p.HealthyStreak = 0
-		}
-	}
 }

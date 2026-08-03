@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -193,6 +194,13 @@ type Server struct {
 	presence      map[string]*Presence
 	commands      map[string][]AnnounceCommand
 	renderTrigger chan string
+	// stalenessTick paces stalenessLoop. Injectable so tests drive the
+	// REAL loop instead of re-implementing its predicate — a test-file
+	// copy of that predicate hid a disabled production one.
+	stalenessTick time.Duration
+	// renderWrites counts the presence-derived render loop's front-config
+	// writes (fleet_status's flap-storm signal).
+	renderWrites atomic.Int64
 
 	// inFlight tracks each cell's current in-flight request count as
 	// reported by llama-swap's inflight SSE frames. The bool in the
@@ -244,6 +252,7 @@ func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Op
 		presence:      map[string]*Presence{},
 		commands:      map[string][]AnnounceCommand{},
 		renderTrigger: make(chan string, 64),
+		stalenessTick: 5 * time.Second,
 		intents:       loadIntents(opts.IntentPath),
 		intentPath:    opts.IntentPath,
 		lastSeen:      loadLastSeen(opts.LastSeenPath),
@@ -280,6 +289,10 @@ func (s *Server) Start() {
 		s.wg.Add(1)
 		go s.watchCell(c)
 	}
+	// Add before the go, like every sibling loop: adding inside the
+	// goroutine races Close's Wait, which can return while the loop still
+	// touches the hub.
+	s.wg.Add(1)
 	go s.stalenessLoop()
 }
 
