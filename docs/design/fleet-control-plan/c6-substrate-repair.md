@@ -440,9 +440,9 @@ token remains every cell's voice; tracked in
 
 ## Execution addendum (2026-08-03)
 
-Branch `fix/c6-substrate-repair` off `main` at `322712f`. Three commits:
-the two majors + their neighbours, the actuation/CLI set, and the
-plumbing set.
+Branch `fix/c6-substrate-repair` off `main` at `322712f`. Four commits:
+the two majors + their neighbours, the actuation/CLI set, the plumbing
+set, and MIN-O's last two sites.
 
 **Anchor drift.** Every anchor in this doc was verified against
 `3854d84` (the C4 branch), but the work lands against `322712f`
@@ -504,9 +504,10 @@ weakened):
    `TestRenderLoop_SteadyStateFingerprintDriftEnforced` (drift with an
    identical id set on an `always_on` cell ⇒ event + strict exclusion)
    plus its mirror (unchanged sha ⇒ no extra render).
-4. Staleness mutation gate — PASS. With `if false &&` prefixed to the
-   predicate at `announce.go:452`, `go test ./internal/vibe/fleetapi/`
-   FAILS: `TestAnnouncePresenceTransitions` ("cell never went stale") and
+4. Staleness mutation gate — PASS. With `if false &&` prefixed to
+   `stalenessLoop`'s predicate (`announce.go:452` before this branch's
+   edits, `:558` after), `go test ./internal/vibe/fleetapi/` FAILS:
+   `TestAnnouncePresenceTransitions` ("cell never went stale") and
    `TestStalenessLoop_PublishesPrunesAndTriggersRender` ("timed out
    waiting for fleet.cellStale"). Predicate restored; suite green.
 5. Wait-status gate — PASS at unit level
