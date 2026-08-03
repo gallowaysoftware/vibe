@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -537,6 +538,36 @@ func TestScheduleTerminalNoteKeepsBothFacts(t *testing.T) {
 	}
 	if !strings.Contains(got.LastNote, "warmed") || !strings.Contains(got.LastNote, "no further fire time") {
 		t.Errorf("note = %q, want both the fire outcome and the terminal warning", got.LastNote)
+	}
+}
+
+// ─── §7 the fleet page ──────────────────────────────────────────────────────
+
+// TestFleetPageAttributesUseAttrEscaper pins PAGE-1: esc() is a TEXT
+// escaper (it leaves " alone), so interpolating it into an attribute
+// value lets a quote in operator config break out of the attribute.
+// Attribute interpolation must go through attr().
+func TestFleetPageAttributesUseAttrEscaper(t *testing.T) {
+	data, err := fleetPageFS.ReadFile("fleet.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(data)
+	for _, re := range []string{
+		`=\s*"[^"\n]*\$\{\s*esc\(`,
+		`=\s*'[^'\n]*\$\{\s*esc\(`,
+	} {
+		if m := regexp.MustCompile(re).FindString(page); m != "" {
+			t.Errorf("esc() interpolated into an attribute value (%q); use attr()", m)
+		}
+	}
+	if !strings.Contains(page, "function attr(") {
+		t.Error("attr() helper missing from the page")
+	}
+	// The cell URL comes from hosts.yaml; a javascript: origin must not
+	// become a clickable script link.
+	if !strings.Contains(page, "function safeURL(") {
+		t.Error("safeURL() gate missing from the page")
 	}
 }
 

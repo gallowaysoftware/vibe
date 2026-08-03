@@ -208,6 +208,24 @@ cells:
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "/api/fleet/state") {
 		t.Errorf("page: HTTP %d, want 200 with the page", resp.StatusCode)
 	}
+	// The exemption is exact-match and GET-only, evaluated before mux
+	// path-cleaning. Pin the boundary so nobody "hardens" it into a
+	// prefix match or a path.Clean — either would WIDEN the one hole.
+	for _, tc := range []struct {
+		method, path string
+	}{
+		{http.MethodPost, "/ui/fleet"},
+		{http.MethodGet, "/ui/fleet/"},
+		{http.MethodGet, "/ui/fleet/../api/fleet/state"},
+		{http.MethodGet, "/ui/fleet%2f"},
+		{http.MethodGet, "//ui/fleet"},
+	} {
+		resp = req(tc.method, "http://"+httpAddr+tc.path, "", "")
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s %s without token: HTTP %d, want 401", tc.method, tc.path, resp.StatusCode)
+		}
+	}
 }
 
 // TestDaemon_FleetRegistry_RequiresCells: the role is explicit — set with

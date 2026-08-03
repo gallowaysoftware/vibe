@@ -99,6 +99,14 @@ function rpc(tool, args) {
 }
 
 function esc(s) { const d = document.createElement("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML; }
+// esc() is a TEXT escaper: it leaves " and ' alone, which is fine for
+// element content and wrong inside an attribute value. Quote-escaping
+// does not belong in esc() itself — its output also feeds textContent,
+// where entities would show up as visible artifacts.
+function attr(s) { return esc(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;"); }
+// A javascript: URL in hosts.yaml would otherwise be a clickable script
+// link; only http(s) origins become hrefs.
+function safeURL(u) { return /^https?:\/\//.test(u || "") ? u : ""; }
 function ago(ts) {
   if (!ts) return "";
   const s = Math.max(0, (Date.now() - new Date(ts).getTime()) / 1000 | 0);
@@ -142,8 +150,10 @@ function render(st) {
     }
     if (c.last_seen && !c.reachable) intentBits.push('<span class="lastseen">last seen ' + ago(c.last_seen) + "</span>");
     const leases = (c.leases || []).map(l => `<div class="leases">${esc(l.holder)} holds ${esc(l.model)}${l.note ? ": " + esc(l.note) : ""}</div>`).join("");
+    const ui = safeURL(c.url);
+    const uiLink = ui ? `<a href="${attr(ui)}/ui" target="_blank" rel="noopener">ui ↗</a>` : "";
     tr.innerHTML =
-      `<td class="cellname">${esc(c.name)}<a href="${esc(c.url)}/ui" target="_blank" rel="noopener">ui ↗</a>${leases}</td>` +
+      `<td class="cellname">${esc(c.name)}${uiLink}${leases}</td>` +
       `<td><span class="badge ${badgeClass(c.display)}">${esc(c.display)}</span></td>` +
       `<td class="cls">${esc(c.class || "-")}</td>` +
       `<td class="models">${models}</td>` +
@@ -169,7 +179,13 @@ function render(st) {
   if (st.front_renders != null) bits.push("front renders: " + st.front_renders);
   if (st.daemon && st.daemon.auth_rejected > 0) bits.push("auth rejections: " + st.daemon.auth_rejected);
   if (st.warm && (st.warm.targets || []).length) {
-    bits.push("warm targets: " + st.warm.targets.map(t => `${esc(t.model)}@${esc(t.cell)} ${esc(t.state)}`).join(" · "));
+    // textContent below is the safe sink; escaping here would show the
+    // entities as literal text.
+    bits.push("warm targets: " + st.warm.targets.map(t => `${t.model}@${t.cell} ${t.state}`).join(" · "));
+  }
+  if (st.warm && (st.warm.schedule || []).length) {
+    bits.push("schedules: " + st.warm.schedule.map(s =>
+      `${s.model} ${s.cron}${s.next_fire ? " next " + new Date(s.next_fire).toLocaleString() : " (never)"}`).join(" · "));
   }
   $("status-line").textContent = bits.join("  ·  ");
 }
@@ -200,13 +216,19 @@ function warmModel() {
 
 // Live updates: fetch-streamed SSE (EventSource can't carry the bearer header).
 let refreshTimer = 0;
+// boot() can run more than once (a mid-session token rotation: 401 →
+// gate → save → boot). Without these handles each rotation would leave
+// another live reader and another poller behind.
+let pollTimer = 0, streamAbort = null, retryDelay = 0;
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => refresh().catch(() => {}), 300);
 }
-async function streamEvents() {
+async function streamEvents(signal) {
+  let gated = false;
   try {
-    const r = await api("/api/fleet/events");
+    const r = await api("/api/fleet/events", { signal });
+    retryDelay = 0;
     const reader = r.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
@@ -235,17 +257,31 @@ async function streamEvents() {
         }
       }
     }
-  } catch (e) { /* 401 gate or network — retry below */ }
-  setTimeout(streamEvents, 3000);
+  } catch (e) {
+    // An aborted stream is this page replacing itself — do not retry it.
+    if (e && e.name === "AbortError") return;
+    // A 401 means the gate is already showing and saveToken() will
+    // re-boot; retrying would re-attack the endpoint with a dead token
+    // every 3s forever.
+    gated = String(e && e.message) === "401";
+  }
+  if (gated || (signal && signal.aborted)) return;
+  retryDelay = retryDelay ? Math.min(retryDelay * 2, 30000) : 3000;
+  setTimeout(() => streamEvents(signal), retryDelay);
 }
 
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh().catch(() => {}); });
 
 async function boot() {
   $("fleetd-addr").textContent = location.host;
+  if (streamAbort) streamAbort.abort();
+  clearInterval(pollTimer);
+  streamAbort = new AbortController();
+  retryDelay = 0;
+  const signal = streamAbort.signal;
   await refresh();
-  streamEvents();
-  setInterval(() => refresh().catch(() => {}), 30000);
+  streamEvents(signal);
+  pollTimer = setInterval(() => refresh().catch(() => {}), 30000);
 }
 if (token) boot();
 </script>
