@@ -532,6 +532,11 @@ func ModelCmd(def *profile.BackendDef, opts Options) (string, error) {
 		// disconnected and the same def spawned by the router carry
 		// byte-identical flags.
 		spec, err = profile.MLXServerSpec(p, 0)
+	} else if def.Backend.LlamaServer == nil {
+		// Callers reach here from announce-supplied model ids (fleetd's
+		// fingerprint pass), so the def kind is attacker-influenced input,
+		// not a local invariant: return an error rather than dereference.
+		return "", fmt.Errorf("backend %s: ModelCmd requires llama_server or mlx_server", def.Name)
 	} else {
 		bin := opts.LlamaServerBinary
 		if b := def.Backend.LlamaServer.Binary; b != "" {

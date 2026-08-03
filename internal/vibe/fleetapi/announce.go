@@ -262,9 +262,21 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	} else {
 		p.HealthyStreak++
 	}
+	prevModels := p.Models
 	p.Models = req.Models
 	p.Capacity = req.Capacity
 	p.Versions = req.Versions
+
+	// A model-set change IS a membership transition (C3 §4): the catalog
+	// derives from presence, so a cell that starts or stops serving a
+	// model triggers a re-render exactly like a cell that left or
+	// returned.
+	modelChanged := modelSetChanged(prevModels, req.Models)
+	withdrawn := p.Withdrawn
+	s.mu.Unlock()
+	if modelChanged {
+		s.noteRenderTrigger(req.Cell)
+	}
 
 	// Transition-gated events: named transitions fire on transitions,
 	// not on every steady-state heartbeat.
@@ -272,14 +284,13 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	switch {
 	case firstEver:
 		events = append(events, Event{Cell: req.Cell, Type: EventCellReturned})
-	case p.Withdrawn && wasWithdrawing:
+	case withdrawn && wasWithdrawing:
 		// Steady-state withdraw: no new transition, no event drip.
-	case p.Withdrawn:
+	case withdrawn:
 		events = append(events, Event{Cell: req.Cell, Type: EventCellWithdrawn})
 	case wasStaleOrWithdrawn:
 		events = append(events, Event{Cell: req.Cell, Type: EventCellReturned})
 	}
-	s.mu.Unlock()
 
 	// The conflict rule, registry side (intentMu orders this against
 	// concurrent SetIntent calls — mu stays the leaf): a NEWER echo
@@ -325,7 +336,7 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	// withdrawn was assigned in the first critical section; reading the
 	// shared pointer's field here is safe from torn state but the
 	// trigger fires on the value as of this announce by construction.
-	if p.Withdrawn || firstEver || wasStaleOrWithdrawn {
+	if withdrawn || firstEver || wasStaleOrWithdrawn {
 		s.noteRenderTrigger(req.Cell)
 	} else if s.cellClass(req.Cell) == string(fleetcfg.ClassRoaming) {
 		// The hysteresis-clearing announce (the Mth consecutive fresh one
@@ -363,6 +374,29 @@ func (s *Server) pruneStaleServingRequest(cell string) {
 		return
 	}
 	slog.Info("dropped unresolvable serving request (cell went stale)", "cell", cell)
+}
+
+// modelSetChanged compares model id SETS (order-insensitive). Announces
+// are untrusted input, so duplicate ids must not hide a change: comparing
+// slice lengths and then only next⊆prev misses [A,B] → [A,A].
+func modelSetChanged(prev, next []AnnounceModel) bool {
+	ids := func(ms []AnnounceModel) map[string]bool {
+		out := make(map[string]bool, len(ms))
+		for _, m := range ms {
+			out[m.ID] = true
+		}
+		return out
+	}
+	prevIDs, nextIDs := ids(prev), ids(next)
+	if len(prevIDs) != len(nextIDs) {
+		return true
+	}
+	for id := range nextIDs {
+		if !prevIDs[id] {
+			return true
+		}
+	}
+	return false
 }
 
 // cellClass resolves a cell's class from the registry (empty when unset).

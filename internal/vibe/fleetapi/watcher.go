@@ -128,21 +128,59 @@ func (s *Server) handleUpstream(cell, payload string) {
 // count. The frame's data is a JSON string carrying {"requests":[…]}
 // (verified on v239; operation add/remove frames carry the full list
 // too), so the count is len(requests) — never an increment guess.
+// Entries also feed per-model activity timestamps (fleetd-side clock),
+// the idle windows C4's warm targets restore on.
 func (s *Server) trackInFlight(cell string, data json.RawMessage) {
 	var inner string
 	if err := json.Unmarshal(data, &inner); err != nil {
 		return
 	}
 	var wrap struct {
-		Requests []json.RawMessage `json:"requests"`
+		Requests []struct {
+			Model string `json:"model"`
+		} `json:"requests"`
 	}
 	if err := json.Unmarshal([]byte(inner), &wrap); err != nil {
 		return
 	}
+	now := time.Now() // duration clock: keep the monotonic reading
+	present := make([]string, 0, len(wrap.Requests))
 	s.mu.Lock()
 	s.inFlight[cell] = len(wrap.Requests)
 	s.inFlightSeen[cell] = true
+	seen := map[string]bool{}
+	for _, r := range wrap.Requests {
+		if r.Model == "" {
+			continue
+		}
+		s.modelActivity[cell+"\x00"+r.Model] = now
+		if !seen[r.Model] {
+			seen[r.Model] = true
+			present = append(present, r.Model)
+		}
+	}
+	// Frames are add/remove EDGES: a request stamps activity when it
+	// starts and would never stamp again, so a generation longer than
+	// restore_after_idle reads as idle. Stamp the completion edge too —
+	// "last activity" means started OR finished.
+	for _, m := range s.lastInFlightModels[cell] {
+		if !seen[m] {
+			s.modelActivity[cell+"\x00"+m] = now
+		}
+	}
+	s.lastInFlightModels[cell] = present
 	s.mu.Unlock()
+}
+
+// modelLastActivity returns when the model last served a request on
+// the cell (fleetd-side clock). The bool is false when no inflight
+// frame has ever mentioned it — callers treat that as "idle since
+// process start", never as "active now".
+func (s *Server) modelLastActivity(cell, model string) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.modelActivity[cell+"\x00"+model]
+	return t, ok
 }
 
 // trackModelStatus measures starting→ready wall time per model. modelStatus

@@ -7,6 +7,8 @@
 #   docker build -t vibe-fleetd deploy/fleetd
 # (deploy/fleetd/vibe is gitignored — never commit binaries.)
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates
+# tzdata: warm schedules (C4) evaluate cron in the declared TZ —
+# without zoneinfo America/Halifax doesn't exist and time.Local is UTC.
+RUN apk add --no-cache ca-certificates tzdata
 COPY vibe /usr/local/bin/vibe
 ENTRYPOINT ["vibe"]

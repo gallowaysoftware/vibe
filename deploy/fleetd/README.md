@@ -37,11 +37,40 @@ mkdir -p "$FLEETD_CONFIG_DIR"/{"profiles","backends","mcp"}
 ```yaml
 # fleetd serves no inference: the proxy stays off, the control plane
 # binds the LAN behind its bearer token, and the fleet role activates
-# (multi-cell registry, intent store, /mcp facade).
+# (multi-cell registry, intent store, announce endpoint, /mcp facade,
+# GET /ui/fleet).
 disable_proxy: true
 bind_all: true
 fleet_registry: true
+
+# C3: the front's rendered llama-swap config, as seen from THIS
+# container. Requires an extra rw mount of the front's -watch-config
+# directory (the reference compose above does not ship one — add it
+# when you turn the render loop on). Only fleetd writes there: two
+# writers to one watched file is what the atomic-write contract
+# forbids.
+fleet:
+  front_config: /front-config/config.yaml
+
+# C4: restore the cell's default model after the operator's swap goes
+# request-idle. Keyed on activity, never on a timer.
+warm_targets:
+  - cell: gpu-cell
+    model: default-chat
+    restore_after_idle: 30m
+
+# C4: cron-fired warms, evaluated in the container's TZ (below).
+warm_schedule:
+  - cron: "30 6 * * *"
+    model: default-chat
 ```
+
+**Timezone.** `warm_schedule` entries evaluate in the container's `TZ`,
+and an alpine base has no tzdata — set `TZ` in `.env` AND keep tzdata in
+the image (the reference `Dockerfile` installs it for exactly this).
+A wrong zone is not silent: every schedule's resolved `next_fire` shows
+in `fleet_status` and on the fleet page, which is how the C4 gate caught
+a UTC container firing "06:30" at 23:30 local.
 
 `hosts.yaml` (the single source of cell membership — `vibe cell`, the
 MCP facade, and C2's front render all read this one file):
@@ -85,14 +114,34 @@ the state dir, which the compose marks required:
 | `start-history.json` | Cold-start ETAs for `warm_model` and the UI. |
 | `leases.json` (C2) | Advisory consumer leases. |
 
+The **backends defs mount** (`/config/vibe/backends`) is not state, but
+it is load-bearing the same way: fleetd renders the front config from
+it, and an EMPTY mount would otherwise render a peerless config over a
+good one. fleetd refuses that render with a loud error rather than
+writing it — if `fleet_status` shows `front_renders` frozen and the log
+says "refusing to render an empty front config", the defs mount is
+wrong.
+
 ## Consuming it
 
 - CLI: `vibe cell status`, `vibe cell await gpu-cell --up` — the fleetd
   address resolves `--api` → `$VIBE_API` → `hosts.yaml fleetd_url` →
   local daemon, with a labeled degraded fallback to direct cell probes.
+- Page: `GET http://<FLEETD_IPV4>:9001/ui/fleet` — the derived-state
+  table, live off the SSE stream, with drain/resume/wake/unload/warm
+  buttons that all POST `/mcp`. One security-relevant fact: this exact
+  path is the ONE bearer-exempt route (GET only, exact match), because a
+  browser cannot 401-and-then-prompt. The page carries no fleet data —
+  every byte of state still requires the token, which it stores in
+  `localStorage`.
 - MCP: `POST http://<FLEETD_IPV4>:9001/mcp` (bearer) speaks
-  initialize / tools-list / tools-call; tools are `fleet_status`,
-  `warm_model`, `unload_model`. Registration for agent harnesses uses
+  initialize / tools-list / tools-call. Tools: `fleet_status`,
+  `warm_model`, `unload_model`, `drain_cell`, `resume_cell`,
+  `wake_cell`, `render_front` (dry-run only — fleetd's presence-driven
+  render loop owns the write path). `drain_cell`/`resume_cell` reach a
+  cell through its `daemon_url` + `token_file`; without those they fall
+  back to recording desired intent for the cell to pick up on its next
+  announce. Registration for agent harnesses uses
   vibe's MCP-spec passthrough (`$XDG_CONFIG_HOME/vibe/mcp/<name>.yaml`),
   e.g. `fleet.yaml`:
 
