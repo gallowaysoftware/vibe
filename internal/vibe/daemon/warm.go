@@ -95,6 +95,11 @@ func (d *Daemon) startWarmLoops(cfg Config, hosts *fleetcfg.File) {
 			}
 			entries = append(entries, fleetapi.WarmScheduleEntry{Cron: e.Cron, Model: e.Model})
 		}
-		d.fleet.StartScheduleLoop(entries, cellOfModel, nil, front.URL)
+		// The declared fleet zone, not the process zone: C4 §2's rule is
+		// that a schedule's timezone is declared and its resolved
+		// next-fire is printed, so a wrong zone is visible at a glance.
+		// Before C7a added fleet.timezone there was nothing to declare it
+		// WITH, and an unset value keeps the old process-zone behavior.
+		d.fleet.StartScheduleLoop(entries, cellOfModel, cfg.FleetLocation(), front.URL)
 	}
 }

@@ -81,6 +81,18 @@ func LastSeenFile() string { return filepath.Join(StateHome(), "fleet", "last-se
 // human-at-the-box timestamp that newer-registry-requests must beat.
 func CellIntentFile() string { return filepath.Join(StateHome(), "fleet", "cell-intent.json") }
 
+// CellUsageFile persists the cell-side usage collector's cursor and
+// cumulative per-model counters (fleet-control C7a §1). Cumulative, so a
+// missed heartbeat loses nothing: the next successful announce carries
+// the arrears.
+func CellUsageFile() string { return filepath.Join(StateHome(), "fleet", "cell-usage.json") }
+
+// UsageLedgerFile is fleetd's append-only per-(day, cell, model, basis)
+// token ledger (fleet-control C7a §6). Raw counts only — never dollars;
+// storing counts is what lets a price table change re-price the whole
+// history.
+func UsageLedgerFile() string { return filepath.Join(StateHome(), "fleet", "usage.jsonl") }
+
 // LeasesFile persists advisory consumer leases ("batch-ingest holds
 // embed-large: mid-batch, 2.1M rows left"). Advisory only — they appear
 // in the pre-drain report and fleet_status, never block anything.

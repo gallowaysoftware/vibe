@@ -236,6 +236,11 @@ type Server struct {
 	// as idle for its whole duration.
 	lastInFlightModels map[string][]string
 
+	// usage is the C7a token ledger, nil outside the fleetd role (a
+	// single-box daemon has no announces to fold and no fleet to account
+	// for).
+	usage *usageLedger
+
 	// warmStates and schedStates are the C4 warm loops' status surfaces
 	// (fleet_status's warm block). Pointers: the loop goroutines mutate
 	// the entries in place under s.mu.
@@ -267,6 +272,14 @@ type Options struct {
 	// LeasePath enables the advisory lease store (POST/DELETE
 	// /api/fleet/lease, GET /api/fleet/leases) backed by this JSON file.
 	LeasePath string
+	// UsagePath enables the C7a token ledger (GET /api/fleet/usage)
+	// backed by this append-only JSONL file. Empty disables it.
+	UsagePath string
+	// Timezone is the explicit Location the ledger's day boundaries are
+	// computed in. Nil means the process zone — which in fleetd's own
+	// container is UTC, splitting an evening session across two days.
+	// Declare it.
+	Timezone *time.Location
 }
 
 // New builds a Server over the given cell registry. historyPath is the JSON
@@ -274,6 +287,10 @@ type Options struct {
 // recorded start); a missing or corrupt file degrades to empty history.
 // daemonInfo is called per snapshot so the daemon half is never stale.
 func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Options) *Server {
+	var usage *usageLedger
+	if opts.UsagePath != "" {
+		usage = newUsageLedger(opts.UsagePath, opts.Timezone)
+	}
 	return &Server{
 		cells:              cells,
 		daemonInfo:         daemonInfo,
@@ -303,6 +320,7 @@ func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Op
 		lastSeenPersisted:  map[string]time.Time{},
 		leases:             loadLeases(opts.LeasePath),
 		leasePath:          opts.LeasePath,
+		usage:              usage,
 		done:               make(chan struct{}),
 	}
 }
@@ -325,6 +343,9 @@ func (s *Server) Register(mux *http.ServeMux) {
 		mux.HandleFunc("POST /api/fleet/lease", s.handleLeaseMutate)
 		mux.HandleFunc("DELETE /api/fleet/lease", s.handleLeaseMutate)
 	}
+	if s.usage != nil {
+		mux.HandleFunc("GET /api/fleet/usage", s.handleUsage)
+	}
 }
 
 // Start launches one watcher goroutine per cell plus the announce
@@ -339,6 +360,10 @@ func (s *Server) Start() {
 	// touches the hub.
 	s.wg.Add(1)
 	go s.stalenessLoop()
+	if s.usage != nil {
+		s.wg.Add(1)
+		go s.usageFlushLoop()
+	}
 }
 
 // Close stops the watchers and unblocks every open SSE response. Idempotent.

@@ -276,6 +276,9 @@ func TestDaemon_FleetRegistryOff_NoMCP(t *testing.T) {
 	for _, probe := range []struct{ method, path string }{
 		{http.MethodPost, "/mcp"},
 		{http.MethodPost, "/api/fleet/intent"},
+		// C7a's ledger is fleetd state: a single-box daemon has no
+		// announces to fold and must not serve a usage document.
+		{http.MethodGet, "/api/fleet/usage"},
 	} {
 		req, _ := http.NewRequest(probe.method, "http://"+httpAddr+probe.path, strings.NewReader("{}"))
 		req.Header.Set("Authorization", "Bearer "+token)

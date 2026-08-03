@@ -181,6 +181,30 @@ type FleetConfig struct {
 	// render_front tool can diff a fresh render against it. Empty means
 	// render-only, no diff.
 	FrontConfig string `yaml:"front_config,omitempty"`
+	// Timezone is the IANA zone (e.g. "America/Toronto") the fleet's
+	// wall-clock decisions are evaluated in: the usage ledger's day
+	// boundaries (C7a §6) and the warm schedule's cron fields (C4 §2).
+	// Declared, never assumed — fleetd runs containerized and defaults to
+	// TZ=UTC, which silently splits an evening session across two days
+	// and fires an 06:30 warm at 01:30 local. Empty keeps the process
+	// zone (the pre-C7a behavior).
+	Timezone string `yaml:"timezone,omitempty"`
+}
+
+// FleetLocation resolves fleet.timezone to a Location. An unparseable
+// zone warns and falls back to the process zone rather than failing
+// startup: a bad TZ must not cost the fleet its registry.
+func (c Config) FleetLocation() *time.Location {
+	if c.Fleet.Timezone == "" {
+		return time.Local
+	}
+	loc, err := time.LoadLocation(c.Fleet.Timezone)
+	if err != nil {
+		slog.Warn("fleet.timezone unparseable; falling back to the process zone",
+			"timezone", c.Fleet.Timezone, "err", err)
+		return time.Local
+	}
+	return loc
 }
 
 // LoadConfig reads the global vibe config; missing file is not an error.
@@ -469,7 +493,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 			fleetCells = append(fleetCells, fc)
 		}
-		fleetOpts = fleetapi.Options{IntentPath: paths.IntentFile(), LastSeenPath: paths.LastSeenFile(), LeasePath: paths.LeasesFile()}
+		fleetOpts = fleetapi.Options{
+			IntentPath:   paths.IntentFile(),
+			LastSeenPath: paths.LastSeenFile(),
+			LeasePath:    paths.LeasesFile(),
+			UsagePath:    paths.UsageLedgerFile(),
+			Timezone:     d.cfg.FleetLocation(),
+		}
 		d.hosts = hosts
 	}
 	fleet := fleetapi.New(

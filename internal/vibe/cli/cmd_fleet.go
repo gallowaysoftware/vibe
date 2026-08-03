@@ -12,6 +12,7 @@ import (
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 	"github.com/gallowaysoftware/vibe/internal/vibe/router"
+	"github.com/gallowaysoftware/vibe/internal/vibe/usagemeter"
 )
 
 // `vibe fleet announce` is the slim announcer (fleet-control C3 §2): a
@@ -75,6 +76,9 @@ func fleetAnnounceCmd() *cobra.Command {
 				Defs:              cellDefs,
 				LlamaServerBinary: llamaBin,
 				IntentPath:        intentPath,
+				// A slim cell's tokens count exactly as much as a
+				// daemon-bearing cell's; same collector, same state file.
+				Usage: usagemeter.Snapshotter(llamaSwap, paths.CellUsageFile()),
 			})
 			if err != nil {
 				return err

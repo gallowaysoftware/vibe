@@ -62,6 +62,61 @@ type AnnounceVersions struct {
 	DefsDirty bool   `json:"defs_dirty,omitempty"`
 }
 
+// AnnounceUsage is the cell's CUMULATIVE token counters (fleet-control
+// C7a §4), piggybacked on the heartbeat. Cumulative — not per-interval —
+// is what makes an offline cell free: a missed heartbeat loses nothing,
+// the next successful announce carries the arrears, and fleetd's delta
+// rule is idempotent under retries, duplicate announces and a roaming
+// laptop that served traffic off-LAN for a day.
+//
+// It is a NEW field rather than a widening of AnnounceModel.Probe, which
+// stays reserved for the v2 throughput block (C3 §1).
+type AnnounceUsage struct {
+	// Epoch identifies the cell's counter generation. A cell mints a new
+	// one when its llama-swap activity ids restart (an in-memory store
+	// restarting at 1); fleetd then starts a new ledger row instead of
+	// reading the cell as flatlined for months.
+	Epoch string `json:"epoch"`
+	// LostRows counts activity rows the cell could not read back because
+	// they aged out of an in-memory ring between two polls. Reported, not
+	// absorbed: silent loss is indistinguishable from an idle cell.
+	LostRows int64 `json:"lost_rows,omitempty"`
+	// Models carries one entry per (model, basis) the cell has ever
+	// metered this epoch.
+	Models []AnnounceUsageModel `json:"models,omitempty"`
+}
+
+// AnnounceUsageModel is one cumulative (model, basis) counter set.
+//
+// Basis records WHICH token-semantics branch produced these numbers.
+// llama-swap stores no field saying which parser won, and the two
+// branches disagree by 1.8x-5x on the same traffic, so without it the
+// cache arithmetic is unreconstructable after the fact (C7a §2).
+type AnnounceUsageModel struct {
+	Model string `json:"model"`
+	Basis string `json:"basis"`
+	// Req counts billable requests (status 200, measured, not a poke).
+	Req int64 `json:"req"`
+	// InFresh is prompt tokens actually processed; InCached is prompt
+	// tokens served from the KV cache. Billable input is their sum, and
+	// C7b prices them at different rates — which is exactly why they are
+	// stored apart.
+	InFresh  int64 `json:"in_fresh"`
+	InCached int64 `json:"in_cached"`
+	Out      int64 `json:"out"`
+	// PokeReq counts fleet self-traffic (warm targets, warm schedules,
+	// warm_model): real metered requests that must never enter a billable
+	// sum or a per-request average.
+	PokeReq int64 `json:"poke_req"`
+	// ErrReq counts non-200 rows; UnmeasuredReq counts 200s that reported
+	// no tokens at all (mlx streaming, client-cancelled streams). Both are
+	// counted and NEITHER is summed as zero.
+	ErrReq        int64 `json:"err_req"`
+	UnmeasuredReq int64 `json:"unmeasured_req"`
+	// BusyMS is wall time on measured rows.
+	BusyMS int64 `json:"busy_ms"`
+}
+
 // AnnounceRequest is the cell→fleetd heartbeat.
 type AnnounceRequest struct {
 	V        int               `json:"v"`
@@ -71,6 +126,10 @@ type AnnounceRequest struct {
 	Models   []AnnounceModel   `json:"models,omitempty"`
 	Capacity *AnnounceCapacity `json:"capacity,omitempty"`
 	Versions *AnnounceVersions `json:"versions,omitempty"`
+	// Usage is the C7a token ledger feed. Additive: old fleetd ignores
+	// it (unknown fields are tolerated by the C3 schema rule) and old
+	// cells omit it, rendering as unmeasured rather than as zero.
+	Usage *AnnounceUsage `json:"usage,omitempty"`
 }
 
 // AnnounceCommand is one piggybacked verb the cell should execute and
@@ -205,6 +264,24 @@ func validateAnnounce(req *AnnounceRequest) error {
 			"versions.defs_sha":   req.Versions.DefsSHA,
 		} {
 			if err := clean(label, v); err != nil {
+				return err
+			}
+		}
+	}
+	if req.Usage != nil {
+		if err := clean("usage.epoch", req.Usage.Epoch); err != nil {
+			return err
+		}
+		for _, m := range req.Usage.Models {
+			if err := clean("usage.models[].model", m.Model); err != nil {
+				return err
+			}
+			// basis is deliberately hygiene-checked, not enum-checked: a
+			// cell one version ahead that adds a basis must not have its
+			// whole heartbeat rejected (that would take presence and the
+			// intent echo down with the accounting). An unknown basis is a
+			// pricing question, and pricing is C7b's.
+			if err := clean("usage.models[].basis", m.Basis); err != nil {
 				return err
 			}
 		}
@@ -356,6 +433,14 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	// that only ever announces (no inbound port, C3's whole destination)
 	// otherwise had NO persisted sighting at all.
 	s.recordSighting(req.Cell, now, firstEver || wasStaleOrWithdrawn || withdrawn)
+
+	// C7a: fold the cell's cumulative token counters and credit residency
+	// for this heartbeat's gap. Both are no-ops outside the fleetd role
+	// and both skip the front structurally (usage.go's fold).
+	if s.usage != nil {
+		s.usage.fold(req.Cell, req.Usage, now)
+		s.usage.foldResidency(req.Cell, req.Models, intervalS, now)
+	}
 
 	for _, ev := range events {
 		s.publish(ev)

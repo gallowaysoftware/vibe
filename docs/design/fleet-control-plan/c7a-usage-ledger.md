@@ -1,7 +1,13 @@
 # C7a — The usage ledger: counting tokens per cell, per model, per day
 
-Status: PLANNED (2026-08-02). Depends on C4 (announce + presence). No
-dependency on C5/C6 beyond merge order.
+Status: EXECUTED + REVIEWED (2026-08-03) on `feat/c7a-usage-ledger`,
+branched off the C4/C5 line. Feature commit, self-review commit, and an
+independent adversarial pass (ground rule 9) whose findings are in
+[§Adversarial-review addendum](#adversarial-review-addendum-second-independent-pass).
+Every mechanically verifiable gate is green; the seven live gates need
+real cells and are listed unrun in
+[§Execution](#execution-2026-08-03). Depends on C4 (announce +
+presence). No dependency on C5/C6 beyond merge order.
 
 C7a produces a durable, per-(cell, model, day) token ledger with **zero
 price knowledge and zero UI**. [C7b](c7b-savings-screen.md) turns it
@@ -36,9 +42,9 @@ llama-swap swaps a model out mid-burst.
 
 - **Not `internal/vibe/proxy`.** Ground rule 1 was relaxed to permit
   instrumenting it. That permission is deliberately **left unspent**:
-  `AGENTS.md:620-626` records that `:9000 is llama-swap, not vibe` and
-  cells run `disable_proxy: true`, so vibe's proxy is not in the fleet
-  request path. A flawless tee would measure ~0% of fleet tokens. The
+  AGENTS.md's "Router / model lifecycle" section records that `:9000 is
+  llama-swap, not vibe` and cells run `disable_proxy: true`, so vibe's
+  proxy is not in the fleet request path. A flawless tee would measure ~0% of fleet tokens. The
   strongest form of the surviving invariant is a gate:
   `git diff --stat internal/vibe/proxy/` is **empty** for this phase.
 - **Not llama-server `/metrics`.** Its `server_metrics` struct has no
@@ -221,7 +227,7 @@ price table updates.
 
 **Day bucketing uses an explicit `*time.Location`** from a new
 fleet-level `timezone` config field, following the precedent
-`cronSpec.nextFire` already sets (`warmsched.go:118-131`):
+`cronSpec.nextFire` already sets (`warmsched.go:144-157`):
 `y, m, d := ts.In(loc).Date()`. **Never `Truncate(24*time.Hour)`** — it
 truncates against absolute time since the epoch and always lands on UTC
 midnight regardless of the Location the value carries, silently. fleetd
@@ -301,3 +307,295 @@ per-harness attribution.
 
 Estimated ~710 lines + tests. Note the plan's own calibration: C0–C4 ran
 3.6–4.5× their line estimates.
+
+## Execution (2026-08-03)
+
+Branched off `feat/c4-fleet-comfort` (C4 + C5 landed).
+
+### What shipped
+
+| piece | where |
+|---|---|
+| cell-side collector | `internal/vibe/usagemeter/usagemeter.go` (new package) |
+| announce wire field | `fleetapi/announce.go` — `AnnounceRequest.Usage *AnnounceUsage` |
+| cell-side hook | `fleetannounce.Config.Usage func(context.Context) *AnnounceUsage`, wired from `daemon/announce.go` and `vibe fleet announce` via `usagemeter.Snapshotter` |
+| fleetd ledger | `fleetapi/usage.go` — fold, day bucketing, JSONL flush/compact |
+| config | `fleet.timezone` (`daemon.FleetConfig`), `Config.FleetLocation()` |
+| paths | `paths.CellUsageFile()`, `paths.UsageLedgerFile()` |
+| exposure | `GET /api/fleet/usage?since=YYYY-MM-DD` + MCP `fleet_usage` |
+
+Two deliberate deviations from the doc, both narrower than what the
+text implied:
+
+- **Basis is a three-value vocabulary, not two.** `chat` (llama.cpp
+  `timings`), `embed` (OpenAI `usage` on embeddings/rerank), and
+  `other` for the remaining model-dispatched endpoints llama-swap
+  meters (audio, images, `/props`, `count_tokens`). `other` uses the
+  embed arithmetic — whatever prompt figure arrives is taken as
+  complete. The doc's third table row ("any mlx row") needs **no branch
+  at all**: mlx answers chat paths from `usage`, so `input_tokens` is
+  already the full prompt AND no cache figure is reported, so
+  `max(cache, 0)` is 0 and `fresh + cached` degenerates to exactly the
+  right answer. Branching on backend kind would have been both wrong
+  and unnecessary.
+- **`resident_s` and `lost_rows` are their own basis values**
+  (`resident`, `cell`) rather than columns on a token row. §6's example
+  line shows `resident_s` beside the token counts, but residency is
+  fleetd-observed and basis-independent, and loss is a property of the
+  cell's READ, not of any model. Separate basis values keep the
+  `(day, cell, model, basis, epoch)` keyspace and the replay rule
+  uniform while making it impossible for either number to land in a
+  token sum.
+
+Two things the doc did not spell out and the code had to decide:
+
+- **The cursor is keyed WITHOUT the day.** `last_total` lives on the
+  bucket line as §6 requires, but the in-memory cursor is
+  `(cell, model, basis, epoch)`. Keyed by day, the first fold after
+  local midnight would read `last_total` as zero and bill the cell's
+  entire lifetime again — a silent 100× on the first bar of every day.
+  Test: `TestUsageFold_DayRolloverBillsTheDeltaNotTheLifetime`.
+- **The id-reset check runs BEFORE the walk-back, not after.** Resetting
+  the cursor after reading rows would leave the shortfall arithmetic
+  comparing rows-read (measured against the old cursor) with a span
+  measured from the new one, reporting a phantom `lost_rows` of every id
+  on the box.
+
+`fleet.timezone` also now feeds C4's warm schedule (`StartScheduleLoop`
+previously got `nil` → process zone). C4 §2's rule is that a schedule's
+zone is declared; before this phase there was nothing to declare it
+with. Unset keeps the old behavior exactly.
+
+### Doc drift found (ground rule 8)
+
+- `AGENTS.md:620-626` → the `:9000 is llama-swap, not vibe` bullet is at
+  **AGENTS.md:666** (the "Router / model lifecycle" section). C5's doc
+  pass shifted it. Fixed above.
+- `warmsched.go:118-131` → `cronSpec.nextFire` is at
+  **warmsched.go:136-157** (comment 136-143, func 144-157). Fixed above.
+- `router/render.go:33-41` → `Options.ExtrasPath` is at **32-41**
+  (comment 32-40, field 41). Close enough to leave.
+- `llama-swap@v239 internal/store/store.go:22-45` and the routes at
+  `internal/server/server.go:261-270` → verified against a checkout at
+  `1f3c68e`: `TokenMetrics` at store.go:22-31, `ActivityLogEntry` at
+  33-46, `ActivityPage` at 82-88; routes at **server.go:303-304**. All
+  the field names and semantics the doc asserts are correct, including
+  the two that matter most: `buildMetrics` overwrites `inputTokens` with
+  `timings.prompt_n` when `timings` exists (store.go's parser, metrics.go
+  442-457), and `cachedTokens`/`draftTokens`/`draftAccTokens` all default
+  to **-1**. Confirmed too: `PruneActivity` runs only when
+  `store.IsInMemory()` (metrics.go:76-80), so §0's `store: {path:}` does
+  retire the 1000-row ring; and `shared.FetchContext` calls
+  `cfg.RealModelName` and falls back to the client's string when it
+  misses (shared/http.go:117-127) — which is exactly why collection is
+  cell-side.
+
+### Gates
+
+| gate | result |
+|---|---|
+| 1. Store gate (24 h soak) | **NOT RUN** — live, needs real cells |
+| 2. No-double-count | unit half **PASS** (`TestUsageFold_FrontCellIsSkippedStructurallyByName`); live half **NOT RUN** |
+| 3. Cache semantics | unit half **PASS** (`TestClassify_ChatAddsCacheAndEmbedDoesNot`, `TestClassify_NegativeCacheSentinelClampsToZero`); live half **NOT RUN** |
+| 4. Unmeasured | unit half **PASS** (`TestClassify_ZeroTokenTwoHundredIsUnmeasuredNotZero`, `TestClassify_NonTwoHundredIsErrorAndContributesNothing`); live half **NOT RUN** |
+| 5. Self-traffic | unit half **PASS** (`TestClassify_OneTokenChatRowIsAPokeExcludedFromBillableSums`); live half **NOT RUN** |
+| 6. Offline | unit analogue **PASS** (cumulative totals + `TestUsageLedger_FlushAndReplayAreIdempotent`); live **NOT RUN** |
+| 7. Restart idempotency | **PASS** (`TestUsageLedger_FlushAndReplayAreIdempotent`, incl. the kill-between-fold-and-flush case) |
+| 8. Epoch | unit half **PASS** (`TestPoll_IDResetMintsANewEpochAndReingests`, `TestUsageFold_SameEpoch*`, `TestUsageFold_NewEpochStartsANewRowAndKeepsTheOld`); live half (restart a cell's llama-swap on an in-memory store) **NOT RUN** |
+| 9. Timezone | **PASS** (`TestUsageDayKey_SplitsAtLocalMidnightNotUTCMidnight`, `TestUsageDayKey_HandlesBothDSTDiscontinuities`, `TestNoTruncateBasedDayBucketing` — the grep now walks the whole module, not two directories; see the review addendum) |
+| 10. MTP | **PASS** (`TestClassify_DraftTokensNeverEnterAnySum`) |
+| 11. Streaming contract | **PASS** — `git diff --stat internal/vibe/proxy/` empty; `git diff -- '*.go' \| grep -c stream_options` = 0 across the phase. Stated precisely: the phrase occurs exactly once in the whole diff, in the row above this one, naming the gate. Zero code occurrences. |
+| 12. Inner loop + review | **PASS** — build / vet / gofmt / mod tidy / `test -race -count=5 ./...` / `golangci-lint run` (0 issues), all re-run on the tree after the second review pass |
+
+### Adversarial self-review (ground rule 9)
+
+Landed as its own commit against the feature commit. Seven findings,
+all fixed, each with a regression test where one was possible.
+
+1. **Two overlapping `Poll`s double-counted the whole window
+   (blocker).** `Poll` read the cursor, released the lock for the HTTP
+   round trip, then folded. Two concurrent calls both saw the old cursor
+   and both ingested the same rows. Invisible to `-race` — it is a logic
+   race, not a memory one. Fixed with a whole-poll `pollMu`.
+   `TestPoll_ConcurrentPollsDoNotDoubleCount`.
+2. **`lost_rows` was assigned, not folded as a delta.** The cell reports
+   it cumulatively like every other counter, so every day after a loss
+   repeated the same number and any cross-day sum was wrong. It now runs
+   through the same cursor machinery as the token counters (and is
+   therefore persisted the same way).
+   `TestUsageFold_LostRowsFoldAsADeltaAcrossDays`.
+3. **Compaction after a degraded read was silent data loss.**
+   `newUsageLedger` compacts by rewriting the file from memory; if
+   `load` could not read the whole file (open error, scanner error), the
+   rewrite deleted whatever had not been read. Compaction is now skipped
+   on a degraded read. Unparseable LINES still compact away — that is
+   the cleanup, and it is why JSONL was chosen.
+   `TestUsageLedger_DegradedReadSkipsCompaction`.
+4. **A first-boot backfill could hold the heartbeat hostage.** `Poll`
+   runs inline in the announce loop, and a ten-page walk against a slow
+   store on a 10s-per-request client is up to 100 s. The heartbeat is
+   the cell's only evidence of life. `PollAndSnapshot` now derives a 20 s
+   deadline; an interrupted backfill costs nothing, because the cursor
+   only advances on a completed poll.
+5. **A cell that lost every row it read announced nothing.** `Snapshot`
+   returned nil on an empty model set, so a total loss was
+   indistinguishable from an idle cell — the exact confusion `lost_rows`
+   exists to prevent. It now reports the loss with no models, and `fold`
+   accepts a model-less usage block.
+   `TestSnapshot_ReportsALossWithNoModels`,
+   `TestUsageFold_ModellessLossStillLands`.
+6. **Ledger file mode depended on which writer ran first** (compaction's
+   tmp+rename made 0600, the append path made 0644). Both are 0600 now,
+   matching the intent and lease stores.
+7. **Residency truncated every heartbeat gap to whole seconds.**
+   Announces land on a jittered ~15 s cadence, so truncation loses half
+   a second per heartbeat — a steady ~3% under-count, and exactly the
+   kind of quiet bias C7b would build an energy figure on. It rounds now.
+   `TestUsageResidency_RoundsRatherThanTruncatesTheGap`.
+
+Known and accepted, documented rather than fixed:
+
+- **A first poll against a large persistent store reports the
+  un-walked prefix as `lost_rows`.** With no prior state the cursor is 0
+  and the walk is bounded at ~10 k rows, so a box with months of history
+  announces a large one-time loss. That is honest — those rows were
+  genuinely never counted — and the alternative (starting the cursor at
+  `max_id` and pretending) would silently discard the same history.
+- **Residency credit lands entirely on the day of the announce**, so a
+  heartbeat straddling local midnight misattributes at most one
+  staleness bound (~50 s).
+- **The front skip is by cell NAME.** A box that serves the front
+  llama-swap while announcing under some other cell name would double
+  count. That is a topology error (the front owns no models), not a
+  fold-time condition the ledger can detect.
+
+### §0 is an operator step, not a code change
+
+The `store: {path: …}` extras block is per-cell llama-swap config and
+lands in the private fleet repo (ground rule 3). Nothing in this repo
+renders it: `router.Options.ExtrasPath` merges the file verbatim. Until
+each cell has it, that cell's activity log is the 1000-row in-memory
+ring and the collector will honestly report `lost_rows` and mint a new
+epoch on every llama-swap restart.
+
+### Adversarial-review addendum (second, independent pass)
+
+Ground rule 9's review of the feature commit **and** of the self-review
+commit that followed it, run 2026-08-03 against `895bdcd`. Seven
+findings, all fixed, every one with a regression test that was
+**mutation-verified**: the production change was reverted and the new
+test observed to fail, then restored.
+
+1. **Announce-supplied counters were folded unclamped (major).**
+   `usageLedger.fold` took `AnnounceUsageModel` straight from the wire.
+   The cell clamps llama-swap's `-1` sentinels, but the announce is
+   untrusted input — the posture C3/C5 established for every other
+   announce-fed path — and this store is APPEND-ONLY: a negative that
+   lands can never be corrected and silently SUBTRACTS from every rollup
+   C7b will build on the file. A cell one bug away from `in_fresh: -1`
+   (or a forged announce; the fleet token is every cell's voice) poisons
+   the history permanently. `clampUsage` now clamps the CUMULATIVE total
+   before the delta rule, not the delta — clamping the delta would leave
+   a poisoned cursor that swallows the next honest announce.
+   `TestUsageFold_NegativeCountersFromTheWireNeverEnterTheLedger`.
+2. **A cell could write into fleetd's reserved basis namespace
+   (major).** `resident` and `cell` are fleetd's own basis values, and
+   nothing stopped an announce from claiming them. A cell-announced
+   `basis: "resident"` row keys onto *exactly* the bucket
+   `foldResidency` credits seconds to, producing a single JSONL line
+   that is simultaneously a token row and a residency row with no way to
+   separate the halves afterwards; `basis: "cell"` collides with the
+   `lost_rows` bookkeeping row the same way. Reserved bases are now
+   dropped at fold with a warn-once (a bad cell sends one every 15 s
+   forever), and the rest of the same announce still lands — one bad
+   entry must not cost the cell its accounting. Unknown bases stay
+   welcome; that is a pricing question and pricing is C7b's.
+   `TestUsageFold_ACellCannotWriteFleetdsReservedBases`.
+3. **`TestUsageLedger_DegradedReadSkipsCompaction` proved nothing
+   (major, ground rule 10).** The self-review's own finding-3 test used
+   an unreadable file, which leaves ZERO buckets — and `compact()`
+   returns early on an empty ledger regardless. Deleting the production
+   guard left the test green. The body now uses a read that stops PART
+   WAY (a valid prefix, then a line past the scanner's 1 MB token limit,
+   then more valid lines): the prefix parses, the scan aborts, and
+   without the guard compaction rewrites the file from that partial view
+   and deletes the tail. Verified to fail with the guard removed.
+4. **`UsageReport` handed callers a pointer into ledger memory
+   (minor).** Each bucket was copied under `l.mu`, but a struct copy
+   still carries `LastTotal *AnnounceUsageModel` — captured under a
+   lock, dereferenced after it, which is the exact shape that shipped in
+   C4. Nothing writes through it today; `LastTotal` is deep-copied now
+   so nothing can start to.
+   `TestUsageReport_DoesNotAliasLedgerMemory`.
+5. **A cell-side state-write failure was invisible (minor).** `Poll`
+   returned `c.save()`'s error into `PollAndSnapshot`, which logs at
+   **debug** under the message "usage poll failed" — correct for an
+   llama-swap that is simply stopped, wrong here. On a read-only or full
+   state dir the poll SUCCEEDED and only durability failed, leaving the
+   cursor advanced in memory and stale on disk; the next restart
+   re-ingests rows already counted, which fleetd folds as new traffic
+   because the cumulative total is all it has to go on. That case now
+   warns at the save site, and the cell still announces its counts
+   (fail-open).
+   `TestPoll_StateWriteFailureIsWarnedNotSwallowed`.
+6. **The role-gating regression test missed the new route (minor).**
+   AGENTS.md's fleetd invariant is that a daemon without
+   `fleet_registry: true` serves none of those routes, "test-gated" by
+   `daemon/fleet_registry_test.go:TestDaemon_FleetRegistryOff_NoMCP` —
+   which probed `/mcp` and `/api/fleet/intent` but not C7a's
+   `GET /api/fleet/usage`. Added; verified to fail when the route is
+   mounted unconditionally.
+7. **Two unbounded inputs on the read surface (minor).** `since` is a
+   STRING comparison against the day key, so `?since=aug3` silently
+   returned an empty document and `?since=1` silently returned
+   everything — a typo reading as an answer about the fleet. It is a 400
+   now (`TestUsageEndpoint_RejectsAMalformedSince`). And `fleet_usage`'s
+   `days` fed `AddDate` unbounded: `days=1<<62` OVERFLOWS `time.Time`
+   and wraps into the future (measured: it lands on *tomorrow*),
+   filtering every bucket out so the tool reports "the fleet used
+   nothing". Absurd windows now mean "everything"
+   (`TestFleetUsageTool_AnAbsurdWindowReturnsEverythingNotNothing`).
+
+Also fixed without a test, because the failure it logs is not reachable
+from a test: `compact()` dropped a bucket silently when `json.Marshal`
+failed, while the append path warned on the identical failure —
+asymmetric, and compaction REPLACES the file rather than appending to
+it, so a silent drop there is deletion.
+
+The gate-9 grep test was widened from two hard-coded directories to a
+walk of the whole module (with a floor on the file count, so a walk that
+silently found nothing cannot pass forever). Gate 9's wording is
+"appears nowhere in the phase", and the phase touched seven packages.
+
+**Verified sound, not changed:**
+
+- The delta/epoch rules, the day-independent cursor, the front skip, the
+  poke/unmeasured/error split, the `req_path` basis branch, the `-1`
+  clamps and the draft-token exclusion all hold under mutation: breaking
+  the day-independent cursor, the chat/embed cache branch, the residency
+  rounding and `pollMu` each made a named test fail.
+- `Server.usageFlushLoop` is `wg.Add`-ed outside its goroutine, exits on
+  `s.done`, stops its ticker, and its final flush completes before
+  `Close()` returns (`Close` waits on the same `wg`).
+- No lock is held across an HTTP call or a `publish`; `flush` marshals
+  under `l.mu` and writes outside it, and re-marks the batch dirty on a
+  write failure.
+- `git diff --stat internal/vibe/proxy/` is still empty and
+  `stream_options` still appears in zero lines of Go.
+
+**Known and accepted (documented, not fixed):**
+
+- **Losing the cell's state file double-counts its recent history.**
+  With no prior state the cursor is 0, so the first poll re-ingests up to
+  ~10 k rows under a NEW epoch, and fleetd starts a new row rather than
+  recognising traffic its ledger already holds. The alternative (start at
+  `max_id`) discards the same history silently. Treat
+  `$XDG_STATE_HOME/vibe/fleet/cell-usage.json` as data, not cache.
+- **Ledger cardinality is announce-driven.** Every distinct
+  `(model, basis, epoch)` a cell announces becomes a permanent bucket.
+  The 1 MB announce body bounds one heartbeat, not the lifetime; a cell
+  whose llama-swap restarts on an in-memory store mints an epoch per
+  restart. §0's `store: {path: …}` is what keeps this small.
+- **`UsageBucket.TZ` is stamped at bucket creation.** Changing
+  `fleet.timezone` between fleetd restarts leaves old lines labelled with
+  the old zone while new counts bucket in the new one.

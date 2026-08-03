@@ -375,6 +375,74 @@ optional.)
     `warm_model` skips `chat`-class entries and still refuses the rest.
     hosts.yaml tolerates fleet.md's top-level `hosts:` inventory as an
     inert key — `KnownFields(true)` stays on.
+- **Usage ledger (fleet-control C7a).** Tokens per cell, per model, per
+  day — RAW COUNTS ONLY, no prices anywhere (C7b prices them; storing
+  counts is what lets a price change re-price the whole history). The
+  pieces an agent must not break:
+  - **`internal/vibe/usagemeter` is CELL-side by necessity, not by
+    taste.** llama-swap keys each activity row on
+    `RealModelName(requested)`; the front's rendered config is
+    peers-only, so that resolves nothing there and the front records
+    whatever string the client typed. Only the cell resolves
+    `qwen3.6-27b-tools` → `qwen3.6-27b`. Never turn this into a fleetd
+    pull.
+  - **Token semantics branch on `req_path`, never on backend kind.** On
+    chat-family paths llama.cpp's `input_tokens` is `timings.prompt_n` =
+    **cache-miss only**, so billable input is `input + max(cache, 0)`;
+    on `/v1/embeddings` and the rerank family it is the OpenAI `usage`
+    prompt figure with cache already included, so adding cache
+    double-counts (1.8x-5x). `-1` is llama-swap's not-reported sentinel
+    for `cache_tokens`, `draft_tokens` and `draft_acc_tokens` — always
+    clamp. **mlx needs no branch**: it answers chat paths from `usage`
+    and reports no cache, so the chat arithmetic degenerates correctly.
+    The chosen branch is recorded per row as `basis`, because llama-swap
+    stores nothing that says which parser won.
+  - **Three corrections, all VISIBLE counters**: `poke_req` (chat rows
+    with `output_tokens <= 1` — C4's warm loops issue real metered
+    1-token completions and can outnumber human requests), `err_req`
+    (non-200), `unmeasured_req` (200 with no tokens: mlx streaming and
+    every cancelled stream). None is summed as zero, and `unmeasured` is
+    **never** estimated from `duration_ms × tokens_per_second` — that
+    field is -1 or 0 on exactly those rows.
+  - **Day buckets use an explicit `*time.Location`** (`fleet.timezone`,
+    `Config.FleetLocation()`). `Truncate(24*time.Hour)` rounds against
+    absolute time and lands on UTC midnight regardless of the value's
+    Location, silently; a grep test over the whole module forbids it.
+  - **An announce is untrusted input on this path too** (C3/C5's posture;
+    the fleet token is every cell's voice). The ledger is APPEND-ONLY, so
+    `fold` hardens at ingest and a wrong value can never be corrected:
+    counters are clamped non-negative on the CUMULATIVE total (clamping
+    the delta would leave a poisoned cursor), and the two bases fleetd
+    writes itself — `resident` and `cell` — are closed to cells, because a
+    cell-announced `resident` row keys onto the exact bucket residency
+    seconds land on. Unknown bases stay welcome (that's a C7b pricing
+    question); one bad entry never costs the announce its other rows.
+  - **No double count is a whitelist**: only announce-carried totals
+    enter the ledger, and `fleetcfg.FrontCell` is skipped structurally
+    by name at fold time. Totals on the wire are CUMULATIVE, so a
+    missed heartbeat loses nothing and a duplicate announce adds
+    nothing; the cursor is keyed `(cell, model, basis, epoch)` WITHOUT
+    the day, or the first fold after local midnight rebills the cell's
+    whole lifetime. `epoch` changes when the cell's activity ids restart
+    (`max_id < cursor`) and starts a new row rather than flatlining the
+    cell.
+  - Storage is append-only JSONL (`paths.UsageLedgerFile()`), coalesced
+    in memory, flushed on a 60s ticker and at shutdown, compacted at
+    start via tmp+rename. Deliberately NOT `history.go`'s
+    rewrite-on-every-record: fleetd folds an announce per cell per 15s.
+    **Compaction rewrites the file from memory, so a DEGRADED read (open
+    error, aborted scan) skips it** — otherwise a transient read error
+    deletes whatever didn't parse. Unparseable LINES still compact away;
+    that is the cleanup, and it is why JSONL was chosen.
+  - `GET /api/fleet/usage` is fleetd-only like `/mcp` and
+    `/api/fleet/intent`, and belongs in
+    `daemon/fleet_registry_test.go:TestDaemon_FleetRegistryOff_NoMCP`'s
+    probe list with them — add every new fleetd route there.
+  - `internal/vibe/proxy` is **not** instrumented and must not be: cells
+    run `disable_proxy: true`, so a flawless tee there would measure ~0%
+    of fleet tokens. Requires `store: {path: …}` in each cell's
+    llama-swap extras (private fleet repo) or the activity log is a
+    1000-row in-memory ring.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.
