@@ -849,9 +849,12 @@ func TestFleetPage_SavingsViewInvariants(t *testing.T) {
 	// The savings view has no action buttons — that is what keeps "no new
 	// mutation surface" trivially true.
 	start := strings.Index(page, `<section id="view-savings"`)
-	end := strings.Index(page[start:], "</section>")
-	if start < 0 || end < 0 {
+	if start < 0 {
 		t.Fatal("savings section not found")
+	}
+	end := strings.Index(page[start:], "</section>")
+	if end < 0 {
+		t.Fatal("savings section is not closed")
 	}
 	section := page[start : start+end]
 	if strings.Contains(section, "<button") || strings.Contains(section, "onclick") {
@@ -1033,5 +1036,263 @@ func TestSavings_MeasuredButUnpricedCellIsNotAZero(t *testing.T) {
 	// for the work, not a measurement of the box.
 	if row.Power == nil {
 		t.Error("declared power dropped out because the tokens were unpriced")
+	}
+}
+
+// ─── second adversarial review pass ─────────────────────────────────────────
+
+// TestSavings_LegacyResidencyFallsBackToTheMaxNotTheSum: ledgers written
+// before the cell-level residency row carry per-model rows only. Summing
+// them bills a box that held two models resident all day for 48 hours of
+// idle watts; the fallback is the MAX across models, which under-counts
+// a cell that alternated models — the conservative direction for a term
+// subtracted from savings.
+func TestSavings_LegacyResidencyFallsBackToTheMaxNotTheSum(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	day := today()
+	seedTokens(s, day, "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000})
+	// No cell-level row: two models, each resident the whole day.
+	seedResidency(s, day, "gpu-cell", "model-a", 86_400)
+	seedResidency(s, day, "gpu-cell", "model-b", 86_400)
+
+	rep := mustSavings(t, s, "30d")
+	// 100W * 86400s = 2.4kWh * $0.15 = $0.36. The sum would be $0.72.
+	if got := money2(t, cellRow(t, rep, "gpu-cell").Power); got != "0.36" {
+		t.Errorf("legacy-ledger power = $%s, want $0.36 (max across models, never the sum)", got)
+	}
+}
+
+// TestSavings_CellResidencyRowWinsOverPerModelRows: once the cell-level
+// row exists it is authoritative, so a box whose per-model rows happen to
+// exceed the day cannot inflate the denominator.
+func TestSavings_CellResidencyRowWinsOverPerModelRows(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	day := today()
+	seedTokens(s, day, "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000})
+	seedResidency(s, day, "gpu-cell", "", 3_600)
+	seedResidency(s, day, "gpu-cell", "model-a", 86_400)
+
+	rep := mustSavings(t, s, "30d")
+	// 100W * 3600s = 0.1kWh * $0.15 = $0.015 → $0.01 to the cent.
+	if got := money2(t, cellRow(t, rep, "gpu-cell").Power); got != "0.01" {
+		t.Errorf("power = $%s, want $0.01 (the cell-level row is the denominator)", got)
+	}
+}
+
+// TestSavings_FrontCapitalIsANoteNotABarItCannotMove: the front is
+// structurally excluded from the savings table (C7a folds no token rows
+// for it), so a payback bar for it has a numerator defined to be zero and
+// would read "0% of $N" forever — a screen claiming to have measured
+// hardware it never measured.
+func TestSavings_FrontCapitalIsANoteNotABarItCannotMove(t *testing.T) {
+	hosts := savingsHosts()
+	front := hosts.Cells[fleetcfg.FrontCell]
+	front.CapitalCost = 900
+	front.CapitalNote = "example: the router box"
+	hosts.Cells[fleetcfg.FrontCell] = front
+
+	s := newSavingsServer(t, hosts)
+	seedTokens(s, today(), "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000})
+	rep := mustSavings(t, s, "all")
+	for _, p := range rep.Payback {
+		if p.Cell == fleetcfg.FrontCell {
+			t.Errorf("the front got a payback bar it can never move: %+v", p)
+		}
+	}
+	if len(rep.Payback) != 1 || rep.Payback[0].Cell != "gpu-cell" {
+		t.Fatalf("payback = %+v, want only the serving cell", rep.Payback)
+	}
+	found := false
+	for _, n := range rep.Notes {
+		if strings.Contains(n, "front") && strings.Contains(n, "capital_cost") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("notes = %v, want the front's capital_cost accounted for in words", rep.Notes)
+	}
+}
+
+// TestSavings_PartialPowerCoverageIsStated: subtracting SOME cells'
+// electricity from a fleet-wide gross is the one place this screen errs
+// toward a larger number. It must not be silent about it.
+func TestSavings_PartialPowerCoverageIsStated(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	day := today()
+	seedTokens(s, day, "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000})
+	seedResidency(s, day, "gpu-cell", "", 3600)
+	seedTokens(s, day, "laptop", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000})
+
+	rep := mustSavings(t, s, "30d")
+	if rep.Totals.Power == nil {
+		t.Fatal("the fleet total counted no power at all; this test needs a partial one")
+	}
+	found := false
+	for _, n := range rep.Notes {
+		if strings.Contains(n, "only some cells") && strings.Contains(n, "laptop") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("notes = %v, want the uncounted cell named", rep.Notes)
+	}
+}
+
+// TestSavings_MissingElectricityPriceBlamesTheRightField: a fleet that
+// declared wattage on every cell and no electricity price gets an em dash
+// everywhere. Blaming a missing `power:` block sends the reader to fix
+// the wrong line.
+func TestSavings_MissingElectricityPriceBlamesTheRightField(t *testing.T) {
+	hosts := savingsHosts()
+	hosts.Pricing.ElectricityPricePerKWh = 0
+	s := newSavingsServer(t, hosts)
+	day := today()
+	seedTokens(s, day, "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000})
+	seedResidency(s, day, "gpu-cell", "", 3600)
+
+	rep := mustSavings(t, s, "30d")
+	if rep.Totals.Power != nil {
+		t.Fatalf("power = %v with no electricity price", *rep.Totals.Power)
+	}
+	found := false
+	for _, n := range rep.Notes {
+		if strings.Contains(n, "electricity_price_per_kwh") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("notes = %v, want the missing electricity price named", rep.Notes)
+	}
+}
+
+// TestSavings_CloudTokensStayOutOfTheTokensPricedPct: cloud rows are a
+// bill reconstruction on the FRONT and never enter the savings
+// arithmetic — including the denominator of "N% of tokens priced", which
+// is a statement about what the CELLS served.
+func TestSavings_CloudTokensStayOutOfTheTokensPricedPct(t *testing.T) {
+	hosts := savingsHosts()
+	hosts.Pricing.Models["cloud-chat"] = fleetcfg.ModelPricing{PricedAs: "cloud-chat"}
+	s := newSavingsServer(t, hosts)
+	day := today()
+	seedTokens(s, day, "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000})
+	seedTokens(s, day, fleetcfg.FrontCell, "cloud-chat", usageBasisCloud, counts{
+		Req: 20, InFresh: 9_000_000, Out: 1_000_000,
+	})
+	rep := mustSavings(t, s, "30d")
+	if rep.Totals.TokensPricedPct != 100 {
+		t.Errorf("tokens priced = %.1f%%, want 100 — cloud tokens are not cell tokens", rep.Totals.TokensPricedPct)
+	}
+	if rep.Totals.InFresh != 1_000_000 {
+		t.Errorf("fleet in_fresh = %d, want only the cell's tokens", rep.Totals.InFresh)
+	}
+}
+
+// TestSavings_CancelledRequestIsNotABadRequest: Savings aborts on
+// ctx.Err() rather than returning a short document, so the handler must
+// not report the client's own disconnect as the client's bad input.
+func TestSavings_CancelledRequestIsNotABadRequest(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	seedTokens(s, today(), "gpu-cell", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/fleet/savings?window=30d", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	s.handleSavings(rec, req)
+	if rec.Code == http.StatusBadRequest {
+		t.Error("a cancelled request reported as HTTP 400; a typo'd window and a dropped connection must differ")
+	}
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("HTTP %d, want 503", rec.Code)
+	}
+
+	// And a genuinely malformed window is still the caller's fault.
+	rec = httptest.NewRecorder()
+	s.handleSavings(rec, httptest.NewRequest(http.MethodGet, "/api/fleet/savings?window=lol", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("malformed window: HTTP %d, want 400", rec.Code)
+	}
+}
+
+// TestFleetPage_MeasuredCellReasonIsRendered: the payload's reason for a
+// measured-but-unpriced cell ("nothing priced in this window") is the
+// only thing standing between the reader and an unexplained em dash.
+func TestFleetPage_MeasuredCellReasonIsRendered(t *testing.T) {
+	page := fleetPageSource(t)
+	start := strings.Index(page, "function renderSavings(")
+	if start < 0 {
+		t.Fatal("renderSavings() not found")
+	}
+	body := page[start:]
+	if end := strings.Index(body, "\nfunction showView("); end > 0 {
+		body = body[:end]
+	}
+	if !strings.Contains(body, "c.reason, c.partial") {
+		t.Error("renderSavings() does not render a measured cell's reason; its money column is an unexplained dash")
+	}
+}
+
+// TestSavings_IdleCellStillPaysForItsElectricity: a cell holding a C4
+// warm target resident all day and serving nothing measurable burns its
+// idle constant. §8 excludes an unmeasured cell from the SAVINGS total;
+// electricity is a cost, not a saving, and dropping it inflates the
+// fleet net. The payback strip already charged those watts — the window
+// table used to disagree with it.
+func TestSavings_IdleCellStillPaysForItsElectricity(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	day := today()
+	// gpu-cell: resident all day, not one measured request.
+	seedResidency(s, day, "gpu-cell", "", 86_400)
+	// laptop: real traffic, so the fleet has a gross to compare against.
+	seedTokens(s, day, "laptop", "qwen-coder", prices.BasisChat, counts{Req: 1, InFresh: 1_000_000})
+
+	rep := mustSavings(t, s, "30d")
+	row := cellRow(t, rep, "gpu-cell")
+	if row.Measured {
+		t.Fatal("a cell with no measured requests must not read as measured")
+	}
+	// 100W * 86400s = 2.4kWh * $0.15 = $0.36
+	if got := money2(t, row.Power); got != "0.36" {
+		t.Errorf("idle cell power = $%s, want $0.36", got)
+	}
+	if got := money2(t, row.Net); got != "-0.36" {
+		t.Errorf("idle cell net = $%s, want -$0.36 — it cost money and saved nothing", got)
+	}
+	if rep.Totals.Power == nil || money2(t, rep.Totals.Power) != "0.36" {
+		t.Errorf("fleet power = %s, want $0.36 — an idle cell's watts are still the fleet's watts",
+			money2(t, rep.Totals.Power))
+	}
+	if rep.Totals.Net == nil || money2(t, rep.Totals.Net) != "-0.16" {
+		t.Errorf("fleet net = %s, want -$0.16 ($0.20 gross − $0.36 power)", money2(t, rep.Totals.Net))
+	}
+	if rep.Totals.CellsMeasured != 1 {
+		t.Errorf("cells measured = %d, want 1 — counting the watts does not make the cell measured", rep.Totals.CellsMeasured)
+	}
+	// And the page has somewhere to put it.
+	page := fleetPageSource(t)
+	if !strings.Contains(page, "td.colSpan = 4;") {
+		t.Error("the page's unmeasured row does not leave room for the power and net columns")
+	}
+}
+
+// TestSavings_WarmLoopPokesAreNamed: C7a calls poke_req a VISIBLE
+// counter because C4's warm loops issue real metered 1-token completions
+// that can outnumber human requests. They are excluded from every token
+// sum, so a screen that never mentions them makes the exclusion
+// invisible.
+func TestSavings_WarmLoopPokesAreNamed(t *testing.T) {
+	s := newSavingsServer(t, savingsHosts())
+	b := s.usage.bucketLocked(usageKey{Day: today(), Cell: "gpu-cell", Model: "qwen-coder", Basis: prices.BasisChat}, "UTC")
+	b.Req = 4
+	b.InFresh = 1_000_000
+	b.PokeReq = 96
+
+	rep := mustSavings(t, s, "30d")
+	row := cellRow(t, rep, "gpu-cell")
+	if !strings.Contains(row.Partial, "96 warm-loop pokes") {
+		t.Errorf("partial note = %q, want the poke count named", row.Partial)
+	}
+	if row.Req != 4 {
+		t.Errorf("req = %d, want 4 — pokes are not requests", row.Req)
 	}
 }

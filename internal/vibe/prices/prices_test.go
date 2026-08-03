@@ -428,3 +428,77 @@ func TestParseRejectsUnknownSchemaAndBadOrder(t *testing.T) {
 		t.Error("accepted out-of-order snapshots")
 	}
 }
+
+// ─── adversarial review pass ────────────────────────────────────────────────
+
+// TestResolver_BuildsOnePerSnapshotGenerationNotPerDay: a savings report
+// resolves every day the ledger holds (payback is lifetime), and
+// resolving the vendored table costs milliseconds. Days inside one
+// snapshot generation resolve identically by construction, so the
+// resolver hands back the SAME object; a day that crosses a snapshot
+// boundary gets a new one with the new rates.
+func TestResolver_BuildsOnePerSnapshotGenerationNotPerDay(t *testing.T) {
+	tbl := &Table{
+		Schema: SchemaVersion,
+		Snapshots: []Snapshot{
+			{EffectiveFrom: "2026-01-01", Base: true, Rows: []Row{
+				{Provider: "h", Model: "acme/chat", Key: "chat", In: 3.00, Out: 15.00, Open: true},
+			}},
+			{EffectiveFrom: "2026-06-01", Rows: []Row{
+				{Provider: "h", Model: "acme/chat", Key: "chat", In: 1.00, Out: 5.00, Open: true},
+			}},
+		},
+	}
+	r := tbl.Resolver()
+	a, b := r("2026-03-01"), r("2026-05-31")
+	if a != b {
+		t.Error("two days in the same snapshot generation resolved twice; a year-old ledger pays that cost per day")
+	}
+	pre, post := r("2026-05-31"), r("2026-06-02")
+	if pre == post {
+		t.Fatal("a day across a snapshot boundary reused the older generation's prices")
+	}
+	// And the cache is not just fast, it is correct: each generation still
+	// prices its own day at its own rate.
+	c := Counts{Basis: BasisChat, InFresh: 1_000_000, Out: 1_000_000}
+	before, ok := PriceAcross(pre.Hosts("acme/chat", true), c)
+	if !ok || cents(t, before.Median) != "18.00" {
+		t.Errorf("pre-cut day = $%s, want $18.00", cents(t, before.Median))
+	}
+	after, ok := PriceAcross(post.Hosts("acme/chat", true), c)
+	if !ok || cents(t, after.Median) != "6.00" {
+		t.Errorf("post-cut day = $%s, want $6.00", cents(t, after.Median))
+	}
+	// A pre-base day is its own generation: it prices at the base but is
+	// flagged, and must not be conflated with a day the base covers.
+	old := r("2025-01-01")
+	if !old.BeforeBase {
+		t.Error("a pre-base day lost its BeforeBase flag through the cache")
+	}
+	if old == pre {
+		t.Error("a pre-base day and a base-covered day shared one resolution")
+	}
+	if r("2025-06-01") != old {
+		t.Error("two pre-base days resolved twice")
+	}
+}
+
+// TestResolverMatchesAt: the cached path and the direct one cannot drift,
+// because they are the same resolution.
+func TestResolverMatchesAt(t *testing.T) {
+	tbl, err := Embedded()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := tbl.Resolver()
+	for _, day := range []string{"2000-01-01", tbl.Oldest(), tbl.AsOf(), "2099-01-01"} {
+		direct, cached := tbl.At(day), r(day)
+		if direct.EffectiveFrom != cached.EffectiveFrom || direct.BeforeBase != cached.BeforeBase {
+			t.Errorf("%s: At()=%s/%v Resolver()=%s/%v", day,
+				direct.EffectiveFrom, direct.BeforeBase, cached.EffectiveFrom, cached.BeforeBase)
+		}
+		if len(direct.byKey) != len(cached.byKey) {
+			t.Errorf("%s: At() indexed %d keys, Resolver() %d", day, len(direct.byKey), len(cached.byKey))
+		}
+	}
+}

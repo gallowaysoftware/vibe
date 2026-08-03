@@ -481,8 +481,13 @@ function renderSavings(sv) {
     const tr = document.createElement("tr");
     cellText(tr, c.cell, "cellname");
     if (!c.measured) {
+      // An unmeasured cell still shows its POWER: electricity is a cost,
+      // not a saving, and a box holding a warm model resident all day
+      // spends it whether or not anyone asked it for a token.
       const td = cellText(tr, c.reason || "unmeasured", "dash");
-      td.colSpan = 6;
+      td.colSpan = 4;
+      cellText(tr, c.power == null ? "—" : (c.power_declared ? "~" : "") + usd(c.power), c.power == null ? "num dash" : "num");
+      cellText(tr, usd(c.net), c.net == null ? "num dash" : "num");
       tb.appendChild(tr);
       continue;
     }
@@ -519,11 +524,16 @@ function renderSavings(sv) {
       mrow.appendChild(td);
       tb.appendChild(mrow);
     }
-    if (c.partial) {
+    // A MEASURED cell can still carry a reason — "nothing priced in this
+    // window" is why its money column is an em dash. Rendering it only in
+    // the unmeasured branch left the reader with a dash and no
+    // explanation, which is the same silence the em dash exists to break.
+    for (const note of [c.reason, c.partial]) {
+      if (!note) continue;
       const prow = document.createElement("tr");
       const td = document.createElement("td");
       td.colSpan = 7; td.className = "sv-model unpriced";
-      td.textContent = "↳ " + c.partial;
+      td.textContent = "↳ " + note;
       prow.appendChild(td);
       tb.appendChild(prow);
     }

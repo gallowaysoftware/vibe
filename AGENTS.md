@@ -479,11 +479,31 @@ optional.)
   - **Energy is declared, never sampled** (`power: {source: declared}`
     per cell; `nvidia_smi`/`ha_entity` are named future values that fail
     validation today). Idle and busy are billed separately because C4's
-    warm targets deliberately increase the idle term.
+    warm targets deliberately increase the idle term. Four rules the
+    review pass had to restore, all in the same direction:
+    **electricity is a COST, not a saving**, so a cell with no measured
+    requests still bills its watts (a box holding a warm target resident
+    all day IS the case §4 was written for, and the payback strip was
+    already charging them); the energy denominator is the **cell-level**
+    residency row, falling back to the **MAX** across per-model rows,
+    never the sum; a **partial** power term (some cells declared, some
+    not) is stated on the page, because it is the one place this screen
+    errs LARGE; and the note names the actual missing field — an unset
+    `pricing.electricity_price_per_kwh` blanks every cell that declared
+    wattage perfectly well.
+  - **The front never gets a payback bar.** C7a folds no token rows for
+    it, so its numerator is defined to be zero; a `capital_cost` on the
+    front becomes a note, not a bar that reads "0% of $N" forever. Same
+    structural exclusion as the savings table.
   - **The page adds no route**: `#savings` is a hash-routed view, because
     `/ui/fleet/savings` would force C5's exact-match bearer exemption to
     widen. Bar widths via `el.style.width`, never an interpolated
     `style="…"`. No action buttons on that view, no external asset.
+  - **Price the ledger through `Table.Resolver()`, never `At()` per day.**
+    Payback is lifetime, so every window walks the whole history, and
+    resolving the vendored table costs ~3 ms; per-day resolution made the
+    endpoint cost ~1.3 s at 400 days and grow forever. Days inside one
+    snapshot generation resolve identically, so the cache is exact.
   - Two additive C7a ledger changes belong to this phase: a **cell-level
     residency row** (`model: ""`) as the energy denominator, and the
     fleetd-reserved **`cloud` basis** on the front cell, fed by

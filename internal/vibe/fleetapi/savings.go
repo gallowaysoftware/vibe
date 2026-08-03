@@ -3,6 +3,7 @@ package fleetapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
@@ -455,15 +456,11 @@ func (s *Server) Savings(ctx context.Context, window string) (SavingsReport, err
 // strip.
 func (s *Server) priceLedger(ctx context.Context, rep *SavingsReport, byDay map[string]map[string]*cellDay, table *prices.Table, now time.Time, loc *time.Location) error {
 	hosts := s.hosts
-	resolved := map[string]*prices.Resolved{}
-	resolveAt := func(day string) *prices.Resolved {
-		if r, ok := resolved[day]; ok {
-			return r
-		}
-		r := table.At(day)
-		resolved[day] = r
-		return r
-	}
+	// One resolution per snapshot GENERATION, not per day: payback is
+	// lifetime, so even a 30d window walks every day the ledger holds,
+	// and resolving the vendored table per day cost ~1.3 s per request at
+	// 400 days of history.
+	resolveAt := table.Resolver()
 
 	type cellAgg struct {
 		models     map[modelKey]*ModelSavings
@@ -482,6 +479,7 @@ func (s *Server) priceLedger(ctx context.Context, rep *SavingsReport, byDay map[
 		unmeasured int64
 		errReq     int64
 		lostRows   int64
+		pokeReq    int64
 		measured   bool
 	}
 	windowCells := map[string]*cellAgg{}
@@ -553,6 +551,7 @@ func (s *Server) priceLedger(ctx context.Context, rep *SavingsReport, byDay map[
 				agg.out += c.Out
 				agg.unmeasured += c.Unmeasured
 				agg.errReq += c.ErrReq
+				agg.pokeReq += c.PokeReq
 				billable := prices.BillableInput(prices.Counts{Basis: k.Basis, InFresh: c.InFresh, InCached: c.InCached}) + c.Out
 				agg.total += billable
 
@@ -638,11 +637,32 @@ func (s *Server) priceLedger(ctx context.Context, rep *SavingsReport, byDay map[
 	var totals SavingsTotals
 	totals.CellsTotal = len(names)
 	powerCounted := false
+	// Cells that served measured work and produced no electricity figure.
+	// The fleet net is exactly that much too generous, and a partial
+	// power term is the one place this screen errs LARGE, so it says so.
+	var powerMissing []string
 	for _, name := range slices.Sorted(maps.Keys(names)) {
 		agg := windowCells[name]
 		row := CellSavings{Cell: name}
 		if agg == nil || !agg.measured {
 			row.Reason = "no measured requests in this window"
+			// Electricity is a COST, not a saving. Excluding an unmeasured
+			// cell from the SAVINGS total is §8's rule; dropping its power
+			// with it inflates the fleet net, and the cell this hits is
+			// precisely the one §4 was written for — a box holding a C4 warm
+			// target resident all day, burning its idle constant, serving
+			// nothing a human asked for. The payback strip already charged
+			// those watts; the window table used not to, and the two
+			// disagreed.
+			if agg != nil && agg.powerKnown {
+				row.Power = money(agg.power)
+				row.PowerDeclared = true
+				row.Net = money(-agg.power)
+				row.NetLabel = "net (nothing priced)"
+				row.Reason = "no measured requests in this window; electricity still counted"
+				addMoney(&totals.Power, agg.power)
+				powerCounted = true
+			}
 			rep.Cells = append(rep.Cells, row)
 			continue
 		}
@@ -653,6 +673,8 @@ func (s *Server) priceLedger(ctx context.Context, rep *SavingsReport, byDay map[
 			row.Power = money(agg.power)
 			row.PowerDeclared = true
 			powerCounted = true
+		} else {
+			powerMissing = append(powerMissing, name)
 		}
 		// A cell that served requests none of which could be PRICED is not
 		// a cell that saved $0.00. Money stays absent and the reason says
@@ -673,7 +695,7 @@ func (s *Server) priceLedger(ctx context.Context, rep *SavingsReport, byDay map[
 			row.NetLabel = "net (power not counted)"
 		}
 		row.TokensPricedPct = pct(agg.priced, agg.total)
-		row.Partial = partialNote(agg.req, agg.unmeasured, agg.errReq, agg.lostRows)
+		row.Partial = partialNote(agg.req, agg.unmeasured, agg.errReq, agg.pokeReq, agg.lostRows)
 		for _, k := range sortedModelKeys(agg.models) {
 			m := *agg.models[k]
 			m.SharePct = pct(prices.BillableInput(prices.Counts{Basis: k.Basis, InFresh: m.InFresh, InCached: m.InCached})+m.Out, agg.total)
@@ -744,7 +766,7 @@ func (s *Server) priceLedger(ctx context.Context, rep *SavingsReport, byDay map[
 	}
 	rep.Cloud = cloud
 
-	rep.Payback = s.payback(lifetime, now, loc)
+	rep.Payback, rep.Notes = s.payback(lifetime, now, loc, rep.Notes)
 	// The inverted rule, on the page (C7b §4): energy lands around 11-16%
 	// of net savings against an honest twin-priced headline, so an
 	// electricity line that looks like a rounding error is evidence the
@@ -756,8 +778,8 @@ func (s *Server) priceLedger(ctx context.Context, rep *SavingsReport, byDay map[
 				share))
 		}
 	}
-	if rep.Totals.Power == nil && anyCellHasPower(s.hosts) {
-		rep.Notes = append(rep.Notes, "electricity is not counted for every cell — cells without a power: block render an em dash")
+	if note := powerGapNote(s.hosts, powerMissing, powerCounted); note != "" {
+		rep.Notes = append(rep.Notes, note)
 	}
 	if rep.Prices.Stale {
 		rep.Notes = append(rep.Notes, "the vendored price table is more than "+strconv.Itoa(prices.StaleAfterDays)+" days old; re-run `vibe fleet prices vendor`")
@@ -849,16 +871,28 @@ func cellPowerCost(hosts *fleetcfg.File, cell string, cd *cellDay) (float64, boo
 }
 
 // payback walks each cell's daily series into the lifetime scoreboard.
-func (s *Server) payback(lifetime map[string]map[string]*dayNet, now time.Time, loc *time.Location) []Payback {
+// It returns the notes it was given plus any it had to add.
+func (s *Server) payback(lifetime map[string]map[string]*dayNet, now time.Time, loc *time.Location, notes []string) ([]Payback, []string) {
 	out := []Payback{}
 	if s.hosts == nil {
-		return out
+		return out, notes
 	}
 	for _, name := range slices.Sorted(maps.Keys(s.hosts.Cells)) {
 		cfg := s.hosts.Cells[name]
 		// No capital_cost → no payback bar at all. Not 0%, not infinity,
 		// not an invented denominator.
 		if cfg.CapitalCost <= 0 {
+			continue
+		}
+		if name == fleetcfg.FrontCell {
+			// The front is structurally excluded from the savings table
+			// (C7a folds no token rows for it), so its numerator is defined
+			// to be zero. A bar that can only ever read "0% of $N" is a
+			// screen making a claim about hardware it never measured — the
+			// exact failure mode §8 exists to prevent. Say it in words
+			// instead of drawing it.
+			notes = append(notes, "cell "+name+" declares capital_cost, but the front is not a serving cell in this ledger "+
+				"(its only presence is the cloud reconstruction), so it gets no payback bar rather than a permanent 0%")
 			continue
 		}
 		p := Payback{Cell: name, CapitalCost: cfg.CapitalCost, CapitalNote: cfg.CapitalNote}
@@ -879,7 +913,7 @@ func (s *Server) payback(lifetime map[string]map[string]*dayNet, now time.Time, 
 		p.Projection = project(series, days, cum, cfg.CapitalCost, p.DaysCovered, now, loc)
 		out = append(out, p)
 	}
-	return out
+	return out, notes
 }
 
 // project renders the trailing-rate projection as the string the page
@@ -923,13 +957,20 @@ func project(series map[string]*dayNet, days []string, cum, capital float64, cov
 // never folded into an estimate: unmeasured rows are 200s that reported
 // no tokens (mlx streaming, cancelled streams), and estimating them from
 // duration would borrow another row's rate.
-func partialNote(req, unmeasured, errReq, lost int64) string {
+func partialNote(req, unmeasured, errReq, pokeReq, lost int64) string {
 	var bits []string
 	if unmeasured > 0 {
 		bits = append(bits, fmt.Sprintf("partial — %d of %d requests reported tokens", req, req+unmeasured))
 	}
 	if errReq > 0 {
 		bits = append(bits, fmt.Sprintf("%d errored requests (unbilled)", errReq))
+	}
+	if pokeReq > 0 {
+		// C7a calls poke_req a VISIBLE counter for a reason: C4's warm
+		// loops issue real metered 1-token completions and can outnumber
+		// human requests. They are excluded from every token sum, so a
+		// screen that never mentions them makes the exclusion invisible.
+		bits = append(bits, fmt.Sprintf("%d warm-loop pokes (excluded from every token sum)", pokeReq))
 	}
 	if lost > 0 {
 		bits = append(bits, fmt.Sprintf("%d activity rows aged out before they could be read", lost))
@@ -951,16 +992,28 @@ func frontierOf(hosts *fleetcfg.File) *fleetcfg.Frontier {
 	return hosts.Pricing.Frontier
 }
 
-func anyCellHasPower(hosts *fleetcfg.File) bool {
-	if hosts == nil {
-		return false
+// powerGapNote names the cells whose electricity went uncounted, and
+// WHY. The reason matters: the likeliest cause is a fleet that declared
+// wattage on every cell and no electricity price, which a note blaming a
+// missing `power:` block sends the reader to fix in the wrong file. A
+// PARTIAL gap gets a note too — subtracting some cells' power from a
+// fleet-wide gross is the one place this screen errs toward a larger
+// number, so it must not be silent.
+func powerGapNote(hosts *fleetcfg.File, missing []string, anyCounted bool) string {
+	if len(missing) == 0 {
+		return ""
 	}
-	for _, c := range hosts.Cells {
-		if c.Power != nil {
-			return true
-		}
+	if hosts == nil || hosts.Pricing == nil || hosts.Pricing.ElectricityPricePerKWh <= 0 {
+		return "electricity is not counted anywhere: pricing.electricity_price_per_kwh is unset, " +
+			"so every cell's power renders an em dash and every net is a gross"
 	}
-	return false
+	who := strings.Join(missing, ", ")
+	if !anyCounted {
+		return "electricity is not counted for " + who +
+			" (no power: block, or no residency and no busy time sampled yet)"
+	}
+	return "electricity is counted for only some cells — " + who +
+		" contributed none, so the fleet net is that much too generous"
 }
 
 // money boxes a float. Every money field on this report is a pointer so
@@ -1053,6 +1106,15 @@ func errText(err error) string {
 func (s *Server) handleSavings(w http.ResponseWriter, r *http.Request) {
 	rep, err := s.Savings(r.Context(), r.URL.Query().Get("window"))
 	if err != nil {
+		// A cancelled request is not a malformed one. Savings aborts on
+		// ctx.Err() rather than returning a short document, and reporting
+		// that abort as a 400 would make a client disconnect and a typo'd
+		// window indistinguishable in the logs of the one endpoint whose
+		// whole job is not lying about what it knows.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

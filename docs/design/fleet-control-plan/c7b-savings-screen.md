@@ -1,11 +1,15 @@
 # C7b — The savings screen: what the fleet didn't spend
 
-Status: EXECUTED (2026-08-03) on `feat/c7b-savings-screen`. Unit gates
-1–8 and 10 are green; gate 9 (live plausibility) needs a real week of
-ledger data and is unrun. Depends on [C7a](c7a-usage-ledger.md) for the
-ledger and on C4 for the page. Implementation notes, including where the
-code deviates from this document, are in the
-[addendum](#implementation-addendum-2026-08-03).
+Status: EXECUTED + REVIEWED TWICE (2026-08-03) on
+`feat/c7b-savings-screen` — feature commit, the implementer's own
+adversarial pass, and an independent second pass (ground rule 9). Unit
+gates 1–8 and 10 are green under `-race -count=5`; gate 9 (live
+plausibility) needs a real week of ledger data on real cells and is
+UNRUN. Depends on [C7a](c7a-usage-ledger.md) for the ledger and on C4
+for the page. Implementation notes, including where the code deviates
+from this document, are in the
+[addendum](#implementation-addendum-2026-08-03); the two review passes'
+findings follow it.
 
 C7a counts tokens. C7b prices them and draws the screen: *did my
 hardware sort of pay for itself?*
@@ -493,7 +497,7 @@ on.
 | 7 page invariants (one route, exact-match exemption, no external asset) | PASS — `TestFleetPage_SavingsIsAViewNotARoute`, `TestFleetPage_SavingsViewInvariants`, `daemon/fleet_registry_test.go` |
 | 8 timer hygiene | PASS — `TestFleetPage_SavingsTimerIsClearedInBoot` |
 | 9 live plausibility | NOT RUN — needs a real week of ledger data on real cells |
-| 10 full inner loop, no new module | PASS — build, vet, gofmt, `go mod tidy` (clean), `golangci-lint` (0 issues), `go test -race -count=5 ./...` |
+| 10 full inner loop, no new module | PASS — build, vet, gofmt, `go mod tidy` (clean), `golangci-lint` (0 issues), `go test -race -count=5 ./...`; re-run green after the second review pass |
 
 ### The rule restatement, verbatim (§7 asks for it in the PR)
 
@@ -568,7 +572,102 @@ Not fixed, recorded instead:
   `effective_from` rather than merging into it. Resolution is
   last-wins, so the prices are right; the artifact is just untidier than
   it needs to be.
-- Power is counted only for days that carry a residency sample, so a
+- ~~Power is counted only for days that carry a residency sample, so a
   cell that served traffic with no residency rows shows an em dash
-  rather than an estimate. That is the honest reading, but it errs
-  toward a LARGER net — the one place in this screen that does.
+  rather than an estimate.~~ **Wrong as written** — corrected by the
+  second review pass below. `cellPowerCost` reports a figure whenever
+  residency OR busy time is non-zero, so a cell with busy time and no
+  residency row bills its busy delta with a zero idle term. The real
+  gap was elsewhere and larger: see finding 2 in the next section.
+
+### Second adversarial review addendum (ground rule 9, 2026-08-03)
+
+An independent pass over the feature commit **and** the first review
+commit. Nine findings; all fixed in the second review commit, each
+mutation-verified (break the production line, watch the named test
+fail). Two were honesty defects in the flattering direction, one was a
+performance defect that grows without bound, and three were tests
+asserting less than the invariant they guard.
+
+1. **Pricing the ledger cost ~1.3 s per request and grew with the
+   fleet's age.** `priceLedger` memoised `table.At(day)` per DAY, and
+   resolving the vendored table is ~3.4 ms (it indexes 4,871 rows).
+   Payback is lifetime, so even a `7d` window resolves every day the
+   ledger holds: measured 1.31 s for a 400-day ledger against the real
+   embedded table, on an endpoint the page polls every 60 s and agents
+   call. Now `prices.Table.Resolver()` builds one resolution per
+   snapshot GENERATION — exact, not approximate, because days inside one
+   generation resolve identically by construction. Same benchmark:
+   **1.31 s → 7.8 ms**. Pinned by
+   `TestResolver_BuildsOnePerSnapshotGenerationNotPerDay` (object
+   identity within a generation, a fresh one across a boundary, and the
+   pre-base day as its own generation) and `TestResolverMatchesAt`.
+2. **An idle cell's electricity vanished from the fleet net.** A cell
+   with no *measured* requests took the `!agg.measured` early exit, so
+   its power never reached `totals.Power` — while `payback` had been
+   charging exactly those watts all along, leaving the window table and
+   the payback strip disagreeing about the same cell. The case this
+   hits is precisely the one §4 exists for: a box holding a C4 warm
+   target resident 20 h/day, serving nothing a human asked for. Money
+   moved in the flattering direction. Electricity is a COST, not a
+   saving: §8's "excluded from the total" is about savings. The row now
+   renders its power and a negative net, the fleet total counts it, and
+   `cells_measured` is unchanged. Pinned by
+   `TestSavings_IdleCellStillPaysForItsElectricity`.
+3. **A partial power term was silent.** The "electricity is not counted"
+   note fired only when NO cell contributed power. A fleet with one
+   declared cell and one undeclared subtracted a partial power term from
+   a whole-fleet gross and said nothing — again the larger-number
+   direction. `powerGapNote` now fires on any gap and names the cells.
+   Pinned by `TestSavings_PartialPowerCoverageIsStated`.
+4. **That note also blamed the wrong field.** The likeliest cause of a
+   blank power column is a fleet that declared wattage everywhere and no
+   `pricing.electricity_price_per_kwh`; the note sent the reader to add
+   a `power:` block they already had. Pinned by
+   `TestSavings_MissingElectricityPriceBlamesTheRightField`.
+5. **The front got a payback bar it could never move.** The savings
+   table excludes `fleetcfg.FrontCell` structurally (C7a folds no token
+   rows for it), but `payback` iterated `hosts.Cells` unfiltered, so a
+   `capital_cost` on the front rendered "0% of $N · too early to
+   project" forever — a screen making a claim about hardware it never
+   measured, which is the failure §8 is written against. It is a note
+   now. Pinned by `TestSavings_FrontCapitalIsANoteNotABarItCannotMove`.
+6. **`poke_req` disappeared at this surface.** C7a calls it one of three
+   VISIBLE counters because C4's warm loops issue real metered 1-token
+   completions that can outnumber human requests. C7b excluded them from
+   every sum, correctly, and then never mentioned them — which makes the
+   exclusion invisible. Now in the cell's partial note. Pinned by
+   `TestSavings_WarmLoopPokesAreNamed`.
+7. **A cancelled request was reported as a bad one.** The first review
+   made `Savings` abort on `ctx.Err()` rather than return a short
+   document; `handleSavings` then rendered that abort as HTTP 400, so a
+   client disconnect and a typo'd `window` were indistinguishable in the
+   logs of the one endpoint whose job is not lying about what it knows.
+   503 for a context error, 400 for the window. Pinned by
+   `TestSavings_CancelledRequestIsNotABadRequest`.
+8. **A measured-but-unpriced cell's reason never reached the page.** The
+   first review's finding 1 put the reason in the payload;
+   `renderSavings` rendered `c.reason` only in the *unmeasured* branch,
+   so the reader got an em dash with no explanation — the same silence
+   the em dash exists to break. Pinned by
+   `TestFleetPage_MeasuredCellReasonIsRendered`.
+9. **Three invariants had no test at all** (found by mutation, not by
+   reading): the residency fallback's max-not-sum rule survived being
+   changed to a sum, and the cloud row's `continue` survived being
+   deleted. Both are now pinned —
+   `TestSavings_LegacyResidencyFallsBackToTheMaxNotTheSum`,
+   `TestSavings_CellResidencyRowWinsOverPerModelRows`,
+   `TestSavings_CloudTokensStayOutOfTheTokensPricedPct`. Also tidied a
+   `page[start:]` slice that ran before its own `start < 0` check.
+
+Not fixed, recorded instead:
+
+- Actual cloud spend takes the MEDIAN across every host in the table for
+  the `priced_as` id, not the specific vendor's rate. `Normalize` strips
+  the provider path, so `priced_as` cannot pin one. For a frontier model
+  the cross-vendor spread is small, and the line is labelled a
+  reconstruction, but it is a median presented as a fact.
+- `BasisOther` (any path that is neither the chat nor the embed family)
+  prices against a chat-mode row without a mode-mismatch check. Cached
+  tokens are still excluded, so the error is bounded, but a genuinely
+  unknown endpoint gets chat rates rather than "unpriced".

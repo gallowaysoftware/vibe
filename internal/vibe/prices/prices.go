@@ -220,16 +220,50 @@ type Resolved struct {
 
 // At resolves the table for one YYYY-MM-DD day.
 func (t *Table) At(day string) *Resolved {
-	res := &Resolved{byKey: map[string][]Row{}}
+	idx, beforeBase := t.resolveIndex(day)
+	return t.resolveTo(idx, beforeBase)
+}
+
+// generation identifies the snapshot set a day resolves to: the index of
+// the last snapshot applied, plus whether the day predates the base.
+// Every day inside one generation resolves to byte-identical prices,
+// which is what makes Resolver's cache sound.
+type generation struct {
+	idx        int
+	beforeBase bool
+}
+
+// resolveIndex reports the generation a day falls in without building
+// anything.
+func (t *Table) resolveIndex(day string) (int, bool) {
 	if t == nil || len(t.Snapshots) == 0 {
+		return -1, false
+	}
+	last := -1
+	for i, s := range t.Snapshots {
+		if s.EffectiveFrom > day && last >= 0 {
+			break
+		}
+		last = i
+		// A day older than the base still prices at the base: pricing it
+		// at nothing would report a fleet that served traffic as having
+		// saved zero, which is a stronger claim than "we don't know what
+		// the rates were that far back".
+		if s.EffectiveFrom > day {
+			return i, true
+		}
+	}
+	return last, false
+}
+
+func (t *Table) resolveTo(idx int, beforeBase bool) *Resolved {
+	res := &Resolved{byKey: map[string][]Row{}, BeforeBase: beforeBase}
+	if t == nil || idx < 0 {
 		return res
 	}
 	rows := map[string]Row{}
-	applied := 0
-	for _, s := range t.Snapshots {
-		if s.EffectiveFrom > day && applied > 0 {
-			break
-		}
+	for i := 0; i <= idx; i++ {
+		s := t.Snapshots[i]
 		if s.Base {
 			rows = map[string]Row{}
 		}
@@ -240,15 +274,6 @@ func (t *Table) At(day string) *Resolved {
 			delete(rows, id)
 		}
 		res.EffectiveFrom = s.EffectiveFrom
-		applied++
-		// A day older than the base still prices at the base: pricing it
-		// at nothing would report a fleet that served traffic as having
-		// saved zero, which is a stronger claim than "we don't know what
-		// the rates were that far back".
-		if s.EffectiveFrom > day {
-			res.BeforeBase = true
-			break
-		}
 	}
 	for _, r := range rows {
 		res.byKey[r.Key] = append(res.byKey[r.Key], r)
@@ -260,6 +285,34 @@ func (t *Table) At(day string) *Resolved {
 		slices.SortFunc(res.byKey[k], func(a, b Row) int { return strings.Compare(rowID(a), rowID(b)) })
 	}
 	return res
+}
+
+// Resolver returns a day → Resolved function that builds ONE resolution
+// per snapshot generation instead of one per day.
+//
+// Resolving the vendored table costs ~3 ms (it indexes several thousand
+// rows), and a savings report resolves every day the ledger holds —
+// payback is lifetime, so even a 30d window walks the whole history.
+// Per-day resolution therefore made GET /api/fleet/savings cost about
+// 1.3 s at 400 days of ledger and grow without bound as the fleet aged,
+// on an endpoint the page polls and agents call. Days inside one
+// generation resolve identically by construction, so caching on the
+// generation is exact rather than approximate.
+//
+// One Resolver per report: it is not safe for concurrent use, and the
+// Resolved values it hands back are read-only like the Table itself.
+func (t *Table) Resolver() func(day string) *Resolved {
+	cache := map[generation]*Resolved{}
+	return func(day string) *Resolved {
+		g := generation{}
+		g.idx, g.beforeBase = t.resolveIndex(day)
+		if r, ok := cache[g]; ok {
+			return r
+		}
+		r := t.resolveTo(g.idx, g.beforeBase)
+		cache[g] = r
+		return r
+	}
 }
 
 // Normalize reduces a model id or name to its join key: the last path
