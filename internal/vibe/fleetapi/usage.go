@@ -109,6 +109,11 @@ type usageLedger struct {
 	// lastFold is the previous announce instant per cell, the residency
 	// credit's denominator.
 	lastFold map[string]time.Time
+	// loadDegraded records that load() could not read the whole file.
+	// Compaction rewrites the file from memory, so compacting a partial
+	// read would DELETE the part that didn't parse — turning a transient
+	// read error into permanent data loss.
+	loadDegraded bool
 }
 
 // newUsageLedger loads (and compacts) the ledger at path. A missing file
@@ -131,6 +136,10 @@ func newUsageLedger(path string, loc *time.Location) *usageLedger {
 		return l
 	}
 	l.load()
+	if l.loadDegraded {
+		slog.Warn("usage ledger read was incomplete; skipping compaction so nothing unread is rewritten away", "path", path)
+		return l
+	}
 	if err := l.compact(); err != nil {
 		slog.Warn("usage ledger compaction failed; the file keeps its replay history", "path", path, "err", err)
 	}
@@ -143,6 +152,7 @@ func (l *usageLedger) load() {
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			slog.Warn("usage ledger unreadable; starting empty", "path", l.path, "err", err)
+			l.loadDegraded = true
 		}
 		return
 	}
@@ -180,8 +190,11 @@ func (l *usageLedger) load() {
 	}
 	if err := sc.Err(); err != nil {
 		slog.Warn("usage ledger truncated on read; keeping what parsed", "path", l.path, "err", err)
+		l.loadDegraded = true
 	}
 	if bad > 0 {
+		// Unparseable LINES are not a degraded read: JSONL degrades line
+		// by line by design, and compacting them away is the cleanup.
 		slog.Warn("usage ledger had unparseable lines; skipped", "path", l.path, "lines", bad)
 	}
 }
@@ -200,7 +213,7 @@ func (l *usageLedger) fold(cell string, u *AnnounceUsage, at time.Time) {
 	if cell == fleetcfg.FrontCell {
 		return
 	}
-	if u == nil || len(u.Models) == 0 {
+	if u == nil {
 		return
 	}
 	day := dayKey(at, l.loc)
@@ -212,22 +225,10 @@ func (l *usageLedger) fold(cell string, u *AnnounceUsage, at time.Time) {
 		if m.Model == "" {
 			continue
 		}
-		ck := cursorKey{Cell: cell, Model: m.Model, Basis: m.Basis, Epoch: u.Epoch}
-		prev, known := l.cursors[ck]
-		delta := m
-		switch {
-		case !known:
-			// First sighting of this epoch: the whole cumulative total is
-			// the delta. A new epoch therefore starts a new row and leaves
-			// every earlier epoch's row untouched.
-		case usageRegressed(m, prev.Totals):
-			slog.Warn("cell usage totals went backwards within an epoch; treating as a counter reset",
-				"cell", cell, "model", m.Model, "basis", m.Basis, "epoch", u.Epoch)
-		default:
-			delta = usageSub(m, prev.Totals)
-		}
+		key := usageKey{Day: day, Cell: cell, Model: m.Model, Basis: m.Basis, Epoch: u.Epoch}
+		delta := l.deltaLocked(cursorKey{Cell: cell, Model: m.Model, Basis: m.Basis, Epoch: u.Epoch}, m, day)
 
-		b := l.bucketLocked(usageKey{Day: day, Cell: cell, Model: m.Model, Basis: m.Basis, Epoch: u.Epoch}, tz)
+		b := l.bucketLocked(key, tz)
 		b.Req += delta.Req
 		b.InFresh += delta.InFresh
 		b.InCached += delta.InCached
@@ -238,19 +239,45 @@ func (l *usageLedger) fold(cell string, u *AnnounceUsage, at time.Time) {
 		b.BusyMS += delta.BusyMS
 		total := m
 		b.LastTotal = &total
-
-		l.cursors[ck] = usageCursor{Totals: m, Day: day}
-		l.dirty[b.key()] = true
+		l.dirty[key] = true
 	}
 
 	if u.LostRows > 0 {
-		// Loss is a property of the cell's read, not of any one model:
-		// park it on a cell-level row so it can never be mistaken for a
-		// model's token count.
-		b := l.bucketLocked(usageKey{Day: day, Cell: cell, Basis: usageBasisCell, Epoch: u.Epoch}, tz)
-		b.LostRows = u.LostRows
-		l.dirty[b.key()] = true
+		// Loss is a property of the cell's READ, not of any one model: it
+		// goes on a cell-level row so it can never be mistaken for a
+		// model's token count. It runs through the same delta machinery as
+		// the token counters — the cell reports it cumulatively, so
+		// assigning it instead would make every day after the loss repeat
+		// the same number and any cross-day sum wrong.
+		synth := AnnounceUsageModel{Basis: usageBasisCell, Req: u.LostRows}
+		key := usageKey{Day: day, Cell: cell, Basis: usageBasisCell, Epoch: u.Epoch}
+		delta := l.deltaLocked(cursorKey{Cell: cell, Basis: usageBasisCell, Epoch: u.Epoch}, synth, day)
+		b := l.bucketLocked(key, tz)
+		b.LostRows += delta.Req
+		total := synth
+		b.LastTotal = &total
+		l.dirty[key] = true
 	}
+}
+
+// deltaLocked resolves one cumulative total against its stored cursor
+// and advances the cursor. Callers hold l.mu.
+func (l *usageLedger) deltaLocked(ck cursorKey, now AnnounceUsageModel, day string) AnnounceUsageModel {
+	prev, known := l.cursors[ck]
+	delta := now
+	switch {
+	case !known:
+		// First sighting of this epoch: the whole cumulative total is the
+		// delta. A new epoch therefore starts a new row and leaves every
+		// earlier epoch's row untouched.
+	case usageRegressed(now, prev.Totals):
+		slog.Warn("cell usage totals went backwards within an epoch; treating as a counter reset",
+			"cell", ck.Cell, "model", ck.Model, "basis", ck.Basis, "epoch", ck.Epoch)
+	default:
+		delta = usageSub(now, prev.Totals)
+	}
+	l.cursors[ck] = usageCursor{Totals: now, Day: day}
+	return delta
 }
 
 // foldResidency credits wall-clock seconds to each model the cell
@@ -258,6 +285,11 @@ func (l *usageLedger) fold(cell string, u *AnnounceUsage, at time.Time) {
 // announce, CAPPED at the staleness bound: a cell that was off for six
 // hours must not have those hours credited to whatever it happened to be
 // serving when it left.
+//
+// The whole gap lands on the day of `at`, so a heartbeat straddling
+// local midnight misattributes at most one staleness bound (~50 s at the
+// default cadence) to the later day. Splitting it would cost a second
+// bucket write per heartbeat to move a rounding error.
 func (l *usageLedger) foldResidency(cell string, models []AnnounceModel, intervalS int, at time.Time) {
 	if cell == fleetcfg.FrontCell {
 		return
@@ -279,7 +311,11 @@ func (l *usageLedger) foldResidency(cell string, models []AnnounceModel, interva
 	if gap <= 0 {
 		return
 	}
-	secs := int64(gap.Seconds())
+	// Round, don't truncate: heartbeats land on a jittered ~15 s cadence,
+	// so truncating each one loses half a second on average — a steady
+	// ~3% under-count of residency, which is exactly the kind of quiet
+	// bias C7b would then build an energy figure on.
+	secs := int64(gap.Round(time.Second).Seconds())
 	if secs <= 0 {
 		return
 	}
@@ -401,7 +437,11 @@ func appendLines(path string, lines [][]byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	// 0600 matches the intent and lease stores: fleetd-private state,
+	// and creating it 0644 here while compaction's tmp+rename creates it
+	// 0600 would make the mode depend on which path happened to run
+	// first.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}

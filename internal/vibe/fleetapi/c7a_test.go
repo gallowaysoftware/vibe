@@ -324,6 +324,27 @@ func TestUsageResidency_CreditsTheGapAndCapsAnOfflineStretch(t *testing.T) {
 	}
 }
 
+// Heartbeats land on a jittered cadence, so truncating each gap to whole
+// seconds loses half a second on average — a steady under-count of the
+// residency figure C7b turns into energy.
+func TestUsageResidency_RoundsRatherThanTruncatesTheGap(t *testing.T) {
+	loc := toronto(t)
+	l, _ := newLedger(t, loc)
+	at := time.Date(2026, 8, 3, 14, 0, 0, 0, loc)
+	models := []AnnounceModel{{ID: "qwen", State: "ready"}}
+
+	l.foldResidency("gpu", models, 15, at)
+	// Four 15.6 s gaps: truncation yields 60 s, rounding yields 64 s, and
+	// the real elapsed time is 62.4 s.
+	for i := 1; i <= 4; i++ {
+		l.foldResidency("gpu", models, 15, at.Add(time.Duration(i)*15600*time.Millisecond))
+	}
+	got := bucketFor(l, usageKey{Day: "2026-08-03", Cell: "gpu", Model: "qwen", Basis: usageBasisResident})
+	if got.ResidentS != 64 {
+		t.Fatalf("resident_s = %d, want 64 (rounded); 60 means the gap was truncated", got.ResidentS)
+	}
+}
+
 // The ledger's day boundary must come from an explicit Location.
 // Truncate rounds against absolute time since the Unix epoch and lands
 // on UTC midnight regardless of the Location the value carries — with no
@@ -442,5 +463,75 @@ func TestAnnounceUsage_IngestsAndToleratesAnUnknownBasis(t *testing.T) {
 	bad := &AnnounceRequest{V: AnnounceVersion, Cell: "gpu", Usage: &AnnounceUsage{Epoch: "e1", Models: []AnnounceUsageModel{{Model: "q\x00wen", Basis: "chat"}}}}
 	if err := validateAnnounce(bad); err == nil {
 		t.Error("validateAnnounce accepted a control character in usage.models[].model")
+	}
+}
+
+// ─── adversarial review pass ────────────────────────────────────────────
+
+// lost_rows arrives cumulatively like every other counter. Assigning it
+// to the bucket instead of folding a delta made every day after a loss
+// repeat the same number, so any cross-day sum was wrong.
+func TestUsageFold_LostRowsFoldAsADeltaAcrossDays(t *testing.T) {
+	loc := toronto(t)
+	l, _ := newLedger(t, loc)
+	d1 := time.Date(2026, 8, 3, 12, 0, 0, 0, loc)
+	d2 := time.Date(2026, 8, 4, 12, 0, 0, 0, loc)
+
+	l.fold("gpu", &AnnounceUsage{Epoch: "e1", LostRows: 40}, d1)
+	l.fold("gpu", &AnnounceUsage{Epoch: "e1", LostRows: 40}, d1.Add(time.Minute))
+	l.fold("gpu", &AnnounceUsage{Epoch: "e1", LostRows: 55}, d2)
+
+	day1 := bucketFor(l, usageKey{Day: "2026-08-03", Cell: "gpu", Basis: usageBasisCell, Epoch: "e1"})
+	day2 := bucketFor(l, usageKey{Day: "2026-08-04", Cell: "gpu", Basis: usageBasisCell, Epoch: "e1"})
+	if day1.LostRows != 40 {
+		t.Errorf("day 1 lost_rows = %d, want 40 (the repeated cumulative value must not add)", day1.LostRows)
+	}
+	if day2.LostRows != 15 {
+		t.Errorf("day 2 lost_rows = %d, want 15 (the delta, not the cumulative 55)", day2.LostRows)
+	}
+}
+
+// A usage block that carries ONLY a loss still folds: a cell that lost
+// every row it tried to read has something to say.
+func TestUsageFold_ModellessLossStillLands(t *testing.T) {
+	loc := toronto(t)
+	l, _ := newLedger(t, loc)
+	l.fold("gpu", &AnnounceUsage{Epoch: "e1", LostRows: 7}, time.Date(2026, 8, 3, 12, 0, 0, 0, loc))
+	if got := bucketFor(l, usageKey{Day: "2026-08-03", Cell: "gpu", Basis: usageBasisCell, Epoch: "e1"}); got.LostRows != 7 {
+		t.Fatalf("model-less loss dropped: %+v", got)
+	}
+}
+
+// Compaction rewrites the file from memory. Compacting after a PARTIAL
+// read would delete whatever didn't parse, turning a transient read
+// error into permanent data loss.
+func TestUsageLedger_DegradedReadSkipsCompaction(t *testing.T) {
+	loc := toronto(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.jsonl")
+	if err := os.WriteFile(path, []byte(`{"d":"2026-08-03","cell":"gpu","model":"qwen","basis":"chat","epoch":"e1","req":5}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Unreadable file: load() must not leave an empty ledger that
+	// compaction then writes over the real one.
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Skipf("cannot chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	if f, err := os.Open(path); err == nil {
+		f.Close()
+		t.Skip("running as a user that ignores file modes (root?)")
+	}
+
+	_ = newUsageLedger(path, loc)
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(string(data), `"req":5`) {
+		t.Fatalf("compaction erased an unread ledger: %q", data)
 	}
 }

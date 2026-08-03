@@ -303,18 +303,32 @@ const activityLimit = 999
 // loop to an unbounded backfill.
 const defaultMaxPages = 10
 
+// pollTimeout bounds one whole Poll, backfill pages included. The
+// announce loop calls Poll inline, and the heartbeat is the cell's only
+// evidence of life: a first-boot backfill walking ten pages against a
+// slow store must not be able to hold presence hostage. An interrupted
+// backfill costs nothing — the cursor only advances on a completed poll,
+// so the next heartbeat resumes from the same place.
+const pollTimeout = 20 * time.Second
+
 // Collector tails one cell's llama-swap activity log.
 type Collector struct {
 	cfg    Config
 	http   *http.Client
 	logger *slog.Logger
 
-	mu      sync.Mutex
-	epoch   string
-	cursor  int64
-	lost    int64
-	totals  map[entryKey]Counters
-	loadErr error
+	// pollMu serializes whole polls. mu alone is not enough: Poll reads
+	// the cursor, releases the lock for the HTTP round trip, then folds,
+	// so two overlapping polls would both ingest the same rows and double
+	// every count in the window. That is a logic race, invisible to
+	// -race.
+	pollMu sync.Mutex
+
+	mu     sync.Mutex
+	epoch  string
+	cursor int64
+	lost   int64
+	totals map[entryKey]Counters
 }
 
 // New builds a Collector and loads (or mints) its state. A missing state
@@ -367,7 +381,6 @@ func (c *Collector) load() {
 			// from 0 against a persistent store would double-count months.
 			// Mint a fresh epoch so fleetd starts a new row instead.
 			c.logger.Warn("usage state unreadable; starting a new epoch", "path", c.cfg.StatePath, "err", err)
-			c.loadErr = err
 		}
 		c.epoch = c.newEpoch()
 		return
@@ -431,6 +444,9 @@ func (c *Collector) save() error {
 // the cumulative counters, then persists. Safe to call from the announce
 // loop on every heartbeat: an idle cell costs one 1-row GET.
 func (c *Collector) Poll(ctx context.Context) error {
+	c.pollMu.Lock()
+	defer c.pollMu.Unlock()
+
 	// Probe the head of the log first. It resolves the id-reset question
 	// BEFORE any walk-back, which matters: resetting the cursor after a
 	// walk would leave the shortfall arithmetic comparing rows read
@@ -569,11 +585,13 @@ func (c *Collector) fetchPage(ctx context.Context, page, limit int) (activityPag
 // Snapshot returns the cumulative announce block. Nil when the collector
 // has counted nothing at all — an empty usage block on the wire would be
 // indistinguishable from a cell that served zero, and "no data" is the
-// honest reading for a cell whose llama-swap has never answered.
+// honest reading for a cell whose llama-swap has never answered. A cell
+// that lost every row it tried to read is NOT nothing: it reports the
+// loss with no models.
 func (c *Collector) Snapshot() *fleetapi.AnnounceUsage {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.totals) == 0 {
+	if len(c.totals) == 0 && c.lost == 0 {
 		return nil
 	}
 	u := &fleetapi.AnnounceUsage{Epoch: c.epoch, LostRows: c.lost}
@@ -600,7 +618,9 @@ func (c *Collector) Snapshot() *fleetapi.AnnounceUsage {
 // cumulative totals are still true and still worth announcing, and an
 // unreachable local llama-swap must never cost the cell its heartbeat.
 func (c *Collector) PollAndSnapshot(ctx context.Context) *fleetapi.AnnounceUsage {
-	if err := c.Poll(ctx); err != nil {
+	pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
+	defer cancel()
+	if err := c.Poll(pollCtx); err != nil {
 		c.logger.Debug("usage poll failed; announcing the last known totals", "err", err)
 	}
 	return c.Snapshot()

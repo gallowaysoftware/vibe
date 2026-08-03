@@ -388,3 +388,57 @@ func TestPollAndSnapshot_SurvivesAnUnreachableLlamaSwap(t *testing.T) {
 		t.Errorf("unreachable llama-swap must not invent totals, got %+v", snap)
 	}
 }
+
+// ─── adversarial review pass ────────────────────────────────────────────
+
+// Poll reads the cursor, releases the lock for the HTTP round trip, then
+// folds. Without a whole-poll lock two overlapping polls both ingest the
+// same rows and double every count in the window — a logic race that
+// -race cannot see.
+func TestPoll_ConcurrentPollsDoNotDoubleCount(t *testing.T) {
+	swap := &fakeSwap{}
+	url := swap.start(t)
+	c := newCollector(t, url)
+
+	var rows []ActivityRow
+	for id := int64(1); id <= 20; id++ {
+		rows = append(rows, chatRow(id, "qwen", 10, 0, 5))
+	}
+	swap.set(rows)
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = c.Poll(context.Background())
+		}()
+	}
+	wg.Wait()
+
+	got := totalsFor(t, c, "qwen", BasisChat)
+	if got.Req != 20 || got.InFresh != 200 || got.Out != 100 {
+		t.Fatalf("concurrent polls double-counted: %+v (want req=20 in_fresh=200 out=100)", got)
+	}
+}
+
+// A cell that lost every row it tried to read is not a cell that counted
+// nothing: the loss has to reach fleetd.
+func TestSnapshot_ReportsALossWithNoModels(t *testing.T) {
+	swap := &fakeSwap{}
+	url := swap.start(t)
+	c := newCollector(t, url, func(cfg *Config) { cfg.MaxPages = 1 })
+
+	// One readable row at id 900: ids 1..899 aged out.
+	swap.set([]ActivityRow{{ID: 900, Model: "qwen", ReqPath: "/v1/chat/completions", RespStatusCode: 200}})
+	if err := c.Poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	snap := c.Snapshot()
+	if snap == nil {
+		t.Fatal("Snapshot() = nil despite a reported loss")
+	}
+	if snap.LostRows != 899 {
+		t.Errorf("lost_rows = %d, want 899", snap.LostRows)
+	}
+}

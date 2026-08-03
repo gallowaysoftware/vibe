@@ -404,6 +404,68 @@ with. Unset keeps the old behavior exactly.
 | 11. Streaming contract | **PASS** — `git diff --stat internal/vibe/proxy/` empty; `stream_options` absent from the diff |
 | 12. Inner loop | **PASS** — build / vet / gofmt / mod tidy / `test -race -count=5` / golangci-lint |
 
+### Adversarial self-review (ground rule 9)
+
+Landed as its own commit against the feature commit. Seven findings,
+all fixed, each with a regression test where one was possible.
+
+1. **Two overlapping `Poll`s double-counted the whole window
+   (blocker).** `Poll` read the cursor, released the lock for the HTTP
+   round trip, then folded. Two concurrent calls both saw the old cursor
+   and both ingested the same rows. Invisible to `-race` — it is a logic
+   race, not a memory one. Fixed with a whole-poll `pollMu`.
+   `TestPoll_ConcurrentPollsDoNotDoubleCount`.
+2. **`lost_rows` was assigned, not folded as a delta.** The cell reports
+   it cumulatively like every other counter, so every day after a loss
+   repeated the same number and any cross-day sum was wrong. It now runs
+   through the same cursor machinery as the token counters (and is
+   therefore persisted the same way).
+   `TestUsageFold_LostRowsFoldAsADeltaAcrossDays`.
+3. **Compaction after a degraded read was silent data loss.**
+   `newUsageLedger` compacts by rewriting the file from memory; if
+   `load` could not read the whole file (open error, scanner error), the
+   rewrite deleted whatever had not been read. Compaction is now skipped
+   on a degraded read. Unparseable LINES still compact away — that is
+   the cleanup, and it is why JSONL was chosen.
+   `TestUsageLedger_DegradedReadSkipsCompaction`.
+4. **A first-boot backfill could hold the heartbeat hostage.** `Poll`
+   runs inline in the announce loop, and a ten-page walk against a slow
+   store on a 10s-per-request client is up to 100 s. The heartbeat is
+   the cell's only evidence of life. `PollAndSnapshot` now derives a 20 s
+   deadline; an interrupted backfill costs nothing, because the cursor
+   only advances on a completed poll.
+5. **A cell that lost every row it read announced nothing.** `Snapshot`
+   returned nil on an empty model set, so a total loss was
+   indistinguishable from an idle cell — the exact confusion `lost_rows`
+   exists to prevent. It now reports the loss with no models, and `fold`
+   accepts a model-less usage block.
+   `TestSnapshot_ReportsALossWithNoModels`,
+   `TestUsageFold_ModellessLossStillLands`.
+6. **Ledger file mode depended on which writer ran first** (compaction's
+   tmp+rename made 0600, the append path made 0644). Both are 0600 now,
+   matching the intent and lease stores.
+7. **Residency truncated every heartbeat gap to whole seconds.**
+   Announces land on a jittered ~15 s cadence, so truncation loses half
+   a second per heartbeat — a steady ~3% under-count, and exactly the
+   kind of quiet bias C7b would build an energy figure on. It rounds now.
+   `TestUsageResidency_RoundsRatherThanTruncatesTheGap`.
+
+Known and accepted, documented rather than fixed:
+
+- **A first poll against a large persistent store reports the
+  un-walked prefix as `lost_rows`.** With no prior state the cursor is 0
+  and the walk is bounded at ~10 k rows, so a box with months of history
+  announces a large one-time loss. That is honest — those rows were
+  genuinely never counted — and the alternative (starting the cursor at
+  `max_id` and pretending) would silently discard the same history.
+- **Residency credit lands entirely on the day of the announce**, so a
+  heartbeat straddling local midnight misattributes at most one
+  staleness bound (~50 s).
+- **The front skip is by cell NAME.** A box that serves the front
+  llama-swap while announcing under some other cell name would double
+  count. That is a topology error (the front owns no models), not a
+  fold-time condition the ledger can detect.
+
 ### §0 is an operator step, not a code change
 
 The `store: {path: …}` extras block is per-cell llama-swap config and
