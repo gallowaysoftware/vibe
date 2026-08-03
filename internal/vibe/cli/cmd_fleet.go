@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -79,7 +80,16 @@ func fleetAnnounceCmd() *cobra.Command {
 				return err
 			}
 			fmt.Fprintf(cmd.ErrOrStderr(), "announcing %s to %s (ctrl-C to stop)\n", cell, registry)
-			return ann.Run(ctx)
+			runErr := ann.Run(ctx)
+			// A clean undock: the final heartbeat says goodbye so fleetd
+			// prunes this cell now instead of waiting out stale_after. Its
+			// own context, because ctx is what just died.
+			wctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := ann.Withdraw(wctx); err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "withdraw announce failed (fleetd will prune on staleness): %v\n", err)
+			}
+			return runErr
 		},
 	}
 	cmd.Flags().StringVar(&cell, "cell", "", "this box's cell name in hosts.yaml (required)")
@@ -87,5 +97,8 @@ func fleetAnnounceCmd() *cobra.Command {
 	cmd.Flags().StringVar(&tokenFile, "token-file", "", "path to fleetd's bearer token")
 	cmd.Flags().StringVar(&llamaSwap, "llama-swap", "http://"+net.JoinHostPort("127.0.0.1", "9000"), "local llama-swap base URL")
 	cmd.Flags().StringVar(&llamaBin, "llama-server", "", "llama-server path rendered into fingerprints (must match the cell's render)")
+	// Two announcers on one box must not share an intent echo file: the
+	// second would read the first's state as its own.
+	cmd.Flags().StringVar(&intentPath, "intent-file", "", "where this announcer stores its local intent echo (default: the per-user cell intent file)")
 	return cmd
 }

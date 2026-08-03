@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
@@ -79,6 +80,9 @@ type Server struct {
 	// CLI gives it.
 	backendsDir string
 	llamaBinary string
+	// tokenWarnOnce keeps the $VIBE_TOKEN-vs-token_file precedence note to
+	// one line per process instead of one per actuation.
+	tokenWarnOnce sync.Once
 }
 
 // Options carries the render_front tool's renderer inputs (the daemon's
@@ -267,10 +271,13 @@ func (s *Server) mcpTools() []any {
 		},
 		map[string]any{
 			"name": "drain_cell",
-			"description": "Reclaim a cell (stop its serving stack; llama-swap drains in-flight " +
-				"requests first). Returns the pre-drain report — resident models, in-flight " +
-				"count, active leases — so you can relay \"heads up: X holds a lease\" before " +
-				"confirming. Records intent (reason/eta) at fleetd after the drain succeeds.",
+			"description": "Reclaim a cell (stop its serving stack). llama-swap's SIGTERM " +
+				"CANCELS in-flight streams immediately — a drain without wait_seconds " +
+				"truncates whatever is generating, so never tell an operator their stream " +
+				"is safe. Returns the pre-drain report — resident models, in-flight count, " +
+				"active leases, and whether a requested wait actually happened — so you can " +
+				"relay \"heads up: X holds a lease\" before confirming. Records intent " +
+				"(reason/eta) at fleetd after the drain succeeds.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -426,7 +433,11 @@ func (s *Server) toolWarmModel(ctx context.Context, model string) (string, error
 	if model == "" {
 		return "", fmt.Errorf("model is required")
 	}
-	if class, pinned := s.hosts.ModelClasses[model]; pinned {
+	// The guard exists to refuse firing a CHAT completion at an
+	// embed/rerank id. A chat-class entry documents ownership and must
+	// not be caught by it — the old blanket refusal told the caller a
+	// chat model "is not chat".
+	if class, pinned := s.hosts.ModelClasses[model]; pinned && class != fleetcfg.ModelClassChat {
 		return "", fmt.Errorf("%s is %s-class (per hosts.yaml model_classes), not chat: "+
 			"warming it with a chat completion would load it for nothing — its pinned cell's "+
 			"config is what needs fixing", model, class)

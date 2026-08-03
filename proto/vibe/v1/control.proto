@@ -223,6 +223,13 @@ message CellDrainResponse {
   // drain still proceeded (leases are advisory), but the caller knows the
   // report can't rule out stranded work.
   bool leases_unavailable = 4;
+  // wait_status reports what became of a requested quiescence wait:
+  // "not_requested" (wait_seconds was 0), "waited" (the cell reported
+  // in-flight counts and reached zero), or "skipped_no_inflight_data"
+  // (nothing ever reported a count, so the drain ran immediately). An
+  // operator who asked for quiescence and silently got a stream-
+  // cancelling drain has to be able to see that.
+  optional string wait_status = 5;
 }
 
 message CellResumeRequest {}

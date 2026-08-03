@@ -376,24 +376,82 @@ func TestLocalIntentPersistsAcrossRestart(t *testing.T) {
 	}
 }
 
+// TestRegistryFailureBackoffAndRecovery drives a registry that fails
+// then heals, and asserts both halves the name claims: attempts during
+// the outage are BOUNDED well below the announce cadence (the backoff
+// actually grows), and a successful announce lands after the flip
+// (recovery). Ranges, not exact counts — an exact count is a timing
+// flake on loaded CI.
 func TestRegistryFailureBackoffAndRecovery(t *testing.T) {
 	swap := newFakeLlamaSwap(t, `{"running":[]}`)
-	cfg := Config{
+
+	var mu sync.Mutex
+	attempts := 0
+	healed := false
+	okAfterHeal := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		attempts++
+		up := healed
+		if up {
+			okAfterHeal++
+		}
+		mu.Unlock()
+		if !up {
+			http.Error(w, "registry down", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"interval_s":1}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c, err := New(Config{
 		Cell:         "gpu-cell",
-		RegistryURL:  "http://127.0.0.1:1", // nothing there
+		RegistryURL:  srv.URL,
 		LlamaSwapURL: swap.srv.URL,
-		Interval:     20 * time.Millisecond,
-	}
-	c, err := New(cfg)
+		Interval:     10 * time.Millisecond,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// Run must keep retrying quietly and exit cleanly on cancel — the
-	// control plane's death is not the data plane's.
-	if err := c.Run(ctx); err != nil {
-		t.Fatal(err)
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+
+	// 3s of outage: at a 10ms cadence an un-backed-off loop would try
+	// ~300 times; the 1s→2s→4s… backoff caps it around a handful.
+	time.Sleep(3 * time.Second)
+	mu.Lock()
+	during := attempts
+	healed = true
+	mu.Unlock()
+	if during > 20 {
+		t.Errorf("%d attempts during a 3s outage — the backoff is not growing", during)
+	}
+	if during < 2 {
+		t.Errorf("%d attempts during the outage — it stopped retrying entirely", during)
+	}
+
+	deadline := time.After(15 * time.Second)
+	for {
+		mu.Lock()
+		ok := okAfterHeal
+		mu.Unlock()
+		if ok > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("no successful announce after the registry healed")
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned %v, want nil on cancel", err)
 	}
 }
 
@@ -480,5 +538,53 @@ func TestGatherModelsWithoutLlamaSwap(t *testing.T) {
 	last := reg.calls()[len(reg.calls())-1]
 	if len(last.Models) != 0 {
 		t.Errorf("models = %+v, want empty when llama-swap is down", last.Models)
+	}
+}
+
+// TestSetLocalIntentConcurrent pins MIN-D: N concurrent writers leave a
+// file that always parses AND matches the in-memory intent at quiesce —
+// a fixed ".tmp" name tore the file, and an unserialised (mutate, write)
+// left the loser's state on disk.
+func TestSetLocalIntentConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "intent.json")
+	c, err := New(Config{Cell: "laptop", RegistryURL: "http://127.0.0.1:1", IntentPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for i := range 32 {
+		state := "drained"
+		if i%2 == 0 {
+			state = "serving"
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := c.SetLocalIntent(state); err != nil {
+				t.Errorf("SetLocalIntent: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var onDisk fleetapi.AnnounceIntent
+	if err := json.Unmarshal(data, &onDisk); err != nil {
+		t.Fatalf("intent file did not parse (%v): %s", err, data)
+	}
+	if got := c.LocalIntent(); onDisk.State != got.State || !onDisk.Since.Equal(got.Since) {
+		t.Errorf("on-disk %+v != in-memory %+v", onDisk, got)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("leftover temp files: %v", entries)
 	}
 }

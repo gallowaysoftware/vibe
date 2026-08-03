@@ -32,6 +32,7 @@ type fakeCellDaemon struct {
 	resumeCalls int
 	failDrain   bool
 	drainDelay  time.Duration
+	waitStatus  string
 }
 
 func (f *fakeCellDaemon) CellDrain(ctx context.Context, req *connect.Request[vibev1.CellDrainRequest]) (*connect.Response[vibev1.CellDrainResponse], error) {
@@ -50,9 +51,15 @@ func (f *fakeCellDaemon) CellDrain(ctx context.Context, req *connect.Request[vib
 		return nil, connect.NewError(connect.CodeUnavailable, fmt.Errorf("drain command failed: exit 1: unit not found"))
 	}
 	two := int64(2)
+	var waitStatus *string
+	if f.waitStatus != "" {
+		ws := f.waitStatus
+		waitStatus = &ws
+	}
 	return connect.NewResponse(&vibev1.CellDrainResponse{
 		ResidentModels:   []string{"qwen3.6-27b"},
 		InFlightRequests: &two,
+		WaitStatus:       waitStatus,
 		ActiveLeases: []*vibev1.LeaseView{
 			{Cell: "gpu-cell", Model: "bge-embed", Holder: "batch-ingest", Note: "mid-batch", ExpiresAt: timestamppb.New(time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC))},
 		},
@@ -310,5 +317,27 @@ func TestMCPWakeCellErrorsWithoutConfig(t *testing.T) {
 	text, isErr = toolText(t, resp)
 	if !isErr || !strings.Contains(text, "unknown cell") {
 		t.Errorf("unknown cell must be a tool error: isErr=%v text=%q", isErr, text)
+	}
+}
+
+// TestMCPDrainCellReportsSkippedWait pins MIN-N's agent-facing half: an
+// agent relaying the drain must be told the requested quiescence wait
+// never happened, or it tells the operator their stream was safe.
+func TestMCPDrainCellReportsSkippedWait(t *testing.T) {
+	cellDaemon := newFakeCellDaemon(t)
+	cellDaemon.waitStatus = fleetapi.DrainWaitSkippedNoInflight
+	front := newFakeLlamaSwap(t)
+	_, ts := newTestFacade(t, map[string]fleetcfg.Cell{
+		"front":    {URL: front.srv.URL, Class: fleetcfg.ClassAlwaysOn},
+		"gpu-cell": {URL: "http://127.0.0.1:1", Class: fleetcfg.ClassOpportunistic, DaemonURL: cellDaemon.srv.URL},
+	}, nil)
+
+	resp := rpc(t, ts, `{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"drain_cell","arguments":{"cell":"gpu-cell","wait_seconds":30}}}`)
+	text, isErr := toolText(t, resp)
+	if isErr {
+		t.Fatalf("drain error: %s", text)
+	}
+	if !strings.Contains(text, "wait was SKIPPED") {
+		t.Errorf("report does not say the wait was skipped:\n%s", text)
 	}
 }

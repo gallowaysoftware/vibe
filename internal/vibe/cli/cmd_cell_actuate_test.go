@@ -405,3 +405,33 @@ func TestWakeCellViaFleetd(t *testing.T) {
 		t.Errorf("packet: n=%d err=%v", n, err)
 	}
 }
+
+// TestPrintDrainReport_WaitStatus pins MIN-N's human-facing half: the
+// operator who asked for quiescence sees whether it happened.
+func TestPrintDrainReport_WaitStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status *string
+		want   string
+		absent string
+	}{
+		{name: "skipped", status: strPtr(fleetapi.DrainWaitSkippedNoInflight), want: "--wait was SKIPPED"},
+		{name: "waited", status: strPtr(fleetapi.DrainWaitWaited), want: "waited for in-flight requests"},
+		{name: "not requested", status: strPtr(fleetapi.DrainWaitNotRequested), absent: "wait"},
+		{name: "absent field (old daemon)", status: nil, absent: "wait"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			printDrainReport(&out, "gpu-cell", &vibev1.CellDrainResponse{WaitStatus: tc.status})
+			s := out.String()
+			if tc.want != "" && !strings.Contains(s, tc.want) {
+				t.Errorf("output %q missing %q", s, tc.want)
+			}
+			if tc.absent != "" && strings.Contains(s, tc.absent) {
+				t.Errorf("output %q mentions %q when it should say nothing", s, tc.absent)
+			}
+		})
+	}
+}
+
+func strPtr(s string) *string { return &s }

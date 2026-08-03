@@ -1129,8 +1129,15 @@ type CellDrainResponse struct {
 	// drain still proceeded (leases are advisory), but the caller knows the
 	// report can't rule out stranded work.
 	LeasesUnavailable bool `protobuf:"varint,4,opt,name=leases_unavailable,json=leasesUnavailable,proto3" json:"leases_unavailable,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// wait_status reports what became of a requested quiescence wait:
+	// "not_requested" (wait_seconds was 0), "waited" (the cell reported
+	// in-flight counts and reached zero), or "skipped_no_inflight_data"
+	// (nothing ever reported a count, so the drain ran immediately). An
+	// operator who asked for quiescence and silently got a stream-
+	// cancelling drain has to be able to see that.
+	WaitStatus    *string `protobuf:"bytes,5,opt,name=wait_status,json=waitStatus,proto3,oneof" json:"wait_status,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CellDrainResponse) Reset() {
@@ -1189,6 +1196,13 @@ func (x *CellDrainResponse) GetLeasesUnavailable() bool {
 		return x.LeasesUnavailable
 	}
 	return false
+}
+
+func (x *CellDrainResponse) GetWaitStatus() string {
+	if x != nil && x.WaitStatus != nil {
+		return *x.WaitStatus
+	}
+	return ""
 }
 
 type CellResumeRequest struct {
@@ -1406,13 +1420,16 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\x06holder\x18\x03 \x01(\tR\x06holder\x12\x12\n" +
 	"\x04note\x18\x04 \x01(\tR\x04note\x129\n" +
 	"\n" +
-	"expires_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\"\xee\x01\n" +
+	"expires_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\"\xa4\x02\n" +
 	"\x11CellDrainResponse\x12'\n" +
 	"\x0fresident_models\x18\x01 \x03(\tR\x0eresidentModels\x121\n" +
 	"\x12in_flight_requests\x18\x02 \x01(\x03H\x00R\x10inFlightRequests\x88\x01\x01\x127\n" +
 	"\ractive_leases\x18\x03 \x03(\v2\x12.vibe.v1.LeaseViewR\factiveLeases\x12-\n" +
-	"\x12leases_unavailable\x18\x04 \x01(\bR\x11leasesUnavailableB\x15\n" +
-	"\x13_in_flight_requests\"\x13\n" +
+	"\x12leases_unavailable\x18\x04 \x01(\bR\x11leasesUnavailable\x12$\n" +
+	"\vwait_status\x18\x05 \x01(\tH\x01R\n" +
+	"waitStatus\x88\x01\x01B\x15\n" +
+	"\x13_in_flight_requestsB\x0e\n" +
+	"\f_wait_status\"\x13\n" +
 	"\x11CellResumeRequest\"\x14\n" +
 	"\x12CellResumeResponse\"\x98\x02\n" +
 	"\fPullProgress\x121\n" +

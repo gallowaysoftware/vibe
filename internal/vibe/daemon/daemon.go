@@ -508,6 +508,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 	slog.Info("daemon shutting down", "reason", shutReason)
 	shCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	// Say goodbye before anything else stops: a clean withdraw lets
+	// fleetd prune this cell's catalog now instead of waiting out
+	// stale_after, which is the whole reason the withdrawing state
+	// exists. Best-effort — an unreachable fleetd must not delay
+	// shutdown past the announce timeout.
+	if d.announce != nil {
+		wctx, wcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := d.announce.Withdraw(wctx); err != nil {
+			slog.Info("withdraw announce failed; fleetd will prune on staleness", "err", err)
+		}
+		wcancel()
+	}
 	// Tear down the active frontend (if any) first; otherwise a
 	// docker-compose stack outlives the daemon and keeps serving stale
 	// requests at the (now-dead) proxy.

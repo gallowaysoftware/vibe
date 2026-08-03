@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -391,6 +392,12 @@ func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell str
 			fmt.Fprintf(out, "%s is %s\n", cell, state)
 			return nil
 		}
+		if errors.Is(err, errUnknownCell) {
+			// A typo'd cell name never becomes true by waiting, and
+			// --timeout 0 is the documented overnight-batch idiom: without
+			// this the command parks until the machine reboots.
+			return err
+		}
 		if err != nil && ctx.Err() == nil {
 			fmt.Fprintf(out, "await %s: %v (retrying)\n", cell, err)
 		}
@@ -431,8 +438,14 @@ func checkCellReachable(ctx context.Context, target fleetdTarget, cell string, m
 			return matches(c.Reachable), nil
 		}
 	}
-	return false, fmt.Errorf("unknown cell %q (not in fleetd's registry)", cell)
+	return false, fmt.Errorf("%w %q (not in fleetd's registry)", errUnknownCell, cell)
 }
+
+// errUnknownCell separates "fleetd answered and has never heard of this
+// cell" from a transport error. The first can only be a typo and must
+// fail fast even with --timeout 0; the second is a restarting fleetd and
+// must keep retrying, which is the whole point of the loop.
+var errUnknownCell = errors.New("unknown cell")
 
 // streamFleetEvents reads the SSE stream, decoding data: frames until
 // ctx or the stream dies. An establishment failure or mid-stream error

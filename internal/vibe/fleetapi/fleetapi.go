@@ -136,6 +136,15 @@ type StateSnapshot struct {
 // dead cell can't stall the whole state response.
 const snapshotTimeout = 3 * time.Second
 
+// Drain wait-status values carried in CellDrainResponse.wait_status.
+// They live here rather than in the daemon because the CLI and the MCP
+// facade both render them and neither may import the daemon.
+const (
+	DrainWaitNotRequested      = "not_requested"
+	DrainWaitWaited            = "waited"
+	DrainWaitSkippedNoInflight = "skipped_no_inflight_data"
+)
+
 // Server aggregates the cell registry, the event hub, and the start-duration
 // history. Construct with New, mount with Register, then Start the per-cell
 // watchers; Close is idempotent and required for the SSE handlers to unblock
