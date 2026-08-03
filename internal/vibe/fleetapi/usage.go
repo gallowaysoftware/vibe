@@ -40,6 +40,35 @@ const (
 	usageBasisCell = "cell"
 )
 
+// reservedBases are fleetd's own basis values, closed to cells. An
+// unknown basis from a newer cell is welcome (it is a pricing question,
+// C7b's); one of THESE is a collision with a bucket fleetd writes itself.
+var reservedBases = map[string]bool{usageBasisResident: true, usageBasisCell: true}
+
+// clampUsage folds a negative counter to zero. The cell already clamps
+// llama-swap's -1 sentinels, but the ledger is APPEND-ONLY and fed by
+// untrusted announces: a negative that lands can never be corrected, and
+// it silently SUBTRACTS from every rollup that later reads the file.
+// Clamping the cumulative total (not the delta) is what makes the next
+// honest announce produce an honest delta against it.
+func clampUsage(m AnnounceUsageModel) AnnounceUsageModel {
+	nn := func(v int64) int64 {
+		if v < 0 {
+			return 0
+		}
+		return v
+	}
+	m.Req = nn(m.Req)
+	m.InFresh = nn(m.InFresh)
+	m.InCached = nn(m.InCached)
+	m.Out = nn(m.Out)
+	m.PokeReq = nn(m.PokeReq)
+	m.ErrReq = nn(m.ErrReq)
+	m.UnmeasuredReq = nn(m.UnmeasuredReq)
+	m.BusyMS = nn(m.BusyMS)
+	return m
+}
+
 // UsageBucket is one JSONL line: one (day, cell, model, basis, epoch)
 // bucket, plus the cumulative cursor that produced it.
 //
@@ -109,6 +138,10 @@ type usageLedger struct {
 	// lastFold is the previous announce instant per cell, the residency
 	// credit's denominator.
 	lastFold map[string]time.Time
+	// warnedBasis dedupes the reserved-basis rejection log. A cell that
+	// sends one sends one every 15 s forever, and a warning that repeats
+	// forever is a warning nobody reads.
+	warnedBasis map[string]bool
 	// loadDegraded records that load() could not read the whole file.
 	// Compaction rewrites the file from memory, so compacting a partial
 	// read would DELETE the part that didn't parse — turning a transient
@@ -125,12 +158,13 @@ func newUsageLedger(path string, loc *time.Location) *usageLedger {
 		loc = time.Local
 	}
 	l := &usageLedger{
-		path:     path,
-		loc:      loc,
-		buckets:  map[usageKey]*UsageBucket{},
-		cursors:  map[cursorKey]usageCursor{},
-		dirty:    map[usageKey]bool{},
-		lastFold: map[string]time.Time{},
+		path:        path,
+		loc:         loc,
+		buckets:     map[usageKey]*UsageBucket{},
+		cursors:     map[cursorKey]usageCursor{},
+		dirty:       map[usageKey]bool{},
+		lastFold:    map[string]time.Time{},
+		warnedBasis: map[string]bool{},
 	}
 	if path == "" {
 		return l
@@ -225,6 +259,22 @@ func (l *usageLedger) fold(cell string, u *AnnounceUsage, at time.Time) {
 		if m.Model == "" {
 			continue
 		}
+		if reservedBases[m.Basis] {
+			// An announce is untrusted input (C3/C5's posture — the fleet
+			// token is every cell's voice). These two basis values are
+			// FLEETD's: a cell-announced "resident" row keys onto exactly
+			// the bucket line foldResidency credits seconds to, producing
+			// one line that is simultaneously a token row and a residency
+			// row with no way to separate the halves afterwards. Drop the
+			// entry, keep the rest of the announce.
+			if k := cell + "\x00" + m.Basis; !l.warnedBasis[k] {
+				l.warnedBasis[k] = true
+				slog.Warn("cell announced a fleetd-reserved usage basis; those rows are dropped",
+					"cell", cell, "basis", m.Basis, "reserved", []string{usageBasisResident, usageBasisCell})
+			}
+			continue
+		}
+		m = clampUsage(m)
 		key := usageKey{Day: day, Cell: cell, Model: m.Model, Basis: m.Basis, Epoch: u.Epoch}
 		delta := l.deltaLocked(cursorKey{Cell: cell, Model: m.Model, Basis: m.Basis, Epoch: u.Epoch}, m, day)
 
@@ -490,6 +540,11 @@ func (l *usageLedger) compact() error {
 	for _, k := range keys {
 		data, err := json.Marshal(l.buckets[k])
 		if err != nil {
+			// Dropping a bucket here deletes it: compaction REPLACES the
+			// history rather than appending to it. Say so out loud, the
+			// way the append path already does.
+			slog.Warn("usage bucket unmarshalable; dropped from the compacted file",
+				"cell", k.Cell, "model", k.Model, "basis", k.Basis, "err", err)
 			continue
 		}
 		if _, err := w.Write(append(data, '\n')); err != nil {
@@ -580,7 +635,17 @@ func (s *Server) UsageReport(sinceDay string) UsageReport {
 	}
 	slices.SortFunc(keys, compareUsageKey)
 	for _, k := range keys {
-		rep.Buckets = append(rep.Buckets, *l.buckets[k])
+		// Deep-copy LastTotal. A struct copy taken under the lock still
+		// hands the caller a POINTER into ledger memory — captured under a
+		// lock, dereferenced after it, which is the shape that shipped in
+		// C4. Nothing writes through it today; the point is that nothing
+		// can start to.
+		b := *l.buckets[k]
+		if b.LastTotal != nil {
+			lt := *b.LastTotal
+			b.LastTotal = &lt
+		}
+		rep.Buckets = append(rep.Buckets, b)
 	}
 	return rep
 }
@@ -615,8 +680,19 @@ func (s *Server) usageFlushLoop() {
 }
 
 // handleUsage serves GET /api/fleet/usage?since=YYYY-MM-DD.
+//
+// A malformed `since` is a 400, not an empty document. The filter is a
+// STRING comparison against the day key, so `since=aug3` silently
+// excludes every bucket and `since=1` silently includes all of them —
+// either way a typo reads as an answer about the fleet.
 func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	since := strings.TrimSpace(r.URL.Query().Get("since"))
+	if since != "" {
+		if _, err := time.Parse("2006-01-02", since); err != nil {
+			http.Error(w, "since must be YYYY-MM-DD", http.StatusBadRequest)
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.UsageReport(since))
 }

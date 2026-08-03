@@ -1,8 +1,11 @@
 # C7a — The usage ledger: counting tokens per cell, per model, per day
 
-Status: EXECUTED (2026-08-03) on `feat/c7a-usage-ledger`, branched off
-the C4/C5 line. Every mechanically verifiable gate is green; the seven
-live gates need real cells and are listed unrun in
+Status: EXECUTED + REVIEWED (2026-08-03) on `feat/c7a-usage-ledger`,
+branched off the C4/C5 line. Feature commit, self-review commit, and an
+independent adversarial pass (ground rule 9) whose findings are in
+[§Adversarial-review addendum](#adversarial-review-addendum-second-independent-pass).
+Every mechanically verifiable gate is green; the seven live gates need
+real cells and are listed unrun in
 [§Execution](#execution-2026-08-03). Depends on C4 (announce +
 presence). No dependency on C5/C6 beyond merge order.
 
@@ -398,11 +401,11 @@ with. Unset keeps the old behavior exactly.
 | 5. Self-traffic | unit half **PASS** (`TestClassify_OneTokenChatRowIsAPokeExcludedFromBillableSums`); live half **NOT RUN** |
 | 6. Offline | unit analogue **PASS** (cumulative totals + `TestUsageLedger_FlushAndReplayAreIdempotent`); live **NOT RUN** |
 | 7. Restart idempotency | **PASS** (`TestUsageLedger_FlushAndReplayAreIdempotent`, incl. the kill-between-fold-and-flush case) |
-| 8. Epoch | **PASS** (`TestPoll_IDResetMintsANewEpochAndReingests`, `TestUsageFold_SameEpoch*`, `TestUsageFold_NewEpochStartsANewRowAndKeepsTheOld`) |
-| 9. Timezone | **PASS** (`TestUsageDayKey_SplitsAtLocalMidnightNotUTCMidnight`, `TestUsageDayKey_HandlesBothDSTDiscontinuities`, `TestNoTruncateBasedDayBucketing`) |
+| 8. Epoch | unit half **PASS** (`TestPoll_IDResetMintsANewEpochAndReingests`, `TestUsageFold_SameEpoch*`, `TestUsageFold_NewEpochStartsANewRowAndKeepsTheOld`); live half (restart a cell's llama-swap on an in-memory store) **NOT RUN** |
+| 9. Timezone | **PASS** (`TestUsageDayKey_SplitsAtLocalMidnightNotUTCMidnight`, `TestUsageDayKey_HandlesBothDSTDiscontinuities`, `TestNoTruncateBasedDayBucketing` — the grep now walks the whole module, not two directories; see the review addendum) |
 | 10. MTP | **PASS** (`TestClassify_DraftTokensNeverEnterAnySum`) |
 | 11. Streaming contract | **PASS** — `git diff --stat internal/vibe/proxy/` empty; `git diff -- '*.go' \| grep -c stream_options` = 0 across the phase. Stated precisely: the phrase occurs exactly once in the whole diff, in the row above this one, naming the gate. Zero code occurrences. |
-| 12. Inner loop | **PASS** — build / vet / gofmt / mod tidy / `test -race -count=5` / golangci-lint, all run on the final tree |
+| 12. Inner loop + review | **PASS** — build / vet / gofmt / mod tidy / `test -race -count=5 ./...` / `golangci-lint run` (0 issues), all re-run on the tree after the second review pass |
 
 ### Adversarial self-review (ground rule 9)
 
@@ -474,3 +477,125 @@ renders it: `router.Options.ExtrasPath` merges the file verbatim. Until
 each cell has it, that cell's activity log is the 1000-row in-memory
 ring and the collector will honestly report `lost_rows` and mint a new
 epoch on every llama-swap restart.
+
+### Adversarial-review addendum (second, independent pass)
+
+Ground rule 9's review of the feature commit **and** of the self-review
+commit that followed it, run 2026-08-03 against `895bdcd`. Seven
+findings, all fixed, every one with a regression test that was
+**mutation-verified**: the production change was reverted and the new
+test observed to fail, then restored.
+
+1. **Announce-supplied counters were folded unclamped (major).**
+   `usageLedger.fold` took `AnnounceUsageModel` straight from the wire.
+   The cell clamps llama-swap's `-1` sentinels, but the announce is
+   untrusted input — the posture C3/C5 established for every other
+   announce-fed path — and this store is APPEND-ONLY: a negative that
+   lands can never be corrected and silently SUBTRACTS from every rollup
+   C7b will build on the file. A cell one bug away from `in_fresh: -1`
+   (or a forged announce; the fleet token is every cell's voice) poisons
+   the history permanently. `clampUsage` now clamps the CUMULATIVE total
+   before the delta rule, not the delta — clamping the delta would leave
+   a poisoned cursor that swallows the next honest announce.
+   `TestUsageFold_NegativeCountersFromTheWireNeverEnterTheLedger`.
+2. **A cell could write into fleetd's reserved basis namespace
+   (major).** `resident` and `cell` are fleetd's own basis values, and
+   nothing stopped an announce from claiming them. A cell-announced
+   `basis: "resident"` row keys onto *exactly* the bucket
+   `foldResidency` credits seconds to, producing a single JSONL line
+   that is simultaneously a token row and a residency row with no way to
+   separate the halves afterwards; `basis: "cell"` collides with the
+   `lost_rows` bookkeeping row the same way. Reserved bases are now
+   dropped at fold with a warn-once (a bad cell sends one every 15 s
+   forever), and the rest of the same announce still lands — one bad
+   entry must not cost the cell its accounting. Unknown bases stay
+   welcome; that is a pricing question and pricing is C7b's.
+   `TestUsageFold_ACellCannotWriteFleetdsReservedBases`.
+3. **`TestUsageLedger_DegradedReadSkipsCompaction` proved nothing
+   (major, ground rule 10).** The self-review's own finding-3 test used
+   an unreadable file, which leaves ZERO buckets — and `compact()`
+   returns early on an empty ledger regardless. Deleting the production
+   guard left the test green. The body now uses a read that stops PART
+   WAY (a valid prefix, then a line past the scanner's 1 MB token limit,
+   then more valid lines): the prefix parses, the scan aborts, and
+   without the guard compaction rewrites the file from that partial view
+   and deletes the tail. Verified to fail with the guard removed.
+4. **`UsageReport` handed callers a pointer into ledger memory
+   (minor).** Each bucket was copied under `l.mu`, but a struct copy
+   still carries `LastTotal *AnnounceUsageModel` — captured under a
+   lock, dereferenced after it, which is the exact shape that shipped in
+   C4. Nothing writes through it today; `LastTotal` is deep-copied now
+   so nothing can start to.
+   `TestUsageReport_DoesNotAliasLedgerMemory`.
+5. **A cell-side state-write failure was invisible (minor).** `Poll`
+   returned `c.save()`'s error into `PollAndSnapshot`, which logs at
+   **debug** under the message "usage poll failed" — correct for an
+   llama-swap that is simply stopped, wrong here. On a read-only or full
+   state dir the poll SUCCEEDED and only durability failed, leaving the
+   cursor advanced in memory and stale on disk; the next restart
+   re-ingests rows already counted, which fleetd folds as new traffic
+   because the cumulative total is all it has to go on. That case now
+   warns at the save site, and the cell still announces its counts
+   (fail-open).
+   `TestPoll_StateWriteFailureIsWarnedNotSwallowed`.
+6. **The role-gating regression test missed the new route (minor).**
+   AGENTS.md's fleetd invariant is that a daemon without
+   `fleet_registry: true` serves none of those routes, "test-gated" by
+   `daemon/fleet_registry_test.go:TestDaemon_FleetRegistryOff_NoMCP` —
+   which probed `/mcp` and `/api/fleet/intent` but not C7a's
+   `GET /api/fleet/usage`. Added; verified to fail when the route is
+   mounted unconditionally.
+7. **Two unbounded inputs on the read surface (minor).** `since` is a
+   STRING comparison against the day key, so `?since=aug3` silently
+   returned an empty document and `?since=1` silently returned
+   everything — a typo reading as an answer about the fleet. It is a 400
+   now (`TestUsageEndpoint_RejectsAMalformedSince`). And `fleet_usage`'s
+   `days` fed `AddDate` unbounded: `days=1<<62` OVERFLOWS `time.Time`
+   and wraps into the future (measured: it lands on *tomorrow*),
+   filtering every bucket out so the tool reports "the fleet used
+   nothing". Absurd windows now mean "everything"
+   (`TestFleetUsageTool_AnAbsurdWindowReturnsEverythingNotNothing`).
+
+Also fixed without a test, because the failure it logs is not reachable
+from a test: `compact()` dropped a bucket silently when `json.Marshal`
+failed, while the append path warned on the identical failure —
+asymmetric, and compaction REPLACES the file rather than appending to
+it, so a silent drop there is deletion.
+
+The gate-9 grep test was widened from two hard-coded directories to a
+walk of the whole module (with a floor on the file count, so a walk that
+silently found nothing cannot pass forever). Gate 9's wording is
+"appears nowhere in the phase", and the phase touched seven packages.
+
+**Verified sound, not changed:**
+
+- The delta/epoch rules, the day-independent cursor, the front skip, the
+  poke/unmeasured/error split, the `req_path` basis branch, the `-1`
+  clamps and the draft-token exclusion all hold under mutation: breaking
+  the day-independent cursor, the chat/embed cache branch, the residency
+  rounding and `pollMu` each made a named test fail.
+- `Server.usageFlushLoop` is `wg.Add`-ed outside its goroutine, exits on
+  `s.done`, stops its ticker, and its final flush completes before
+  `Close()` returns (`Close` waits on the same `wg`).
+- No lock is held across an HTTP call or a `publish`; `flush` marshals
+  under `l.mu` and writes outside it, and re-marks the batch dirty on a
+  write failure.
+- `git diff --stat internal/vibe/proxy/` is still empty and
+  `stream_options` still appears in zero lines of Go.
+
+**Known and accepted (documented, not fixed):**
+
+- **Losing the cell's state file double-counts its recent history.**
+  With no prior state the cursor is 0, so the first poll re-ingests up to
+  ~10 k rows under a NEW epoch, and fleetd starts a new row rather than
+  recognising traffic its ledger already holds. The alternative (start at
+  `max_id`) discards the same history silently. Treat
+  `$XDG_STATE_HOME/vibe/fleet/cell-usage.json` as data, not cache.
+- **Ledger cardinality is announce-driven.** Every distinct
+  `(model, basis, epoch)` a cell announces becomes a permanent bucket.
+  The 1 MB announce body bounds one heartbeat, not the lifetime; a cell
+  whose llama-swap restarts on an in-memory store mints an epoch per
+  restart. §0's `store: {path: …}` is what keeps this small.
+- **`UsageBucket.TZ` is stamped at bucket creation.** Changing
+  `fleet.timezone` between fleetd restarts leaves old lines labelled with
+  the old zone while new counts bucket in the new one.

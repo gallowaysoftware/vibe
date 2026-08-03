@@ -511,7 +511,18 @@ func (c *Collector) Poll(ctx context.Context) error {
 			"lost", expected-int64(seen), "cursor", cursor, "max_id", maxID)
 	}
 	c.cursor = maxID
-	return c.save()
+	if err := c.save(); err != nil {
+		// The poll SUCCEEDED and only the durability failed, so this
+		// cannot ride PollAndSnapshot's debug-level "poll failed" line: a
+		// read-only or full state dir leaves the cursor advanced in memory
+		// and stale on disk, and the next restart re-ingests rows already
+		// counted — which fleetd folds as new traffic, because the cell's
+		// cumulative total is all it has to go on.
+		c.logger.Warn("usage cursor not persisted; a restart will re-ingest rows already counted",
+			"path", c.cfg.StatePath, "err", err)
+		return err
+	}
+	return nil
 }
 
 // fetchSince walks the activity log back from maxID to cursor,

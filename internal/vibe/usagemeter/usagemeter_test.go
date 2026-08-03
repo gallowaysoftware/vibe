@@ -6,12 +6,16 @@ package usagemeter
 // durability across restarts.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -440,5 +444,50 @@ func TestSnapshot_ReportsALossWithNoModels(t *testing.T) {
 	}
 	if snap.LostRows != 899 {
 		t.Errorf("lost_rows = %d, want 899", snap.LostRows)
+	}
+}
+
+// ─── second adversarial pass ────────────────────────────────────────────
+
+// A state-dir write failure is NOT a poll failure: the rows were read and
+// folded, only the cursor did not reach disk. PollAndSnapshot logs poll
+// failures at debug (an llama-swap that is simply stopped is expected and
+// noisy), so a durability failure logged the same way is invisible in
+// production — and it is the one that makes a restart re-ingest rows
+// already counted.
+func TestPoll_StateWriteFailureIsWarnedNotSwallowed(t *testing.T) {
+	swap := &fakeSwap{}
+	url := swap.start(t)
+
+	// StatePath's parent is a FILE, so MkdirAll fails on every save.
+	blocked := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	c, err := New(Config{
+		LlamaSwapURL: url,
+		StatePath:    filepath.Join(blocked, "cell-usage.json"),
+		Logger:       logger,
+		NewEpoch:     func() string { return "e1" },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	swap.set([]ActivityRow{chatRow(1, "qwen", 100, 0, 50)})
+	if err := c.Poll(context.Background()); err == nil {
+		t.Fatal("Poll returned nil despite an unwritable state path")
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "not persisted") {
+		t.Errorf("a durability failure was not warned about; log was:\n%s", out)
+	}
+
+	// Fail-open: the counts are still true and still worth announcing.
+	if snap := c.Snapshot(); snap == nil || len(snap.Models) != 1 || snap.Models[0].InFresh != 100 {
+		t.Errorf("an unwritable state path cost the cell its counts: %+v", snap)
 	}
 }

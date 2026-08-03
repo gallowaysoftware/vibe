@@ -349,26 +349,57 @@ func TestUsageResidency_RoundsRatherThanTruncatesTheGap(t *testing.T) {
 // Truncate rounds against absolute time since the Unix epoch and lands
 // on UTC midnight regardless of the Location the value carries — with no
 // error, no type mismatch, and no way to notice from the output.
+// The gate is "appears nowhere in the phase", and the phase touched
+// fleetapi, usagemeter, daemon, fleetannounce, fleetmcp, cli and paths.
+// Walking the whole module is both simpler and stricter than naming
+// directories — and a day bucket computed by truncation is wrong
+// wherever it is written, not only in these two packages.
 func TestNoTruncateBasedDayBucketing(t *testing.T) {
-	forbidden := "Truncate(24" + " *" + " time.Hour)"
-	alsoForbidden := "Truncate(24" + "*time.Hour)"
-	for _, dir := range []string{".", "../usagemeter"} {
-		entries, err := os.ReadDir(dir)
+	forbidden := []string{
+		"Truncate(24" + " *" + " time.Hour)",
+		"Truncate(24" + "*time.Hour)",
+	}
+	root, err := filepath.Abs("../../..")
+	if err != nil {
+		t.Fatalf("abs: %v", err)
+	}
+	self, err := filepath.Abs("c7a_test.go")
+	if err != nil {
+		t.Fatalf("abs: %v", err)
+	}
+	walked := 0
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			t.Fatalf("read %s: %v", dir, err)
+			return err
 		}
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || e.Name() == "c7a_test.go" {
-				continue
+		if d.IsDir() {
+			if name := d.Name(); path != root && (name == ".git" || name == "dist" || name == "node_modules") {
+				return filepath.SkipDir
 			}
-			data, err := os.ReadFile(filepath.Join(dir, e.Name()))
-			if err != nil {
-				t.Fatalf("read %s: %v", e.Name(), err)
-			}
-			if strings.Contains(string(data), forbidden) || strings.Contains(string(data), alsoForbidden) {
-				t.Errorf("%s/%s truncates to a 24h boundary; day buckets must use an explicit *time.Location", dir, e.Name())
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || path == self {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		walked++
+		for _, f := range forbidden {
+			if strings.Contains(string(data), f) {
+				rel, _ := filepath.Rel(root, path)
+				t.Errorf("%s truncates to a 24h boundary; day buckets must use an explicit *time.Location", rel)
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	// A walk that silently found nothing would pass forever.
+	if walked < 100 {
+		t.Fatalf("walked only %d .go files; the grep gate is not covering the module", walked)
 	}
 }
 
@@ -505,33 +536,171 @@ func TestUsageFold_ModellessLossStillLands(t *testing.T) {
 // Compaction rewrites the file from memory. Compacting after a PARTIAL
 // read would delete whatever didn't parse, turning a transient read
 // error into permanent data loss.
+//
+// The read has to stop PART WAY for this to prove anything. An
+// unreadable file leaves zero buckets, and compact() returns early on an
+// empty ledger anyway — so that shape passes with the guard deleted. A
+// line past the scanner's token limit is the case that bites: the prefix
+// parses, the scan aborts, and the tail is unread but still on disk.
 func TestUsageLedger_DegradedReadSkipsCompaction(t *testing.T) {
 	loc := toronto(t)
-	dir := t.TempDir()
-	path := filepath.Join(dir, "usage.jsonl")
-	if err := os.WriteFile(path, []byte(`{"d":"2026-08-03","cell":"gpu","model":"qwen","basis":"chat","epoch":"e1","req":5}`+"\n"), 0o644); err != nil {
+	path := filepath.Join(t.TempDir(), "usage.jsonl")
+	head := `{"d":"2026-08-03","cell":"gpu","model":"qwen","basis":"chat","epoch":"e1","req":5}`
+	oversize := `{"d":"2026-08-04","cell":"gpu","model":"` + strings.Repeat("x", 2<<20) + `","basis":"chat","req":9}`
+	tail := `{"d":"2026-08-05","cell":"gpu","model":"zeta","basis":"chat","epoch":"e1","req":7}`
+	if err := os.WriteFile(path, []byte(head+"\n"+oversize+"\n"+tail+"\n"), 0o600); err != nil {
 		t.Fatal(err)
-	}
-	// Unreadable file: load() must not leave an empty ledger that
-	// compaction then writes over the real one.
-	if err := os.Chmod(path, 0o000); err != nil {
-		t.Skipf("cannot chmod: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
-	if f, err := os.Open(path); err == nil {
-		f.Close()
-		t.Skip("running as a user that ignores file modes (root?)")
 	}
 
-	_ = newUsageLedger(path, loc)
-	if err := os.Chmod(path, 0o644); err != nil {
-		t.Fatal(err)
+	l := newUsageLedger(path, loc)
+	if !l.loadDegraded {
+		t.Fatal("an aborted scan did not mark the read degraded")
+	}
+	if got := bucketFor(l, usageKey{Day: "2026-08-03", Cell: "gpu", Model: "qwen", Basis: "chat", Epoch: "e1"}); got.Req != 5 {
+		t.Fatalf("the parsed prefix was lost: %+v", got)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if !strings.Contains(string(data), `"req":5`) {
-		t.Fatalf("compaction erased an unread ledger: %q", data)
+	if !strings.Contains(string(data), `"model":"zeta"`) {
+		t.Fatalf("compaction erased the unread tail; %d bytes left", len(data))
+	}
+}
+
+// ─── second adversarial pass ────────────────────────────────────────────
+
+// The cell clamps llama-swap's -1 sentinels, but the ledger is fed by
+// announces, and an announce is untrusted input. The store is
+// APPEND-ONLY: a negative that lands can never be corrected, and it
+// subtracts from every rollup that later reads the file.
+func TestUsageFold_NegativeCountersFromTheWireNeverEnterTheLedger(t *testing.T) {
+	loc := toronto(t)
+	l, _ := newLedger(t, loc)
+	at := time.Date(2026, 8, 3, 14, 0, 0, 0, loc)
+
+	l.fold("gpu", &AnnounceUsage{Epoch: "e1", Models: []AnnounceUsageModel{{
+		Model: "qwen", Basis: "chat",
+		Req: -5, InFresh: -1, InCached: -1, Out: -1,
+		PokeReq: -3, ErrReq: -2, UnmeasuredReq: -7, BusyMS: -900,
+	}}}, at)
+
+	key := usageKey{Day: "2026-08-03", Cell: "gpu", Model: "qwen", Basis: "chat", Epoch: "e1"}
+	got := bucketFor(l, key)
+	for label, v := range map[string]int64{
+		"req": got.Req, "in_fresh": got.InFresh, "in_cached": got.InCached, "out": got.Out,
+		"poke_req": got.PokeReq, "err_req": got.ErrReq, "unmeasured_req": got.UnmeasuredReq,
+		"busy_ms": got.BusyMS,
+	} {
+		if v != 0 {
+			t.Errorf("%s = %d, want 0 (a negative counter must not enter an append-only ledger)", label, v)
+		}
+	}
+
+	// And the CUMULATIVE total is clamped too, not just this delta: the
+	// next honest announce has to produce an honest delta against it.
+	l.fold("gpu", &AnnounceUsage{Epoch: "e1", Models: []AnnounceUsageModel{usageOf("qwen", 10, 1000, 0, 400)}}, at.Add(time.Minute))
+	got = bucketFor(l, key)
+	if got.Req != 10 || got.InFresh != 1000 || got.Out != 400 {
+		t.Fatalf("bucket after the recovery announce = %+v, want the full honest total once", got)
+	}
+}
+
+// `resident` and `cell` are fleetd's OWN basis values. A cell-announced
+// "resident" row keys onto exactly the bucket foldResidency credits
+// seconds to, producing one line that is simultaneously a token row and
+// a residency row with no way to separate the halves.
+func TestUsageFold_ACellCannotWriteFleetdsReservedBases(t *testing.T) {
+	loc := toronto(t)
+	l, _ := newLedger(t, loc)
+	at := time.Date(2026, 8, 3, 14, 0, 0, 0, loc)
+
+	l.foldResidency("gpu", []AnnounceModel{{ID: "qwen", State: "ready"}}, 15, at)
+	l.foldResidency("gpu", []AnnounceModel{{ID: "qwen", State: "ready"}}, 15, at.Add(20*time.Second))
+
+	l.fold("gpu", &AnnounceUsage{Models: []AnnounceUsageModel{
+		{Model: "qwen", Basis: usageBasisResident, Out: 999999, Req: 42},
+		{Model: "qwen", Basis: usageBasisCell, Out: 555},
+		{Model: "qwen", Basis: "chat", Out: 120, Req: 1},
+	}}, at)
+
+	res := bucketFor(l, usageKey{Day: "2026-08-03", Cell: "gpu", Model: "qwen", Basis: usageBasisResident})
+	if res.ResidentS != 20 {
+		t.Fatalf("residency row = %+v, want the 20 s fleetd observed", res)
+	}
+	if res.Out != 0 || res.Req != 0 {
+		t.Errorf("cell tokens landed in fleetd's residency row: %+v", res)
+	}
+	if cellRow := bucketFor(l, usageKey{Day: "2026-08-03", Cell: "gpu", Model: "qwen", Basis: usageBasisCell}); cellRow.Out != 0 {
+		t.Errorf("cell tokens landed in the cell-bookkeeping namespace: %+v", cellRow)
+	}
+	// The legitimate row in the same announce still lands: one bad entry
+	// must not cost the cell the rest of its accounting.
+	if chat := bucketFor(l, usageKey{Day: "2026-08-03", Cell: "gpu", Model: "qwen", Basis: "chat"}); chat.Out != 120 || chat.Req != 1 {
+		t.Errorf("a reserved-basis entry took the whole announce down with it: %+v", chat)
+	}
+}
+
+// UsageReport copies each bucket under the lock, but a struct copy still
+// carries the LastTotal POINTER — captured under a lock, dereferenced
+// after it, which is the exact shape that shipped in C4.
+func TestUsageReport_DoesNotAliasLedgerMemory(t *testing.T) {
+	loc := toronto(t)
+	dir := t.TempDir()
+	s := New(
+		[]Cell{{Name: "gpu", URL: "http://127.0.0.1:1"}},
+		filepath.Join(dir, "hist.json"), testDaemonInfo,
+		Options{IntentPath: filepath.Join(dir, "intent.json"), UsagePath: filepath.Join(dir, "usage.jsonl"), Timezone: loc},
+	)
+	t.Cleanup(s.Close)
+	at := time.Date(2026, 8, 3, 14, 0, 0, 0, loc)
+	s.usage.fold("gpu", &AnnounceUsage{Epoch: "e1", Models: []AnnounceUsageModel{usageOf("qwen", 4, 400, 0, 100)}}, at)
+
+	rep := s.UsageReport("")
+	if len(rep.Buckets) != 1 || rep.Buckets[0].LastTotal == nil {
+		t.Fatalf("report = %+v", rep.Buckets)
+	}
+	rep.Buckets[0].LastTotal.InFresh = 999999
+
+	inner := bucketFor(s.usage, usageKey{Day: "2026-08-03", Cell: "gpu", Model: "qwen", Basis: "chat", Epoch: "e1"})
+	if inner.LastTotal.InFresh != 400 {
+		t.Fatalf("a reader mutated the ledger's cursor through the report: last_total.in_fresh = %d", inner.LastTotal.InFresh)
+	}
+}
+
+// The since filter is a STRING comparison against the day key, so a typo
+// silently returns either nothing or everything — and either reads as an
+// answer about the fleet.
+func TestUsageEndpoint_RejectsAMalformedSince(t *testing.T) {
+	dir := t.TempDir()
+	s := New(
+		[]Cell{{Name: "gpu", URL: "http://127.0.0.1:1"}},
+		filepath.Join(dir, "hist.json"), testDaemonInfo,
+		Options{IntentPath: filepath.Join(dir, "intent.json"), UsagePath: filepath.Join(dir, "usage.jsonl"), Timezone: time.UTC},
+	)
+	t.Cleanup(s.Close)
+	mux := http.NewServeMux()
+	s.Register(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	for _, tc := range []struct {
+		query string
+		want  int
+	}{
+		{"", http.StatusOK},
+		{"?since=2026-08-03", http.StatusOK},
+		{"?since=aug3", http.StatusBadRequest},
+		{"?since=2026-8-3", http.StatusBadRequest},
+		{"?since=1", http.StatusBadRequest},
+	} {
+		resp, err := http.Get(ts.URL + "/api/fleet/usage" + tc.query)
+		if err != nil {
+			t.Fatalf("GET %q: %v", tc.query, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != tc.want {
+			t.Errorf("GET /api/fleet/usage%s = HTTP %d, want %d", tc.query, resp.StatusCode, tc.want)
+		}
 	}
 }

@@ -113,3 +113,40 @@ func TestFleetUsageTool_RejectsANegativeWindow(t *testing.T) {
 		t.Fatalf("days=-1 accepted: %s", text)
 	}
 }
+
+// AddDate on an absurd day count overflows time.Time and wraps into the
+// future, filtering every bucket out. An agent that asks for too much
+// history must get all of it, never a document that reads as "the fleet
+// used nothing".
+func TestFleetUsageTool_AnAbsurdWindowReturnsEverythingNotNothing(t *testing.T) {
+	ts := newUsageFacade(t)
+	postAnnounce(t, ts, fleetapi.AnnounceRequest{
+		V: fleetapi.AnnounceVersion, Cell: "gpu", Seq: 1,
+		Intent: &fleetapi.AnnounceIntent{State: "serving", Since: time.Now().UTC()},
+		Usage: &fleetapi.AnnounceUsage{Epoch: "e1", Models: []fleetapi.AnnounceUsageModel{
+			{Model: "qwen3.6-27b", Basis: "chat", Req: 1, InFresh: 10, Out: 20},
+		}},
+	})
+
+	decode := func(args string) fleetapi.UsageReport {
+		t.Helper()
+		text, isErr := toolText(t, rpc(t, ts, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fleet_usage","arguments":`+args+`}}`))
+		if isErr {
+			t.Fatalf("fleet_usage errored: %s", text)
+		}
+		var rep fleetapi.UsageReport
+		if err := json.Unmarshal([]byte(text), &rep); err != nil {
+			t.Fatalf("decode: %v (%s)", err, text)
+		}
+		return rep
+	}
+
+	all := decode(`{"days":0}`)
+	if len(all.Buckets) == 0 {
+		t.Fatal("days=0 returned nothing")
+	}
+	huge := decode(`{"days":4611686018427387904}`)
+	if len(huge.Buckets) != len(all.Buckets) {
+		t.Errorf("an absurd window returned %d buckets, want the same %d as days=0", len(huge.Buckets), len(all.Buckets))
+	}
+}

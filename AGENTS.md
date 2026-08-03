@@ -407,7 +407,16 @@ optional.)
   - **Day buckets use an explicit `*time.Location`** (`fleet.timezone`,
     `Config.FleetLocation()`). `Truncate(24*time.Hour)` rounds against
     absolute time and lands on UTC midnight regardless of the value's
-    Location, silently; a grep test forbids it.
+    Location, silently; a grep test over the whole module forbids it.
+  - **An announce is untrusted input on this path too** (C3/C5's posture;
+    the fleet token is every cell's voice). The ledger is APPEND-ONLY, so
+    `fold` hardens at ingest and a wrong value can never be corrected:
+    counters are clamped non-negative on the CUMULATIVE total (clamping
+    the delta would leave a poisoned cursor), and the two bases fleetd
+    writes itself — `resident` and `cell` — are closed to cells, because a
+    cell-announced `resident` row keys onto the exact bucket residency
+    seconds land on. Unknown bases stay welcome (that's a C7b pricing
+    question); one bad entry never costs the announce its other rows.
   - **No double count is a whitelist**: only announce-carried totals
     enter the ledger, and `fleetcfg.FrontCell` is skipped structurally
     by name at fold time. Totals on the wire are CUMULATIVE, so a
@@ -421,6 +430,14 @@ optional.)
     in memory, flushed on a 60s ticker and at shutdown, compacted at
     start via tmp+rename. Deliberately NOT `history.go`'s
     rewrite-on-every-record: fleetd folds an announce per cell per 15s.
+    **Compaction rewrites the file from memory, so a DEGRADED read (open
+    error, aborted scan) skips it** — otherwise a transient read error
+    deletes whatever didn't parse. Unparseable LINES still compact away;
+    that is the cleanup, and it is why JSONL was chosen.
+  - `GET /api/fleet/usage` is fleetd-only like `/mcp` and
+    `/api/fleet/intent`, and belongs in
+    `daemon/fleet_registry_test.go:TestDaemon_FleetRegistryOff_NoMCP`'s
+    probe list with them — add every new fleetd route there.
   - `internal/vibe/proxy` is **not** instrumented and must not be: cells
     run `disable_proxy: true`, so a flawless tee there would measure ~0%
     of fleet tokens. Requires `store: {path: …}` in each cell's

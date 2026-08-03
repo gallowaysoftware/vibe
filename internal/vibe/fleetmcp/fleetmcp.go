@@ -456,6 +456,13 @@ func (s *Server) toolFleetStatus(ctx context.Context) (string, error) {
 // doesn't paste two years of buckets into its context.
 const defaultUsageDays = 30
 
+// maxUsageDays is longer than any ledger this will ever hold, and past it
+// "how many days" stops meaning anything. It is a guard, not a policy:
+// AddDate on an absurd count OVERFLOWS time.Time and wraps into the
+// FUTURE (days=1<<62 lands on tomorrow), which filters every bucket out
+// and reads as "the fleet used nothing" instead of "everything".
+const maxUsageDays = 36600
+
 // toolFleetUsage returns the raw ledger. It deliberately computes
 // nothing: no totals, no rates, no money. C7b prices these counts, and
 // keeping the pricing out of C7a is what lets the whole history be
@@ -467,6 +474,9 @@ func (s *Server) toolFleetUsage(days *int) (string, error) {
 	}
 	if n < 0 {
 		return "", fmt.Errorf("days must be >= 0 (0 = everything)")
+	}
+	if n > maxUsageDays {
+		n = 0
 	}
 	since := ""
 	if n > 0 {
