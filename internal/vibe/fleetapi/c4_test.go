@@ -54,11 +54,10 @@ func TestWarmTarget_IdleWindowStateMachine(t *testing.T) {
 	target := WarmTarget{Cell: "heavy", Model: "default-model", RestoreAfterIdle: 200 * time.Millisecond}
 	s := newWarmServer(t, []Cell{{Name: "heavy", URL: "http://127.0.0.1:1", Class: "always_on"}})
 	cfg := warmLoopConfig{
-		targets:   []WarmTarget{target},
-		frontURL:  "http://front.test",
-		warmFn:    probe.warm,
-		tick:      30 * time.Millisecond,
-		idleFloor: time.Hour,
+		targets:  []WarmTarget{target},
+		frontURL: "http://front.test",
+		warmFn:   probe.warm,
+		tick:     30 * time.Millisecond,
 	}
 	s.startWarmLoopWithConfig(cfg)
 
@@ -70,15 +69,18 @@ func TestWarmTarget_IdleWindowStateMachine(t *testing.T) {
 		if len(probe.got()) > 0 {
 			t.Fatal("warmed while the swap was resident and active — the pin-via-keep-warm bug")
 		}
-		// Keep the swap busy: requests reset the idle window.
-		s.mu.Lock()
-		s.modelActivity["heavy\x00challenger"] = time.Now().UTC()
-		s.mu.Unlock()
+		// Keep the swap busy through the REAL parser: llama-swap's
+		// double-encoded inflight frame is what resets the window in
+		// production, so the window is driven end to end here.
+		s.trackInFlight("heavy", inflightFrame(t, "challenger"))
 		time.Sleep(40 * time.Millisecond)
 	}
 
-	// Now go quiet: after restore_after_idle of true idleness the
-	// default warms exactly once, then holds (resident → holding).
+	// Now go quiet: the remove frame both drops the in-flight count and
+	// stamps the completion edge, which is where the idle window starts.
+	// After restore_after_idle of true idleness the default warms exactly
+	// once, then holds (resident → holding).
+	s.trackInFlight("heavy", inflightFrame(t))
 	idleStart := time.Now()
 	for time.Since(idleStart) < 2*time.Second {
 		if got := probe.got(); len(got) == 1 {
@@ -101,7 +103,7 @@ func TestWarmTarget_IdleWindowStateMachine(t *testing.T) {
 	t.Fatal("default never warmed after the swap went idle")
 }
 
-func TestWarmTarget_SkipsAbsentAndDrainedCells(t *testing.T) {
+func TestWarmTarget_SkipsStaleCells(t *testing.T) {
 	probe := &warmProbe{}
 	target := WarmTarget{Cell: "heavy", Model: "default-model", RestoreAfterIdle: time.Millisecond}
 	s := newWarmServer(t, []Cell{{Name: "heavy", URL: "http://127.0.0.1:1", Class: "always_on"}})
@@ -185,8 +187,9 @@ func TestWarmTarget_SwapAppearingMidGraceResets(t *testing.T) {
 	snap := CellSnapshot{}
 	s.applyWarmEval(target, st, cfg, snap) // empty: grace starts
 	s.applyWarmEval(target, st, cfg, CellSnapshot{Models: []ModelState{{ID: "challenger", State: "ready"}}})
-	// Challenger ready: grace cancels; its own idle (unknown → floor
-	// 1h) is far below the 24h restore window, so no fire either.
+	// Challenger ready: grace cancels; its own idle (no activity evidence
+	// → measured from fleetd start, ~0) is far below the 24h restore
+	// window, so no fire either.
 	time.Sleep(120 * time.Millisecond)
 	s.applyWarmEval(target, st, cfg, snap) // empty again — grace RESTARTS from here
 	if len(probe.got()) != 0 {
@@ -223,13 +226,15 @@ func TestCronParse(t *testing.T) {
 		"0 9-17 * * 1-5": {},
 		"0 0 1 */3 *":    {},
 		"0 0 * * 0,2,4":  {},
+		"* * * * 7":      {}, // Vixie's second spelling of Sunday
 		"bad":            {wantErr: true},
 		"1 2 3":          {wantErr: true},
 		"61 * * * *":     {wantErr: true},
-		"* * * * 7":      {wantErr: true},
+		"* * * * 8":      {wantErr: true}, // the dow upper bound stays pinned
 		"0 0 32 1 *":     {wantErr: true},
 		"0 0 * * 1-":     {wantErr: true},
 		"0 0 * * */0":    {wantErr: true},
+		"* * * * sun":    {wantErr: true}, // names are deliberately unsupported
 	}
 	for spec, tc := range cases {
 		_, err := parseCron(spec)
@@ -239,11 +244,35 @@ func TestCronParse(t *testing.T) {
 	}
 }
 
+func TestCronParseDow7IsSunday(t *testing.T) {
+	// 7 must be FOLDED to 0 at parse time: time.Weekday() never returns
+	// 7, so a spec normalised anywhere later would silently never match.
+	spec, err := parseCron("0 9 * * 7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.dow[7] {
+		t.Error("dow 7 survived parse; time.Weekday() never returns 7")
+	}
+	got, ok := spec.nextFire(time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC), time.UTC) // Monday
+	if !ok {
+		t.Fatal("no fire")
+	}
+	if want := time.Date(2026, 8, 9, 9, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Errorf("got %v, want %v (next Sunday)", got, want)
+	}
+}
+
 func TestCronNextFire(t *testing.T) {
 	loc := time.UTC
 	at := func(y, mo, d, h, mi int) time.Time {
 		return time.Date(y, time.Month(mo), d, h, mi, 0, 0, time.UTC)
 	}
+	// The dom/dow rule is the one interesting piece of cron semantics and
+	// it was untested, which is how an AND implementation passed a gate
+	// reported PASS. Vixie: if EITHER field starts with "*", both must
+	// match; otherwise either matching fires. The star test is TEXTUAL —
+	// "1-31" is not a star, "*/2" is.
 	cases := []struct {
 		spec string
 		from time.Time
@@ -254,8 +283,25 @@ func TestCronNextFire(t *testing.T) {
 		{"*/20 * * * *", at(2026, 8, 2, 6, 40), at(2026, 8, 2, 7, 0)},
 		{"0 0 29 2 *", at(2026, 3, 1, 0, 0), at(2028, 2, 29, 0, 0)}, // 2027 not a leap year
 		{"0 9 * * 1", at(2026, 8, 2, 10, 0), at(2026, 8, 3, 9, 0)},  // Sunday → Monday
-		{"0 9 1 * 1", at(2026, 8, 2, 10, 0), at(2026, 8, 3, 9, 0)},  // Vixie OR: Monday matches first (not Sep 1, the next 1st-Monday)
 		{"0 9 1 * *", at(2026, 8, 3, 10, 0), at(2026, 9, 1, 9, 0)},  // dow=* → dom decides
+
+		// Both restricted ⇒ OR, and which side wins depends on the date.
+		{"0 9 1 * 1", at(2026, 8, 2, 10, 0), at(2026, 8, 3, 9, 0)},  // dow wins: Mon Aug 3 beats Sep 1
+		{"0 9 1 * 1", at(2026, 8, 15, 0, 0), at(2026, 8, 17, 9, 0)}, // dow wins again, mid-month
+		{"0 9 1 * 1", at(2026, 8, 31, 10, 0), at(2026, 9, 1, 9, 0)}, // dom wins: Sep 1 is a Tuesday
+
+		// An explicitly enumerated full range is NOT a star.
+		{"0 9 1-31 * 1", at(2026, 8, 4, 0, 0), at(2026, 8, 4, 9, 0)}, // dom 1-31 matches every day → OR fires today
+		{"0 9 1 * 0-6", at(2026, 8, 2, 10, 0), at(2026, 8, 3, 9, 0)}, // dow 0-6 matches every day → OR fires tomorrow
+
+		// A stepped star IS a star (cronie/Vixie entry.c sets DOM_STAR
+		// when the field's first character is '*', before parsing it).
+		// Python's croniter disagrees here — it reads "*/2" as restricted
+		// and would answer 2026-08-05 / 2026-08-04 for these two rows. The
+		// rows above were cross-checked against croniter and agree; these
+		// two follow the C implementation the config format comes from.
+		{"0 9 */2 * 1", at(2026, 8, 3, 10, 0), at(2026, 8, 17, 9, 0)}, // AND: odd day that is also a Monday
+		{"0 9 1 * */2", at(2026, 8, 2, 10, 0), at(2026, 9, 1, 9, 0)},  // AND: the 1st that is also Sun/Tue/Thu/Sat
 	}
 	for _, tc := range cases {
 		spec, err := parseCron(tc.spec)
@@ -264,7 +310,7 @@ func TestCronNextFire(t *testing.T) {
 		}
 		got, ok := spec.nextFire(tc.from, loc)
 		if !ok {
-			t.Fatalf("%s: no fire within a year", tc.spec)
+			t.Fatalf("%s: no fire within 8 years", tc.spec)
 		}
 		if !got.Equal(tc.want) {
 			t.Errorf("%s from %v: got %v, want %v", tc.spec, tc.from, got, tc.want)
@@ -272,28 +318,27 @@ func TestCronNextFire(t *testing.T) {
 	}
 }
 
-func TestCronNextFireDomDowOr(t *testing.T) {
-	// Vixie rule: both restricted ⇒ EITHER matches. Sep 1 2026 is a
-	// Tuesday: "0 9 1 * 1" fires there (dom), not the next Monday.
-	spec, err := parseCron("0 9 1 * 1")
+func TestCronNextFireCenturyNonLeap(t *testing.T) {
+	// 2100 is not a leap year, so Feb 29 has an 8-year gap around it: a
+	// 4-year scan bound reports "impossible spec" for a perfectly valid
+	// one, and the schedule silently never runs.
+	spec, err := parseCron("0 0 29 2 *")
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, ok := spec.nextFire(time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC), time.UTC)
+	got, ok := spec.nextFire(time.Date(2096, 3, 1, 0, 0, 0, 0, time.UTC), time.UTC)
 	if !ok {
-		t.Fatal("no fire")
+		t.Fatal("no fire within the scan bound; 2104-02-29 is reachable")
 	}
-	want := time.Date(2026, 8, 17, 9, 0, 0, 0, time.UTC) // Monday Aug 17 beats Sep 1
-	if !got.Equal(want) {
-		t.Errorf("got %v, want %v (Vixie OR: first Monday OR first-of-month)", got, want)
+	if want := time.Date(2104, 2, 29, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Errorf("got %v, want %v", got, want)
 	}
 }
 
-func TestCronNextFireDST(t *testing.T) {
+func TestCronNextFireDSTGapSkips(t *testing.T) {
 	// America/Halifax springs forward 2026-03-08 02:00 → 03:00: a 02:30
 	// fire that day must SKIP (the wall minute never exists); the next
-	// day fires normally. Fall-back day 2026-11-01 fires at the first
-	// occurrence.
+	// day fires normally.
 	loc, err := time.LoadLocation("America/Halifax")
 	if err != nil {
 		t.Skip("tz database unavailable")
@@ -315,12 +360,42 @@ func TestCronNextFireDST(t *testing.T) {
 	}
 }
 
+func TestCronNextFireDSTFallBackFiresTwice(t *testing.T) {
+	// The honest behaviour, pinned rather than claimed away: America/
+	// Halifax falls back 2026-11-01 02:00 ADT → 01:00 AST, so the wall
+	// minute 01:30 exists TWICE in absolute time and the scan matches
+	// both. The schedule's in-flight/lease guard makes a duplicate warm
+	// harmless; a comment asserting first-occurrence-wins would not be.
+	loc, err := time.LoadLocation("America/Halifax")
+	if err != nil {
+		t.Skip("tz database unavailable")
+	}
+	spec, err := parseCron("30 1 * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, ok := spec.nextFire(time.Date(2026, 11, 1, 4, 0, 0, 0, time.UTC), loc)
+	if !ok {
+		t.Fatal("no fire")
+	}
+	if want := time.Date(2026, 11, 1, 4, 30, 0, 0, time.UTC); !first.Equal(want) {
+		t.Fatalf("first occurrence: got %v, want %v", first, want)
+	}
+	second, ok := spec.nextFire(first, loc)
+	if !ok {
+		t.Fatal("no second fire")
+	}
+	if want := time.Date(2026, 11, 1, 5, 30, 0, 0, time.UTC); !second.Equal(want) {
+		t.Errorf("repeated hour: got %v, want %v (the same wall minute an hour later)", second, want)
+	}
+}
+
 func TestScheduleGuardSkipsBusyAndLeased(t *testing.T) {
 	probe := &warmProbe{}
 	s := newWarmServer(t, []Cell{{Name: "heavy", URL: "http://127.0.0.1:1", Class: "always_on"}})
 	entry := WarmScheduleEntry{Cron: "* * * * *", Model: "default-model"}
 	spec, _ := parseCron(entry.Cron)
-	cellOf := func(string) string { return "heavy" }
+	cellOf := func(string) (string, error) { return "heavy", nil }
 	now := time.Now()
 
 	// Due now; cell busy → skip with note, no fire.

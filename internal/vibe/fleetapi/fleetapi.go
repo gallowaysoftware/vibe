@@ -207,12 +207,23 @@ type Server struct {
 	// same frames (key cell+"\x00"+model), fleetd-side clock. The warm
 	// targets' idle windows key off these.
 	modelActivity map[string]time.Time
+	// lastInFlightModels is the previous frame's model list per cell, so
+	// a model that DISAPPEARS from the list gets a completion stamp —
+	// without it a long generation produces one stamp at start and reads
+	// as idle for its whole duration.
+	lastInFlightModels map[string][]string
 
 	// warmStates and schedStates are the C4 warm loops' status surfaces
 	// (fleet_status's warm block). Pointers: the loop goroutines mutate
 	// the entries in place under s.mu.
 	warmStates  []*warmTargetState
 	schedStates []*warmScheduleState
+
+	// started is this process's boot instant, immutable after New. The
+	// warm policy uses it as the idle floor for a model no inflight frame
+	// has ever mentioned: fleetd must never claim more silence than it
+	// was running to observe.
+	started time.Time
 
 	done      chan struct{}
 	closeOnce sync.Once
@@ -255,16 +266,19 @@ func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Op
 		inFlight:      map[string]int{},
 		inFlightSeen:  map[string]bool{},
 		modelActivity: map[string]time.Time{},
-		presence:      map[string]*Presence{},
-		commands:      map[string][]AnnounceCommand{},
-		renderTrigger: make(chan string, 64),
-		intents:       loadIntents(opts.IntentPath),
-		intentPath:    opts.IntentPath,
-		lastSeen:      loadLastSeen(opts.LastSeenPath),
-		lastSeenPath:  opts.LastSeenPath,
-		leases:        loadLeases(opts.LeasePath),
-		leasePath:     opts.LeasePath,
-		done:          make(chan struct{}),
+
+		lastInFlightModels: map[string][]string{},
+		started:            time.Now(),
+		presence:           map[string]*Presence{},
+		commands:           map[string][]AnnounceCommand{},
+		renderTrigger:      make(chan string, 64),
+		intents:            loadIntents(opts.IntentPath),
+		intentPath:         opts.IntentPath,
+		lastSeen:           loadLastSeen(opts.LastSeenPath),
+		lastSeenPath:       opts.LastSeenPath,
+		leases:             loadLeases(opts.LeasePath),
+		leasePath:          opts.LeasePath,
+		done:               make(chan struct{}),
 	}
 }
 

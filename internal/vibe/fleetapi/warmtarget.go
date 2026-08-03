@@ -52,11 +52,10 @@ type warmTargetState struct {
 // warmLoopConfig wires the warm loops. Nil WarmFn uses the front's
 // 1-token chat completion (JIT is the start verb).
 type warmLoopConfig struct {
-	targets   []WarmTarget
-	frontURL  string
-	warmFn    func(ctx context.Context, frontURL, model string) error
-	tick      time.Duration
-	idleFloor time.Duration // last-activity unknown → idle since this long ago (fleetd start)
+	targets  []WarmTarget
+	frontURL string
+	warmFn   func(ctx context.Context, frontURL, model string) error
+	tick     time.Duration
 	// emptyGrace is the time nothing-resident must persist before the
 	// empty-restore fires (default 30s ≈ two announce intervals).
 	emptyGrace time.Duration
@@ -112,6 +111,16 @@ func (s *Server) warmTargetLoop(t WarmTarget, st *warmTargetState, cfg warmLoopC
 // presence when the cell announces (the no-inbound-port case), probes
 // otherwise.
 func (s *Server) evalWarmTarget(t WarmTarget, st *warmTargetState, cfg warmLoopConfig) {
+	// Drain is checked FIRST, before presence and probes: a drained cell
+	// keeps announcing an empty model list by design (fleetannounce: "the
+	// unit is stopped reads as an empty model list"), which the
+	// nothing-resident branch would read as "restore the default" — and
+	// where the drain left llama-swap up, that warm SUCCEEDS, reloading
+	// the model onto the GPU the operator just reclaimed.
+	if in, ok := s.effectiveIntent(t.Cell); ok && in.State == "drained" {
+		s.setWarmState(st, "skipped", "cell drained")
+		return
+	}
 	if p := s.presenceFor(t.Cell); p != nil && p.Announcing {
 		if p.Stale || p.Withdrawn {
 			s.setWarmState(st, "skipped", "cell stale/withdrawn")
@@ -159,7 +168,10 @@ func (s *Server) applyWarmEval(t WarmTarget, st *warmTargetState, cfg warmLoopCo
 	case len(residents) == 0:
 		s.mu.Lock()
 		if st.emptySince.IsZero() {
-			st.emptySince = time.Now().UTC()
+			// Monotonic: this is a duration clock, and .UTC() would strip
+			// the monotonic reading, making an NTP step skip or wedge the
+			// grace the live gate had to add.
+			st.emptySince = time.Now()
 		}
 		emptyFor := time.Since(st.emptySince)
 		s.mu.Unlock()
@@ -180,50 +192,90 @@ func (s *Server) applyWarmEval(t WarmTarget, st *warmTargetState, cfg warmLoopCo
 		s.mu.Lock()
 		st.emptySince = time.Time{}
 		s.mu.Unlock()
+		// An in-flight request IS activity, and one generation longer
+		// than restore_after_idle would otherwise read as idle and be
+		// evicted mid-stream: the timestamp map only records the frames
+		// that mention a model, and a long request produces no frame
+		// between its start and its completion.
+		if n, reported := s.InFlight(t.Cell); reported && n > 0 {
+			s.setWarmState(st, "waiting", fmt.Sprintf("cell busy (%d in-flight)", n))
+			return true
+		}
 		// An operator swap is resident: restore only after EVERY
 		// resident has been request-idle for the window. Any request to
 		// any of them resets it.
-		idle, idleFor := s.swapIdleFor(t.Cell, residents, cfg)
+		idle, idleFor, unknown := s.swapIdleFor(t.Cell, residents)
 		if idle >= t.RestoreAfterIdle {
 			s.restore(t, st, cfg, fmt.Sprintf("swap idle %s", idleFor))
 			return true
 		}
-		s.setWarmState(st, "waiting", fmt.Sprintf("swap %s active (idle %s of %s)", strings.Join(residents, ","), idleFor, t.RestoreAfterIdle))
+		detail := fmt.Sprintf("swap %s active (idle %s of %s)", strings.Join(residents, ","), idleFor, t.RestoreAfterIdle)
+		if len(unknown) > 0 {
+			detail += fmt.Sprintf("; no activity evidence for %s (idle measured from fleetd start)", strings.Join(unknown, ","))
+		}
+		s.setWarmState(st, "waiting", detail)
 		return true
 	}
 }
 
-// swapIdleFor reports the OLDEST still-idle window across the resident
-// models and how long that is — restore only fires when the quietest
-// resident has been quiet for the whole window.
-func (s *Server) swapIdleFor(cell string, residents []string, cfg warmLoopConfig) (time.Duration, string) {
-	now := time.Now().UTC()
-	idleFloor := cfg.idleFloor
-	if idleFloor == 0 {
-		idleFloor = time.Hour
-	}
-	oldest := idleFloor
+// swapIdleFor reports the SHORTEST idle window across the resident
+// models — the most recently used one — so restore fires only when even
+// the busiest resident has been quiet for the whole window. The third
+// return names the residents no inflight frame has ever mentioned;
+// their idle is measured from fleetd's own start, because fleetd cannot
+// claim silence it was not running to observe.
+func (s *Server) swapIdleFor(cell string, residents []string) (time.Duration, string, []string) {
+	now := time.Now()
+	minIdle := time.Duration(-1)
+	var unknown []string
 	for _, id := range residents {
 		last, ok := s.modelLastActivity(cell, id)
 		var idle time.Duration
 		if !ok {
-			// No inflight frame ever mentioned it: idle since fleetd
-			// start — bounded, so a long-idle swap eventually restores
-			// rather than pinning forever on missing data.
-			idle = idleFloor
+			unknown = append(unknown, id)
+			idle = now.Sub(s.started)
 		} else {
 			idle = now.Sub(last)
 		}
-		if idle < oldest {
-			oldest = idle
+		if minIdle < 0 || idle < minIdle {
+			minIdle = idle
 		}
 	}
-	return oldest, oldest.Round(time.Second).String()
+	if minIdle < 0 {
+		// residents is non-empty at the only call site; defensive.
+		minIdle = 0
+	}
+	return minIdle, minIdle.Round(time.Second).String(), unknown
+}
+
+// warmTimeout bounds one warm call. A cold start on a large model is
+// minutes, so it is generous; warmCtx is what keeps it from holding
+// Close() hostage.
+const warmTimeout = 10 * time.Minute
+
+// warmCtx builds a warm's timeout context and links cancellation to
+// s.done. Both warm loops call warmFn synchronously from goroutines
+// registered on s.wg, so an unlinked context lets Close() → wg.Wait()
+// block for the full warmTimeout against an unreachable front.
+func (s *Server) warmCtx(d time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	stop := make(chan struct{})
+	go func() {
+		select {
+		case <-s.done:
+			cancel()
+		case <-stop:
+		}
+	}()
+	return ctx, func() {
+		close(stop)
+		cancel()
+	}
 }
 
 // restore fires the warm and marks the state.
 func (s *Server) restore(t WarmTarget, st *warmTargetState, cfg warmLoopConfig, why string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := s.warmCtx(warmTimeout)
 	defer cancel()
 	if err := cfg.warmFn(ctx, cfg.frontURL, t.Model); err != nil {
 		s.setWarmState(st, "waiting", "warm failed: "+err.Error())

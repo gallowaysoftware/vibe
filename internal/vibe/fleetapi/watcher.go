@@ -143,14 +143,32 @@ func (s *Server) trackInFlight(cell string, data json.RawMessage) {
 	if err := json.Unmarshal([]byte(inner), &wrap); err != nil {
 		return
 	}
+	now := time.Now() // duration clock: keep the monotonic reading
+	present := make([]string, 0, len(wrap.Requests))
 	s.mu.Lock()
 	s.inFlight[cell] = len(wrap.Requests)
 	s.inFlightSeen[cell] = true
+	seen := map[string]bool{}
 	for _, r := range wrap.Requests {
-		if r.Model != "" {
-			s.modelActivity[cell+"\x00"+r.Model] = time.Now().UTC()
+		if r.Model == "" {
+			continue
+		}
+		s.modelActivity[cell+"\x00"+r.Model] = now
+		if !seen[r.Model] {
+			seen[r.Model] = true
+			present = append(present, r.Model)
 		}
 	}
+	// Frames are add/remove EDGES: a request stamps activity when it
+	// starts and would never stamp again, so a generation longer than
+	// restore_after_idle reads as idle. Stamp the completion edge too —
+	// "last activity" means started OR finished.
+	for _, m := range s.lastInFlightModels[cell] {
+		if !seen[m] {
+			s.modelActivity[cell+"\x00"+m] = now
+		}
+	}
+	s.lastInFlightModels[cell] = present
 	s.mu.Unlock()
 }
 
