@@ -399,14 +399,21 @@ func (t *Tracker) Step(now time.Time, conds []Condition, away bool) []Notificati
 // pager works must not be the one command that silently does nothing
 // while you are away.
 func Explicit(now time.Time, title, message string) Notification {
-	return Notification{State: StateExplicit, Title: title, Message: message, At: now, Priority: 3}
+	return Notification{State: StateExplicit, Title: title, Message: message, At: stamp(now), Priority: 3}
 }
+
+// stamp normalises a timestamp for the wire. The caller is expected to
+// hand Step a reading that still carries the monotonic clock — every
+// dwell here is a Sub, and a wall-clock step must not move a threshold —
+// so UTC is applied on the way OUT, once, where the value becomes a
+// rendered field rather than an interval.
+func stamp(t time.Time) time.Time { return t.UTC() }
 
 func firingNotification(now time.Time, a *alarmState) Notification {
 	return Notification{
 		Key: string(a.kind) + "\x00" + a.scope, Kind: a.kind, Scope: a.scope,
 		State: StateFiring, Title: "fleet: " + a.scope, Message: a.detail,
-		At: now, Priority: 4,
+		At: stamp(now), Priority: 4,
 	}
 }
 
@@ -415,7 +422,7 @@ func resolvedNotification(now time.Time, a *alarmState) Notification {
 		Key: string(a.kind) + "\x00" + a.scope, Kind: a.kind, Scope: a.scope,
 		State: StateResolved, Title: "fleet: " + a.scope + " resolved",
 		Message: string(a.kind) + " cleared (" + a.detail + ")",
-		At:      now, Priority: 3,
+		At:      stamp(now), Priority: 3,
 	}
 }
 
@@ -452,7 +459,7 @@ func (t *Tracker) digest(now time.Time) (Notification, bool) {
 	t.suppressed = map[string]int{}
 	return Notification{
 		State: StateDigest, Title: "fleet: welcome back", Message: b.String(),
-		At: now, Priority: 4,
+		At: stamp(now), Priority: 4,
 	}, true
 }
 
@@ -532,10 +539,10 @@ func (t *Tracker) Status() Status {
 	for key, a := range t.alarms {
 		row := AlarmStatus{
 			Key: DisplayKey(key), Kind: a.kind, Scope: a.scope,
-			State: a.state, Detail: a.detail, Since: a.firstAt,
+			State: a.state, Detail: a.detail, Since: stamp(a.firstAt),
 		}
 		if !a.firedAt.IsZero() {
-			f := a.firedAt
+			f := stamp(a.firedAt)
 			row.FiredAt = &f
 		}
 		st.Alarms = append(st.Alarms, row)

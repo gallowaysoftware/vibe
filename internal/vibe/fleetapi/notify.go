@@ -38,9 +38,6 @@ import (
 // subscription to the event hub buys ~30s on one of four conditions.
 const notifyEvalInterval = 30 * time.Second
 
-// notifySendTimeout bounds the snapshot the evaluator takes.
-const notifySnapshotTimeout = snapshotTimeout + 2*time.Second
-
 // maxNotifyFieldLen bounds an operator-supplied explicit message.
 const maxNotifyFieldLen = 2000
 
@@ -158,6 +155,17 @@ func (s *Server) notifyCtx() (context.Context, context.CancelFunc) {
 	return ctx, cancel
 }
 
+// notifyNow is the evaluator's clock. It deliberately does NOT call
+// .UTC(): that strips the monotonic reading, and every dwell and the
+// rate bucket are computed with Sub on the values handed to the tracker.
+// An NTP step backwards would then stall the pager — pending alarms
+// never reaching their dwell, deferred notifications never draining —
+// until wall time caught up, and a step forward would fire an alarm
+// early. The tracker normalises to UTC on the way OUT, so the wire and
+// status formats are unaffected. `away` is a wall-clock declaration and
+// compares against an absolute instant either way.
+func notifyNow() time.Time { return time.Now() }
+
 func (s *Server) notifyLoop(r *notifyRunner, interval time.Duration) {
 	defer s.wg.Done()
 	ctx, cancel := s.notifyCtx()
@@ -177,12 +185,19 @@ func (s *Server) notifyLoop(r *notifyRunner, interval time.Duration) {
 // evalNotify runs one round: snapshot, conditions, state machine,
 // enqueue. The tracker lock is never held across the snapshot — the
 // snapshot itself renders the notify status block, which takes it.
+//
+// Snapshot deliberately detaches its probe round from the caller's
+// context (a disconnecting client must not poison every follower's
+// snapshot), so ctx binds nothing here and a deadline on it would be a
+// guard that reads real and is not: the round is bounded by fleetapi's
+// own snapshotTimeout, which is also the longest Close() can wait on an
+// evaluation in progress. What s.done DOES bind is the delivery half —
+// see notifyCtx and Deliverer.deliver, which is where an unbounded wait
+// would actually live.
 func (s *Server) evalNotify(ctx context.Context, r *notifyRunner) {
-	sctx, cancel := context.WithTimeout(ctx, notifySnapshotTimeout)
-	snap := s.Snapshot(sctx)
-	cancel()
+	snap := s.Snapshot(ctx)
 
-	now := time.Now().UTC()
+	now := notifyNow()
 	conds := s.notifyConditions(snap)
 	away := s.NotifyScopeAt(now).awayAt(now)
 
@@ -261,12 +276,23 @@ func absentAlarm(c CellSnapshot) (string, bool) {
 // drainLeaseAlarm is the "did I just strand a 19-hour job?" question,
 // answered without being asked. Leases stay advisory: this reports, it
 // does not block, and it never un-drains anything.
+//
+// C11 put holds in the same store, so this renderer keys on the reserved
+// holder exactly as cli.printDrainReport and fleetmcp.leaseLine do. A
+// hold is a policy override, not a note about running work: rendering it
+// as "hold holds qwen3.6-27b, 1 advisory lease" gets both the noun and
+// the consequence wrong, and the consequence is the point — a drain
+// evicts a held model regardless.
 func drainLeaseAlarm(c CellSnapshot) (string, bool) {
 	if c.Intent == nil || c.Intent.State != "drained" || len(c.Leases) == 0 {
 		return "", false
 	}
 	holders := make([]string, 0, len(c.Leases))
 	for _, l := range c.Leases {
+		if l.Holder == HoldHolder {
+			holders = append(holders, fmt.Sprintf("a hold on %s (the drain evicts it anyway)", l.Model))
+			continue
+		}
 		holders = append(holders, fmt.Sprintf("%s holds %s", l.Holder, l.Model))
 	}
 	sort.Strings(holders)
@@ -274,7 +300,7 @@ func drainLeaseAlarm(c CellSnapshot) (string, bool) {
 	if why == "" {
 		why = "no reason given"
 	}
-	return fmt.Sprintf("%s is drained (%s) while %d advisory lease(s) are active: %s",
+	return fmt.Sprintf("%s is drained (%s) while %d lease(s)/hold(s) are active: %s",
 		c.Name, why, len(c.Leases), strings.Join(holders, "; ")), true
 }
 
@@ -435,11 +461,31 @@ func boundUntil(now, at time.Time) (time.Time, error) {
 	return at, nil
 }
 
+// validateExplicit is the field hygiene every explicit message gets, in
+// ONE place because there are two producers: the HTTP route and the
+// fleet_notify_test MCP verb, which is the door an agent drives. The
+// title becomes an HTTP header at the sink, so it takes the same clean()
+// every display-feeding ingest takes; the MESSAGE deliberately does not,
+// because a notification body may legitimately contain newlines — it is
+// only length-bounded.
+func validateExplicit(title, message string) error {
+	if err := clean("title", title); err != nil {
+		return err
+	}
+	if len(message) > maxNotifyFieldLen {
+		return fmt.Errorf("message exceeds %d bytes", maxNotifyFieldLen)
+	}
+	return nil
+}
+
 // SendNotification delivers an operator-requested message immediately.
 // It is NOT an alarm: it skips the state machine, the dwells and the
 // away gate, because the one command that proves the pager works must
 // not be the one command that silently does nothing while you are away.
 func (s *Server) SendNotification(title, message string) error {
+	if err := validateExplicit(title, message); err != nil {
+		return err
+	}
 	s.notifyMu.Lock()
 	r := s.notify
 	s.notifyMu.Unlock()
@@ -490,16 +536,11 @@ func (s *Server) handleNotifySend(w http.ResponseWriter, r *http.Request) {
 	if req.Title == "" {
 		req.Title = "vibe fleet"
 	}
-	// The title becomes an HTTP header at the sink, so it gets the same
-	// hygiene every other ingest that feeds a display surface gets. The
-	// MESSAGE deliberately does not: a notification body may legitimately
-	// contain newlines, and clean() would reject them.
-	if err := clean("title", req.Title); err != nil {
+	// Same predicate SendNotification enforces; the handler runs it first
+	// only so a bad field is a 400 rather than the 503 an unconfigured
+	// sink earns.
+	if err := validateExplicit(req.Title, req.Message); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if len(req.Message) > maxNotifyFieldLen {
-		http.Error(w, "message too long", http.StatusBadRequest)
 		return
 	}
 	if err := s.SendNotification(req.Title, req.Message); err != nil {

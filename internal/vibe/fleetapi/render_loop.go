@@ -376,9 +376,20 @@ func (rl *renderLoop) applyFingerprints(defs []*profile.BackendDef, pres map[str
 			}
 			slog.Warn("flags fingerprint mismatch", "model", m.ID, "cell", p.Cell, "mode", mode, "defs_sha", defsSHA, "defs_dirty", defsDirty)
 			rl.srv.publish(Event{Cell: p.Cell, Type: EventFingerprint, Data: data})
-			mismatched = append(mismatched, FingerprintMismatch{
-				Cell: p.Cell, Model: m.ID, Expected: expected, Got: m.FlagsSHA256, Mode: mode,
-			})
+			// The C9 alarm SET carries FRESH announces only. Announcing
+			// stays true through staleness and a clean withdraw, so a cell
+			// that has been powered off keeps its last-announced model list
+			// — and would keep a mismatch in the set forever, paging about
+			// drift on a box that is serving nothing (and, on a roaming
+			// laptop, every night). C8's probe.degraded roll-up already
+			// draws this line: a stale announce is history, not evidence of
+			// what the cell is serving right now. The EVENT above and the
+			// strict exclusion below are C3's and keep their own semantics.
+			if !p.Stale && !p.Withdrawn {
+				mismatched = append(mismatched, FingerprintMismatch{
+					Cell: p.Cell, Model: m.ID, Expected: expected, Got: m.FlagsSHA256, Mode: mode,
+				})
+			}
 			if mode == "strict" {
 				excluded[def.Name] = true
 			}

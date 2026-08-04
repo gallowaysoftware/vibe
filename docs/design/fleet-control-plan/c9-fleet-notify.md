@@ -1,7 +1,9 @@
 # C9 — `vibe fleet notify`: the alarm column, delivered
 
-Status: EXECUTED + REVIEWED, PR #28 OPEN — not merged (2026-08-04), off
-`feat/c9-fleet-notify`, branched off `main` at `c9e8bcf` (C8 merged).
+Status: EXECUTED + REVIEWED + SECOND (ADVERSARIAL) REVIEW PASS, PR #28
+OPEN — not merged (2026-08-04), off `feat/c9-fleet-notify`, branched off
+`main` at `c9e8bcf` (C8 merged) and since merged forward over C11
+(`e7adae4`).
 Every mechanically verifiable gate is green under `-race -count=5`; the
 four live gates need real hardware and are **NOT RUN** — see
 [§Execution](#execution-2026-08-04). Second v2-backlog item to land
@@ -242,7 +244,11 @@ implementation: `WebhookSink`, an `net/http` POST.
   non-blocking and counts drops. Every request and every backoff sleep
   is bound to a context cancelled by `s.done`, so `Close()` cannot be
   held hostage — C4's `warmCtx` rule, which exists because an unlinked
-  timeout already blocked `Close()` once in this package.
+  timeout already blocked `Close()` once in this package. The
+  EVALUATION half is a different bound and the review pass had to say so:
+  `Server.Snapshot` detaches its probe round from the caller's context
+  by design, so `Close()` can wait out an evaluation already in flight,
+  bounded by `snapshotTimeout` (3 s) and nothing else.
 
 ### 7. Secrets: the URL is a credential and must not be printable
 
@@ -493,10 +499,11 @@ internal/vibe/proxy` is empty.
   bearer auth, the 2000-byte message cap and the bounded queue (a flood
   becomes counted drops). Rate-limiting them would mean the one command
   that proves the pager works could silently do nothing.
-- **The digest can in principle be evicted from a full deferral queue**
-  if 32 further notifications arrive in the same evaluation round as the
-  return from away. It is emitted first and takes the first available
-  token, so this needs 32 simultaneous alarms to reach.
+- **The digest bypasses the rate bucket entirely.** It is appended to
+  the round's output before `gate` runs, so it is never suppressed,
+  never deferred and never evicted — the one message that says what a
+  week of silence hid is not a message to pace. (The first review pass
+  documented the opposite; the second corrected the doc, not the code.)
 - **An `eta` that has passed does not alarm.** "drained until 23:00, it
   is now 02:00" is an inference about what the operator meant; if it
   ever ships it ships as its own declared thing.
@@ -509,3 +516,124 @@ says whether 2 minutes is the right absence dwell, whether 15 minutes is
 long enough to avoid paging mid-deploy, and whether a dozen an hour is a
 ceiling that ever binds. The most likely correction after live use is
 the fingerprint dwell.
+
+## Adversarial-review addendum (2026-08-04, second pass, 6 findings)
+
+A separate review pass over the merged-forward branch (C8 and C11 are in
+`main` under it; C11's `hold_model` is the one that matters here, because
+a hold is a LEASE and C9 renders leases). Five fixes, each
+mutation-verified — the production line was reverted, the named test was
+watched to FAIL, then restored — plus one doc correction.
+
+- **A powered-off cell kept paging about serving-flag drift (MAJOR).**
+  `Presence.Announcing` means "has ever announced": it stays TRUE through
+  staleness and through a clean withdraw, and the presence entry keeps the
+  cell's last-announced model list. `applyFingerprints` skipped only
+  `!p.Announcing`, so every render pass re-recorded a dead cell's stale
+  hash into `Server.fpMismatch`, `FirstSeen` intact. The 15-minute
+  persistence dwell then fired against a box that was serving nothing —
+  an `always_on` outage paged twice (absence, then drift, the drift never
+  resolving until the cell came back), and an **`opportunistic`
+  workstation being switched off paged at all**, which is a direct
+  violation of the class table's alarm column (`opportunistic` absence:
+  no). Roaming cells were accidentally covered, because class policy
+  prunes their defs first — which is also what made the first draft of
+  the regression test pass against the bug, and why the test now uses an
+  opportunistic cell. The C9 SET now takes FRESH announces only, the rule
+  C8's `probe.degraded` roll-up already applies for the same reason: a
+  stale announce is history, not evidence of what a cell is serving right
+  now. The event and the strict exclusion are C3's and are unchanged.
+  `TestRenderPass_AStaleCellLeavesTheFingerprintMismatchSet`,
+  `TestRenderPass_AWithdrawnCellLeavesTheFingerprintMismatchSet`, and
+  `TestRenderPass_AFreshCellKeepsItsMismatch` as the positive control.
+- **A C11 hold rendered as an advisory lease (MINOR, semantic conflict
+  git reported no conflict for).** C11 landed after this branch was cut
+  and put holds in the ONE lease store under the reserved holder `hold`,
+  making `Holder == HoldHolder` the deterministic test that
+  `cli.printDrainReport` and `fleetmcp.leaseLine` both key on. C9 added a
+  third lease renderer that did not, so draining a held cell paged
+  `hold holds qwen3.6-27b … 1 advisory lease(s) are active`. Both the
+  noun and the consequence are wrong, and the consequence is the point: a
+  drain evicts a held model regardless, which is exactly what the
+  operator needs told.
+  `TestNotifyConditions_AHoldIsNamedAsAHoldNotAsAnAdvisoryLease`.
+- **The two producers of an explicit message had different hygiene
+  (MINOR).** `POST /api/fleet/notify/send` capped the body at 2000 bytes
+  and cleaned the title; `fleet_notify_test` — the door an agent actually
+  drives — went straight to `SendNotification` with neither. The
+  predicate is now `validateExplicit`, called by both, with the handler
+  running it first only so a bad field is a 400 rather than the 503 an
+  unconfigured sink earns. C8's `probeGuard` shape: one guard, two
+  producers, so they cannot drift.
+  `TestSendNotification_BoundsTheMessageForEveryProducer`.
+- **Every dwell was wall-clock (MINOR).** `evalNotify` stamped
+  `time.Now().UTC()`, and `.UTC()` strips the monotonic reading; the
+  tracker then computes every fire dwell, every clear dwell and the token
+  bucket's refill with `Sub` on those values. An NTP step backwards would
+  stall the pager — pending alarms never reaching their dwell, the
+  deferral queue never draining — until wall time caught up, and a step
+  forward would fire an alarm below its threshold. Both directions
+  silently, on the one subsystem whose job is to not be silent. The
+  evaluator hands over a monotonic reading now (`notifyNow`) and the
+  tracker normalises to UTC on the way OUT (`stamp`), so the status, page
+  and json-body formats are byte-identical. `away` is unaffected: it is a
+  wall-clock declaration compared against an absolute instant.
+  `TestNotifyEvaluator_UsesAMonotonicClock` and
+  `TestNotifyStatus_TimestampsAreUTCEvenFromAMonotonicClock` pin the two
+  halves independently, because either alone hides the other's removal.
+- **`models[].flags_sha256` was the one announce string with no hygiene
+  (NIT, the repo's recurring class).** `models[].id`, `models[].state`,
+  the versions block, the usage block and C8's entire probe block — down
+  to `probe.flags_sha256` on the SAME model — all run through `clean()`.
+  The model-level `flags_sha256` did not, while it lands in the presence
+  document, the mismatch event's payload and, from C9, an alarm's detail
+  line. No injection was reachable (it reaches bodies and escaped display
+  surfaces, never a header), so this is consistency with its own sibling
+  rather than a hole.
+  `TestAnnounce_ModelFlagsSHAGetsTheSameHygieneAsItsSiblings`.
+- **Two doc claims did not match the code (doc only).** `Close()` is not
+  bound by `s.done` on the EVALUATION half — `Server.Snapshot` detaches
+  its probe round deliberately, so an evaluation in flight can hold
+  shutdown for `snapshotTimeout` (3 s); the `notifySnapshotTimeout`
+  wrapper that appeared to bound it was inert (`context.WithoutCancel`
+  drops the deadline too) and is gone, because a guard that reads real
+  and is not is worse than none. And the "known and accepted" note about
+  the away digest being evictable from a full deferral queue described
+  behaviour the code does not have: the digest never enters `gate`, so it
+  is neither rate-limited nor evictable. Both sections above are
+  corrected.
+
+**Verified sound, not changed.** The default alarm set and the class
+filter; declared-vs-inferred intent; `INCONSISTENT` as a nag; the
+both-edges dwell and the 200-flap zero; the no-re-fire rule; the away
+gate, the digest, and the backlog held until home; the deferral queue's
+bound and its index bookkeeping under eviction and drain; `Enqueue`'s
+non-blocking drop; the 4xx-is-an-answer rule; the `*url.Error` unwrap and
+the scrub, pinned independently; `Redact` dropping path, query and
+userinfo. Alarm keys are bounded by `hosts.yaml` (an announce cannot
+create a cell), and cell classes are a closed required vocabulary, so
+there is no unbounded key space behind the tracker's maps. No lock is
+held across an HTTP call, a `publish` or a `Snapshot`; `notifyReport`
+dereferences the scope pointer under `notifyMu` and only compares it to
+nil afterwards. `git diff --stat main..HEAD -- internal/vibe/proxy` is
+empty.
+
+**Known and accepted, documented not fixed:**
+
+- **A render pass that cannot run leaves the mismatch set as it was.**
+  `renderPass` returns early on a `LoadDefs` failure and on its
+  zero-defs guard, both before `applyFingerprints`, so a broken defs
+  mount freezes the set rather than clearing it. The stale entry
+  describes a mismatch that was real at its `LastSeen`, and the failure
+  is loud on every trigger; adding a second staleness notion inside the
+  alarm path to cover it would cost more than it buys.
+- **An "away" with no `until` is unbounded.** It is bounded only by
+  someone declaring home, which is a real way to stay quiet forever.
+  Three surfaces say so (the MCP reply's `warning`, the CLI's line, and
+  the page's amber strip) and every suppressed alarm stays counted in
+  `fleet_status`, so it cannot be silent — but the page's one-click
+  "away" button sends no `until`, and an operator who wants the fleet to
+  un-mute itself has to use the CLI or the MCP verb.
+- The first pass's four accepted items stand unchanged: alarm state is
+  not persisted, explicit sends bypass the rate bucket, and an `eta`
+  that has passed does not alarm.

@@ -667,7 +667,27 @@ optional.)
     `Server.fpMismatch` every pass, preserving `FirstSeen`. Without
     `fleet.front_config` there are no passes, so the status reports
     `fingerprint_source: unavailable (…)` rather than letting a silent
-    zero read as "no drift".
+    zero read as "no drift". The set takes **FRESH announces only**
+    (`!p.Stale && !p.Withdrawn`): `Presence.Announcing` means "has ever
+    announced" and survives both, so a powered-off hold-class cell would
+    otherwise keep its last hash in the set and page about drift on a box
+    serving nothing — including an `opportunistic` one, whose absence the
+    class table says must never alarm. Same rule as C8's
+    `probe.degraded` roll-up. The mismatch EVENT and the strict render
+    exclusion are C3's and keep their own (stale-tolerant) semantics.
+  - **The drain_with_lease alarm is a lease renderer**, so it keys on
+    `fleetapi.HoldHolder` like `cli.printDrainReport` and
+    `fleetmcp.leaseLine`: a C11 hold is a policy override the drain
+    overrides, not an advisory note about running work.
+  - **The dwell clock is monotonic** (`notifyNow`), and the tracker
+    normalises to UTC on the way OUT (`stamp`). `time.Now().UTC()` strips
+    the monotonic reading, and every dwell plus the token bucket is a
+    `Sub` — a wall-clock step would move a threshold in either direction
+    on the one subsystem whose job is not being silent. `away` stays
+    wall-clock; it is a declaration about a date.
+  - **Explicit sends go through `validateExplicit`**, because there are
+    two producers (the HTTP route and `fleet_notify_test`) and only the
+    route used to bound anything.
   - **Coalescing is three rules**: dwell on BOTH edges (a cell flapping
     faster than its dwell notifies zero times), an active key never
     re-fires, and a token bucket that DEFERS rather than drops.
