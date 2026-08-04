@@ -434,6 +434,73 @@ packages this phase touches. It is recorded rather than explained away:
 if a flake surfaces in CI, `internal/vibe/supervisor` (69 s, timing-
 heavy, untouched by this phase) is the first place to look.
 
+### Adversarial self-review (ground rule 9)
+
+Landed as its own commit against the feature commit. Six findings, four
+fixed with a mutation-verified regression test, two documented.
+
+1. **A partial `Dwell` override silently zeroed every other kind
+   (major).** `NewTracker` merged the dwell map per MAP (`if p.Dwell ==
+   nil`), so a caller setting one threshold left the rest at zero —
+   which means "fire on the first evaluation". A config with
+   `dwell: {cell_absent: 5m}` would have turned the 15-minute
+   fingerprint persistence rule into an instant page, i.e. the exact
+   noise this phase exists to prevent, by omission. Production was safe
+   only because `daemon.notifyPolicy` starts from `DefaultPolicy` and
+   overlays; the library was one caller away. Merges per KIND now.
+   `TestTracker_APartialDwellOverrideKeepsTheOtherKindsDefaults`.
+2. **"Away" delivered the rate-limited backlog (major).**
+   `drainDeferred` ran on every `Step`, including while away, so a
+   notification the bucket held back the minute before the operator left
+   went out mid-vacation. The deferral queue now only drains at home.
+   `TestTracker_AwayHoldsTheRateLimitedBacklogToo`.
+3. **The explicit-send title skipped the field hygiene every other
+   ingest gets (minor).** It becomes an HTTP header at the sink, where
+   `headerSafe` would silently mangle it; a 400 that names the problem
+   beats a delivered message with its title eaten. The MESSAGE
+   deliberately still allows newlines.
+   `TestNotifySend_RejectsAControlCharacterTitleButAcceptsAMultilineBody`.
+4. **The status block aliased the runner's `enabled` slice (minor)** —
+   the shape C7a's review had to fix on `UsageReport`. Copied now.
+5. **The evaluator/status lock order was a real deadlock one line
+   away**, and nothing tested it: `notifyReport` runs INSIDE
+   `probeSnapshot` and takes `notifyMu`, while `evalNotify` calls
+   `Snapshot`. Taking the lock one line earlier hangs every
+   `/api/fleet/state` in the process.
+   `TestNotifyLoop_StatusAndEvaluationDoNotDeadlock` (mutation-verified:
+   moving the lock above the snapshot hangs the test).
+6. **A plaintext `http://` endpoint now warns at construction** (the
+   topic is IN the path, so it travels unencrypted every request).
+   Named, not refused — loopback and a reverse-proxied self-hosted ntfy
+   are legitimate.
+
+**Verified sound, not changed:** the both-edges dwell, the no-re-fire
+rule, the digest, the front/class filter and the declared-vs-inferred
+intent split all hold under mutation (each has a named test that fails
+when the production line is broken); no lock is held across an HTTP call
+or a `publish`; both notify goroutines are `wg.Add`-ed outside their
+goroutine and exit on `s.done`; `git diff --stat main..HEAD --
+internal/vibe/proxy` is empty.
+
+**Known and accepted (documented, not fixed):**
+
+- **Alarm state is not persisted.** A fleetd restart re-fires every
+  still-true alarm once its dwell elapses again. That is arguably
+  correct — the problem is still happening — and a crash loop is bounded
+  by the token bucket. A store would add a staleness that could suppress
+  a real alarm, which is the worse failure.
+- **Explicit sends bypass the rate bucket.** They are bounded by the
+  bearer auth, the 2000-byte message cap and the bounded queue (a flood
+  becomes counted drops). Rate-limiting them would mean the one command
+  that proves the pager works could silently do nothing.
+- **The digest can in principle be evicted from a full deferral queue**
+  if 32 further notifications arrive in the same evaluation round as the
+  return from away. It is emitted first and takes the first available
+  token, so this needs 32 simultaneous alarms to reach.
+- **An `eta` that has passed does not alarm.** "drained until 23:00, it
+  is now 02:00" is an inference about what the operator meant; if it
+  ever ships it ships as its own declared thing.
+
 ### What the live gates would prove that the unit gates cannot
 
 Everything about whether the alarms are the RIGHT alarms. The unit

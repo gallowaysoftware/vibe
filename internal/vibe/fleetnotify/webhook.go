@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -138,6 +139,14 @@ func NewWebhookSink(cfg WebhookConfig) (*WebhookSink, error) {
 	hc := cfg.Client
 	if hc == nil {
 		hc = &http.Client{Timeout: timeout}
+	}
+	if u.Scheme == "http" && u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost" && u.Hostname() != "::1" {
+		// The topic is IN the path, so plaintext puts a bearer-equivalent
+		// credential on the wire in every request. Named, not refused: the
+		// house posture is LAN/VPN, and a self-hosted ntfy behind a
+		// reverse proxy is a legitimate deployment.
+		slog.Warn("fleet notify endpoint is plaintext http; the webhook path is a credential and travels unencrypted",
+			"endpoint", Redact(raw))
 	}
 	return &WebhookSink{
 		url:      raw,

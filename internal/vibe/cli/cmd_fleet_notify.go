@@ -77,7 +77,7 @@ func renderNotifyStatus(out io.Writer, snap *fleetapi.StateSnapshot) {
 		return
 	}
 	fmt.Fprintf(out, "  endpoint: %s\n", termSafe(n.Endpoint))
-	fmt.Fprintf(out, "  alarms enabled: %s\n", strings.Join(n.Enabled, " "))
+	fmt.Fprintf(out, "  alarms enabled: %s\n", termSafe(strings.Join(n.Enabled, " ")))
 	if n.FingerprintSource != "" {
 		fmt.Fprintf(out, "  fingerprint source: %s\n", termSafe(n.FingerprintSource))
 	}

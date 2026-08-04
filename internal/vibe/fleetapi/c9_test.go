@@ -484,6 +484,34 @@ func TestNotifyRoutes_ScopeAndSendOverHTTP(t *testing.T) {
 	}
 }
 
+// TestNotifySend_RejectsAControlCharacterTitleButAcceptsAMultilineBody:
+// the title becomes an HTTP header at the sink, so it gets the same
+// hygiene every other display-feeding ingest gets — while a message body
+// may legitimately contain newlines.
+func TestNotifySend_RejectsAControlCharacterTitleButAcceptsAMultilineBody(t *testing.T) {
+	s := notifyServer(t, []Cell{{Name: "front", URL: "http://127.0.0.1:1", Class: "always_on"}})
+	s.StartNotifyLoop(NotifyLoopConfig{Sink: &captureSink{}, Interval: time.Hour})
+	mux := http.NewServeMux()
+	s.Register(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	post := func(body string) int {
+		resp, err := http.Post(srv.URL+"/api/fleet/notify/send", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if got := post(`{"title":"a\nb: injected","message":"x"}`); got != http.StatusBadRequest {
+		t.Fatalf("a control-character title: HTTP %d, want 400", got)
+	}
+	if got := post(`{"title":"fleet","message":"line one\nline two"}`); got != http.StatusOK {
+		t.Fatalf("a multiline message: HTTP %d, want 200", got)
+	}
+}
+
 // TestNotifyLoop_CloseReturnsPromptlyWhileTheWebhookHangs is the
 // shutdown gate: a notifier that wedges must not take fleetd with it.
 func TestNotifyLoop_CloseReturnsPromptlyWhileTheWebhookHangs(t *testing.T) {
@@ -517,6 +545,36 @@ func TestNotifyLoop_CloseReturnsPromptlyWhileTheWebhookHangs(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("Close blocked on a hung webhook")
+	}
+}
+
+// TestNotifyLoop_StatusAndEvaluationDoNotDeadlock: the status block is
+// rendered from INSIDE probeSnapshot and takes the tracker lock, while
+// the evaluator calls Snapshot — holding that lock across the snapshot
+// would deadlock the whole state surface. Two writers, one reader, one
+// round each.
+func TestNotifyLoop_StatusAndEvaluationDoNotDeadlock(t *testing.T) {
+	s := notifyServer(t, []Cell{{Name: "front", URL: "http://127.0.0.1:1", Class: "always_on"}})
+	s.StartNotifyLoop(NotifyLoopConfig{Sink: &captureSink{}, Interval: time.Hour,
+		Policy: fleetnotify.Policy{Dwell: map[fleetnotify.Kind]time.Duration{fleetnotify.KindCellAbsent: 0}}})
+	r := s.notifyRunnerForTest()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 20 {
+			s.evalNotify(context.Background(), r)
+		}
+	}()
+	for range 20 {
+		if rep := s.Snapshot(context.Background()).Notify; rep == nil {
+			t.Error("snapshot carried no notify block")
+		}
+	}
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("evaluation and status rendering deadlocked")
 	}
 }
 

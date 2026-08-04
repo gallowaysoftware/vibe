@@ -347,6 +347,61 @@ func TestTracker_StatusSinceIsWhenTheConditionStartedNotTheLastTransition(t *tes
 	}
 }
 
+// TestTracker_APartialDwellOverrideKeepsTheOtherKindsDefaults: merging
+// per MAP rather than per KIND turned every unlisted kind's threshold
+// into zero — an instant page by omission, and the 15-minute
+// persistence rule silently gone.
+func TestTracker_APartialDwellOverrideKeepsTheOtherKindsDefaults(t *testing.T) {
+	tr := NewTracker(Policy{Dwell: map[Kind]time.Duration{KindCellAbsent: time.Second}})
+	got := tr.Policy()
+	if got.Dwell[KindCellAbsent] != time.Second {
+		t.Fatalf("the override was lost: %v", got.Dwell[KindCellAbsent])
+	}
+	if got.Dwell[KindFingerprint] != 15*time.Minute {
+		t.Fatalf("fingerprint dwell = %v, want the 15m default", got.Dwell[KindFingerprint])
+	}
+	cond := Condition{Kind: KindFingerprint, Scope: "gpu-cell/bge-m3", Detail: "drift"}
+	if out := tr.Step(epoch, []Condition{cond}, false); len(out) != 0 {
+		t.Fatalf("a fingerprint mismatch paged instantly: %s", states(out))
+	}
+}
+
+// TestTracker_AwayHoldsTheRateLimitedBacklogToo: a notification the
+// bucket held back before the operator left is still an alarm, and
+// delivering it mid-vacation is exactly the noise away exists to stop.
+func TestTracker_AwayHoldsTheRateLimitedBacklogToo(t *testing.T) {
+	p := fastPolicy()
+	p.Burst = 1
+	p.RatePerHour = 60
+	p.Alarms = []Kind{KindDrainWithLease}
+	p.Dwell = map[Kind]time.Duration{KindDrainWithLease: 0}
+	tr := NewTracker(p)
+	cond := func(cell string) Condition {
+		return Condition{Kind: KindDrainWithLease, Scope: cell, Detail: cell + " drained with a lease"}
+	}
+	conds := []Condition{cond("a"), cond("b")}
+
+	if out := tr.Step(epoch, conds, false); len(out) != 1 {
+		t.Fatalf("setup: burst 1 delivered %s", states(out))
+	}
+	if tr.Status().Deferred != 1 {
+		t.Fatalf("setup: want one deferred, got %+v", tr.Status())
+	}
+	// An hour of away with a full bucket: the backlog must not move.
+	for i := range 60 {
+		if out := tr.Step(epoch.Add(time.Duration(i+1)*time.Minute), conds, true); len(out) != 0 {
+			t.Fatalf("away delivered the backlog: %s", states(out))
+		}
+	}
+	if tr.Status().Deferred != 1 {
+		t.Fatalf("the backlog changed while away: %+v", tr.Status())
+	}
+	out := tr.Step(epoch.Add(61*time.Minute), conds, false)
+	if len(out) != 1 || out[0].Scope != "b" {
+		t.Fatalf("the backlog did not drain on return: %s", states(out))
+	}
+}
+
 func TestParseKind_RejectsUnknownKindsByName(t *testing.T) {
 	if _, err := ParseKind("cell_absent"); err != nil {
 		t.Fatalf("cell_absent rejected: %v", err)

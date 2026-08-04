@@ -253,8 +253,17 @@ func NewTracker(p Policy) *Tracker {
 	if len(p.Alarms) == 0 {
 		p.Alarms = d.Alarms
 	}
+	// Merge per KIND, not per map: a caller overriding one dwell would
+	// otherwise leave every other kind at zero, which means "fire on the
+	// first evaluation" — turning a 15-minute persistence threshold into
+	// an instant page by omission.
 	if p.Dwell == nil {
-		p.Dwell = d.Dwell
+		p.Dwell = map[Kind]time.Duration{}
+	}
+	for k, v := range d.Dwell {
+		if _, set := p.Dwell[k]; !set {
+			p.Dwell[k] = v
+		}
 	}
 	if p.ClearDwell <= 0 {
 		p.ClearDwell = d.ClearDwell
@@ -373,7 +382,14 @@ func (t *Tracker) Step(now time.Time, conds []Condition, away bool) []Notificati
 		}
 	}
 
-	out = append(out, t.drainDeferred(now)...)
+	if !away {
+		// The deferral queue is drained only at home. A notification that
+		// the bucket held back before the operator left is still an alarm,
+		// and delivering it mid-vacation would be the one form of noise
+		// "away" exists to stop — the backlog waits for the return like
+		// everything else.
+		out = append(out, t.drainDeferred(now)...)
+	}
 	return out
 }
 

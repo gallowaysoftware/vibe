@@ -490,8 +490,16 @@ func (s *Server) handleNotifySend(w http.ResponseWriter, r *http.Request) {
 	if req.Title == "" {
 		req.Title = "vibe fleet"
 	}
-	if len(req.Title) > maxAnnounceFieldLen || len(req.Message) > maxNotifyFieldLen {
-		http.Error(w, "title or message too long", http.StatusBadRequest)
+	// The title becomes an HTTP header at the sink, so it gets the same
+	// hygiene every other ingest that feeds a display surface gets. The
+	// MESSAGE deliberately does not: a notification body may legitimately
+	// contain newlines, and clean() would reject them.
+	if err := clean("title", req.Title); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(req.Message) > maxNotifyFieldLen {
+		http.Error(w, "message too long", http.StatusBadRequest)
 		return
 	}
 	if err := s.SendNotification(req.Title, req.Message); err != nil {
@@ -533,7 +541,9 @@ func (s *Server) notifyReport() *notifyStatus {
 	if r != nil {
 		st.Configured = true
 		st.Endpoint = r.deliverer.Endpoint()
-		st.Enabled = r.enabled
+		// Copied, not aliased: handing a reader a slice the runner owns is
+		// the shape C7a's review had to fix on UsageReport.
+		st.Enabled = append([]string(nil), r.enabled...)
 		st.Status = r.tracker.Status()
 		d := r.deliverer.Stats()
 		st.Delivery = &d
