@@ -147,7 +147,7 @@ func TestCellAwaitUnblocksOnTransition(t *testing.T) {
 	if terr != nil {
 		t.Fatal(terr)
 	}
-	err := awaitCell(t.Context(), &out, target, "gpu-cell", true, 5*time.Second, 50*time.Millisecond)
+	err := awaitCell(t.Context(), &out, target, "gpu-cell", awaitConds{wantUp: true}, 5*time.Second, 50*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestCellAwaitViaEventsStream(t *testing.T) {
 		t.Fatal(terr)
 	}
 	start := time.Now()
-	err := awaitCell(t.Context(), &out, target, "gpu-cell", true, 5*time.Second, 2*time.Second)
+	err := awaitCell(t.Context(), &out, target, "gpu-cell", awaitConds{wantUp: true}, 5*time.Second, 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestCellAwaitUnknownCellFailsFast(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
-	err := awaitCell(ctx, &out, target, "nope", true, 0, 50*time.Millisecond)
+	err := awaitCell(ctx, &out, target, "nope", awaitConds{wantUp: true}, 0, 50*time.Millisecond)
 	if !errors.Is(err, errUnknownCell) {
 		t.Errorf("unknown cell: got %v, want errUnknownCell", err)
 	}
@@ -233,7 +233,7 @@ func TestCellAwaitDown(t *testing.T) {
 	if terr != nil {
 		t.Fatal(terr)
 	}
-	if err := awaitCell(t.Context(), &out, target, "gpu-cell", false, 2*time.Second, 50*time.Millisecond); err != nil {
+	if err := awaitCell(t.Context(), &out, target, "gpu-cell", awaitConds{}, 2*time.Second, 50*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "gpu-cell is down") {

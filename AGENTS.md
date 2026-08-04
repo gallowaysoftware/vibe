@@ -581,6 +581,44 @@ optional.)
   - C8 adds **no HTTP route** (verdicts ride `/api/fleet/state`, the verb
     rides `/mcp`), so the fleetd route list and C5's exact-match bearer
     exemption are untouched.
+- **await extensions (fleet-control C10).** `vibe cell await` grew
+  `--model <id> --ready`, `--idle <dur>`, `--unleased` and `--lease`
+  (`cli/cmd_cell_await.go` + `awaitCell`), fed by
+  `CellSnapshot.Activity` (`fleetapi/activity.go`). No new HTTP route,
+  no new MCP tool, no new store — every condition is a read of an axis
+  something else already owns.
+  - **Missing evidence is never idleness.** `--idle` unblocks only on a
+    computed window; where fleetd has no LIVE `/api/events` stream to
+    the cell it keeps waiting and prints why. This is C4/C5's rule (a
+    cell fleetd doesn't watch makes fleetd's own uptime the idle clock)
+    with a bigger blast radius: a wrong warm restore costs a model load,
+    a wrong `--idle` launches a 19-hour batch into a box in use. There
+    is no `--assume-idle` and there must not be one.
+  - **The window is floored at `cellUpSince`, not process start**: the
+    watcher's connect instant per cell, cleared on drop. fleetd may not
+    claim silence it was not connected to observe, and the reconnect is
+    exactly when a running generation is invisible. `lastInFlightFrame`
+    is the cell-level activity stamp — every inflight frame is an EDGE,
+    so ANY frame is activity, which C4's per-model map cannot say once
+    llama-swap TTL-unloads the model somebody just used.
+  - **Idle is cell-scoped even with `--model`** (the contended resource
+    is the GPU), a reported in-flight count > 0 outranks any window, and
+    an unreported count is still not a zero one.
+  - **Every condition is judged against ONE snapshot** — "ready at
+    03:00 and idle at 03:05" is not "ready and idle" — and C3's events
+    fast-path returns immediately ONLY for a bare `--up`/`--down` wait;
+    with any extra condition an event triggers a re-poll.
+  - **C6's fail-fast rule extends to model ids**: an id absent from a
+    REACHABLE cell's NON-EMPTY catalog is a typo and errors even under
+    `--timeout 0`; an unreachable cell or an empty catalog (a drained
+    cell announces one by design) keeps retrying, as does any transport
+    error. `--ready` against `front` is refused outright — peers-only,
+    C8's probeGuard reason.
+  - **Leases stay advisory**: `--unleased` is the WAITER opting to
+    respect other holders (its own holder is ignored, so a crashed run
+    can't deadlock on its own residue) and `--lease` claims one on
+    success; a refused claim fails the command, because a batch that
+    runs undeclared is invisible to the pre-drain report.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.

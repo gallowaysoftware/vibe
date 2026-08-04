@@ -308,47 +308,82 @@ func cellAwaitCmd() *cobra.Command {
 		down     bool
 		timeout  time.Duration
 		interval time.Duration
+		cond     awaitConds
 	)
 	cmd := &cobra.Command{
 		Use:   "await <cell>",
-		Short: "Block until a cell is reachable (--up) or unreachable (--down).",
+		Short: "Block until a cell is reachable (--up), unreachable (--down), warm (--ready) or quiet (--idle).",
 		Long: "Park a script on fleet state: `vibe cell await gpu-cell --up && ./overnight-batch.sh`.\n" +
-			"--up means the cell's llama-swap answers; intent is deliberately not consulted (routing truth rule).",
+			"--up means the cell's llama-swap answers; intent is deliberately not consulted (routing truth rule).\n" +
+			"--model <id> --ready waits for llama-swap to report that model resident and ready — cell-up is not\n" +
+			"model-warm, and on the heavy cell that gap is 6-10 minutes.\n" +
+			"--idle <dur> waits until fleetd has OBSERVED that long without a request on the cell. Where fleetd\n" +
+			"has no live event stream to it there is no evidence, and await keeps waiting and says so rather\n" +
+			"than firing a batch into a busy box.\n" +
+			"--unleased waits for other consumers' advisory leases to clear; --lease <holder> takes one on\n" +
+			"success, which is what makes the pair a queue.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
 				ctx = context.Background()
 			}
-			if down {
-				up = false
-			} else {
-				up = true // default
+			if up && down {
+				return fmt.Errorf("--up and --down are contradictory")
 			}
+			cond.wantUp = !down // --up is the default
 			if interval <= 0 {
 				return fmt.Errorf("--interval must be > 0")
+			}
+			if err := validateAwaitFlags(args[0], cond, cmd.Flags().Changed("lease-ttl")); err != nil {
+				return err
 			}
 			target, err := resolveFleetd(apiFlag)
 			if err != nil {
 				return err
 			}
-			return awaitCell(ctx, cmd.OutOrStdout(), target, args[0], up, timeout, interval)
+			out := cmd.OutOrStdout()
+			if err := awaitCell(ctx, out, target, args[0], cond, timeout, interval); err != nil {
+				return err
+			}
+			if cond.lease.holder == "" {
+				return nil
+			}
+			if err := acquireLease(ctx, target, args[0], cond); err != nil {
+				return fmt.Errorf("the wait was satisfied but the lease was refused: %w", err)
+			}
+			fmt.Fprintf(out, "lease held: %s on %s/%s for %s\n", cond.lease.holder, args[0], cond.model, cond.lease.ttl)
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&apiFlag, "api", "", "fleetd base URL (default: $VIBE_API, hosts.yaml fleetd_url, or the local daemon)")
 	cmd.Flags().BoolVar(&up, "up", false, "wait until the cell answers (default)")
 	cmd.Flags().BoolVar(&down, "down", false, "wait until the cell stops answering")
+	cmd.Flags().StringVar(&cond.model, "model", "", "the model this wait is about (with --ready)")
+	cmd.Flags().BoolVar(&cond.ready, "ready", false, "also wait until --model is resident and ready on the cell")
+	cmd.Flags().DurationVar(&cond.idle, "idle", 0, "also wait until the cell has been observed request-idle this long")
+	cmd.Flags().BoolVar(&cond.unleased, "unleased", false, "also wait until no other holder's advisory lease names the cell")
+	cmd.Flags().StringVar(&cond.lease.holder, "lease", "", "on success, take an advisory lease under this holder name")
+	cmd.Flags().DurationVar(&cond.lease.ttl, "lease-ttl", time.Hour, "TTL for --lease")
+	cmd.Flags().StringVar(&cond.lease.note, "lease-note", "", "note recorded with --lease (shown in the pre-drain report)")
 	cmd.Flags().DurationVar(&timeout, "timeout", 0, "give up after this long (0 = wait forever)")
 	cmd.Flags().DurationVar(&interval, "interval", 5*time.Second, "poll interval")
 	return cmd
 }
 
-// awaitCell blocks until the named cell's reachability matches wantUp.
+// awaitCell blocks until every requested condition holds for the named
+// cell IN THE SAME SNAPSHOT (C10): evaluating them across different
+// polls would report "ready and idle" having never observed a moment
+// when both were true.
+//
 // C3 made transitions subscribable: it rides /api/fleet/events when the
 // stream works (cellUp/cellDown, cellReturned/cellStale/cellWithdrawn)
-// and falls back to the 5s poll when it doesn't. Intent is never
-// consulted — a drained cell that answers is up (routing truth rule).
-func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell string, wantUp bool, timeout, interval time.Duration) error {
+// and falls back to the 5s poll when it doesn't. With extra conditions
+// requested a matching event triggers an immediate re-poll instead of a
+// return — an event proves reachability moved, not that a model is warm.
+// Intent is never consulted — a drained cell that answers is up (routing
+// truth rule).
+func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell string, cond awaitConds, timeout, interval time.Duration) error {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -368,52 +403,59 @@ func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell str
 		}
 	}()
 
-	matches := func(reachable bool) bool { return reachable == wantUp }
 	eventMatches := func(ev fleetEvent) bool {
 		if ev.Cell != cell {
 			return false
 		}
 		switch ev.Type {
 		case "fleet.cellUp", "fleet.cellReturned":
-			return wantUp
+			return cond.wantUp
 		case "fleet.cellDown", "fleet.cellStale", "fleet.cellWithdrawn":
-			return !wantUp
+			return !cond.wantUp
 		}
 		return false
 	}
 
+	var lastStatus string
+	var lastUnmet []string
 	for {
-		ok, err := checkCellReachable(ctx, target, cell, matches)
-		if err == nil && ok {
-			state := "up"
-			if !wantUp {
-				state = "down"
-			}
-			fmt.Fprintf(out, "%s is %s\n", cell, state)
+		ev, err := evaluateAwait(ctx, target, cell, cond)
+		switch {
+		case err == nil && ev.ok:
+			fmt.Fprintf(out, "%s is %s%s\n", cell, upWord(cond.wantUp), successSuffix(ev))
 			return nil
-		}
-		if errors.Is(err, errUnknownCell) {
-			// A typo'd cell name never becomes true by waiting, and
-			// --timeout 0 is the documented overnight-batch idiom: without
-			// this the command parks until the machine reboots.
+		case err == nil:
+			lastUnmet = ev.unmet
+			// Only on change: a 10-minute idle window at a 5s poll would
+			// otherwise print 120 identical lines.
+			if ev.status != lastStatus {
+				lastStatus = ev.status
+				fmt.Fprintf(out, "await %s: %s\n", cell, ev.status)
+			}
+		case errors.Is(err, errUnknownCell), errors.Is(err, errUnknownModel):
+			// A typo never becomes true by waiting, and --timeout 0 is the
+			// documented overnight-batch idiom: without this the command
+			// parks until the machine reboots.
 			return err
-		}
-		if err != nil && ctx.Err() == nil {
-			fmt.Fprintf(out, "await %s: %v (retrying)\n", cell, err)
+		default:
+			// A transport error is a restarting fleetd, which is exactly
+			// what the retry loop is for.
+			if ctx.Err() == nil {
+				fmt.Fprintf(out, "await %s: %v (retrying)\n", cell, err)
+			}
 		}
 		select {
 		case <-ctx.Done():
 			if timeout > 0 {
-				return fmt.Errorf("timeout waiting for %s to come %s", cell, map[bool]string{true: "up", false: "down"}[wantUp])
+				if cond.extras() && len(lastUnmet) > 0 {
+					return fmt.Errorf("timeout waiting for %s: %s", cell, strings.Join(lastUnmet, "; "))
+				}
+				return fmt.Errorf("timeout waiting for %s to come %s", cell, upWord(cond.wantUp))
 			}
 			return ctx.Err()
 		case ev := <-events:
-			if streamAlive.Load() && eventMatches(ev) {
-				state := "up"
-				if !wantUp {
-					state = "down"
-				}
-				fmt.Fprintf(out, "%s is %s (%s)\n", cell, state, ev.Type)
+			if streamAlive.Load() && eventMatches(ev) && !cond.extras() {
+				fmt.Fprintf(out, "%s is %s (%s)\n", cell, upWord(cond.wantUp), ev.Type)
 				return nil
 			}
 		case <-tick.C:
@@ -421,24 +463,29 @@ func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell str
 	}
 }
 
+// successSuffix appends the conditions beyond reachability to the
+// success line, so the script's log records what was actually true.
+func successSuffix(ev awaitEval) string {
+	if len(ev.extra) == 0 {
+		return ""
+	}
+	return ": " + strings.Join(ev.extra, "; ")
+}
+
+// evaluateAwait runs one /state poll and judges every condition against
+// that one document.
+func evaluateAwait(ctx context.Context, target fleetdTarget, cell string, cond awaitConds) (awaitEval, error) {
+	snap, err := target.fetchState(ctx)
+	if err != nil {
+		return awaitEval{}, err
+	}
+	return cond.evaluate(snap, cell)
+}
+
 // fleetEvent is the CLI's minimal decode of one /api/fleet/events frame.
 type fleetEvent struct {
 	Cell string `json:"cell"`
 	Type string `json:"type"`
-}
-
-// checkCellReachable runs one /state poll for the cell.
-func checkCellReachable(ctx context.Context, target fleetdTarget, cell string, matches func(bool) bool) (bool, error) {
-	snap, err := target.fetchState(ctx)
-	if err != nil {
-		return false, err
-	}
-	for _, c := range snap.Cells {
-		if c.Name == cell {
-			return matches(c.Reachable), nil
-		}
-	}
-	return false, fmt.Errorf("%w %q (not in fleetd's registry)", errUnknownCell, cell)
 }
 
 // errUnknownCell separates "fleetd answered and has never heard of this

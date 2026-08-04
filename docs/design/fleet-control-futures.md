@@ -55,10 +55,20 @@ Small (days):
    "alarm? yes" column terminates in an SSE stream nobody watches.
    Gate on an away/home fleet-scope intent so vacation isn't noisy.
 3. **`vibe cell await --model <id> --ready` and `--idle <duration>`**
-   — cell-up is not model-warm (a 6–10 min gap on the heavy cell),
-   and resume-then-immediately-chatting shouldn't fire the parked
-   batch. `--idle` rides C4's idle-window state machine; with leases
-   this composes into a real scheduling primitive.
+   — **SHIPPED as [C10](fleet-control-plan/c10-await-extensions.md)
+   (2026-08-04).** Cell-up is not model-warm (a 6–10 min gap on the
+   heavy cell), and resume-then-immediately-chatting shouldn't fire the
+   parked batch. Three notes for whoever reads this next. `--idle` does
+   ride C4's fold, but per CELL, not per model: the resource a batch
+   contends for is the GPU, and C4's per-model window goes quiet the
+   moment llama-swap TTL-unloads the model someone was using thirty
+   seconds ago. The hard rule is that **missing evidence is never
+   idleness** — on a cell fleetd has no live events stream to, `--idle`
+   keeps waiting and says why rather than firing the batch, and the
+   window is floored at the moment the watcher CONNECTED. And the lease
+   composition landed as two flags, `--unleased` (wait for other
+   holders to clear) and `--lease <holder>` (claim on success), which
+   keeps leases advisory: the waiter opts in, nothing blocks.
 4. **`hold_model(cell, model, for)`** — suspend the warm-target
    restore for an evaluation afternoon; without it, restore-after-idle
    dutifully evicts the challenger you stepped away from.

@@ -1,4 +1,4 @@
-# Fleet-control implementation plan (C0–C8)
+# Fleet-control implementation plan (C0–C10)
 
 Execution plan for [../fleet-control.md](../fleet-control.md). Each
 phase is one PR, independently shippable, and pays for itself before
@@ -17,12 +17,20 @@ to be implementable on its own after that.
 | [C7a](c7a-usage-ledger.md) | The usage ledger: tokens per cell, per model, per day | ~710 lines | C4 | merged (#24); unit gates green, 7 live gates UNRUN |
 | [C7b](c7b-savings-screen.md) | The savings screen: what the fleet didn't spend | ~690 lines + ~100 KB data | C7a, C5 | merged (#25); unit gates green, live plausibility gate UNRUN |
 | [C8](c8-probe-model.md) | probe_model: throughput health against the model's own baseline | ~900 lines | C3, C4 | merged (#27); unit gates 1-10 green, 5 live gates UNRUN |
+| C9 | `vibe fleet notify`: the alarm column, delivered | ~1100 lines | C2, C3, C4 | PR #28 OPEN on `feat/c9-fleet-notify`; its phase doc lands with it |
+| [C10](c10-await-extensions.md) | await extensions: `--model --ready`, `--idle`, the lease handshake | ~450 lines | C1, C2, C3, C4, C6 | PR OPEN; unit gates 1-11 green, 4 live gates UNRUN |
 
 **Merged is not live-gated.** Every C0–C7b PR merged on a green CI run
 of the mechanical inner loop. The live gates — the ones that need real
 cells, a real GPU and a real week of traffic — are UNRUN for C5, C6,
-C7a, C7b and C8, and each phase doc lists exactly which. Ground rule 10
-applies to this table: a status cell is a claim about a mechanical run.
+C7a, C7b, C8 and C10, and each phase doc lists exactly which. Ground
+rule 10 applies to this table: a status cell is a claim about a
+mechanical run.
+
+C9 and C10 were cut from `main` at `c9e8bcf` in parallel and neither
+builds on the other; C10's phase doc records the merge-order
+accommodation (one duplicated 20-line POST helper, one expected textual
+conflict in `cellAwaitCmd`).
 
 Line counts are order-of-magnitude scoping signals, not budgets. Actual
 C0–C4 spend ran 3.6–4.5× the estimate in every phase; price that in.
@@ -40,6 +48,17 @@ It fills the per-model `probe` slot C3 reserved, and its single hardest
 rule is that the measurement must never become an actuator — a probe
 runs only against an already-resident model, and a `degraded` verdict
 changes nothing but a display.
+
+C10 (2026-08-04) is the backlog's third item, and its one carried
+finding is a rule rather than a feature: **missing evidence is never
+idleness**. `--idle` had to answer "has this cell been quiet" for a
+consumer that acts on the answer by taking the GPU for hours, and the
+substrate cannot answer it everywhere — a cell fleetd holds no events
+stream to produces no evidence at all. C4/C5 already lost a phase to
+the softer version of this (fleetd's own uptime becoming the idle
+clock), so await refuses, visibly, instead of guessing. The idle window
+is also floored at the moment fleetd's watcher CONNECTED to the cell,
+not at process start: silence you were not there for is not silence.
 
 C7a/C7b were added the same day: a "did my hardware pay for itself"
 screen. They are split because C7a (counting) is mechanically
