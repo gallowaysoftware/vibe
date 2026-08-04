@@ -227,11 +227,7 @@ func intentLastSeen(c fleetapi.CellSnapshot) string {
 		if !l.Hold {
 			continue
 		}
-		left := time.Until(l.ExpiresAt).Round(time.Minute)
-		if left < 0 {
-			left = 0
-		}
-		held := fmt.Sprintf("held: %s, %s left", l.Model, left)
+		held := fmt.Sprintf("held: %s, %s", l.Model, fleetapi.HoldLeft(l.ExpiresAt))
 		if l.Note != "" {
 			held += " (" + l.Note + ")"
 		}

@@ -14,7 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
+	vibev1 "github.com/gallowaysoftware/vibe/proto/vibe/v1"
 )
 
 // leaseRecorder is a fleetd that records lease mutations and answers
@@ -95,6 +98,57 @@ func TestCellHoldReleaseDeletesTheSameKey(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "hold released") {
 		t.Errorf("output = %q", out.String())
+	}
+}
+
+// TestCellHoldReleaseReportsWhenThereWasNoHold: the DELETE is idempotent,
+// so a mistyped MODEL succeeds. Reporting "hold released" there tells the
+// operator the warm policy is running again while the real hold keeps
+// suppressing it — the one answer that is definitely wrong, and the one
+// release_hold already refuses to give.
+func TestCellHoldReleaseReportsWhenThereWasNoHold(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /api/fleet/lease", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "deleted", "existed": false})
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	target, err := resolveFleetd(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runCellHold(t.Context(), &out, target, "gpu-cell", "glm-4", "", 0, true); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	s := out.String()
+	if !strings.Contains(s, "no active hold") {
+		t.Errorf("output claimed a release that did not happen:\n%s", s)
+	}
+	if strings.Contains(s, "hold released") {
+		t.Errorf("output = %q", s)
+	}
+}
+
+// TestDrainReportNamesAHoldAsAHold: the pre-drain PROMPT learned to say
+// this in C11, and the RPC report printed three lines later did not — the
+// same drain said "HELD: glm-5" and then "hold holds glm-5". The report
+// carries no hold flag (C11 added no proto field), so the reserved holder
+// is the key, which is what a reserved holder is for.
+func TestDrainReportNamesAHoldAsAHold(t *testing.T) {
+	var out bytes.Buffer
+	printDrainReport(&out, "gpu-cell", &vibev1.CellDrainResponse{ActiveLeases: []*vibev1.LeaseView{
+		{Cell: "gpu-cell", Model: "glm-5", Holder: fleetapi.HoldHolder, Note: "evaluating",
+			ExpiresAt: timestamppb.New(time.Now().Add(time.Hour))},
+		{Cell: "gpu-cell", Model: "qwen", Holder: "batch", Note: "mid-batch",
+			ExpiresAt: timestamppb.New(time.Now().Add(time.Hour))},
+	}})
+	s := out.String()
+	if !strings.Contains(s, "HELD: glm-5") || strings.Contains(s, "hold holds") {
+		t.Errorf("hold not rendered as a hold:\n%s", s)
+	}
+	if !strings.Contains(s, "batch holds qwen") {
+		t.Errorf("ordinary lease rendering changed:\n%s", s)
 	}
 }
 

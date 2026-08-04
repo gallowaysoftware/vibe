@@ -1,10 +1,13 @@
 # C11 — hold_model: the pause button on the warm policy
 
-Status: IMPLEMENTED (2026-08-04), branch `feat/c11-hold-model`, PR #30
-OPEN (CI `test (stable)` green). Unit gates 1–11 green
-(`-race -count=5 ./...`); the 4 live gates need real cells and are
-**NOT RUN** — the implementing environment cannot reach the fleet (SSH
-blocked, LAN does not route).
+Status: MERGED (2026-08-04) via PR #30, feature + adversarial-review
+commits. Unit gates 1–11 green on a full local inner loop
+(`-race -count=5 ./...`, `golangci-lint run` 0 issues, `gofmt -l .`
+silent, `go mod tidy` clean); the 4 live gates need real cells and are
+**NOT RUN** — neither the implementing nor the reviewing environment can
+reach the fleet (SSH blocked, LAN does not route). The independent
+review pass (ground rule 9) found 6 further items, all fixed and
+mutation-verified here — see the addendum at the end.
 
 Backlog item 4 in [fleet-control-futures.md](../fleet-control-futures.md)
 §2, one sentence long:
@@ -108,6 +111,17 @@ A hold suppresses **fleetd's own automatic warm policy on that cell**:
 | `warm_model`, `unload_model`, `probe_model` (explicit MCP verbs) | untouched | an operator asking is not fleetd guessing |
 | request routing, the front render, the catalog | untouched | the control plane changes what the catalog SAYS, never where a request goes |
 | llama-swap's TTL | untouched | residency belongs to llama-swap |
+
+**Both halves of the warm path, not just the decision** (review
+finding 1). The warm loops check the hold when they DECIDE, but a warm
+the front cannot deliver rides C3's piggyback queue and is handed to the
+cell on a later announce — at-least-once, so it survives until a higher
+seq retires it. A restore queued one tick before the hold was declared
+would therefore still land and evict the held model. `drainCommands`
+drops queued `warm` verbs for a held cell (`dropHeldWarmsLocked`).
+`warm` is the only verb dropped and that is structural: every queued
+warm comes from `queueWarm`, i.e. from fleetd's own policy, while
+`unload` is an operator's verb and `probe` can be one.
 
 Two of those deserve their reasons written down.
 
@@ -285,14 +299,19 @@ while looking like it does.
    `TestHold_ValidationRejects*`.
 8. **A hold changes nothing but fleetd's own policy (unit).** With an
    active hold: the cell's `Display`, `Reachable` and `Intent` are
-   unchanged, its model set in the front render is unchanged, and
-   `unload_model` still queues. Mutation-tested against a deliberate
-   leak into `Display`.
-   `TestHold_DoesNotTouchAvailabilityIntentOrTheRender`.
+   unchanged, its model set in the front render is unchanged, and the
+   explicit verbs still act (`unload_model` on the held model itself
+   reaches the cell, and the hold survives it). Mutation-tested against
+   a deliberate leak into `Display`.
+   `TestHold_DoesNotTouchAvailabilityIntentOrTheRender`,
+   `TestMCPHoldDoesNotBlockExplicitVerbs`.
 9. **The surfaces say the remaining time (unit).** `fleet_status`'s
    warm block names the hold and its remaining time; the page's held
-   line renders from `hold`/`expires_at`; `vibe cell status` prints it.
-   `TestHold_StatusAndCLISurfacesShowRemainingTime`,
+   line renders from `hold`/`expires_at`; `vibe cell status` prints it;
+   and the string has ONE implementation (`fleetapi.HoldLeft`).
+   `TestHold_StatusSurfacesShowRemainingTime`,
+   `TestCellStatusShowsAHoldWithItsRemainingTime`,
+   `TestHoldLeft_ReadsInMinutesAndNeverGoesNegative`,
    `TestFleetPage_RendersHeldRows`.
 10. **Streaming contract (mechanical).**
     `git diff --stat main..HEAD -- internal/vibe/proxy` is empty for
@@ -457,3 +476,101 @@ Six findings against the feature commit, all fixed in the review commit:
 - **`release_hold`'s "unknown cell" wording says "not in the registry"**
   where the sibling MCP tools say "not in hosts.yaml". Same file, two
   spellings; unified wording is a nit for a later sweep.
+
+## Adversarial-review addendum (2026-08-04, 6 findings, all fixed with regression tests)
+
+An independent pass over the feature + self-review commits (ground rule
+9). Every fix below is mutation-verified: the production change was
+reverted, the named test was watched to FAIL, then restored. The two
+guards the implementing agent claimed were mutation-tested (the hold
+check in `evalWarmTarget`, the `emptySince` clear in `setWarmState`)
+were re-verified the same way and both hold.
+
+- **A queued warm ignored the hold at DELIVERY (MAJOR)** — the classic
+  shape here: the sending side guards, the receiving side does not. The
+  warm loops check the hold when they decide, but a warm the front
+  cannot deliver goes onto C3's piggyback queue, and that queue is
+  at-least-once — the batch is handed out again on every announce until
+  a HIGHER seq retires it. A restore queued one tick before the operator
+  declared the hold (the announce-only cell case, where every restore
+  queues) would still land on the next heartbeat and evict exactly the
+  model the hold was taken to protect, with the status cheerfully
+  reading `skipped / held`. `drainCommands` now calls
+  `dropHeldWarmsLocked`, which clears queued `warm` verbs — from the
+  pending queue AND from the in-flight redelivery slot — while a hold
+  stands. Only `warm` is dropped, and that is structural rather than a
+  judgement call: every queued warm comes from `queueWarm` (the
+  warm-target restore, the warm schedule), i.e. from fleetd's own
+  policy, while `unload` is an operator's explicit verb and `probe` can
+  be one — "an operator asking is not fleetd guessing". Dropping rather
+  than deferring, because the restore is re-decided every tick once the
+  hold lifts and a warm delivered hours late is a stale decision.
+  `TestHold_DropsQueuedPolicyWarmsAtDeliveryKeepsOperatorVerbs` (three
+  cases: the positive control, the pending queue, the in-flight slot).
+  The read needed `holdOnLocked` — `drainCommands` already holds `s.mu`,
+  and calling the exported `HoldOn` there would have deadlocked.
+- **`vibe cell hold --release` claimed a release it had not made
+  (MAJOR)** — `DELETE /api/fleet/lease` answers `{"status":"deleted"}`
+  whether or not the key existed, so an operator who mistyped the MODEL
+  (the cell is validated, the model is not, by design — §"Known and
+  accepted") was told "hold released — the warm policy resumes there"
+  while the real hold went on suppressing it. The MCP verb got this
+  right from the start ("No active hold on …"); `dropLease` already
+  returned `existed` and only the wire dropped it. The endpoint now
+  reports `{"status":"deleted","existed":<bool>}` (additive; `status`
+  unchanged for C2 clients) and the CLI says which happened.
+  `TestHold_ReleaseReportsWhetherAHoldWasThere`,
+  `TestCellHoldReleaseReportsWhenThereWasNoHold`.
+- **The pre-drain report still said "hold holds glm-5" (MAJOR)** — the
+  self-review's finding 2 was fixed on ONE of the three surfaces that
+  print leases before a drain. `vibe cell drain` prints the fleetd-read
+  prompt (fixed) and then the RPC report three lines later (not fixed),
+  so a single drain said `HELD: glm-5` and `lease: hold holds glm-5` in
+  the same output; fleetmcp's `drain_cell` report said only the latter.
+  Neither carries a hold flag — C11 adds no proto field — but the
+  RESERVED HOLDER is a deterministic key, which is what reserving it
+  buys. Both now render the hold as a hold; the CLI's lease lines also
+  gained the `termSafe` its sibling prompt already had.
+  `TestDrainReportNamesAHoldAsAHold` (one in `cli`, one in `fleetmcp`,
+  the latter against an extracted `leaseLine` so it needs no live cell
+  daemon).
+- **Gate 8 asserted less than it claimed (MINOR)** — the gate says "and
+  `unload_model` still queues", and no test anywhere exercised an
+  explicit verb against a held cell. That is the invariant an agent is
+  most likely to "helpfully" break, so it now has a test that unloads
+  the HELD model itself and checks the hold survives it.
+  `TestMCPHoldDoesNotBlockExplicitVerbs`. Gate 9 also named a test that
+  does not exist (`TestHold_StatusAndCLISurfacesShowRemainingTime`);
+  ground rule 10 cuts both ways, so the gate now names the tests that
+  are actually there.
+- **`leases.go` still promised leases "never block anything" (MINOR)** —
+  the self-review's finding 6 corrected `fleet-control.md` §5 and left
+  the same sentence at the top of the file the rule is about, which is
+  where the next agent will read it. The package comment now carries the
+  amended rule: a lease constrains what fleetd INITIATES, never what an
+  operator or a client asks for.
+- **The remaining-time string had three implementations (NIT)** —
+  `holdDetail` rendered `1h59m59s left`, `vibe cell status` rendered
+  `1h30m0s left`, the MCP reply a third way, and the phase doc's
+  examples matched none of them. One exported `fleetapi.HoldLeft` now
+  serves all three (minute granularity above a minute — a countdown that
+  churns every second is a status line nobody can diff), and the doc's
+  examples are true again. `TestHoldLeft_ReadsInMinutesAndNeverGoesNegative`.
+
+### Looked at and deliberately left alone
+
+- **The lease store's ownership and lock discipline**: `leaseMu` →
+  `s.mu` ordering is consistent everywhere (no path takes `s.mu` first),
+  `cloneLeases`/`commitLeases` persist-then-swap so a failed write
+  leaves the observable map untouched, and C11 added no goroutine, no
+  timer and no context. C6's cap/delete behaviour survives the
+  `putLease`/`dropLease` refactor unchanged.
+- **A hand-edited lease file can hold an unbounded hold.** `MaxHoldFor`
+  is enforced at every write path but not at `loadLeases`. Every writer
+  is fleetd itself, so this is operator-edits-own-state-dir territory;
+  re-validating on load would also silently rewrite a file the operator
+  is holding open. Noted, not fixed.
+- **The hold is only as trustworthy as the fleet token** (design §6): any
+  cell holding it can declare a hold on any other cell, bounded at 24h.
+  Unchanged from C3's threat note; per-cell credentials remain the
+  futures item.

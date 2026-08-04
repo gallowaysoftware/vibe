@@ -15,9 +15,16 @@ import (
 // Advisory leases (fleet-control C2 §3): a batch consumer registers "I
 // hold <model> on <cell>: mid-batch, N rows left" with a TTL, and the
 // pre-drain report answers "would I strand a 19-hour job?" at drain time.
-// Leases are ADVISORY ONLY — they appear in the pre-drain report and in
-// fleet_status; they never block anything. TTL expiry is enforced at read
-// time, so a crashed consumer cannot haunt the fleet.
+// TTL expiry is enforced at read time, so a crashed consumer cannot haunt
+// the fleet.
+//
+// Leases are ADVISORY: no request, no drain, no resume and no render ever
+// waits on one. What they DO defer is fleetd's own automatic policy — C4's
+// scheduled warms skip a leased cell, C8's probes skip it, and a C11 hold
+// additionally suspends the warm-target restore. A lease constrains what
+// fleetd INITIATES, never what an operator or a client asks for. (The
+// original "never block anything" stopped being true in C4; fleet-control.md
+// §5 carries the amended rule.)
 
 // Bounds on the lease store. A lease is a HOLD a running consumer
 // refreshes, so a week is already generous; the count cap keeps a
@@ -157,13 +164,19 @@ func (s *Server) handleLeaseMutate(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(l)
 	case http.MethodDelete:
-		if _, err := s.dropLease(req.Cell, req.Model, req.Holder); err != nil {
+		existed, err := s.dropLease(req.Cell, req.Model, req.Holder)
+		if err != nil {
 			slog.Warn("lease persist failed", "err", err)
 			http.Error(w, "persist lease", http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
+		// `existed` is what keeps a release honest. Deleting a key that was
+		// never there is not an error (release is idempotent), but a caller
+		// told "deleted" after a typo'd model believes it lifted a hold that
+		// is still suppressing the warm policy. dropLease already knew;
+		// only the wire didn't say.
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "deleted", "existed": existed})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}

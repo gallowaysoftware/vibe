@@ -8,9 +8,27 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
+	vibev1 "github.com/gallowaysoftware/vibe/proto/vibe/v1"
 )
+
+// TestDrainReportNamesAHoldAsAHold: the same fix the CLI prompt got, on
+// the agent's copy of the pre-drain report. The reserved holder is the
+// key — that is what reserving it buys.
+func TestDrainReportNamesAHoldAsAHold(t *testing.T) {
+	exp := timestamppb.New(time.Now().Add(time.Hour))
+	held := leaseLine(&vibev1.LeaseView{Model: "glm-5", Holder: fleetapi.HoldHolder, Note: "evaluating", ExpiresAt: exp})
+	if !strings.HasPrefix(held, "HELD: glm-5") || strings.Contains(held, "hold holds") {
+		t.Errorf("hold rendered as %q", held)
+	}
+	plain := leaseLine(&vibev1.LeaseView{Model: "qwen", Holder: "batch", ExpiresAt: exp})
+	if !strings.Contains(plain, "batch holds qwen") || !strings.Contains(plain, "(no note)") {
+		t.Errorf("ordinary lease rendering changed: %q", plain)
+	}
+}
 
 func TestMCPHoldModel(t *testing.T) {
 	cellSrv := newFakeLlamaSwap(t, "qwen3.6-27b")
@@ -74,6 +92,34 @@ func TestMCPHoldModelRefusals(t *testing.T) {
 				t.Errorf("error %q, want it to mention %q", text, tc.want)
 			}
 		})
+	}
+}
+
+// TestMCPHoldDoesNotBlockExplicitVerbs is gate 8's other half, which had
+// no test: a hold suspends what fleetd INITIATES, and an operator asking
+// is not fleetd guessing. unload_model on the held model itself is the
+// sharpest case — it is the operator undoing their own evaluation, and
+// the control plane must not second-guess that.
+func TestMCPHoldDoesNotBlockExplicitVerbs(t *testing.T) {
+	cellSrv := newFakeLlamaSwap(t, "qwen3.6-27b")
+	f, ts := newTestFacade(t, map[string]fleetcfg.Cell{
+		"front":    {URL: cellSrv.srv.URL},
+		"gpu-cell": {URL: cellSrv.srv.URL, Class: fleetcfg.ClassOpportunistic},
+	}, nil)
+	if _, err := f.fleet.SetHold("gpu-cell", "qwen3.6-27b", "evaluating", time.Hour); err != nil {
+		t.Fatalf("SetHold: %v", err)
+	}
+
+	text, isErr := toolText(t, rpc(t, ts, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"unload_model",
+		"arguments":{"cell":"gpu-cell","model":"qwen3.6-27b"}}}`))
+	if isErr {
+		t.Fatalf("unload_model refused on a held cell: %s", text)
+	}
+	if cellSrv.unloaded.Load() != "qwen3.6-27b" {
+		t.Errorf("the cell never saw the unload: %v", cellSrv.unloaded.Load())
+	}
+	if _, held := f.fleet.HoldOn("gpu-cell"); !held {
+		t.Error("an explicit verb cleared the hold — a hold expires or is released, nothing else")
 	}
 }
 

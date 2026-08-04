@@ -121,6 +121,19 @@ func runCellHold(ctx context.Context, out io.Writer, target fleetdTarget, cell, 
 		return fmt.Errorf("%s /api/fleet/lease: HTTP %d: %s", method, resp.StatusCode, termSafe(strings.TrimSpace(string(payload))))
 	}
 	if release {
+		// The registry says whether a hold was actually there. Reporting
+		// "released" after a mistyped model would tell an operator the warm
+		// policy is running again while the real hold keeps suppressing it —
+		// the same answer release_hold refuses to give.
+		var deleted struct {
+			Existed *bool `json:"existed"`
+		}
+		_ = json.Unmarshal(payload, &deleted)
+		if deleted.Existed != nil && !*deleted.Existed {
+			fmt.Fprintf(out, "no active hold on %s/%s (already expired, never declared, or a different model) — the warm policy is running there.\n",
+				termSafe(cell), termSafe(model))
+			return nil
+		}
 		fmt.Fprintf(out, "hold released on %s/%s — the warm policy resumes there on its next evaluation.\n",
 			termSafe(cell), termSafe(model))
 		return nil

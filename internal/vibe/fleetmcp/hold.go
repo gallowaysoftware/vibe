@@ -78,7 +78,7 @@ func (s *Server) toolHoldModel(cell, model, forStr, note string) (string, error)
 	return fmt.Sprintf("Held %s on %s until %s (%s). fleetd's warm target, warm schedules and probes "+
 		"will not act on %s until then. This is not a pin: llama-swap's own TTL can still unload %s — "+
 		"the hold only guarantees fleetd won't cause the eviction. Release early with release_hold.",
-		l.Model, l.Cell, l.ExpiresAt.Format(time.RFC3339), time.Until(l.ExpiresAt).Round(time.Minute),
+		l.Model, l.Cell, l.ExpiresAt.Format(time.RFC3339), fleetapi.HoldLeft(l.ExpiresAt),
 		l.Cell, l.Model), nil
 }
 

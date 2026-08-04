@@ -317,7 +317,16 @@ func printDrainReport(out io.Writer, name string, r *vibev1.CellDrainResponse) {
 		fmt.Fprintln(out, "  warning: lease list unavailable — stranded-work check could not run")
 	}
 	for _, l := range r.ActiveLeases {
-		fmt.Fprintf(out, "  lease: %s holds %s: %s\n", l.Holder, l.Model, l.Note)
+		// The RPC report carries no hold flag (C11 added no proto field),
+		// but the reserved holder is a deterministic key — that is what it
+		// is FOR. Without this the same drain prints "HELD: glm-5" in the
+		// prompt and "hold holds glm-5" three lines later.
+		if l.Holder == fleetapi.HoldHolder {
+			fmt.Fprintf(out, "  HELD: %s%s (a drain evicts it; the hold does not block you)\n",
+				termSafe(l.Model), noteSuffix(l.Note))
+			continue
+		}
+		fmt.Fprintf(out, "  lease: %s holds %s: %s\n", termSafe(l.Holder), termSafe(l.Model), termSafe(l.Note))
 	}
 }
 

@@ -611,6 +611,22 @@ optional.)
     adds is the case where the evidence is right and the conclusion is
     wrong. Widening it would let a forgotten 168h lease disable the warm
     policy for a week.
+  - **The hold holds at BOTH ends of the warm path**: the loops check it
+    when they decide, and `drainCommands` drops queued `warm` verbs for a
+    held cell (`dropHeldWarmsLocked`) — the piggyback queue is
+    at-least-once, so a restore queued one tick before the hold would
+    otherwise land on the next announce and evict the held model. `warm`
+    is the ONLY verb dropped: every queued warm comes from `queueWarm`
+    (fleetd's own policy), while `unload` is an operator's verb and
+    `probe` can be one. Use `holdOnLocked` there — `drainCommands`
+    already holds `s.mu`.
+  - **Surfaces with no hold flag key on the RESERVED HOLDER.** The
+    pre-drain RPC report (`vibev1.LeaseView`) carries no `hold` field and
+    must not grow one; `Holder == fleetapi.HoldHolder` is the
+    deterministic test, and both renderers (`cli.printDrainReport`,
+    `fleetmcp.leaseLine`) use it. `DELETE /api/fleet/lease` returns
+    `existed` beside `status` so a release never claims work it did not
+    do; `fleetapi.HoldLeft` is the ONE remaining-time string.
   - **Ladder: drained > held > stale > unreachable > policy.** Every
     rung skips, so the order decides only the reason an operator reads —
     which is why it is written down here and in the phase doc.

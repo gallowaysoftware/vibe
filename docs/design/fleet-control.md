@@ -214,8 +214,8 @@ mux behind the same bearer auth, wire pattern cloned from
 | `wake_cell(cell)` | C2 | Wake-on-LAN magic packet; explicit, never automatic |
 | `render_front(dry_run?)` | C2 | `vibe router render --cell front` (`--check` when dry_run) |
 | `probe_model(cell, model, rebaseline?)` | C8 | ask the cell to measure one RESIDENT model against its own baseline; refuses a cold model rather than loading it |
-| `hold_model(cell, model, for?, note?)` | C11 (PR open) | suspend fleetd's own warm policy on a cell until an expiry — the evaluation afternoon. Stored as a lease with `hold: true`; not a pin (llama-swap's TTL is untouched) |
-| `release_hold(cell, model)` | C11 (PR open) | end a hold early; holds expire on their own |
+| `hold_model(cell, model, for?, note?)` | C11 | suspend fleetd's own warm policy on a cell until an expiry — the evaluation afternoon. Stored as a lease with `hold: true`; not a pin (llama-swap's TTL is untouched) |
+| `release_hold(cell, model)` | C11 | end a hold early; holds expire on their own |
 
 **CLI.** `vibe cell status | await | drain | resume | wake | hold` — local
 verbs run the configured per-cell command; remote verbs go through the

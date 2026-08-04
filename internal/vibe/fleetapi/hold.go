@@ -2,6 +2,7 @@ package fleetapi
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -154,6 +155,13 @@ func (s *Server) knownCell(cell string) bool {
 func (s *Server) HoldOn(cell string) (Lease, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.holdOnLocked(cell)
+}
+
+// holdOnLocked is the same read for callers that already hold s.mu.
+// drainCommands is one, and HoldOn re-entering there would deadlock —
+// the shape this repo has shipped a lock bug in before.
+func (s *Server) holdOnLocked(cell string) (Lease, bool) {
 	// Earliest expiry wins the report so the "N left" an operator reads
 	// is the one that runs out first — a longer hold behind it keeps
 	// suppressing, and the next evaluation says so.
@@ -170,19 +178,92 @@ func (s *Server) HoldOn(cell string) (Lease, bool) {
 	return best, found
 }
 
+// dropHeldWarmsLocked removes fleetd's own queued warms from a held
+// cell's piggyback queue. Callers hold s.mu.
+//
+// The warm loops check the hold when they DECIDE, but the piggyback
+// queue is at-least-once and delivery happens later: a restore queued
+// one tick before the operator declared the hold would still land on the
+// cell's next announce and evict exactly the model the hold was taken to
+// protect. The sending side guarding and the receiving side not is this
+// repo's most repeated defect; the hold has to hold at both ends.
+//
+// Only `warm` is dropped, and that is not a coincidence: every queued
+// warm comes from queueWarm, i.e. from fleetd's OWN policy (the
+// warm-target restore and the warm schedule), which is precisely what a
+// hold suspends. `unload` is an operator's explicit verb and `probe` can
+// be one — "an operator asking is not fleetd guessing", so both still
+// deliver. Dropping rather than deferring is deliberate: the restore is
+// re-decided every tick once the hold lifts, and a warm delivered hours
+// late is a stale decision.
+func (s *Server) dropHeldWarmsLocked(cell string) {
+	if _, held := s.holdOnLocked(cell); !held {
+		return
+	}
+	drop := func(cmds []AnnounceCommand) ([]AnnounceCommand, int) {
+		kept := make([]AnnounceCommand, 0, len(cmds))
+		for _, c := range cmds {
+			if c.Verb == "warm" {
+				continue
+			}
+			kept = append(kept, c)
+		}
+		return kept, len(cmds) - len(kept)
+	}
+	if q, ok := s.commands[cell]; ok {
+		if kept, n := drop(q); n > 0 {
+			slog.Info("dropped queued warms for a held cell", "cell", cell, "dropped", n)
+			if len(kept) == 0 {
+				delete(s.commands, cell)
+			} else {
+				s.commands[cell] = kept
+			}
+		}
+	}
+	// The in-flight slot too: an at-least-once batch handed out before
+	// the hold is redelivered until a higher seq retires it.
+	if pend, ok := s.cmdInflight[cell]; ok {
+		if kept, n := drop(pend.cmds); n > 0 {
+			slog.Info("dropped undelivered warms for a held cell", "cell", cell, "dropped", n)
+			if len(kept) == 0 {
+				delete(s.cmdInflight, cell)
+			} else {
+				pend.cmds = kept
+				s.cmdInflight[cell] = pend
+			}
+		}
+	}
+}
+
 // holdDetail is the operator-facing status string for a suppressed warm
 // target: what is held and how much longer. fleet_status carries the
 // absolute expires_at on the lease itself; this is the surface where the
 // question "why has my default not come back?" is actually asked, so it
 // answers in words.
 func holdDetail(h Lease) string {
-	left := time.Until(h.ExpiresAt).Round(time.Second)
-	if left < 0 {
-		left = 0
-	}
-	d := fmt.Sprintf("held: %s, %s left", h.Model, left)
+	d := fmt.Sprintf("held: %s, %s", h.Model, HoldLeft(h.ExpiresAt))
 	if h.Note != "" {
 		d += " (" + h.Note + ")"
 	}
 	return d
+}
+
+// HoldLeft renders the time remaining on a hold. Exported because the
+// CLI's status column and the MCP reply say the same thing, and three
+// copies of a duration format is three chances to disagree about what
+// the operator is being told. Minute granularity above a minute: a
+// countdown that churns every second is a status line nobody can diff.
+func HoldLeft(expiresAt time.Time) string {
+	left := time.Until(expiresAt)
+	if left < time.Minute {
+		if left < 0 {
+			left = 0
+		}
+		return fmt.Sprintf("%ds left", int(left.Round(time.Second).Seconds()))
+	}
+	left = left.Round(time.Minute)
+	if h := int(left / time.Hour); h > 0 {
+		return fmt.Sprintf("%dh%dm left", h, int((left%time.Hour)/time.Minute))
+	}
+	return fmt.Sprintf("%dm left", int(left/time.Minute))
 }
