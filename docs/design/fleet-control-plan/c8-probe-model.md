@@ -1,6 +1,6 @@
 # C8 — probe_model: throughput health, scored against the model's own baseline
 
-Status: EXECUTED + REVIEWED (2026-08-04), off `feat/c8-probe-model`
+Status: MERGED (#27, 2026-08-04), off `feat/c8-probe-model`
 branched from `main` at `8658c2e` (C0–C7b + the post-merge
 reconciliation PR). Feature commit, ground rule 9's adversarial
 self-review commit, and a second (independent) adversarial review

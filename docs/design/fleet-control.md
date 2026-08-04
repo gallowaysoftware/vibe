@@ -1,10 +1,10 @@
 # Fleet control: node state, intent, and the control plane
 
-Status: MERGED THROUGH C7b (2026-08-03); C8 (probe_model, the first v2
-backlog item) is in review. Every phase C0–C7b is on `main`
-(#18–#25), plus one post-merge reconciliation PR for the three items no
+Status: MERGED THROUGH C8 (2026-08-04) — C8 is probe_model, the first
+v2 backlog item to land. Every phase C0–C8 is on `main` (#18–#25, #27),
+plus one post-merge reconciliation PR for the three items no
 single phase branch could reach. **Merged is not live-gated:** C5's,
-C6's, C7a's and C7b's live gates need real cells and were NOT run — the
+C6's, C7a's, C7b's and C8's live gates need real cells and were NOT run — the
 phase docs and the README's status column say per phase which gates are
 mechanical (green, repeated under `-race`) and which are still owed.
 That README's status column is the authoritative per-phase state.

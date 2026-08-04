@@ -16,7 +16,7 @@ to be implementable on its own after that.
 | [C6](c6-substrate-repair.md) | Substrate repair: the C1–C3 findings against merged code | ~500 lines | independent of C5 | merged (#23); unit gates green, live gates 1 + 2 UNRUN |
 | [C7a](c7a-usage-ledger.md) | The usage ledger: tokens per cell, per model, per day | ~710 lines | C4 | merged (#24); unit gates green, 7 live gates UNRUN |
 | [C7b](c7b-savings-screen.md) | The savings screen: what the fleet didn't spend | ~690 lines + ~100 KB data | C7a, C5 | merged (#25); unit gates green, live plausibility gate UNRUN |
-| [C8](c8-probe-model.md) | probe_model: throughput health against the model's own baseline | ~900 lines | C3, C4 | PR open; unit gates 1-10 green, 5 live gates UNRUN |
+| [C8](c8-probe-model.md) | probe_model: throughput health against the model's own baseline | ~900 lines | C3, C4 | merged (#27); unit gates 1-10 green, 5 live gates UNRUN |
 
 **Merged is not live-gated.** Every C0–C7b PR merged on a green CI run
 of the mechanical inner loop. The live gates — the ones that need real
