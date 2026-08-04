@@ -2,10 +2,13 @@
 
 Status: EXECUTED + REVIEWED (2026-08-04), off `feat/c8-probe-model`
 branched from `main` at `8658c2e` (C0–C7b + the post-merge
-reconciliation PR). Feature commit plus ground rule 9's adversarial
-self-review commit; every mechanically verifiable gate is green under
-`-race -count=5`, and the five live gates (L1–L5) are **NOT RUN** —
-they need real cells and a real GPU. See [§Execution](#execution-2026-08-04).
+reconciliation PR). Feature commit, ground rule 9's adversarial
+self-review commit, and a second (independent) adversarial review
+commit — six further findings, all mutation-verified, listed in the
+[second addendum](#adversarial-review-addendum-second-pass). Every
+mechanically verifiable gate is green under `-race -count=5`, and the
+five live gates (L1–L5) are **NOT RUN** — they need real cells and a
+real GPU. See [§Execution](#execution-2026-08-04).
 
 C8 fills the `probe` slot [C3](c3-announce.md) §1 reserved on
 `AnnounceModel` and converts the design doc's
@@ -528,3 +531,100 @@ still costs budget.
   argument containing `--embedding` would be read as a flag. The failure
   mode is a chat def probing as embed, which fails loudly on the first
   probe rather than reporting a wrong number.
+
+### Adversarial-review addendum (second pass)
+
+Ground rule 9's review pass run by a second agent against the merged
+feature + self-review commits. Six findings, no blockers — the load rule,
+the guard set, the events and the ownership-axis separation all held
+under mutation (see "mutation-verified sound" below). Each fix landed
+with a regression test that was mutation-verified: the production change
+reverted, the named test observed to fail, the change restored.
+
+1. **A rerank def was probeable whenever `--reranking` was not the first
+   flag (minor).** `kindFromArgv` returned on the first recognised flag,
+   so `--reranking` alone disabled the def while `--embedding
+   --reranking` or `--pooling rank --reranking` — the way a reranker is
+   actually configured, since llama.cpp's rerank mode IS pooling-type
+   rank — read as a plain embedding server. Same def, opposite answers,
+   decided by which flag the operator typed first. The consequence is a
+   64-input embed batch against a rank-pooled server every five minutes:
+   a 400 recorded as a failed probe, burning the attempt budget, exactly
+   the mis-probe the doc says is prevented. Disabling flags are now
+   scanned across the whole argv before the kind is decided.
+   `TestSpecsFromDefs_RerankIsDisabledWhateverTheFlagOrder`.
+2. **`samples` counted the window AFTER the new sample, not the baseline
+   behind the verdict (minor).** The field's own contract is "how many
+   backed it" and the threshold is `minSamples = 5`, so the fifth probe
+   announced `samples: 5, verdict: unknown` — which reads as a broken
+   scorer rather than as "four samples so far". `baseline_at` had the
+   same off-by-one and dated a baseline of zero on a fresh cell's first
+   probe. Both now describe the window `baseline_p50` was computed from.
+   `TestRecord_SamplesCountsWhatBackedTheVerdictNotTheWindowAfterIt`,
+   `TestRecord_BaselineAtIsNilUntilThereIsABaseline`.
+3. **The `degraded` roll-up answered for cells that stopped announcing
+   (minor).** `probe.degraded` is the one-line answer to "is anything
+   slow RIGHT NOW", and it walked every presence entry — so a cell
+   withdrawn a week ago kept reporting its last verdict as current. C6's
+   rule (staleness retires the announce as evidence) applies with extra
+   force to the one field that is purely evidence. It now reads fresh
+   announces only; the model row keeps the verdict either way, so
+   nothing is hidden, only un-claimed.
+   `TestProbeReport_DegradedRollUpReadsFreshAnnouncesOnly`.
+4. **The front-cell refusal was in both producers and in neither
+   guard (minor).** §3 and AGENTS.md both say one `probeGuard` serves the
+   scheduler and the MCP verb "so they cannot drift" — but the front rule
+   lived in the daemon's config filter and in `fleetmcp/probe.go`, i.e.
+   in two hand-written copies outside the thing that exists to prevent
+   drift. A shared guard only shares the rules it holds. `probeGuard`
+   now refuses the front (the MCP verb still errors loudly first, so its
+   behaviour is unchanged), which also turns a front `probe_targets`
+   entry reaching `StartProbeLoop` from a silently dropped config line
+   into a visible skip. `TestProbeGuard_RefusesTheFrontCellItself`.
+5. **`probeTargetState`'s time pointers escaped the lock that owns them
+   (nit).** The self-review fixed exactly this shape on `AnnounceProbe`
+   (`CloneProbe`) and missed the struct one file over: `evalProbeTarget`
+   captured `st.LastAsk` under `s.mu` and dereferenced it after the
+   unlock, and `probeReport` handed out shallow copies carrying the same
+   two pointers. Provably safe today — `setProbeState` replaces the
+   pointer rather than writing through it — and precisely the shape this
+   repo has already shipped a race in. Deref under the lock,
+   `cloneProbeTargetState` on the way out.
+   `TestProbeReport_DoesNotHandOutTheSchedulerStatePointers`.
+6. **`probe_targets:` was undocumented in the reference stack (nit).**
+   `deploy/fleetd/README.md` is where C4's `warm_targets`/`warm_schedule`
+   and C7b's `power`/`capital_cost` are documented for an operator; C8's
+   config was not. Added, with the floor, the front refusal and the
+   "model as the CELL announces it" rule stated. A `SpecsFromDefs` def
+   whose argv fails to render now also logs — the kind silently falls
+   back to chat, which is a guess.
+
+**Mutation-verified sound, not changed.** Deleting the cell-side
+residency check fails both gate-1 tests; treating unreported in-flight as
+zero fails the scheduler guard test; leaking a verdict into
+`snap.Reachable` fails the ownership-axis test; firing the degraded event
+without the transition check fails the events test. `probeEvents` runs
+under the same lock and against the same `prevModels` the render triggers
+use. `Run` marks the attempt before measuring, so an abandoned probe
+still costs budget.
+
+**Considered and deliberately not changed.**
+
+- **The scheduler floor and the cell cooldown are both 5 minutes**, so a
+  target declared at exactly the floor has roughly every second ask
+  refused by the cooldown (the ask lands slightly before the gap
+  expires). The effect is a ~10-minute effective period at the most
+  aggressive legal setting, and it is self-explaining — the refusal
+  carries the reason and the last measurement. §3's budget table declares
+  both figures as 5 minutes; changing one silently would be worse than
+  the papercut.
+- **`Prober.Start`'s goroutine is untracked and builds its context from
+  `context.Background()`.** That is deliberate — the announce loop's ctx
+  is cancelled the moment `executeCommand` returns, which is the whole
+  point of the hand-off — and it cannot hang shutdown, because nothing
+  waits on it. The cost is that an in-flight probe outlives the daemon by
+  up to `probeTimeout` and writes its state file afterwards.
+- **`Run` checks residency on the requested id while `record` keys on
+  `spec.Model`.** Both are the canonical def name under every shipped
+  `Specs` implementation (`Hooks`), so they cannot diverge today; a
+  future alias-resolving `Specs` would need to reconcile them.

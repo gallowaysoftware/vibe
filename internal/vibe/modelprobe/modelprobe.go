@@ -631,6 +631,16 @@ func (p *Prober) record(spec Spec, m measurement, rebaseline bool) *fleetapi.Ann
 		b.DegradedSince = nil
 	}
 
+	// The count that BACKED this verdict, captured before the new sample
+	// lands. Reporting the post-append length announced "samples: 5" beside
+	// "verdict: unknown" on the fifth probe — the threshold is minSamples=5,
+	// so that reads as a broken scorer rather than as "four samples so far".
+	backing := len(b.Samples)
+	var backingAt *time.Time
+	if backing > 0 {
+		t := b.Samples[backing-1].At
+		backingAt = &t
+	}
 	p50, ok := median(b.Samples)
 	verdict := fleetapi.VerdictUnknown
 	ratio := 0.0
@@ -675,7 +685,7 @@ func (p *Prober) record(spec Spec, m measurement, rebaseline bool) *fleetapi.Ann
 		Metric:      m.Metric,
 		Value:       m.Value,
 		BaselineP50: p50,
-		Samples:     len(b.Samples),
+		Samples:     backing,
 		Ratio:       ratio,
 		Verdict:     verdict,
 		TTFTMS:      m.TTFTMS,
@@ -685,10 +695,10 @@ func (p *Prober) record(spec Spec, m measurement, rebaseline bool) *fleetapi.Ann
 		t := *b.DegradedSince
 		res.DegradedSince = &t
 	}
-	if n := len(b.Samples); n > 0 {
-		t := b.Samples[n-1].At
-		res.BaselineAt = &t
-	}
+	// The newest sample BEHIND BaselineP50, same window as Samples: taking
+	// it after the append made a fresh cell's first probe report a baseline
+	// age beside a baseline of zero.
+	res.BaselineAt = backingAt
 	p.results[spec.Model] = res
 	p.saveLocked()
 	return fleetapi.CloneProbe(res)

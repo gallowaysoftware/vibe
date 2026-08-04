@@ -63,6 +63,19 @@ warm_targets:
 warm_schedule:
   - cron: "30 6 * * *"
     model: default-chat
+
+# C8: throughput probes. fleetd ASKS on this schedule and the CELL
+# measures — against a model it already holds resident, never loading
+# one. Empty (the default) means no probing at all: this is the one
+# place the control plane deliberately spends GPU time, so it is
+# declared, never implicit. `every` is floored at 5m; the front cell is
+# refused (its config is peers-only, so a probe there would measure a
+# peer THROUGH the front). `model` is the id the CELL announces — the
+# canonical def name, never a client-side alias.
+probe_targets:
+  - cell: gpu-cell
+    model: default-chat
+    every: 6h
 ```
 
 **Timezone.** `warm_schedule` entries evaluate in the container's `TZ`,

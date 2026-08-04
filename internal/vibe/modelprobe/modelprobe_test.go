@@ -581,3 +581,59 @@ func TestResults_DoesNotAliasProberMemory(t *testing.T) {
 		t.Fatal("Results() handed out a pointer into prober memory")
 	}
 }
+
+// ─── adversarial-review regressions (ground rule 9, second pass) ──────
+
+// TestRecord_SamplesCountsWhatBackedTheVerdictNotTheWindowAfterIt: the
+// announced `samples` is documented as "how many backed it", and the
+// verdict threshold is minSamples. Counting the just-recorded sample
+// published "samples: 5, verdict: unknown" on the fifth probe against a
+// documented five-sample threshold — an operator reading that concludes
+// the scorer is broken, when it is honestly saying "four so far".
+func TestRecord_SamplesCountsWhatBackedTheVerdictNotTheWindowAfterIt(t *testing.T) {
+	sw, srv := newSwap(t, map[string]string{"qwen": "ready"})
+	clk := testClock()
+	p := newProber(t, srv, nil, clk)
+
+	var scoredAt int
+	for i := 1; i <= minSamples+2; i++ {
+		sw.setRate(40)
+		clk.advance(minGap)
+		res := p.Run(context.Background(), "qwen", false)
+		if res.Samples >= minSamples && res.Verdict == fleetapi.VerdictUnknown {
+			t.Fatalf("probe %d announced samples=%d with verdict unknown: the count does not describe the baseline behind it (%+v)", i, res.Samples, res)
+		}
+		if res.Verdict != fleetapi.VerdictUnknown && scoredAt == 0 {
+			scoredAt = i
+			if res.Samples != minSamples {
+				t.Fatalf("first scored probe reports samples=%d, want the %d that backed it", res.Samples, minSamples)
+			}
+		}
+	}
+	if scoredAt != minSamples+1 {
+		t.Fatalf("the first scored probe was #%d; want #%d (minSamples behind it)", scoredAt, minSamples+1)
+	}
+}
+
+// TestRecord_BaselineAtIsNilUntilThereIsABaseline: BaselineAt is what
+// makes "flagged for six days against a July baseline" legible, so it
+// must describe the same window BaselineP50 does. Taken after the append
+// it dated a baseline of zero on a fresh cell's very first probe.
+func TestRecord_BaselineAtIsNilUntilThereIsABaseline(t *testing.T) {
+	sw, srv := newSwap(t, map[string]string{"qwen": "ready"})
+	clk := testClock()
+	p := newProber(t, srv, nil, clk)
+
+	first := p.Run(context.Background(), "qwen", false)
+	if first.BaselineP50 != 0 {
+		t.Fatalf("first probe already has a baseline: %+v", first)
+	}
+	if first.BaselineAt != nil {
+		t.Fatalf("a baseline of zero was dated %s", first.BaselineAt)
+	}
+	sw.setRate(40)
+	clk.advance(minGap)
+	if second := p.Run(context.Background(), "qwen", false); second.BaselineAt == nil {
+		t.Fatal("a real baseline carries no age")
+	}
+}

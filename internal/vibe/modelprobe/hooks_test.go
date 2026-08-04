@@ -77,3 +77,27 @@ func TestSpecsFromDefs_BindsTheBaselineToTheRenderedFlags(t *testing.T) {
 		t.Fatal("a serving-flag change left the baseline key unchanged")
 	}
 }
+
+// ─── adversarial-review regressions (ground rule 9, second pass) ──────
+
+// TestSpecsFromDefs_RerankIsDisabledWhateverTheFlagOrder: a reranker IS
+// an embedding server plus --reranking (llama.cpp's rerank mode is
+// pooling-type rank), so the disabling flag routinely arrives AFTER
+// --embedding or --pooling. Deciding on the first flag that matched made
+// the same def probeable or disabled depending on which flag the
+// operator typed first — and probeable means a 64-input embed batch
+// against a rank-pooled server, i.e. a 400 recorded as a failed probe
+// every five minutes.
+func TestSpecsFromDefs_RerankIsDisabledWhateverTheFlagOrder(t *testing.T) {
+	for _, args := range [][]string{
+		{"--reranking"},
+		{"--embedding", "--reranking"},
+		{"--pooling", "rank", "--reranking"},
+		{"--embedding", "--pooling", "rank", "--rerank"},
+	} {
+		specs := SpecsFromDefs([]*profile.BackendDef{llamaDef("reranker", args...)}, "/usr/bin/llama-server")
+		if !specs["reranker"].Disabled {
+			t.Errorf("args %v left a rerank def probeable with a request shape it does not speak", args)
+		}
+	}
+}

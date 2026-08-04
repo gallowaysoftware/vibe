@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"slices"
 	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 )
 
 // Throughput probes, fleetd's half (fleet-control C8). fleetd does
@@ -100,10 +102,17 @@ func (s *Server) probeTargetLoop(t ProbeTarget, st *probeTargetState, tick time.
 // is a skip. Unknown in-flight is not zero in-flight.
 func (s *Server) evalProbeTarget(t ProbeTarget, st *probeTargetState) {
 	now := time.Now()
+	// Dereferenced UNDER the lock, not after it. setProbeState replaces the
+	// pointer rather than writing through it, so carrying the pointer out
+	// happens to be safe today — and that is exactly the shape this repo
+	// has already shipped a race in twice. The value costs nothing.
 	s.mu.Lock()
-	last := st.LastAsk
+	var last time.Time
+	if st.LastAsk != nil {
+		last = *st.LastAsk
+	}
 	s.mu.Unlock()
-	if last != nil && now.Sub(*last) < t.Every {
+	if !last.IsZero() && now.Sub(last) < t.Every {
 		return
 	}
 
@@ -125,6 +134,15 @@ func (s *Server) evalProbeTarget(t ProbeTarget, st *probeTargetState) {
 // whether a box is busy. The reason string is the operator-facing
 // explanation; it is never swallowed.
 func (s *Server) probeGuard(cell, model string) (string, bool) {
+	if cell == fleetcfg.FrontCell {
+		// The front's rendered config is peers-only, so a probe there
+		// measures a peer THROUGH the front — LAN, proxy hop and the peer's
+		// queue folded into one unattributable number (C8 §1). The daemon's
+		// config wiring and the MCP verb each refuse this too; it belongs
+		// HERE as well, because "one shared guard so the producers cannot
+		// drift" is only true of the rules the shared guard actually holds.
+		return fmt.Sprintf("%s serves no models of its own; probe the cell that holds the model", fleetcfg.FrontCell), false
+	}
 	if in, ok := s.effectiveIntent(cell); ok && in.State == "drained" {
 		return fmt.Sprintf("cell %s is drained", cell), false
 	}
@@ -237,10 +255,18 @@ func (s *Server) probeReport() *probeStatus {
 	s.mu.Lock()
 	states := make([]probeTargetState, 0, len(s.probeStates))
 	for _, st := range s.probeStates {
-		states = append(states, *st)
+		states = append(states, cloneProbeTargetState(st))
 	}
 	var degraded []string
 	for cell, p := range s.presence {
+		// Degraded answers "is anything slow RIGHT NOW", so it reads only
+		// FRESH announces. A stale or withdrawn cell's last verdict is
+		// history — C6's rule that staleness retires the announce as
+		// evidence, applied to the one field that is pure evidence. The
+		// model row keeps the verdict either way; this is the roll-up.
+		if p == nil || !p.Announcing || p.Stale || p.Withdrawn {
+			continue
+		}
 		for _, m := range p.Models {
 			if m.Probe != nil && m.Probe.Verdict == VerdictDegraded {
 				degraded = append(degraded, cell+"/"+m.ID)
@@ -253,4 +279,20 @@ func (s *Server) probeReport() *probeStatus {
 	}
 	slices.Sort(degraded)
 	return &probeStatus{Targets: states, Degraded: degraded}
+}
+
+// cloneProbeTargetState deep-copies the two *time.Time fields. A struct
+// copy carries the pointers out of the lock that owns them — the same
+// shape CloneProbe exists for, one struct over.
+func cloneProbeTargetState(st *probeTargetState) probeTargetState {
+	cp := *st
+	if st.LastAsk != nil {
+		t := *st.LastAsk
+		cp.LastAsk = &t
+	}
+	if st.NextDue != nil {
+		t := *st.NextDue
+		cp.NextDue = &t
+	}
+	return cp
 }

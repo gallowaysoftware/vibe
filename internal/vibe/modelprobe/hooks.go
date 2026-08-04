@@ -50,7 +50,15 @@ func SpecsFromDefs(defs []*profile.BackendDef, llamaBinary string) map[string]Sp
 		// Only the spec-rendered kinds have an argv to read (the same
 		// split gatherModels applies to fingerprints).
 		if def.Backend.LlamaServer != nil || def.Backend.MLXServer != nil {
-			if cmd, err := router.ModelCmd(def, router.Options{LlamaServerBinary: llamaBinary}); err == nil {
+			cmd, err := router.ModelCmd(def, router.Options{LlamaServerBinary: llamaBinary})
+			if err != nil {
+				// The kind then falls back to chat, which is a GUESS about a
+				// def whose serving flags could not be rendered. Say so: a
+				// silently mis-typed embedding def probes with a chat body
+				// and reports a 400 as a failed probe forever.
+				slog.Warn("probe kind falls back to chat; the def's serving flags did not render",
+					"def", def.Name, "err", err)
+			} else {
 				if hash, err := router.FlagsSHA256(cmd); err == nil {
 					spec.FlagsSHA256 = hash
 				}
@@ -70,12 +78,22 @@ func SpecsFromDefs(defs []*profile.BackendDef, llamaBinary string) map[string]Sp
 // kindFromArgv reads the probe kind off the serving flags. Rerank is
 // DISABLED rather than mis-probed: its request body is a query plus
 // documents, so sending it the embed batch would measure a 400.
+//
+// Disabling flags are scanned FIRST, across the whole argv, because a
+// reranker is configured as an embedding server plus `--reranking`
+// (llama.cpp's rerank mode IS pooling-type rank) and argv order is the
+// operator's. Deciding on the first flag that matched made
+// `--embedding --reranking` probeable and `--reranking` alone disabled —
+// same def, opposite answers, decided by which flag was typed first.
 func kindFromArgv(cmd string) (kind string, disabled bool) {
 	fields := strings.Fields(cmd)
 	for _, f := range fields {
-		switch {
-		case f == "--reranking" || f == "--rerank":
+		if f == "--reranking" || f == "--rerank" {
 			return KindEmbed, true
+		}
+	}
+	for _, f := range fields {
+		switch {
 		case f == "--embedding" || f == "--embeddings":
 			return KindEmbed, false
 		case strings.HasPrefix(f, "--pooling"):

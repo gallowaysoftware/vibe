@@ -535,3 +535,91 @@ func TestAnnounceProbe_FutureTimestampIsClampedAtIngest(t *testing.T) {
 		t.Fatalf("a cell clock from the future survived ingest: %s", got.At)
 	}
 }
+
+// ─── adversarial-review regressions (ground rule 9, second pass) ──────
+
+// TestProbeGuard_RefusesTheFrontCellItself: the front rule lived in two
+// places (the daemon's config filter and the MCP verb) while the guard
+// documented as the reason the two producers "cannot drift" did not hold
+// it. A shared guard only shares the rules it actually contains.
+func TestProbeGuard_RefusesTheFrontCellItself(t *testing.T) {
+	s := New([]Cell{{Name: "front", URL: "http://127.0.0.1:1"}},
+		t.TempDir()+"/hist.json", testDaemonInfo, Options{})
+	t.Cleanup(s.Close)
+	// Every other guard deliberately passes: ready model, idle cell.
+	presenceOf(s, "front", AnnounceModel{ID: "qwen", State: "ready"})
+	s.trackInFlight("front", inflightFrame(t))
+
+	why, ok := s.ProbeGuard("front", "qwen")
+	if ok {
+		t.Fatal("the guard allowed a probe of the front, which measures a peer through the front")
+	}
+	if !strings.Contains(why, "front") {
+		t.Fatalf("skip reason does not name the front: %q", why)
+	}
+	st := &probeTargetState{Cell: "front", Model: "qwen"}
+	s.evalProbeTarget(ProbeTarget{Cell: "front", Model: "qwen", Every: time.Hour}, st)
+	if cmds := peekQueued(s, "front"); len(cmds) != 0 {
+		t.Fatalf("scheduler queued a probe to the front: %+v", cmds)
+	}
+}
+
+// TestProbeReport_DegradedRollUpReadsFreshAnnouncesOnly: the block is
+// the one-line answer to "is anything slow RIGHT NOW". C6 established
+// that staleness retires the announce as evidence, and a verdict is pure
+// evidence — a cell that has been off for a week must not keep answering
+// a question about the present. The model row keeps the verdict either
+// way; this is the roll-up.
+func TestProbeReport_DegradedRollUpReadsFreshAnnouncesOnly(t *testing.T) {
+	s := probeServer(t)
+	presenceOf(s, "gpu-cell", AnnounceModel{ID: "qwen", State: "ready", Probe: probeBlock(VerdictDegraded, 4, 40)})
+	if rep := s.probeReport(); rep == nil || len(rep.Degraded) != 1 {
+		t.Fatalf("a fresh degraded announce is missing from the roll-up: %+v", rep)
+	}
+
+	s.mu.Lock()
+	s.presence["gpu-cell"].Stale = true
+	s.mu.Unlock()
+	if rep := s.probeReport(); rep != nil && len(rep.Degraded) != 0 {
+		t.Fatalf("a stale cell still answers 'is anything slow right now': %+v", rep.Degraded)
+	}
+
+	s.mu.Lock()
+	s.presence["gpu-cell"].Stale = false
+	s.presence["gpu-cell"].Withdrawn = true
+	s.mu.Unlock()
+	if rep := s.probeReport(); rep != nil && len(rep.Degraded) != 0 {
+		t.Fatalf("a withdrawn cell still answers 'is anything slow right now': %+v", rep.Degraded)
+	}
+
+	// The verdict itself is untouched: the roll-up filtered, it did not
+	// rewrite the model row.
+	if p := s.presenceFor("gpu-cell"); p.Models[0].Probe.Verdict != VerdictDegraded {
+		t.Fatalf("the roll-up filter reached into the model row: %+v", p.Models[0].Probe)
+	}
+}
+
+// TestProbeReport_DoesNotHandOutTheSchedulerStatePointers: probeReport
+// copies each target state by value, which carries LastAsk and NextDue
+// out of the lock that owns them — the same shape CloneProbe exists for,
+// one struct over.
+func TestProbeReport_DoesNotHandOutTheSchedulerStatePointers(t *testing.T) {
+	s := probeServer(t)
+	readyPresence(s, t, "qwen")
+	st := &probeTargetState{Cell: "gpu-cell", Model: "qwen"}
+	s.mu.Lock()
+	s.probeStates = append(s.probeStates, st)
+	s.mu.Unlock()
+	s.evalProbeTarget(ProbeTarget{Cell: "gpu-cell", Model: "qwen", Every: time.Hour}, st)
+
+	rep := s.probeReport()
+	if rep == nil || len(rep.Targets) != 1 || rep.Targets[0].LastAsk == nil || rep.Targets[0].NextDue == nil {
+		t.Fatalf("scheduler state did not reach fleet_status: %+v", rep)
+	}
+	s.mu.Lock()
+	if rep.Targets[0].LastAsk == st.LastAsk || rep.Targets[0].NextDue == st.NextDue {
+		s.mu.Unlock()
+		t.Fatal("probeReport handed back the loop's own time pointers")
+	}
+	s.mu.Unlock()
+}

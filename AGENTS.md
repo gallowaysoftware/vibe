@@ -542,15 +542,20 @@ optional.)
     front render's exclusion path (that stays fingerprint-only), never a
     warm/unload/drain trigger. The remediation runbook is human:
     probe → `unload_model` → probe. Test-pinned through the REAL snapshot
-    path in `fleetapi/c8_test.go`.
+    path in `fleetapi/c8_test.go`. fleet_status's `probe.degraded`
+    roll-up answers "is anything slow RIGHT NOW", so it reads FRESH
+    announces only (C6's staleness rule applied to the one field that is
+    pure evidence); the model row keeps the verdict either way.
   - **fleetd ASKS, the cell MEASURES.** Requests travel on C3's piggyback
     queue (so announce-only cells are probeable), guarded by C4's guard
     set verbatim — drained / stale / busy / **unreported** in-flight /
-    leased / not-announced-ready — with every skip named in
-    fleet_status's `probe` block. One `probeGuard` serves the scheduler
-    and the MCP verb so they cannot drift. The front cell is refused on
-    both producers (peers-only config ⇒ a probe there measures a peer
-    through the front).
+    leased / not-announced-ready / the front cell — with every skip named
+    in fleet_status's `probe` block. One `probeGuard` holds all of them
+    and serves both producers (the scheduler and the MCP verb) so they
+    cannot drift; the daemon's config filter and the MCP verb ALSO refuse
+    the front, loudly, but the shared guard is what makes that a rule
+    rather than two coincidences (peers-only config ⇒ a probe there
+    measures a peer through the front).
   - **The budget is explicit and enforced on the CELL**, because the
     piggyback queue is at-least-once: 5-minute per-model cooldown keyed
     on the last ATTEMPT (not the last result — refusals carry the last
@@ -561,7 +566,10 @@ optional.)
     `(model, flags_sha256, metric)` so a def edit starts a fresh baseline
     instead of reporting a config change as a regression, and scored as
     a median over ≤20 samples. Under 5 samples the verdict is `unknown`,
-    never `degraded`. **A degraded sample never enters the window** (or a
+    never `degraded`; the announced `samples`/`baseline_at` describe the
+    window BEHIND that verdict (the sample just taken is excluded from
+    both, exactly as it is from `baseline_p50`), so `samples: 5` never
+    rides `unknown`. **A degraded sample never enters the window** (or a
     real regression washes out in ~11 probes and the status goes green
     while the box is slow); `rebaseline: true` is the explicit escape
     hatch. It reuses `history.go`'s SHAPE (small window, rewrite on
