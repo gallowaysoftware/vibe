@@ -122,14 +122,14 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 
 	list := rpc(t, ts, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
 	tools, ok := list.Result.(map[string]any)["tools"].([]any)
-	if !ok || len(tools) != 9 {
+	if !ok || len(tools) != 10 {
 		t.Fatalf("tools = %v", list.Result)
 	}
 	names := map[string]bool{}
 	for _, tool := range tools {
 		names[tool.(map[string]any)["name"].(string)] = true
 	}
-	for _, want := range []string{"fleet_status", "warm_model", "unload_model", "drain_cell", "resume_cell", "wake_cell", "render_front", "fleet_usage", "fleet_savings"} {
+	for _, want := range []string{"fleet_status", "warm_model", "unload_model", "drain_cell", "resume_cell", "wake_cell", "render_front", "fleet_usage", "fleet_savings", "probe_model"} {
 		if !names[want] {
 			t.Errorf("missing tool %s in %v", want, names)
 		}

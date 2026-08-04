@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetannounce"
+	"github.com/gallowaysoftware/vibe/internal/vibe/modelprobe"
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"github.com/gallowaysoftware/vibe/internal/vibe/prices"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
@@ -244,6 +245,7 @@ func fleetAnnounceCmd() *cobra.Command {
 			if intentPath == "" {
 				intentPath = paths.CellIntentFile()
 			}
+			probes, runProbe := modelprobe.Hooks(llamaSwap, paths.CellProbeFile(), cellDefs, llamaBin)
 			ann, err := fleetannounce.New(fleetannounce.Config{
 				Cell:              cell,
 				RegistryURL:       registry,
@@ -255,6 +257,10 @@ func fleetAnnounceCmd() *cobra.Command {
 				// A slim cell's tokens count exactly as much as a
 				// daemon-bearing cell's; same collector, same state file.
 				Usage: usagemeter.Snapshotter(llamaSwap, paths.CellUsageFile()),
+				// Same for its probes: a slim cell is probeable exactly like
+				// a daemon-bearing one (C8 §1 — the announcer is the prober).
+				Probes:   probes,
+				RunProbe: runProbe,
 			})
 			if err != nil {
 				return err

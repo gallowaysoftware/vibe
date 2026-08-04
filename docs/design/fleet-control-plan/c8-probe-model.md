@@ -1,0 +1,416 @@
+# C8 — probe_model: throughput health, scored against the model's own baseline
+
+Status: IN PROGRESS (2026-08-04), off `feat/c8-probe-model` branched from
+`main` at `8658c2e` (C0–C7b + the post-merge reconciliation PR).
+
+C8 fills the `probe` slot [C3](c3-announce.md) §1 reserved on
+`AnnounceModel` and converts the design doc's
+[friction pain 2](../fleet-control.md#10-friction-pain-scorecard-at-plan-completion)
+from *deferred with a designed slot* to *answered*. It is backlog item 1
+in [fleet-control-futures.md](../fleet-control-futures.md) §2 — the
+highest-ranked v2 item, because pain 2 is the one guaranteed incident of
+the year:
+
+> **Nothing supervises health as throughput.** llama-server can degrade
+> 10–100× while `/health` stays green; only realistic batch probes or
+> domain-truth signals catch it. (design §1, pain 2)
+
+`fleet_status` today answers every question except the one asked when
+something *feels* slow. After C8 it answers that one too, with a number
+and a baseline beside it.
+
+## The shape of the answer
+
+One canned, deterministic completion (or embedding batch) issued **on
+the cell, against a model that is already resident**, timed, and scored
+against the median of that model's own recent healthy samples. The
+verdict — `ok` / `degraded` / `unknown` — rides the announce in the
+reserved per-model `probe` block. fleetd displays it, publishes a
+transition event, and does **nothing else with it**.
+
+That last clause is the whole design. Everything below is the set of
+rules that keep a measurement from becoming an actuator.
+
+## Design
+
+### 1. Who runs the probe: the cell's announcer
+
+The cell, not fleetd. Four reasons, in descending order of how badly
+the alternative fails:
+
+1. **Only the cell can refuse to load.** A probe issued through the
+   front is a request like any other, and llama-swap's whole contract is
+   JIT-on-request: a probe for a model that isn't resident *starts it*.
+   That is precisely the eviction C4's warm policy was built to avoid
+   ("a pinned default re-warms on a timer and evicts the model the
+   operator just swapped in" — design §9's rejected row). Only the box
+   holding the model can check `/running` on localhost microseconds
+   before issuing and abort instead. §2 makes this a rule.
+2. **Attribution.** C7a established it for tokens and it holds
+   identically for throughput: the front's rendered config is
+   peers-only, so llama-swap's `RealModelName` resolves nothing there
+   and the front records whatever string the client typed. Only the cell
+   maps `qwen3.6-27b-tools` → `qwen3.6-27b`. A baseline keyed on a
+   client's alias is a baseline of nothing.
+3. **It measures the model, not the path.** A fleetd-side probe through
+   the front measures LAN + the front's proxy hop + the cell's queue +
+   the model. When the number moves you cannot say which moved. The
+   cell-side probe reads llama.cpp's own `timings` block, which excludes
+   queueing entirely (§4).
+4. **C3's inversion.** Cells announce, the catalog is derived, and after
+   C3 `daemon_url` is an optimization rather than a requirement. A
+   fleetd-side prober needs a route to every cell and re-inverts the
+   phase this plan spent its largest PR on.
+
+fleetd keeps exactly two jobs: it **asks** (scheduling and the MCP verb,
+because it is the only party that knows about leases and in-flight work
+fleet-wide), and it **displays**. The asking travels on the C3 piggyback
+command queue, so an announce-only cell with no inbound port is probeable
+like any other.
+
+### 2. When a probe may cause a load: never
+
+The rule, stated so it can be tested:
+
+> A probe is issued **only** for a model the cell's own llama-swap
+> reports as `ready` at the moment of issue. A probe never loads,
+> re-loads, or keeps alive a model. There is no flag, no argument and no
+> config value that relaxes this.
+
+Consequences, all deliberate:
+
+- `probe_model` on a stopped model is a **refusal with an instruction**,
+  not a load: *"qwen3.6-27b is not resident on gpu-cell; a probe must not
+  load it. Warm it first (`warm_model`), then probe."* Warming is a
+  declared act with its own verb; folding it into a measurement is how
+  the measurement becomes an actuator.
+- The residency check happens **twice**: fleetd checks announced
+  residency before queueing (cheap, ~1 heartbeat stale), and the cell
+  re-checks its own `/running` immediately before issuing (authoritative).
+  Only the second one is load-bearing; the first exists so the command
+  queue does not fill with probes that will all be refused.
+- The residual race is one TTL eviction landing between the cell's
+  `/running` read and its request — milliseconds — and its cost is one
+  JIT load of a model that was resident a moment earlier. Stated, not
+  hidden.
+- A probe does **not** count as activity for C4's warm targets. Those key
+  on fleetd's inflight-frame timestamps, and a probe does produce an
+  inflight frame, so a probe *does* reset a warm target's idle window.
+  That is the honest direction to err: a probe delays a restore by one
+  window rather than causing one.
+
+### 3. Respecting the operator's box: guards and budget
+
+C4's warm schedule established the pattern and C8 reuses it verbatim
+(`warmsched.go:evalScheduleEntry`), including the rule that **a guard
+which cannot be evaluated is a skip**:
+
+| guard | evaluated by | on failure |
+|---|---|---|
+| cell drained (`effectiveIntent`) | fleetd, before queueing | skip, noted |
+| cell stale / withdrawn / never announced | fleetd | skip, noted |
+| model not announced `ready` | fleetd | skip, noted |
+| in-flight > 0 **or unreported** | fleetd | skip, noted ("unknown in-flight is not zero in-flight") |
+| active lease on the cell | fleetd | skip, noted |
+| model not resident **now** | cell, at issue | refuse, reported in the next announce |
+| cooldown / daily cap | cell | refuse, reported |
+
+Everything a skip costs is one line in `fleet_status`; nothing retries
+in a tight loop.
+
+**The budget, explicit and bounded.** This is the one place the control
+plane deliberately generates inference load, so the numbers are written
+down rather than implied:
+
+| knob | value | where enforced |
+|---|---|---|
+| chat probe | 1 request, deterministic ~200-token prompt, `max_tokens: 64`, `temperature: 0`, non-streaming | `modelprobe` (constant) |
+| embed probe | 1 request, 64 fixed short inputs (the field-proven 64-input batch shape) | `modelprobe` (constant) |
+| per-probe wall bound | 120 s, then abandoned and recorded as a failure | `modelprobe` |
+| min gap between two probes of the same model | 5 min | cell (hard floor, survives a duplicated command) |
+| max probes per cell per rolling 24 h | 96 | cell (hard cap) |
+| scheduled interval floor | 5 min, clamped like `minRestoreAfterIdle` | daemon config wiring |
+| concurrent probes per cell | 1 (single-flight) | cell |
+
+Worst case per cell per day: 96 × (~200 prompt + 64 generated) ≈ 25 k
+tokens. The cell-side caps are the real bound — the piggyback queue is
+at-least-once by design (C6), so a redelivered command must not buy a
+second probe, and it doesn't.
+
+**Probes are metered as ordinary traffic.** C7a's poke rule is
+`output_tokens <= 1`, and a 64-token probe is not a poke, so probe
+tokens land in the billable columns of the usage ledger. That is
+~25 k tokens/cell/day at the cap and typically ~1 k. Tagging them is not
+possible (llama-swap's `Metadata` is populated only by its internal
+handlers — C7a §3), so the honest move is to say so here and keep the
+budget small enough that it doesn't matter.
+
+### 4. What is measured, and against what baseline
+
+**Metric.** Decode throughput, in output tokens per second, from
+llama.cpp's own `timings` block on the non-streaming response
+(`timings.predicted_per_second`). It excludes prompt processing and
+queueing, which is what makes it comparable across runs. When the
+response carries no `timings` (mlx, or a future engine), the fallback is
+end-to-end `completion_tokens / wall_seconds` — recorded under a
+**different metric name** (`e2e_tok_s` vs `decode_tok_s`) and keyed
+separately, because comparing the two would manufacture a regression out
+of a parser change. Embedding probes measure `embed_inputs_s`.
+
+TTFT is recorded for context and **is not scored**: a probe that lands
+behind a real request measures the queue, and scoring that would fire
+the alarm exactly when the box is busy — the inverse of the signal.
+
+**Baseline location: the cell, beside the prober.** Not
+`fleetapi/history.go`, and the reasoning is worth keeping:
+
+- `history.go` is fleetd's, and the *verdict* has to be computable on the
+  cell — C3's cardinal rule is that an unreachable registry never affects
+  the box. A cell whose registry is down must still know its model is
+  degraded and say so on the next successful heartbeat.
+- Its keyspace is wrong: `map[model][]{at, seconds}` versus C8's
+  `(model, flags_sha256, metric)`.
+- What C8 *does* reuse is its **shape**, deliberately: a small rolling
+  window (cap 20 samples), persisted as one JSON file, rewritten on every
+  record through tmp+rename. `history.go`'s comment says rewrite-on-record
+  is right because "starts are rare (seconds-to-minutes apart at best)".
+  Probes are minutes-to-hours apart, so the same reasoning applies, and
+  C7a's opposite choice (append-only JSONL) was driven by a 15-second
+  fold cadence that does not exist here.
+
+**The baseline key includes `flags_sha256`.** A def edit — new quant, new
+`-ngl`, a changed draft model — produces a different server, and scoring
+the new one against the old one's numbers reports a regression that is
+really a change. On a fingerprint change the baseline for that key is
+simply empty: verdict `unknown`, "baselining (2/5 samples)". This is the
+same hash C3 already computes and announces; C8 adds no second notion of
+identity.
+
+**Scoring.** `ratio = value / baseline_p50`, where `baseline_p50` is the
+median of the stored samples for that key, excluding the current one.
+
+- fewer than 5 samples → `unknown` (never `degraded` without a baseline;
+  the false-alarm class this rules out is "a fresh cell screams on boot")
+- `ratio < 0.50` → `degraded`
+- `ratio >= 0.65` → `ok`
+- in between → the previous verdict is kept (hysteresis, so a model
+  sitting near the line doesn't drip transition events)
+
+**Baseline updates: healthy samples only.** A `degraded` sample does not
+enter the window. The alternative — every sample updates — means a
+genuine, persistent 2× regression washes out of a 20-sample median in
+about eleven probes and the status quietly goes green while the box is
+still slow. The cost of the choice is that a *legitimate* permanent
+slowdown (a llama.cpp build that trades tok/s for something else, and
+therefore changes no flags) stays flagged forever, so the escape hatch is
+explicit rather than automatic: `probe_model(..., rebaseline: true)`
+clears that key's window and starts over. The status carries
+`degraded_since` and the baseline's own age so "flagged for six days
+against a baseline from July" is legible.
+
+### 5. `degraded` is a per-model health state and lives nowhere else
+
+The three ownership axes (design §4) are availability (observed), intent
+(declared) and residency (llama-swap's). A degraded model on a serving
+cell is a **fourth thing**, and this phase's main way to fail is to let
+it leak into the first one. So:
+
+- `degraded` is carried on the **model row** —
+  `AnnounceModel.Probe`, surfaced as `ModelState.Probe` in
+  `/api/fleet/state` — never on `CellSnapshot.Reachable`,
+  `CellSnapshot.Display` or `Intent`. A cell with three healthy models
+  and one degraded one is `SERVING`, exactly as it is.
+- It never changes what the front render emits. `render_loop.go`'s
+  exclusion path stays fingerprint-only.
+- It never triggers a warm, an unload, a drain or a render.
+- It is not inferred from anything. No verdict is ever computed from
+  observed traffic, TTL churn, or a cell's silence — only from a probe
+  that actually ran and returned a number. "No probe has run" is
+  `unknown`, and `unknown` reads as *nothing is known*, not as *fine*.
+
+**Why not withdraw a degraded model from the render** (design §10's
+sketch says "marking models degraded → withdrawn from render"): three
+reasons, and this doc is the work order, so it decides.
+(a) A degraded chat model still answers; yanking its id from the catalog
+turns a slow model into a fleet-wide 404 for every consumer pinning it —
+the failure mode the class table's `hold` policy exists to prevent.
+(b) The probe has a false-positive tail by construction (§4's queueing
+note), and a fail-closed action on a measurement with a false-positive
+tail is exactly the "blanket fail-closed fingerprints" alternative
+design §9 already rejected. (c) The operator's fix is one existing verb:
+`unload_model` — the next request JIT-reloads a clean server — so the
+runbook is *probe → unload → probe*, and every step of it is declared.
+
+### 6. Wire format (additive, v1-safe)
+
+`AnnounceModel.Probe` changes from `any` (always `null` in v1) to
+`*AnnounceProbe`. Byte-compatible in both directions: a v1 cell sends
+`"probe": null` and decodes to `nil`; a v1 fleetd receiving a populated
+block decodes it into `any` and ignores it, which is C3's unknown-field
+tolerance doing its job.
+
+```json
+{ "id": "qwen3.6-27b", "state": "ready", "flags_sha256": "9f2c…",
+  "probe": { "kind": "chat", "spec": "chat/v1:64out",
+             "at": "2026-08-04T14:03:11Z",
+             "metric": "decode_tok_s", "value": 41.7,
+             "baseline_p50": 44.9, "samples": 12, "ratio": 0.93,
+             "verdict": "ok", "ttft_ms": 210,
+             "flags_sha256": "9f2c…" } }
+```
+
+The announce response's `commands[]` gains the `probe` verb
+(`{"verb":"probe","model":"qwen3.6-27b","rebaseline":false}`). An old
+cell receiving it logs "unknown piggyback verb" and continues — already
+its behaviour, unchanged.
+
+Ingest hygiene follows C7a's precedent exactly: the announce is untrusted
+input, so strings are length/control-char checked and numbers are clamped
+non-negative, but an unrecognised `kind` or `metric` is **not** rejected —
+a cell one version ahead must not have its whole heartbeat (and with it
+presence, and the intent echo) refused over an accounting field. `verdict`
+is enum-checked and an unknown value reads as `unknown`, because that
+field drives an event.
+
+### 7. What fleetd does with it
+
+- **Display**: `ModelState.Probe` on every cell snapshot, so the MCP
+  `fleet_status`, `GET /api/fleet/state` and the C4 page all show the
+  same numbers. The page grows one badge on a degraded model span — no
+  new route, no new mutation surface (C5's exact-match bearer exemption
+  is untouched).
+- **Events**: `fleet.modelDegraded` / `fleet.modelRecovered` on verdict
+  transitions only (never on every heartbeat). C3 §3 reserved
+  `model_degraded` with no emitter; the emitted names follow the code's
+  dotted-camelCase convention like every other fleet event.
+- **A `probe` block in `fleet_status`** beside `warm`: per target, its
+  last request, its last result, its next due time, and the reason for
+  the most recent skip. A guard that silently skips forever is the
+  failure C5 spent a phase fixing.
+- **Scheduling**: `probe_targets:` in the fleetd config — declared, never
+  implicit. No entries means no probing at all, which is the default.
+
+### 8. Files
+
+| piece | where |
+|---|---|
+| cell-side prober + baseline | `internal/vibe/modelprobe/` (new) |
+| wire types, ingest, events | `fleetapi/announce.go` |
+| scheduler, guards, status block | `fleetapi/probe.go` (new) |
+| snapshot surfacing | `fleetapi/fleetapi.go`, `fleetapi/display.go` |
+| page badge | `fleetapi/fleet.html` |
+| cell wiring (verb + blocks) | `fleetannounce/fleetannounce.go` |
+| daemon wiring | `daemon/announce.go`, `daemon/probe.go` (new), `daemon/daemon.go` |
+| slim-announcer wiring | `cli/cmd_fleet.go` |
+| MCP verb | `fleetmcp/fleetmcp.go`, `fleetmcp/probe.go` (new) |
+| state file | `paths.CellProbeFile()` |
+
+## Acceptance gates
+
+1. **A probe never loads a model (unit).** With the cell's `/running`
+   reporting the model absent (and with it reporting `stopped`), the
+   prober issues **no** request to `/v1/chat/completions` and returns a
+   refusal naming residency. Mutation-tested: deleting the residency
+   check makes the test fail.
+   `TestProbe_RefusesAModelThatIsNotResidentAndIssuesNoRequest`.
+2. **fleetd's scheduler respects the C4 guards (unit).** A probe target
+   is skipped, with the reason in `fleet_status`, when the cell is
+   drained, when the cell is stale, when in-flight > 0, when in-flight is
+   **unreported**, when an active lease names the cell, and when the
+   model is not announced `ready` — and it queues exactly one `probe`
+   command when none of those hold.
+   `TestProbeSchedule_*`.
+3. **Degraded does not leak into availability (unit).** A cell
+   announcing a `degraded` verdict on one model still renders
+   `SERVING`, `reachable: true`, unchanged `intent`, and its model set is
+   unchanged in the front render. Mutation-tested against a deliberate
+   leak.
+   `TestProbe_DegradedModelDoesNotChangeCellDisplayOrRender`.
+4. **Baseline scoring (unit).** Under 5 samples → `unknown`, never
+   `degraded`. A 3× slowdown against a 10-sample baseline → `degraded`
+   with the ratio. A sample inside the hysteresis band keeps the previous
+   verdict. A `flags_sha256` change starts a fresh baseline rather than
+   scoring across it. A degraded sample does not enter the baseline
+   window; `rebaseline` clears it.
+   `TestScore_*`, `TestBaseline_*`.
+5. **Budget is enforced on the cell (unit).** Two probe commands inside
+   the cooldown produce one probe; the 24 h cap refuses the 97th; two
+   concurrent probes produce one request and one "already running".
+   `TestProbe_CooldownAndCapAreEnforcedOnTheCell`,
+   `TestProbe_SingleFlight`.
+6. **The heartbeat is never held hostage (unit).** A probe that takes
+   longer than an announce interval does not delay the announce loop: the
+   command handler returns immediately and the result appears in a later
+   heartbeat. Mutation-tested against a synchronous implementation.
+   `TestAnnounceProbeCommand_DoesNotBlockTheHeartbeat`.
+7. **Wire compatibility (unit).** A v1 announce with `"probe": null`
+   round-trips unchanged; a populated block survives a
+   marshal/unmarshal cycle; an announce carrying an unknown `kind`,
+   unknown `metric`, or a garbage `verdict` is **accepted** (verdict
+   normalised to `unknown`) rather than costing the cell its heartbeat;
+   negative values are clamped at ingest.
+   `TestAnnounceProbe_*`.
+8. **Events fire on transitions only (unit).**
+   `fleet.modelDegraded` once when the verdict flips, nothing on repeat
+   heartbeats carrying the same verdict, `fleet.modelRecovered` on the
+   way back.
+   `TestProbeEvents_FireOnTransitionsOnly`.
+9. **Streaming contract (mechanical).**
+   `git diff --stat main..HEAD -- internal/vibe/proxy` is empty for the
+   whole phase.
+10. **Full inner loop** (ground rule 4): build, vet, gofmt, `go mod
+    tidy`, `go test -race -count=5 ./...`, `golangci-lint run` — plus
+    ground rule 9's adversarial self-review as its own commit.
+
+### Live gates (need real cells; NOT runnable from the implementing
+environment)
+
+L1. **Real baseline, real verdict.** Probe a resident chat model on the
+    gpu-cell ten times over an evening; confirm the samples cluster,
+    `verdict: ok`, and the `p50` matches what `llama-bench`-style manual
+    timing says within ~10%.
+L2. **Induced degradation is caught.** Force the classic failure: load a
+    second large model so the first spills out of VRAM (or start a
+    competing process), then probe. Verdict flips to `degraded`,
+    `fleet.modelDegraded` lands on the events stream, `fleet_status`
+    shows the ratio, and `unload_model` + a fresh probe returns it to
+    `ok`.
+L3. **The load rule holds in the field.** `probe_model` a model that is
+    *not* resident on a cell with a TTL that just evicted it: the cell
+    refuses, `nvidia-smi` shows no load, and the front catalog is
+    unchanged.
+L4. **Budget observed.** With a 15-minute `probe_targets` interval on
+    two cells for 24 h, the cell-side counters show ≤ 96 probes each and
+    C7a's ledger shows the corresponding token delta within the stated
+    envelope.
+L5. **Embed probe on the utility cell.** A 64-input batch against the
+    embedding model produces `embed_inputs_s` with a stable baseline;
+    changing a serving flag starts a fresh baseline instead of reporting
+    a regression.
+
+## Out of scope (deliberately)
+
+- **Withdrawing degraded models from the front render.** §5 decides
+  against it and says why. If it is ever revisited, it belongs behind the
+  same `fingerprint: strict` opt-in embed defs already use, not as
+  default behaviour.
+- **Auto-remediation** (probe → unload → re-probe without a human). The
+  measurement must not become an actuator; the runbook is documented
+  instead. `sleep_schedule`-style declared-action-deferred-by-observation
+  is the sanctioned shape if this is ever wanted.
+- **Latency SLOs, percentile dashboards, Prometheus export.** llama-swap's
+  `/ui` and metrics own throughput display; C8 owns one comparison
+  against one baseline.
+- **Probing through the front, or fleetd-side probing of any kind.** §1.
+- **Tool-call-rate / quality scoring** (`vibe bench replay`, futures item
+  11). C8 measures speed only; a quality regression is a different phase
+  with a different corpus.
+- **Tagging probe traffic out of the C7a ledger.** Not possible without a
+  llama-swap change (§3); documented instead.
+- **Per-cell probe credentials or a separate probe token.** The fleet
+  token remains every cell's voice (design §6); a forged announce can
+  already fake `SERVING`, and after C8 it can additionally fake
+  `degraded` — which does nothing but display, by §5's construction.
+
+Estimated ~700 lines + tests, on the plan's calibration (C0–C4 ran
+3.6–4.5× their estimates).

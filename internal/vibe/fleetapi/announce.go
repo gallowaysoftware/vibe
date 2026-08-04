@@ -42,7 +42,65 @@ type AnnounceModel struct {
 	State       string `json:"state"` // llama-swap's states mapped through
 	FlagsSHA256 string `json:"flags_sha256,omitempty"`
 	Fingerprint string `json:"fingerprint,omitempty"` // "strict" | "advisory" (default)
-	Probe       any    `json:"probe"`                 // reserved (v2 throughput block); null in v1
+	// Probe is C3 §1's reserved per-model throughput-health block, filled
+	// in by C8. Nil marshals to `null` exactly as the v1 reservation did,
+	// so the wire is unchanged for cells that do not probe.
+	Probe *AnnounceProbe `json:"probe"`
+}
+
+// Probe verdicts. A verdict is only ever computed from a probe that
+// RAN and returned a number: "no probe has run" is VerdictUnknown, and
+// unknown means nothing is known — never that the model is fine.
+const (
+	VerdictOK       = "ok"
+	VerdictDegraded = "degraded"
+	VerdictUnknown  = "unknown"
+)
+
+// AnnounceProbe is the v2 throughput-health block (fleet-control C8):
+// one canned, deterministic request the CELL issued against a model that
+// was already resident, timed and scored against that model's own recent
+// healthy samples.
+//
+// It is display and event data only. A degraded verdict never changes
+// availability (observed), intent (declared) or residency
+// (llama-swap-owned), never excludes a model from the front render, and
+// never triggers a warm, an unload or a drain — see C8 §5. The one way
+// this phase fails is by letting a measurement become an actuator.
+type AnnounceProbe struct {
+	Kind string    `json:"kind"`           // "chat" | "embed"
+	Spec string    `json:"spec,omitempty"` // canned spec id, e.g. "chat/v1:64out"
+	At   time.Time `json:"at"`
+	// Metric names WHAT was measured, because two engines answer with
+	// different evidence: decode_tok_s comes from llama.cpp's own timings
+	// block (queueing excluded), e2e_tok_s is the fallback for responses
+	// that carry none. Baselines are keyed by metric so a parser change
+	// can never read as a regression.
+	Metric string  `json:"metric"`
+	Value  float64 `json:"value"`
+	// BaselineP50 is the median of the model's stored healthy samples for
+	// this (model, flags_sha256, metric) key, EXCLUDING this one; Samples
+	// is how many backed it.
+	BaselineP50 float64 `json:"baseline_p50,omitempty"`
+	Samples     int     `json:"samples,omitempty"`
+	Ratio       float64 `json:"ratio,omitempty"`
+	Verdict     string  `json:"verdict"`
+	// TTFTMS is recorded for context and deliberately NOT scored: a probe
+	// that lands behind real work measures the queue, so scoring it would
+	// fire the alarm exactly when the box is busy.
+	TTFTMS int64 `json:"ttft_ms,omitempty"`
+	// DegradedSince marks when the verdict last flipped to degraded, so a
+	// model flagged for a week against an old baseline is legible.
+	DegradedSince *time.Time `json:"degraded_since,omitempty"`
+	// BaselineAt is the newest healthy sample behind BaselineP50.
+	BaselineAt *time.Time `json:"baseline_at,omitempty"`
+	// FlagsSHA256 binds the numbers to the serving argv they were measured
+	// against: a def edit starts a fresh baseline instead of reporting a
+	// configuration change as a regression.
+	FlagsSHA256 string `json:"flags_sha256,omitempty"`
+	// Note carries a refusal or failure reason (not resident, cooldown,
+	// request failed) for a probe that produced no number.
+	Note string `json:"note,omitempty"`
 }
 
 // AnnounceCapacity is the cell's free resources (advisory display data).
@@ -136,8 +194,16 @@ type AnnounceRequest struct {
 // reflect in its next announce (verbs whose latency doesn't matter
 // after C3; interactive paths still use daemon_url when present).
 type AnnounceCommand struct {
-	Verb  string `json:"verb"` // "unload" | "warm"
+	Verb  string `json:"verb"` // "unload" | "warm" | "probe"
 	Model string `json:"model"`
+	// Rebaseline applies to the probe verb only: clear this model's
+	// stored samples before recording the new one. It is the escape hatch
+	// for a LEGITIMATE permanent slowdown (a build that trades tok/s for
+	// something else changes no serving flags, so the fingerprint key
+	// cannot notice it), and it is explicit because the alternative —
+	// letting degraded samples re-baseline on their own — turns the status
+	// green while the box is still slow.
+	Rebaseline bool `json:"rebaseline,omitempty"`
 }
 
 // AnnounceResponse is fleetd's answer: cadence, desired intent (a
@@ -171,6 +237,11 @@ const (
 	EventCellWithdrawn = "fleet.cellWithdrawn"
 	EventCellReturned  = "fleet.cellReturned"
 	EventFingerprint   = "fleet.fingerprintMismatch"
+	// C3 §3 reserved a model_degraded event with no emitter; C8 is the
+	// emitter, named in the same dotted camelCase the CLI and the live SSE
+	// consumers already match on.
+	EventModelDegraded  = "fleet.modelDegraded"
+	EventModelRecovered = "fleet.modelRecovered"
 )
 
 // staleAfter derives the staleness bound: 3× the announced interval
@@ -256,6 +327,9 @@ func validateAnnounce(req *AnnounceRequest) error {
 		if err := clean("models[].state", m.State); err != nil {
 			return err
 		}
+		if err := validateProbe(m.Probe); err != nil {
+			return err
+		}
 	}
 	if req.Versions != nil {
 		for label, v := range map[string]string{
@@ -289,6 +363,109 @@ func validateAnnounce(req *AnnounceRequest) error {
 	return nil
 }
 
+// validateProbe applies the same field hygiene the rest of the announce
+// gets to C8's throughput block. Deliberately NOT an enum check on kind
+// or metric: a cell one version ahead that measures something new must
+// not have its whole heartbeat rejected — that would take presence and
+// the intent echo down with an accounting field. The verdict IS
+// normalized (normalizeProbe), because that one drives an event.
+func validateProbe(p *AnnounceProbe) error {
+	if p == nil {
+		return nil
+	}
+	for label, v := range map[string]string{
+		"models[].probe.kind":         p.Kind,
+		"models[].probe.spec":         p.Spec,
+		"models[].probe.metric":       p.Metric,
+		"models[].probe.verdict":      p.Verdict,
+		"models[].probe.note":         p.Note,
+		"models[].probe.flags_sha256": p.FlagsSHA256,
+	} {
+		if err := clean(label, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// normalizeProbe hardens one announced probe block at ingest. The
+// announce is untrusted input (C3/C5's posture — the fleet token is
+// every cell's voice), and these numbers are read straight into status
+// surfaces: negatives are clamped rather than rendered, and an
+// unrecognised verdict becomes "unknown" rather than a fourth state
+// nothing downstream handles. Clamping at ingest is the same rule C7a's
+// clampUsage follows, minus the append-only urgency.
+func normalizeProbe(p *AnnounceProbe) {
+	if p == nil {
+		return
+	}
+	switch p.Verdict {
+	case VerdictOK, VerdictDegraded, VerdictUnknown:
+	default:
+		p.Verdict = VerdictUnknown
+	}
+	p.Value = clampNonNegF(p.Value)
+	p.BaselineP50 = clampNonNegF(p.BaselineP50)
+	p.Ratio = clampNonNegF(p.Ratio)
+	if p.Samples < 0 {
+		p.Samples = 0
+	}
+	if p.TTFTMS < 0 {
+		p.TTFTMS = 0
+	}
+}
+
+func clampNonNegF(v float64) float64 {
+	// NaN fails every comparison, so it is caught by the negation rather
+	// than by v < 0: a NaN rendered into fleet_status is not a number a
+	// human can act on, and JSON cannot even carry it.
+	if !(v >= 0) {
+		return 0
+	}
+	return v
+}
+
+// probeEvents reports the verdict TRANSITIONS between two announces from
+// one cell. Steady-state heartbeats carrying the same verdict publish
+// nothing (C3's transition-gating rule); degraded → unknown is NOT a
+// recovery, because losing the evidence is not the same as getting a
+// good number back.
+func probeEvents(cell string, prev, next []AnnounceModel) []Event {
+	was := make(map[string]string, len(prev))
+	for _, m := range prev {
+		if m.Probe != nil {
+			was[m.ID] = m.Probe.Verdict
+		}
+	}
+	var out []Event
+	for _, m := range next {
+		if m.Probe == nil {
+			continue
+		}
+		before := was[m.ID]
+		switch {
+		case m.Probe.Verdict == VerdictDegraded && before != VerdictDegraded:
+			out = append(out, Event{Cell: cell, Type: EventModelDegraded, Data: probeEventData(m)})
+		case m.Probe.Verdict == VerdictOK && before == VerdictDegraded:
+			out = append(out, Event{Cell: cell, Type: EventModelRecovered, Data: probeEventData(m)})
+		}
+	}
+	return out
+}
+
+// probeEventData carries the model and its numbers on the event, so an
+// SSE consumer does not have to re-fetch state to know what changed.
+func probeEventData(m AnnounceModel) json.RawMessage {
+	data, err := json.Marshal(struct {
+		Model string         `json:"model"`
+		Probe *AnnounceProbe `json:"probe"`
+	}{Model: m.ID, Probe: m.Probe})
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
 // echoFutureSkew bounds how far ahead of fleetd's clock an echo's
 // timestamp may be. The announce client stamps time.Now(), so a small
 // allowance covers jitter; a skewed or forged clock (year-2999) gets
@@ -314,6 +491,12 @@ func clampEchoClock(req *AnnounceRequest) {
 func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	now := time.Now().UTC()
 	intervalS := DefaultAnnounceIntervalS
+
+	// Hardened here rather than in the handler so every ingest path — the
+	// HTTP endpoint and the in-process callers — gets the same treatment.
+	for i := range req.Models {
+		normalizeProbe(req.Models[i].Probe)
+	}
 
 	s.mu.Lock()
 	p := s.presence[req.Cell]
@@ -362,6 +545,11 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	// mismatch always raises a loud event". Two independent reasons to
 	// re-render, one trigger.
 	fingerprintChanged := modelFingerprintChanged(prevModels, req.Models)
+	// Verdict transitions are computed against the SAME prevModels the
+	// render triggers use, under the same lock: reading p.Models again
+	// after the unlock would race a concurrent announce and either miss a
+	// transition or report one twice.
+	probeTransitions := probeEvents(req.Cell, prevModels, req.Models)
 	withdrawn := p.Withdrawn
 	s.mu.Unlock()
 	if modelChanged || fingerprintChanged {
@@ -381,6 +569,7 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	case wasStaleOrWithdrawn:
 		events = append(events, Event{Cell: req.Cell, Type: EventCellReturned})
 	}
+	events = append(events, probeTransitions...)
 
 	// The conflict rule, registry side (intentMu orders this against
 	// concurrent SetIntent calls — mu stays the leaf): a NEWER echo
@@ -559,8 +748,10 @@ func (s *Server) cellClass(name string) string {
 // in-flight slot stamped with this announce's seq instead of being
 // deleted, and only an announce with a HIGHER seq — proof the cell read
 // the response it was attached to — retires it. Deleting at hand-off
-// lost the batch whenever the response never arrived. Both verbs
-// (unload/warm) are idempotent, so a duplicate is harmless.
+// lost the batch whenever the response never arrived. unload and warm
+// are idempotent, so a duplicate is harmless; probe is not (it spends
+// GPU time), which is why the cell — not this queue — holds the cooldown
+// and the daily cap that make a redelivered probe free.
 func (s *Server) drainCommands(cell string, seq uint64) []AnnounceCommand {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -591,9 +782,9 @@ func (s *Server) drainCommands(cell string, seq uint64) []AnnounceCommand {
 // the caller rather than sit in a queue nothing will ever execute.
 func (s *Server) QueueCommand(cell string, cmd AnnounceCommand) error {
 	switch cmd.Verb {
-	case "unload", "warm":
+	case "unload", "warm", "probe":
 	default:
-		return fmt.Errorf("unknown verb %q (want unload or warm)", cmd.Verb)
+		return fmt.Errorf("unknown verb %q (want unload, warm or probe)", cmd.Verb)
 	}
 	p := s.PresenceFor(cell)
 	if p == nil || !p.Announcing {

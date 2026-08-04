@@ -91,6 +91,12 @@ type ModelState struct {
 	State string `json:"state"`
 	TTL   int    `json:"ttl,omitempty"`
 	Name  string `json:"name,omitempty"`
+	// Probe is the cell's latest throughput-health block for this model
+	// (C8). Health is a per-MODEL property and lives ONLY here: it never
+	// touches CellSnapshot.Reachable, .Display or .Intent, because those
+	// are the availability and intent axes and a slow model is neither an
+	// absent cell nor a declared one.
+	Probe *AnnounceProbe `json:"probe,omitempty"`
 }
 
 // CellSnapshot is one cell's merged state in the fleet snapshot.
@@ -136,6 +142,9 @@ type StateSnapshot struct {
 	// Warm is the C4 warm policy status (targets + schedule), present
 	// when either is configured.
 	Warm *warmStatus `json:"warm,omitempty"`
+	// Probe is the C8 throughput-probe status (scheduler state + the
+	// currently-degraded models), present when either exists.
+	Probe *probeStatus `json:"probe,omitempty"`
 }
 
 // snapshotTimeout bounds the per-cell /running + /v1/models probes so one
@@ -257,6 +266,10 @@ type Server struct {
 	// the entries in place under s.mu.
 	warmStates  []*warmTargetState
 	schedStates []*warmScheduleState
+
+	// probeStates is the C8 probe scheduler's status surface, same
+	// discipline as the warm states.
+	probeStates []*probeTargetState
 
 	// started is this process's boot instant, immutable after New. The
 	// warm policy uses it as the idle floor for a model no inflight frame
@@ -455,6 +468,7 @@ func (s *Server) probeSnapshot(ctx context.Context) StateSnapshot {
 		StartHistory: s.hist.Stats(),
 		FrontRenders: s.RenderCount(),
 		Warm:         s.warmReport(),
+		Probe:        s.probeReport(),
 	}
 	var wg sync.WaitGroup
 	for i, c := range s.cells {
@@ -576,6 +590,9 @@ func (s *Server) snapshotCell(ctx context.Context, c Cell) CellSnapshot {
 		idx[r.Model] = len(snap.Models)
 		snap.Models = append(snap.Models, ModelState{ID: r.Model, State: r.State, TTL: r.TTL, Name: r.Name})
 	}
+	// After the model list is complete, whichever way it was built (probe
+	// merge above, or presence in decorate when the cell answers nothing).
+	s.attachProbes(&snap)
 	sort.Slice(snap.Models, func(i, j int) bool { return snap.Models[i].ID < snap.Models[j].ID })
 	return snap
 }
