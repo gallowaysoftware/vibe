@@ -87,6 +87,14 @@ func CellIntentFile() string { return filepath.Join(StateHome(), "fleet", "cell-
 // the arrears.
 func CellUsageFile() string { return filepath.Join(StateHome(), "fleet", "cell-usage.json") }
 
+// CellProbeFile persists the cell-side throughput prober's rolling
+// baselines and budget counters (fleet-control C8 §4). It lives on the
+// CELL because the verdict has to be computable there: C3's cardinal
+// rule is that an unreachable registry never affects the box, and a cell
+// whose fleetd is down must still know its model is degraded and say so
+// on the next successful heartbeat.
+func CellProbeFile() string { return filepath.Join(StateHome(), "fleet", "model-probe.json") }
+
 // FrontCloudUsageFile persists fleetd's cursor and cumulative counters
 // for the FRONT's cloud_peer traffic (fleet-control C7b §6) — actual
 // spend, reconstructed from the front's own activity log. Separate from

@@ -29,6 +29,7 @@
   .cls { color: var(--dim); font-size: 12px; }
   .models { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
   .m-ready { color: var(--green); } .m-starting { color: var(--amber); } .m-other { color: var(--dim); }
+  .m-degraded { color: var(--red); font-weight: 600; }
   .intent { color: var(--amber); } .lastseen { color: var(--dim); }
   .leases { color: var(--blue); font-size: 12px; }
   button { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 4px;
@@ -191,7 +192,17 @@ function badgeClass(d) {
 }
 function modelSpan(m) {
   const cls = m.state === "ready" ? "m-ready" : (m.state === "starting" ? "m-starting" : "m-other");
-  return `<span class="${cls}">${esc(m.id)}:${esc(m.state)}</span>`;
+  let out = `<span class="${cls}">${esc(m.id)}:${esc(m.state)}</span>`;
+  // C8: per-MODEL health. It rides the model row and nowhere else — the
+  // cell's own badge (display state) stays exactly what availability and
+  // intent say, because a slow model is neither an absent cell nor a
+  // declared one.
+  const p = m.probe;
+  if (p && p.verdict === "degraded") {
+    const ratio = p.ratio ? ` ${Math.round(p.ratio * 100)}% of baseline` : "";
+    out += ` <span class="m-degraded" title="${attr(p.metric + " " + p.value + " vs baseline " + p.baseline_p50)}">degraded${esc(ratio)}</span>`;
+  }
+  return out;
 }
 
 async function refresh() {
@@ -249,6 +260,13 @@ function render(st) {
     // textContent below is the safe sink; escaping here would show the
     // entities as literal text.
     bits.push("warm targets: " + st.warm.targets.map(t => `${t.model}@${t.cell} ${t.state}`).join(" · "));
+  }
+  if (st.probe && (st.probe.degraded || []).length) {
+    bits.push("degraded: " + st.probe.degraded.join(" · "));
+  }
+  if (st.probe && (st.probe.targets || []).length) {
+    bits.push("probes: " + st.probe.targets.map(t =>
+      `${t.model}@${t.cell} ${t.state}`).join(" · "));
   }
   if (st.warm && (st.warm.schedule || []).length) {
     bits.push("schedules: " + st.warm.schedule.map(s =>

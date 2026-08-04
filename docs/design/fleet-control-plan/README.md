@@ -1,4 +1,4 @@
-# Fleet-control implementation plan (C0–C7)
+# Fleet-control implementation plan (C0–C8)
 
 Execution plan for [../fleet-control.md](../fleet-control.md). Each
 phase is one PR, independently shippable, and pays for itself before
@@ -16,11 +16,12 @@ to be implementable on its own after that.
 | [C6](c6-substrate-repair.md) | Substrate repair: the C1–C3 findings against merged code | ~500 lines | independent of C5 | merged (#23); unit gates green, live gates 1 + 2 UNRUN |
 | [C7a](c7a-usage-ledger.md) | The usage ledger: tokens per cell, per model, per day | ~710 lines | C4 | merged (#24); unit gates green, 7 live gates UNRUN |
 | [C7b](c7b-savings-screen.md) | The savings screen: what the fleet didn't spend | ~690 lines + ~100 KB data | C7a, C5 | merged (#25); unit gates green, live plausibility gate UNRUN |
+| [C8](c8-probe-model.md) | probe_model: throughput health against the model's own baseline | ~900 lines | C3, C4 | merged (#27); unit gates 1-10 green, 5 live gates UNRUN |
 
 **Merged is not live-gated.** Every C0–C7b PR merged on a green CI run
 of the mechanical inner loop. The live gates — the ones that need real
 cells, a real GPU and a real week of traffic — are UNRUN for C5, C6,
-C7a and C7b, and each phase doc lists exactly which. Ground rule 10
+C7a, C7b and C8, and each phase doc lists exactly which. Ground rule 10
 applies to this table: a status cell is a claim about a mechanical run.
 
 Line counts are order-of-magnitude scoping signals, not budgets. Actual
@@ -31,6 +32,14 @@ implementation run. C5 is not new scope — it is the self-review step
 C1, C2 and C3 each got and C4 did not (see ground rule 9). C6 is the
 same audit's findings against already-merged code, split out so
 landing C4 stays reviewable.
+
+C8 (2026-08-04) is the first v2-backlog item to land: `probe_model`,
+ranked first in [fleet-control-futures.md](../fleet-control-futures.md)
+§2 because friction pain 2 is the one guaranteed incident of the year.
+It fills the per-model `probe` slot C3 reserved, and its single hardest
+rule is that the measurement must never become an actuator — a probe
+runs only against an already-resident model, and a `degraded` verdict
+changes nothing but a display.
 
 C7a/C7b were added the same day: a "did my hardware pay for itself"
 screen. They are split because C7a (counting) is mechanically

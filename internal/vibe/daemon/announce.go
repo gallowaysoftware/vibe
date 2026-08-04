@@ -17,6 +17,7 @@ import (
 	"github.com/gallowaysoftware/vibe/internal/buildinfo"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetannounce"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
+	"github.com/gallowaysoftware/vibe/internal/vibe/modelprobe"
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 	"github.com/gallowaysoftware/vibe/internal/vibe/router"
@@ -47,6 +48,7 @@ func (d *Daemon) startAnnounce(ctx context.Context) error {
 	}
 
 	llamaSwapURL := "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(d.cfg.ProxyPort))
+	probes, runProbe := modelprobe.Hooks(llamaSwapURL, paths.CellProbeFile(), cellDefs, d.cfg.LlamaBinary)
 
 	ann, err := fleetannounce.New(fleetannounce.Config{
 		Cell:              d.cfg.Fleet.Cell,
@@ -63,6 +65,8 @@ func (d *Daemon) startAnnounce(ctx context.Context) error {
 		Versions: d.fleetVersions,
 		Capacity: d.fleetCapacity,
 		Usage:    usagemeter.Snapshotter(llamaSwapURL, paths.CellUsageFile()),
+		Probes:   probes,
+		RunProbe: runProbe,
 	})
 	if err != nil {
 		return err

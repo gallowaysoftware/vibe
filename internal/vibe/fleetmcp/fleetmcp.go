@@ -270,6 +270,28 @@ func (s *Server) mcpTools() []any {
 			},
 		},
 		map[string]any{
+			"name": "probe_model",
+			"description": "Measure one model's throughput on its cell and score it against that " +
+				"model's own rolling baseline — the answer to \"is this thing slow right now?\", " +
+				"which fleet_status cannot give you (llama-server degrades 10-100x while /health " +
+				"stays green). Probes ONLY a model the cell already holds resident: a probe never " +
+				"loads a model, so a cold one is refused with a note to warm_model first. It is " +
+				"also refused while the cell is busy, leased or drained — a probe spends real GPU " +
+				"time. The measurement runs on the cell, so the result lands about two heartbeats " +
+				"later; read it back with fleet_status. A degraded verdict changes nothing on its " +
+				"own (the catalog, the render and the intent are untouched) — the remediation verb " +
+				"is unload_model, then probe again.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"cell":       map[string]any{"type": "string", "description": "Cell name from hosts.yaml."},
+					"model":      map[string]any{"type": "string", "description": "Model id as the CELL announces it (the canonical def name)."},
+					"rebaseline": map[string]any{"type": "boolean", "description": "Clear this model's stored baseline first. Use ONLY when the model is legitimately slower now (new build, deliberate flag change) and the old baseline is what is wrong."},
+				},
+				"required": []string{"cell", "model"},
+			},
+		},
+		map[string]any{
 			"name": "drain_cell",
 			"description": "Reclaim a cell (stop its serving stack). llama-swap's SIGTERM " +
 				"CANCELS in-flight streams immediately — a drain without wait_seconds " +
@@ -404,6 +426,16 @@ func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMess
 			return "", fmt.Errorf("invalid arguments: %v", err)
 		}
 		return s.toolUnloadModel(ctx, args.Cell, args.Model)
+	case "probe_model":
+		var args struct {
+			Cell       string `json:"cell"`
+			Model      string `json:"model"`
+			Rebaseline bool   `json:"rebaseline"`
+		}
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return "", fmt.Errorf("invalid arguments: %v", err)
+		}
+		return s.toolProbeModel(args.Cell, args.Model, args.Rebaseline)
 	case "drain_cell":
 		var args struct {
 			Cell        string `json:"cell"`

@@ -38,11 +38,16 @@ re-deriving it.
 
 Small (days):
 
-1. **`probe_model(cell, model)`** — a canned realistic batch
-   completion scored against the model's own rolling baseline; marks
-   `degraded` in `fleet_status`. Fills the reserved `probe` slot;
-   converts friction pain 2 from deferred to solved. The history
-   machinery it needs already exists (`fleetapi/history.go`).
+1. **`probe_model(cell, model)`** — **SHIPPED as
+   [C8](fleet-control-plan/c8-probe-model.md) (2026-08-04).** A canned
+   realistic batch completion scored against the model's own rolling
+   baseline; marks `degraded` in `fleet_status`. Fills the reserved
+   `probe` slot; converts friction pain 2 from deferred to answered.
+   Two notes for whoever reads this next: the baseline did NOT reuse
+   `fleetapi/history.go` (it reuses its *shape* — the verdict has to be
+   computable on the cell, whose registry may be down, and the keyspace
+   is `(model, flags_sha256, metric)`), and a degraded model is NOT
+   withdrawn from the render — see the phase doc §5 for why.
 2. **`vibe fleet notify`** — SSE-events-to-webhook bridge (ntfy or
    similar), default policy = the class table's alarm column only
    (always-on staleness, persistent fingerprint mismatch,

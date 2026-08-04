@@ -69,6 +69,18 @@ type Config struct {
 	// than as zero. It takes the announce's ctx so a slow local poll
 	// cannot outlive the heartbeat that asked for it.
 	Usage func(context.Context) *fleetapi.AnnounceUsage
+	// Probes supplies the latest per-model throughput-health blocks (C8),
+	// keyed by model id, for the reserved per-model `probe` field.
+	// Nil-safe: the field stays null, exactly as it was in v1.
+	Probes func() map[string]*fleetapi.AnnounceProbe
+	// RunProbe starts one probe for a model and MUST return immediately —
+	// the probe runs in the background and its result rides a later
+	// heartbeat. A synchronous implementation would hold the announce loop
+	// for the probe's duration, and a degraded model (the case this exists
+	// for) is the slowest probe there is: the cell would go stale for being
+	// slow to prove it was slow. Nil means this cell cannot probe, and the
+	// verb is logged and dropped.
+	RunProbe func(model string, rebaseline bool)
 	// Logger; nil → slog.Default.
 	Logger *slog.Logger
 	// Interval override for tests (0 = follow the registry's interval_s).
@@ -493,6 +505,16 @@ func (c *Client) executeCommand(ctx context.Context, cmd fleetapi.AnnounceComman
 	case "warm":
 		body := `{"model":` + strconv.Quote(cmd.Model) + `,"max_tokens":1,"messages":[{"role":"user","content":"warm"}]}`
 		err = c.postNoContent(ctx, c.cfg.LlamaSwapURL+"/v1/chat/completions", body)
+	case "probe":
+		if c.cfg.RunProbe == nil {
+			c.logger.Info("probe requested but this cell has no prober configured", "model", cmd.Model)
+			return
+		}
+		// Fire-and-forget by contract (Config.RunProbe): the heartbeat is
+		// this cell's only evidence of life and must not wait on inference.
+		c.cfg.RunProbe(cmd.Model, cmd.Rebaseline)
+		c.logger.Info("probe started", "model", cmd.Model, "rebaseline", cmd.Rebaseline)
+		return
 	default:
 		c.logger.Warn("unknown piggyback verb", "verb", cmd.Verb)
 		return
@@ -546,6 +568,10 @@ func (c *Client) gatherModels(ctx context.Context) ([]fleetapi.AnnounceModel, er
 	if err != nil {
 		return nil, err
 	}
+	var probes map[string]*fleetapi.AnnounceProbe
+	if c.cfg.Probes != nil {
+		probes = c.cfg.Probes()
+	}
 	var out []fleetapi.AnnounceModel
 	covered := map[string]bool{}
 	for _, def := range c.cfg.Defs {
@@ -575,6 +601,7 @@ func (c *Client) gatherModels(ctx context.Context) ([]fleetapi.AnnounceModel, er
 		if def.Fingerprint != "" {
 			m.Fingerprint = def.Fingerprint
 		}
+		m.Probe = probes[def.Name]
 		out = append(out, m)
 	}
 	for id := range catalog {
@@ -589,7 +616,7 @@ func (c *Client) gatherModels(ctx context.Context) ([]fleetapi.AnnounceModel, er
 		if state == "" {
 			state = "stopped"
 		}
-		out = append(out, fleetapi.AnnounceModel{ID: id, State: state})
+		out = append(out, fleetapi.AnnounceModel{ID: id, State: state, Probe: probes[id]})
 	}
 	return out, nil
 }

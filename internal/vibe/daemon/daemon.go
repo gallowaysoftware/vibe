@@ -121,6 +121,12 @@ type Config struct {
 	// WarmSchedule is cron-firing model warming (C4): evaluated in the
 	// daemon's TZ (declared via the environment, not inherited).
 	WarmSchedule []WarmScheduleEntry `yaml:"warm_schedule,omitempty"`
+	// ProbeTargets are the declared periodic throughput probes
+	// (fleet-control C8). fleetd ASKS on this schedule; the cell measures
+	// and may refuse. No entries means no probing at all — this is the one
+	// place the control plane deliberately spends GPU time, so it is
+	// declared, never implicit.
+	ProbeTargets []ProbeTarget `yaml:"probe_targets,omitempty"`
 }
 
 // WarmTarget names a cell's default model and the idle window after
@@ -145,6 +151,21 @@ type WarmTarget struct {
 type WarmScheduleEntry struct {
 	Cron  string `yaml:"cron"`
 	Model string `yaml:"model"`
+}
+
+// ProbeTarget is one declared periodic throughput probe (C8). A probe
+// only ever runs against a model the cell already holds resident, so a
+// target on a model that is usually cold simply reports "not resident"
+// and costs nothing.
+type ProbeTarget struct {
+	// Cell is the fleet cell name (must exist in hosts.yaml).
+	Cell string `yaml:"cell"`
+	// Model is the model id to probe, as the CELL announces it (the
+	// canonical def name, never a client-side alias).
+	Model string `yaml:"model"`
+	// Every is the request interval (Go duration string, e.g. "6h"),
+	// floored at minProbeInterval.
+	Every string `yaml:"every"`
 }
 
 // CellCmds maps the unified verbs to this box's process regime. Commands
@@ -536,6 +557,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		// C4: warm policy loops ride the same presence/inflight substrate.
 		d.startWarmLoops(d.cfg, d.hosts)
+		// C8: the probe scheduler rides it too — same guards, and it only
+		// ever ASKS (the cell measures, and may refuse).
+		d.startProbeLoop(d.cfg, d.hosts)
 		// C7b: actual cloud spend, tailed off the front's own activity log.
 		d.startCloudSpendLoop(d.hosts)
 	}
