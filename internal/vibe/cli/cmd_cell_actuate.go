@@ -218,10 +218,7 @@ func drainCell(ctx context.Context, out io.Writer, cell, reason, eta string, yes
 	}
 	leases := fetchLeasesForCell(ctx, cell)
 	if len(leases) > 0 && !yes {
-		fmt.Fprintf(out, "active leases on %s:\n", displayCell(name))
-		for _, l := range leases {
-			fmt.Fprintf(out, "  - %s holds %s: %s (expires %s)\n", l.Holder, l.Model, l.Note, l.ExpiresAt.Local().Format("15:04"))
-		}
+		printLeasePrompt(out, displayCell(name), leases)
 		if !isatty.IsTerminal(os.Stdin.Fd()) {
 			return fmt.Errorf("leases are active and stdin is not a terminal — re-run with --yes to drain anyway")
 		}
@@ -251,6 +248,23 @@ func drainCell(ctx context.Context, out io.Writer, cell, reason, eta string, yes
 	}
 	printDrainReport(out, name, report)
 	return nil
+}
+
+// printLeasePrompt lists the advisory holds a drain would strand. A C11
+// hold is a lease, but "hold holds glm-5" is not the sentence this
+// prompt exists to say to an operator about to take the box: somebody is
+// mid-evaluation on it. Holds still block nothing.
+func printLeasePrompt(out io.Writer, name string, leases []fleetapi.Lease) {
+	fmt.Fprintf(out, "active leases on %s:\n", name)
+	for _, l := range leases {
+		if l.Hold {
+			fmt.Fprintf(out, "  - HELD: %s until %s%s (a drain evicts it; the hold does not block you)\n",
+				termSafe(l.Model), l.ExpiresAt.Local().Format("15:04"), noteSuffix(l.Note))
+			continue
+		}
+		fmt.Fprintf(out, "  - %s holds %s: %s (expires %s)\n",
+			termSafe(l.Holder), termSafe(l.Model), termSafe(l.Note), l.ExpiresAt.Local().Format("15:04"))
+	}
 }
 
 // postCLIIntent records intent at fleetd after a CLI-driven remote verb.
@@ -303,7 +317,16 @@ func printDrainReport(out io.Writer, name string, r *vibev1.CellDrainResponse) {
 		fmt.Fprintln(out, "  warning: lease list unavailable — stranded-work check could not run")
 	}
 	for _, l := range r.ActiveLeases {
-		fmt.Fprintf(out, "  lease: %s holds %s: %s\n", l.Holder, l.Model, l.Note)
+		// The RPC report carries no hold flag (C11 added no proto field),
+		// but the reserved holder is a deterministic key — that is what it
+		// is FOR. Without this the same drain prints "HELD: glm-5" in the
+		// prompt and "hold holds glm-5" three lines later.
+		if l.Holder == fleetapi.HoldHolder {
+			fmt.Fprintf(out, "  HELD: %s%s (a drain evicts it; the hold does not block you)\n",
+				termSafe(l.Model), noteSuffix(l.Note))
+			continue
+		}
+		fmt.Fprintf(out, "  lease: %s holds %s: %s\n", termSafe(l.Holder), termSafe(l.Model), termSafe(l.Note))
 	}
 }
 

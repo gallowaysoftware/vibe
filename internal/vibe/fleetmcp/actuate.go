@@ -13,6 +13,7 @@ import (
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"github.com/gallowaysoftware/vibe/internal/vibe/router"
 	"github.com/gallowaysoftware/vibe/internal/vibeclient"
+	vibev1 "github.com/gallowaysoftware/vibe/proto/vibe/v1"
 )
 
 // The C2 actuation tools. fleetd drives a cell by calling THAT cell's
@@ -141,14 +142,27 @@ func (s *Server) toolDrainCell(ctx context.Context, cell, reason, eta string, wa
 		b.WriteString("\n- WARNING: lease list was unavailable — stranded-work check could not run")
 	}
 	for _, l := range report.ActiveLeases {
-		note := l.Note
-		if note == "" {
-			note = "(no note)"
-		}
-		fmt.Fprintf(&b, "\n- lease: %s holds %s — %s (expires %s)", l.Holder, l.Model, note,
-			l.ExpiresAt.AsTime().Local().Format("15:04"))
+		b.WriteString("\n- " + leaseLine(l))
 	}
 	return b.String(), nil
+}
+
+// leaseLine renders one pre-drain lease row. A C11 hold rides this list
+// under the reserved holder (the RPC report has no hold flag — C11 added
+// no proto field), and "hold holds glm-5" tells an agent nothing;
+// "somebody is mid-evaluation on this box" is the sentence the pre-drain
+// report exists for. Split out so the rendering has a test that does not
+// need a live cell daemon.
+func leaseLine(l *vibev1.LeaseView) string {
+	note := l.Note
+	if note == "" {
+		note = "(no note)"
+	}
+	at := l.ExpiresAt.AsTime().Local().Format("15:04")
+	if l.Holder == fleetapi.HoldHolder {
+		return fmt.Sprintf("HELD: %s — %s (hold expires %s; the drain proceeds and evicts it)", l.Model, note, at)
+	}
+	return fmt.Sprintf("lease: %s holds %s — %s (expires %s)", l.Holder, l.Model, note, at)
 }
 
 // toolResumeCell drives the resume RPC, or the desired-intent announce

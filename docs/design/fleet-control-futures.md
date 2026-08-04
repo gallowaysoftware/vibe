@@ -59,9 +59,21 @@ Small (days):
    and resume-then-immediately-chatting shouldn't fire the parked
    batch. `--idle` rides C4's idle-window state machine; with leases
    this composes into a real scheduling primitive.
-4. **`hold_model(cell, model, for)`** — suspend the warm-target
-   restore for an evaluation afternoon; without it, restore-after-idle
-   dutifully evicts the challenger you stepped away from.
+4. **`hold_model(cell, model, for)`** — **SHIPPED as
+   [C11](fleet-control-plan/c11-hold-model.md) (2026-08-04).** Suspends
+   the warm-target restore for an evaluation afternoon; without it,
+   restore-after-idle dutifully evicts the challenger you stepped away
+   from. Three notes for whoever reads this next. It is **not a new
+   store**: a hold is a LEASE with `hold: true`, because the lease store
+   already had the key, the TTL, the file, the pre-drain report and the
+   status surface — and two of the three suppressions (scheduled warms,
+   C8 probes) then cost no code at all, since those guards already skip
+   on an active lease. Warm TARGETS skip on a hold specifically, not on
+   any lease, because the restore is already evidence-gated and what a
+   hold adds is the one case the evidence cannot reach. And a hold is
+   **not a pin** — residency stays llama-swap's, so the cell's own TTL
+   can still unload the held model; the hold only guarantees fleetd
+   won't be the one to evict it.
 5. **Drain where reclaim happens** — a documented Steam launch-option
    / desktop-shortcut wrapper for `vibe cell drain --until-exit --`,
    plus an `ExecStopPost` hook on cell units that best-effort records

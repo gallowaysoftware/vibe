@@ -32,6 +32,7 @@
   .m-degraded { color: var(--red); font-weight: 600; }
   .intent { color: var(--amber); } .lastseen { color: var(--dim); }
   .leases { color: var(--blue); font-size: 12px; }
+  .held { color: var(--amber); font-size: 12px; }
   button { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 4px;
            padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer; }
   button:hover { border-color: var(--blue); }
@@ -183,6 +184,16 @@ function ago(ts) {
   if (s < 86400) return (s / 3600 | 0) + "h ago";
   return (s / 86400 | 0) + "d ago";
 }
+// leftUntil renders a hold's remaining time. Computed from the absolute
+// expires_at rather than trusted from the server as words, so a page
+// left open overnight counts down instead of freezing on a stale string.
+function leftUntil(ts) {
+  if (!ts) return "";
+  const s = Math.max(0, (new Date(ts).getTime() - Date.now()) / 1000 | 0);
+  if (s < 60) return s + "s left";
+  if (s < 3600) return (s / 60 | 0) + "m left";
+  return (s / 3600 | 0) + "h " + ((s % 3600) / 60 | 0) + "m left";
+}
 function badgeClass(d) {
   if (d === "SERVING") return "b-serving";
   if (d === "DRAINED") return "b-drained";
@@ -227,7 +238,9 @@ function render(st) {
       intentBits.push('<span class="intent pending">resume requested, awaiting ack</span>');
     }
     if (c.last_seen && !c.reachable) intentBits.push('<span class="lastseen">last seen ' + ago(c.last_seen) + "</span>");
-    const leases = (c.leases || []).map(l => `<div class="leases">${esc(l.holder)} holds ${esc(l.model)}${l.note ? ": " + esc(l.note) : ""}</div>`).join("");
+    const leases = (c.leases || []).map(l => l.hold
+      ? `<div class="held">held: ${esc(l.model)} — warm policy paused, ${esc(leftUntil(l.expires_at))}${l.note ? " (" + esc(l.note) + ")" : ""}</div>`
+      : `<div class="leases">${esc(l.holder)} holds ${esc(l.model)}${l.note ? ": " + esc(l.note) : ""}</div>`).join("");
     const ui = safeURL(c.url);
     const uiLink = ui ? `<a href="${attr(ui)}/ui" target="_blank" rel="noopener">ui ↗</a>` : "";
     tr.innerHTML =
