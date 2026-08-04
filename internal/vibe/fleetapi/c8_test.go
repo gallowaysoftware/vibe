@@ -468,3 +468,70 @@ func TestLatestProbe_CopiesAndReportsNilForAnUnprobedModel(t *testing.T) {
 		t.Fatal("LatestProbe handed out a pointer into presence memory")
 	}
 }
+
+// ─── adversarial-review regressions (ground rule 9) ──────────────────
+
+// TestCloneProbe_DoesNotAliasTheTimePointers: a struct copy still
+// carries DegradedSince and BaselineAt, which is the exact shape C7a's
+// review pass had to fix on UsageReport — captured under a lock,
+// dereferenced after it.
+func TestCloneProbe_DoesNotAliasTheTimePointers(t *testing.T) {
+	when := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
+	orig := &AnnounceProbe{Verdict: VerdictDegraded, DegradedSince: &when, BaselineAt: &when}
+	cp := CloneProbe(orig)
+	if cp.DegradedSince == orig.DegradedSince || cp.BaselineAt == orig.BaselineAt {
+		t.Fatal("CloneProbe handed back the original pointers")
+	}
+	*cp.DegradedSince = time.Now()
+	if !orig.DegradedSince.Equal(when) {
+		t.Fatal("writing through the clone reached the original")
+	}
+	if CloneProbe(nil) != nil {
+		t.Fatal("CloneProbe(nil) must stay nil")
+	}
+}
+
+// TestProbeSchedule_PublishesTheNextDueTime: a declared schedule whose
+// next fire is invisible is how a wrong interval hides — the reason C4's
+// warm schedules print theirs.
+func TestProbeSchedule_PublishesTheNextDueTime(t *testing.T) {
+	s := probeServer(t)
+	readyPresence(s, t, "qwen")
+	st := &probeTargetState{Cell: "gpu-cell", Model: "qwen", EveryS: (6 * time.Hour).Seconds()}
+	// Registered the way StartProbeLoop registers it, so the assertion
+	// covers the fleet_status surface and not just the struct.
+	s.mu.Lock()
+	s.probeStates = append(s.probeStates, st)
+	s.mu.Unlock()
+
+	s.evalProbeTarget(ProbeTarget{Cell: "gpu-cell", Model: "qwen", Every: 6 * time.Hour}, st)
+	rep := s.probeReport()
+	if rep == nil || len(rep.Targets) != 1 || rep.Targets[0].NextDue == nil {
+		t.Fatalf("next_due missing from fleet_status: %+v", rep)
+	}
+	s.mu.Lock()
+	next := st.NextDue
+	s.mu.Unlock()
+	if next == nil {
+		t.Fatal("next_due was never published")
+	}
+	if d := time.Until(*next); d < 5*time.Hour || d > 7*time.Hour {
+		t.Fatalf("next_due %s is not one interval away", d)
+	}
+}
+
+// TestAnnounceProbe_FutureTimestampIsClampedAtIngest: the cell's clock is
+// bounded exactly like the intent echo's (C3's one consulted clock, now
+// two).
+func TestAnnounceProbe_FutureTimestampIsClampedAtIngest(t *testing.T) {
+	s := probeServer(t)
+	far := time.Now().UTC().Add(500 * time.Hour)
+	s.recordAnnounce(&AnnounceRequest{V: AnnounceVersion, Cell: "gpu-cell", Seq: 1,
+		Models: []AnnounceModel{{ID: "qwen", State: "ready", Probe: &AnnounceProbe{
+			Verdict: VerdictOK, Value: 40, At: far,
+		}}}})
+	got := s.presenceFor("gpu-cell").Models[0].Probe
+	if got.At.After(time.Now().UTC().Add(echoFutureSkew + time.Minute)) {
+		t.Fatalf("a cell clock from the future survived ingest: %s", got.At)
+	}
+}

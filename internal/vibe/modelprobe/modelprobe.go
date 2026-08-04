@@ -322,16 +322,7 @@ func (p *Prober) Results() map[string]*fleetapi.AnnounceProbe {
 		if v == nil {
 			continue
 		}
-		cp := *v
-		if v.DegradedSince != nil {
-			t := *v.DegradedSince
-			cp.DegradedSince = &t
-		}
-		if v.BaselineAt != nil {
-			t := *v.BaselineAt
-			cp.BaselineAt = &t
-		}
-		out[k] = &cp
+		out[k] = fleetapi.CloneProbe(v)
 	}
 	return out
 }
@@ -607,8 +598,7 @@ func (p *Prober) note(model, kind, why string) *fleetapi.AnnounceProbe {
 	}
 	p.results[model] = res
 	p.saveLocked()
-	cp := *res
-	return &cp
+	return fleetapi.CloneProbe(res)
 }
 
 // record scores a completed measurement against the baseline and stores
@@ -701,8 +691,7 @@ func (p *Prober) record(spec Spec, m measurement, rebaseline bool) *fleetapi.Ann
 	}
 	p.results[spec.Model] = res
 	p.saveLocked()
-	cp := *res
-	return &cp
+	return fleetapi.CloneProbe(res)
 }
 
 func specID(kind string) string {

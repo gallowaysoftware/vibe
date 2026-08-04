@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 )
 
 // probe_model (fleet-control C8): ask a cell to measure one of its
@@ -20,6 +21,14 @@ import (
 func (s *Server) toolProbeModel(cell, model string, rebaseline bool) (string, error) {
 	if _, ok := s.hosts.Cells[cell]; !ok {
 		return "", fmt.Errorf("unknown cell %q (not in hosts.yaml)", cell)
+	}
+	if cell == fleetcfg.FrontCell {
+		// Same rule the scheduler's config wiring applies: the front's
+		// rendered config is peers-only, so a probe there measures a peer
+		// THROUGH the front — LAN, proxy hop and the peer's queue folded
+		// into one number nobody can attribute. Name the cell that holds
+		// the model instead.
+		return "", fmt.Errorf("the %s cell serves no models of its own; probe the cell that holds %q", fleetcfg.FrontCell, model)
 	}
 	model = strings.TrimSpace(model)
 	if model == "" {

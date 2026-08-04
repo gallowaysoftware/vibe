@@ -116,6 +116,7 @@ func (s *Server) evalProbeTarget(t ProbeTarget, st *probeTargetState) {
 		return
 	}
 	s.setProbeState(st, "requested", "queued for the cell's next announce", true)
+	s.setProbeNextDue(st, now.Add(t.Every))
 	slog.Info("probe requested", "cell", t.Cell, "model", t.Model)
 }
 
@@ -174,8 +175,7 @@ func (s *Server) LatestProbe(cell, model string) *AnnounceProbe {
 	}
 	for _, m := range p.Models {
 		if m.ID == model && m.Probe != nil {
-			cp := *m.Probe
-			return &cp
+			return CloneProbe(m.Probe)
 		}
 	}
 	return nil
@@ -192,8 +192,7 @@ func (s *Server) attachProbes(snap *CellSnapshot) {
 	if p != nil {
 		for _, m := range p.Models {
 			if m.Probe != nil {
-				cp := *m.Probe
-				byID[m.ID] = &cp
+				byID[m.ID] = CloneProbe(m.Probe)
 			}
 		}
 	}
@@ -206,6 +205,16 @@ func (s *Server) attachProbes(snap *CellSnapshot) {
 			snap.Models[i].Probe = pr
 		}
 	}
+}
+
+// setProbeNextDue publishes when this target will next be asked. A
+// declared schedule whose next fire is invisible is how a wrong interval
+// hides (C4 §2's rule for warm schedules, same reason).
+func (s *Server) setProbeNextDue(st *probeTargetState, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t := at.UTC()
+	st.NextDue = &t
 }
 
 func (s *Server) setProbeState(st *probeTargetState, state, detail string, asked bool) {

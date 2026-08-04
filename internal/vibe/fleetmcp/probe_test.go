@@ -238,3 +238,14 @@ func TestProbeModelTool_RebaselineIsCarriedToTheCell(t *testing.T) {
 		t.Fatalf("rebaseline did not reach the queued command: %+v", resp.Commands)
 	}
 }
+
+// TestProbeModelTool_RefusesTheFrontCell mirrors the scheduler's config
+// rule: the front's rendered config is peers-only, so a probe there
+// measures a peer THROUGH the front — LAN, proxy hop and the peer's
+// queue folded into one unattributable number.
+func TestProbeModelTool_RefusesTheFrontCell(t *testing.T) {
+	f := newProbeFixture(t)
+	if _, err := f.s.toolProbeModel(fleetcfg.FrontCell, "qwen", false); err == nil {
+		t.Fatal("probing the front cell succeeded")
+	}
+}

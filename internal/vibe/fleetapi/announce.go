@@ -413,6 +413,32 @@ func normalizeProbe(p *AnnounceProbe) {
 	if p.TTFTMS < 0 {
 		p.TTFTMS = 0
 	}
+	// The cell's clock, bounded exactly like the intent echo's: this is
+	// the second place a cell timestamp is consulted, and "last probed in
+	// 973 years" is not a thing an operator can act on.
+	if max := time.Now().UTC().Add(echoFutureSkew); p.At.After(max) {
+		p.At = max
+	}
+}
+
+// CloneProbe deep-copies a probe block. A struct copy still carries the
+// three *time.Time pointers, which is the exact shape C7a's review pass
+// had to fix on UsageReport: captured under a lock, dereferenced after
+// it. Nothing writes through them today; this is what keeps that true.
+func CloneProbe(p *AnnounceProbe) *AnnounceProbe {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	if p.DegradedSince != nil {
+		t := *p.DegradedSince
+		cp.DegradedSince = &t
+	}
+	if p.BaselineAt != nil {
+		t := *p.BaselineAt
+		cp.BaselineAt = &t
+	}
+	return &cp
 }
 
 func clampNonNegF(v float64) float64 {
