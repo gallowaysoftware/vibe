@@ -478,6 +478,19 @@ in total); no lock is held across an HTTP call; `activityFor` takes
 `s.mu` once and builds outside it; `git diff --stat main..HEAD --
 internal/vibe/proxy` is empty.
 
+**One out-of-phase fix, recorded because it is not this phase's code.**
+CI failed once on `TestRenderLoopUnchangedNoWrite` (C3-era,
+`render_loop_test.go`) with `RenderCount = 1 after changed render, want
+2` on a run whose own log printed `renders=2` — the probe's `writeFile`
+seam signals the test BEFORE `renderPass` increments the counter, so
+`waitWrite` can return one instruction ahead of it. It is a race in the
+TEST, not in the render loop, and it reproduces on nothing this phase
+touched (60 local `-race` iterations were green before the fix, which is
+how a flake this narrow gets missed). Fixed with a polling
+`waitRenderCount` helper at the two sites that read the counter
+immediately after a write; the assertions that a write must NOT have
+happened stay immediate, because they already follow `assertSilent`.
+
 **Known and accepted (documented, not fixed):**
 
 - **A warm counts as activity.** C4's warm-target restore and
