@@ -1,4 +1,4 @@
-# Fleet-control implementation plan (C0–C10)
+# Fleet-control implementation plan (C0–C11)
 
 Execution plan for [../fleet-control.md](../fleet-control.md). Each
 phase is one PR, independently shippable, and pays for itself before
@@ -18,13 +18,20 @@ to be implementable on its own after that.
 | [C7b](c7b-savings-screen.md) | The savings screen: what the fleet didn't spend | ~690 lines + ~100 KB data | C7a, C5 | merged (#25); unit gates green, live plausibility gate UNRUN |
 | [C8](c8-probe-model.md) | probe_model: throughput health against the model's own baseline | ~900 lines | C3, C4 | merged (#27); unit gates 1-10 green, 5 live gates UNRUN |
 | C9 | `vibe fleet notify`: the alarm column, delivered | ~1100 lines | C2, C3, C4 | PR #28 OPEN on `feat/c9-fleet-notify`; its phase doc lands with it |
-| [C10](c10-await-extensions.md) | await extensions: `--model --ready`, `--idle`, the lease handshake | ~450 lines | C1, C2, C3, C4, C6 | PR OPEN; unit gates 1-11 green, 4 live gates UNRUN |
+| [C10](c10-await-extensions.md) | await extensions: `--model --ready`, `--idle`, the lease handshake | ~450 lines | C1, C2, C3, C4, C6 | PR #29 OPEN; unit gates 1-12 green, 4 live gates UNRUN |
+| [C11](c11-hold-model.md) | hold_model: the pause button on the warm policy | ~450 lines | C2, C4, C5 | merged (#30); unit gates 1-11 green, 4 live gates UNRUN |
+
+C9 (`vibe fleet notify`) and C10 (await extensions) are open on their
+own branches, cut from `c9e8bcf` in parallel with C11. None of the three
+builds on the others; C11 landed first, so C10 carries the merge of
+`main` and the semantic reconciliation with the lease store a hold now
+shares (`c10-await-extensions.md`'s addendum records it).
 
 **Merged is not live-gated.** Every C0–C7b PR merged on a green CI run
 of the mechanical inner loop. The live gates — the ones that need real
 cells, a real GPU and a real week of traffic — are UNRUN for C5, C6,
-C7a, C7b, C8 and C10, and each phase doc lists exactly which. Ground
-rule 10 applies to this table: a status cell is a claim about a
+C7a, C7b, C8, C10 and C11, and each phase doc lists exactly which.
+Ground rule 10 applies to this table: a status cell is a claim about a
 mechanical run.
 
 C9 and C10 were cut from `main` at `c9e8bcf` in parallel and neither
@@ -59,6 +66,17 @@ the softer version of this (fleetd's own uptime becoming the idle
 clock), so await refuses, visibly, instead of guessing. The idle window
 is also floored at the moment fleetd's watcher CONNECTED to the cell,
 not at process start: silence you were not there for is not silence.
+
+C11 (2026-08-04) is backlog item 4, `hold_model`, and its one carried
+rule is about where declarations live: **a hold is a lease**. The lease
+store already had every property a hold needs — the (cell, model,
+holder) key, TTL-at-read expiry, the atomic file, the pre-drain report,
+`cells[].leases` — so the phase adds a flag to it rather than a second
+store, and two of the three suppressions (scheduled warms, C8 probes)
+come for free because their guards already skip on an active lease. The
+phase's other job is honesty about what a hold is NOT: residency belongs
+to llama-swap, so a hold stops fleetd evicting your challenger and
+cannot stop the cell's own TTL.
 
 C7a/C7b were added the same day: a "did my hardware pay for itself"
 screen. They are split because C7a (counting) is mechanically

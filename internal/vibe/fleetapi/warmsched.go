@@ -296,6 +296,12 @@ func (s *Server) evalScheduleEntry(e WarmScheduleEntry, spec cronSpec, st *warmS
 		default:
 			if leases := s.leasesForCellActive(cell); len(leases) > 0 {
 				note = fmt.Sprintf("skipped (%d active leases on %s)", len(leases), cell)
+				// A hold (C11) is one of those leases, and it is a
+				// declaration with an expiry — "1 active leases" is not what
+				// the operator who declared it needs to read back.
+				if h, held := s.HoldOn(cell); held {
+					note = fmt.Sprintf("skipped (%s on %s)", holdDetail(h), cell)
+				}
 			}
 		}
 	}
