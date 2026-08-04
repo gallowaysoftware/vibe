@@ -781,6 +781,7 @@ func (s *Server) cellClass(name string) string {
 func (s *Server) drainCommands(cell string, seq uint64) []AnnounceCommand {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.dropHeldWarmsLocked(cell)
 	if pend, ok := s.cmdInflight[cell]; ok {
 		if seq > pend.seq {
 			delete(s.cmdInflight, cell)

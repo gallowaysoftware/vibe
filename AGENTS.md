@@ -581,6 +581,63 @@ optional.)
   - C8 adds **no HTTP route** (verdicts ride `/api/fleet/state`, the verb
     rides `/mcp`), so the fleetd route list and C5's exact-match bearer
     exemption are untouched.
+- **hold_model (fleet-control C11).** The operator's declaration that
+  fleetd must not act on its own warm policy for a cell until it
+  expires — the evaluation-afternoon verb. `fleetapi/hold.go`,
+  `fleetmcp/hold.go` (`hold_model` / `release_hold`), `vibe cell hold`.
+  No new HTTP route, no proto change, no cell-side code.
+  - **A hold IS a lease** (`Lease.Hold`), in the ONE lease store: the
+    (cell, model, holder) key, TTL-at-read expiry, the atomic file, the
+    pre-drain report and `cells[].leases` are all requirements of a hold
+    that C2 already built. A second store would have duplicated every
+    one of them. The holder is the reserved literal `hold` and the
+    endpoint enforces that pairing BOTH ways — a hold under another
+    holder is invisible to `release_hold`, and a plain lease squatting
+    on the reserved holder would be deleted by someone else's release.
+    Not the intent store: axis 2's vocabulary is cell state the CELL
+    echoes, and no cell can echo a hold.
+  - **What it suppresses**: the C4 warm-target restore (the new check),
+    and — inherited, no new code — scheduled warms and C8 probes, which
+    already skip on an active lease. What it does NOT touch: routing,
+    the render, the catalog, availability/intent, `warm_model` /
+    `unload_model` / `drain_cell` / `resume_cell` (an operator asking is
+    not fleetd guessing), and llama-swap's TTL.
+  - **A hold is not a pin**, and every surface says so. Residency
+    belongs to llama-swap; the hold guarantees only that FLEETD will not
+    cause the eviction. Do not "fix" this by writing a cell's TTL.
+  - **Warm targets skip on a HOLD, not on any lease** (schedules keep
+    skipping on any). The restore is already evidence-gated, so a
+    working batch is covered by the in-flight/idle guards; what a hold
+    adds is the case where the evidence is right and the conclusion is
+    wrong. Widening it would let a forgotten 168h lease disable the warm
+    policy for a week.
+  - **The hold holds at BOTH ends of the warm path**: the loops check it
+    when they decide, and `drainCommands` drops queued `warm` verbs for a
+    held cell (`dropHeldWarmsLocked`) — the piggyback queue is
+    at-least-once, so a restore queued one tick before the hold would
+    otherwise land on the next announce and evict the held model. `warm`
+    is the ONLY verb dropped: every queued warm comes from `queueWarm`
+    (fleetd's own policy), while `unload` is an operator's verb and
+    `probe` can be one. Use `holdOnLocked` there — `drainCommands`
+    already holds `s.mu`.
+  - **Surfaces with no hold flag key on the RESERVED HOLDER.** The
+    pre-drain RPC report (`vibev1.LeaseView`) carries no `hold` field and
+    must not grow one; `Holder == fleetapi.HoldHolder` is the
+    deterministic test, and both renderers (`cli.printDrainReport`,
+    `fleetmcp.leaseLine`) use it. `DELETE /api/fleet/lease` returns
+    `existed` beside `status` so a release never claims work it did not
+    do; `fleetapi.HoldLeft` is the ONE remaining-time string.
+  - **Ladder: drained > held > stale > unreachable > policy.** Every
+    rung skips, so the order decides only the reason an operator reads —
+    which is why it is written down here and in the phase doc.
+  - **Bounded and self-expiring**: default 4h, max 24h (tighter than the
+    lease store's 168h, because a hold disables a configured policy). A
+    re-issue refreshes the same key. There is no unbounded hold.
+  - **A SKIP is not an observation of emptiness** (`setWarmState` clears
+    `emptySince` on `skipped`): every skip returns before residency is
+    read, so banked emptiness let the first tick after a hold or a drain
+    ended fire the empty-restore against a mid-cold-start model — the
+    live race C4's grace window exists to prevent.
 - **Alarm notifications (fleet-control C9).** `internal/vibe/fleetnotify`
   (the dwell/dedup/rate policy engine + the webhook sink, zero fleet
   imports), `fleetapi/notify.go` (conditions, the away/home scope,

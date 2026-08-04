@@ -123,6 +123,18 @@ func (s *Server) evalWarmTarget(t WarmTarget, st *warmTargetState, cfg warmLoopC
 		s.setWarmState(st, "skipped", "cell drained")
 		return
 	}
+	// A hold (C11) is checked second: it is a declaration, so it is
+	// answerable with no evidence at all, and it is the answer to the
+	// question the operator is actually asking ("why has my default not
+	// come back?"). Drain still outranks it — that is a declaration about
+	// the whole box. Everything below this line is evidence, and the
+	// point of a hold is that the evidence is right and the conclusion is
+	// wrong: the swap looks abandoned because the operator went to lunch
+	// mid-evaluation.
+	if h, held := s.HoldOn(t.Cell); held {
+		s.setWarmState(st, "skipped", holdDetail(h))
+		return
+	}
 	if p := s.presenceFor(t.Cell); p != nil && p.Announcing {
 		if p.Stale || p.Withdrawn {
 			s.setWarmState(st, "skipped", "cell stale/withdrawn")
@@ -336,6 +348,16 @@ func (s *Server) setWarmState(st *warmTargetState, state, detail string) {
 	s.mu.Lock()
 	st.State = state
 	st.Detail = detail
+	// A SKIP is not an observation of emptiness. Every skip above returns
+	// before the residency branches run, so a stale emptySince would
+	// survive the whole skip and let the empty-restore fire on the first
+	// tick after a hold or a drain ends — against a cell whose model is
+	// mid-cold-start, which is the exact live race C4's gate 1 found and
+	// the grace window exists to prevent. Restart the window when
+	// observation resumes.
+	if state == "skipped" {
+		st.emptySince = time.Time{}
+	}
 	s.mu.Unlock()
 }
 

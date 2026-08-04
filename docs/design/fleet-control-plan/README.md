@@ -1,4 +1,4 @@
-# Fleet-control implementation plan (C0–C9)
+# Fleet-control implementation plan (C0–C11)
 
 Execution plan for [../fleet-control.md](../fleet-control.md). Each
 phase is one PR, independently shippable, and pays for itself before
@@ -18,13 +18,19 @@ to be implementable on its own after that.
 | [C7b](c7b-savings-screen.md) | The savings screen: what the fleet didn't spend | ~690 lines + ~100 KB data | C7a, C5 | merged (#25); unit gates green, live plausibility gate UNRUN |
 | [C8](c8-probe-model.md) | probe_model: throughput health against the model's own baseline | ~900 lines | C3, C4 | merged (#27); unit gates 1-10 green, 5 live gates UNRUN |
 | [C9](c9-fleet-notify.md) | `vibe fleet notify`: the alarm column, delivered | ~1100 lines | C2, C3, C4 | PR #28 OPEN (not merged); unit gates 1-13 green, 4 live gates UNRUN |
+| [C11](c11-hold-model.md) | hold_model: the pause button on the warm policy | ~450 lines | C2, C4, C5 | merged (#30); unit gates 1-11 green, 4 live gates UNRUN |
+
+C10 (await extensions) is still open on its own branch, cut from
+`c9e8bcf` in parallel with C9 and C11. None of the three builds on the
+others; C11 touched `cmd_cell.go`'s `AddCommand` line and this table,
+which is where the textual conflicts landed.
 
 **Merged is not live-gated.** Every C0–C7b PR merged on a green CI run
 of the mechanical inner loop. The live gates — the ones that need real
 cells, a real GPU and a real week of traffic — are UNRUN for C5, C6,
-C7a, C7b, C8 and C9, and each phase doc lists exactly which. Ground rule
-10 applies to this table: a status cell is a claim about a mechanical
-run.
+C7a, C7b, C8, C9 and C11, and each phase doc lists exactly which.
+Ground rule 10 applies to this table: a status cell is a claim about a
+mechanical run.
 
 Line counts are order-of-magnitude scoping signals, not budgets. Actual
 C0–C4 spend ran 3.6–4.5× the estimate in every phase; price that in.
@@ -50,6 +56,17 @@ wrong shape for the policy it was meant to deliver, because two of the
 four default alarms have no event to forward (see the phase doc's
 opening section). It ships as a state differ over the same snapshot
 every other surface renders.
+
+C11 (2026-08-04) is backlog item 4, `hold_model`, and its one carried
+rule is about where declarations live: **a hold is a lease**. The lease
+store already had every property a hold needs — the (cell, model,
+holder) key, TTL-at-read expiry, the atomic file, the pre-drain report,
+`cells[].leases` — so the phase adds a flag to it rather than a second
+store, and two of the three suppressions (scheduled warms, C8 probes)
+come for free because their guards already skip on an active lease. The
+phase's other job is honesty about what a hold is NOT: residency belongs
+to llama-swap, so a hold stops fleetd evicting your challenger and
+cannot stop the cell's own TTL.
 
 C7a/C7b were added the same day: a "did my hardware pay for itself"
 screen. They are split because C7a (counting) is mechanically

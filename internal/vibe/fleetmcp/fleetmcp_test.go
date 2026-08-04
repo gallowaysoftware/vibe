@@ -63,7 +63,8 @@ func newTestFacade(t *testing.T, cells map[string]fleetcfg.Cell, classes map[str
 	}
 	fleet := fleetapi.New(fleetCells, dir+"/history.json",
 		func() fleetapi.DaemonInfo { return fleetapi.DaemonInfo{} },
-		fleetapi.Options{IntentPath: dir + "/intent.json", LastSeenPath: dir + "/last-seen.json"})
+		fleetapi.Options{IntentPath: dir + "/intent.json", LastSeenPath: dir + "/last-seen.json",
+			LeasePath: dir + "/leases.json"})
 	t.Cleanup(fleet.Close)
 	hosts := &fleetcfg.File{Cells: cells, ModelClasses: classes}
 	s := New(fleet, hosts, Options{})
@@ -122,14 +123,14 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 
 	list := rpc(t, ts, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
 	tools, ok := list.Result.(map[string]any)["tools"].([]any)
-	if !ok || len(tools) != 12 {
+	if !ok || len(tools) != 14 {
 		t.Fatalf("tools = %v", list.Result)
 	}
 	names := map[string]bool{}
 	for _, tool := range tools {
 		names[tool.(map[string]any)["name"].(string)] = true
 	}
-	for _, want := range []string{"fleet_status", "warm_model", "unload_model", "drain_cell", "resume_cell", "wake_cell", "render_front", "fleet_usage", "fleet_savings", "probe_model", "fleet_notify_scope", "fleet_notify_test"} {
+	for _, want := range []string{"fleet_status", "warm_model", "unload_model", "drain_cell", "resume_cell", "wake_cell", "render_front", "fleet_usage", "fleet_savings", "probe_model", "hold_model", "release_hold", "fleet_notify_scope", "fleet_notify_test"} {
 		if !names[want] {
 			t.Errorf("missing tool %s in %v", want, names)
 		}

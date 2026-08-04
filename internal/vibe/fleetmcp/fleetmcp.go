@@ -228,7 +228,7 @@ func (s *Server) dispatchRPC(ctx context.Context, req jsonRPCRequest) (jsonRPCRe
 }
 
 func (s *Server) mcpTools() []any {
-	return []any{
+	return append([]any{
 		map[string]any{
 			"name": "fleet_status",
 			"description": "Fleet-wide state: one derived row per cell (SERVING / DRAINED / " +
@@ -413,7 +413,7 @@ func (s *Server) mcpTools() []any {
 				},
 			},
 		},
-	}
+	}, holdTools()...)
 }
 
 func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMessage) (string, error) {
@@ -467,6 +467,26 @@ func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMess
 			return "", fmt.Errorf("invalid arguments: %v", err)
 		}
 		return s.toolProbeModel(args.Cell, args.Model, args.Rebaseline)
+	case "hold_model":
+		var args struct {
+			Cell  string `json:"cell"`
+			Model string `json:"model"`
+			For   string `json:"for"`
+			Note  string `json:"note"`
+		}
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return "", fmt.Errorf("invalid arguments: %v", err)
+		}
+		return s.toolHoldModel(args.Cell, args.Model, args.For, args.Note)
+	case "release_hold":
+		var args struct {
+			Cell  string `json:"cell"`
+			Model string `json:"model"`
+		}
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return "", fmt.Errorf("invalid arguments: %v", err)
+		}
+		return s.toolReleaseHold(args.Cell, args.Model)
 	case "drain_cell":
 		var args struct {
 			Cell        string `json:"cell"`
