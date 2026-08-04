@@ -179,7 +179,10 @@ Response:
   throughput-health block (friction pain 2): a realistic batch probe
   spec + latest result for *that model*, letting the announcer mark
   it `degraded` individually. Reserve it in the schema now so v2 is
-  additive.
+  additive. *(Filled by [C8](c8-probe-model.md), 2026-08-04: a typed
+  `*AnnounceProbe` that still marshals to `null` for a cell which does
+  not probe, so the reservation cost nothing and v2 was additive as
+  intended.)*
 - `commands` carries the piggybacked verbs (drain, resume, unload,
   warm). The cell executes and reflects results in its next announce.
   This retires the C2 requirement that fleetd can reach a cell's
@@ -228,7 +231,9 @@ registry must never affect serving (invariant: control plane failure
   `fleet.fingerprintMismatch`, plus the probe-path
   `fleet.cellUp`/`fleet.cellDown` — and the CLI and live SSE consumers
   depend on those names, so the doc follows the code here, never the
-  reverse (C6/DOC-3). `model_degraded` stays reserved with no emitter.
+  reverse (C6/DOC-3). `model_degraded` was reserved with no emitter;
+  [C8](c8-probe-model.md) is the emitter, named `fleet.modelDegraded`
+  (with `fleet.modelRecovered`) to match that convention.
 - **Cold start:** on fleetd startup the presence table is empty and
   must not be mistaken for a withdrawn fleet — hold the last-rendered
   front config and defer any presence-driven re-render until

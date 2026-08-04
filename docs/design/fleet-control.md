@@ -1,6 +1,7 @@
 # Fleet control: node state, intent, and the control plane
 
-Status: MERGED THROUGH C7b (2026-08-03). Every phase C0–C7b is on `main`
+Status: MERGED THROUGH C7b (2026-08-03); C8 (probe_model, the first v2
+backlog item) is in review. Every phase C0–C7b is on `main`
 (#18–#25), plus one post-merge reconciliation PR for the three items no
 single phase branch could reach. **Merged is not live-gated:** C5's,
 C6's, C7a's and C7b's live gates need real cells and were NOT run — the
@@ -212,6 +213,7 @@ mux behind the same bearer auth, wire pattern cloned from
 | `resume_cell(cell)` | C2 | inverse; clears intent |
 | `wake_cell(cell)` | C2 | Wake-on-LAN magic packet; explicit, never automatic |
 | `render_front(dry_run?)` | C2 | `vibe router render --cell front` (`--check` when dry_run) |
+| `probe_model(cell, model, rebaseline?)` | C8 | ask the cell to measure one RESIDENT model against its own baseline; refuses a cold model rather than loading it |
 
 **CLI.** `vibe cell status | await | drain | resume | wake` — local
 verbs run the configured per-cell command; remote verbs go through the
@@ -375,7 +377,7 @@ start-duration history (built for exactly this).
 | pain | end state |
 |---|---|
 | 1 — lifecycle verbs | One verb facade (`vibe cell …` / MCP) over the regimes; regime count also shrinks (C0). Underlying regimes remain — honest partial. |
-| 2 — throughput health | **Deferred with a designed slot**: the announce schema reserves a per-model `probe` block; the field-proven 64-input batch-probe watchdog graduates into the announcer in v2, marking models degraded → withdrawn from render. |
+| 2 — throughput health | **Answered (C8, 2026-08-04)**: the reserved per-model `probe` block is filled by a cell-side canned probe scored against that model's own rolling baseline, surfaced as `degraded` in `fleet_status` + `fleet.modelDegraded`. One deliberate departure from this row's original sketch: a degraded model is **NOT** withdrawn from the render. Yanking a slow-but-serving id turns it into a fleet-wide 404 for every consumer pinning it, and a fail-closed action on a measurement with a false-positive tail is the "blanket fail-closed fingerprints" alternative §9 already rejects. The remediation is a human verb (`unload_model`, then probe again). |
 | 3 — static pointers | Front half retired: peer list rendered (C2), then presence-derived (C3); consumers already point at the stable front. |
 | 4 — fingerprints | Contract via `flags_sha256` at announce (C3); strict for embed-class. |
 | 5 — opaque load/unload | Retired: existing levers surfaced as verbs, residency + evictions visible in status/events. |

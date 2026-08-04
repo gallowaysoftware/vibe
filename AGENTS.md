@@ -522,6 +522,57 @@ optional.)
     `cloud_peer` ids only — actual spend beside notional savings, the
     induced-demand control. A defs read that fails skips the poll
     entirely rather than folding unfiltered.
+- **Throughput probes (fleet-control C8).** `internal/vibe/modelprobe`
+  (cell-side prober + rolling baselines), `fleetapi/probe.go` (scheduler,
+  shared guard, status block), the typed `AnnounceModel.Probe` block, the
+  `probe` piggyback verb, and fleetmcp's `probe_model`. Answers friction
+  pain 2 (llama-server degrades 10-100x while `/health` stays green). The
+  rules that keep a measurement from becoming an actuator:
+  - **A probe never loads a model.** It runs ONLY against a model the
+    cell's own `/running` reports `ready`, checked on localhost
+    immediately before the request; a cold model is REFUSED with a note
+    to `warm_model` first. There is no force flag anywhere on this path,
+    and there must not be one — that is why the prober is cell-side at
+    all (a probe through the front is a request like any other, and
+    llama-swap JIT-starts whatever it is asked for, which is exactly the
+    eviction C4's warm policy exists to prevent).
+  - **`degraded` is a per-MODEL health state and a fourth thing** beside
+    the three ownership axes. It rides `ModelState.Probe` and nothing
+    else: never `CellSnapshot.Reachable`/`.Display`/`.Intent`, never the
+    front render's exclusion path (that stays fingerprint-only), never a
+    warm/unload/drain trigger. The remediation runbook is human:
+    probe → `unload_model` → probe. Test-pinned through the REAL snapshot
+    path in `fleetapi/c8_test.go`.
+  - **fleetd ASKS, the cell MEASURES.** Requests travel on C3's piggyback
+    queue (so announce-only cells are probeable), guarded by C4's guard
+    set verbatim — drained / stale / busy / **unreported** in-flight /
+    leased / not-announced-ready — with every skip named in
+    fleet_status's `probe` block. One `probeGuard` serves the scheduler
+    and the MCP verb so they cannot drift. The front cell is refused on
+    both producers (peers-only config ⇒ a probe there measures a peer
+    through the front).
+  - **The budget is explicit and enforced on the CELL**, because the
+    piggyback queue is at-least-once: 5-minute per-model cooldown keyed
+    on the last ATTEMPT (not the last result — refusals carry the last
+    measurement forward), a rolling 96/day cap counting attempts, and
+    single-flight. `probe_targets:` in the fleetd config is declared and
+    empty by default; the daemon clamps its interval to 5 min.
+  - **The baseline is CELL-side** (`paths.CellProbeFile()`), keyed
+    `(model, flags_sha256, metric)` so a def edit starts a fresh baseline
+    instead of reporting a config change as a regression, and scored as
+    a median over ≤20 samples. Under 5 samples the verdict is `unknown`,
+    never `degraded`. **A degraded sample never enters the window** (or a
+    real regression washes out in ~11 probes and the status goes green
+    while the box is slow); `rebaseline: true` is the explicit escape
+    hatch. It reuses `history.go`'s SHAPE (small window, rewrite on
+    record) and deliberately not C7a's JSONL — records here are
+    minutes-to-hours apart.
+  - `Prober.Start` returns immediately and probes on its own goroutine:
+    the heartbeat is the cell's only evidence of life, and a synchronous
+    probe would mark a cell stale for being slow to prove it was slow.
+  - C8 adds **no HTTP route** (verdicts ride `/api/fleet/state`, the verb
+    rides `/mcp`), so the fleetd route list and C5's exact-match bearer
+    exemption are untouched.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.

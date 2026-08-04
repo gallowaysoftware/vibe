@@ -1,7 +1,11 @@
 # C8 — probe_model: throughput health, scored against the model's own baseline
 
-Status: IN PROGRESS (2026-08-04), off `feat/c8-probe-model` branched from
-`main` at `8658c2e` (C0–C7b + the post-merge reconciliation PR).
+Status: EXECUTED + REVIEWED (2026-08-04), off `feat/c8-probe-model`
+branched from `main` at `8658c2e` (C0–C7b + the post-merge
+reconciliation PR). Feature commit plus ground rule 9's adversarial
+self-review commit; every mechanically verifiable gate is green under
+`-race -count=5`, and the five live gates (L1–L5) are **NOT RUN** —
+they need real cells and a real GPU. See [§Execution](#execution-2026-08-04).
 
 C8 fills the `probe` slot [C3](c3-announce.md) §1 reserved on
 `AnnounceModel` and converts the design doc's
@@ -126,7 +130,7 @@ down rather than implied:
 |---|---|---|
 | chat probe | 1 request, deterministic ~200-token prompt, `max_tokens: 64`, `temperature: 0`, non-streaming | `modelprobe` (constant) |
 | embed probe | 1 request, 64 fixed short inputs (the field-proven 64-input batch shape) | `modelprobe` (constant) |
-| per-probe wall bound | 120 s, then abandoned and recorded as a failure | `modelprobe` |
+| per-probe wall bound | 3 min, then abandoned and recorded as a failed attempt (a model degraded 100x still answers inside it: 64 tokens at 0.5 tok/s is ~128 s) | `modelprobe` |
 | min gap between two probes of the same model | 5 min | cell (hard floor, survives a duplicated command) |
 | max probes per cell per rolling 24 h | 96 | cell (hard cap) |
 | scheduled interval floor | 5 min, clamped like `minRestoreAfterIdle` | daemon config wiring |
@@ -414,3 +418,113 @@ L5. **Embed probe on the utility cell.** A 64-input batch against the
 
 Estimated ~700 lines + tests, on the plan's calibration (C0–C4 ran
 3.6–4.5× their estimates).
+
+## Execution (2026-08-04)
+
+### What shipped
+
+| piece | where |
+|---|---|
+| cell-side prober + rolling baselines | `internal/vibe/modelprobe/modelprobe.go` (new package) |
+| def → probe spec (kind, fingerprint binding) | `internal/vibe/modelprobe/hooks.go` — `SpecsFromDefs`, `Hooks` |
+| wire block + ingest hardening + transition events | `fleetapi/announce.go` — `AnnounceProbe`, `normalizeProbe`, `probeEvents`, `CloneProbe` |
+| scheduler, shared guard, status block | `fleetapi/probe.go` — `ProbeTarget`, `evalProbeTarget`, `probeGuard`, `attachProbes`, `probeReport` |
+| snapshot surfacing | `fleetapi/fleetapi.go` — `ModelState.Probe`, `StateSnapshot.Probe` |
+| page badge + footer lines | `fleetapi/fleet.html` (no new route) |
+| cell wiring (verb + blocks) | `fleetannounce/fleetannounce.go` — `Config.Probes`, `Config.RunProbe`, the `probe` command case |
+| daemon wiring | `daemon/probe.go` (new), `daemon/announce.go`, `daemon/daemon.go` (`probe_targets:`) |
+| slim-announcer wiring | `cli/cmd_fleet.go` |
+| MCP verb | `fleetmcp/probe.go` (new) + the tool entry in `fleetmcp/fleetmcp.go` |
+| state file | `paths.CellProbeFile()` → `$XDG_STATE_HOME/vibe/fleet/model-probe.json` |
+
+Four things the doc did not spell out and the code had to decide:
+
+- **The cooldown is keyed on the last ATTEMPT, not the last result.** A
+  refusal (not resident, cell busy) deliberately carries the previous
+  measurement forward so the status keeps showing it — and keying the
+  5-minute gap on that timestamp would let a run of refusals lock a model
+  out of probing for as long as they kept arriving.
+  `TestProbe_RefusalsDoNotExtendTheCooldown`.
+- **The daily cap counts attempts, not completions**, and its window
+  rolls rather than resetting at midnight. An abandoned probe spent the
+  GPU time too.
+- **Probe kind is read off the rendered argv**, not the model name and
+  not a new def field: `--embedding`/`--pooling` means embed,
+  `--reranking` means *disabled* (its request body is a query plus
+  documents, so the embed batch would measure a 400 and call it
+  throughput), `cloud_peer` means disabled (every probe of one is a paid
+  request). Reusing the argv the C3 fingerprint is already computed over
+  means the kind and the baseline key come from the same source of truth.
+- **The front cell is refused on both producers.** Its rendered config is
+  peers-only, so a probe there measures a peer THROUGH the front — the
+  confounded measurement §1 rejects.
+
+C8 adds **no HTTP route**: the verdict rides `/api/fleet/state` (already
+mounted) and the verb rides `/mcp` (already fleetd-gated), so
+`daemon/fleet_registry_test.go`'s route list is unchanged and C5's
+exact-match bearer exemption is untouched.
+
+### Gates
+
+| gate | result |
+|---|---|
+| 1. A probe never loads a model | **PASS** — `TestProbe_RefusesAModelThatIsNotResidentAndIssuesNoRequest`, `TestProbe_RefusesAModelThatIsStartingRatherThanReady`. Mutation-verified: deleting the residency check fails both. |
+| 2. Scheduler respects the C4 guards | **PASS** — `TestProbeSchedule_{QueuesOneProbeWhenEveryGuardPasses,SkipsADrainedCell,SkipsWhenInFlightIsUnreported,SkipsABusyCell,SkipsACellWithAnActiveLease,SkipsAModelThatIsNotResident,SkipsAStaleCellAndOneThatNeverAnnounced}`. Mutation-verified on the unreported-in-flight branch. |
+| 3. Degraded does not leak into availability | **PASS** — `TestProbe_DegradedModelDoesNotChangeCellDisplayOrAvailability` (through the REAL snapshot path), `TestProbe_DegradedModelStaysInTheAnnouncedModelSet`. Mutation-verified: a leak added in `attachProbes` fails it. The first version of this test called `decorate` alone and did NOT catch that mutation — ground rule 10 in miniature; the body was rewritten before the gate was claimed. |
+| 4. Baseline scoring | **PASS** — `TestScore_{UnderMinSamplesIsUnknownNeverDegraded,ThreeTimesSlowdownAgainstABaselineIsDegraded,HysteresisBandKeepsThePreviousVerdict}`, `TestBaseline_{DegradedSamplesDoNotEnterTheWindow,RebaselineClearsTheWindow,FlagsChangeStartsAFreshBaseline}`, `TestProber_BaselinesSurviveARestart` |
+| 5. Budget enforced on the cell | **PASS** — `TestProbe_{CooldownRefusesTheSecondProbeAndKeepsTheLastResult,RefusalsDoNotExtendTheCooldown,DailyCapRefusesPastTheBudget,SingleFlight}`. Mutation-verified on the cooldown key. |
+| 6. The heartbeat is never held hostage | **PASS** — `TestProberStart_ReturnsWhileTheProbeIsStillRunning` (the production guarantee; mutation-verified — a synchronous `Start` deadlocks the test) and `TestAnnounceProbeCommand_ReturnsWhileTheProbeIsStillRunning` (the wire half, asserting the announce completed while the probe was demonstrably still in flight). |
+| 7. Wire compatibility | **PASS** — `TestAnnounceProbe_{V1NullRoundTripsUnchanged,UnknownKindAndMetricAreAccepted,GarbageVerdictNormalizesToUnknown,NegativeNumbersAreClampedAtIngest,OversizedStringsAreRejected,FutureTimestampIsClampedAtIngest}` |
+| 8. Events fire on transitions only | **PASS** — `TestProbeEvents_FireOnTransitionsOnly` (mutation-verified), `TestProbeEvents_LosingEvidenceIsNotARecovery` |
+| 9. Streaming contract | **PASS** — `git diff --stat main..HEAD -- internal/vibe/proxy` is empty |
+| 10. Full inner loop + review commit | **PASS** — build / vet / `gofmt -l .` (silent) / `go mod tidy` (clean) / `go test -race -count=5 ./...` / `golangci-lint run` (0 issues), re-run after the review commit |
+| L1–L5 (live) | **NOT RUN** — every one needs real cells and a real GPU; the implementing environment cannot reach the fleet (SSH blocked, LAN does not route). No transcripts are offered. |
+
+### Adversarial self-review (ground rule 9)
+
+Landed as its own commit. Four findings, each with a mutation-verified
+regression test.
+
+1. **Probe blocks were copied shallowly (minor).** A struct copy carries
+   `DegradedSince` and `BaselineAt` — captured under a lock, dereferenced
+   after it, the exact shape C7a's review had to fix on `UsageReport`.
+   `fleetapi.CloneProbe` now deep-copies and every hand-off uses it.
+   `TestCloneProbe_DoesNotAliasTheTimePointers`.
+2. **`next_due` was declared, documented and never populated (minor).**
+   `TestProbeSchedule_PublishesTheNextDueTime`.
+3. **`probe_model` accepted the front cell (minor)** while the scheduler's
+   config wiring refused it. `TestProbeModelTool_RefusesTheFrontCell`.
+4. **A cell-supplied `probe.at` was unbounded at ingest (minor)** — every
+   other cell timestamp is clamped (C3's echo rule).
+   `TestAnnounceProbe_FutureTimestampIsClampedAtIngest`.
+
+**Verified sound, not changed:** the load rule holds under mutation at
+both producers; presence model slices are replaced, never mutated in
+place, so the probe pointers a snapshot reads cannot tear; `probeGuard`
+is one function shared by the scheduler and the MCP verb, so they cannot
+drift; `Run` marks the attempt BEFORE measuring, so an abandoned probe
+still costs budget.
+
+### Known and accepted (documented, not fixed)
+
+- **A probe resets C4's warm-target idle window.** Probes produce
+  inflight frames like any request, and fleetd's per-model activity map
+  cannot tell them apart. The effect is to DELAY a restore by one window,
+  never to cause one — the honest direction to err.
+- **Probe traffic is metered as ordinary traffic by C7a.** A 64-token
+  probe is not a poke (`output_tokens <= 1`), and llama-swap's `Metadata`
+  is populated only by its internal handlers, so there is no way to tag
+  it. Bounded by the budget: ≤ ~25 k tokens/cell/day at the cap,
+  typically ~1 k.
+- **Between fleetd's guard evaluation and the cell's execution sits up to
+  one heartbeat.** Work that starts inside that window meets a probe.
+  The cost is one bounded completion, and the cell still re-checks
+  residency (the guard that actually matters).
+- **A `note`-only result (refusal) keeps the previous verdict visible.**
+  A refusal is not evidence about the model's health, so it must not
+  erase what was known — but it does mean a stale `ok` can sit beside a
+  string of refusals. `at` and the note say so.
+- **Kind detection scans the rendered argv textually**, so a quoted
+  argument containing `--embedding` would be read as a flag. The failure
+  mode is a chat def probing as embed, which fails loudly on the first
+  probe rather than reporting a wrong number.
