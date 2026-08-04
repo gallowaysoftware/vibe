@@ -36,6 +36,11 @@ type Lease struct {
 	Holder    string    `json:"holder"`
 	Note      string    `json:"note,omitempty"`
 	ExpiresAt time.Time `json:"expires_at"`
+	// Hold marks this lease as a C11 hold: the operator's declaration
+	// that fleetd's own warm policy must not act on the cell until it
+	// expires. Every other lease property is identical — the flag is what
+	// separates a note about work in progress from a policy override.
+	Hold bool `json:"hold,omitempty"`
 }
 
 // leaseRequest is the POST /api/fleet/lease body; the same three-field
@@ -46,6 +51,7 @@ type leaseRequest struct {
 	Holder string `json:"holder"`
 	Note   string `json:"note,omitempty"`
 	TTL    string `json:"ttl,omitempty"` // Go duration string, e.g. "2h"
+	Hold   bool   `json:"hold,omitempty"`
 }
 
 func leaseKey(cell, model, holder string) string { return cell + "\x00" + model + "\x00" + holder }
@@ -113,17 +119,6 @@ func (s *Server) handleLeaseMutate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.leaseMu.Lock()
-	defer s.leaseMu.Unlock()
-
-	s.mu.Lock()
-	next := make(map[string]Lease, len(s.leases)+1)
-	for k, v := range s.leases {
-		next[k] = v
-	}
-	s.mu.Unlock()
-
-	var respLease *Lease
 	switch r.Method {
 	case http.MethodPost:
 		ttl, err := time.ParseDuration(req.TTL)
@@ -135,48 +130,121 @@ func (s *Server) handleLeaseMutate(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("ttl exceeds the %s bound (a lease is a hold, not a reservation)", maxLeaseTTL), http.StatusBadRequest)
 			return
 		}
+		// C11: the hold flag rides the same body, and its rules are the
+		// hold's, not the lease store's — the reserved-holder pairing and
+		// the tighter TTL bound.
+		if err := validateHoldRequest(req.Hold, req.Holder, ttl); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.Hold {
+			if err := s.checkHoldTarget(req.Cell); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
 		l := Lease{Cell: req.Cell, Model: req.Model, Holder: req.Holder, Note: req.Note,
-			ExpiresAt: time.Now().UTC().Add(ttl)}
-		next[leaseKey(l.Cell, l.Model, l.Holder)] = l
-		respLease = &l
+			Hold: req.Hold, ExpiresAt: time.Now().UTC().Add(ttl)}
+		if err := s.putLease(l); err != nil {
+			if errors.Is(err, errLeaseStoreFull) {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
+			slog.Warn("lease persist failed", "err", err)
+			http.Error(w, "persist lease", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(l)
 	case http.MethodDelete:
-		delete(next, leaseKey(req.Cell, req.Model, req.Holder))
+		if _, err := s.dropLease(req.Cell, req.Model, req.Holder); err != nil {
+			slog.Warn("lease persist failed", "err", err)
+			http.Error(w, "persist lease", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
 	}
-	// Prune expired entries on every mutation so the file can't grow
-	// forever under crashed consumers.
-	now := time.Now()
-	for k, l := range next {
-		if !l.ExpiresAt.After(now) {
-			delete(next, k)
-		}
-	}
+}
+
+// errLeaseStoreFull is the cap refusal, typed so the HTTP endpoint can
+// map it to 409 while the in-process verbs report it as an error like
+// any other.
+var errLeaseStoreFull = errors.New("lease store is full")
+
+// putLease upserts one lease: clone, prune, cap, persist, swap. It is
+// the ONLY mutation path into the store (with dropLease), shared by the
+// HTTP endpoint and C11's in-process hold verbs — two writers with two
+// copies of the prune-and-cap rules is how they drift apart.
+func (s *Server) putLease(l Lease) error {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+
+	next := s.cloneLeases()
+	next[leaseKey(l.Cell, l.Model, l.Holder)] = l
+	pruneExpired(next)
 	// The cap applies AFTER the prune, so expired entries never count
 	// against a live holder. A store this size is a runaway producer, not
 	// a fleet. It gates GROWTH only: refusing a DELETE because the store
 	// is full contradicts its own message and leaves an over-cap file
 	// (a downgrade, a hand edit) with no way back down.
-	if r.Method == http.MethodPost && len(next) > maxLeases {
-		http.Error(w, fmt.Sprintf("lease store is full (%d active); expire or delete some first", maxLeases), http.StatusConflict)
-		return
+	if len(next) > maxLeases {
+		return fmt.Errorf("%w (%d active); expire or delete some first", errLeaseStoreFull, maxLeases)
 	}
+	return s.commitLeases(next)
+}
 
+// dropLease removes one lease by key. The bool reports whether the key
+// was actually present — release is idempotent, but a caller must be
+// able to say "there was no hold" rather than claim it undid one.
+func (s *Server) dropLease(cell, model, holder string) (bool, error) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+
+	next := s.cloneLeases()
+	key := leaseKey(cell, model, holder)
+	_, existed := next[key]
+	delete(next, key)
+	pruneExpired(next)
+	if err := s.commitLeases(next); err != nil {
+		return false, err
+	}
+	return existed, nil
+}
+
+// cloneLeases snapshots the store for a mutation. Callers hold leaseMu.
+func (s *Server) cloneLeases() map[string]Lease {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := make(map[string]Lease, len(s.leases)+1)
+	for k, v := range s.leases {
+		next[k] = v
+	}
+	return next
+}
+
+// commitLeases persists then swaps: a failed write leaves the observable
+// map untouched, so the caller's error is the whole truth.
+func (s *Server) commitLeases(next map[string]Lease) error {
 	if err := saveLeases(s.leasePath, next); err != nil {
-		slog.Warn("lease persist failed", "err", err)
-		http.Error(w, "persist lease", http.StatusInternalServerError)
-		return
+		return err
 	}
 	s.mu.Lock()
 	s.leases = next
 	s.mu.Unlock()
+	return nil
+}
 
-	w.Header().Set("Content-Type", "application/json")
-	if respLease != nil {
-		_ = json.NewEncoder(w).Encode(respLease)
-	} else {
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
+// pruneExpired drops expired entries on every mutation so the file can't
+// grow forever under crashed consumers.
+func pruneExpired(leases map[string]Lease) {
+	now := time.Now()
+	for k, l := range leases {
+		if !l.ExpiresAt.After(now) {
+			delete(leases, k)
+		}
 	}
 }
 

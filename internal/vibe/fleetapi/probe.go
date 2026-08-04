@@ -175,6 +175,12 @@ func (s *Server) probeGuard(cell, model string) (string, bool) {
 		return fmt.Sprintf("cell %s has %d in-flight", cell, n), false
 	}
 	if leases := s.leasesForCellActive(cell); len(leases) > 0 {
+		// Same lease guard, but a C11 hold names itself: a probe spends
+		// real GPU time on a cell the operator declared hands-off, and the
+		// refusal should say so and say for how long.
+		if h, held := s.HoldOn(cell); held {
+			return fmt.Sprintf("%s is %s", cell, holdDetail(h)), false
+		}
 		return fmt.Sprintf("%d active leases on %s", len(leases), cell), false
 	}
 	return "", true

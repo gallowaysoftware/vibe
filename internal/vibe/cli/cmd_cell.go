@@ -35,7 +35,7 @@ func cellCmd() *cobra.Command {
 		Use:   "cell",
 		Short: "Fleet cell observability (status, await).",
 	}
-	cmd.AddCommand(cellStatusCmd(), cellAwaitCmd(), cellDrainCmd(), cellResumeCmd(), cellWakeCmd())
+	cmd.AddCommand(cellStatusCmd(), cellAwaitCmd(), cellDrainCmd(), cellResumeCmd(), cellWakeCmd(), cellHoldCmd())
 	return cmd
 }
 
@@ -220,6 +220,22 @@ func intentLastSeen(c fleetapi.CellSnapshot) string {
 		// A resume request has no drained intent to show, but the
 		// pending marker is the point.
 		parts = append(parts, "intent: resume requested, awaiting cell ack")
+	}
+	// A hold (C11) belongs in this column: it is a declaration, and it is
+	// the reason a cell's default model has not come back.
+	for _, l := range c.Leases {
+		if !l.Hold {
+			continue
+		}
+		left := time.Until(l.ExpiresAt).Round(time.Minute)
+		if left < 0 {
+			left = 0
+		}
+		held := fmt.Sprintf("held: %s, %s left", l.Model, left)
+		if l.Note != "" {
+			held += " (" + l.Note + ")"
+		}
+		parts = append(parts, held)
 	}
 	if c.LastSeen != nil && !c.Reachable {
 		parts = append(parts, "last seen "+time.Since(*c.LastSeen).Round(time.Second).String()+" ago")
