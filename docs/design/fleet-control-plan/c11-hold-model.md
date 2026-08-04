@@ -1,7 +1,7 @@
 # C11 — hold_model: the pause button on the warm policy
 
 Status: IMPLEMENTED (2026-08-04), branch `feat/c11-hold-model`, PR
-OPEN. Unit gates 1–11 green (`-race -count=5 ./...`); the 4 live gates
+#30 OPEN (CI `test (stable)` green). Unit gates 1–11 green (`-race -count=5 ./...`); the 4 live gates
 need real cells and are **NOT RUN** — the implementing environment
 cannot reach the fleet (SSH blocked, LAN does not route).
 
