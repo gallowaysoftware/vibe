@@ -1,6 +1,6 @@
 # C9 — `vibe fleet notify`: the alarm column, delivered
 
-Status: EXECUTED + REVIEWED, PR OPEN (2026-08-04), off
+Status: EXECUTED + REVIEWED, PR #28 OPEN — not merged (2026-08-04), off
 `feat/c9-fleet-notify`, branched off `main` at `c9e8bcf` (C8 merged).
 Every mechanically verifiable gate is green under `-race -count=5`; the
 four live gates need real hardware and are **NOT RUN** — see
