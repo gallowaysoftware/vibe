@@ -161,16 +161,21 @@ func TestCellAwaitUnblocksOnTransition(t *testing.T) {
 
 func TestCellAwaitViaEventsStream(t *testing.T) {
 	// fleetd with an SSE stream: the transition event must unblock the
-	// await before the poll interval matters.
-	state := fleetapi.StateSnapshot{
-		GeneratedAt: time.Now(),
-		Cells: []fleetapi.CellSnapshot{{
-			Name: "gpu-cell", URL: "http://gpu.lan:9000", Reachable: false,
-		}},
-	}
+	// await before the poll interval matters. The cell becomes reachable
+	// at the same moment the event is emitted — the event is what makes
+	// await LOOK, and the snapshot is what decides (C10 review: a
+	// fixture whose state contradicted its own event was asserting that
+	// the event alone could return, which is how `--down` unblocked on
+	// `fleet.cellStale` against a cell C6 deliberately keeps reachable).
+	var reachable atomic.Bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/fleet/state", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(state)
+		_ = json.NewEncoder(w).Encode(fleetapi.StateSnapshot{
+			GeneratedAt: time.Now(),
+			Cells: []fleetapi.CellSnapshot{{
+				Name: "gpu-cell", URL: "http://gpu.lan:9000", Reachable: reachable.Load(),
+			}},
+		})
 	})
 	mux.HandleFunc("GET /api/fleet/events", func(w http.ResponseWriter, r *http.Request) {
 		flusher := w.(http.Flusher)
@@ -178,6 +183,7 @@ func TestCellAwaitViaEventsStream(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		flusher.Flush()
 		time.Sleep(200 * time.Millisecond)
+		reachable.Store(true)
 		fmt.Fprintf(w, "event:message\ndata:{\"cell\":\"gpu-cell\",\"type\":\"fleet.cellReturned\"}\n\n")
 		flusher.Flush()
 		<-r.Context().Done()

@@ -89,6 +89,33 @@ func validateAwaitFlags(cell string, c awaitConds, ttlSet bool) error {
 	if ttlSet && c.lease.holder == "" {
 		return errors.New("--lease-ttl needs --lease <holder>")
 	}
+	// Everything below is a refusal fleetd would issue anyway — the point
+	// is WHEN. The claim is POSTed after the wait, so under the
+	// documented `--timeout 0` idiom a batch parks all night, unblocks at
+	// 03:00 and then exits non-zero on a 400 that was decidable before
+	// the first poll. Everything else in this function exists for the
+	// same reason.
+	if c.lease.holder != "" {
+		if c.lease.holder == fleetapi.HoldHolder {
+			// C11 reserves this holder and the lease endpoint refuses it
+			// for a non-hold. Worse than the late failure: --unleased
+			// skips its OWN holder, so `--unleased --lease hold` would
+			// step over the operator's do-not-touch declaration on the way
+			// to failing.
+			return fmt.Errorf("%q is the holder reserved for C11 holds — pick another --lease name (to declare a hold, use `vibe cell hold`)",
+				fleetapi.HoldHolder)
+		}
+		if c.lease.ttl > fleetapi.MaxLeaseTTL {
+			return fmt.Errorf("--lease-ttl may not exceed %s (the lease store's bound)", fleetapi.MaxLeaseTTL)
+		}
+	}
+	for _, f := range []struct{ flag, value string }{
+		{"--model", c.model}, {"--lease", c.lease.holder}, {"--lease-note", c.lease.note},
+	} {
+		if f.value != termSafe(f.value) {
+			return fmt.Errorf("%s contains a control character, which fleetd's field hygiene refuses", f.flag)
+		}
+	}
 	if c.ready && cell == fleetcfg.FrontCell {
 		// C8's probeGuard refuses the front for the same reason: the
 		// front's rendered config is peers-only, so an id there is a
@@ -103,8 +130,15 @@ func validateAwaitFlags(cell string, c awaitConds, ttlSet bool) error {
 // condResult is one condition's verdict plus the phrase that explains
 // it. The progress line, the success line and the timeout error are all
 // built from these, so they cannot describe the wait differently.
+//
+// key is the STATE the detail describes, stripped of every number that
+// moves on its own. The progress line is deduplicated on it: `idle 3m of
+// 10m` differs from `idle 3m5s of 10m` in text and not at all in
+// meaning, and an eight-hour `--timeout 0` wait deduplicated on text
+// prints one line per poll.
 type condResult struct {
 	met    bool
+	key    string
 	detail string
 }
 
@@ -113,6 +147,7 @@ type condResult struct {
 type awaitEval struct {
 	ok     bool
 	status string   // full progress line
+	key    string   // change-detection identity of that line
 	extra  []string // details of the non-reachability conditions
 	unmet  []string // details of whatever was not met
 }
@@ -146,8 +181,14 @@ func (c awaitConds) evaluate(snap *fleetapi.StateSnapshot, cell string) (awaitEv
 
 	ev := awaitEval{ok: true}
 	details := make([]string, 0, len(results))
+	keys := make([]string, 0, len(results))
 	for i, r := range results {
 		details = append(details, r.detail)
+		key := r.key
+		if key == "" {
+			key = r.detail
+		}
+		keys = append(keys, key)
 		if i > 0 {
 			ev.extra = append(ev.extra, r.detail)
 		}
@@ -157,6 +198,7 @@ func (c awaitConds) evaluate(snap *fleetapi.StateSnapshot, cell string) (awaitEv
 		}
 	}
 	ev.status = strings.Join(details, "; ")
+	ev.key = strings.Join(keys, "\x00")
 	return ev, nil
 }
 
@@ -192,10 +234,10 @@ func (c awaitConds) evalModel(cs *fleetapi.CellSnapshot, snap *fleetapi.StateSna
 			return condResult{}, fmt.Errorf("%w %q on cell %q (its catalog: %s)",
 				errUnknownModel, c.model, cs.Name, termSafe(catalogSummary(cs.Models)))
 		}
-		return condResult{detail: fmt.Sprintf("%s not in %s's catalog yet", termSafe(c.model), termSafe(cs.Name))}, nil
+		return condResult{key: "model:absent", detail: fmt.Sprintf("%s not in %s's catalog yet", termSafe(c.model), termSafe(cs.Name))}, nil
 	}
 	if row.State == "ready" {
-		return condResult{met: true, detail: termSafe(row.ID) + " ready"}, nil
+		return condResult{met: true, key: "model:ready", detail: termSafe(row.ID) + " ready"}, nil
 	}
 	state := row.State
 	if state == "" {
@@ -210,7 +252,7 @@ func (c awaitConds) evalModel(cs *fleetapi.CellSnapshot, snap *fleetapi.StateSna
 				time.Duration(st.P50S*float64(time.Second)).Round(time.Second), st.Count)
 		}
 	}
-	return condResult{detail: detail}, nil
+	return condResult{key: "model:" + state, detail: detail}, nil
 }
 
 // catalogSummary lists a few ids so a typo is fixable from the error.
@@ -245,7 +287,7 @@ func (c awaitConds) evalIdle(cs *fleetapi.CellSnapshot) condResult {
 				reason = termSafe(a.Reason)
 			}
 		}
-		return condResult{detail: "idle unknown: " + reason +
+		return condResult{key: "idle:unknown", detail: "idle unknown: " + reason +
 			" — await will not treat missing evidence as idleness"}
 	}
 	// Clamped before the conversion: float→int64 out of range is
@@ -261,12 +303,22 @@ func (c awaitConds) evalIdle(cs *fleetapi.CellSnapshot) condResult {
 	}
 	idle := time.Duration(secs * float64(time.Second)).Round(time.Second)
 	if a.InFlight != nil && *a.InFlight > 0 {
-		return condResult{detail: fmt.Sprintf("%d request(s) in flight", *a.InFlight)}
+		return condResult{key: "idle:busy", detail: fmt.Sprintf("%d request(s) in flight", *a.InFlight)}
+	}
+	// fleetd qualifies a window it can compute but not fully vouch for —
+	// today, "the stream is live and no inflight frame has EVER arrived",
+	// which is the one reading of `--idle` that rests on the cell's
+	// silence rather than on an edge fleetd watched. §3 rule 2 promises
+	// it is "surfaced in the status line either way"; dropping it on the
+	// success path is how missing evidence becomes a silent green light.
+	qual := ""
+	if a.Reason != "" {
+		qual = " — " + termSafe(a.Reason)
 	}
 	if idle >= c.idle {
-		return condResult{met: true, detail: fmt.Sprintf("idle %s (>= %s)", idle, c.idle)}
+		return condResult{met: true, key: "idle:met", detail: fmt.Sprintf("idle %s (>= %s)%s", idle, c.idle, qual)}
 	}
-	return condResult{detail: fmt.Sprintf("idle %s of %s", idle, c.idle)}
+	return condResult{key: "idle:waiting", detail: fmt.Sprintf("idle %s of %s%s", idle, c.idle, qual)}
 }
 
 // evalLeases reads C2's advisory store as a DECLARATION the waiter has
@@ -282,6 +334,13 @@ func (c awaitConds) evalLeases(cs *fleetapi.CellSnapshot) condResult {
 	var holders []string
 	for _, l := range cs.Leases {
 		if c.lease.holder != "" && l.Holder == c.lease.holder {
+			continue
+		}
+		// C11's rule for surfaces: a hold is keyed on the RESERVED
+		// holder, and "leased by hold" reads as a consumer with an odd
+		// name rather than the operator's do-not-touch declaration.
+		if l.Holder == fleetapi.HoldHolder {
+			holders = append(holders, "held: "+termSafe(l.Model))
 			continue
 		}
 		holders = append(holders, termSafe(l.Holder))

@@ -204,3 +204,60 @@ func TestSnapshotAlwaysCarriesAnActivityBlock(t *testing.T) {
 		t.Errorf("unwatched cell reported as observable: %+v", act)
 	}
 }
+
+// ─── adversarial review pass (C10) ──────────────────────────────────────────
+
+// TestActivity_APreConnectInFlightCountIsNotEvidenceAboutNow: the count
+// survives a reconnect, the knowledge does not. llama-swap's remove edge
+// for a request that finished while fleetd was disconnected is simply
+// lost, so a non-zero count last stamped before the current connection
+// is neither "busy now" nor "idle" — and reporting it as busy is a claim
+// that also never resolves, because the frame that would clear it only
+// arrives when someone issues a NEW request. That is the connect-floor
+// rule pointed the other way: fleetd may not claim what it was not
+// watching, in either direction.
+func TestActivity_APreConnectInFlightCountIsNotEvidenceAboutNow(t *testing.T) {
+	s := activityServer(t)
+	s.setCellUp("gpu-cell", true)
+	s.trackInFlight("gpu-cell", inflightFrame(t, "qwen")) // one request starts
+	s.setCellUp("gpu-cell", false)                        // stream drops mid-request
+	s.setCellUp("gpu-cell", true)                         // and comes back
+
+	act := s.activityFor("gpu-cell")
+	if !act.Observed {
+		t.Fatal("the reconnected stream is not observed")
+	}
+	if act.IdleSeconds != nil {
+		t.Errorf("idle_s = %v from a pre-connect frame: fleetd is vouching for a window it was disconnected for", *act.IdleSeconds)
+	}
+	if !strings.Contains(act.Reason, "predates the current stream connection") {
+		t.Errorf("Reason = %q: a stale count reported as a live one is a false statement the operator cannot see through", act.Reason)
+	}
+
+	// And it self-heals: the next frame is inside the window.
+	s.trackInFlight("gpu-cell", inflightFrame(t))
+	act = s.activityFor("gpu-cell")
+	if act.IdleSeconds == nil {
+		t.Fatalf("a fresh frame did not restore the window: %+v", act)
+	}
+	if *act.IdleSeconds > 60 {
+		t.Errorf("idle_s = %.0f after a completion edge, want ~0", *act.IdleSeconds)
+	}
+}
+
+// TestActivity_AnInFlightCountInsideTheWindowStillReportsBusy is the
+// positive control for the test above: the stale-frame check must not
+// swallow the ordinary busy case, which is the guard C4 needed.
+func TestActivity_AnInFlightCountInsideTheWindowStillReportsBusy(t *testing.T) {
+	s := activityServer(t)
+	s.setCellUp("gpu-cell", true)
+	s.trackInFlight("gpu-cell", inflightFrame(t, "qwen", "bge"))
+
+	act := s.activityFor("gpu-cell")
+	if act.IdleSeconds == nil || *act.IdleSeconds != 0 {
+		t.Fatalf("idle_s = %v with 2 in flight on the current connection, want a reported 0", act.IdleSeconds)
+	}
+	if !strings.Contains(act.Reason, "in flight") {
+		t.Errorf("Reason = %q", act.Reason)
+	}
+}

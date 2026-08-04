@@ -1,6 +1,7 @@
 # C10 — await extensions: model-ready, cell-idle, and the lease handshake
 
-Status: EXECUTED + REVIEWED (2026-08-04), off `feat/c10-await-extensions`.
+Status: EXECUTED + REVIEWED + ADVERSARIALLY REVIEWED (2026-08-04), off
+`feat/c10-await-extensions`, merged with `main` at `e7adae4` (C11).
 Every mechanically verifiable gate is green under `-race -count=5`; the
 four live gates need real hardware and are **NOT RUN** — see
 [§Execution](#execution-2026-08-04). Third v2-backlog item
@@ -531,3 +532,127 @@ closes it, but the case where fleetd reconnects mid-generation and the
 generation outlives the window is real and untested against hardware.
 The honest statement today is that `--idle` is safe against everything
 fleetd has watched and bounded — not that it is safe against everything.
+
+## Adversarial-review addendum (2026-08-04, 7 findings, all fixed with regression tests)
+
+Ground rule 9's second pass, run against C10 **merged with `main` at
+`e7adae4`** — C11 (`hold_model`) landed after this branch was cut and
+shares the lease store `--lease`/`--unleased` write and read. Landed as
+its own `review:` commit. Every fix below is mutation-verified: the
+production change was reverted and the named test was watched to FAIL,
+then restored (twelve mutations in total, including re-running five of
+the first pass's to confirm the refactor did not hollow them out).
+
+- **A parked wait re-polled `/api/fleet/state` once per SSE frame from
+  anywhere in the fleet (MAJOR).** `handleUpstream` publishes EVERY
+  upstream llama-swap payload — `logData`, `modelStatus`, `metrics` —
+  from EVERY cell onto `/api/fleet/events`, and the wait loop fell
+  through to a fresh poll on any frame it did not return on.
+  `/api/fleet/state` is an uncached probe round (`Snapshot` singleflights
+  concurrent callers but caches nothing), so each frame cost two HTTP
+  GETs per cell — against the same llama-swaps serving the traffic that
+  generated the frames. Harmless for C1's `--up`, which usually returns
+  on its first poll; C10 makes the long wait the *point*, so an
+  overnight `--idle` turns a generation on any cell into a probe flood.
+  A frame is now a reason to re-evaluate only when it is a transition
+  for THIS cell, which is what §5 already said.
+  `TestCellAwaitDoesNotRePollOnUnrelatedEvents`.
+- **`--down` unblocked on `fleet.cellStale` against a cell that was
+  still answering (MAJOR, C6's finding on the path C6 did not reach).**
+  Staleness retires the ANNOUNCE, never the probe — `presence.go`'s
+  not-fresh branch sets `snap.Reachable = probeOK` precisely so a cell
+  whose announcer died while llama-swap keeps serving stays reachable —
+  but the events fast-path took `fleet.cellStale` as a verdict and
+  printed `gpu-cell is down (fleet.cellStale)` for exactly that cell.
+  `fleet.cellWithdrawn` is the same shape (C6 gates the withdraw's
+  `HostReachable=false` on the probe failing too), and `fleet.cellUp`/
+  `fleet.cellDown` are the events STREAM, not the two GETs `Reachable`
+  is defined by. **The snapshot is now the only verdict**; a transition
+  triggers an immediate re-poll, which is what preserved C3's sub-second
+  unblock in the first place. `TestCellAwaitDown_AStaleAnnouncerIsNotADownCell`
+  (both event types). C3's `TestCellAwaitViaEventsStream` needed its
+  fixture made self-consistent — it emitted `fleet.cellReturned` from a
+  state document that said the cell was NOT reachable, i.e. it was
+  asserting that the event alone could return.
+- **`--lease` accepted C11's reserved holder, and only failed after the
+  wait (MAJOR).** The claim is POSTed when the wait succeeds, so under
+  `--timeout 0` — the documented overnight idiom — a batch parks all
+  night, unblocks at 03:00 and exits non-zero on a `400` that was
+  decidable before the first poll. `hold` is worse than late: C11
+  reserves that holder, and `--unleased` skips its OWN holder, so
+  `--unleased --lease hold` would step over the operator's do-not-touch
+  declaration on the way to failing. `validateAwaitFlags` now refuses
+  the reserved holder (pointing at `vibe cell hold`), an over-bound
+  `--lease-ttl` (`fleetapi.MaxLeaseTTL`, exported for this), and a
+  control character in `--model`/`--lease`/`--lease-note` — every
+  refusal fleetd would issue, issued before the wait starts.
+  `TestCellAwaitLease_ReservedHolderAndOverBoundTTLAreRefusedBeforeTheWait`
+  asserts **zero** state polls happened.
+- **The evidence gap was dropped on the success path (MAJOR).** §3 rule
+  2 promises the unreported-in-flight qualification is "surfaced in the
+  status line either way", and it was not: `activityFor` sets
+  `Reason = "no inflight frame seen yet; idle measured from the stream
+  connect"`, and `evalIdle` printed `idle 15m0s (>= 10m0s)` and threw it
+  away. That is the one reading of `--idle` resting on the cell's
+  SILENCE rather than on an edge fleetd watched, so if live gate (b)
+  finds v239 does not emit the frames the fold needs, the failure mode
+  is a silent green light — the M2 trap with nothing on screen to catch
+  it. fleetd's qualification now rides both the progress and the success
+  line. `TestCellAwaitIdle_ASatisfiedWindowStillNamesTheEvidenceGap`.
+- **A pre-connect in-flight count was reported as a live one (MINOR).**
+  `s.inFlight[cell]` survives a stream drop; the knowledge does not. A
+  request that finished while fleetd was disconnected takes its remove
+  edge with it, so after a reconnect the cell reports `in_flight: 1`,
+  `idle_s: 0`, "1 request(s) in flight" — a claim about now built from a
+  frame predating the observation window this phase exists to enforce,
+  and one that never resolves, because the frame that would clear it
+  only arrives when someone issues a NEW request. `--idle` therefore
+  parked forever on a genuinely idle cell, with a false reason. It still
+  refuses to unblock — fleetd honestly does not know, and that is the
+  fail-closed direction — but says so as the missing evidence it is, and
+  self-heals on the next frame. This is the connect floor pointed the
+  other way. `TestActivity_APreConnectInFlightCountIsNotEvidenceAboutNow`
+  plus `TestActivity_AnInFlightCountInsideTheWindowStillReportsBusy` as
+  the positive control.
+- **"Print only on change" changed nothing (MINOR, and the test said
+  otherwise).** The progress line is deduplicated on its rendered text,
+  which embeds a second-resolution idle counter that moves on every
+  poll — so against a real fleetd it deduplicates nothing and an
+  overnight `--timeout 0 --idle` wait logs one line per poll for eight
+  hours. The original test froze `idle_s` and so could never see it
+  (ground rule 10 again). `condResult` grew a stable `key` and the loop
+  deduplicates on that. `TestCellAwaitProgressSurvivesAMovingIdleCounter`
+  drives a MOVING counter and asserts one line.
+- **A C11 hold rendered as a consumer with an odd name (MINOR).**
+  `--unleased` printed `leased by hold`. C11's rule for surfaces that
+  carry no hold flag is to key on the reserved holder; `evalLeases` now
+  does, and prints `held: <model>`.
+  `TestCellAwaitUnleased_AHoldIsNamedAsAHold`.
+
+**Verified sound, not changed.** `--timeout 0` is still wait-forever and
+the flag's default is now pinned by a test (`DefValue == "0s"`). The
+unknown-model fail-fast still requires a REACHABLE cell with a NON-EMPTY
+catalog, transport errors still retry, and the one-snapshot rule, the
+connect floor, the `Observed` gate, the cell-level frame stamp and the
+own-holder skip each still fail a named test when their production line
+is broken. `--idle` deliberately does NOT consult a C11 hold: a hold
+suspends what **fleetd** initiates, and an operator's batch is not
+fleetd guessing (C11 §"what it does NOT touch") — `--unleased` is how a
+batch respects one, and it now names it.
+
+**Known and accepted, added by this pass.** A 4xx from fleetd's `/state`
+(a stale token, an `--api` pointed at a daemon without the fleetd role)
+retries forever under `--timeout 0` rather than failing fast like an
+unknown cell. It is visible — every attempt prints `(retrying)` with the
+status — and narrowing it risks the 502/503-while-restarting case the
+retry loop exists for, so it is recorded rather than changed.
+
+### Gates, re-run after the review commit
+
+Gates 1–11 **PASS** on the merged tree; gate 12 (live, a–d) remains
+**NOT RUN** — no route to the fleet's hardware from the reviewing
+environment either, and no transcripts are fabricated. Full inner loop:
+`go build ./...`, `go vet ./...`, `gofmt -l .` silent, `go mod tidy`
+clean, `golangci-lint run` **0 issues**, `go test -race -count=5 ./...`
+**exit 0, 27 packages ok, no DATA RACE**. Gate 10 re-checked against the
+merge base: `git diff --stat main..HEAD -- internal/vibe/proxy` is empty.

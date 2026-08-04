@@ -390,11 +390,12 @@ func cellAwaitCmd() *cobra.Command {
 //
 // C3 made transitions subscribable: it rides /api/fleet/events when the
 // stream works (cellUp/cellDown, cellReturned/cellStale/cellWithdrawn)
-// and falls back to the 5s poll when it doesn't. With extra conditions
-// requested a matching event triggers an immediate re-poll instead of a
-// return — an event proves reachability moved, not that a model is warm.
-// Intent is never consulted — a drained cell that answers is up (routing
-// truth rule).
+// and falls back to the poll interval when it doesn't. A transition for
+// THIS cell triggers an immediate re-poll — that is what keeps C3's
+// sub-second unblock — but the snapshot is what decides, always: an
+// event proves something moved, never that the cell is reachable, that a
+// model is warm or that a GPU is free. Intent is never consulted — a
+// drained cell that answers is up (routing truth rule).
 func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell string, cond awaitConds, timeout, interval time.Duration) error {
 	// Cancelled on EVERY return, not just the --timeout path: the events
 	// goroutine below only exits on ctx, so a successful wait under
@@ -422,20 +423,32 @@ func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell str
 		}
 	}()
 
-	eventMatches := func(ev fleetEvent) bool {
+	// A transition frame is a WAKE-UP, never a verdict. The five types
+	// mean five different things and only the snapshot reconciles them:
+	// `fleet.cellStale` says the ANNOUNCER died, and C6's whole finding
+	// is that a dead announcer leaves a healthy cell serving
+	// (`snap.Reachable = probeOK`), so returning "down" on it reports the
+	// exact cell C6 kept reachable as gone. `fleet.cellReturned` says the
+	// announcer is back, which a drained echo can still render
+	// unreachable. Even `fleet.cellDown` is the events stream dropping,
+	// not the two GETs `Reachable` is defined by. Re-polling costs one
+	// round trip and keeps the sub-second unblock C3 built this for,
+	// while leaving ONE thing deciding — the same snapshot rule the
+	// composite conditions already follow.
+	eventRelevant := func(ev fleetEvent) bool {
 		if ev.Cell != cell {
 			return false
 		}
 		switch ev.Type {
-		case "fleet.cellUp", "fleet.cellReturned":
-			return cond.wantUp
-		case "fleet.cellDown", "fleet.cellStale", "fleet.cellWithdrawn":
-			return !cond.wantUp
+		case "fleet.cellUp", "fleet.cellDown", "fleet.cellStale",
+			"fleet.cellWithdrawn", "fleet.cellReturned":
+			return true
 		}
 		return false
 	}
 
-	var lastStatus string
+	var lastKey string
+	var printed bool
 	var lastUnmet []string
 	var lastErr error
 	for {
@@ -446,10 +459,12 @@ func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell str
 			return nil
 		case err == nil:
 			lastUnmet, lastErr = ev.unmet, nil
-			// Only on change: a 10-minute idle window at a 5s poll would
-			// otherwise print 120 identical lines.
-			if ev.status != lastStatus {
-				lastStatus = ev.status
+			// On a CHANGE OF STATE, not of text. The status line carries a
+			// live idle counter, so deduplicating on the rendered line
+			// deduplicates nothing against a real fleetd — an overnight
+			// `--idle` wait would log one line per poll for eight hours.
+			if !printed || ev.key != lastKey {
+				lastKey, printed = ev.key, true
 				fmt.Fprintf(out, "await %s: %s\n", cell, ev.status)
 			}
 		case errors.Is(err, errUnknownCell), errors.Is(err, errUnknownModel):
@@ -467,26 +482,36 @@ func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell str
 				fmt.Fprintf(out, "await %s: %v (retrying)\n", cell, err)
 			}
 		}
-		select {
-		case <-ctx.Done():
-			if timeout > 0 {
-				switch {
-				case lastErr != nil:
-					// fleetd was unreachable at the end: reporting "the cell
-					// never came up" would blame the cell for the registry.
-					return fmt.Errorf("timeout waiting for %s: last attempt failed: %w", cell, lastErr)
-				case cond.extras() && len(lastUnmet) > 0:
-					return fmt.Errorf("timeout waiting for %s: %s", cell, strings.Join(lastUnmet, "; "))
+		// Wait for the next REASON to re-evaluate. An unrelated frame is
+		// not one: fleetd forwards every upstream llama-swap payload
+		// (logData, modelStatus, metrics) from every cell onto this
+		// stream, and /api/fleet/state is an uncached probe round of the
+		// whole fleet. Re-polling per frame turns a long wait — which is
+		// the entire point of --idle — into a probe flood against the
+		// llama-swaps that are serving the traffic.
+		for repoll := false; !repoll; {
+			select {
+			case <-ctx.Done():
+				if timeout > 0 {
+					switch {
+					case lastErr != nil:
+						// fleetd was unreachable at the end: reporting "the cell
+						// never came up" would blame the cell for the registry.
+						return fmt.Errorf("timeout waiting for %s: last attempt failed: %w", cell, lastErr)
+					case cond.extras() && len(lastUnmet) > 0:
+						return fmt.Errorf("timeout waiting for %s: %s", cell, strings.Join(lastUnmet, "; "))
+					}
+					return fmt.Errorf("timeout waiting for %s to come %s", cell, upWord(cond.wantUp))
 				}
-				return fmt.Errorf("timeout waiting for %s to come %s", cell, upWord(cond.wantUp))
+				return ctx.Err()
+			case ev := <-events:
+				if !streamAlive.Load() || !eventRelevant(ev) {
+					continue
+				}
+				repoll = true
+			case <-tick.C:
+				repoll = true
 			}
-			return ctx.Err()
-		case ev := <-events:
-			if streamAlive.Load() && eventMatches(ev) && !cond.extras() {
-				fmt.Fprintf(out, "%s is %s (%s)\n", cell, upWord(cond.wantUp), ev.Type)
-				return nil
-			}
-		case <-tick.C:
 		}
 	}
 }

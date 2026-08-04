@@ -18,7 +18,7 @@ to be implementable on its own after that.
 | [C7b](c7b-savings-screen.md) | The savings screen: what the fleet didn't spend | ~690 lines + ~100 KB data | C7a, C5 | merged (#25); unit gates green, live plausibility gate UNRUN |
 | [C8](c8-probe-model.md) | probe_model: throughput health against the model's own baseline | ~900 lines | C3, C4 | merged (#27); unit gates 1-10 green, 5 live gates UNRUN |
 | C9 | `vibe fleet notify`: the alarm column, delivered | ~1100 lines | C2, C3, C4 | PR #28 OPEN on `feat/c9-fleet-notify`; its phase doc lands with it |
-| [C10](c10-await-extensions.md) | await extensions: `--model --ready`, `--idle`, the lease handshake | ~450 lines | C1, C2, C3, C4, C6 | PR #29 OPEN; unit gates 1-12 green, 4 live gates UNRUN |
+| [C10](c10-await-extensions.md) | await extensions: `--model --ready`, `--idle`, the lease handshake | ~450 lines | C1, C2, C3, C4, C6, C11 | PR #29 OPEN; unit gates 1-11 green after the adversarial pass, 4 live gates UNRUN |
 | [C11](c11-hold-model.md) | hold_model: the pause button on the warm policy | ~450 lines | C2, C4, C5 | merged (#30); unit gates 1-11 green, 4 live gates UNRUN |
 
 C9 (`vibe fleet notify`) and C10 (await extensions) are open on their

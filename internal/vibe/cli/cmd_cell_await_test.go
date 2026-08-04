@@ -203,6 +203,15 @@ func TestAwaitFlagsRejectWaitsThatCouldNeverEnd(t *testing.T) {
 			awaitConds{wantUp: true}, true, "--lease-ttl needs --lease"},
 		{"negative --idle", "gpu-cell",
 			awaitConds{wantUp: true, idle: -time.Second}, false, "--idle must be a positive"},
+		{"--lease on C11's reserved holder", "gpu-cell",
+			awaitConds{wantUp: true, model: "qwen", ready: true,
+				lease: leaseClaim{holder: fleetapi.HoldHolder, ttl: time.Hour}}, false, "reserved for C11 holds"},
+		{"--lease-ttl past the store's bound", "gpu-cell",
+			awaitConds{wantUp: true, model: "qwen", ready: true,
+				lease: leaseClaim{holder: "batch", ttl: 200 * time.Hour}}, true, "may not exceed 168h"},
+		{"a control character fleetd would refuse", "gpu-cell",
+			awaitConds{wantUp: true, model: "qwen", ready: true,
+				lease: leaseClaim{holder: "batch", ttl: time.Hour, note: "1200\nrows"}}, false, "control character"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := validateAwaitFlags(tc.cell, tc.cond, tc.ttlSet)
@@ -217,6 +226,11 @@ func TestAwaitFlagsRejectWaitsThatCouldNeverEnd(t *testing.T) {
 	if err := validateAwaitFlags("gpu-cell", awaitConds{wantUp: true, model: "qwen", ready: true,
 		idle: 10 * time.Minute, unleased: true, lease: leaseClaim{holder: "batch", ttl: time.Hour}}, true); err != nil {
 		t.Errorf("the documented full invocation was rejected: %v", err)
+	}
+	// --timeout 0 is the overnight-batch idiom and the flag default; a
+	// default that sneaked in would end every parked wait silently.
+	if def := cellAwaitCmd().Flags().Lookup("timeout").DefValue; def != "0s" {
+		t.Errorf("--timeout default = %q, want %q (0 = wait forever)", def, "0s")
 	}
 }
 
@@ -627,5 +641,211 @@ func TestCellAwaitProgressLinesPrintOnlyOnChange(t *testing.T) {
 	_ = awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 300*time.Millisecond, 20*time.Millisecond)
 	if n := strings.Count(out.String(), "await gpu-cell:"); n != 1 {
 		t.Errorf("%d progress lines for one unchanged state:\n%s", n, out.String())
+	}
+}
+
+// ─── adversarial review pass (C10) ──────────────────────────────────────────
+
+// TestCellAwaitDoesNotRePollOnUnrelatedEvents: fleetd forwards EVERY
+// upstream llama-swap payload from EVERY cell onto /api/fleet/events
+// (logData, modelStatus, metrics — handleUpstream publishes them all),
+// and /api/fleet/state is an uncached probe round of the whole fleet.
+// Falling through to a re-poll on any frame turns the long wait --idle
+// exists for into a probe flood against the llama-swaps that are
+// serving the traffic. Only a matching transition for THIS cell is a
+// reason to re-evaluate, which is what the phase doc already said.
+func TestCellAwaitDoesNotRePollOnUnrelatedEvents(t *testing.T) {
+	var polls atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/fleet/state", func(w http.ResponseWriter, r *http.Request) {
+		polls.Add(1)
+		_ = json.NewEncoder(w).Encode(statusState(awaitTestCell(nil, idleActivity(60))))
+	})
+	mux.HandleFunc("GET /api/fleet/events", func(w http.ResponseWriter, r *http.Request) {
+		flusher := w.(http.Flusher)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			default:
+			}
+			// A busy neighbour and a log frame from the awaited cell: both
+			// are noise for every condition await can evaluate.
+			fmt.Fprint(w, "event:message\ndata:{\"cell\":\"other-cell\",\"type\":\"fleet.cellUp\"}\n\n")
+			fmt.Fprint(w, "event:message\ndata:{\"cell\":\"gpu-cell\",\"type\":\"logData\"}\n\n")
+			flusher.Flush()
+			time.Sleep(time.Millisecond)
+		}
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	var out bytes.Buffer
+	cond := awaitConds{wantUp: true, idle: time.Hour}
+	_ = awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 600*time.Millisecond, 200*time.Millisecond)
+	// 600ms at a 200ms tick is 4 polls; anything near the ~600 frames the
+	// stream delivered means the poll rate is the fleet's event rate.
+	if n := polls.Load(); n > 12 {
+		t.Errorf("%d state polls in 600ms at a 200ms interval: unrelated SSE frames are driving the poll loop", n)
+	}
+}
+
+// TestCellAwaitLease_ReservedHolderAndOverBoundTTLAreRefusedBeforeTheWait:
+// both are refusals fleetd would issue anyway, and the whole question is
+// WHEN. The claim is POSTed after the wait, so under `--timeout 0` a
+// batch parks all night and then exits non-zero on a 400 that was
+// decidable before the first poll. `hold` is worse than late: C11
+// reserves it, and --unleased skips its own holder, so `--unleased
+// --lease hold` steps over the operator's do-not-touch declaration on
+// its way to failing.
+func TestCellAwaitLease_ReservedHolderAndOverBoundTTLAreRefusedBeforeTheWait(t *testing.T) {
+	var polls atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/fleet/state", func(w http.ResponseWriter, r *http.Request) {
+		polls.Add(1)
+		_ = json.NewEncoder(w).Encode(statusState(awaitTestCell(
+			[]fleetapi.ModelState{{ID: "qwen", State: "ready"}}, idleActivity(1800))))
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	for _, tc := range []struct{ name, ttl, want string }{
+		{"reserved holder", "1h", "reserved for C11 holds"},
+		{"over-bound ttl", "200h", "may not exceed 168h"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			holder := "nightly-eval"
+			if tc.name == "reserved holder" {
+				holder = fleetapi.HoldHolder
+			}
+			polls.Store(0)
+			_, err := runAwait(t, "gpu-cell", "--api", ts.URL, "--model", "qwen", "--ready",
+				"--unleased", "--lease", holder, "--lease-ttl", tc.ttl, "--interval", "20ms", "--timeout", "2s")
+			if err == nil {
+				t.Fatal("accepted")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want it to mention %q", err, tc.want)
+			}
+			if polls.Load() != 0 {
+				t.Errorf("%d polls: the refusal came after the wait started, which under --timeout 0 is a night later", polls.Load())
+			}
+		})
+	}
+}
+
+// TestCellAwaitIdle_ASatisfiedWindowStillNamesTheEvidenceGap: §3 rule 2
+// of the phase doc promises the unreported-in-flight qualification is
+// "surfaced in the status line either way". The MET path is the half
+// that matters — this is the one reading of --idle that rests on the
+// cell's silence rather than on an edge fleetd watched, so if v239 turns
+// out not to emit inflight frames at all (live gate b, NOT RUN), a
+// silent success line is the M2 trap with nothing on screen to catch it.
+func TestCellAwaitIdle_ASatisfiedWindowStillNamesTheEvidenceGap(t *testing.T) {
+	act := idleActivity(900)
+	act.InFlight = nil // no frame has ever arrived from this cell
+	act.Reason = "no inflight frame seen yet; idle measured from the stream connect"
+	ts := cannedFleetd(t, func() fleetapi.StateSnapshot { return statusState(awaitTestCell(nil, act)) })
+
+	var out bytes.Buffer
+	cond := awaitConds{wantUp: true, idle: 10 * time.Minute}
+	if err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 2*time.Second, 20*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "no inflight frame seen yet") {
+		t.Errorf("the success line dropped fleetd's qualification, so the gap is invisible:\n%s", out.String())
+	}
+}
+
+// TestCellAwaitProgressSurvivesAMovingIdleCounter: the dedupe has to key
+// on the STATE, not the rendered text. idle_s grows on every poll
+// against a real fleetd, so deduplicating on the line deduplicates
+// nothing — an overnight `--timeout 0 --idle` wait logs one line per
+// poll for eight hours. The original test froze idle_s and so could
+// never see it.
+func TestCellAwaitProgressSurvivesAMovingIdleCounter(t *testing.T) {
+	var polls atomic.Int64
+	ts := cannedFleetd(t, func() fleetapi.StateSnapshot {
+		return statusState(awaitTestCell(nil, idleActivity(float64(polls.Add(1)))))
+	})
+	var out bytes.Buffer
+	cond := awaitConds{wantUp: true, idle: time.Hour}
+	_ = awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 400*time.Millisecond, 20*time.Millisecond)
+	if polls.Load() < 5 {
+		t.Fatalf("only %d polls: the test did not exercise the moving counter", polls.Load())
+	}
+	if n := strings.Count(out.String(), "await gpu-cell:"); n != 1 {
+		t.Errorf("%d progress lines across %d polls of one unchanged state:\n%s", n, polls.Load(), out.String())
+	}
+}
+
+// TestCellAwaitUnleased_AHoldIsNamedAsAHold: C11's rule for surfaces
+// with no hold flag — key on the reserved holder. "leased by hold" reads
+// as a consumer with an odd name, not as the operator's declaration.
+func TestCellAwaitUnleased_AHoldIsNamedAsAHold(t *testing.T) {
+	snap := statusState(awaitTestCell(nil, idleActivity(900),
+		fleetapi.Lease{Cell: "gpu-cell", Model: "qwen", Holder: fleetapi.HoldHolder, Hold: true,
+			ExpiresAt: time.Now().Add(time.Hour)}))
+	cond := awaitConds{wantUp: true, unleased: true}
+	ev, err := cond.evaluate(&snap, "gpu-cell")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.ok {
+		t.Fatal("--unleased ignored an active hold")
+	}
+	if !strings.Contains(ev.status, "held: qwen") {
+		t.Errorf("status = %q, want the hold named as one", ev.status)
+	}
+}
+
+// TestCellAwaitDown_AStaleAnnouncerIsNotADownCell is C6's finding on the
+// path C6 did not reach. Staleness retires the ANNOUNCE, never the
+// probe: `presence.go`'s not-fresh branch sets `snap.Reachable = probeOK`
+// precisely so a cell whose announcer died while llama-swap keeps
+// serving stays reachable. The events fast-path took `fleet.cellStale`
+// as a verdict anyway, so `await --down` reported "down" — with the
+// event named in the line, which is worse — for a cell still answering
+// every request. `fleet.cellWithdrawn` is the same shape (C6 gates the
+// withdraw's HostReachable=false on the probe failing too).
+func TestCellAwaitDown_AStaleAnnouncerIsNotADownCell(t *testing.T) {
+	for _, evType := range []string{"fleet.cellStale", "fleet.cellWithdrawn"} {
+		t.Run(evType, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /api/fleet/state", func(w http.ResponseWriter, r *http.Request) {
+				// The cell is answering: llama-swap is fine, its announcer is not.
+				_ = json.NewEncoder(w).Encode(statusState(awaitTestCell(
+					[]fleetapi.ModelState{{ID: "qwen", State: "ready"}}, idleActivity(60))))
+			})
+			mux.HandleFunc("GET /api/fleet/events", func(w http.ResponseWriter, r *http.Request) {
+				flusher := w.(http.Flusher)
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				flusher.Flush()
+				for {
+					select {
+					case <-r.Context().Done():
+						return
+					case <-time.After(10 * time.Millisecond):
+						fmt.Fprintf(w, "event:message\ndata:{\"cell\":\"gpu-cell\",\"type\":%q}\n\n", evType)
+						flusher.Flush()
+					}
+				}
+			})
+			ts := httptest.NewServer(mux)
+			t.Cleanup(ts.Close)
+
+			var out bytes.Buffer
+			err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", awaitConds{}, 300*time.Millisecond, time.Second)
+			if err == nil {
+				t.Fatalf("%s unblocked a --down wait against a cell that is still answering:\n%s", evType, out.String())
+			}
+			if !strings.Contains(err.Error(), "timeout waiting for gpu-cell") {
+				t.Errorf("err = %v", err)
+			}
+		})
 	}
 }

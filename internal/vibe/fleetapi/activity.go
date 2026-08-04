@@ -73,6 +73,19 @@ func (s *Server) activityFor(cell string) *CellActivity {
 		act.InFlight = &c
 	}
 	if reported && count > 0 {
+		if haveLast && last.Before(since) {
+			// The count survives a reconnect; the knowledge does not. A
+			// non-zero count last stamped BEFORE the current connection is
+			// not a claim about now — the remove edge that closed it out
+			// arrived while fleetd was disconnected, or the request is
+			// still running, and nothing here can tell those apart. Report
+			// it as the absent evidence it is (no window) rather than as a
+			// live busy count: the first is a refusal a consumer can read
+			// and act on, the second is a false statement of fact that
+			// also never resolves.
+			act.Reason = fmt.Sprintf("%s's last inflight frame (%d in flight) predates the current stream connection — that count is not evidence about now, and no frame has arrived since fleetd reconnected", cell, count)
+			return act
+		}
 		zero := 0.0
 		act.IdleSeconds = &zero
 		act.Reason = fmt.Sprintf("%d request(s) in flight", count)
