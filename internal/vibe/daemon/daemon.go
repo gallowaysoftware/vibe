@@ -202,6 +202,11 @@ type FleetConfig struct {
 	// render_front tool can diff a fresh render against it. Empty means
 	// render-only, no diff.
 	FrontConfig string `yaml:"front_config,omitempty"`
+	// Notify is the alarm-to-webhook bridge (fleet-control C9). Empty
+	// means no notifications — the design's "alarm? yes" column then
+	// terminates in an SSE stream nobody watches, which is the status
+	// quo, not a regression.
+	Notify NotifyConfig `yaml:"notify,omitempty"`
 	// Timezone is the IANA zone (e.g. "America/Toronto") the fleet's
 	// wall-clock decisions are evaluated in: the usage ledger's day
 	// boundaries (C7a §6) and the warm schedule's cron fields (C4 §2).
@@ -210,6 +215,42 @@ type FleetConfig struct {
 	// and fires an 06:30 warm at 01:30 local. Empty keeps the process
 	// zone (the pre-C7a behavior).
 	Timezone string `yaml:"timezone,omitempty"`
+}
+
+// NotifyConfig configures the C9 alarm notifier. The webhook URL is a
+// CREDENTIAL (an ntfy topic URL is bearer-equivalent in both
+// directions), so URLFile is the preferred form and neither value is
+// ever logged, returned in an error, or serialized into a status
+// document — see internal/vibe/fleetnotify's Redact and Scrub.
+type NotifyConfig struct {
+	// URL is the webhook endpoint inline. Acceptable only when
+	// config.yaml itself is 0600; prefer URLFile.
+	URL string `yaml:"url,omitempty"`
+	// URLFile is a file containing the endpoint (first line), following
+	// fleet.token_file's convention: the path is config, the value never
+	// enters a repo. Tilde-expanded at load.
+	URLFile string `yaml:"url_file,omitempty"`
+	// TokenFile is an optional bearer token for the webhook (self-hosted
+	// ntfy with access control). Tilde-expanded at load.
+	TokenFile string `yaml:"token_file,omitempty"`
+	// Format is "text" (default, ntfy-native headers) or "json".
+	Format string `yaml:"format,omitempty"`
+	// Interval is the evaluation cadence (Go duration, default 30s).
+	Interval string `yaml:"interval,omitempty"`
+	// Alarms overrides the enabled alarm kinds. Empty means the design
+	// doc §4 class table's alarm column and nothing else.
+	Alarms []string `yaml:"alarms,omitempty"`
+	// Dwell overrides the per-kind fire threshold (Go durations, keyed by
+	// alarm kind); ClearDwell overrides the resolve threshold.
+	Dwell      map[string]string `yaml:"dwell,omitempty"`
+	ClearDwell string            `yaml:"clear_dwell,omitempty"`
+	// RatePerHour and Burst bound deliveries absolutely (defaults 12 and
+	// 4). Anything the dwells let through is paced by this bucket.
+	RatePerHour float64 `yaml:"rate_per_hour,omitempty"`
+	Burst       int     `yaml:"burst,omitempty"`
+	// Resolve sends a notification when a fired alarm clears (default
+	// true) — the passive half of "await-unblocked".
+	Resolve *bool `yaml:"resolve,omitempty"`
 }
 
 // FleetLocation resolves fleet.timezone to a Location. An unparseable
@@ -250,6 +291,8 @@ func LoadConfig() (Config, error) {
 	}
 	c.Fleet.TokenFile = expandTilde(c.Fleet.TokenFile)
 	c.Fleet.FrontConfig = expandTilde(c.Fleet.FrontConfig)
+	c.Fleet.Notify.URLFile = expandTilde(c.Fleet.Notify.URLFile)
+	c.Fleet.Notify.TokenFile = expandTilde(c.Fleet.Notify.TokenFile)
 	return c.resolveHTTPAddr(), nil
 }
 
@@ -524,7 +567,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// hosts.yaml beside the cells they describe. Membership still
 			// comes from fleetCells above — this is the same file, not a
 			// second cell list.
-			Hosts: hosts,
+			Hosts:           hosts,
+			NotifyScopePath: paths.NotifyScopeFile(),
 		}
 		d.hosts = hosts
 	}
@@ -562,6 +606,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.startProbeLoop(d.cfg, d.hosts)
 		// C7b: actual cloud spend, tailed off the front's own activity log.
 		d.startCloudSpendLoop(d.hosts)
+		// C9: the class table's alarm column, delivered. Read-only over
+		// the same snapshot every other surface renders.
+		d.startNotifyLoop(d.cfg)
 	}
 
 	// C3: this box announces to fleetd when it has a cell identity and a

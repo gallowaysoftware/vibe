@@ -145,6 +145,10 @@ type StateSnapshot struct {
 	// Probe is the C8 throughput-probe status (scheduler state + the
 	// currently-degraded models), present when either exists.
 	Probe *probeStatus `json:"probe,omitempty"`
+	// Notify is the C9 alarm-notifier status: the declared away/home
+	// scope, every alarm the tracker holds (including ones whose delivery
+	// away suppressed), and the delivery counters.
+	Notify *notifyStatus `json:"notify,omitempty"`
 }
 
 // snapshotTimeout bounds the per-cell /running + /v1/models probes so one
@@ -271,6 +275,24 @@ type Server struct {
 	// discipline as the warm states.
 	probeStates []*probeTargetState
 
+	// notify is the C9 alarm notifier (nil when unconfigured);
+	// notifyScope is the declared away/home fleet scope. notifyMu guards
+	// both plus the tracker, which is stepped by the evaluation loop and
+	// read by every status render. It is NEVER held across a Snapshot:
+	// the snapshot renders the notify block and takes it itself.
+	notifyMu        sync.Mutex
+	notify          *notifyRunner
+	notifyScope     *NotifyScope
+	notifyScopePath string
+
+	// fpMismatch is the render loop's current fingerprint-mismatch set,
+	// keyed cell+"\x00"+model — the state the C9 persistence threshold is
+	// measured against, because the mismatch EVENT fires once and then
+	// goes silent. renderLoopOn records whether the pass that maintains
+	// it is running at all.
+	fpMismatch   map[string]FingerprintMismatch
+	renderLoopOn bool
+
 	// started is this process's boot instant, immutable after New. The
 	// warm policy uses it as the idle floor for a model no inflight frame
 	// has ever mentioned: fleetd must never claim more silence than it
@@ -310,6 +332,9 @@ type Options struct {
 	Hosts *fleetcfg.File
 	// Prices overrides the embedded price table (tests only).
 	Prices *prices.Table
+	// NotifyScopePath backs the declared away/home fleet scope (C9).
+	// Empty keeps the scope in memory only.
+	NotifyScopePath string
 }
 
 // New builds a Server over the given cell registry. historyPath is the JSON
@@ -353,6 +378,9 @@ func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Op
 		usage:              usage,
 		hosts:              opts.Hosts,
 		prices:             opts.Prices,
+		fpMismatch:         map[string]FingerprintMismatch{},
+		notifyScope:        loadNotifyScope(opts.NotifyScopePath),
+		notifyScopePath:    opts.NotifyScopePath,
 		done:               make(chan struct{}),
 	}
 }
@@ -368,6 +396,11 @@ func (s *Server) Register(mux *http.ServeMux) {
 		mux.HandleFunc("POST /api/fleet/intent", s.handleIntent)
 		mux.HandleFunc("POST /api/fleet/wake", s.handleWake)
 		mux.HandleFunc("POST /api/fleet/announce", s.handleAnnounce)
+		// C9. The scope route exists whether or not a webhook is
+		// configured (declaring away before wiring a sink is harmless);
+		// the send route answers 503 without one.
+		mux.HandleFunc("POST /api/fleet/notify/scope", s.handleNotifyScope)
+		mux.HandleFunc("POST /api/fleet/notify/send", s.handleNotifySend)
 		s.registerFleetPage(mux)
 	}
 	if s.leasePath != "" {
@@ -469,6 +502,7 @@ func (s *Server) probeSnapshot(ctx context.Context) StateSnapshot {
 		FrontRenders: s.RenderCount(),
 		Warm:         s.warmReport(),
 		Probe:        s.probeReport(),
+		Notify:       s.notifyReport(),
 	}
 	var wg sync.WaitGroup
 	for i, c := range s.cells {

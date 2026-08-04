@@ -94,6 +94,11 @@ func (s *Server) StartRenderLoop(cfg RenderLoopConfig) {
 	if cfg.WriteFile == nil {
 		cfg.WriteFile = writeAtomic
 	}
+	// The fingerprint alarm (C9) is only as trustworthy as the pass that
+	// evaluates it, so the status names whether that pass exists at all.
+	s.mu.Lock()
+	s.renderLoopOn = true
+	s.mu.Unlock()
 	s.wg.Add(1)
 	go (&renderLoop{srv: s, cfg: cfg, pruned: map[string]bool{}}).run()
 }
@@ -293,6 +298,11 @@ func (rl *renderLoop) applyFingerprints(defs []*profile.BackendDef, pres map[str
 		byName[d.Name] = d
 	}
 	excluded := map[string]bool{}
+	// mismatched accumulates what THIS pass found. The set is rebuilt from
+	// it (C9): the mismatch event fires once and then goes silent, so
+	// "persistent" can only be measured against state, and this pass is
+	// the only thing that evaluates it.
+	var mismatched []FingerprintMismatch
 	for _, p := range pres {
 		if !p.Announcing {
 			continue
@@ -366,11 +376,15 @@ func (rl *renderLoop) applyFingerprints(defs []*profile.BackendDef, pres map[str
 			}
 			slog.Warn("flags fingerprint mismatch", "model", m.ID, "cell", p.Cell, "mode", mode, "defs_sha", defsSHA, "defs_dirty", defsDirty)
 			rl.srv.publish(Event{Cell: p.Cell, Type: EventFingerprint, Data: data})
+			mismatched = append(mismatched, FingerprintMismatch{
+				Cell: p.Cell, Model: m.ID, Expected: expected, Got: m.FlagsSHA256, Mode: mode,
+			})
 			if mode == "strict" {
 				excluded[def.Name] = true
 			}
 		}
 	}
+	rl.srv.setFingerprintMismatches(mismatched, time.Now().UTC())
 	if len(excluded) == 0 {
 		return defs
 	}

@@ -581,6 +581,55 @@ optional.)
   - C8 adds **no HTTP route** (verdicts ride `/api/fleet/state`, the verb
     rides `/mcp`), so the fleetd route list and C5's exact-match bearer
     exemption are untouched.
+- **Alarm notifications (fleet-control C9).** `internal/vibe/fleetnotify`
+  (the dwell/dedup/rate policy engine + the webhook sink, zero fleet
+  imports), `fleetapi/notify.go` (conditions, the away/home scope,
+  `POST /api/fleet/notify/{scope,send}`, the `notify` status block),
+  `daemon/notify.go` (config), fleetmcp's `fleet_notify_scope` /
+  `fleet_notify_test`, `vibe fleet notify`, `vibe cell await --notify`.
+  - **It is a state DIFFER, not an event bridge**, and that is not a
+    style choice: `fleet.fingerprintMismatch` fires exactly ONCE per
+    drift (renderPass runs on triggers; a steady wrong hash triggers
+    nothing) and drain-with-lease has no event at all. Conditions are
+    read off `Server.Snapshot` — the same document the page and
+    `vibe cell status` render — so the pager and the page cannot
+    disagree. Do not "fix" this by subscribing to the hub.
+  - **The default policy is the design §4 class table's alarm column and
+    nothing else**: always_on absence, persistent fingerprint drift,
+    drain-with-active-lease. `model_degraded` is implemented and OFF
+    (C8's verdict has a false-positive tail; the table does not list
+    it). A notifier that fires on everything is one the operator learns
+    to swipe away — that is a worse failure than no notifier.
+  - **Declared intent may SUPPRESS an alarm; inferred intent does
+    nothing.** A cell absent with a declared drain (DRAINED, OFF) is
+    explained and does not page; absent with NO entry is `DRAINED?` and
+    pages. That reads the intent store's emptiness as a fact, never as a
+    guess about what the operator meant, and it actuates nothing.
+    INCONSISTENT is a nag, not an alarm.
+  - **Persistence needs a set, not an event**: `renderPass` rebuilds
+    `Server.fpMismatch` every pass, preserving `FirstSeen`. Without
+    `fleet.front_config` there are no passes, so the status reports
+    `fingerprint_source: unavailable (…)` rather than letting a silent
+    zero read as "no drift".
+  - **Coalescing is three rules**: dwell on BOTH edges (a cell flapping
+    faster than its dwell notifies zero times), an active key never
+    re-fires, and a token bucket that DEFERS rather than drops.
+  - **`notify.scope` (away/home) is its own file**
+    (`paths.NotifyScopeFile()`), never a key in `intent.json` — every
+    reader of that store treats a key as a cell that announces and
+    echoes. Away gates DELIVERY only: alarms still fire, stay visible in
+    `fleet_status` with a suppressed count, and coming home sends one
+    digest. An explicit send (`notify test`, `await --notify`) is never
+    gated by away.
+  - **The webhook URL is a credential** (an ntfy topic URL is
+    bearer-equivalent). `*url.Error.Error()` embeds the full URL, so the
+    sink unwraps it AND scrubs; the status shows `Redact(url)` only.
+    Both guards are individually mutation-pinned — do not delete either
+    because "the other one covers it".
+  - Delivery runs on one worker behind a bounded queue: `Enqueue` never
+    blocks, and every request and backoff is bound to a context
+    cancelled by `s.done` (C4's `warmCtx` rule). A 4xx is the far side
+    answering and is never retried (C6's piggyback rule).
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.

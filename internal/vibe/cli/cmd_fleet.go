@@ -29,10 +29,11 @@ import (
 func fleetCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "fleet",
-		Short: "Fleet announcer (slim cells).",
+		Short: "Fleet announcer (slim cells), notifications, and price tooling.",
 	}
 	cmd.AddCommand(fleetAnnounceCmd())
 	cmd.AddCommand(fleetPricesCmd())
+	cmd.AddCommand(fleetNotifyCmd())
 	return cmd
 }
 

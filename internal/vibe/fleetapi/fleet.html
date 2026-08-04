@@ -41,6 +41,8 @@
   #warmrow { margin: 16px 0; display: flex; gap: 8px; align-items: center; }
   #warmrow input { background: var(--panel); border: 1px solid var(--line); color: var(--text);
                    border-radius: 4px; padding: 5px 10px; font: inherit; width: 260px; }
+  #notifyrow { margin: 12px 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12px; }
+  #notifyrow .away { color: var(--amber); }
   #warnings { margin-top: 20px; }
   .warn-item { background: rgba(217,95,95,.10); border-left: 3px solid var(--red); padding: 8px 12px; margin: 6px 0; font-size: 12px; }
   .warn-item code { color: var(--red); }
@@ -103,6 +105,10 @@
     <button onclick="warmModel()">warm</button>
     <span class="meta">warm goes through the front; ETA from start history</span>
   </div>
+  <!-- C9's away/home toggle. Like every other button here it is a
+       tools/call on the MCP facade — the page still adds no mutation
+       route of its own. -->
+  <div id="notifyrow"></div>
   <div id="warnings"></div>
   <div id="status-line"></div>
   </section>
@@ -273,6 +279,37 @@ function render(st) {
       `${s.model} ${s.cron}${s.next_fire ? " next " + new Date(s.next_fire).toLocaleString() : " (never)"}`).join(" · "));
   }
   $("status-line").textContent = bits.join("  ·  ");
+  renderNotify(st.notify);
+}
+
+// The notify strip. A suppressed alarm is shown HERE, in the same place
+// as everything else, which is the whole promise of "away defers, it
+// does not mute".
+function renderNotify(n) {
+  const row = $("notifyrow");
+  row.innerHTML = "";
+  if (!n) return;
+  const away = n.scope === "away";
+  const label = document.createElement("span");
+  label.className = away ? "away" : "";
+  const parts = ["notify: " + n.scope];
+  if (n.endpoint) parts.push(n.endpoint);
+  const live = (n.alarms || []).filter(a => a.state === "active");
+  if (live.length) parts.push(live.length + " alarm(s) active: " + live.map(a => a.key).join(", "));
+  if (n.suppressed) parts.push(n.suppressed + " suppressed while away");
+  if (n.deferred) parts.push(n.deferred + " deferred by the rate limit");
+  if (n.delivery && n.delivery.last_error) parts.push("last delivery error: " + n.delivery.last_error);
+  label.textContent = parts.join("  ·  ");
+  row.appendChild(label);
+  if (!n.configured) return;
+  const mk = (text, tool, args) => {
+    const b = document.createElement("button");
+    b.textContent = text;
+    b.onclick = () => runTool(b, tool, args);
+    row.appendChild(b);
+  };
+  mk(away ? "home" : "away", "fleet_notify_scope", { scope: away ? "home" : "away" });
+  mk("test", "fleet_notify_test", {});
 }
 
 async function runTool(btn, tool, args) {
