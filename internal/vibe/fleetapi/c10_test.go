@@ -6,6 +6,7 @@ package fleetapi
 // is a batch job about to take the GPU.
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -46,8 +47,8 @@ func TestActivity_WithoutALiveStreamReportsNoEvidenceAndNoIdleWindow(t *testing.
 	if act.IdleSeconds != nil {
 		t.Errorf("IdleSeconds = %v with no observation channel, want nil", *act.IdleSeconds)
 	}
-	if act.Reason == "" {
-		t.Error("no Reason: the missing evidence has to be nameable by the CLI")
+	if !strings.Contains(act.Reason, "gpu-cell") {
+		t.Errorf("Reason = %q: the missing evidence has to name the cell, because the CLI renders it verbatim", act.Reason)
 	}
 }
 

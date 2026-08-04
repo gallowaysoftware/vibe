@@ -384,11 +384,18 @@ func cellAwaitCmd() *cobra.Command {
 // Intent is never consulted — a drained cell that answers is up (routing
 // truth rule).
 func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell string, cond awaitConds, timeout, interval time.Duration) error {
+	// Cancelled on EVERY return, not just the --timeout path: the events
+	// goroutine below only exits on ctx, so a successful wait under
+	// `--timeout 0` used to leave it streaming until the caller's context
+	// died. Harmless in a process that exits next; a leak in a function
+	// that is also called from tests and could be called from a loop.
+	var cancel context.CancelFunc
 	if timeout > 0 {
-		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
 	}
+	defer cancel()
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 
@@ -418,6 +425,7 @@ func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell str
 
 	var lastStatus string
 	var lastUnmet []string
+	var lastErr error
 	for {
 		ev, err := evaluateAwait(ctx, target, cell, cond)
 		switch {
@@ -425,7 +433,7 @@ func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell str
 			fmt.Fprintf(out, "%s is %s%s\n", cell, upWord(cond.wantUp), successSuffix(ev))
 			return nil
 		case err == nil:
-			lastUnmet = ev.unmet
+			lastUnmet, lastErr = ev.unmet, nil
 			// Only on change: a 10-minute idle window at a 5s poll would
 			// otherwise print 120 identical lines.
 			if ev.status != lastStatus {
@@ -439,15 +447,23 @@ func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell str
 			return err
 		default:
 			// A transport error is a restarting fleetd, which is exactly
-			// what the retry loop is for.
+			// what the retry loop is for. An error caused by our OWN
+			// deadline expiring mid-poll is not evidence of anything and
+			// must not become the reported cause — it is the timeout.
 			if ctx.Err() == nil {
+				lastErr = err
 				fmt.Fprintf(out, "await %s: %v (retrying)\n", cell, err)
 			}
 		}
 		select {
 		case <-ctx.Done():
 			if timeout > 0 {
-				if cond.extras() && len(lastUnmet) > 0 {
+				switch {
+				case lastErr != nil:
+					// fleetd was unreachable at the end: reporting "the cell
+					// never came up" would blame the cell for the registry.
+					return fmt.Errorf("timeout waiting for %s: last attempt failed: %w", cell, lastErr)
+				case cond.extras() && len(lastUnmet) > 0:
 					return fmt.Errorf("timeout waiting for %s: %s", cell, strings.Join(lastUnmet, "; "))
 				}
 				return fmt.Errorf("timeout waiting for %s to come %s", cell, upWord(cond.wantUp))

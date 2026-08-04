@@ -33,6 +33,11 @@ import (
 // shape of "not there yet" keeps waiting.
 var errUnknownModel = errors.New("unknown model")
 
+// maxIdleSeconds bounds the idle window read off the wire before it
+// becomes a time.Duration. A century of silence is not a window anyone
+// waits on, and an unbounded float64 conversion is undefined.
+const maxIdleSeconds = 100 * 365 * 24 * 3600
+
 // leaseClaim is the advisory hold await takes on success (C2's store).
 type leaseClaim struct {
 	holder string
@@ -230,14 +235,31 @@ func catalogSummary(models []fleetapi.ModelState) string {
 func (c awaitConds) evalIdle(cs *fleetapi.CellSnapshot) condResult {
 	a := cs.Activity
 	if a == nil || !a.Observed || a.IdleSeconds == nil {
-		reason := "fleetd reports no activity evidence for this cell"
-		if a != nil && a.Reason != "" {
-			reason = termSafe(a.Reason)
+		// Version skew is its own answer: a pre-C10 fleetd sends no
+		// activity block at all, and "no evidence for this cell" would
+		// send the operator looking at the cell instead of the registry.
+		reason := "this fleetd sends no activity block (pre-C10 fleetd? --idle reads /api/fleet/state's activity field)"
+		if a != nil {
+			reason = "fleetd reports no activity evidence for this cell"
+			if a.Reason != "" {
+				reason = termSafe(a.Reason)
+			}
 		}
 		return condResult{detail: "idle unknown: " + reason +
 			" — await will not treat missing evidence as idleness"}
 	}
-	idle := time.Duration(*a.IdleSeconds * float64(time.Second)).Round(time.Second)
+	// Clamped before the conversion: float→int64 out of range is
+	// implementation-defined in Go, and this number arrives over a
+	// network. Negative is nonsense; a century is not a window anyone
+	// waits on.
+	secs := *a.IdleSeconds
+	if secs < 0 {
+		secs = 0
+	}
+	if secs > maxIdleSeconds {
+		secs = maxIdleSeconds
+	}
+	idle := time.Duration(secs * float64(time.Second)).Round(time.Second)
 	if a.InFlight != nil && *a.InFlight > 0 {
 		return condResult{detail: fmt.Sprintf("%d request(s) in flight", *a.InFlight)}
 	}
@@ -252,6 +274,10 @@ func (c awaitConds) evalIdle(cs *fleetapi.CellSnapshot) condResult {
 // waiting process choosing to care. A lease held by this invocation's
 // own holder is ignored, so a crashed run of the same job cannot
 // deadlock against its own residue.
+//
+// The lease's MODEL is deliberately not compared: a hold on any model
+// of the cell is a hold on the GPU, which is the same reason --idle is
+// cell-scoped.
 func (c awaitConds) evalLeases(cs *fleetapi.CellSnapshot) condResult {
 	var holders []string
 	for _, l := range cs.Leases {

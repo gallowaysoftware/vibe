@@ -418,8 +418,87 @@ Four things the doc did not spell out and the code had to decide:
 | 8. No regression | **PASS** — C1/C6's `TestCellAwaitUnblocksOnTransition`, `TestCellAwaitViaEventsStream`, `TestCellAwaitUnknownCellFailsFast`, `TestCellAwaitDown` pass with only their call sites updated for the struct argument; `TestCellAwaitCmd_PlainUpIsUnchanged` pins the old output line verbatim through the real command |
 | 9. Role/route | **PASS** — no HTTP route and no MCP tool added; `daemon/fleet_registry_test.go`'s probe list is untouched and still complete |
 | 10. Streaming contract | **PASS** — `git diff --stat main..HEAD -- internal/vibe/proxy` is empty |
-| 11. Inner loop | **PASS** — `go build ./...`, `go vet ./...`, `gofmt -l .` (silent), `go mod tidy` (`git diff --exit-code` clean), `golangci-lint run` (0 issues), `go test -race -count=5 ./...` (exit 0, 27 packages ok, no DATA RACE) |
+| 11. Inner loop | **PASS** — `go build ./...`, `go vet ./...`, `gofmt -l .` (silent), `go mod tidy` (`git diff --exit-code` clean), `golangci-lint run` (0 issues), `go test -race -count=5 ./...` (exit 0, 27 packages ok, no DATA RACE), re-run end to end after the review commit |
 | 12. Live gates (a–d) | **NOT RUN** — no route to the fleet's hardware from the implementing environment. No transcripts are fabricated |
+
+### Adversarial self-review (ground rule 9)
+
+Landed as its own commit against the feature commit. Six findings, five
+fixed with a mutation-verified regression test, one documented.
+
+1. **A hollow test passed a gate (major, and the gate was mine).**
+   `TestActivity_IdleIsFlooredAtTheStreamConnectNotTheFrameHistory`
+   set up an in-flight request before backdating, so `activityFor`
+   short-circuited to the busy branch and the test never reached the
+   floor it is named for — removing the floor entirely left it green.
+   This is ground rule 10 exactly: a test's name is part of its
+   assertion. Fixed by completing the request first; the mutation now
+   fails it (`idle_s = 3600`).
+2. **The timeout error blamed the cell for the registry (major).**
+   With fleetd unreachable for the whole wait there are no unmet
+   conditions to report, so a `--model --ready --idle` wait timed out
+   saying "the cell never came up" — about a cell it had never
+   successfully asked about. The last real error is now carried and
+   named. The subtlety that made this a two-round fix: the error from
+   the poll that was interrupted BY the timeout is
+   `context deadline exceeded`, which would have replaced every real
+   cause with a restatement of the timeout, so an error is only recorded
+   while `ctx.Err() == nil`.
+   `TestCellAwaitTimeout_NamesTheRegistryFailureNotTheCell`,
+   mutation-verified both ways.
+3. **A pre-C10 fleetd was reported as a cell with no evidence (minor).**
+   Version skew is guaranteed in this fleet (C3's announce rule) and an
+   older fleetd simply sends no `activity` field. "No activity evidence
+   for this cell" sends the operator to look at the cell instead of the
+   registry; the message now names the skew.
+   `TestCellAwaitIdle_AnOlderFleetdSendsNoActivityBlockAndSaysSo`.
+4. **`idle_s` off the wire could overflow into a random duration
+   (minor).** `time.Duration(f * float64(time.Second))` is
+   implementation-defined for an out-of-range float, and the mutation
+   test shows what that actually produced: `-2562047h47m16s` from
+   `1e30`, i.e. a garbled number turning into a *negative* window rather
+   than an obviously wrong one. Clamped to [0, 100 years] before the
+   conversion. `TestCellAwaitIdle_AnAbsurdIdleFromTheWireIsClamped`.
+5. **The events goroutine outlived a successful `--timeout 0` wait
+   (minor).** Only the timeout path derived a cancellable context, so
+   the overnight idiom — the one invocation guaranteed to use
+   `--timeout 0` — returned with its SSE connection still open until the
+   caller's context died. Harmless in a process about to exit and a leak
+   anywhere else. `TestCellAwaitReleasesItsEventStreamOnSuccess`
+   (mutation-verified: restoring the old shape hangs it).
+6. **A lease's MODEL is deliberately not compared** — documented, not
+   changed. `--unleased` blocks on any holder of the CELL, for the same
+   reason `--idle` is cell-scoped: the contended resource is the GPU.
+
+**Verified sound, not changed:** the one-snapshot evaluation, the
+events fast-path narrowing, the busy-before-window ordering, the
+unknown-model qualification and the own-holder skip each have a named
+test that fails when the production line is broken (nine mutations run
+in total); no lock is held across an HTTP call; `activityFor` takes
+`s.mu` once and builds outside it; `git diff --stat main..HEAD --
+internal/vibe/proxy` is empty.
+
+**Known and accepted (documented, not fixed):**
+
+- **A warm counts as activity.** C4's warm-target restore and
+  warm-schedule fires are real metered requests (C7a counts them as
+  `poke_req`), so a scheduled warm pushes `--idle` out by a full window.
+  That is correct — the GPU genuinely just did work — but an operator
+  whose `warm_schedule` fires every 15 minutes cannot use `--idle 20m`,
+  and nothing warns about the interaction.
+- **`--idle front` measures whatever the front's own inflight frames
+  cover.** The front proxies to peers, and whether llama-swap reports
+  proxied requests as in-flight there is unverified. `--idle` against
+  the front is not refused (unlike `--ready`, which cannot ever be true
+  there), but do not read it as "the fleet is quiet" until gate (b)
+  says what those frames contain.
+- **The claim is not atomic.** Between the last evaluation and the
+  lease POST there is one poll interval in which another batch can
+  unblock on the same cell. Leases are advisory; a real mutex is a
+  different feature and this fleet has one operator.
+- **No `--idle` for announce-only cells.** §Out of scope names the
+  usage-counter channel that could serve them; today they get a refusal
+  with a reason, which is the correct failure.
 
 ### What the live gates would prove that the unit gates cannot
 

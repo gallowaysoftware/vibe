@@ -260,6 +260,69 @@ func TestCellAwaitIdle_MissingEvidenceNeverUnblocksAndSaysWhy(t *testing.T) {
 	}
 }
 
+// TestCellAwaitIdle_AnOlderFleetdSendsNoActivityBlockAndSaysSo: version
+// skew is guaranteed in this fleet (C3's announce rule). A pre-C10
+// fleetd sends no activity field, and "no evidence for this cell" would
+// send the operator to look at the cell instead of the registry.
+func TestCellAwaitIdle_AnOlderFleetdSendsNoActivityBlockAndSaysSo(t *testing.T) {
+	ts := cannedFleetd(t, func() fleetapi.StateSnapshot {
+		return statusState(awaitTestCell(nil, nil))
+	})
+	var out bytes.Buffer
+	cond := awaitConds{wantUp: true, idle: 10 * time.Minute}
+	err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 200*time.Millisecond, 20*time.Millisecond)
+	if err == nil {
+		t.Fatal("unblocked against a fleetd that reports no activity at all")
+	}
+	if !strings.Contains(err.Error(), "pre-C10 fleetd") {
+		t.Errorf("err = %v, want the skew named", err)
+	}
+}
+
+// TestCellAwaitTimeout_NamesTheRegistryFailureNotTheCell: with fleetd
+// unreachable for the whole wait there are no unmet conditions to
+// report, and "the cell never came up" blames the wrong box.
+func TestCellAwaitTimeout_NamesTheRegistryFailureNotTheCell(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/fleet/state", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "fleetd restarting", http.StatusBadGateway)
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	var out bytes.Buffer
+	cond := awaitConds{wantUp: true, model: "qwen", ready: true, idle: time.Minute}
+	err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 200*time.Millisecond, 20*time.Millisecond)
+	if err == nil {
+		t.Fatal("no error")
+	}
+	if !strings.Contains(err.Error(), "last attempt failed") || !strings.Contains(err.Error(), "502") {
+		t.Errorf("err = %v, want the transport failure named", err)
+	}
+}
+
+// TestCellAwaitIdle_AnAbsurdIdleFromTheWireIsClamped: the number arrives
+// over a network and float→int64 is implementation-defined out of range.
+// Clamping keeps a garbled value from becoming a random duration.
+func TestCellAwaitIdle_AnAbsurdIdleFromTheWireIsClamped(t *testing.T) {
+	for _, secs := range []float64{-1, 1e30} {
+		act := idleActivity(0)
+		act.IdleSeconds = &secs
+		snap := statusState(awaitTestCell(nil, act))
+		cond := awaitConds{wantUp: true, idle: 10 * time.Minute}
+		ev, err := cond.evaluate(&snap, "gpu-cell")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if secs < 0 && ev.ok {
+			t.Errorf("a negative idle satisfied a 10m window")
+		}
+		if secs > 0 && !ev.ok {
+			t.Errorf("a clamped huge idle did not satisfy a 10m window: %s", ev.status)
+		}
+	}
+}
+
 // TestCellAwaitIdle_InFlightRequestsAreNotIdleEvenPastTheWindow pins the
 // CLI's precedence: a reported in-flight count outranks any idle number
 // beside it. C4 learned this the hard way — one generation longer than
@@ -371,6 +434,41 @@ func TestCellAwaitExtras_ATransitionEventDoesNotSatisfyAModelCondition(t *testin
 	}
 	if !strings.Contains(err.Error(), "qwen starting") {
 		t.Errorf("err = %v, want the unmet model condition", err)
+	}
+}
+
+// TestCellAwaitReleasesItsEventStreamOnSuccess: the events goroutine
+// only exits on the context, and under `--timeout 0` (the overnight
+// idiom) awaitCell used to return without cancelling anything. Harmless
+// in a process about to exit; a leak in a function tests and loops call.
+func TestCellAwaitReleasesItsEventStreamOnSuccess(t *testing.T) {
+	var once sync.Once
+	connected := make(chan struct{})
+	released := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/fleet/state", func(w http.ResponseWriter, r *http.Request) {
+		<-connected // the stream is established before the wait can succeed
+		_ = json.NewEncoder(w).Encode(statusState(awaitTestCell(nil, idleActivity(0))))
+	})
+	mux.HandleFunc("GET /api/fleet/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		once.Do(func() { close(connected) })
+		<-r.Context().Done()
+		close(released)
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	var out bytes.Buffer
+	if err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", awaitConds{wantUp: true}, 0, 20*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-released:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the events stream is still open after the wait returned")
 	}
 }
 
