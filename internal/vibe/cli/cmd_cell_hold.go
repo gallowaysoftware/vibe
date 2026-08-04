@@ -44,8 +44,10 @@ func cellHoldCmd() *cobra.Command {
 			if ctx == nil {
 				ctx = context.Background()
 			}
-			if release && cmd.Flags().Changed("for") {
-				return fmt.Errorf("--release takes no --for")
+			if release && (cmd.Flags().Changed("for") || cmd.Flags().Changed("note")) {
+				// Silently ignoring them would leave an operator believing
+				// they had shortened a hold or annotated its removal.
+				return fmt.Errorf("--release takes no --for/--note (it deletes the hold)")
 			}
 			if !release {
 				if holdFor <= 0 {
@@ -67,6 +69,14 @@ func cellHoldCmd() *cobra.Command {
 	cmd.Flags().StringVar(&note, "note", "", "why (shown in fleet_status, on the page, and in the pre-drain report)")
 	cmd.Flags().BoolVar(&release, "release", false, "end an existing hold early")
 	return cmd
+}
+
+// noteSuffix renders an optional lease/hold note in parentheses.
+func noteSuffix(note string) string {
+	if note == "" {
+		return ""
+	}
+	return " (" + termSafe(note) + ")"
 }
 
 // runCellHold POSTs (or DELETEs) the hold at fleetd and reports what the
@@ -100,6 +110,13 @@ func runCellHold(ctx context.Context, out io.Writer, target fleetdTarget, cell, 
 	}
 	defer resp.Body.Close()
 	payload, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if resp.StatusCode == http.StatusNotFound {
+		// The lease store — and therefore every hold — exists only in the
+		// fleetd role. A bare 404 sends the operator hunting for a typo in
+		// the cell name instead.
+		return fmt.Errorf("%s has no lease endpoint: holds live at fleetd (fleet_registry: true), "+
+			"so point --api or hosts.yaml fleetd_url at it", target.base)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s /api/fleet/lease: HTTP %d: %s", method, resp.StatusCode, termSafe(strings.TrimSpace(string(payload))))
 	}

@@ -135,6 +135,12 @@ never on a clock**:
 - The cell's own TTL still applies underneath; warm-target is fleetd
   policy layered on top, and it must tolerate the cell being drained
   or absent (skip silently; note in status).
+- *Added C11.* The one case this rule is right and its conclusion is
+  wrong — the challenger you walked away from at lunch — is answered by
+  a declaration, not by better observation:
+  [`hold_model`](c11-hold-model.md) suspends this restore on one cell
+  until an expiry. It is a lease with `hold: true`, and it is the ONLY
+  thing that suppresses the restore besides drain/stale/absent.
 
 **Activity evidence (decided in C5, was left implicit).** "Request-idle"
 needs a source of truth for last-request time. Today that is

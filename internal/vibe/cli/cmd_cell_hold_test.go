@@ -112,6 +112,41 @@ func TestCellHoldRejectsAnUnboundedHold(t *testing.T) {
 	}
 }
 
+// TestCellHoldReleaseRefusesForAndNote: silently ignoring them would
+// leave an operator believing they had shortened a hold.
+func TestCellHoldReleaseRefusesForAndNote(t *testing.T) {
+	for _, extra := range [][]string{{"--for", "1h"}, {"--note", "done"}} {
+		cmd := cellHoldCmd()
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs(append([]string{"gpu-cell", "glm-5", "--release"}, extra...))
+		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--release takes no") {
+			t.Errorf("with %v: err = %v, want the refusal", extra, err)
+		}
+	}
+}
+
+// TestPreDrainReportNamesAHoldAsAHold: the pre-drain prompt is where an
+// operator learns somebody is mid-evaluation on the box they are about
+// to take. "hold holds glm-5" is not that sentence.
+func TestPreDrainReportNamesAHoldAsAHold(t *testing.T) {
+	var out bytes.Buffer
+	leases := []fleetapi.Lease{
+		{Cell: "gpu-cell", Model: "glm-5", Holder: fleetapi.HoldHolder, Hold: true,
+			Note: "evaluating", ExpiresAt: time.Now().Add(time.Hour)},
+		{Cell: "gpu-cell", Model: "qwen", Holder: "batch", Note: "mid-batch",
+			ExpiresAt: time.Now().Add(time.Hour)},
+	}
+	printLeasePrompt(&out, "gpu-cell", leases)
+	s := out.String()
+	if !strings.Contains(s, "HELD: glm-5") || !strings.Contains(s, "evaluating") {
+		t.Errorf("hold not rendered as a hold:\n%s", s)
+	}
+	if !strings.Contains(s, "batch holds qwen") {
+		t.Errorf("ordinary lease rendering changed:\n%s", s)
+	}
+}
+
 // TestCellStatusShowsAHoldWithItsRemainingTime: the intent column is
 // where an operator asks "why is this cell like this".
 func TestCellStatusShowsAHoldWithItsRemainingTime(t *testing.T) {

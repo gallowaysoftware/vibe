@@ -325,6 +325,12 @@ func TestHold_IsOneLeaseInTheLeaseStoreAndSurvivesReload(t *testing.T) {
 	if existed, err := s.ReleaseHold("heavy", "challenger"); err != nil || existed {
 		t.Errorf("second ReleaseHold = %v, %v; want (false, nil)", existed, err)
 	}
+	// A typo'd cell is the one case where "no active hold" is definitely
+	// the wrong answer — it reads as "already gone".
+	if _, err := s.ReleaseHold("heavvy", "challenger"); err == nil ||
+		!strings.Contains(err.Error(), "unknown cell") {
+		t.Errorf("ReleaseHold on an unknown cell = %v, want the typo named", err)
+	}
 }
 
 func TestHold_ValidationRejectsBadTargetsAndDurations(t *testing.T) {

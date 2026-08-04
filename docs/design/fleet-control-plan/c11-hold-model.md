@@ -349,3 +349,110 @@ L4. **The hold survives a fleetd restart.** Take a 2h hold, restart the
 
 Estimated ~450 lines + tests, on the plan's calibration (C0–C4 ran
 3.6–4.5× their estimates).
+
+## Execution (2026-08-04)
+
+### What shipped
+
+- **`fleetapi/hold.go`** — `HoldHolder` / `DefaultHoldFor` (4h) /
+  `MaxHoldFor` (24h), `validateHoldRequest` (the reserved-holder pairing
+  and the tighter bound, shared by the endpoint and the in-process
+  verbs), `SetHold` / `ReleaseHold` / `HoldOn`, `checkHoldTarget` (front
+  + unknown-cell refusals) and `holdDetail` (the "N left" string).
+  `HoldOn` is **cell-scoped** and reports the EARLIEST-expiring hold, so
+  the countdown an operator reads is the one that runs out first.
+- **`fleetapi/leases.go`** — `Lease.Hold`, and the store mutation
+  factored into `putLease` / `dropLease` / `cloneLeases` /
+  `commitLeases` / `pruneExpired`, so the HTTP endpoint and the hold
+  verbs share one clone-prune-cap-persist-swap path. The endpoint's
+  behaviour is unchanged: same 400s, the same 409 (now via a typed
+  `errLeaseStoreFull`), the same "prune on every mutation, cap on POST
+  only" — C6's cap/delete test passes untouched, which is what says the
+  refactor preserved it.
+- **`fleetapi/warmtarget.go`** — the hold check, second in the ladder;
+  and `setWarmState` clears `emptySince` on `skipped`.
+- **`fleetapi/warmsched.go` + `fleetapi/probe.go`** — the existing lease
+  guards now NAME a hold when the active lease is one ("held: challenger,
+  1h59m left" rather than "1 active leases"). The guard itself is
+  untouched; only its reason string improves.
+- **`fleetmcp/hold.go`** — `hold_model` and `release_hold`, with the
+  not-a-pin sentence in the tool description AND in the success reply.
+- **`cli/cmd_cell_hold.go`** — `vibe cell hold <cell> <model>
+  [--for|--note|--release]`, reporting the expiry the REGISTRY stored
+  rather than this process's clock.
+- **`cli/cmd_cell.go` / `cli/cmd_cell_actuate.go`** — the hold in
+  `vibe cell status`'s intent column, and `printLeasePrompt` rendering a
+  hold as `HELD: <model> until 15:04 (evaluating)` in the pre-drain
+  prompt.
+- **`fleetapi/fleet.html`** — the held line and `leftUntil()`, which
+  counts down from the absolute `expires_at` so a page left open
+  overnight does not freeze on a stale string.
+
+### Gates
+
+Unit gates 1–11: **PASS**, run as the full inner loop —
+`go build ./...`, `go vet ./...`, `gofmt -l .` (silent), `go mod tidy`
+(clean), `golangci-lint run` (0 issues), `go test -race -count=5 ./...`
+(all packages ok). Gate 10 verified: the branch's diff against `main`
+touches no file under `internal/vibe/proxy`.
+
+Four guards were **mutation-tested** — the production code was broken
+and the named test observed to fail:
+
+| mutation | test that failed |
+|---|---|
+| delete the hold check in `evalWarmTarget` | `TestWarmTarget_ActiveHoldSuppressesTheRestoreAndIssuesNoWarm` (warmed twice), `…HoldPrecedence…/held_outranks_stale` |
+| delete `setWarmState`'s `emptySince` clear | `TestWarmTarget_SkipClearsTheEmptyGraceWindow` (restored on the first tick after the hold) |
+| leak a hold into `CellSnapshot.Display` | `TestHold_DoesNotTouchAvailabilityIntentOrTheRender` |
+| delete the endpoint's `validateHoldRequest` call | `TestHold_ValidationRejectsBadTargetsAndDurations` (3 subtests) |
+
+Live gates L1–L4: **NOT RUN.** The implementing environment cannot
+reach the fleet (SSH blocked, the LAN does not route), and a fabricated
+hardware transcript is worse than an honest gap.
+
+### Adversarial self-review (ground rule 9)
+
+Six findings against the feature commit, all fixed in the review commit:
+
+1. **`ReleaseHold` on a typo'd cell reported "no active hold".** That
+   reads as *already gone* to the operator who mistyped, which is the one
+   answer that is definitely wrong. Now C6's fail-fast rule applies:
+   unknown cell errors. The front refusal deliberately does NOT apply to
+   release — a hold there cannot exist, so releasing one is a harmless
+   no-op.
+2. **The pre-drain prompt printed "hold holds glm-5: evaluating".** The
+   prompt exists to tell an operator about to take the box that somebody
+   is mid-evaluation on it; the lease vocabulary buried that. Now
+   `HELD: glm-5 until 15:04 (evaluating)`, with "the hold does not block
+   you" so nobody reads it as a refusal.
+3. **`--release` silently ignored `--for` and `--note`**, leaving an
+   operator believing they had shortened a hold. Both are now refused.
+4. **A `vibe cell hold` against a non-fleetd daemon returned a bare
+   404**, sending the operator to hunt for a typo in the cell name. The
+   lease store exists only in the fleetd role, and the error now says so.
+5. **The schedule and probe skip reasons said "1 active leases".** True,
+   and useless to the operator who declared the hold thirty seconds
+   earlier. Both now name the hold and its remaining time.
+6. **Doc drift (ground rule 8):** fleet-control.md §5 still claimed
+   leases "never block anything". Since C4 that has been false of
+   fleetd's own policy (scheduled warms skip leased cells), and C11
+   widens it. The paragraph now states the real rule — a lease
+   constrains what fleetd INITIATES, never what an operator or a client
+   asks for.
+
+### Known and accepted (documented, not fixed)
+
+- **A hold's expiry is wall-clock**, like every other lease: a large NTP
+  step lengthens or shortens it. Inherited from C2's store; not worth a
+  divergent clock for a 4-hour declaration.
+- **Two holds on one cell** (two models under evaluation) are two lease
+  entries. Both suppress; the status names the earliest-expiring one and
+  moves to the next when it lapses.
+- **The model on a hold is a label, not a scope.** A hold on a model the
+  cell never announced still suppresses, because the suppression is
+  cell-scoped by design (C10's `--idle` rule: the contended resource is
+  the GPU). Validating the id against the catalog would refuse a
+  legitimately un-announced experimental model.
+- **`release_hold`'s "unknown cell" wording says "not in the registry"**
+  where the sibling MCP tools say "not in hosts.yaml". Same file, two
+  spellings; unified wording is a nit for a later sweep.

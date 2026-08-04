@@ -109,6 +109,14 @@ func (s *Server) ReleaseHold(cell, model string) (bool, error) {
 	if cell == "" || model == "" {
 		return false, fmt.Errorf("cell and model are required")
 	}
+	// A typo'd cell must not report "no active hold": that reads as "the
+	// hold is already gone" to the operator who typed it, which is the
+	// one answer that is definitely wrong. C6's fail-fast-on-unknown-cell
+	// rule. The front refusal does NOT apply here — a hold there is
+	// impossible to create, so releasing one is a harmless no-op.
+	if !s.knownCell(cell) {
+		return false, fmt.Errorf("unknown cell %q (not in the registry)", cell)
+	}
 	return s.dropLease(cell, model, HoldHolder)
 }
 
@@ -120,12 +128,21 @@ func (s *Server) checkHoldTarget(cell string) error {
 	if cell == fleetcfg.FrontCell {
 		return fmt.Errorf("%s serves no models of its own; hold the cell that holds the model", fleetcfg.FrontCell)
 	}
+	if !s.knownCell(cell) {
+		return fmt.Errorf("unknown cell %q (not in the registry)", cell)
+	}
+	return nil
+}
+
+// knownCell reports registry membership. s.cells is immutable after New
+// (membership comes from hosts.yaml at startup), so no lock.
+func (s *Server) knownCell(cell string) bool {
 	for _, c := range s.cells {
 		if c.Name == cell {
-			return nil
+			return true
 		}
 	}
-	return fmt.Errorf("unknown cell %q (not in the registry)", cell)
+	return false
 }
 
 // HoldOn returns the active hold on a cell, if any. Cell-scoped, not

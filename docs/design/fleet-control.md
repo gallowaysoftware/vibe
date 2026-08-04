@@ -214,8 +214,10 @@ mux behind the same bearer auth, wire pattern cloned from
 | `wake_cell(cell)` | C2 | Wake-on-LAN magic packet; explicit, never automatic |
 | `render_front(dry_run?)` | C2 | `vibe router render --cell front` (`--check` when dry_run) |
 | `probe_model(cell, model, rebaseline?)` | C8 | ask the cell to measure one RESIDENT model against its own baseline; refuses a cold model rather than loading it |
+| `hold_model(cell, model, for?, note?)` | C11 (PR open) | suspend fleetd's own warm policy on a cell until an expiry — the evaluation afternoon. Stored as a lease with `hold: true`; not a pin (llama-swap's TTL is untouched) |
+| `release_hold(cell, model)` | C11 (PR open) | end a hold early; holds expire on their own |
 
-**CLI.** `vibe cell status | await | drain | resume | wake` — local
+**CLI.** `vibe cell status | await | drain | resume | wake | hold` — local
 verbs run the configured per-cell command; remote verbs go through the
 cell daemon's `:9001` Connect RPC (`${VIBE_API}`/`${VIBE_TOKEN}`
 machinery, already shipped). `vibe cell await <cell> --up` is the
@@ -230,6 +232,15 @@ machinery, already shipped). `vibe cell await <cell> --up` is the
 advisory only — they appear in the pre-drain report and in
 `fleet_status`, they never block anything. They turn "did I just
 strand a 19-hour job?" into a visible answer at drain time.
+
+*Amended C4 + C11.* "Never block anything" still holds for everything
+outside this control plane — no request, no drain, no resume, no render
+ever waits on a lease. What a lease DOES defer is **fleetd's own
+automatic policy**: C4's scheduled warms skip a leased cell (the
+eviction-fight guard), C8's probes skip it, and C11's `hold: true`
+leases additionally suspend the warm-target restore. The distinction to
+keep: a lease constrains what fleetd initiates, never what an operator
+or a client asks for.
 
 **Web.** Deliberately last (C4): one static embedded page over
 `/api/fleet/state` + `/events`, with thin buttons over the same
