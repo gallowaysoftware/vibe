@@ -465,6 +465,7 @@ is this repo's most repeated defect.
 | `internal/vibe/daemon/sleep.go` | config → `fleetapi.SleepScheduleEntry` validation, clamps and refusals; the suspend function the loop calls |
 | `internal/vibe/fleetapi/sleepsched.go` | the loop, `suspendGuard`, the wake half, the status block |
 | `internal/vibe/fleetapi/fleetapi.go` | `StateSnapshot.Sleep`, server fields |
+| `internal/vibe/fleetapi/intent.go` | `SetIntentAt` (review REV-1): the record's `since` is the instant the action was ISSUED, so a sleeping box's own echo can resolve it |
 | `internal/vibe/fleetapi/notify.go` | the `wake_failed` condition (read off the snapshot, C9's rule) |
 | `internal/vibe/fleetnotify/fleetnotify.go` | `KindWakeFailed` + its dwell + default-on |
 | `internal/vibe/fleetapi/doctor.go` | `sleep.schedule` check |
