@@ -2,9 +2,11 @@ package swaptest_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/gallowaysoftware/vibe/internal/swaptest"
 )
@@ -43,6 +45,39 @@ func TestEveryWireHasARecording(t *testing.T) {
 		if rec.Synthesized() && rec.Caveat == "" {
 			t.Errorf("%s was synthesized from upstream source and carries no caveat; a fixture nobody captured must say so where it is read", w)
 		}
+	}
+}
+
+// TestContentTypeIsNotAConstant is the cheap unit form of the bug that
+// motivated it: the double logged text/event-stream on every chat row
+// regardless of `stream`, which made "streaming rows carry tokens" pass
+// over a row nobody streamed. Verified against a real llama-swap v247
+// serving one model twice — id 1 (stream=true) "text/event-stream", id 2
+// (stream=false) "application/json; charset=utf-8". A row llama-swap
+// generates ITSELF, like the 404 in activity-row-error.json, carries the
+// bare type with no charset, because llama.cpp never saw the request.
+func TestContentTypeIsNotAConstant(t *testing.T) {
+	cell := swaptest.NewCell(t, swaptest.WithModels(swaptest.Model{ID: "m", State: "ready"}))
+	cell.Request("m", "/v1/chat/completions", swaptest.Tokens{Input: 10, Output: 4}, time.Second)
+	cell.RequestJSON("m", "/v1/chat/completions", swaptest.Tokens{Input: 10, Output: 4}, time.Second)
+	cell.Fail("nope", "/v1/chat/completions", 404, "no router for requested model")
+
+	got := map[string]string{}
+	for _, r := range cell.Rows() {
+		got[fmt.Sprint(r.ID)] = r.RespContentType
+		if !r.HasCapture {
+			t.Errorf("row %d has has_capture=false; every real row carries it true", r.ID)
+		}
+	}
+	types := map[string]bool{}
+	for _, ct := range got {
+		types[ct] = true
+	}
+	if len(types) != 3 {
+		t.Errorf("three requests that the wire logs three different resp_content_types produced %d distinct values: %v", len(types), got)
+	}
+	if !types["text/event-stream"] || !types["application/json; charset=utf-8"] || !types["application/json"] {
+		t.Errorf("resp_content_type set is %v, want the three the wire produces", got)
 	}
 }
 
