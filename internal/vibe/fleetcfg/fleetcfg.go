@@ -433,6 +433,39 @@ func KnownModelClass(class string) bool {
 	return false
 }
 
+// WarmClassRefusal reports why a CHAT-completion warm must not be fired
+// at model, or "" when it may be. It lives here, on the file that carries
+// the declaration, because every warm in the fleet is the same verb and
+// the guard has to be the same sentence: fleetmcp's `warm_model` (the
+// operator's verb) and the three automated producers — C4's warm-target
+// restore, C4's warm schedule, C14's post-wake warms — plus the piggyback
+// queue they all fall back to. `warm_model` alone honoured it until the
+// lab watched a `warm_schedule` fire five chat completions at an
+// embed-class id the same fleetd had just refused by hand.
+//
+// There is deliberately no class-dispatched warm body here. C8's prober
+// does have an embed path, so "warm an embedding model" is a coherent
+// want — but it needs the right verb per class (rerank takes a query plus
+// documents, stt multipart audio, tts a voice), and on the two classes
+// with an obvious body the warm stops being free: an embed warm is a
+// fully metered request on the `embed` basis, where C7a has no `poke_req`
+// equivalent to keep it out of the billable figures. A 96-a-day schedule
+// would quietly inflate an append-only ledger. That is a feature with a
+// phase doc, not a line in a bug fix; until it exists the honest answer
+// is to refuse and say which config is wrong.
+func (f *File) WarmClassRefusal(model string) string {
+	if f == nil {
+		return ""
+	}
+	class, pinned := f.ModelClasses[model]
+	if !pinned || class == ModelClassChat {
+		return ""
+	}
+	return fmt.Sprintf("%s is %s-class (per hosts.yaml model_classes), not chat: "+
+		"warming it with a chat completion would load it for nothing — its pinned cell's "+
+		"config is what needs fixing", model, class)
+}
+
 func validatePower(cell string, p *Power) error {
 	if p == nil {
 		return nil

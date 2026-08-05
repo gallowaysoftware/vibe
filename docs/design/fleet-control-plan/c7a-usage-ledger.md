@@ -600,3 +600,47 @@ silently found nothing cannot pass forever). Gate 9's wording is
 - **`UsageBucket.TZ` is stamped at bucket creation.** Changing
   `fleet.timezone` between fleetd restarts leaves old lines labelled with
   the old zone while new counts bucket in the new one.
+
+## Live-gate addendum (2026-08-05): the id-reset rule's missing half
+
+Found on the same real 4-cell fleet, and fixed on
+`fix/live-gate-correctness`.
+
+The epoch rule answers `max_id < cursor`: an in-memory store restarted,
+ids began again, mint an epoch. Its mirror had no answer. Cell `alpha`
+had served 111 rows against a persistent store; the store was replaced by
+a copy whose ids sat above the cursor, and the collector folded the whole
+log a second time — `req` 9 → 18, 84 → 168, `in_fresh` 878 → 1756, same
+epoch, straight into a ledger that is append-only by design and can never
+be corrected. Ids alone cannot tell that apart from a cell that served a
+lot while nobody was reading: both are a jump forward.
+
+The state file now carries an **anchor** — the id, timestamp, model,
+`req_path` and status of the row the cursor points at — and a window whose
+own contents contradict it is not folded at all. Two checks, both free,
+one per shape the swap takes:
+
+- the replacement's ids OVERLAP the old ones, so the row still sitting at
+  the cursor id is a different request (the walk-back already reads past
+  the cursor to know it is done);
+- the replacement's ids sit entirely ABOVE the cursor, so rows claiming to
+  be newer than the anchor were recorded BEFORE it. llama-swap stamps
+  `ts_created` at request COMPLETION and inserts the row then — verified
+  live: a 7.18 s request issued at 09:57:12 landed stamped 09:57:19, and
+  999 consecutive production rows carried zero timestamp inversions — so
+  within one store id order and timestamp order agree. The 5-minute
+  tolerance is for a backwards clock correction on the cell, not for
+  request overlap.
+
+On a break the collector adopts the new head, folds nothing, adds the
+rows it read and refused to `lost_rows`, and logs the evidence by name.
+It does NOT mint an epoch: the counters are the CELL's lifetime totals,
+they stay monotone, and fleetd's delta arithmetic keeps working.
+
+Deliberately NOT a check on an unreachable anchor. On an in-memory ring
+the anchor legitimately ages out and every surviving row is newer than it;
+refusing there would drop real traffic on every cell that outruns its
+ring. This tests for CONTRADICTED continuity, not unproven continuity —
+which is also why the row-count cross-check against `/api/metrics/stats`
+was rejected: a ring's aged-out span and a swapped store's id hole are
+numerically identical.

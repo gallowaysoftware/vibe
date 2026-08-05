@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeSwap serves llama-swap v239's GET /api/metrics/activity contract:
@@ -525,5 +526,226 @@ func TestPoll_ModelFilterKeepsOnlyTheAskedForModels(t *testing.T) {
 	}
 	if lost != 0 {
 		t.Errorf("lost = %d, want 0 — a filtered row is not a lost row", lost)
+	}
+}
+
+// ─── the upward id jump (live gate, 2026-08-05) ─────────────────────────
+//
+// The epoch rule answers max_id < cursor. Its mirror — a store restored,
+// copied or swapped for one whose ids sit ABOVE the cursor — was found by
+// standing up a real 4-cell fleet: alpha had served 111 rows against a
+// persistent store, the store was replaced by a copy with ids shifted up,
+// and the collector folded every counter a second time (req 9 -> 18,
+// 84 -> 168, in_fresh 878 -> 1756) into fleetd's APPEND-ONLY ledger.
+
+func stamped(r ActivityRow, ts time.Time) ActivityRow {
+	r.Timestamp = ts
+	return r
+}
+
+// A log holding the same requests under higher ids is not traffic that
+// arrived while nobody was reading: llama-swap stamps a row at request
+// COMPLETION and inserts it then, so no single log can carry a row that
+// is both newer by id and older by clock. The window is skipped whole and
+// the skipped rows are reported, because an under-count is recoverable
+// and a double count into an append-only ledger is not.
+func TestPoll_LogWhoseRowsPredateTheCursorIsSkippedNotFoldedAgain(t *testing.T) {
+	swap := &fakeSwap{}
+	url := swap.start(t)
+	c := newCollector(t, url)
+
+	base := time.Date(2026, 8, 5, 8, 0, 0, 0, time.UTC)
+	var rows []ActivityRow
+	for i := range 40 {
+		rows = append(rows, stamped(chatRow(int64(i+1), "qwen", 100, 0, 50), base.Add(time.Duration(i)*time.Minute)))
+	}
+	swap.set(rows)
+	if err := c.Poll(context.Background()); err != nil {
+		t.Fatalf("poll 1: %v", err)
+	}
+	want := totalsFor(t, c, "qwen", BasisChat)
+	if want.Req != 40 {
+		t.Fatalf("setup: req = %d, want 40", want.Req)
+	}
+
+	// The store is swapped for another holding the SAME requests with ids
+	// above the cursor.
+	shifted := make([]ActivityRow, 0, len(rows))
+	for _, r := range rows {
+		r.ID += 10_000
+		shifted = append(shifted, r)
+	}
+	swap.set(shifted)
+	if err := c.Poll(context.Background()); err != nil {
+		t.Fatalf("poll 2: %v", err)
+	}
+
+	if got := totalsFor(t, c, "qwen", BasisChat); got != want {
+		t.Fatalf("the swapped store was folded a second time:\n before %+v\n  after %+v", want, got)
+	}
+	snap := c.Snapshot()
+	if snap.LostRows != 40 {
+		t.Errorf("lost_rows = %d, want 40 — the skipped rows have to be reported, not absorbed", snap.LostRows)
+	}
+	if snap.Epoch != "epoch1" {
+		t.Errorf("epoch = %q, want epoch1 — the cell's cumulative totals stay true, only the window is refused", snap.Epoch)
+	}
+	c.mu.Lock()
+	cursor := c.cursor
+	c.mu.Unlock()
+	if cursor != 10_040 {
+		t.Fatalf("cursor = %d, want 10040 — refusing a window must not park the collector on a dead cursor", cursor)
+	}
+
+	// And traffic that genuinely arrives on the new store is counted from
+	// there: the refusal is one window, not a stuck cell.
+	swap.set(append(shifted, stamped(chatRow(10_041, "qwen", 7, 0, 3), base.Add(200*time.Minute))))
+	if err := c.Poll(context.Background()); err != nil {
+		t.Fatalf("poll 3: %v", err)
+	}
+	got := totalsFor(t, c, "qwen", BasisChat)
+	if got.Req != want.Req+1 || got.InFresh != want.InFresh+7 {
+		t.Fatalf("new rows on the new store were not counted: %+v (was %+v)", got, want)
+	}
+}
+
+// The other shape the same swap takes: the replacement log's ids OVERLAP
+// the cursor. Every timestamp here is at or after the anchor's, so the
+// clock check cannot fire — what catches it is that the row at the cursor
+// id is no longer the row the cursor was set from.
+func TestPoll_LogWhoseCursorRowIsADifferentRequestIsSkipped(t *testing.T) {
+	swap := &fakeSwap{}
+	url := swap.start(t)
+	c := newCollector(t, url)
+
+	base := time.Date(2026, 8, 5, 8, 0, 0, 0, time.UTC)
+	var rows []ActivityRow
+	for i := range 5 {
+		rows = append(rows, stamped(chatRow(int64(i+1), "qwen", 100, 0, 50), base.Add(time.Duration(i)*time.Minute)))
+	}
+	swap.set(rows)
+	if err := c.Poll(context.Background()); err != nil {
+		t.Fatalf("poll 1: %v", err)
+	}
+	want := totalsFor(t, c, "qwen", BasisChat)
+
+	// A different log occupying the same id space, all of it stamped
+	// AFTER the anchor so only the identity check can object.
+	var other []ActivityRow
+	for i := range 8 {
+		other = append(other, stamped(chatRow(int64(i+1), "bge-rewrite", 20, 0, 10), base.Add(time.Duration(10+i)*time.Minute)))
+	}
+	swap.set(other)
+	if err := c.Poll(context.Background()); err != nil {
+		t.Fatalf("poll 2: %v", err)
+	}
+
+	if got := totalsFor(t, c, "bge-rewrite", BasisChat); got.Req != 0 {
+		t.Fatalf("a log that replaced the cursor row was folded anyway: %+v", got)
+	}
+	if got := totalsFor(t, c, "qwen", BasisChat); got != want {
+		t.Fatalf("the original totals moved: %+v, want %+v", got, want)
+	}
+	if snap := c.Snapshot(); snap.LostRows != 3 {
+		t.Errorf("lost_rows = %d, want 3 (ids 6..8 were read and refused)", snap.LostRows)
+	}
+}
+
+// The deliberate NON-strictness: on an in-memory ring the anchor ages out
+// legitimately, and every surviving row is newer than it. That is
+// unproven continuity, not contradicted continuity, and refusing it would
+// drop real traffic on every cell that outruns its ring — so it folds and
+// reports the aged-out span exactly as it did before.
+func TestPoll_AgedOutAnchorStillFoldsAndReportsTheShortfall(t *testing.T) {
+	swap := &fakeSwap{}
+	url := swap.start(t)
+	c := newCollector(t, url)
+
+	base := time.Date(2026, 8, 5, 8, 0, 0, 0, time.UTC)
+	swap.set([]ActivityRow{
+		stamped(chatRow(1, "qwen", 100, 0, 50), base),
+		stamped(chatRow(2, "qwen", 100, 0, 50), base.Add(time.Minute)),
+		stamped(chatRow(3, "qwen", 100, 0, 50), base.Add(2*time.Minute)),
+	})
+	if err := c.Poll(context.Background()); err != nil {
+		t.Fatalf("poll 1: %v", err)
+	}
+
+	swap.set([]ActivityRow{
+		stamped(chatRow(900, "qwen", 10, 0, 5), base.Add(3*time.Hour)),
+		stamped(chatRow(901, "qwen", 10, 0, 5), base.Add(4*time.Hour)),
+		stamped(chatRow(902, "qwen", 10, 0, 5), base.Add(5*time.Hour)),
+	})
+	if err := c.Poll(context.Background()); err != nil {
+		t.Fatalf("poll 2: %v", err)
+	}
+	got := totalsFor(t, c, "qwen", BasisChat)
+	if got.Req != 6 || got.InFresh != 330 {
+		t.Fatalf("a ring that aged the anchor out lost its readable rows: %+v", got)
+	}
+	if snap := c.Snapshot(); snap.LostRows != 896 {
+		t.Errorf("lost_rows = %d, want 896 (max_id 902 - cursor 3 - 3 rows read)", snap.LostRows)
+	}
+}
+
+// A state file written before the anchor existed carries none, and the
+// upgrade must not cost the cell a window: with nothing to contradict,
+// the first poll folds and re-establishes the anchor.
+func TestPoll_StateFileWithoutAnAnchorStillFolds(t *testing.T) {
+	swap := &fakeSwap{}
+	url := swap.start(t)
+	statePath := filepath.Join(t.TempDir(), "cell-usage.json")
+	if err := os.WriteFile(statePath, []byte(`{"epoch":"e1","last_row_id":2,"lost_rows":0,"models":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(Config{LlamaSwapURL: url, StatePath: statePath, NewEpoch: func() string { return "unused" }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	base := time.Date(2026, 8, 5, 8, 0, 0, 0, time.UTC)
+	swap.set([]ActivityRow{
+		stamped(chatRow(1, "qwen", 100, 0, 50), base),
+		stamped(chatRow(2, "qwen", 100, 0, 50), base.Add(time.Minute)),
+		stamped(chatRow(3, "qwen", 40, 0, 20), base.Add(2*time.Minute)),
+	})
+	if err := c.Poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if got := totalsFor(t, c, "qwen", BasisChat); got.Req != 1 || got.InFresh != 40 {
+		t.Fatalf("an anchorless state file cost the cell its window: %+v", got)
+	}
+	// The anchor is now recorded, so the very next swap is caught.
+	c.mu.Lock()
+	a := c.anchor
+	c.mu.Unlock()
+	if a == nil || a.ID != 3 {
+		t.Fatalf("anchor = %+v, want the row at id 3", a)
+	}
+}
+
+// Ordinary growth with real timestamps must never trip either check —
+// this is the false-positive guard on a cell that is simply busy.
+func TestPoll_OrdinaryGrowthWithTimestampsNeverTripsTheContinuityCheck(t *testing.T) {
+	swap := &fakeSwap{}
+	url := swap.start(t)
+	c := newCollector(t, url)
+
+	base := time.Date(2026, 8, 5, 8, 0, 0, 0, time.UTC)
+	var rows []ActivityRow
+	for i := range 6 {
+		// Second granularity: llama-swap's timestamps repeat within a
+		// second, so equal stamps across ids must not read as backwards.
+		rows = append(rows, stamped(chatRow(int64(i+1), "qwen", 10, 0, 5), base.Add(time.Duration(i/2)*time.Second)))
+		swap.set(rows)
+		if err := c.Poll(context.Background()); err != nil {
+			t.Fatalf("poll %d: %v", i, err)
+		}
+	}
+	got := totalsFor(t, c, "qwen", BasisChat)
+	if got.Req != 6 {
+		t.Fatalf("req = %d, want 6", got.Req)
+	}
+	if snap := c.Snapshot(); snap.LostRows != 0 {
+		t.Errorf("lost_rows = %d on an ordinary growing log", snap.LostRows)
 	}
 }

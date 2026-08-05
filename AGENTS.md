@@ -296,6 +296,21 @@ optional.)
     facade is what's incomplete. `esc()` is the TEXT escaper and
     `attr()` the attribute one — they stay separate because esc()'s
     output also feeds `textContent`.
+  - **`model_classes` guards EVERY warm producer, at both ends**
+    (`fleetcfg.File.WarmClassRefusal` — the ONE sentence, used by
+    fleetmcp's `warm_model`, both C4 loops, C14's post-wake warms and the
+    daemon's config load). Every warm in the fleet is `warmViaFront`, a
+    CHAT completion; hosts.yaml pinning an id to a non-chat class is the
+    declaration that it must not receive one. Until the 2026-08-05 live
+    gate only `warm_model` honoured it, and a `warm_schedule` fired five
+    500-ing chat completions at an embed-class id — then queued them to
+    the cell, because a 500 is a DELIVERY failure. So the refusal holds
+    at WIRING (a `skipped` status row and no goroutine; a refused
+    schedule carries no `next_fire`) and at FIRE time (`restore`,
+    `evalScheduleEntry`, `wakeWarm`) and in `queueWarm`. Do not "fix" a
+    refused embed target by adding an embed warm body: the right verb
+    per class is a phase, and an embed warm is a fully METERED request on
+    C7a's `embed` basis, which has no `poke_req` equivalent.
   - **Model-set changes are render triggers** (recordAnnounce): a cell
     that starts/stops serving a model re-renders like a membership
     transition.
@@ -437,6 +452,28 @@ optional.)
     whole lifetime. `epoch` changes when the cell's activity ids restart
     (`max_id < cursor`) and starts a new row rather than flatlining the
     cell.
+  - **The cursor carries an ANCHOR, and a contradicted window is never
+    folded.** The epoch rule above only answers the DOWNWARD jump; a
+    store restored or swapped for one whose ids sit ABOVE the cursor
+    presents identically to a cell that served a lot while nobody was
+    reading, and the 2026-08-05 live gate watched every counter double
+    into the append-only ledger. So the state file records the id,
+    timestamp, model, `req_path` and status of the row the cursor points
+    at, and `Poll` refuses the whole window on either contradiction: the
+    row now AT the cursor id is a different request, or a row above the
+    cursor was recorded BEFORE the anchor (llama-swap stamps
+    `ts_created` at request COMPLETION and inserts then, so id order and
+    timestamp order agree within one store; `maxRowClockSkew` is for a
+    backwards clock step, not request overlap). A break adopts the new
+    head, folds nothing, adds the refused rows to `lost_rows` and names
+    the evidence — under-count and say so, never silently double-count.
+    It does NOT mint an epoch: the counters are the cell's LIFETIME
+    totals and must stay monotone. An UNREACHABLE anchor is deliberately
+    not a break — on an in-memory ring it ages out legitimately, and this
+    tests CONTRADICTED continuity, not unproven continuity (the same
+    reason a row-count cross-check against `/api/metrics/stats` was
+    rejected: a ring's aged-out span and a swapped store's id hole are
+    numerically identical).
   - Storage is append-only JSONL (`paths.UsageLedgerFile()`), coalesced
     in memory, flushed on a 60s ticker and at shutdown, compacted at
     start via tmp+rename. Deliberately NOT `history.go`'s

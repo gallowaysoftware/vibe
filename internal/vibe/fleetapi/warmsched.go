@@ -209,10 +209,21 @@ func (s *Server) startScheduleLoopWithConfig(entries []WarmScheduleEntry, cellOf
 		// goroutine is gated on BOTH, or it parks forever re-running the
 		// full multi-year scan every minute.
 		live := err == nil
-		if err != nil {
+		refused := s.warmClassRefusal(e.Model)
+		switch {
+		case refused != "":
+			// A model hosts.yaml pins to a non-chat class can never be
+			// warmed by this verb, so the entry is inert from wiring —
+			// same shape as an invalid cron, and answered FIRST so the
+			// status carries no next_fire for a warm that will never
+			// happen.
+			live = false
+			st.LastNote = "refused: " + refused
+			slog.Error("warm schedule refused: the warm verb is a chat completion", "cron", e.Cron, "model", e.Model, "why", refused)
+		case err != nil:
 			st.LastNote = "invalid cron: " + err.Error()
 			slog.Warn("warm schedule invalid", "cron", e.Cron, "err", err)
-		} else {
+		default:
 			next, ok := spec.nextFire(now, loc)
 			if ok {
 				nextUTC := next
@@ -276,8 +287,13 @@ func (s *Server) evalScheduleEntry(e WarmScheduleEntry, spec cronSpec, st *warmS
 	}
 
 	note, unguarded := "", ""
+	refused := s.warmClassRefusal(e.Model)
 	cell, err := cellOfModel(e.Model)
 	switch {
+	case refused != "":
+		// Answered before the guard rungs and before any resolve: this is
+		// a configuration refusal, not a condition of tonight.
+		note = "refused: " + refused
 	case err != nil:
 		note = fmt.Sprintf("skipped (cannot resolve cell for %s: %v)", e.Model, err)
 		slog.Warn("warm schedule cell resolve failed — not firing unguarded", "model", e.Model, "err", err)

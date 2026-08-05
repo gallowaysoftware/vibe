@@ -340,3 +340,27 @@ func TestLoad_PricingRejectsNonsense(t *testing.T) {
 		}
 	}
 }
+
+// WarmClassRefusal is the ONE sentence every warm producer refuses with —
+// fleetmcp's warm_model, C4's two loops, C14's post-wake warms and the
+// piggyback queue they share. A second copy is how one of them rots.
+func TestWarmClassRefusal(t *testing.T) {
+	f := &File{ModelClasses: map[string]string{"bge-embed": "embed", "qwen": ModelClassChat}}
+	if why := f.WarmClassRefusal("bge-embed"); why == "" {
+		t.Error("an embed-class id was not refused")
+	} else if !strings.Contains(why, "embed-class") || !strings.Contains(why, "model_classes") {
+		t.Errorf("the refusal does not say which declaration made it: %q", why)
+	}
+	// A chat-class entry documents ownership; refusing it told a caller
+	// its chat model "is not chat".
+	if why := f.WarmClassRefusal("qwen"); why != "" {
+		t.Errorf("a chat-class id was refused: %q", why)
+	}
+	if why := f.WarmClassRefusal("unlisted"); why != "" {
+		t.Errorf("an unlisted id was refused: %q", why)
+	}
+	// A daemon with no hosts.yaml at all declares no classes.
+	if why := (*File)(nil).WarmClassRefusal("bge-embed"); why != "" {
+		t.Errorf("nil hosts.yaml refused %q", why)
+	}
+}
