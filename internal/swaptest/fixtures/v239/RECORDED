@@ -1,0 +1,12 @@
+{
+  "at": "2026-08-05T13:48:52Z",
+  "captured_from": "a running llama-swap instance",
+  "commit": "dd81801",
+  "logdata_bytes": [
+    106810,
+    103636
+  ],
+  "redactions": "logData frame payloads are replaced with a marker; their original byte lengths are in logdata_bytes. Nothing else is altered.",
+  "source": "http://127.0.0.1:9000",
+  "version": "v239"
+}

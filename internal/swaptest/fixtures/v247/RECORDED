@@ -1,0 +1,12 @@
+{
+  "at": "2026-08-05T14:16:31Z",
+  "captured_from": "a running llama-swap instance",
+  "commit": "40027d6",
+  "logdata_bytes": [
+    691,
+    1801
+  ],
+  "redactions": "TWO, and only two: logData frame payloads are replaced with a marker (their original byte lengths are in logdata_bytes), and the recording operator's home directory is folded to ~. Nothing else is altered.",
+  "source": "http://127.0.0.1:15800",
+  "version": "v247"
+}

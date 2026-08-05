@@ -1,0 +1,12 @@
+event:message
+data:{"type":"logData","data":"{\"data\":\"[REDACTED BY swaptest RECORDER: 106810 bytes of operator log]\"}"}
+
+event:message
+data:{"type":"logData","data":"{\"data\":\"[REDACTED BY swaptest RECORDER: 103636 bytes of operator log]\"}"}
+
+event:message
+data:{"type":"modelStatus","data":"[{\"id\":\"comfyui\",\"name\":\"\",\"description\":\"\",\"state\":\"stopped\",\"unlisted\":false,\"peerID\":\"\"},{\"id\":\"gemma-4-31b\",\"name\":\"\",\"description\":\"\",\"state\":\"stopped\",\"unlisted\":false,\"peerID\":\"\"},{\"id\":\"gemma-4-31b-mm\",\"name\":\"\",\"description\":\"\",\"state\":\"stopped\",\"unlisted\":false,\"peerID\":\"\",\"aliases\":[\"gemma-4-31b-it\"]},{\"id\":\"gemma-4-31b-tools\",\"name\":\"\",\"description\":\"\",\"state\":\"stopped\",\"unlisted\":false,\"peerID\":\"\"},{\"id\":\"qwen2.5-coder-7b\",\"name\":\"\",\"description\":\"\",\"state\":\"stopped\",\"unlisted\":false,\"peerID\":\"\"},{\"id\":\"qwen3.6-27b\",\"name\":\"\",\"description\":\"\",\"state\":\"ready\",\"unlisted\":false,\"peerID\":\"\",\"aliases\":[\"qwen3.6-27b-mtp-q6_k\"]},{\"id\":\"qwen3.6-27b-tools\",\"name\":\"\",\"description\":\"\",\"state\":\"stopped\",\"unlisted\":false,\"peerID\":\"\"},{\"id\":\"slowmodel\",\"name\":\"\",\"description\":\"\",\"state\":\"stopped\",\"unlisted\":true,\"peerID\":\"\"},{\"id\":\"claude-opus-4-8\",\"name\":\"\",\"description\":\"\",\"state\":\"\",\"unlisted\":false,\"peerID\":\"anthropic\"},{\"id\":\"claude-sonnet-5\",\"name\":\"\",\"description\":\"\",\"state\":\"\",\"unlisted\":false,\"peerID\":\"anthropic\"}]"}
+
+event:message
+data:{"type":"inflight","data":"{\"requests\":[{\"id\":\"93445\",\"timestamp\":\"2026-08-05T10:48:49.012790876-03:00\",\"model\":\"qwen3.6-27b\",\"req_path\":\"/v1/chat/completions\",\"method\":\"POST\"}]}"}
+

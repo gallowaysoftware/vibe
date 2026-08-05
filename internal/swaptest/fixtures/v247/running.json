@@ -1,0 +1,14 @@
+{
+  "running": [
+    {
+      "model": "conformance",
+      "state": "ready",
+      "cmd": "/tmp/swaptest-rec/upstream/llama-server --model /tmp/swaptest-rec/stories260K.gguf --host 127.0.0.1 --port 15801 --ctx-size 512 --n-gpu-layers 0 --no-warmup\n",
+      "proxy": "http://127.0.0.1:15801",
+      "ttl": 600,
+      "name": "",
+      "description": ""
+    }
+  ]
+}
+
