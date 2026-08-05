@@ -573,16 +573,19 @@ are never enforced, and C9's fingerprint alarm has no evaluator. That is
 |---|---|
 | `internal/vibe/fleetapi/doctor.go` | new: `DoctorReport`, `DoctorCheck`, `Level`, `Server.Doctor(ctx)`, every server-side check |
 | `internal/vibe/fleetapi/routes.go` | one row: `GET /api/fleet/doctor`, `AccessTokenOnly`, `enabled: fleetdRole` |
-| `internal/vibe/fleetcfg/fleetcfg.go` | `CellCredential(cell, env, pref)` — the one credential resolver, with the two documented preferences |
+| `internal/vibe/fleetcfg/fleetcfg.go` | `CellCredential(cell, env, pref, localToken)` — the one credential resolver, with the two documented preferences |
 | `internal/vibe/fleetmcp/actuate.go` | `cellClient` repointed at it (behaviour unchanged) |
 | `internal/vibe/fleetmcp/doctor.go` | new: the `fleet_doctor` tool |
 | `internal/vibe/cli/cmd_cell_actuate.go` | `resolveCellClient` repointed at it (behaviour unchanged) |
 | `internal/vibe/cli/cmd_fleet_doctor.go` | new: `vibe fleet doctor`, the renderer, the client-side checks, the degraded path |
-| `internal/vibe/daemon/daemon.go` | wires the doctor's host provider (disk, token-minted, `$VIBE_TOKEN` presence, defs SHA) and the outbound-auth prober into `fleetapi.Options` |
+| `internal/vibe/daemon/doctor.go` | new: the host facts (`statfs`, token-minted, `$VIBE_TOKEN` presence, the def checkout) and the outbound credential probe |
+| `internal/vibe/daemon/daemon.go` | wires both into `fleetapi.Options`; records `tokenMinted` at startup |
+| `cmd/vibe/main.go`, `internal/vibe/cli/root.go` | `cli.ExitCode(err)` so a command whose OUTPUT is the message can choose its status without main printing an error line on top of it |
 | `internal/vibe/daemon/announce.go` | the versions/capacity provider extracted so the slim announcer shares it |
 | `internal/vibe/cli/cmd_fleet.go` | slim announcer gains the same `Versions` + `Capacity` providers (§5) |
 | `internal/vibe/daemon/fleet_registry_test.go` | the new route joins the fleetd-only probe list |
-| `AGENTS.md`, this plan's `README.md` | the C13 invariants and the status row |
+| `deploy/fleetd/README.md` | the command and the quarterly fire drill, where an operator finds them |
+| `AGENTS.md`, this plan's `README.md`, `fleet-control-futures.md` | the C13 invariants, the status row, and backlog item 7 marked SHIPPED |
 
 `fleetapi` gains no import of `vibeclient`: the outbound prober is
 injected through `Options` exactly as `daemonInfo` is, which keeps the
