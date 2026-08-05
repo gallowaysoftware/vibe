@@ -1,0 +1,18 @@
+event:message
+data:{"type":"logData","data":"{\"data\":\"[REDACTED BY swaptest RECORDER: 691 bytes of operator log]\"}"}
+
+event:message
+data:{"type":"logData","data":"{\"data\":\"[REDACTED BY swaptest RECORDER: 1801 bytes of operator log]\"}"}
+
+event:message
+data:{"type":"modelStatus","data":"[{\"id\":\"conformance\",\"name\":\"\",\"description\":\"\",\"state\":\"ready\",\"unlisted\":false,\"peerID\":\"\"}]"}
+
+event:message
+data:{"type":"uiConfig","data":"{\"activity\":{\"session_id\":[\"X-Session-ID\",\"X-Litellm-Session-Id\"]}}"}
+
+event:message
+data:{"type":"profileChanged","data":"{\"active\":null}"}
+
+event:message
+data:{"type":"inflight","data":"{\"operation\":\"snapshot\"}"}
+

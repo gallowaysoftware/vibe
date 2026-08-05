@@ -1,0 +1,20 @@
+{
+  "data": [
+    {
+      "id": "conformance",
+      "object": "model",
+      "created": 1785939371,
+      "owned_by": "llama-swap",
+      "meta": {
+        "llamaswap": {
+          "type": "model"
+        }
+      },
+      "status": {
+        "value": "loaded"
+      }
+    }
+  ],
+  "object": "list"
+}
+

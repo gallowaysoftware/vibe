@@ -51,6 +51,91 @@ them before pushing. (2026-07-12: a push failed CI on golangci-lint
 findings that vet+gofmt missed — the linter is part of the gate, not
 optional.)
 
+`go test -race ./...` is ~15s on a workstation. That number is an asset —
+it is why agents here run the whole gate before every push — so anything
+that pushes the blocking job past ~3 min is not worth whatever fidelity it
+buys. The llama-swap conformance work lives in SEPARATE CI jobs for
+exactly that reason.
+
+## Test doubles and upstream contracts
+
+**`internal/swaptest` is the one llama-swap double.** Stdlib only, no new
+module, `NewCell(t, WithWire(…))` serving `/running`, `/v1/models`,
+`/api/events`, `/api/metrics/activity` and the completion paths. New tests
+that need a llama-swap use it; do not hand-roll a fifty-first `httptest`
+stand-in.
+
+- **Fail toward "no evidence", never toward "confirmed idle".** A parser
+  reading an upstream contract must map a shape it does not recognise to
+  *unknown*, never to a valid-looking value. `trackInFlight` is the worked
+  example: an unrecognised inflight `operation` sets `inFlightSeen=false`,
+  which the eight busy guards (drain, suspend, probe, both warm loops, the
+  pre-drain report) already render as a refusal — because a *reported zero*
+  is a positive claim of idleness that no guard can question. This is the
+  only mechanism that protects against drift nobody noticed, and it is a
+  property of the production code, not of a test.
+- **The in-flight wire is version-dependent and the difference is not
+  cosmetic.** v239 sends the full request list on every edge; v240+ sends
+  operation-tagged DELTAS (`snapshot` / `upsert` / `remove`) with
+  `requests` omitempty and absent, so `len(requests)` reads a request
+  STARTING as an idle cell. Verified 2026-08-05 by running the fold against
+  real v239 and real v247 binaries: pre-fix code passed v239 and failed
+  v247. The fold is a SET keyed by request id, and it keeps the model per
+  id because a v247 remove edge names only an id — without that memory C4's
+  per-model activity never stamps and every `restore_after_idle` window
+  reads as never-active.
+- **A count belongs to the connection that produced it** — `clearInFlight`
+  on stream drop. llama-swap re-seeds a fresh `/api/events` connection with
+  a current-state inflight snapshot inside ~200ms (measured), so keeping the
+  old count buys nothing and can strand a busy verdict forever.
+- **Fixtures are RAW RECORDED BYTES** (`internal/swaptest/fixtures/<ver>/`),
+  captured by `TestRecord` and checked in verbatim, never re-encoded
+  production structs — a fixture that round-trips through the same json tags
+  the decoder reads cancels out a tag typo, and a field the production
+  struct omits (`resp_content_type`, `error_msg`, `has_capture`) is
+  structurally invisible. logData payloads are the one redaction (they are
+  the operator's log history); the byte lengths are kept in `RECORDED`.
+  Every fixture set carries provenance and a `caveat` if it was not captured
+  from a running binary.
+- **Re-recording is triggered by bumping a pin.** `.github/workflows/ci.yml`
+  pins the conformance matrix; whoever bumps it runs `TestRecord` and
+  commits the new `fixtures/<version>/` BESIDE the old ones. Old recordings
+  are kept, not replaced: a heterogeneous fleet is the normal state, so
+  "both wires must pass" is the requirement, not "newest wins".
+  `TestRecordingIsCurrent` fires on the box where the upgrade happened.
+- **`TestSwapContract` is ONE assertion list run against every fake wire AND
+  a real binary** (env-gated on `LLAMA_SWAP_BIN`/`LLAMA_SERVER_BIN`/
+  `LLAMA_GGUF`, never a build tag — this module has zero `//go:build` lines
+  and a tagged-out file is skipped by vet and the linter, so it rots
+  uncompiled). Assert SEMANTICS, never bytes: v247 added five fields to the
+  in-flight entry and two new frame types to the connect burst, all
+  harmless, and a byte golden would have flapped on every one.
+- **The double may not INVENT a field's value, and a conformance invariant
+  may not `t.Skip`.** Two ways a green suite lies, both found by review on
+  the pass that introduced the double. It logged `resp_content_type:
+  text/event-stream` on every chat row whether or not the client asked to
+  stream, so "streaming rows carry tokens" was satisfied by a row nobody
+  streamed — and correcting the lie turned that invariant into a green
+  SKIP. If a field's value is not something the double actually models,
+  model it (`swaptest` honours `stream`, because a real v247 logs
+  `application/json; charset=utf-8` for the same completion unstreamed);
+  and a target that fails to produce the row an invariant is about must be
+  RED, not skipped. Assertions on the double's *own* output — the `-1`
+  sentinel, the wire shape — are required of `fake/` targets and merely
+  noted on live ones: llama.cpp may legitimately not report a counter, but
+  the double has no excuse.
+- **The local rigs stay.** `scripts/fleetlab` and
+  `scripts/smoke/llama-swap/` are not made redundant by any of this — CI has
+  no GPU, no real models, no SSH, no wattmeter, and its numbers would be
+  different numbers measuring a different thing. Run them: before merging
+  anything that touches drain / suspend / warm / sleep-schedule / probe
+  semantics (the eight `InFlight` call sites); whenever the weekly
+  `drift` workflow goes red; after any llama-swap version bump on a real
+  cell, BEFORE the fleet is left unattended overnight with sleep schedules
+  armed; before a release; and when adding a new cell CLASS. **A green CI
+  suite is never evidence that a phase doc's gate passed** — those
+  transcripts are real hardware runs.
+
 ## Conventions agents tend to violate
 
 - **Stdlib first.** Reach for stdlib before adding a dep. Current
@@ -188,6 +273,19 @@ optional.)
     last_seen; probes are the fallback for never-announced cells.
     Staleness is `3×interval + 5s` from fleetd-side `received_at`
     only — seq is a per-boot hint, cell clocks are never consulted.
+  - **A cell cannot announce itself into existence.** hosts.yaml stays
+    the single source of membership: an announce naming a cell the
+    registry does not carry is refused `400 unknown cell`, so
+    commissioning is daemon/announcer + `hosts.yaml` entry + registry
+    URL — all three. What C3 retires is the inbound PORT, not the
+    membership record, and **"announce-only" everywhere in these docs
+    means fleetd cannot DIAL the cell** (no reachable inbound port, no
+    `daemon_url`), never that the cell is missing from hosts.yaml.
+    Several docs said the latter until 2026-08-05; they were describing
+    a state that has never been reachable. Do not loosen the check to
+    make them true — an announce accepting an unknown NAME is a
+    fleet-wide write from an unauthenticated one, and the fleet token
+    authenticates the connection, never the cell (design §6, below).
   - **The conflict rule**: registry intent is a REQUEST until the
     cell echoes it; a NEWER echo resolves it either way (complied or
     human override); older echo gets desired_intent handed back. The
@@ -287,15 +385,46 @@ optional.)
       `s.wg` goroutines, so an unlinked timeout blocks `Close()`.
   - **The fleet page** (fleetapi/fleet.html via embed.FS at
     `GET /ui/fleet`): static, framework-free, bearer-exempt as a static
-    asset ONLY (the ONE middleware exemption — exact-match, GET-only,
-    evaluated before mux path-cleaning, boundary test-pinned in
-    daemon/fleet_registry_test.go; do NOT widen it to a prefix match or
-    `path.Clean`). SSE (`/api/fleet/events`) drives debounced state
+    asset ONLY (the ONE middleware exemption — exact-match, GET-only, on
+    the escaped path, evaluated before mux path-cleaning, boundary
+    test-pinned in daemon/fleet_registry_test.go and
+    daemon/authpath_test.go; do NOT widen it to a prefix match,
+    `path.Clean` or a decoded path). SSE (`/api/fleet/events`) drives
+    debounced state
     refreshes; action buttons POST `/mcp` tools/call — never add
     mutation routes for it; if a button needs something new, the MCP
     facade is what's incomplete. `esc()` is the TEXT escaper and
     `attr()` the attribute one — they stay separate because esc()'s
     output also feeds `textContent`.
+  - **`model_classes` guards EVERY warm producer, at both ends**
+    (`fleetcfg.File.WarmClassRefusal` — the ONE sentence, used by
+    fleetmcp's `warm_model`, both C4 loops, C14's post-wake warms and the
+    daemon's config load). Every warm in the fleet is `warmViaFront`, a
+    CHAT completion; hosts.yaml pinning an id to a non-chat class is the
+    declaration that it must not receive one. Until the 2026-08-05 live
+    gate only `warm_model` honoured it, and a `warm_schedule` fired five
+    500-ing chat completions at an embed-class id — then queued them to
+    the cell, because a 500 is a DELIVERY failure. So the refusal holds
+    at WIRING (a `skipped` status row and no goroutine; a refused
+    schedule carries no `next_fire`, and `warm.policy` reports its NOTE
+    rather than "no resolved next fire", which names a cron field that is
+    fine) and at FIRE time (`restore`, `evalScheduleEntry`, `wakeWarm`)
+    and in `queueWarm`. Do not "fix" a refused embed target by adding an
+    embed warm body: the right verb per class is a phase, and an embed
+    warm is a fully METERED request on C7a's `embed` basis, which has no
+    `poke_req` equivalent.
+    - **The test is "does it answer a chat completion", not "is the class
+      string `chat`"** (`fleetcfg.chatCapableClasses` = `chat` +
+      `vision`). A multimodal model is llama-server plus `--mmproj`: same
+      `/v1/chat/completions`, image as a content part, warmed by the same
+      1-token request. Four of the five producers are automated policy,
+      so a FALSE refusal is not a command failing in front of an operator
+      — it is a declared target that silently never fires and a
+      `warm.policy` yellow forever. `embed`/`rerank`/`stt`/`tts` each
+      answer their own route, and `classify` names llama.cpp's
+      sequence-classification family; a small model used FOR
+      classification but served on the chat route is class `chat`
+      (listing it documents ownership and gates nothing).
   - **Model-set changes are render triggers** (recordAnnounce): a cell
     that starts/stops serving a model re-renders like a membership
     transition.
@@ -365,9 +494,11 @@ optional.)
     error or a 5xx from the cell's admin port; the warm-target restore
     and the warm-schedule fire (`fleetapi.queueWarm`) queue a `warm`
     when the front cannot deliver, or when the cell has **no front
-    route at all** — the front's peers are rendered from `hosts.yaml`,
-    so a cell known only through its announces is the warm-loop analog
-    of "no daemon_url" and is queued without a pointless round trip. In
+    route at all** — the front's peers are rendered from `hosts.yaml`
+    and every registry cell carries a `url`, so "no front route" means
+    the cell is ABSENT from the registry (`fleetapi.noFrontRoute` says
+    so; it read "announce-only" until 2026-08-05, naming a state the
+    announce endpoint forbids). In
     every case a **4xx is the far side answering** and stays an error:
     telling an agent a refused verb is "queued for the next announce"
     is worse than failing. That decision needs a status, so
@@ -383,7 +514,8 @@ optional.)
     and keeps retrying transport errors; `--timeout 0` stays the
     overnight-batch idiom.
   - `model_classes` has a closed vocabulary (`fleetcfg.ModelClasses`);
-    `warm_model` skips `chat`-class entries and still refuses the rest.
+    the warm guard skips the CHAT-CAPABLE classes (`chat`, `vision`) and
+    still refuses the rest — see C4's `WarmClassRefusal` note.
     hosts.yaml tolerates fleet.md's top-level `hosts:` inventory as an
     inert key — `KnownFields(true)` stays on.
 - **Usage ledger (fleet-control C7a).** Tokens per cell, per model, per
@@ -437,6 +569,35 @@ optional.)
     whole lifetime. `epoch` changes when the cell's activity ids restart
     (`max_id < cursor`) and starts a new row rather than flatlining the
     cell.
+  - **The cursor carries an ANCHOR, and a contradicted window is never
+    folded.** The epoch rule above only answers the DOWNWARD jump; a
+    store restored or swapped for one whose ids sit ABOVE the cursor
+    presents identically to a cell that served a lot while nobody was
+    reading, and the 2026-08-05 live gate watched every counter double
+    into the append-only ledger. So the state file records the id,
+    timestamp, model, `req_path` and status of the row the cursor points
+    at, and `Poll` refuses the whole window on either contradiction: the
+    row now AT the cursor id is a different request, or a row above the
+    cursor was recorded BEFORE the anchor (llama-swap stamps
+    `ts_created` at request COMPLETION and inserts then, so id order and
+    timestamp order agree within one store; `maxRowClockSkew` is for a
+    backwards clock step, not request overlap). A break adopts the new
+    head, folds nothing, adds the refused rows to `lost_rows` and names
+    the evidence — under-count and say so, never silently double-count.
+    It does NOT mint an epoch: the counters are the cell's LIFETIME
+    totals and must stay monotone. An UNREACHABLE anchor is deliberately
+    not a break — on an in-memory ring it ages out legitimately, and this
+    tests CONTRADICTED continuity, not unproven continuity (the same
+    reason a row-count cross-check against `/api/metrics/stats` was
+    rejected: a ring's aged-out span and a swapped store's id hole are
+    numerically identical). The two checks are a LADDER, not a
+    conjunction: a row still sitting at the cursor id that matches the
+    anchor PROVES the log's identity, so the clock scan is skipped —
+    running it anyway let one backwards clock step (the thing
+    `maxRowClockSkew` exists to absorb) discard a window of real traffic
+    from a settled log. Two identity changes it does NOT catch, named in
+    the code: a store copied from a busier box whose rows all postdate
+    the anchor, and two llama-swap instances sharing one `store.path`.
   - Storage is append-only JSONL (`paths.UsageLedgerFile()`), coalesced
     in memory, flushed on a 60s ticker and at shutdown, compacted at
     start via tmp+rename. Deliberately NOT `history.go`'s
@@ -796,12 +957,30 @@ optional.)
     the same way as "the next agent decided". Deciding is one line, and
     the decision is `AccessTokenOnly` unless there is an argument.
   - **Enforcement is a positive allowlist**, in daemon/auth.go via
-    `fleetapi.AccessFor(r.Method, r.URL.Path)`: exact (method, path), on
-    the RAW path before the mux cleans anything, everything undeclared
-    (`/mcp`, the whole Connect mount, typos, future routes) token-only.
-    Never a denylist, never a prefix, never `path.Clean`. **C5's
-    `/ui/fleet` exemption is now the table's one `AccessPublic` entry** —
-    same GET-only exact match, same six pinned bypass attempts.
+    `fleetapi.AccessFor(r.Method, r.URL.EscapedPath())`: exact
+    (method, path), on the RAW path before the mux cleans anything,
+    everything undeclared (`/mcp`, the whole Connect mount, typos,
+    future routes) token-only. Never a denylist, never a prefix, never
+    `path.Clean`, never `url.PathUnescape`. **C5's `/ui/fleet` exemption
+    is now the table's one `AccessPublic` entry** — same GET-only exact
+    match, and the same bypass family pinned in
+    `daemon/fleet_registry_test.go` (the list has grown with the phases;
+    do not quote a count at it).
+  - **RAW means `EscapedPath()`, and the difference is not academic.**
+    net/url decodes before the middleware runs
+    (`url.ParseRequestURI("/ui/%66leet")` → `URL.Path == "/ui/fleet"`,
+    `RawPath == "/ui/%66leet"`), so `r.URL.Path` is the DECODED path and
+    matching on it granted every percent-encoded spelling of a declared
+    route while this file claimed the opposite. Nothing was reachable
+    that was not already reachable — Go's ServeMux routes on the decoded
+    path too, so middleware and router agreed, and a positive exact
+    allowlist can only re-grant a route it already granted — but a
+    load-bearing security invariant stated falsely becomes a real hole
+    the day anything routes on `RawPath`. Fixed 2026-08-05 by matching
+    the code to the doc: an encoded spelling is a different string,
+    therefore a miss, therefore token-only — the answer `/ui/fleet%2f`
+    has always got. `/ui/%66leet` and `/api/fleet/%73tate` are pinned in
+    `daemon/authpath_test.go`.
   - **The guest surface is state, never history.** `/api/fleet/usage`
     and `/api/fleet/savings` are refused despite being read-only GETs:
     tokens per cell per day is a record of when this house works and
@@ -876,6 +1055,21 @@ optional.)
     to find out is a mutation), `tls.not_after` not `tls.valid` (the
     chain is deliberately unverified — LAN certs are self-signed, and
     the message says so). Ground rule 10 applied to check names.
+  - **Missing evidence may only ever ADD concern, never subtract it.**
+    `defs.parity` decides DIVERGENCE over every cell that reports a SHA
+    and AGREEMENT only over the clean ones, because the first cut
+    dropped a dirty checkout from the comparison entirely: the
+    2026-08-05 live gate watched a correctly-reported divergence flip to
+    OK the moment the diverged cell went dirty, and a fleetd dirty on a
+    different commit suppressed its own WARN the same way. Dirty-and-
+    diverged is strictly worse than clean-and-diverged. The two
+    can't-compare shapes stay distinct UNKNOWNs — nobody reports a SHA,
+    versus everybody reports one SHA and no tree is clean — and neither
+    is an OK. fleetd's OWN checkout is named on every branch that names
+    SHAs, not only on the agreement one: the box writing the front's
+    render used to vanish from the report exactly when the cells also
+    disagreed, which is the report where "so which tree is the render
+    coming from" is the next question.
   - **The credential check uses the resolver the VERBS use.**
     `fleetcfg.CellCredential(cell, env, pref, localToken)` now holds
     C6's two deliberately-divergent precedences as named values

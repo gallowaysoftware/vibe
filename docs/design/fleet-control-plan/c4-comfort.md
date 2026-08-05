@@ -277,3 +277,58 @@ collision with llama-swap's `/ui` on cells):
 Metrics dashboards (llama-swap's `/ui` + Prometheus endpoints already
 exist), multi-user auth, anything mobile-app-shaped, the v2 throughput
 probe (still reserved).
+
+## Live-gate addendum (2026-08-05): the class guard held on one producer
+of three
+
+Found by standing a real 4-cell fleet up (four llama-swap v239 processes,
+a real fleetd, real announcers) and running these gates against it, and
+fixed on `fix/live-gate-correctness`.
+
+`hosts.yaml`'s `model_classes` exists so the control plane never pokes a
+non-chat model with a chat completion, and the lab confirmed `warm_model`
+refusing an embed-class id by name. A `warm_target` and a `warm_schedule`
+naming that same id then fired five chat completions at it inside 150
+seconds — every one an HTTP 500 from the embedding server, every one
+JIT-loading bge-m3 onto a cell for nothing, and every one queued to the
+cell's next announce afterwards, because a 500 is a DELIVERY failure and
+the piggyback fallback correctly treats it as one.
+
+The guard now lives in `fleetcfg.File.WarmClassRefusal` — one sentence,
+four packages — and is applied at both ends of every producer: the
+warm-target loop, the warm schedule, C14's post-wake warms, and the
+piggyback queue all three share. Refusal at WIRING gives the entry a
+`skipped` status row and no goroutine (a target that is silently absent
+is the failure mode this phase's "clamp, never skip" rule was written
+against, and a refused schedule must not advertise a `next_fire` for a
+warm that will never happen); refusal at FIRE time is what makes it a
+rule rather than a property of one wiring path. The daemon names the same
+refusal at startup for `warm_targets`, `warm_schedule` and
+`sleep_schedule.warm`.
+
+**Review pass (2026-08-05).** The guard's question is whether the model
+ANSWERS a chat completion, not whether its class string is the word
+`chat`. The first cut refused everything but `chat`, which included
+`vision` — and a multimodal model is llama-server plus `--mmproj`: the
+same `/v1/chat/completions`, the image carried as a content part, warmed
+by the same 1-token request. Four of the five producers are automated
+policy, so a false refusal there is not a command failing in front of an
+operator; it is a declared `warm_target` that silently never fires for
+the life of the fleet and a `warm.policy` check that is yellow forever —
+the permanent-WARN failure C13's review pass had to fix three times.
+`fleetcfg.chatCapableClasses` is the line, and the whole vocabulary is
+pinned against a spelled-out table so a class added later has to be
+decided rather than inherited. The same pass carried the refusal's NOTE
+into `warm.policy`: three different causes park a schedule with no
+`next_fire`, and reporting only "no resolved next fire" sends an operator
+to debug a cron field that is fine.
+
+**No class-dispatched warm body was added, deliberately.** C8's prober
+does have an embed path, so "warm an embedding model" is a coherent want
+— but it needs the right verb per class, and on the two classes with an
+obvious body the warm stops being free: an embed warm is a fully metered
+request on C7a's `embed` basis, where there is no `poke_req` equivalent
+to keep it out of the billable figures, so a 96-a-day schedule would
+quietly inflate an append-only ledger. That is a phase with a doc, not a
+line in a bug fix. Until it exists the refusal names which config is
+wrong.

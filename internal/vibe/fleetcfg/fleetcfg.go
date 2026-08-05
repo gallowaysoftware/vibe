@@ -415,13 +415,32 @@ func (f *File) validate() error {
 }
 
 // ModelClasses is the closed vocabulary of model_classes values.
-// ModelClassChat is the one class warm_model may still poke — it is a
-// chat model, which is exactly what a warm request loads.
-var ModelClasses = []string{ModelClassChat, "embed", "rerank", "classify", "stt", "tts", "vision"}
+var ModelClasses = []string{ModelClassChat, "embed", "rerank", "classify", "stt", "tts", ModelClassVision}
 
 // ModelClassChat marks an id that is a normal chat model; listing it
 // documents ownership without gating the warm path.
 const ModelClassChat = "chat"
+
+// ModelClassVision marks a multimodal model. It is llama-server with an
+// `--mmproj` projector: the endpoint is `/v1/chat/completions` and the
+// image is a CONTENT PART inside an ordinary chat message, so a 1-token
+// text completion warms it exactly as it warms any chat model.
+const ModelClassVision = "vision"
+
+// chatCapableClasses is the set of classes whose models ANSWER a chat
+// completion, which is the only question the warm guard asks.
+//
+// The line is drawn on the endpoint, not on the word "chat": embed,
+// rerank, stt and tts each have their own route (`/v1/embeddings`,
+// `/v1/rerank`, `/v1/audio/*`) and answer a chat completion with an
+// error, and `classify` names llama.cpp's sequence-classification
+// family, which is the same story. `vision` does not — a multimodal
+// model is a chat model that also accepts image parts, and refusing it
+// would turn a working `warm_target` into a permanent `skipped` row and
+// `warm.policy` into a permanent WARN. If a small model is used FOR
+// classification but is served on the chat route, `chat` is its class
+// (listing it documents ownership without gating anything).
+var chatCapableClasses = map[string]bool{ModelClassChat: true, ModelClassVision: true}
 
 // KnownModelClass reports whether class is in the closed vocabulary.
 func KnownModelClass(class string) bool {
@@ -431,6 +450,44 @@ func KnownModelClass(class string) bool {
 		}
 	}
 	return false
+}
+
+// WarmClassRefusal reports why a CHAT-completion warm must not be fired
+// at model, or "" when it may be. It lives here, on the file that carries
+// the declaration, because every warm in the fleet is the same verb and
+// the guard has to be the same sentence: fleetmcp's `warm_model` (the
+// operator's verb) and the three automated producers — C4's warm-target
+// restore, C4's warm schedule, C14's post-wake warms — plus the piggyback
+// queue they all fall back to. `warm_model` alone honoured it until the
+// lab watched a `warm_schedule` fire five chat completions at an
+// embed-class id the same fleetd had just refused by hand.
+//
+// There is deliberately no class-dispatched warm body here. C8's prober
+// does have an embed path, so "warm an embedding model" is a coherent
+// want — but it needs the right verb per class (rerank takes a query plus
+// documents, stt multipart audio, tts a voice), and on the two classes
+// with an obvious body the warm stops being free: an embed warm is a
+// fully metered request on the `embed` basis, where C7a has no `poke_req`
+// equivalent to keep it out of the billable figures. A 96-a-day schedule
+// would quietly inflate an append-only ledger. That is a feature with a
+// phase doc, not a line in a bug fix; until it exists the honest answer
+// is to refuse and say which config is wrong.
+//
+// The test is chatCapableClasses, NOT class == chat. Four of the five
+// producers are automated policy, so a false refusal is not a command
+// that fails in front of an operator — it is a declared target that
+// silently never fires and a doctor check that is yellow forever.
+func (f *File) WarmClassRefusal(model string) string {
+	if f == nil {
+		return ""
+	}
+	class, pinned := f.ModelClasses[model]
+	if !pinned || chatCapableClasses[class] {
+		return ""
+	}
+	return fmt.Sprintf("%s is %s-class (per hosts.yaml model_classes), which does not answer a chat "+
+		"completion: warming it would load it for nothing. Drop it from the warm declaration that named "+
+		"it, or correct model_classes if the class is wrong", model, class)
 }
 
 func validatePower(cell string, p *Power) error {

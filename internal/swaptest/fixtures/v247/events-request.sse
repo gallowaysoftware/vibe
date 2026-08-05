@@ -1,0 +1,15 @@
+event:message
+data:{"type":"inflight","data":"{\"operation\":\"snapshot\"}"}
+
+event:message
+data:{"type":"inflight","data":"{\"operation\":\"upsert\",\"request\":{\"id\":\"2\",\"timestamp\":\"2026-08-05T11:16:11.269059232-03:00\",\"model\":\"conformance\",\"req_path\":\"/v1/chat/completions\",\"method\":\"POST\",\"req_headers\":{\"Accept-Encoding\":\"gzip\",\"Content-Length\":\"82\",\"Content-Type\":\"application/json\",\"User-Agent\":\"Go-http-client/1.1\"},\"remote_ip\":\"127.0.0.1\",\"resp_headers\":{},\"resp_bytes\":0,\"elapsed_ms\":0}}"}
+
+event:message
+data:{"type":"inflight","data":"{\"operation\":\"upsert\",\"request\":{\"id\":\"2\",\"timestamp\":\"2026-08-05T11:16:11.269059232-03:00\",\"model\":\"conformance\",\"req_path\":\"/v1/chat/completions\",\"method\":\"POST\",\"req_headers\":{\"Accept-Encoding\":\"gzip\",\"Content-Length\":\"82\",\"Content-Type\":\"application/json\",\"User-Agent\":\"Go-http-client/1.1\"},\"remote_ip\":\"127.0.0.1\",\"resp_headers\":{\"Access-Control-Allow-Origin\":\"\",\"Content-Length\":\"638\",\"Content-Type\":\"application/json; charset=utf-8\",\"Server\":\"llama.cpp\"},\"resp_bytes\":0,\"elapsed_ms\":54}}"}
+
+event:message
+data:{"type":"inflight","data":"{\"operation\":\"remove\",\"id\":\"2\"}"}
+
+event:message
+data:{"type":"activity","data":"{\"id\":2}"}
+

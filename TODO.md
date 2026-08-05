@@ -2,6 +2,43 @@
 
 ## Open
 
+- **Migrate the hand-rolled llama-swap fakes onto `internal/swaptest`.**
+  The shared double landed with a decisive first set of tests
+  (`fleetapi/watcher_wire_test.go`, `usagemeter/ring_test.go`,
+  `swaptest/contract_test.go`); the ~50 existing stand-ins were
+  deliberately NOT rewritten in that pass. Convert opportunistically — a
+  file swaps its local `httptest.NewServer` for `swaptest.NewCell` when it
+  is next touched. Highest value first, because each of these currently
+  asserts against a stream that does not resemble the wire:
+  1. `internal/vibe/fleetapi/fleetapi_test.go`'s `newFakeCell` — the
+     single highest-leverage one. Its `/api/events` emits modelStatus and
+     NEVER an inflight frame, so every drop/reconnect test in the package
+     (`TestCellDownUpTransitions` and friends) exercises a state where an
+     in-flight bug cannot appear. It is why the v247 break survived 50
+     fakes and green CI.
+  2. `internal/vibe/fleetapi/c5_test.go`'s `inflightFrame` helper — named
+     "real frames", builds entries with no `id`. The real v239 wire always
+     sends one and v240+ makes it load-bearing.
+  3. `internal/vibe/usagemeter/usagemeter_test.go:37-69` — builds its
+     pages by marshalling `activityPage`/`ActivityRow`, the production
+     types. A json tag typo cancels out, and `resp_content_type`,
+     `error_msg` and `has_capture` are structurally invisible.
+  4. The eight `{"running":[...]}` literals across `daemon`, `fleetmcp`
+     and `cli` — one shape, eight spellings.
+  5. `internal/vibe/fleetapi/fleetapi_test.go:191` asserts
+     `Name: "Qwen Coder"` off a `/running` payload; the real `/running`
+     always answers `"name":""` (display names live on modelStatus). The
+     fallback at `fleetapi.go:648` makes it a production no-op, so this is
+     a green test asserting a value reality never produces.
+- **A ~30 MB embedding GGUF for the conformance job.** stories260K 501s on
+  `/v1/embeddings`, which is exactly why C7a's basis branch exists — so the
+  `embed` basis is the one arithmetic the pinned job does not exercise
+  against a real llama-swap.
+- **Pin `FRONT_IMAGE` to a digest in `deploy/front/.env.example`.**
+  `deploy/front/docker-compose.yaml` floats `:cpu`, and a
+  `docker compose pull` on the front is precisely the event that would have
+  armed the v247 in-flight break on a live cell.
+
 - **Router + model lifecycle (adopt llama-swap).** Design at
   `docs/design/router-lifecycle.md` (2026-07-12): llama-swap per cell
   (e.g. a GPU cell / a paired-accelerator cell / a utility cell) federated via peers, front instance takes

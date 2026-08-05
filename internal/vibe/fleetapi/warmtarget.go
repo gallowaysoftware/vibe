@@ -85,9 +85,21 @@ func (s *Server) startWarmLoopWithConfig(cfg warmLoopConfig) {
 			Detail:            "watching",
 			RestoreAfterIdleS: t.RestoreAfterIdle.Seconds(),
 		}
+		// A target naming a non-chat class is a permanent configuration
+		// answer, so it gets a status row and no goroutine — loud at
+		// startup rather than at the first tick, and visible in
+		// fleet_status rather than silently missing from it.
+		refused := s.warmClassRefusal(t.Model)
+		if refused != "" {
+			st.State, st.Detail = "skipped", refused
+			slog.Error("warm target refused: the warm verb is a chat completion", "cell", t.Cell, "model", t.Model, "why", refused)
+		}
 		s.mu.Lock()
 		s.warmStates = append(s.warmStates, st)
 		s.mu.Unlock()
+		if refused != "" {
+			continue
+		}
 		s.wg.Add(1)
 		go s.warmTargetLoop(t, st, cfg)
 	}
@@ -316,13 +328,17 @@ func (s *Server) warmCtx(d time.Duration) (context.Context, context.CancelFunc) 
 // state stays "waiting" either way, because a QUEUED warm has not
 // restored anything yet and LastRestore must not claim it did.
 func (s *Server) restore(t WarmTarget, st *warmTargetState, cfg warmLoopConfig, why string) {
+	if refused := s.warmClassRefusal(t.Model); refused != "" {
+		s.setWarmState(st, "skipped", refused)
+		return
+	}
 	ctx, cancel := s.warmCtx(warmTimeout)
 	defer cancel()
 	var err error
 	if s.frontCanRoute(t.Cell) {
 		err = cfg.warmFn(ctx, cfg.frontURL, t.Model)
 	} else {
-		err = fmt.Errorf("cell %q has no front route (announce-only)", t.Cell)
+		err = noFrontRoute(t.Cell)
 	}
 	if err != nil {
 		note, qerr := s.queueWarm(t.Cell, t.Model, err)
@@ -368,6 +384,30 @@ func (s *Server) cellURL(name string) string {
 		}
 	}
 	return ""
+}
+
+// warmClassRefusal reports why an automated warm must not fire at model,
+// or "" when it may. Every warm this package issues is `warmViaFront` —
+// a CHAT completion — and hosts.yaml's model_classes is the operator's
+// declaration that an id is not a chat model.
+//
+// It is checked at BOTH ends of every producer, which is the shape this
+// repo keeps getting wrong from the other side. `warm_model` has refused
+// these since C1; the warm-target restore, the warm schedule and C14's
+// post-wake warms did not, so the guard held on the verb an operator
+// types by hand and on none of the three that run at 06:30 — the lab
+// watched a `warm_schedule` land five chat completions on an embed-class
+// id (all HTTP 500, all JIT-loading the model onto a GPU for nothing,
+// all recorded as err_req in an append-only ledger) seconds after the
+// same fleetd refused `warm_model` for that exact id.
+//
+// Wiring-time refusal is not redundant with fire-time refusal: a refused
+// entry that never gets a goroutine is inert, but only a status row makes
+// it VISIBLE, and C4's rule is that a silently absent target is worse
+// than a clamped one. Fire time is what makes the rule hold for any
+// producer that reaches the loops another way.
+func (s *Server) warmClassRefusal(model string) string {
+	return s.hosts.WarmClassRefusal(model)
 }
 
 // warmViaFront is the default warm: a 1-token chat completion through
@@ -446,6 +486,16 @@ func definitiveWarmRefusal(err error) bool {
 // On success it returns the status note; on failure an error naming
 // BOTH the original cause and why the piggyback was unavailable.
 func (s *Server) queueWarm(cell, model string, cause error) (string, error) {
+	// The piggyback is the same actuation by another channel, and the
+	// cell executes the verb with no idea what class the model is (C11's
+	// dropHeldWarmsLocked exists for the same reason). A refusal that
+	// only held on the front's route would be a guard the queue walks
+	// around one heartbeat later — which is exactly what the live gate
+	// saw: the front answered the embed warm with a 500, and a 500 is a
+	// DELIVERY failure, so the refused warm was queued for the cell.
+	if refused := s.warmClassRefusal(model); refused != "" {
+		return "", errors.New(refused)
+	}
 	if cell == "" {
 		return "", fmt.Errorf("%w (piggyback unavailable: no cell resolved for %s)", cause, model)
 	}
@@ -461,13 +511,27 @@ func (s *Server) queueWarm(cell, model string, cause error) (string, error) {
 }
 
 // frontCanRoute reports whether the front could route a warm to this
-// cell at all. The front's peer config is rendered from hosts.yaml
-// (render_loop.go), so a cell fleetd knows only through its announces
-// has no front route — the warm-loop analog of fleetmcp's "cell has no
-// daemon_url", and the case the piggyback queue exists for. Sending the
-// warm anyway would earn a definitive 404 from the front and, by the
-// rule above, correctly refuse the queue for the one cell that needs it.
+// cell at all. The front's peer config is rendered from the registry
+// (render_loop.go), and every registry cell carries a url — hosts.yaml
+// requires one — so a cell with no url here is a cell that is not in the
+// registry. Sending the warm anyway would earn a definitive 404 from the
+// front and, by the rule above, correctly refuse the queue.
 func (s *Server) frontCanRoute(cell string) bool { return s.cellURL(cell) != "" }
+
+// noFrontRoute names what the missing route actually IS.
+//
+// It used to say "(announce-only)", describing a cell fleetd knew only
+// through its announces — a state that cannot exist. hosts.yaml is the
+// single source of cell membership, and POST /api/fleet/announce refuses
+// a cell absent from it (announce.go), so nothing can announce itself
+// into the registry. What reaches here is a warm target, a backend def's
+// `cell:` or a sleep entry naming a box hosts.yaml has never heard of,
+// and "announce-only" sent the operator looking for a dead announcer
+// instead of a missing registry entry — which the piggyback attempt that
+// follows then confirmed with "has never announced".
+func noFrontRoute(cell string) error {
+	return fmt.Errorf("cell %q is not in fleetd's cell registry (hosts.yaml), so the front has no peer entry to route a warm through", cell)
+}
 
 // warmStatus is the fleet_status surface for the warm loops.
 type warmStatus struct {

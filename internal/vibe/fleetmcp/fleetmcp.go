@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -688,11 +689,10 @@ func (s *Server) toolWarmModel(ctx context.Context, model string) (string, error
 	// The guard exists to refuse firing a CHAT completion at an
 	// embed/rerank id. A chat-class entry documents ownership and must
 	// not be caught by it — the old blanket refusal told the caller a
-	// chat model "is not chat".
-	if class, pinned := s.hosts.ModelClasses[model]; pinned && class != fleetcfg.ModelClassChat {
-		return "", fmt.Errorf("%s is %s-class (per hosts.yaml model_classes), not chat: "+
-			"warming it with a chat completion would load it for nothing — its pinned cell's "+
-			"config is what needs fixing", model, class)
+	// chat model "is not chat". The sentence lives in fleetcfg because
+	// the automated warm paths need the identical one.
+	if why := s.hosts.WarmClassRefusal(model); why != "" {
+		return "", errors.New(why)
 	}
 	front, ok := s.hosts.Cells[fleetcfg.FrontCell]
 	if !ok {

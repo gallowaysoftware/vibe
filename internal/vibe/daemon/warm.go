@@ -65,6 +65,13 @@ func (d *Daemon) startWarmLoops(cfg Config, hosts *fleetcfg.File) {
 			if len(knownModels) > 0 && !knownModels[wt.Model] {
 				slog.Warn("warm target names a model with no backend def (front-only alias?)", "cell", wt.Cell, "model", wt.Model)
 			}
+			// Named at STARTUP, not at the first tick. The entry is still
+			// handed to fleetapi, which refuses it at wiring and carries the
+			// refusal in fleet_status's warm block — a dropped entry would
+			// be invisible on the one screen an operator reads.
+			if why := hosts.WarmClassRefusal(wt.Model); why != "" {
+				slog.Error("warm target names a model hosts.yaml pins to a non-chat class; it will not be warmed", "cell", wt.Cell, "model", wt.Model, "why", why)
+			}
 			targets = append(targets, fleetapi.WarmTarget{Cell: wt.Cell, Model: wt.Model, RestoreAfterIdle: dur})
 		}
 		d.fleet.StartWarmLoop(targets, front.URL)
@@ -92,6 +99,9 @@ func (d *Daemon) startWarmLoops(cfg Config, hosts *fleetcfg.File) {
 			if e.Cron == "" || e.Model == "" {
 				slog.Warn("warm_schedule entry needs cron + model; skipped", "entry", fmt.Sprintf("%+v", e))
 				continue
+			}
+			if why := hosts.WarmClassRefusal(e.Model); why != "" {
+				slog.Error("warm_schedule names a model hosts.yaml pins to a non-chat class; it will not fire", "cron", e.Cron, "model", e.Model, "why", why)
 			}
 			entries = append(entries, fleetapi.WarmScheduleEntry{Cron: e.Cron, Model: e.Model})
 		}

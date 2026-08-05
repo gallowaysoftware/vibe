@@ -141,6 +141,14 @@ func sleepEntries(cfg Config, hosts *fleetcfg.File) []fleetapi.SleepScheduleEntr
 			if len(knownModels) > 0 && !knownModels[m] {
 				slog.Warn("sleep_schedule warm names a model with no backend def (front-only alias?)", "cell", e.Cell, "model", m)
 			}
+			// Dropped here rather than refused at the fire, because unlike
+			// the two warm loops this list has no per-model status row: a
+			// note that appears once at 07:15 inside the wake's detail
+			// string is not a place a misconfiguration is found.
+			if why := hosts.WarmClassRefusal(m); why != "" {
+				slog.Error("sleep_schedule warm names a model hosts.yaml pins to a non-chat class; dropped", "cell", e.Cell, "model", m, "why", why)
+				continue
+			}
 			entry.Warm = append(entry.Warm, m)
 		}
 		claimed[e.Cell] = true

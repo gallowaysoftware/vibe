@@ -131,13 +131,20 @@ func TestWarmTargetNeverAnnouncedCellIsNotQueued(t *testing.T) {
 	}
 }
 
-// TestWarmTargetAnnounceOnlyCellSkipsTheFront is the "no daemon_url"
-// analog for the warm loops. The front's peers are rendered from
-// hosts.yaml, so a cell fleetd knows only through its announces has no
-// front route at all; warming through the front would earn a definitive
-// 404 and — correctly, by the rule above — refuse the queue for the one
-// cell the queue exists for.
-func TestWarmTargetAnnounceOnlyCellSkipsTheFront(t *testing.T) {
+// TestWarmTargetUnregisteredCellSkipsTheFrontAndNamesTheRegistry.
+//
+// This test was called …AnnounceOnlyCell… and described "a cell fleetd
+// knows only through its announces", which is a state fleetd forbids:
+// POST /api/fleet/announce refuses a cell absent from hosts.yaml, and
+// hosts.yaml requires a url on every cell it does carry. The fixture
+// below — presence for a cell the server has no registry entry for —
+// therefore models a MISCONFIGURATION, and the one that reaches this
+// branch in production is a backend def's `cell:` (or a sleep entry)
+// naming a box hosts.yaml has never heard of. The behaviour is
+// unchanged and still right: no front warm, and the piggyback attempt
+// follows. What changed is that the reason names the registry instead of
+// sending the operator to look for a dead announcer.
+func TestWarmTargetUnregisteredCellSkipsTheFrontAndNamesTheRegistry(t *testing.T) {
 	probe := &warmProbe{}
 	s := newWarmServer(t, nil)
 	presenceOf(s, "roamer", AnnounceModel{ID: "default-model", State: "stopped"})
@@ -153,6 +160,46 @@ func TestWarmTargetAnnounceOnlyCellSkipsTheFront(t *testing.T) {
 	cmds := queuedFor(s, "roamer")
 	if len(cmds) != 1 || cmds[0].Verb != "warm" || cmds[0].Model != "default-model" {
 		t.Fatalf("commands = %+v, want the piggybacked warm", cmds)
+	}
+	d := warmStateOf(s, st).Detail
+	if !strings.Contains(d, "registry") || !strings.Contains(d, "hosts.yaml") {
+		t.Errorf("detail = %q, want the missing hosts.yaml entry named — the cell cannot be announce-only, "+
+			"because an announce from a cell absent from the registry is refused", d)
+	}
+	if strings.Contains(d, "announce-only") {
+		t.Errorf("detail = %q still calls it announce-only, a state POST /api/fleet/announce forbids", d)
+	}
+}
+
+// TestAnnounce_UnknownCellIsRefusedAndLeavesNoTrace is the other half of
+// the same decision, and the reason the doc rather than the code was
+// wrong: a cell absent from hosts.yaml cannot announce itself into the
+// registry, so "announce-only membership" has never been reachable.
+// Loosening it would make an announce a fleet-wide write from an
+// unauthenticated name (design §6 — the fleet token authenticates the
+// connection, never the cell it claims to be).
+func TestAnnounce_UnknownCellIsRefusedAndLeavesNoTrace(t *testing.T) {
+	s := newWarmServer(t, nil)
+	rec := httptest.NewRecorder()
+	body := `{"v":1,"cell":"stranger","seq":1,"interval_s":15,` +
+		`"intent":{"state":"serving","since":"2026-08-05T00:00:00Z"},` +
+		`"models":[{"id":"default-model","state":"ready"}]}`
+	s.handleAnnounce(rec, httptest.NewRequest(http.MethodPost, "/api/fleet/announce", strings.NewReader(body)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("announce from a cell absent from hosts.yaml: HTTP %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "not in the registry") {
+		t.Errorf("body = %q, want the registry named", rec.Body.String())
+	}
+	if p := s.PresenceFor("stranger"); p != nil {
+		t.Errorf("a refused announce created presence: %+v", p)
+	}
+	// And the refusal is what keeps the warm loops' registry lookup
+	// meaningful: nothing can arrive at frontCanRoute having announced
+	// itself into existence.
+	if s.frontCanRoute("stranger") {
+		t.Error("frontCanRoute is true for a cell that is not in the registry")
 	}
 }
 

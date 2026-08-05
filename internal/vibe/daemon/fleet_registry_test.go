@@ -220,6 +220,11 @@ cells:
 		{http.MethodGet, "/ui/fleet/"},
 		{http.MethodGet, "/ui/fleet/../api/fleet/state"},
 		{http.MethodGet, "/ui/fleet%2f"},
+		// %66 is f. The middleware matches on the ESCAPED path, so an
+		// encoded spelling of the one public route is a different string
+		// and therefore a miss — see daemon/authpath_test.go, which pins
+		// the whole family and asserts why it mattered.
+		{http.MethodGet, "/ui/%66leet"},
 		{http.MethodGet, "//ui/fleet"},
 		// C7b's savings screen is a hash-routed VIEW inside the one page,
 		// so this is not a route at all — and if someone ever makes it

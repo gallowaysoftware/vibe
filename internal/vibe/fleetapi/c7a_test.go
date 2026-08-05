@@ -373,7 +373,10 @@ func TestNoTruncateBasedDayBucketing(t *testing.T) {
 			return err
 		}
 		if d.IsDir() {
-			if name := d.Name(); path != root && (name == ".git" || name == "dist" || name == "node_modules") {
+			// `.claude` holds git worktrees of this same repo (AGENTS.md's
+			// "never git add ." note), so a walk that descends into it
+			// reports a sibling checkout's files as findings in this one.
+			if name := d.Name(); path != root && (name == ".git" || name == ".claude" || name == "dist" || name == "node_modules") {
 				return filepath.SkipDir
 			}
 			return nil

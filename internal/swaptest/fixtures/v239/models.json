@@ -1,0 +1,117 @@
+{
+  "data": [
+    {
+      "id": "claude-opus-4-8",
+      "object": "model",
+      "created": 1785937730,
+      "owned_by": "llama-swap",
+      "name": "anthropic: claude-opus-4-8",
+      "meta": {
+        "llamaswap": {
+          "peerID": "anthropic"
+        }
+      },
+      "status": {
+        "value": "unloaded"
+      }
+    },
+    {
+      "id": "claude-sonnet-5",
+      "object": "model",
+      "created": 1785937730,
+      "owned_by": "llama-swap",
+      "name": "anthropic: claude-sonnet-5",
+      "meta": {
+        "llamaswap": {
+          "peerID": "anthropic"
+        }
+      },
+      "status": {
+        "value": "unloaded"
+      }
+    },
+    {
+      "id": "comfyui",
+      "object": "model",
+      "created": 1785937730,
+      "owned_by": "llama-swap",
+      "status": {
+        "value": "unloaded"
+      }
+    },
+    {
+      "id": "gemma-4-31b",
+      "object": "model",
+      "created": 1785937730,
+      "owned_by": "llama-swap",
+      "status": {
+        "value": "unloaded"
+      }
+    },
+    {
+      "id": "gemma-4-31b-it",
+      "object": "model",
+      "created": 1785937730,
+      "owned_by": "llama-swap",
+      "status": {
+        "value": "unloaded"
+      }
+    },
+    {
+      "id": "gemma-4-31b-mm",
+      "object": "model",
+      "created": 1785937730,
+      "owned_by": "llama-swap",
+      "status": {
+        "value": "unloaded"
+      }
+    },
+    {
+      "id": "gemma-4-31b-tools",
+      "object": "model",
+      "created": 1785937730,
+      "owned_by": "llama-swap",
+      "status": {
+        "value": "unloaded"
+      }
+    },
+    {
+      "id": "qwen2.5-coder-7b",
+      "object": "model",
+      "created": 1785937730,
+      "owned_by": "llama-swap",
+      "status": {
+        "value": "unloaded"
+      }
+    },
+    {
+      "id": "qwen3.6-27b",
+      "object": "model",
+      "created": 1785937730,
+      "owned_by": "llama-swap",
+      "status": {
+        "value": "loaded"
+      }
+    },
+    {
+      "id": "qwen3.6-27b-mtp-q6_k",
+      "object": "model",
+      "created": 1785937730,
+      "owned_by": "llama-swap",
+      "status": {
+        "value": "loaded"
+      }
+    },
+    {
+      "id": "qwen3.6-27b-tools",
+      "object": "model",
+      "created": 1785937730,
+      "owned_by": "llama-swap",
+      "status": {
+        "value": "unloaded"
+      }
+    }
+  ],
+  "object": "list"
+}
+

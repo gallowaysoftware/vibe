@@ -23,3 +23,6 @@ vendor/
 
 # Agent worktrees
 .claude/
+
+# Upstream binaries fetched by the conformance CI job / a local conformance run.
+.upstream/

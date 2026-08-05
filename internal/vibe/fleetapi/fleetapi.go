@@ -272,6 +272,16 @@ type Server struct {
 	// callers must not invent a count for a cell that never reported.
 	inFlight     map[string]int
 	inFlightSeen map[string]bool
+	// inFlightReqs is the live request SET per cell (request id -> model).
+	// A set rather than a count because v240+ sends DELTAS: an upsert
+	// names one request and a remove names only an id, so folding them
+	// requires remembering what is open — and remembering the model per id
+	// is what lets a remove still stamp a completion.
+	inFlightReqs map[string]map[string]string
+	// inFlightUnknownOp records the last unrecognised inflight `operation`
+	// per cell. It de-duplicates the warning and gives the activity block
+	// a truthful reason: "seen but not understood" is not "never seen".
+	inFlightUnknownOp map[string]string
 	// modelActivity records per-model last-request timestamps from the
 	// same frames (key cell+"\x00"+model), fleetd-side clock. The warm
 	// targets' idle windows key off these.
@@ -419,6 +429,8 @@ func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Op
 		startedAt:          map[string]time.Time{},
 		inFlight:           map[string]int{},
 		inFlightSeen:       map[string]bool{},
+		inFlightReqs:       map[string]map[string]string{},
+		inFlightUnknownOp:  map[string]string{},
 		modelActivity:      map[string]time.Time{},
 		lastInFlightModels: map[string][]string{},
 		lastInFlightFrame:  map[string]time.Time{},
