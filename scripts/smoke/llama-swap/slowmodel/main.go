@@ -95,6 +95,29 @@ func (s *server) countTokens(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"input_tokens": 8})
 }
 
+// timings is llama.cpp's own block, and llama-swap parses it — not the
+// OpenAI `usage` object — to populate an activity row's token counts on
+// chat-family paths. Without it this rig drives the REAL llama-swap and
+// every row it logs comes back unmeasured, so C7a's whole chat basis
+// (`input_tokens` is timings.prompt_n, which is CACHE-MISS ONLY) is
+// exercised by nothing here.
+//
+// cache_n is deliberately non-zero: billable input is input + max(cache,0)
+// on this basis, and a rig that always reports a cold prompt never
+// exercises the addition.
+func timings(n int) map[string]any {
+	const promptN, cacheN = 8, 3
+	return map[string]any{
+		"prompt_n":             promptN,
+		"prompt_ms":            12.0,
+		"prompt_per_second":    float64(promptN) / 0.012,
+		"predicted_n":          n,
+		"predicted_ms":         float64(n) * 10,
+		"predicted_per_second": 100.0,
+		"cache_n":              cacheN,
+	}
+}
+
 func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var req chatRequest
 	if !s.decode(w, r, &req) {
@@ -109,7 +132,8 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				"index": 0, "finish_reason": "stop",
 				"message": map[string]any{"role": "assistant", "content": fullText(n)},
 			}},
-			"usage": map[string]any{"prompt_tokens": 8, "completion_tokens": n, "total_tokens": 8 + n},
+			"usage":   map[string]any{"prompt_tokens": 8, "completion_tokens": n, "total_tokens": 8 + n},
+			"timings": timings(n),
 		})
 		return
 	}
@@ -134,6 +158,8 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	writeSSEData(w, map[string]any{
 		"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": s.model,
 		"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+		"usage":   map[string]any{"prompt_tokens": 8, "completion_tokens": n, "total_tokens": 8 + n},
+		"timings": timings(n),
 	})
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	fl.Flush()
