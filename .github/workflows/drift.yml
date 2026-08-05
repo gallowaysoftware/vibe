@@ -69,7 +69,9 @@ jobs:
           cp -a /tmp/lcpp/llama-*/. .upstream/
           curl -sSfL -o .upstream/stories260K.gguf "$MODEL_URL"
           chmod +x .upstream/llama-swap .upstream/llama-server
+          export LD_LIBRARY_PATH="$PWD/.upstream"
           .upstream/llama-swap --version
+          .upstream/llama-server --version
       - name: conformance against latest
         env:
           LLAMA_SWAP_BIN: ${{ github.workspace }}/.upstream/llama-swap
