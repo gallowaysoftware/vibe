@@ -1,14 +1,20 @@
 # C15 — the warm credential
 
-Status: **PR OPEN** (2026-08-05), off `feat/c15-warm-auth` branched from
-`main` at `0c275fd`. Three commits: the feature, `fleet.front_extras`
-(the render half — see §5, it is not optional scope), and ground rule 9's
-adversarial self-review commit (two findings, one of them an eighth
-producer living outside fleetd). Every production predicate in the phase
-is **mutation-verified**: 24 reverts, each confirmed to turn a named test
-red and then restored. Unit gates U1–U11 green on a full local inner loop
-(`go build`, `go vet`, `go test -race -timeout 300s ./...` repeated,
-`gofmt -l .` silent, `go mod tidy` clean, `golangci-lint run` 0 issues).
+Status: **PR OPEN** ([#38](https://github.com/gallowaysoftware/vibe/pull/38),
+2026-08-05), off `feat/c15-warm-auth` branched from `main` at `0c275fd`.
+Four commits: the feature, `fleet.front_extras` (the render half — see
+§6, it is not optional scope), ground rule 9's adversarial self-review
+commit (two findings, one of them an eighth producer living outside
+fleetd), and a post-CI fix (the page's credential line, and the AST
+scans off the deprecated `parser.ParseDir`). Every production predicate
+in the phase is **mutation-verified**: 24 reverts, each confirmed to turn
+a named test red and then restored. Unit gates U1–U12 green on a full
+local inner loop (`go build`, `go vet`,
+`go test -race -timeout 300s ./...` repeated, `gofmt -l .` silent,
+`go mod tidy` clean, `golangci-lint run` 0 issues **at CI's v2.12.2** —
+the first push failed CI on a rule the locally-installed v2.0.0 did not
+have, so the local linter was upgraded to match the gate; a stale
+linter is a gate you are not actually running).
 
 **The live gate PASSED on 2026-08-05** against two real llama-swap v239
 processes with `apiKeys` set, a real fleetd, a real announcer and a real
@@ -305,6 +311,17 @@ configurations that are fine (no render mount; no key declared), because
 a permanent WARN on a healthy fleet is how an operator learns to ignore a
 level (C13).
 
+### 6b. The page
+
+A credential-suppressed warm renders as `skipped` like every other skip,
+and the page is the surface an operator watches. The status strip now
+carries `llama-swap credential: <cell> <kind>` — the cell and the KIND,
+not the detail sentence (it names `cells.<name>.swap_key_file`, and the
+state document is guest-readable), and obviously not the key. The
+sentence stays on the token-only surfaces: `fleet_status` and
+`vibe fleet doctor`. No new route, no new fetch — the field rides the
+state document the page already polls (C7b's rule).
+
 ### 7. The eighth producer
 
 `cli.probeCellDirect` backs two surfaces, both reached exactly when
@@ -372,6 +389,7 @@ see [For the reconciliation pass](#for-the-reconciliation-pass).
 | `internal/vibe/daemon/doctor.go` | `FrontExtras` into `DoctorHost` |
 | `internal/vibe/cli/cmd_cell.go` | `probeCellDirect` authenticates; `auth?` state |
 | `internal/vibe/cli/cmd_fleet_doctor.go` | `cell.direct` distinguishes refused-credential from no-answer |
+| `internal/vibe/fleetapi/fleet.html` | one status-strip line: cell + failure kind, no sentence, no key |
 | `scripts/fleetlab/gate-c15-warm-auth.sh` | **new** — the live gate rig |
 
 `internal/vibe/proxy` diff: **empty**. `go.mod`/`go.sum`: **byte-identical**.
@@ -393,6 +411,7 @@ see [For the reconciliation pass](#for-the-reconciliation-pass).
 | U9 | The key value appears in no state document, no doctor report and no error string — and the diagnosis is still useful | PASS |
 | U10 | Every `http.NewRequest*` in `fleetapi` and in `fleetmcp` calls the authorizer (AST scan; fails on an empty scan) | PASS |
 | U11 | `swap.credential` is FAIL / FAIL / FAIL / OK / OK / UNKNOWN across the six configurations; `front.extras` FAILs exactly on the erase-the-key trap; the render is given the extras path | PASS |
+| U12 | The fleet page renders the cell and the failure KIND, and NOT the detail sentence (which names the config path) | PASS |
 
 Plus 24 mutation checks — each production predicate reverted, a named
 test confirmed red, the line restored. The two that mattered most:
@@ -601,6 +620,10 @@ A new bullet in the fleet-control section, after C14's:
 >     the renderer emits no `apiKeys`, so without the extras merge fleetd
 >     deletes the key it was just given. Doctor's `front.extras` FAILs on
 >     exactly that combination.
+>   - **The page carries the KIND, not the sentence** (`fleet.html`'s
+>     status strip): the detail names `cells.<name>.swap_key_file` and the
+>     state document is guest-readable, so the sentence stays on
+>     `fleet_status` and doctor. No new route — C7b's rule.
 >   - **The cell-side dialers are NOT covered** (fleetannounce,
 >     modelprobe, the cell's own usagemeter): different config surface.
 >     The hazard to know: `announceOnce` maps a `gatherModels` failure to
