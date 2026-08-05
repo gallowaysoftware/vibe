@@ -354,6 +354,16 @@ function render(st) {
   if (st.probe && (st.probe.degraded || []).length) {
     bits.push("degraded: " + st.probe.degraded.join(" · "));
   }
+  // C15. A cell whose llama-swap is refusing fleetd's credential shows a
+  // warm row that says "skipped" like any other skip, and this is the
+  // surface someone actually watches — so the KIND and the cell go here.
+  // The key itself appears nowhere on this page, and neither does the
+  // path: the sentence naming the config lives in fleet_status and in
+  // `vibe fleet doctor`.
+  if (st.swap_auth && (st.swap_auth.cells || []).length) {
+    bits.push("llama-swap credential: " + st.swap_auth.cells.map(c =>
+      `${c.cell} ${c.kind}`).join(" · "));
+  }
   if (st.probe && (st.probe.targets || []).length) {
     bits.push("probes: " + st.probe.targets.map(t =>
       `${t.model}@${t.cell} ${t.state}`).join(" · "));

@@ -159,45 +159,50 @@ func TestUnloadModelUnresolvableKeyIsNotQueued(t *testing.T) {
 // HTTP request this package builds goes to a cell's llama-swap, so every
 // builder must call the one authorizer.
 func TestEveryLlamaSwapRequestIsAuthorized(t *testing.T) {
-	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, 0)
+	// ParseFile per source file rather than the deprecated parser.ParseDir.
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("parse: %v", err)
+		t.Fatalf("read dir: %v", err)
 	}
+	fset := token.NewFileSet()
 	found := 0
-	for _, pkg := range pkgs {
-		for path, file := range pkg.Files {
-			ast.Inspect(file, func(n ast.Node) bool {
-				fn, ok := n.(*ast.FuncDecl)
-				if !ok || fn.Body == nil {
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			fn, ok := n.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				return true
+			}
+			builds, authorizes := false, false
+			ast.Inspect(fn.Body, func(m ast.Node) bool {
+				sel, ok := m.(*ast.SelectorExpr)
+				if !ok {
 					return true
 				}
-				builds, authorizes := false, false
-				ast.Inspect(fn.Body, func(m ast.Node) bool {
-					sel, ok := m.(*ast.SelectorExpr)
-					if !ok {
-						return true
-					}
-					switch sel.Sel.Name {
-					case "NewRequestWithContext", "NewRequest":
-						builds = true
-					case "AuthorizeSwap":
-						authorizes = true
-					}
-					return true
-				})
-				if builds {
-					found++
-					if !authorizes {
-						t.Errorf("%s: %s builds an HTTP request to a llama-swap without calling AuthorizeSwap (C15)",
-							filepath.Base(path), fn.Name.Name)
-					}
+				switch sel.Sel.Name {
+				case "NewRequestWithContext", "NewRequest":
+					builds = true
+				case "AuthorizeSwap":
+					authorizes = true
 				}
 				return true
 			})
-		}
+			if builds {
+				found++
+				if !authorizes {
+					t.Errorf("%s: %s builds an HTTP request to a llama-swap without calling AuthorizeSwap (C15)",
+						name, fn.Name.Name)
+				}
+			}
+			return true
+		})
 	}
 	if found == 0 {
 		t.Fatal("no request builders found — the scan is inert")

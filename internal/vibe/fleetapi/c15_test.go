@@ -518,46 +518,53 @@ func TestEveryLlamaSwapRequestIsAuthorized(t *testing.T) {
 
 func assertRequestsAuthorized(t *testing.T, dir, authorizer string) {
 	t.Helper()
-	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, dir, func(fi os.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, 0)
+	// ParseFile per source file rather than parser.ParseDir: the latter is
+	// deprecated as of Go 1.25, and this scan wants every non-test .go file
+	// in the directory regardless of package association anyway.
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.Fatalf("parse %s: %v", dir, err)
+		t.Fatalf("read %s: %v", dir, err)
 	}
+	fset := token.NewFileSet()
 	found := 0
-	for _, pkg := range pkgs {
-		for path, file := range pkg.Files {
-			ast.Inspect(file, func(n ast.Node) bool {
-				fn, ok := n.(*ast.FuncDecl)
-				if !ok || fn.Body == nil {
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			fn, ok := n.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				return true
+			}
+			builds, authorizes := false, false
+			ast.Inspect(fn.Body, func(m ast.Node) bool {
+				sel, ok := m.(*ast.SelectorExpr)
+				if !ok {
 					return true
 				}
-				builds, authorizes := false, false
-				ast.Inspect(fn.Body, func(m ast.Node) bool {
-					sel, ok := m.(*ast.SelectorExpr)
-					if !ok {
-						return true
-					}
-					switch sel.Sel.Name {
-					case "NewRequestWithContext", "NewRequest":
-						builds = true
-					case authorizer:
-						authorizes = true
-					}
-					return true
-				})
-				if builds {
-					found++
-					if !authorizes {
-						t.Errorf("%s: %s builds an HTTP request to a llama-swap without calling %s — "+
-							"every fleetd→llama-swap call carries the cell's credential (C15)",
-							filepath.Base(path), fn.Name.Name, authorizer)
-					}
+				switch sel.Sel.Name {
+				case "NewRequestWithContext", "NewRequest":
+					builds = true
+				case authorizer:
+					authorizes = true
 				}
 				return true
 			})
-		}
+			if builds {
+				found++
+				if !authorizes {
+					t.Errorf("%s: %s builds an HTTP request to a llama-swap without calling %s — "+
+						"every fleetd→llama-swap call carries the cell's credential (C15)",
+						name, fn.Name.Name, authorizer)
+				}
+			}
+			return true
+		})
 	}
 	if found == 0 {
 		t.Fatalf("no request builders found in %s — the scan is inert and would pass on an empty package", dir)
@@ -687,5 +694,27 @@ func TestDoctorFrontExtras(t *testing.T) {
 				t.Fatalf("level = %s (%s), want %s", got.Level, got.Summary, tc.want)
 			}
 		})
+	}
+}
+
+// ── U11: the page says a credential failure out loud ────────────────────
+
+// TestFleetPageShowsTheCredentialFailure: a suppressed warm renders as
+// "skipped" like every other skip, and the page is the surface an
+// operator actually watches. The KIND and the cell belong there; the key
+// and the file path do not (C12's rule that everything on the state
+// document is guest-visible).
+func TestFleetPageShowsTheCredentialFailure(t *testing.T) {
+	page := fleetPageSource(t)
+	for _, want := range []string{"st.swap_auth", "llama-swap credential"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("fleet.html does not render %q — a fleet whose warms stopped says nothing on the page", want)
+		}
+	}
+	// The page carries the KIND, not the sentence: the detail names
+	// `cells.<name>.swap_key_file`, which is house configuration on a
+	// surface anyone with the URL can read.
+	if strings.Contains(page, "swap_auth") && strings.Contains(page, "c.detail") {
+		t.Error("fleet.html renders the swap_auth detail sentence; the page gets the kind, fleet_status and doctor get the sentence")
 	}
 }
