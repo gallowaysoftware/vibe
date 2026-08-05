@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -246,8 +248,16 @@ func (s *Server) checkFleetd(rep *DoctorReport, snap StateSnapshot, host DoctorH
 			Detail:  "the daemon did not supply its state directory, so free space and existence are unchecked."})
 	default:
 		if _, err := os.Stat(dir); err != nil {
+			// "missing" is a claim, not a synonym for "stat failed": a
+			// permission or I/O error on a directory that exists has a
+			// different fix, and a doctor that names the wrong one sends an
+			// operator to remount a volume that is already there.
+			sum := "state dir missing: " + dir
+			if !errors.Is(err, fs.ErrNotExist) {
+				sum = "state dir unreadable: " + dir + " (" + err.Error() + ")"
+			}
 			rep.Add(DoctorCheck{ID: "fleetd.state_dir", Level: LevelFail,
-				Summary: "state dir missing: " + dir,
+				Summary: sum,
 				Detail: "intent.json, leases.json and usage.jsonl live here. A failed persist leaves fleetd's memory " +
 					"holding a resolution the file does not carry (C6).",
 				Fix: "check the state volume mount (deploy/fleetd's state contract)."})
@@ -512,6 +522,16 @@ func (s *Server) checkVersions(rep *DoctorReport, snap StateSnapshot, pres map[s
 				Detail: "def-SHA parity and the version matrix cannot include this cell. `vibe fleet announce` sent no " +
 					"versions block before C13.",
 				Fix: "upgrade this cell's vibe build."})
+		case p.Versions.DefsSHA == "":
+			// A block that names a vibe build but no defs_sha is exactly the
+			// evidence gap §5 exists to assert BEFORE parity: this cell can
+			// neither agree nor disagree, and scoring it OK because SOMETHING
+			// arrived is the absent-evidence mistake one field over.
+			rep.Add(DoctorCheck{ID: "versions.reported", Cell: c.Name, Level: LevelUnknown,
+				Summary: "versions block carries no defs_sha",
+				Detail: "vibe " + orDash(p.Versions.Vibe) + ", but no def checkout SHA, so def-SHA parity cannot include " +
+					"this cell.",
+				Fix: "the cell's backends dir is not a git checkout, or git is not on the announcer's PATH."})
 		default:
 			det := "vibe " + orDash(p.Versions.Vibe) + ", defs " + orDash(p.Versions.DefsSHA)
 			if p.Versions.DefsDirty {
@@ -561,15 +581,23 @@ func (s *Server) checkVersions(rep *DoctorReport, snap StateSnapshot, pres map[s
 		// the string matches is the absent-evidence mistake exactly.
 		dirtyNote = " Uncomparable (working tree dirty): " + strings.Join(dirty, ", ") + "."
 	}
+	// Which cells this verdict does NOT cover belongs on EVERY branch. A
+	// divergence report that lists two SHAs on a four-cell fleet reads as
+	// "and the other two agree with one of these"; the missing cells are
+	// the ones most likely to be the actual problem.
+	absentNote := ""
+	if len(absent) > 0 {
+		absentNote = " Not reporting a SHA: " + strings.Join(absent, ", ") + "."
+	}
 	switch {
 	case len(clean) == 0:
 		rep.Add(DoctorCheck{ID: "defs.parity", Level: LevelUnknown,
 			Summary: "no cell reports a clean defs SHA",
-			Detail:  "nothing to compare." + dirtyNote})
+			Detail:  "nothing to compare." + dirtyNote + absentNote})
 	case len(clean) > 1:
 		rep.Add(DoctorCheck{ID: "defs.parity", Level: LevelWarn,
 			Summary: "cells disagree about the def checkout",
-			Detail:  shaGroups(clean) + dirtyNote,
+			Detail:  shaGroups(clean) + "." + dirtyNote + absentNote,
 			Fix:     "converge the backend-def checkouts; a fingerprint mismatch downstream is this, one level up."})
 	default:
 		var sha string
@@ -582,10 +610,7 @@ func (s *Server) checkVersions(rep *DoctorReport, snap StateSnapshot, pres map[s
 			lvl = LevelWarn
 			det += fmt.Sprintf(" fleetd's own def checkout is at %s — the render it writes comes from a different tree than the cells serve.", host.DefsSHA)
 		}
-		if len(absent) > 0 {
-			det += " Not reporting: " + strings.Join(absent, ", ") + "."
-		}
-		rep.Add(DoctorCheck{ID: "defs.parity", Level: lvl, Summary: "def checkouts agree", Detail: det + dirtyNote})
+		rep.Add(DoctorCheck{ID: "defs.parity", Level: lvl, Summary: "def checkouts agree", Detail: det + dirtyNote + absentNote})
 	}
 
 	// The llama-swap version matrix (futures item 13's canary → gate →
@@ -657,10 +682,24 @@ func (s *Server) checkDisk(rep *DoctorReport, pres map[string]Presence, host Doc
 		if !p.Announcing {
 			continue // auth.inbound already reports the silence
 		}
-		if p.Capacity == nil || p.Capacity.DiskFreeGB == 0 {
+		switch {
+		case p.Capacity == nil:
 			rep.Add(DoctorCheck{ID: "disk.free", Cell: c.Name, Level: LevelUnknown,
-				Summary: "announces carry no disk figure",
-				Detail:  "the cell's capacity block is absent or reports nothing."})
+				Summary: "announces carry no capacity block",
+				Detail:  "nothing on the wire describes this cell's model filesystem."})
+			continue
+		case p.Capacity.DiskFreeGB == 0:
+			// The producer leaves the field at zero when statfs FAILS, and a
+			// genuinely full filesystem also announces zero: the wire cannot
+			// separate them. Unknown is the honest verdict — but the reason
+			// must name both, because "no disk figure" alone reads as "not
+			// reported" and hides the one failure this row exists to catch.
+			rep.Add(DoctorCheck{ID: "disk.free", Cell: c.Name, Level: LevelUnknown,
+				Summary: "announced disk figure is zero",
+				Detail: "a filesystem the announcer could not stat and one with nothing left both announce 0, and the " +
+					"wire does not separate them. Treated as unmeasured rather than as full — a doctor must not invent " +
+					"either reading.",
+				Fix: "check free space on that cell by hand."})
 			continue
 		}
 		lvl := LevelOK
@@ -698,10 +737,20 @@ const tlsDialTimeout = 3 * time.Second
 func (s *Server) checkTLS(ctx context.Context, rep *DoctorReport) {
 	type ep struct{ cell, url string }
 	var eps []ep
-	if s.hosts != nil {
-		if isHTTPS(s.hosts.FleetdURL) {
-			eps = append(eps, ep{"fleetd_url", s.hosts.FleetdURL})
+	seen := map[string]bool{}
+	add := func(cell, raw string) {
+		raw = strings.TrimSpace(raw)
+		if !isHTTPS(raw) || seen[raw] {
+			// One endpoint, one dial: a cell whose url and daemon_url are
+			// the same host answered twice under the same (id, cell) key,
+			// and the second row is a duplicate that also costs a dial.
+			return
 		}
+		seen[raw] = true
+		eps = append(eps, ep{cell, raw})
+	}
+	if s.hosts != nil {
+		add("fleetd_url", s.hosts.FleetdURL)
 		names := make([]string, 0, len(s.hosts.Cells))
 		for n := range s.hosts.Cells {
 			names = append(names, n)
@@ -709,12 +758,8 @@ func (s *Server) checkTLS(ctx context.Context, rep *DoctorReport) {
 		sort.Strings(names)
 		for _, n := range names {
 			c := s.hosts.Cells[n]
-			if isHTTPS(c.URL) {
-				eps = append(eps, ep{n, c.URL})
-			}
-			if isHTTPS(c.DaemonURL) {
-				eps = append(eps, ep{n, c.DaemonURL})
-			}
+			add(n, c.URL)
+			add(n, c.DaemonURL)
 		}
 	}
 	if len(eps) == 0 {
@@ -725,9 +770,29 @@ func (s *Server) checkTLS(ctx context.Context, rep *DoctorReport) {
 			Detail:  "every fleet URL is plain HTTP on the LAN, so there is no certificate to expire."})
 		return
 	}
-	for _, e := range eps {
-		lvl, sum, det := certNotAfter(ctx, e.url)
-		rep.Add(DoctorCheck{ID: "tls.not_after", Cell: e.cell, Level: lvl, Summary: sum, Detail: det})
+	// Dialled in PARALLEL, for REV-1's reason one subsystem over. Each
+	// dial is bounded at tlsDialTimeout and they SHARE the report's
+	// deadline, so run serially a fleet with a few TLS boxes off spends
+	// the whole budget in a queue and every endpoint behind them reports
+	// "TLS dial failed — a host that is off" for a dial that was never
+	// attempted. A diagnostic that invents an observation is worse than a
+	// slow one.
+	type verdict struct {
+		lvl      Level
+		sum, det string
+	}
+	out := make([]verdict, len(eps))
+	var wg sync.WaitGroup
+	for i, e := range eps {
+		wg.Add(1)
+		go func(i int, raw string) {
+			defer wg.Done()
+			out[i].lvl, out[i].sum, out[i].det = certNotAfter(ctx, raw, s.tlsDial)
+		}(i, e.url)
+	}
+	wg.Wait()
+	for i, e := range eps {
+		rep.Add(DoctorCheck{ID: "tls.not_after", Cell: e.cell, Level: out[i].lvl, Summary: out[i].sum, Detail: out[i].det})
 	}
 }
 
@@ -736,10 +801,13 @@ func isHTTPS(raw string) bool {
 	return err == nil && u.Scheme == "https" && u.Host != ""
 }
 
-func certNotAfter(ctx context.Context, raw string) (Level, string, string) {
+func certNotAfter(ctx context.Context, raw string, dialTimeout time.Duration) (Level, string, string) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return LevelUnknown, "unparseable URL: " + raw, ""
+	}
+	if dialTimeout <= 0 {
+		dialTimeout = tlsDialTimeout
 	}
 	host := u.Host
 	if u.Port() == "" {
@@ -750,13 +818,22 @@ func certNotAfter(ctx context.Context, raw string) (Level, string, string) {
 	// not DialWithDialer: the latter ignores the report's context
 	// entirely, so a cancelled request left N dials running.
 	d := &tls.Dialer{
-		NetDialer: &net.Dialer{Timeout: tlsDialTimeout},
+		NetDialer: &net.Dialer{Timeout: dialTimeout},
 		Config:    &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // reads notAfter only; never used to carry data
 	}
-	dctx, cancel := context.WithTimeout(ctx, tlsDialTimeout)
+	dctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 	conn, err := d.DialContext(dctx, "tcp", host)
 	if err != nil {
+		if ctx.Err() != nil {
+			// The REPORT's deadline, not this endpoint's. Saying "a host
+			// that is off" here would be an observation doctor never made:
+			// the budget ran out, possibly before the dial was attempted at
+			// all. Naming the budget is what makes the difference visible.
+			return LevelUnknown, host + ": not reached inside the report's deadline",
+				"the report ran out of time before this endpoint answered, so nothing was learned about it. " +
+					"This row is about the BUDGET, not about the host."
+		}
 		return LevelUnknown, host + ": TLS dial failed", err.Error() +
 			" — a host that is off and a broken TLS listener are indistinguishable from here."
 	}
@@ -881,34 +958,85 @@ const longLeaseRemaining = 24 * time.Hour
 const awayTooLong = 7 * 24 * time.Hour
 
 func (s *Server) checkHygiene(rep *DoctorReport, snap StateSnapshot) {
+	expl := explainedCells(snap)
 	s.checkIntentHygiene(rep, snap)
 	s.checkLeases(rep)
 	s.checkFingerprints(rep)
-	s.checkProbes(rep, snap)
-	s.checkWarm(rep, snap)
-	s.checkUsage(rep, snap)
+	s.checkProbes(rep, snap, expl)
+	s.checkWarm(rep, snap, expl)
+	s.checkUsage(rep, snap, expl)
 	s.checkNotify(rep, snap)
 	s.checkRenderMount(rep)
 }
 
-func (s *Server) checkIntentHygiene(rep *DoctorReport, snap StateSnapshot) {
-	var pending, residue []string
+// explainedCells names, per cell, the reason a policy loop is CORRECT
+// not to be acting on it right now.
+//
+// Without this the report contradicts itself: `leases.age` renders a
+// C11 hold as the operator's own declaration while `warm.policy` calls
+// the resulting skip "the warm policy is not doing what it was declared
+// to do", and a `vibe cell drain` — the most ordinary verb in the
+// control plane — turns two checks yellow for as long as the drain
+// lasts. This repo's rule is that a DECLARED intent explains an absence
+// (C9's alarm suppression) and that the class table decides whether an
+// absent box is news at all: `opportunistic` and `roaming` absence
+// never is.
+//
+// It reads the same StateSnapshot every other surface renders, never a
+// loop's prose — the loops' detail strings are operator text and are
+// free to change.
+func explainedCells(snap StateSnapshot) map[string]string {
+	out := map[string]string{}
 	for _, c := range snap.Cells {
-		if c.IntentPending {
-			age := time.Duration(0)
-			if c.Intent != nil {
-				age = time.Since(c.Intent.Since)
+		switch {
+		// C11's ladder order: drained > held > class-normal absence.
+		case c.Intent != nil && c.Intent.State == "drained":
+			out[c.Name] = "cell drained, declared" + reasonSuffix(c.Intent.Reason)
+		default:
+			for _, l := range c.Leases {
+				if l.Hold {
+					out[c.Name] = "hold in force on " + l.Model + " (" + HoldLeft(l.ExpiresAt) + ")"
+					break
+				}
 			}
-			if age > staleRequestAge || c.Intent == nil {
-				pending = append(pending, c.Name)
+			if _, done := out[c.Name]; done || c.Reachable {
+				continue
 			}
-		}
-		switch c.Display {
-		case DisplayDrainedQ, DisplayInconsistent:
-			residue = append(residue, c.Name+" "+c.Display)
+			switch c.Class {
+			case string(fleetcfg.ClassOpportunistic), string(fleetcfg.ClassRoaming):
+				out[c.Name] = "cell absent, which its " + c.Class + " class expects"
+			}
 		}
 	}
-	if len(pending) == 0 && len(residue) == 0 {
+	return out
+}
+
+func (s *Server) checkIntentHygiene(rep *DoctorReport, snap StateSnapshot) {
+	var pending, undeclared, unreconciled []string
+	for _, c := range snap.Cells {
+		// A request the cell has not answered YET is the normal middle of
+		// every drain: the echo rides the next heartbeat. Only a request
+		// that has outlived the ack window is residue.
+		young := c.IntentPending && c.Intent != nil && time.Since(c.Intent.Since) <= staleRequestAge
+		if c.IntentPending && !young {
+			pending = append(pending, c.Name)
+		}
+		switch c.Display {
+		case DisplayDrainedQ:
+			// The cell stopped with NO entry in the intent store: nothing
+			// declared this, which is the whole point of the "?".
+			undeclared = append(undeclared, c.Name+" "+c.Display)
+		case DisplayInconsistent:
+			// INCONSISTENT is the opposite: the intent IS declared and the
+			// cell is still answering. Calling that "undeclared" was simply
+			// wrong, and flagging it inside the ack window accused the
+			// operator's own drain one second after they typed it.
+			if !young {
+				unreconciled = append(unreconciled, c.Name)
+			}
+		}
+	}
+	if len(pending) == 0 && len(undeclared) == 0 && len(unreconciled) == 0 {
 		rep.Add(DoctorCheck{ID: "intent.hygiene", Level: LevelOK,
 			Summary: "no stuck intent requests and no undeclared stops"})
 		return
@@ -917,9 +1045,13 @@ func (s *Server) checkIntentHygiene(rep *DoctorReport, snap StateSnapshot) {
 	if len(pending) > 0 {
 		det = append(det, "requested but never echoed: "+strings.Join(pending, ", "))
 	}
-	if len(residue) > 0 {
-		det = append(det, "undeclared state: "+strings.Join(residue, ", ")+
+	if len(undeclared) > 0 {
+		det = append(det, "undeclared state: "+strings.Join(undeclared, ", ")+
 			" (reported only — an inferred intent is never acted on, invariant 2)")
+	}
+	if len(unreconciled) > 0 {
+		det = append(det, "declared drained but still answering: "+strings.Join(unreconciled, ", ")+
+			" (INCONSISTENT — evidence outranks the declaration, and nothing acts on either)")
 	}
 	rep.Add(DoctorCheck{ID: "intent.hygiene", Level: LevelWarn,
 		Summary: "the intent axis has residue",
@@ -989,7 +1121,7 @@ func (s *Server) checkFingerprints(rep *DoctorReport) {
 		Fix:     "see defs.parity — a mismatch is usually a def checkout one level up."})
 }
 
-func (s *Server) checkProbes(rep *DoctorReport, snap StateSnapshot) {
+func (s *Server) checkProbes(rep *DoctorReport, snap StateSnapshot, expl map[string]string) {
 	measured := false
 	for _, c := range snap.Cells {
 		for _, m := range c.Models {
@@ -998,50 +1130,81 @@ func (s *Server) checkProbes(rep *DoctorReport, snap StateSnapshot) {
 			}
 		}
 	}
-	var skipped []string
+	// A target skipped RIGHT NOW is not a finding: C8's guard set skips on
+	// in-flight work, an unreported in-flight count, a model that is not
+	// resident and an active lease, so a declared target on a fleet in use
+	// is skipped most of the time by design. What §11 asks for is the
+	// target that has been "skipped for its whole life" — never once asked
+	// — and not for a reason the fleet already declared.
+	var never, transient []string
 	if snap.Probe != nil {
 		for _, t := range snap.Probe.Targets {
-			if t.State == "skipped" {
-				skipped = append(skipped, fmt.Sprintf("%s/%s: %s", t.Cell, t.Model, orDash(t.LastSkip)))
+			if t.State != "skipped" {
+				continue
+			}
+			line := fmt.Sprintf("%s/%s: %s", t.Cell, t.Model, orDash(t.LastSkip))
+			switch {
+			case expl[t.Cell] != "":
+				transient = append(transient, fmt.Sprintf("%s/%s: %s", t.Cell, t.Model, expl[t.Cell]))
+			case t.LastAsk != nil:
+				transient = append(transient, line)
+			default:
+				never = append(never, line)
 			}
 		}
+	}
+	skipNote := ""
+	if len(transient) > 0 {
+		skipNote = " Skipped this pass (asked before, or explained): " + strings.Join(transient, "; ") + "."
 	}
 	switch {
 	case snap.Probe != nil && len(snap.Probe.Degraded) > 0:
 		rep.Add(DoctorCheck{ID: "probe.verdicts", Level: LevelWarn,
 			Summary: "degraded: " + strings.Join(snap.Probe.Degraded, ", "),
-			Detail:  "a model measurably slower than its own baseline. Nothing acts on this verdict; the runbook is human.",
-			Fix:     "probe_model → unload_model → probe_model."})
-	case len(skipped) > 0:
+			Detail: "a model measurably slower than its own baseline. Nothing acts on this verdict; the runbook is human." +
+				skipNote,
+			Fix: "probe_model → unload_model → probe_model."})
+	case len(never) > 0:
 		rep.Add(DoctorCheck{ID: "probe.verdicts", Level: LevelWarn,
-			Summary: "probe targets are being skipped",
-			Detail:  strings.Join(skipped, "; ")})
+			Summary: "probe targets have never once been asked",
+			Detail: strings.Join(never, "; ") + ". A target that has been skipped for its whole life measures nothing, " +
+				"so this fleet's throughput is unproven where it was declared to be watched." + skipNote})
 	case measured:
 		rep.Add(DoctorCheck{ID: "probe.verdicts", Level: LevelOK,
-			Summary: "no model reports degraded throughput"})
+			Summary: "no model reports degraded throughput", Detail: strings.TrimSpace(skipNote)})
 	default:
 		// Absence of a degraded verdict is not evidence of health when
 		// nothing has measured. Friction pain 2 is that llama-server can
 		// rot 10-100x while /health stays green.
 		rep.Add(DoctorCheck{ID: "probe.verdicts", Level: LevelUnknown,
 			Summary: "nothing measures throughput on this fleet",
-			Detail:  "no cell has produced a probe verdict, so 'nothing is slow' is unproven.",
+			Detail:  "no cell has produced a probe verdict, so 'nothing is slow' is unproven." + skipNote,
 			Fix:     "declare probe_targets in fleetd's config, or run probe_model by hand."})
 	}
 }
 
-func (s *Server) checkWarm(rep *DoctorReport, snap StateSnapshot) {
+func (s *Server) checkWarm(rep *DoctorReport, snap StateSnapshot, expl map[string]string) {
 	if snap.Warm == nil {
 		rep.Add(DoctorCheck{ID: "warm.policy", Level: LevelOK,
 			Summary: "no warm targets or schedules configured",
 			Detail:  "nothing is declared, so nothing should happen."})
 		return
 	}
-	var bad []string
+	// A skip the fleet's own DECLARED state explains is the policy
+	// working, not failing: a drained cell, a C11 hold, or an absent
+	// opportunistic/roaming box. Calling those "the warm policy is not
+	// doing what it was declared to do" put this check in direct
+	// contradiction with `leases.age` two rows above it.
+	var bad, explained []string
 	for _, t := range snap.Warm.Targets {
-		if t.State == "skipped" {
-			bad = append(bad, fmt.Sprintf("target %s/%s skipped: %s", t.Cell, t.Model, orDash(t.Detail)))
+		if t.State != "skipped" {
+			continue
 		}
+		if e := expl[t.Cell]; e != "" {
+			explained = append(explained, fmt.Sprintf("target %s/%s skipped: %s", t.Cell, t.Model, e))
+			continue
+		}
+		bad = append(bad, fmt.Sprintf("target %s/%s skipped: %s", t.Cell, t.Model, orDash(t.Detail)))
 	}
 	for _, sc := range snap.Warm.Schedule {
 		if sc.NextFire == nil {
@@ -1049,10 +1212,14 @@ func (s *Server) checkWarm(rep *DoctorReport, snap StateSnapshot) {
 		}
 	}
 	det := scheduleSummary(snap.Warm.Schedule)
+	if len(explained) > 0 {
+		det = strings.TrimSpace("Skipped as declared: " + strings.Join(explained, "; ") + ". " + det)
+	}
 	if len(bad) == 0 {
 		rep.Add(DoctorCheck{ID: "warm.policy", Level: LevelOK,
-			Summary: fmt.Sprintf("%d warm target(s), %d schedule(s), none skipping", len(snap.Warm.Targets), len(snap.Warm.Schedule)),
-			Detail:  det})
+			Summary: fmt.Sprintf("%d warm target(s), %d schedule(s), none skipping unexpectedly",
+				len(snap.Warm.Targets), len(snap.Warm.Schedule)),
+			Detail: det})
 		return
 	}
 	rep.Add(DoctorCheck{ID: "warm.policy", Level: LevelWarn,
@@ -1082,7 +1249,7 @@ func scheduleSummary(entries []warmScheduleState) string {
 // enough that a quiet weekend is not a finding.
 const usageWindowDays = 7
 
-func (s *Server) checkUsage(rep *DoctorReport, snap StateSnapshot) {
+func (s *Server) checkUsage(rep *DoctorReport, snap StateSnapshot, expl map[string]string) {
 	if s.usage == nil {
 		rep.Add(DoctorCheck{ID: "usage.flow", Level: LevelOK,
 			Summary: "usage ledger disabled on this daemon"})
@@ -1102,6 +1269,12 @@ func (s *Server) checkUsage(rep *DoctorReport, snap StateSnapshot) {
 	for _, c := range snap.Cells {
 		if c.Name == fleetcfg.FrontCell {
 			continue // C7a skips the front structurally; it folds no token rows
+		}
+		if expl[c.Name] != "" {
+			// A cell the operator drained or put on hold is SUPPOSED to
+			// serve nothing; billing that silence to a missing `store:`
+			// config is the same accusation warm.policy used to make.
+			continue
 		}
 		p := s.presenceFor(c.Name)
 		if p == nil || !p.Announcing || p.Stale {

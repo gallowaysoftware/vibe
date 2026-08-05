@@ -895,6 +895,31 @@ optional.)
     capacity blocks the daemon does (`daemon.FleetVersions`,
     `daemon.FleetDiskCapacity`) — before C13 the heavy cell reported
     neither.
+  - **A DECLARED suppression is the policy working, and `WARN` is
+    subject to the same "permanent verdict on a healthy fleet" rule as
+    `UNKNOWN`** (the review pass; three checks broke it). `warm.policy`,
+    `probe.verdicts` and `usage.flow` route every skip through
+    `explainedCells`, which derives the reason from the **StateSnapshot**
+    — declared drain → C11 hold → class-normal absence, C11's ladder
+    order — never from a loop's detail prose, and reports an explained
+    skip as OK **with the reason named**. Without it one report called a
+    hold both "active" and "the warm policy not doing what it was
+    declared to do", and `vibe cell drain` turned two checks yellow for
+    its whole duration. A probe skip is a finding only when the target
+    was NEVER asked (`LastAsk == nil`): C8's guard set skips on in-flight
+    work and an unreported in-flight count, so "skipped right now" is
+    what a fleet in USE looks like. `intent.hygiene` gates BOTH buckets
+    on `staleRequestAge` — the window between a drain request and the
+    cell's echo is the normal middle of every drain — and `DRAINED?`
+    (no entry) and `INCONSISTENT` (declared, not yet reconciled) are
+    separate sentences; the second is not "undeclared".
+  - **Every fan-out shares the report's ONE deadline**, so nothing on
+    this path may be serial: the credential probes (self-review REV-1)
+    and the TLS dials (review pass) both shipped serial first, and both
+    produced rows describing endpoints that were never dialled. When
+    `ctx.Err() != nil` a row names the BUDGET, never the host — "a host
+    that is off and a broken TLS listener are indistinguishable" is a
+    claim about a dial that happened.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.

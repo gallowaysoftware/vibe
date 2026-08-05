@@ -200,31 +200,51 @@ func TestDoctor_ReachesNoMutatingVerb(t *testing.T) {
 		"Enqueue":           "sends a notification",
 		"recordAnnounce":    "mutates presence",
 		"noteRenderTrigger": "triggers a render",
+		// The RPC verbs. The daemon half of this path holds a vibeclient,
+		// which is the one place in the whole command where reaching for an
+		// actuation call is a one-line edit — and the behavioural test
+		// cannot see it, because the prober is injected and the fixture
+		// injects a fake.
+		"CellDrain":  "drains a cell",
+		"CellResume": "resumes a cell",
+		"Activate":   "activates a profile",
+		"Deactivate": "stops a profile",
+		"Shutdown":   "stops a daemon",
 	}
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "doctor.go", nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ast.Inspect(file, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
+	// Every file on the doctor path, not just this one. The scan used to
+	// cover fleetapi/doctor.go alone, which is the file LEAST able to
+	// mutate anything off-box.
+	for _, path := range []string{
+		"doctor.go",
+		"../daemon/doctor.go",
+		"../fleetmcp/doctor.go",
+		"../cli/cmd_fleet_doctor.go",
+	} {
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			var name string
+			switch fn := call.Fun.(type) {
+			case *ast.Ident:
+				name = fn.Name
+			case *ast.SelectorExpr:
+				name = fn.Sel.Name
+			}
+			if why, bad := banned[name]; bad {
+				t.Errorf("%s calls %s (%s). Doctor is read-only and safe to run mid-incident; if a check "+
+					"genuinely needs this, the phase doc's §1 promise has to change first.",
+					fset.Position(call.Pos()), name, why)
+			}
 			return true
-		}
-		var name string
-		switch fn := call.Fun.(type) {
-		case *ast.Ident:
-			name = fn.Name
-		case *ast.SelectorExpr:
-			name = fn.Sel.Name
-		}
-		if why, bad := banned[name]; bad {
-			t.Errorf("%s calls %s (%s). Doctor is read-only and safe to run mid-incident; if a check "+
-				"genuinely needs this, the phase doc's §1 promise has to change first.",
-				fset.Position(call.Pos()), name, why)
-		}
-		return true
-	})
+		})
+	}
 }
 
 // TestDoctor_EveryCheckDeclaresALevel: Level's zero value is not a
@@ -861,7 +881,7 @@ func TestDoctor_TLSDialHonoursTheReportContext(t *testing.T) {
 	start := time.Now()
 	// 10.255.255.1 is RFC1918 space that does not answer; without context
 	// support this blocks for the full tlsDialTimeout.
-	lvl, _, _ := certNotAfter(ctx, "https://10.255.255.1:9443")
+	lvl, _, _ := certNotAfter(ctx, "https://10.255.255.1:9443", tlsDialTimeout)
 	if elapsed := time.Since(start); elapsed > tlsDialTimeout/2 {
 		t.Errorf("certNotAfter took %v against a cancelled context; the dial ignores it", elapsed)
 	}
@@ -889,5 +909,347 @@ func TestDoctor_ReportsFleetdsOwnBuild(t *testing.T) {
 		if !strings.Contains(got.Detail, want) {
 			t.Errorf("detail = %q, want it to carry %q", got.Detail, want)
 		}
+	}
+}
+
+// ─── adversarial-review-pass regressions (ground rule 9) ────────────────────
+
+// tlsBlackhole accepts TCP and never speaks TLS, so every dial burns the
+// whole dial timeout — what a powered-down box behind a DROP rule looks
+// like, and the only shape that exposes a serial fan-out.
+func tlsBlackhole(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		var held []net.Conn
+		defer func() {
+			for _, c := range held {
+				c.Close()
+			}
+		}()
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			held = append(held, c)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// TestDoctor_TLSDialsRunInParallel is REV-1 one subsystem over: the
+// credential probes were fanned out and the TLS dials were left serial,
+// sharing the report's single deadline. Ten unreachable https endpoints
+// consumed the whole 20s budget in a queue, and the endpoints behind the
+// queue reported "TLS dial failed — a host that is off" for a dial that
+// was never attempted. A diagnostic that invents an observation is worse
+// than a slow one.
+func TestDoctor_TLSDialsRunInParallel(t *testing.T) {
+	addr := tlsBlackhole(t)
+	const n = 6
+	cells := []Cell{{Name: fleetcfg.FrontCell, URL: "http://127.0.0.1:1"}}
+	hostCells := map[string]fleetcfg.Cell{fleetcfg.FrontCell: {URL: "http://127.0.0.1:1"}}
+	for i := range n {
+		name := fmt.Sprintf("cell-%d", i)
+		cells = append(cells, Cell{Name: name, URL: "http://127.0.0.1:1"})
+		// Distinct hosts (same listener) so the dedupe does not hide the
+		// serial cost this test is about.
+		hostCells[name] = fleetcfg.Cell{URL: "https://" + strings.Replace(addr, "127.0.0.1", "localhost", 1) + "/" + name}
+	}
+	s, _ := doctorServer(t, cells...)
+	s.tlsDial = 300 * time.Millisecond
+	s.hosts = &fleetcfg.File{Cells: hostCells}
+
+	// A budget of three dials for six endpoints: parallel fits, serial
+	// cannot, and the endpoints serial never reached must say so rather
+	// than describe a host.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*s.tlsDial)
+	defer cancel()
+	start := time.Now()
+	rep := s.Doctor(ctx)
+	elapsed := time.Since(start)
+	if elapsed > time.Duration(n-1)*s.tlsDial {
+		t.Errorf("Doctor took %v for %d blackholed TLS endpoints at %v each: the dials are serial", elapsed, n, s.tlsDial)
+	}
+	rows := 0
+	for _, c := range rep.Checks {
+		if c.ID != "tls.not_after" {
+			continue
+		}
+		rows++
+		if c.Level != LevelUnknown {
+			t.Errorf("%s → %s, want unknown", c.Cell, c.Level)
+		}
+		if strings.Contains(c.Summary, "not reached inside the report") {
+			t.Errorf("%s never got a dial: %q. Serially, the endpoints behind the queue are reported without "+
+				"having been observed at all", c.Cell, c.Summary)
+		}
+	}
+	if rows != n {
+		t.Errorf("%d tls rows, want %d", rows, n)
+	}
+}
+
+// TestDoctor_TLSRowNamesTheBudgetWhenTheReportRanOut: "a host that is
+// off and a broken TLS listener are indistinguishable" is a claim about
+// an endpoint doctor actually dialled. When the report's own deadline is
+// what expired, the row must say so — otherwise a slow report reads as
+// a fleet of dead boxes.
+func TestDoctor_TLSRowNamesTheBudgetWhenTheReportRanOut(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	lvl, sum, det := certNotAfter(ctx, "https://10.255.255.1:9443", tlsDialTimeout)
+	if lvl != LevelUnknown {
+		t.Fatalf("level = %s, want unknown", lvl)
+	}
+	if !strings.Contains(sum, "not reached inside the report") || !strings.Contains(det, "BUDGET") {
+		t.Errorf("summary/detail = %q / %q, want the report's budget named rather than the host", sum, det)
+	}
+}
+
+// TestDoctor_TLSDialsEachEndpointOnce: a cell whose url and daemon_url
+// are the same host produced two identical rows under one (id, cell)
+// key, and paid for two handshakes to learn the same fact.
+func TestDoctor_TLSDialsEachEndpointOnce(t *testing.T) {
+	srv := tlsServerExpiring(t, 90*24*time.Hour)
+	s, _ := doctorServer(t)
+	s.hosts = &fleetcfg.File{
+		FleetdURL: srv.URL,
+		Cells:     map[string]fleetcfg.Cell{fleetcfg.FrontCell: {URL: srv.URL, DaemonURL: srv.URL}},
+	}
+	rows := 0
+	for _, c := range s.Doctor(context.Background()).Checks {
+		if c.ID == "tls.not_after" {
+			rows++
+		}
+	}
+	if rows != 1 {
+		t.Errorf("%d tls.not_after rows for one endpoint named three times, want 1", rows)
+	}
+}
+
+// TestDoctor_DeclaredSuppressionIsNotAPolicyFailure. A C11 hold and a
+// drain are the operator's own declarations, and the class table says an
+// absent opportunistic or roaming box is not news. Before this, one
+// report said "1 active lease, none outliving a day — active holds: …"
+// two rows above "the warm policy is not doing what it was declared to
+// do", about the same hold.
+func TestDoctor_DeclaredSuppressionIsNotAPolicyFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		class   string
+		arrange func(t *testing.T, s *Server)
+		wantIn  string
+	}{
+		{"a C11 hold", "always_on", func(t *testing.T, s *Server) {
+			if _, err := s.SetHold("heavy", "qwen", "evaluating", 4*time.Hour); err != nil {
+				t.Fatal(err)
+			}
+		}, "hold in force"},
+		{"a declared drain", "always_on", func(t *testing.T, s *Server) {
+			if _, err := s.SetIntent("heavy", "drained", "gaming", ""); err != nil {
+				t.Fatal(err)
+			}
+			s.mu.Lock()
+			since := s.intents["heavy"].Since
+			s.mu.Unlock()
+			s.recordAnnounce(&AnnounceRequest{V: AnnounceVersion, Cell: "heavy", Seq: 9,
+				Intent: &AnnounceIntent{State: "drained", Since: since}})
+		}, "cell drained, declared"},
+		{"an absent opportunistic box", "opportunistic", func(*testing.T, *Server) {}, "class expects"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := doctorServer(t, Cell{Name: fleetcfg.FrontCell, URL: "http://127.0.0.1:1"},
+				Cell{Name: "heavy", URL: "http://127.0.0.1:1", Class: tc.class})
+			if tc.class == "always_on" {
+				presenceOf(s, "heavy", AnnounceModel{ID: "qwen", State: "ready"})
+			}
+			s.startWarmLoopWithConfig(warmLoopConfig{
+				targets: []WarmTarget{{Cell: "heavy", Model: "qwen", RestoreAfterIdle: time.Hour}},
+				tick:    5 * time.Millisecond,
+				warmFn:  func(context.Context, string, string) error { return nil },
+			})
+			s.startProbeLoopWithTick([]ProbeTarget{{Cell: "heavy", Model: "qwen", Every: time.Hour}}, 5*time.Millisecond)
+			tc.arrange(t, s)
+			waitForCond(t, func() bool {
+				for _, st := range s.warmReport().Targets {
+					if st.State == "skipped" {
+						return true
+					}
+				}
+				return false
+			})
+
+			rep := s.Doctor(context.Background())
+			warm := mustCheck(t, rep, "warm.policy", "")
+			if warm.Level != LevelOK {
+				t.Errorf("warm.policy → %s (%s): a skip the fleet itself declared is the policy working", warm.Level, warm.Detail)
+			}
+			if !strings.Contains(warm.Detail, tc.wantIn) {
+				t.Errorf("warm.policy detail = %q, want the declared reason named (%q) rather than swallowed", warm.Detail, tc.wantIn)
+			}
+			if probe := mustCheck(t, rep, "probe.verdicts", ""); probe.Level == LevelWarn {
+				t.Errorf("probe.verdicts → warn (%s): a guard skip the fleet declared is not a finding", probe.Detail)
+			}
+		})
+	}
+}
+
+func waitForCond(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("condition never held")
+}
+
+// TestDoctor_ProbeSkipIsAFindingOnlyWhenTheTargetWasNeverAsked. C8's
+// guard set skips on in-flight work, an UNREPORTED in-flight count, a
+// model that is not resident and an active lease — so on a fleet in use
+// a declared target is skipped most passes, and "skipped right now" made
+// probe.verdicts a permanent WARN. §11 asks for the target skipped for
+// its whole LIFE.
+func TestDoctor_ProbeSkipIsAFindingOnlyWhenTheTargetWasNeverAsked(t *testing.T) {
+	s, _ := doctorServer(t, Cell{Name: fleetcfg.FrontCell, URL: "http://127.0.0.1:1"},
+		Cell{Name: "heavy", URL: "http://127.0.0.1:1", Class: "always_on"})
+	presenceOf(s, "heavy", AnnounceModel{ID: "qwen", State: "ready"})
+
+	asked := time.Now().Add(-time.Minute)
+	s.mu.Lock()
+	s.probeStates = append(s.probeStates,
+		&probeTargetState{Cell: "heavy", Model: "qwen", State: "skipped",
+			Detail: "cell heavy has 2 in-flight", LastSkip: "cell heavy has 2 in-flight", LastAsk: &asked},
+	)
+	s.mu.Unlock()
+	if got := mustCheck(t, s.Doctor(context.Background()), "probe.verdicts", "").Level; got == LevelWarn {
+		t.Error("a target that has measured before and is skipped because the cell is BUSY is the fleet working")
+	}
+
+	s2, _ := doctorServer(t, Cell{Name: fleetcfg.FrontCell, URL: "http://127.0.0.1:1"},
+		Cell{Name: "heavy", URL: "http://127.0.0.1:1", Class: "always_on"})
+	presenceOf(s2, "heavy", AnnounceModel{ID: "qwen", State: "ready"})
+	s2.mu.Lock()
+	s2.probeStates = append(s2.probeStates,
+		&probeTargetState{Cell: "heavy", Model: "qwen", State: "skipped",
+			Detail: "cell heavy in-flight unknown", LastSkip: "cell heavy in-flight unknown"},
+	)
+	s2.mu.Unlock()
+	got := mustCheck(t, s2.Doctor(context.Background()), "probe.verdicts", "")
+	if got.Level != LevelWarn {
+		t.Fatalf("a target never once asked → %s, want warn: it measures nothing where it was declared to watch", got.Level)
+	}
+	if !strings.Contains(got.Detail, "in-flight unknown") {
+		t.Errorf("detail = %q, want the skip reason carried", got.Detail)
+	}
+}
+
+// TestDoctor_IntentHygieneDoesNotAccuseAFreshDrainRequest: a request the
+// cell has not answered yet is the normal middle of every drain — the
+// echo rides the next heartbeat, and the cell answering while it winds
+// down renders INCONSISTENT by design. Flagging that one second after
+// `vibe cell drain` accused the operator of their own verb; the
+// staleRequestAge gate existed and was applied to the other bucket only.
+func TestDoctor_IntentHygieneDoesNotAccuseAFreshDrainRequest(t *testing.T) {
+	s, _ := doctorServer(t, Cell{Name: fleetcfg.FrontCell, URL: "http://127.0.0.1:1"},
+		Cell{Name: "heavy", URL: "http://127.0.0.1:1", Class: "always_on"})
+	presenceOf(s, "heavy", AnnounceModel{ID: "qwen", State: "ready"})
+	if _, err := s.SetIntent("heavy", "drained", "gaming", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustCheck(t, s.Doctor(context.Background()), "intent.hygiene", ""); got.Level != LevelOK {
+		t.Errorf("a drain requested one second ago → %s (%s), want ok: the echo rides the next heartbeat",
+			got.Level, got.Detail)
+	}
+
+	// Past the ack window the same state IS residue — and it is not
+	// "undeclared": the intent is declared and the cell is ignoring it.
+	s.mu.Lock()
+	in := s.intents["heavy"]
+	in.Since = time.Now().Add(-2 * staleRequestAge)
+	s.intents["heavy"] = in
+	s.mu.Unlock()
+	got := mustCheck(t, s.Doctor(context.Background()), "intent.hygiene", "")
+	if got.Level != LevelWarn {
+		t.Fatalf("a request unacked for %v → %s, want warn", 2*staleRequestAge, got.Level)
+	}
+	if !strings.Contains(got.Detail, "still answering") {
+		t.Errorf("detail = %q, want INCONSISTENT described as declared-but-unreconciled, not as an undeclared stop", got.Detail)
+	}
+}
+
+// TestDoctor_VersionsWithoutADefsSHACannotJoinParity. §5's rule is
+// assert the evidence EXISTS before asserting parity over it: a block
+// carrying a vibe build and no defs_sha scored OK while defs.parity
+// silently dropped that cell from a divergence report.
+func TestDoctor_VersionsWithoutADefsSHACannotJoinParity(t *testing.T) {
+	s := versionFleet(t, map[string]*AnnounceVersions{
+		"a":       {DefsSHA: "abc123", Vibe: "v1"},
+		"b":       {DefsSHA: "def456", Vibe: "v1"},
+		"no-defs": {Vibe: "v1"},
+	})
+	rep := s.Doctor(context.Background())
+	if got := mustCheck(t, rep, "versions.reported", "no-defs"); got.Level != LevelUnknown {
+		t.Errorf("a versions block with no defs_sha → %s, want unknown: it can neither agree nor disagree", got.Level)
+	}
+	parity := mustCheck(t, rep, "defs.parity", "")
+	if parity.Level != LevelWarn {
+		t.Fatalf("divergent SHAs → %s", parity.Level)
+	}
+	if !strings.Contains(parity.Detail, "no-defs") {
+		t.Errorf("detail = %q, want the cell the verdict does NOT cover named — on a divergence report it is the "+
+			"most likely culprit", parity.Detail)
+	}
+}
+
+// TestDoctor_ZeroDiskFigureNamesBothReadings: the producer leaves
+// disk_free_gb at zero when statfs fails, and a genuinely full
+// filesystem announces the same zero. UNKNOWN is right; "the capacity
+// block is absent or reports nothing" was a claim doctor cannot make,
+// and it hid the one failure the row exists to catch.
+func TestDoctor_ZeroDiskFigureNamesBothReadings(t *testing.T) {
+	s, _ := doctorServer(t, Cell{Name: fleetcfg.FrontCell, URL: "http://127.0.0.1:1"},
+		Cell{Name: "heavy", URL: "http://127.0.0.1:1", Class: "always_on"})
+	s.recordAnnounce(&AnnounceRequest{V: AnnounceVersion, Cell: "heavy", Seq: 1,
+		Intent:   &AnnounceIntent{State: "serving", Since: time.Now().UTC()},
+		Capacity: &AnnounceCapacity{VRAMTotalGB: 24}})
+	got := mustCheck(t, s.Doctor(context.Background()), "disk.free", "heavy")
+	if got.Level != LevelUnknown {
+		t.Fatalf("zero disk figure → %s, want unknown", got.Level)
+	}
+	if !strings.Contains(got.Detail, "nothing left") {
+		t.Errorf("detail = %q, want a full filesystem named as the other reading of the same zero", got.Detail)
+	}
+}
+
+// TestDoctor_StateDirUnreadableIsNotReportedAsMissing: "missing" sends
+// an operator to remount a volume that is already mounted.
+func TestDoctor_StateDirUnreadableIsNotReportedAsMissing(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "a-file")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	notADir := filepath.Join(file, "state") // ENOTDIR, not ENOENT
+	s := New([]Cell{{Name: fleetcfg.FrontCell, URL: "http://127.0.0.1:1"}},
+		filepath.Join(dir, "h.json"), testDaemonInfo, Options{
+			IntentPath: filepath.Join(dir, "intent.json"),
+			DoctorHost: func() DoctorHost { return DoctorHost{StateDir: notADir} },
+		})
+	t.Cleanup(s.Close)
+	got := mustCheck(t, s.Doctor(context.Background()), "fleetd.state_dir", "")
+	if got.Level != LevelFail {
+		t.Fatalf("unstattable state dir → %s, want fail", got.Level)
+	}
+	if !strings.Contains(got.Summary, "unreadable") {
+		t.Errorf("summary = %q, want the stat error reported as unreadable rather than as missing", got.Summary)
 	}
 }

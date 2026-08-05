@@ -2,16 +2,20 @@
 
 Status: **PR OPEN** (2026-08-05), off `feat/c13-doctor` branched from
 `feat/c12-guest-token` at `96f793c` (**C12 merges first**). Feature
-commit plus ground rule 9's adversarial self-review commit — five
-findings, three of them ways this command could have MISREPORTED, all
-fixed with mutation-verified regression tests (see the
-[addendum](#adversarial-self-review-addendum)). Unit gates
+commit, ground rule 9's adversarial self-review commit (five findings,
+three of them ways this command could have MISREPORTED — see the
+[self-review addendum](#adversarial-self-review-addendum)), and the
+independent review pass (eight more, six of them the same failure in
+the other direction: a check that cries wolf on a healthy fleet — see
+the [review addendum](#adversarial-review-addendum-2026-08-05-8-findings-all-fixed-with-regression-tests)).
+Every fix in both is mutation-verified. Unit gates
 U1–U16 are green on a full local inner loop (`go build`, `go vet`,
 `go test -race -count=5`, `golangci-lint run` 0 issues, `gofmt -l .`
 silent, `go mod tidy` clean) plus a local end-to-end run of the real
 command against a real fleetd; the four live gates need the real fleet
-and are **NOT RUN** — the implementing environment cannot reach it (SSH
-blocked, the LAN does not route). See [Execution](#execution).
+and are **NOT RUN** — neither the implementing nor the reviewing
+environment can reach it (SSH blocked, the LAN does not route). See
+[Execution](#execution).
 
 Backlog item 7 in [fleet-control-futures.md](../fleet-control-futures.md)
 §2, the first Medium-tier item:
@@ -771,3 +775,132 @@ Two things the pass looked at and deliberately left:
   Deliberate: the JSON keeps emission order (grouped by subject) so two
   runs diff cleanly, and a consumer that wants severity order has the
   level on every check.
+
+## Adversarial-review addendum (2026-08-05, 8 findings, all fixed with regression tests)
+
+Ground rule 9's independent pass over the feature commit *and* the
+self-review commit. Every fix below is mutation-verified: the production
+change was reverted and the named test watched to FAIL, then restored.
+
+One theme runs through six of the eight, and it is the theme this
+command is most exposed to: **a diagnostic that cries wolf is a
+diagnostic nobody reads.** The phase doc argues this for `UNKNOWN` (§2:
+"a permanent UNKNOWN on a healthy fleet teaches the operator to ignore
+the level") and then shipped four checks that emit a permanent `WARN` on
+a healthy fleet — including two that contradict a declaration the
+operator made with this same control plane.
+
+- **The TLS dials were serial and shared the report's one deadline
+  (MAJOR — the report described dials it never made).** This is REV-1
+  verbatim, one subsystem over: the self-review fanned out the outbound
+  credential probes and left `checkTLS` in a queue. Measured, ten
+  blackholed https endpoints at `tlsDialTimeout` each: the report
+  consumed its **entire 20s budget** (20.007s) and the endpoints behind
+  the queue were reported as `TLS dial failed — a host that is off and a
+  broken TLS listener are indistinguishable from here` for a handshake
+  that was never attempted. Fixed by fanning out exactly like
+  `checkAuth`. Two independent pins:
+  `TestDoctor_TLSDialsRunInParallel` (six blackholed endpoints inside a
+  three-dial budget; serial takes 0.90s and reports four unobserved
+  endpoints) and — because "the budget expired" and "the host is off"
+  must never render as the same sentence again —
+  `TestDoctor_TLSRowNamesTheBudgetWhenTheReportRanOut`, which is a real
+  honesty fix in its own right: when `ctx.Err() != nil` the row now says
+  *not reached inside the report's deadline … this row is about the
+  BUDGET, not about the host.*
+- **`warm.policy` accused the operator of their own declaration
+  (MAJOR — a C11 conflict git reports no conflict for).** A skipped warm
+  target rendered as "the warm policy is not doing what it was declared
+  to do" whatever the reason, and C4's reasons include `cell drained`
+  and C11's `held: …`. So one report said, three rows apart, *"1 active
+  lease(s), none outliving a day — active holds: heavy/qwen held by
+  hold, 4h0m left"* and *"the warm policy is not doing what it was
+  declared to do: target heavy/qwen skipped: held"* — about the same
+  hold. The same WARN fired for the whole duration of any `vibe cell
+  drain`, the most ordinary verb in the control plane, and for an
+  `opportunistic` or `roaming` box being absent, which the design §4
+  class table says is not news at all. `explainedCells` now derives the
+  explanation from the **StateSnapshot** (declared intent → C11 hold →
+  class-normal absence, C11's ladder order), never from a loop's prose,
+  and a skip it explains is reported OK **with the reason named**.
+  `TestDoctor_DeclaredSuppressionIsNotAPolicyFailure` covers all three.
+- **`probe.verdicts` WARNed because the fleet was in use (MAJOR).** The
+  check flagged any target whose state was `skipped` *right now*, but
+  C8's guard set skips on in-flight work, an **unreported** in-flight
+  count, a model that is not resident and an active lease — so a
+  declared target on a working fleet is skipped most passes, and a cell
+  fleetd has no events stream to is skipped *forever* (`cell heavy
+  in-flight unknown — not spending GPU time blind`). §11 asks for the
+  target "skipped for its whole life"; that is `LastAsk == nil`, and it
+  is what the check now reports, minus the explained set above. Every
+  other skip still rides the detail line, so no reason is swallowed.
+  `TestDoctor_ProbeSkipIsAFindingOnlyWhenTheTargetWasNeverAsked`.
+- **`intent.hygiene` flagged a drain one second after it was requested,
+  and called it "undeclared" (MAJOR).** `staleRequestAge` gated the
+  *pending* bucket and not the *residue* one, so a fresh request landed
+  in residue anyway: between `vibe cell drain` and the cell's next
+  heartbeat the display is `INCONSISTENT` by design (evidence outranks
+  the declaration), and doctor reported that as `undeclared state`. Two
+  errors in one line — the intent is emphatically declared, and the
+  window is the normal middle of every drain. `DRAINED?` (genuinely no
+  entry) and `INCONSISTENT` (declared, not yet reconciled) are now
+  separate sentences, and the ack window gates both.
+  `TestDoctor_IntentHygieneDoesNotAccuseAFreshDrainRequest`.
+- **`versions.reported` scored a cell OK with no `defs_sha`, and
+  `defs.parity` dropped it (MAJOR-ish).** §5's own rule is *assert the
+  block is populated before asserting parity over it*; the code asserted
+  only that the block was not entirely empty, so a cell announcing a
+  vibe build and no def SHA — a backends dir that is not a git checkout,
+  or an announcer with no `git` on `PATH` — read as `OK, versions block
+  present`, and the divergence branch of `defs.parity` printed
+  `abc123: a · def456: b` with the third cell nowhere on the page. The
+  cell most likely to be the problem was the one the report omitted. No
+  `defs_sha` is now UNKNOWN, and "Not reporting a SHA: …" rides **every**
+  branch. `TestDoctor_VersionsWithoutADefsSHACannotJoinParity`.
+- **A genuinely full cell disk read as "no disk figure" (MINOR).**
+  `disk.free` treated `disk_free_gb == 0` as an absent measurement with
+  the detail "the cell's capacity block is absent or reports nothing" —
+  a claim doctor cannot make, since the producer leaves the field at
+  zero when `statfs` fails and a filesystem with nothing left announces
+  the same zero. UNKNOWN is still the right level (the wire does not
+  separate them) but the reason now names **both** readings, which is
+  the house rule the `auth_rejected` attribution note already follows.
+  `TestDoctor_ZeroDiskFigureNamesBothReadings`.
+- **A stat failure was always reported as "state dir missing" (MINOR).**
+  A permission or I/O error on a directory that is mounted sent the
+  operator to remount a volume that is already there. `errors.Is(err,
+  fs.ErrNotExist)` now decides the sentence.
+  `TestDoctor_StateDirUnreadableIsNotReportedAsMissing`.
+- **The read-only source scan covered one of the four doctor files
+  (MINOR, test truth).** `TestDoctor_ReachesNoMutatingVerb` parsed
+  `fleetapi/doctor.go` — the file *least* able to mutate anything, since
+  it holds no client and no config. `daemon/doctor.go` holds the
+  `vibeclient`, where reaching for `CellDrain` is a one-line edit, and
+  the behavioural test cannot see it either (the prober is injected and
+  the fixture injects a fake). The scan now covers all four files and
+  bans the RPC verbs as well; mutation-verified by planting a
+  `client.CellDrain` in `daemon/doctor.go` and watching it fail at the
+  right line.
+
+Two smaller things fixed in passing, both inside the TLS work: one
+endpoint named three times (`fleetd_url`, `cells.X.url`,
+`cells.X.daemon_url` pointing at one host) produced three identical rows
+under one key and paid for three handshakes
+(`TestDoctor_TLSDialsEachEndpointOnce`), and `certNotAfter` grew a
+per-server dial timeout so the fan-out is testable in milliseconds
+rather than 3s per endpoint.
+
+Two things the pass looked at and left:
+
+- **`leases.age` measures REMAINING time, not age.** `Lease` carries no
+  creation stamp, so "older than 24h" is not computable; a lease with
+  more than a day left is the closest honest proxy, and the summary says
+  what it measured ("a lease will outlive the day"). Noted here so the
+  next reader does not take the check ID literally.
+- **`usage.flow` still WARNs for an announcing cell that served nothing
+  in seven days** — including one commissioned this morning. The ledger
+  keeps no "this cell's meter has ever reported" bit, so a
+  newly-announcing cell and a cell with no `store:` in its llama-swap
+  extras are the same observation. The detail names both causes, and the
+  declared-suppression fix above removes the drained/held case, which
+  was the noisiest one.

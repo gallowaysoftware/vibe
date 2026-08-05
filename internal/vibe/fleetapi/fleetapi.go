@@ -197,6 +197,10 @@ type Server struct {
 	// them down so cellDown→cellUp transitions resolve in milliseconds.
 	baseBackoff time.Duration
 	maxBackoff  time.Duration
+	// tlsDial bounds one doctor TLS handshake (C13). A field rather than
+	// the constant so a test can assert the FAN-OUT in milliseconds
+	// instead of burning the real 3s per endpoint.
+	tlsDial time.Duration
 
 	mu     sync.Mutex
 	subs   map[chan Event]struct{}
@@ -398,6 +402,7 @@ func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Op
 		streamClient:       &http.Client{},
 		baseBackoff:        500 * time.Millisecond,
 		maxBackoff:         30 * time.Second,
+		tlsDial:            tlsDialTimeout,
 		subs:               map[chan Event]struct{}{},
 		cellUp:             map[string]bool{},
 		cellUpSince:        map[string]time.Time{},
