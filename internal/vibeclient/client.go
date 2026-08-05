@@ -154,6 +154,18 @@ func (c *Client) CellResume(ctx context.Context) error {
 	return err
 }
 
+// CellSuspend asks the daemon to run its configured suspend verb — the
+// box goes to sleep (fleet-control C14). requireIdle makes the cell
+// refuse unless it can prove it is idle; fleetd's schedule always sets
+// it, an operator's --force does not.
+func (c *Client) CellSuspend(ctx context.Context, reason string, requireIdle bool) (*vibev1.CellSuspendResponse, error) {
+	resp, err := c.rpc.CellSuspend(ctx, connect.NewRequest(&vibev1.CellSuspendRequest{Reason: reason, RequireIdle: requireIdle}))
+	if err != nil {
+		return nil, err
+	}
+	return resp.Msg, nil
+}
+
 // StatusFull returns the active-profile Status plus every running
 // service. Used by `vibe ps` to render the whole picture; callers
 // that only care about the active profile can keep using Status().

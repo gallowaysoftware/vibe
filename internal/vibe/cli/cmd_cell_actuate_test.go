@@ -25,11 +25,14 @@ import (
 // cellVerbFake records drain/resume RPCs over the real Connect handler,
 // optionally serving from a unix socket (the local-daemon path).
 type cellVerbFake struct {
-	mu         sync.Mutex
-	drains     int
-	resumes    int
-	lastReason string
-	failDrain  bool
+	mu          sync.Mutex
+	drains      int
+	resumes     int
+	suspends    int
+	lastReason  string
+	lastRequire bool
+	failDrain   bool
+	failSuspend bool
 }
 
 func (f *cellVerbFake) CellDrain(_ context.Context, req *connect.Request[vibev1.CellDrainRequest]) (*connect.Response[vibev1.CellDrainResponse], error) {
@@ -48,6 +51,22 @@ func (f *cellVerbFake) CellResume(_ context.Context, _ *connect.Request[vibev1.C
 	defer f.mu.Unlock()
 	f.resumes++
 	return connect.NewResponse(&vibev1.CellResumeResponse{}), nil
+}
+
+func (f *cellVerbFake) CellSuspend(_ context.Context, req *connect.Request[vibev1.CellSuspendRequest]) (*connect.Response[vibev1.CellSuspendResponse], error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.suspends++
+	f.lastReason = req.Msg.Reason
+	f.lastRequire = req.Msg.RequireIdle
+	if f.failSuspend {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("2 request(s) in flight; not suspending"))
+	}
+	idle := fleetapi.SuspendIdleNotRequired
+	if req.Msg.RequireIdle {
+		idle = fleetapi.SuspendIdleVerified
+	}
+	return connect.NewResponse(&vibev1.CellSuspendResponse{ResidentModels: []string{"qwen"}, IdleStatus: idle}), nil
 }
 
 func (f *cellVerbFake) Status(context.Context, *connect.Request[vibev1.StatusRequest]) (*connect.Response[vibev1.StatusResponse], error) {

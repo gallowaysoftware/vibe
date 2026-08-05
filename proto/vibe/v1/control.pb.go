@@ -74,7 +74,7 @@ func (x PullProgress_Phase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PullProgress_Phase.Descriptor instead.
 func (PullProgress_Phase) EnumDescriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{21, 0}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{23, 0}
 }
 
 type Status struct {
@@ -1277,6 +1277,131 @@ func (*CellResumeResponse) Descriptor() ([]byte, []int) {
 	return file_vibe_v1_control_proto_rawDescGZIP(), []int{20}
 }
 
+type CellSuspendRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// reason is the declared intent recorded alongside the suspend
+	// ("asleep per sleep_schedule"), for humans and agents asking why.
+	Reason string `protobuf:"bytes,1,opt,name=reason,proto3" json:"reason,omitempty"`
+	// require_idle refuses the suspend unless this cell can PROVE it is
+	// idle: a non-zero in-flight count and an UNREPORTED one both refuse,
+	// because unknown is not zero on the receiving side either. fleetd's
+	// scheduled path always sets it; an operator's explicit --force does
+	// not, since an operator asking is not fleetd guessing.
+	RequireIdle   bool `protobuf:"varint,2,opt,name=require_idle,json=requireIdle,proto3" json:"require_idle,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CellSuspendRequest) Reset() {
+	*x = CellSuspendRequest{}
+	mi := &file_vibe_v1_control_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CellSuspendRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CellSuspendRequest) ProtoMessage() {}
+
+func (x *CellSuspendRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_vibe_v1_control_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CellSuspendRequest.ProtoReflect.Descriptor instead.
+func (*CellSuspendRequest) Descriptor() ([]byte, []int) {
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *CellSuspendRequest) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *CellSuspendRequest) GetRequireIdle() bool {
+	if x != nil {
+		return x.RequireIdle
+	}
+	return false
+}
+
+type CellSuspendResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// resident_models are the models llama-swap had loaded at suspend time
+	// — the same pre-verb report CellDrain gives, for the same reason.
+	ResidentModels []string `protobuf:"bytes,1,rep,name=resident_models,json=residentModels,proto3" json:"resident_models,omitempty"`
+	// in_flight_requests is present only when the cell's inflight tracking
+	// has reported; absent means unknown, never zero.
+	InFlightRequests *int64 `protobuf:"varint,2,opt,name=in_flight_requests,json=inFlightRequests,proto3,oneof" json:"in_flight_requests,omitempty"`
+	// idle_status is what became of the idle proof: "not_required" or
+	// "verified_idle".
+	IdleStatus    string `protobuf:"bytes,3,opt,name=idle_status,json=idleStatus,proto3" json:"idle_status,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CellSuspendResponse) Reset() {
+	*x = CellSuspendResponse{}
+	mi := &file_vibe_v1_control_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CellSuspendResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CellSuspendResponse) ProtoMessage() {}
+
+func (x *CellSuspendResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_vibe_v1_control_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CellSuspendResponse.ProtoReflect.Descriptor instead.
+func (*CellSuspendResponse) Descriptor() ([]byte, []int) {
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *CellSuspendResponse) GetResidentModels() []string {
+	if x != nil {
+		return x.ResidentModels
+	}
+	return nil
+}
+
+func (x *CellSuspendResponse) GetInFlightRequests() int64 {
+	if x != nil && x.InFlightRequests != nil {
+		return *x.InFlightRequests
+	}
+	return 0
+}
+
+func (x *CellSuspendResponse) GetIdleStatus() string {
+	if x != nil {
+		return x.IdleStatus
+	}
+	return ""
+}
+
 type PullProgress struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	Phase           PullProgress_Phase     `protobuf:"varint,1,opt,name=phase,proto3,enum=vibe.v1.PullProgress_Phase" json:"phase,omitempty"`
@@ -1290,7 +1415,7 @@ type PullProgress struct {
 
 func (x *PullProgress) Reset() {
 	*x = PullProgress{}
-	mi := &file_vibe_v1_control_proto_msgTypes[21]
+	mi := &file_vibe_v1_control_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1302,7 +1427,7 @@ func (x *PullProgress) String() string {
 func (*PullProgress) ProtoMessage() {}
 
 func (x *PullProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[21]
+	mi := &file_vibe_v1_control_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1315,7 +1440,7 @@ func (x *PullProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PullProgress.ProtoReflect.Descriptor instead.
 func (*PullProgress) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{21}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *PullProgress) GetPhase() PullProgress_Phase {
@@ -1431,7 +1556,16 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\x13_in_flight_requestsB\x0e\n" +
 	"\f_wait_status\"\x13\n" +
 	"\x11CellResumeRequest\"\x14\n" +
-	"\x12CellResumeResponse\"\x98\x02\n" +
+	"\x12CellResumeResponse\"O\n" +
+	"\x12CellSuspendRequest\x12\x16\n" +
+	"\x06reason\x18\x01 \x01(\tR\x06reason\x12!\n" +
+	"\frequire_idle\x18\x02 \x01(\bR\vrequireIdle\"\xa9\x01\n" +
+	"\x13CellSuspendResponse\x12'\n" +
+	"\x0fresident_models\x18\x01 \x03(\tR\x0eresidentModels\x121\n" +
+	"\x12in_flight_requests\x18\x02 \x01(\x03H\x00R\x10inFlightRequests\x88\x01\x01\x12\x1f\n" +
+	"\vidle_status\x18\x03 \x01(\tR\n" +
+	"idleStatusB\x15\n" +
+	"\x13_in_flight_requests\"\x98\x02\n" +
 	"\fPullProgress\x121\n" +
 	"\x05phase\x18\x01 \x01(\x0e2\x1b.vibe.v1.PullProgress.PhaseR\x05phase\x12)\n" +
 	"\x10downloaded_bytes\x18\x02 \x01(\x03R\x0fdownloadedBytes\x12\x1f\n" +
@@ -1444,7 +1578,7 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\x11PHASE_DOWNLOADING\x10\x02\x12\x13\n" +
 	"\x0fPHASE_VERIFYING\x10\x03\x12\x0e\n" +
 	"\n" +
-	"PHASE_DONE\x10\x042\xcf\x04\n" +
+	"PHASE_DONE\x10\x042\x9b\x05\n" +
 	"\x0eControlService\x12;\n" +
 	"\x06Status\x12\x16.vibe.v1.StatusRequest\x1a\x17.vibe.v1.StatusResponse\"\x00\x12M\n" +
 	"\fListProfiles\x12\x1c.vibe.v1.ListProfilesRequest\x1a\x1d.vibe.v1.ListProfilesResponse\"\x00\x128\n" +
@@ -1455,7 +1589,8 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\x04Pull\x12\x14.vibe.v1.PullRequest\x1a\x15.vibe.v1.PullProgress\"\x000\x01\x12D\n" +
 	"\tCellDrain\x12\x19.vibe.v1.CellDrainRequest\x1a\x1a.vibe.v1.CellDrainResponse\"\x00\x12G\n" +
 	"\n" +
-	"CellResume\x12\x1a.vibe.v1.CellResumeRequest\x1a\x1b.vibe.v1.CellResumeResponse\"\x00B7Z5github.com/gallowaysoftware/vibe/proto/vibe/v1;vibev1b\x06proto3"
+	"CellResume\x12\x1a.vibe.v1.CellResumeRequest\x1a\x1b.vibe.v1.CellResumeResponse\"\x00\x12J\n" +
+	"\vCellSuspend\x12\x1b.vibe.v1.CellSuspendRequest\x1a\x1c.vibe.v1.CellSuspendResponse\"\x00B7Z5github.com/gallowaysoftware/vibe/proto/vibe/v1;vibev1b\x06proto3"
 
 var (
 	file_vibe_v1_control_proto_rawDescOnce sync.Once
@@ -1470,7 +1605,7 @@ func file_vibe_v1_control_proto_rawDescGZIP() []byte {
 }
 
 var file_vibe_v1_control_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_vibe_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
+var file_vibe_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 26)
 var file_vibe_v1_control_proto_goTypes = []any{
 	(PullProgress_Phase)(0),       // 0: vibe.v1.PullProgress.Phase
 	(*Status)(nil),                // 1: vibe.v1.Status
@@ -1494,22 +1629,24 @@ var file_vibe_v1_control_proto_goTypes = []any{
 	(*CellDrainResponse)(nil),     // 19: vibe.v1.CellDrainResponse
 	(*CellResumeRequest)(nil),     // 20: vibe.v1.CellResumeRequest
 	(*CellResumeResponse)(nil),    // 21: vibe.v1.CellResumeResponse
-	(*PullProgress)(nil),          // 22: vibe.v1.PullProgress
-	nil,                           // 23: vibe.v1.Status.FrontendEnvEntry
-	nil,                           // 24: vibe.v1.FrontendInfo.EnvVarsEntry
-	(*timestamppb.Timestamp)(nil), // 25: google.protobuf.Timestamp
+	(*CellSuspendRequest)(nil),    // 22: vibe.v1.CellSuspendRequest
+	(*CellSuspendResponse)(nil),   // 23: vibe.v1.CellSuspendResponse
+	(*PullProgress)(nil),          // 24: vibe.v1.PullProgress
+	nil,                           // 25: vibe.v1.Status.FrontendEnvEntry
+	nil,                           // 26: vibe.v1.FrontendInfo.EnvVarsEntry
+	(*timestamppb.Timestamp)(nil), // 27: google.protobuf.Timestamp
 }
 var file_vibe_v1_control_proto_depIdxs = []int32{
-	25, // 0: vibe.v1.Status.started_at:type_name -> google.protobuf.Timestamp
-	23, // 1: vibe.v1.Status.frontend_env:type_name -> vibe.v1.Status.FrontendEnvEntry
-	24, // 2: vibe.v1.FrontendInfo.env_vars:type_name -> vibe.v1.FrontendInfo.EnvVarsEntry
+	27, // 0: vibe.v1.Status.started_at:type_name -> google.protobuf.Timestamp
+	25, // 1: vibe.v1.Status.frontend_env:type_name -> vibe.v1.Status.FrontendEnvEntry
+	26, // 2: vibe.v1.FrontendInfo.env_vars:type_name -> vibe.v1.FrontendInfo.EnvVarsEntry
 	1,  // 3: vibe.v1.StatusResponse.status:type_name -> vibe.v1.Status
 	1,  // 4: vibe.v1.StatusResponse.services:type_name -> vibe.v1.Status
 	2,  // 5: vibe.v1.ListProfilesResponse.profiles:type_name -> vibe.v1.Profile
 	1,  // 6: vibe.v1.StartResponse.status:type_name -> vibe.v1.Status
 	3,  // 7: vibe.v1.StartResponse.frontend:type_name -> vibe.v1.FrontendInfo
 	1,  // 8: vibe.v1.StopResponse.status:type_name -> vibe.v1.Status
-	25, // 9: vibe.v1.LeaseView.expires_at:type_name -> google.protobuf.Timestamp
+	27, // 9: vibe.v1.LeaseView.expires_at:type_name -> google.protobuf.Timestamp
 	18, // 10: vibe.v1.CellDrainResponse.active_leases:type_name -> vibe.v1.LeaseView
 	0,  // 11: vibe.v1.PullProgress.phase:type_name -> vibe.v1.PullProgress.Phase
 	4,  // 12: vibe.v1.ControlService.Status:input_type -> vibe.v1.StatusRequest
@@ -1521,17 +1658,19 @@ var file_vibe_v1_control_proto_depIdxs = []int32{
 	16, // 18: vibe.v1.ControlService.Pull:input_type -> vibe.v1.PullRequest
 	17, // 19: vibe.v1.ControlService.CellDrain:input_type -> vibe.v1.CellDrainRequest
 	20, // 20: vibe.v1.ControlService.CellResume:input_type -> vibe.v1.CellResumeRequest
-	5,  // 21: vibe.v1.ControlService.Status:output_type -> vibe.v1.StatusResponse
-	7,  // 22: vibe.v1.ControlService.ListProfiles:output_type -> vibe.v1.ListProfilesResponse
-	9,  // 23: vibe.v1.ControlService.Start:output_type -> vibe.v1.StartResponse
-	11, // 24: vibe.v1.ControlService.Stop:output_type -> vibe.v1.StopResponse
-	13, // 25: vibe.v1.ControlService.Shutdown:output_type -> vibe.v1.ShutdownResponse
-	15, // 26: vibe.v1.ControlService.Logs:output_type -> vibe.v1.LogsResponse
-	22, // 27: vibe.v1.ControlService.Pull:output_type -> vibe.v1.PullProgress
-	19, // 28: vibe.v1.ControlService.CellDrain:output_type -> vibe.v1.CellDrainResponse
-	21, // 29: vibe.v1.ControlService.CellResume:output_type -> vibe.v1.CellResumeResponse
-	21, // [21:30] is the sub-list for method output_type
-	12, // [12:21] is the sub-list for method input_type
+	22, // 21: vibe.v1.ControlService.CellSuspend:input_type -> vibe.v1.CellSuspendRequest
+	5,  // 22: vibe.v1.ControlService.Status:output_type -> vibe.v1.StatusResponse
+	7,  // 23: vibe.v1.ControlService.ListProfiles:output_type -> vibe.v1.ListProfilesResponse
+	9,  // 24: vibe.v1.ControlService.Start:output_type -> vibe.v1.StartResponse
+	11, // 25: vibe.v1.ControlService.Stop:output_type -> vibe.v1.StopResponse
+	13, // 26: vibe.v1.ControlService.Shutdown:output_type -> vibe.v1.ShutdownResponse
+	15, // 27: vibe.v1.ControlService.Logs:output_type -> vibe.v1.LogsResponse
+	24, // 28: vibe.v1.ControlService.Pull:output_type -> vibe.v1.PullProgress
+	19, // 29: vibe.v1.ControlService.CellDrain:output_type -> vibe.v1.CellDrainResponse
+	21, // 30: vibe.v1.ControlService.CellResume:output_type -> vibe.v1.CellResumeResponse
+	23, // 31: vibe.v1.ControlService.CellSuspend:output_type -> vibe.v1.CellSuspendResponse
+	22, // [22:32] is the sub-list for method output_type
+	12, // [12:22] is the sub-list for method input_type
 	12, // [12:12] is the sub-list for extension type_name
 	12, // [12:12] is the sub-list for extension extendee
 	0,  // [0:12] is the sub-list for field type_name
@@ -1543,13 +1682,14 @@ func file_vibe_v1_control_proto_init() {
 		return
 	}
 	file_vibe_v1_control_proto_msgTypes[18].OneofWrappers = []any{}
+	file_vibe_v1_control_proto_msgTypes[22].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_vibe_v1_control_proto_rawDesc), len(file_vibe_v1_control_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   24,
+			NumMessages:   26,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

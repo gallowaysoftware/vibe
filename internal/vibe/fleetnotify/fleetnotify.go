@@ -45,18 +45,30 @@ const (
 	// it, and the measurement has a false-positive tail that C8 already
 	// refused to let actuate anything.
 	KindModelDegraded Kind = "model_degraded"
+	// KindWakeFailed is C14's: fleetd suspended a cell on a declared
+	// schedule and its own paired wake did not bring the box back. It is
+	// in the default set despite not appearing in the class table, and
+	// the distinction is the whole reason it is allowed to be: the class
+	// table governs ABSENCE, which for an opportunistic cell is normal
+	// and silent forever. This is not absence — it is a declared action
+	// of the control plane's own that did not complete, and the
+	// alternative to paging is the operator discovering a fleet-less
+	// morning at 09:00.
+	KindWakeFailed Kind = "wake_failed"
 )
 
 // AllKinds is every kind this package understands, for config
 // validation. Order is display order.
 func AllKinds() []Kind {
-	return []Kind{KindCellAbsent, KindFingerprint, KindDrainWithLease, KindModelDegraded}
+	return []Kind{KindCellAbsent, KindFingerprint, KindDrainWithLease, KindModelDegraded, KindWakeFailed}
 }
 
-// DefaultAlarms is the class table's alarm column, verbatim. Changing
-// this list changes what the fleet pages about; it is test-pinned.
+// DefaultAlarms is the class table's alarm column, verbatim, plus C14's
+// undelivered-wake — the one alarm that is not about a cell's state at
+// all but about a promise this control plane made. Changing this list
+// changes what the fleet pages about; it is test-pinned.
 func DefaultAlarms() []Kind {
-	return []Kind{KindCellAbsent, KindFingerprint, KindDrainWithLease}
+	return []Kind{KindCellAbsent, KindFingerprint, KindDrainWithLease, KindWakeFailed}
 }
 
 // ParseKind resolves a configured kind name.
@@ -161,6 +173,10 @@ func DefaultPolicy() Policy {
 			// two-minute-late page is a bereavement notice.
 			KindDrainWithLease: 0,
 			KindModelDegraded:  10 * time.Minute,
+			// None. The wake grace window IS the dwell — the condition only
+			// exists after fleetd has already waited the declared minutes
+			// for the box to come back.
+			KindWakeFailed: 0,
 		},
 		ClearDwell:  time.Minute,
 		RatePerHour: 12,

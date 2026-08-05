@@ -166,6 +166,10 @@ type StateSnapshot struct {
 	// scope, every alarm the tracker holds (including ones whose delivery
 	// away suppressed), and the delivery counters.
 	Notify *notifyStatus `json:"notify,omitempty"`
+	// Sleep is the C14 sleep-schedule status: each declared night's
+	// resolved next suspend and next wake, what is deferring it, and any
+	// wake this schedule promised and did not deliver.
+	Sleep *sleepStatus `json:"sleep,omitempty"`
 }
 
 // snapshotTimeout bounds the per-cell /running + /v1/models probes so one
@@ -305,6 +309,11 @@ type Server struct {
 	// probeStates is the C8 probe scheduler's status surface, same
 	// discipline as the warm states.
 	probeStates []*probeTargetState
+
+	// sleepStates is the C14 sleep schedules' status surface, same
+	// discipline again: the loop goroutines mutate the entries in place
+	// under s.mu, and the report copies.
+	sleepStates []*sleepScheduleState
 
 	// notify is the C9 alarm notifier (nil when unconfigured);
 	// notifyScope is the declared away/home fleet scope. notifyMu guards
@@ -522,6 +531,7 @@ func (s *Server) probeSnapshot(ctx context.Context) StateSnapshot {
 		Warm:         s.warmReport(),
 		Probe:        s.probeReport(),
 		Notify:       s.notifyReport(),
+		Sleep:        s.sleepReport(),
 	}
 	var wg sync.WaitGroup
 	for i, c := range s.cells {

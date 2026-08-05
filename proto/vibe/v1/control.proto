@@ -47,6 +47,15 @@ service ControlService {
   // CellResume runs cell_cmds.resume, restoring JIT service after a drain.
   // Same error contract as CellDrain.
   rpc CellResume(CellResumeRequest) returns (CellResumeResponse) {}
+
+  // CellSuspend runs cell_cmds.suspend — the box goes to sleep
+  // (fleet-control C14). Same error contract as CellDrain, plus
+  // FailedPrecondition when require_idle is set and the cell cannot prove
+  // it is idle. The configured command must RETURN (systemctl suspend is
+  // asynchronous by design); one that blocks until the machine freezes
+  // makes this RPC fail with a transport error, which the caller reports
+  // as an unknown outcome and records no intent for.
+  rpc CellSuspend(CellSuspendRequest) returns (CellSuspendResponse) {}
 }
 
 message Status {
@@ -234,6 +243,30 @@ message CellDrainResponse {
 
 message CellResumeRequest {}
 message CellResumeResponse {}
+
+message CellSuspendRequest {
+  // reason is the declared intent recorded alongside the suspend
+  // ("asleep per sleep_schedule"), for humans and agents asking why.
+  string reason = 1;
+  // require_idle refuses the suspend unless this cell can PROVE it is
+  // idle: a non-zero in-flight count and an UNREPORTED one both refuse,
+  // because unknown is not zero on the receiving side either. fleetd's
+  // scheduled path always sets it; an operator's explicit --force does
+  // not, since an operator asking is not fleetd guessing.
+  bool require_idle = 2;
+}
+
+message CellSuspendResponse {
+  // resident_models are the models llama-swap had loaded at suspend time
+  // — the same pre-verb report CellDrain gives, for the same reason.
+  repeated string resident_models = 1;
+  // in_flight_requests is present only when the cell's inflight tracking
+  // has reported; absent means unknown, never zero.
+  optional int64 in_flight_requests = 2;
+  // idle_status is what became of the idle proof: "not_required" or
+  // "verified_idle".
+  string idle_status = 3;
+}
 
 message PullProgress {
   enum Phase {

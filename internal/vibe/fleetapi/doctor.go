@@ -966,7 +966,59 @@ func (s *Server) checkHygiene(rep *DoctorReport, snap StateSnapshot) {
 	s.checkWarm(rep, snap, expl)
 	s.checkUsage(rep, snap, expl)
 	s.checkNotify(rep, snap)
+	s.checkSleep(rep, snap)
 	s.checkRenderMount(rep)
+}
+
+// checkSleep audits the C14 declared nights. It exists because every
+// other surface for a sleep schedule is after the fact: the night it
+// matters is the night nobody is looking, so the question "will this
+// work tonight" has to be answerable at 14:00 on a Tuesday.
+//
+// A fleet with no sleep_schedule emits nothing at all — not UNKNOWN.
+// Nothing declared is nothing to check, and a permanent UNKNOWN on a
+// healthy fleet teaches the operator to ignore the level (C13's rule).
+func (s *Server) checkSleep(rep *DoctorReport, snap StateSnapshot) {
+	if snap.Sleep == nil {
+		return
+	}
+	for _, e := range snap.Sleep.Entries {
+		switch {
+		case e.State == "disabled":
+			rep.Add(DoctorCheck{ID: "sleep.schedule", Cell: e.Cell, Level: LevelWarn,
+				Summary: "sleep schedule disabled: " + e.Detail,
+				Detail:  "the entry is declared in config and will never fire.",
+				Fix:     "fix the cron (suspend " + e.SuspendCron + ", wake " + e.WakeCron + ") — a broken wake disables the suspend half too, on purpose."})
+		case e.WakeFailedSince != nil:
+			rep.Add(DoctorCheck{ID: "sleep.wake", Cell: e.Cell, Level: LevelFail,
+				Summary: "the scheduled wake did not bring " + e.Cell + " back (since " + e.WakeFailedSince.Format(time.RFC3339) + ")",
+				Detail:  e.Detail,
+				Fix: "wake it by hand (`vibe cell wake " + e.Cell + "`), then find out which half failed: the packet " +
+					"(WoL disarmed in BIOS or by a driver's power management) or the box (it woke and its serving stack did not). " +
+					"Whether a NIC is armed is not observable from here — the fire drill is the test."})
+		case e.State == "failed":
+			// A deferred or abandoned night is the policy working (C13's
+			// rule) and reports OK below. A suspend that was ATTEMPTED and
+			// errored is not: the commonest cause is a cell with no
+			// cell_cmds.suspend, which fails identically every night
+			// forever while the box keeps drawing its idle watts — a
+			// permanent green on a schedule that has never once fired.
+			rep.Add(DoctorCheck{ID: "sleep.suspend", Cell: e.Cell, Level: LevelWarn,
+				Summary: "the last declared suspend of " + e.Cell + " failed",
+				Detail:  e.Detail,
+				Fix: "run `vibe cell suspend " + e.Cell + "` by hand to see the same error interactively. " +
+					"The usual cause is cell_cmds.suspend unset in that cell's config.yaml; the box keeps drawing its idle watts until it is."})
+		default:
+			sum := e.Cell + " sleeps " + e.SuspendCron + ", wakes " + e.WakeCron
+			if e.NextSuspend != nil && e.NextWake != nil {
+				sum += " (next: " + e.NextSuspend.Format(time.RFC3339) + " / " + e.NextWake.Format(time.RFC3339) + ")"
+			}
+			rep.Add(DoctorCheck{ID: "sleep.schedule", Cell: e.Cell, Level: LevelOK,
+				Summary: sum,
+				Detail: "state: " + e.State + " — " + e.Detail + ". A schedule that keeps deferring is a box that is genuinely in use at that hour, " +
+					"not a fault; the resolved next-fire times are in UTC, so a wrong timezone is visible here."})
+		}
+	}
 }
 
 // explainedCells names, per cell, the reason a policy loop is CORRECT
@@ -1018,7 +1070,13 @@ func (s *Server) checkIntentHygiene(rep *DoctorReport, snap StateSnapshot) {
 		// every drain: the echo rides the next heartbeat. Only a request
 		// that has outlived the ack window is residue.
 		young := c.IntentPending && c.Intent != nil && time.Since(c.Intent.Since) <= staleRequestAge
-		if c.IntentPending && !young {
+		// A box asleep on a declared schedule (C14) cannot echo anything:
+		// that is what asleep means. Counting it as residue would turn
+		// this check yellow every night on a fleet doing exactly what it
+		// was configured to do — the permanent-WARN failure this file's
+		// own review pass had to fix three times.
+		asleep := c.Intent != nil && c.Intent.Reason == SleepIntentReason
+		if c.IntentPending && !young && !asleep {
 			pending = append(pending, c.Name)
 		}
 		switch c.Display {

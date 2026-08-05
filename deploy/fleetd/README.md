@@ -118,6 +118,20 @@ probe_targets:
   - cell: gpu-cell
     model: default-chat
     every: 6h
+
+# C14: the declared night. The cron DECLARES the suspend; in-flight
+# work, leases, holds, a declared drain and the quiet window only ever
+# DEFER it. Opportunistic cells only, and the cell needs both a
+# daemon_url (the suspend is an RPC — no announce fallback) and a wake:
+# block in hosts.yaml, or the entry is refused at startup.
+sleep_schedule:
+  - cell: gpu-cell
+    suspend: "30 23 * * *"
+    wake: "15 7 * * *"
+    # quiet_for: 15m     # every model idle this long before it fires (floor 5m)
+    # max_defer: 2h      # give up for tonight after this; also gives up at the wake
+    # wake_grace: 10m    # how long the box has to come back before it is a failed wake
+    warm: [default-chat]
 ```
 
 **Notifications (C9).** Write the endpoint to the state volume once —
@@ -130,7 +144,29 @@ firing and stay visible in `fleet_status` the whole time, and
 `vibe fleet notify home` sends one digest naming what was suppressed.
 The `class` in `hosts.yaml` is what decides which absences alarm at all.
 
-**Timezone.** `warm_schedule` entries evaluate in the container's `TZ`,
+**Sleeping a box (C14).** The suspend itself is house-specific and lives
+in the CELL's `config.yaml` beside its other verbs — this repo ships the
+mechanism, never the command:
+
+```yaml
+cell_cmds:
+  drain:   "systemctl --user stop llama-swap"
+  resume:  "systemctl --user start llama-swap"
+  suspend: "systemctl --user stop llama-swap && systemctl suspend"
+```
+
+Two contract notes. The command must **return** (`systemctl suspend` is
+asynchronous by design); one that blocks until the machine freezes turns
+the RPC into a transport error and the outcome into a guess. And
+stopping the serving stack first is the right default, because CUDA
+contexts do not reliably survive S3 — the morning `resume` verb runs on
+its own through the desired-intent path when the wake clears the sleep
+record. Check it works *before* the night it matters: `fleet_status`
+shows both resolved fires per entry and `vibe fleet doctor` reports
+`sleep.schedule`, but the only real test of a WoL path is the fire
+drill's one live `wake_cell`.
+
+**Timezone.** `warm_schedule` and `sleep_schedule` entries evaluate in the container's `TZ`,
 and an alpine base has no tzdata — set `TZ` in `.env` AND keep tzdata in
 the image (the reference `Dockerfile` installs it for exactly this).
 A wrong zone is not silent: every schedule's resolved `next_fire` shows
@@ -272,7 +308,7 @@ wrong.
 - MCP: `POST http://<FLEETD_IPV4>:9001/mcp` (bearer) speaks
   initialize / tools-list / tools-call. Tools: `fleet_status`,
   `fleet_doctor`, `warm_model`, `unload_model`, `drain_cell`,
-  `resume_cell`, `wake_cell`, `render_front` (dry-run only — fleetd's
+  `resume_cell`, `wake_cell`, `suspend_cell`, `render_front` (dry-run only — fleetd's
   presence-driven render loop owns the write path). `drain_cell`/`resume_cell` reach a
   cell through its `daemon_url` + `token_file`; without those they fall
   back to recording desired intent for the cell to pick up on its next

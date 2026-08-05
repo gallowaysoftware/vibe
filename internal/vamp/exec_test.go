@@ -91,6 +91,9 @@ func (s *stubControl) CellDrain(context.Context, *connect.Request[vibev1.CellDra
 func (s *stubControl) CellResume(context.Context, *connect.Request[vibev1.CellResumeRequest]) (*connect.Response[vibev1.CellResumeResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("no cell verbs"))
 }
+func (s *stubControl) CellSuspend(context.Context, *connect.Request[vibev1.CellSuspendRequest]) (*connect.Response[vibev1.CellSuspendResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("no cell verbs"))
+}
 func (s *stubControl) Pull(_ context.Context, _ *connect.Request[vibev1.PullRequest], stream *connect.ServerStream[vibev1.PullProgress]) error {
 	return stream.Send(&vibev1.PullProgress{Phase: vibev1.PullProgress_PHASE_DONE})
 }
@@ -2416,6 +2419,9 @@ func (s *vramFallbackControl) CellDrain(context.Context, *connect.Request[vibev1
 func (s *vramFallbackControl) CellResume(context.Context, *connect.Request[vibev1.CellResumeRequest]) (*connect.Response[vibev1.CellResumeResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("no cell verbs"))
 }
+func (s *vramFallbackControl) CellSuspend(context.Context, *connect.Request[vibev1.CellSuspendRequest]) (*connect.Response[vibev1.CellSuspendResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("no cell verbs"))
+}
 func (s *vramFallbackControl) Pull(_ context.Context, _ *connect.Request[vibev1.PullRequest], stream *connect.ServerStream[vibev1.PullProgress]) error {
 	return stream.Send(&vibev1.PullProgress{Phase: vibev1.PullProgress_PHASE_DONE})
 }
@@ -2608,6 +2614,9 @@ func (a *abortControl) CellDrain(ctx context.Context, req *connect.Request[vibev
 }
 func (a *abortControl) CellResume(ctx context.Context, req *connect.Request[vibev1.CellResumeRequest]) (*connect.Response[vibev1.CellResumeResponse], error) {
 	return a.inner.CellResume(ctx, req)
+}
+func (a *abortControl) CellSuspend(ctx context.Context, req *connect.Request[vibev1.CellSuspendRequest]) (*connect.Response[vibev1.CellSuspendResponse], error) {
+	return a.inner.CellSuspend(ctx, req)
 }
 
 // TestExecutor_CacheHit verifies that a second run with byte-identical inputs

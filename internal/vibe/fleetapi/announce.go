@@ -242,6 +242,10 @@ const (
 	// consumers already match on.
 	EventModelDegraded  = "fleet.modelDegraded"
 	EventModelRecovered = "fleet.modelRecovered"
+	// EventWakeFailed is C14's: a wake this control plane DECLARED and
+	// then did not deliver. It is not an absence event — an opportunistic
+	// cell's absence is normal and silent — it is a promise that failed.
+	EventWakeFailed = "fleet.wakeFailed"
 )
 
 // staleAfter derives the staleness bound: 3× the announced interval

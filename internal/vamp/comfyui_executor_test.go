@@ -281,6 +281,9 @@ func (s *stubControlWithBackend) CellDrain(context.Context, *connect.Request[vib
 func (s *stubControlWithBackend) CellResume(context.Context, *connect.Request[vibev1.CellResumeRequest]) (*connect.Response[vibev1.CellResumeResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("no cell verbs"))
 }
+func (s *stubControlWithBackend) CellSuspend(context.Context, *connect.Request[vibev1.CellSuspendRequest]) (*connect.Response[vibev1.CellSuspendResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("no cell verbs"))
+}
 func (s *stubControlWithBackend) Pull(_ context.Context, _ *connect.Request[vibev1.PullRequest], stream *connect.ServerStream[vibev1.PullProgress]) error {
 	return stream.Send(&vibev1.PullProgress{Phase: vibev1.PullProgress_PHASE_DONE})
 }

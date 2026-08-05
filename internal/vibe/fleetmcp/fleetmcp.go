@@ -429,7 +429,7 @@ func (s *Server) mcpTools() []any {
 				},
 			},
 		},
-	}, holdTools()...)
+	}, append(holdTools(), sleepTools()...)...)
 }
 
 func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMessage) (string, error) {
@@ -448,6 +448,10 @@ func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMess
 		_ = json.Unmarshal(rawArgs, &probe)
 		timeout = time.Duration(probe.WaitSeconds)*time.Second + 75*time.Second
 	case "resume_cell", "wake_cell", "render_front":
+		timeout = 90 * time.Second
+	case "suspend_cell":
+		// A unit stop plus a logind call, same shape as resume_cell — and
+		// the same reason the budget is not the 10s probe one.
 		timeout = 90 * time.Second
 	case "fleet_doctor":
 		// A read, but a wide one: the state snapshot's per-cell probes,
@@ -538,6 +542,16 @@ func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMess
 			return "", fmt.Errorf("invalid arguments: %v", err)
 		}
 		return s.toolWakeCell(ctx, args.Cell)
+	case "suspend_cell":
+		var args struct {
+			Cell   string `json:"cell"`
+			Reason string `json:"reason"`
+			Force  bool   `json:"force"`
+		}
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return "", fmt.Errorf("invalid arguments: %v", err)
+		}
+		return s.toolSuspendCell(ctx, args.Cell, args.Reason, args.Force)
 	case "fleet_usage":
 		var args struct {
 			Days *int `json:"days"`

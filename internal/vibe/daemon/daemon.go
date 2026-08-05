@@ -127,6 +127,39 @@ type Config struct {
 	// place the control plane deliberately spends GPU time, so it is
 	// declared, never implicit.
 	ProbeTargets []ProbeTarget `yaml:"probe_targets,omitempty"`
+	// SleepSchedule is the declared night (fleet-control C14): a cron
+	// suspend for an opportunistic cell, paired with the wake that brings
+	// it back. The suspend is DEFERRED by in-flight work, leases, holds, a
+	// declared drain and recent activity — never triggered by any of them.
+	SleepSchedule []SleepScheduleEntry `yaml:"sleep_schedule,omitempty"`
+}
+
+// SleepScheduleEntry is one cell's declared night. Both crons are the
+// five standard fields at minute granularity, evaluated in the declared
+// fleet timezone by the same evaluator warm_schedule uses.
+type SleepScheduleEntry struct {
+	// Cell is the fleet cell name. It must be class opportunistic, carry
+	// a daemon_url (the suspend is an RPC, never a piggyback command) and
+	// declare a wake: block in hosts.yaml.
+	Cell string `yaml:"cell"`
+	// Suspend is the cron that DECLARES the suspend.
+	Suspend string `yaml:"suspend"`
+	// Wake is the paired wake cron. Required: a suspend with no declared
+	// wake is a box that never comes back, and an unparseable wake
+	// disables the suspend half too.
+	Wake string `yaml:"wake"`
+	// QuietFor is how long every model on the cell must have been
+	// request-idle before the declared suspend fires (default 15m, floor
+	// 5m). It protects the operator who is typing at 23:29.
+	QuietFor string `yaml:"quiet_for,omitempty"`
+	// MaxDefer bounds how long a blocked suspend keeps retrying (default
+	// 2h). It is also abandoned at the paired wake, whichever is sooner.
+	MaxDefer string `yaml:"max_defer,omitempty"`
+	// WakeGrace is how long the cell is given to come back after the wake
+	// before the schedule calls it a failed wake (default 10m).
+	WakeGrace string `yaml:"wake_grace,omitempty"`
+	// Warm names models to warm through the front once the cell is back.
+	Warm []string `yaml:"warm,omitempty"`
 }
 
 // WarmTarget names a cell's default model and the idle window after
@@ -184,6 +217,15 @@ type CellCmds struct {
 	// llama-swap"). Models return by JIT on next request; resume does not
 	// preload.
 	Resume string `yaml:"resume,omitempty"`
+	// Suspend puts the whole BOX to sleep (fleet-control C14) — how is
+	// house-specific, which is why it is a command and not a mechanism
+	// this repo picks. The reference example stops the serving stack
+	// first, because CUDA contexts do not reliably survive S3:
+	// "systemctl --user stop llama-swap && systemctl suspend". The
+	// command must RETURN (systemctl suspend is asynchronous); one that
+	// blocks until the machine freezes turns the RPC into a transport
+	// error and the outcome into a guess.
+	Suspend string `yaml:"suspend,omitempty"`
 }
 
 // FleetConfig is the daemon's cell identity and registry pointer. C3's
@@ -641,6 +683,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// C9: the class table's alarm column, delivered. Read-only over
 		// the same snapshot every other surface renders.
 		d.startNotifyLoop(d.cfg)
+		// C14: the declared night. A cron DECLARES the suspend; in-flight
+		// work, leases, holds, a declared drain and recent activity only
+		// ever DEFER it.
+		d.startSleepLoops(d.cfg, d.hosts)
 	}
 
 	// C3: this box announces to fleetd when it has a cell identity and a
