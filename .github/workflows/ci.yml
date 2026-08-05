@@ -39,3 +39,89 @@ jobs:
         run: |
           go mod tidy
           git diff --exit-code go.mod go.sum
+
+  # internal/swaptest's conformance list, run against a REAL llama-swap.
+  #
+  # A SEPARATE job so the blocking `test` job's ~15s stays ~15s; the two run
+  # in parallel, so PR wall-clock is unchanged.
+  #
+  # Both versions are exercised on purpose. v239 is what the fleet runs
+  # today; v247 is what the next `go install` on any cell delivers, and the
+  # in-flight frame shape changed between them in a way that silently
+  # disarmed every busy guard in the fleet. "Both wires must pass" is the
+  # requirement — a heterogeneous fleet is the normal state here.
+  #
+  # No container runtime and no new Go module: llama-swap ships a statically
+  # linked 13 MB binary, llama.cpp ships a 16 MB CPU build, and stories260K
+  # is a 1.2 MB GGUF that emits a full llama.cpp `timings` block — which is
+  # what llama-swap parses into an activity row, so C7a's chat basis is
+  # exercisable with no GPU and no model of consequence.
+  conformance:
+    name: conformance (llama-swap ${{ matrix.llama-swap }})
+    runs-on: ubuntu-latest
+    env:
+      LLAMA_CPP_VERSION: b10282
+      MODEL_URL: https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf
+    strategy:
+      fail-fast: false
+      matrix:
+        # Bumping either pin is the documented trigger to re-record
+        # internal/swaptest/fixtures/<version>/ — see TestRecord's doc
+        # comment for the capture procedure.
+        llama-swap: [v239, v247]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: true
+      - name: cache upstream binaries
+        uses: actions/cache@v4
+        with:
+          path: .upstream
+          # Keyed on THIS FILE's hash as well as the versions. The first
+          # attempt at this job cached a broken .upstream (see the fetch
+          # step), and a version-only key then served that same broken copy
+          # back to the run that fixed the bug. A cache whose key does not
+          # cover the code that populates it can only be repaired by hand.
+          key: upstream-${{ matrix.llama-swap }}-${{ env.LLAMA_CPP_VERSION }}-stories260K-${{ hashFiles('.github/workflows/ci.yml') }}
+      - name: fetch llama-swap + llama.cpp + a 1.2 MB model
+        run: |
+          set -euo pipefail
+          export LD_LIBRARY_PATH="$PWD/.upstream"
+          mkdir -p .upstream
+          v="${{ matrix.llama-swap }}"
+          # Presence is not usability. Test what actually broke — whether the
+          # binary RUNS — so a poisoned cache repairs itself instead of being
+          # trusted because the file exists.
+          .upstream/llama-swap --version >/dev/null 2>&1 || {
+            curl -sSfL -o /tmp/ls.tgz \
+              "https://github.com/mostlygeek/llama-swap/releases/download/${v}/llama-swap_${v#v}_linux_amd64.tar.gz"
+            tar xzf /tmp/ls.tgz -C .upstream llama-swap
+          }
+          .upstream/llama-server --version >/dev/null 2>&1 || {
+            curl -sSfL -o /tmp/lcpp.tgz \
+              "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_VERSION}/llama-${LLAMA_CPP_VERSION}-bin-ubuntu-x64.tar.gz"
+            rm -rf /tmp/lcpp && mkdir -p /tmp/lcpp && tar xzf /tmp/lcpp.tgz -C /tmp/lcpp
+            # cp -a the whole directory: the ggml libraries ship as versioned
+            # sonames with SYMLINKS beside them (libggml.so.0 -> .0.18.1), and
+            # a `find -type f` copy silently drops the symlinks. llama-server
+            # then fails to load, llama-swap answers every completion 500, and
+            # four of the five invariants pass anyway because they never need
+            # an upstream. requireUpstreamServes is what makes that red.
+            cp -a /tmp/lcpp/llama-*/. .upstream/
+          }
+          if [ ! -s .upstream/stories260K.gguf ]; then
+            curl -sSfL -o .upstream/stories260K.gguf "$MODEL_URL"
+          fi
+          chmod +x .upstream/llama-swap .upstream/llama-server
+          .upstream/llama-swap --version
+          .upstream/llama-server --version
+          du -sh .upstream
+      - name: conformance
+        env:
+          LLAMA_SWAP_BIN: ${{ github.workspace }}/.upstream/llama-swap
+          LLAMA_SERVER_BIN: ${{ github.workspace }}/.upstream/llama-server
+          LLAMA_GGUF: ${{ github.workspace }}/.upstream/stories260K.gguf
+          LD_LIBRARY_PATH: ${{ github.workspace }}/.upstream
+        run: go test -timeout 300s -v -run TestSwapContract ./internal/swaptest/

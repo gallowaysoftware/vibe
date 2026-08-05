@@ -51,6 +51,91 @@ them before pushing. (2026-07-12: a push failed CI on golangci-lint
 findings that vet+gofmt missed — the linter is part of the gate, not
 optional.)
 
+`go test -race ./...` is ~15s on a workstation. That number is an asset —
+it is why agents here run the whole gate before every push — so anything
+that pushes the blocking job past ~3 min is not worth whatever fidelity it
+buys. The llama-swap conformance work lives in SEPARATE CI jobs for
+exactly that reason.
+
+## Test doubles and upstream contracts
+
+**`internal/swaptest` is the one llama-swap double.** Stdlib only, no new
+module, `NewCell(t, WithWire(…))` serving `/running`, `/v1/models`,
+`/api/events`, `/api/metrics/activity` and the completion paths. New tests
+that need a llama-swap use it; do not hand-roll a fifty-first `httptest`
+stand-in.
+
+- **Fail toward "no evidence", never toward "confirmed idle".** A parser
+  reading an upstream contract must map a shape it does not recognise to
+  *unknown*, never to a valid-looking value. `trackInFlight` is the worked
+  example: an unrecognised inflight `operation` sets `inFlightSeen=false`,
+  which the eight busy guards (drain, suspend, probe, both warm loops, the
+  pre-drain report) already render as a refusal — because a *reported zero*
+  is a positive claim of idleness that no guard can question. This is the
+  only mechanism that protects against drift nobody noticed, and it is a
+  property of the production code, not of a test.
+- **The in-flight wire is version-dependent and the difference is not
+  cosmetic.** v239 sends the full request list on every edge; v240+ sends
+  operation-tagged DELTAS (`snapshot` / `upsert` / `remove`) with
+  `requests` omitempty and absent, so `len(requests)` reads a request
+  STARTING as an idle cell. Verified 2026-08-05 by running the fold against
+  real v239 and real v247 binaries: pre-fix code passed v239 and failed
+  v247. The fold is a SET keyed by request id, and it keeps the model per
+  id because a v247 remove edge names only an id — without that memory C4's
+  per-model activity never stamps and every `restore_after_idle` window
+  reads as never-active.
+- **A count belongs to the connection that produced it** — `clearInFlight`
+  on stream drop. llama-swap re-seeds a fresh `/api/events` connection with
+  a current-state inflight snapshot inside ~200ms (measured), so keeping the
+  old count buys nothing and can strand a busy verdict forever.
+- **Fixtures are RAW RECORDED BYTES** (`internal/swaptest/fixtures/<ver>/`),
+  captured by `TestRecord` and checked in verbatim, never re-encoded
+  production structs — a fixture that round-trips through the same json tags
+  the decoder reads cancels out a tag typo, and a field the production
+  struct omits (`resp_content_type`, `error_msg`, `has_capture`) is
+  structurally invisible. logData payloads are the one redaction (they are
+  the operator's log history); the byte lengths are kept in `RECORDED`.
+  Every fixture set carries provenance and a `caveat` if it was not captured
+  from a running binary.
+- **Re-recording is triggered by bumping a pin.** `.github/workflows/ci.yml`
+  pins the conformance matrix; whoever bumps it runs `TestRecord` and
+  commits the new `fixtures/<version>/` BESIDE the old ones. Old recordings
+  are kept, not replaced: a heterogeneous fleet is the normal state, so
+  "both wires must pass" is the requirement, not "newest wins".
+  `TestRecordingIsCurrent` fires on the box where the upgrade happened.
+- **`TestSwapContract` is ONE assertion list run against every fake wire AND
+  a real binary** (env-gated on `LLAMA_SWAP_BIN`/`LLAMA_SERVER_BIN`/
+  `LLAMA_GGUF`, never a build tag — this module has zero `//go:build` lines
+  and a tagged-out file is skipped by vet and the linter, so it rots
+  uncompiled). Assert SEMANTICS, never bytes: v247 added five fields to the
+  in-flight entry and two new frame types to the connect burst, all
+  harmless, and a byte golden would have flapped on every one.
+- **The double may not INVENT a field's value, and a conformance invariant
+  may not `t.Skip`.** Two ways a green suite lies, both found by review on
+  the pass that introduced the double. It logged `resp_content_type:
+  text/event-stream` on every chat row whether or not the client asked to
+  stream, so "streaming rows carry tokens" was satisfied by a row nobody
+  streamed — and correcting the lie turned that invariant into a green
+  SKIP. If a field's value is not something the double actually models,
+  model it (`swaptest` honours `stream`, because a real v247 logs
+  `application/json; charset=utf-8` for the same completion unstreamed);
+  and a target that fails to produce the row an invariant is about must be
+  RED, not skipped. Assertions on the double's *own* output — the `-1`
+  sentinel, the wire shape — are required of `fake/` targets and merely
+  noted on live ones: llama.cpp may legitimately not report a counter, but
+  the double has no excuse.
+- **The local rigs stay.** `scripts/fleetlab` and
+  `scripts/smoke/llama-swap/` are not made redundant by any of this — CI has
+  no GPU, no real models, no SSH, no wattmeter, and its numbers would be
+  different numbers measuring a different thing. Run them: before merging
+  anything that touches drain / suspend / warm / sleep-schedule / probe
+  semantics (the eight `InFlight` call sites); whenever the weekly
+  `drift` workflow goes red; after any llama-swap version bump on a real
+  cell, BEFORE the fleet is left unattended overnight with sleep schedules
+  armed; before a release; and when adding a new cell CLASS. **A green CI
+  suite is never evidence that a phase doc's gate passed** — those
+  transcripts are real hardware runs.
+
 ## Conventions agents tend to violate
 
 - **Stdlib first.** Reach for stdlib before adding a dep. Current
