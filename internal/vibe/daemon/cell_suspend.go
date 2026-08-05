@@ -8,6 +8,7 @@ import (
 	"connectrpc.com/connect"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 	vibev1 "github.com/gallowaysoftware/vibe/proto/vibe/v1"
 )
 
@@ -31,6 +32,17 @@ import (
 // one-writer rule — that rule is about who writes intent at FLEETD, and
 // this is the cell's record of its own state.
 func (d *Daemon) CellSuspend(ctx context.Context, req *connect.Request[vibev1.CellSuspendRequest]) (*connect.Response[vibev1.CellSuspendResponse], error) {
+	// The receiving side holds the structural refusal too. The schedule
+	// refuses the front at wiring and suspend_cell refuses it at the
+	// guard, but this repo's most repeated defect is exactly the shape
+	// where the senders check and the receiver does not — and a third
+	// caller (a script with a token, `vibe cell suspend front`) is one
+	// line away at all times. Local invocation is untouched: a human at
+	// the front box typing the verb has declared it.
+	if isRemoteInvocation(ctx) && d.cfg.Fleet.Cell == fleetcfg.FrontCell {
+		return nil, connect.NewError(connect.CodeFailedPrecondition,
+			fmt.Errorf("this daemon is the %s cell: the data plane and the control plane ride it, so a remote suspend is a total fleet outage. Suspend it at the box if that is really what you mean", fleetcfg.FrontCell))
+	}
 	if d.cfg.CellCmds.Suspend == "" {
 		return nil, connect.NewError(connect.CodeFailedPrecondition,
 			fmt.Errorf("this daemon has no suspend verb configured (cell_cmds.suspend is unset)"))

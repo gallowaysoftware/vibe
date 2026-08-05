@@ -1,13 +1,16 @@
 # C14 — sleep_schedule: the declared night, deferred by observation
 
-Status: IN REVIEW (2026-08-05), feature + adversarial-review commits.
+Status: IN REVIEW (2026-08-05), feature + self-review + second-pass +
+**adversarial-review** commits (ground rule 9's separate pass).
 Branched off [C13](c13-doctor.md). Unit gates U1–U18 green on a full
 local inner loop (`-race -count=5 ./...`, `golangci-lint run` 0 issues,
 `gofmt -l .` silent, `go mod tidy` clean); the six live gates need a real
 box that really suspends and are **NOT RUN** — the implementing
 environment cannot reach the fleet (SSH blocked, LAN does not route). The
-review pass found 4 items, all fixed and mutation-verified here — see the
-addendum at the end.
+implementer's own review found 4 items (REV-1…REV-4); the separate
+adversarial pass found 7 more (REV2-1…REV2-7), including two that would
+have taken the fleet down or paged every morning. All eleven are fixed
+and mutation-verified — see the two addenda at the end.
 
 Backlog item 9 in [fleet-control-futures.md](../fleet-control-futures.md)
 §2, Medium tier:
@@ -589,10 +592,10 @@ from the plan above and both are now reflected in the design sections:
 | U1–U18 (unit) | **PASS** — `go build ./...`, `go vet ./...`, `go test -race -count=5 ./...`, `gofmt -l .` silent, `go mod tidy` clean, `golangci-lint run` 0 issues |
 | L1–L6 (live) | **NOT RUN** — they need a box that really suspends and a real night; the implementing environment cannot reach the fleet (SSH blocked, LAN does not route) |
 
-The three review fixes below are each **mutation-verified**: the guard
+The four review fixes below are each **mutation-verified**: the guard
 was removed, the named test failed, the guard was restored.
 
-## Adversarial-review addendum (2026-08-05, 4 findings, all fixed with regression tests)
+## Self-review addendum (2026-08-05, 4 findings, all fixed with regression tests)
 
 **REV-1 — the sleep record was an unackable request, every night.**
 `SetIntent` stamps `since` at the moment it is called, which for a
@@ -657,3 +660,141 @@ cell, refused loudly at wiring.
   request resumes it. It self-heals through C3/C6's own rules, and both
   branches are pinned in
   `TestSleepSchedule_TheCellsOwnStampIsWhatPreventsTheGhostDrain`.
+
+## Adversarial-review addendum (2026-08-05, 7 findings, all fixed with regression tests)
+
+Ground rule 9's separate pass, run against the feature + self-review
+commits above. Every fix below is **mutation-verified**: the production
+change was reverted, the named test was watched to FAIL, and the change
+was restored. Two of the seven are blockers — one takes the fleet down,
+one pages the operator every morning about the thing the class table
+forbids paging about.
+
+- **REV2-1 — `vibe cell suspend` held none of the structural refusals
+  (BLOCKER).** §8 says both explicit verbs "apply the same guard", and
+  U16 says `force` "skips the policy rungs but never the structural
+  ones". `suspend_cell` did. The CLI did not: it resolved the cell's
+  daemon and called the RPC, full stop. So `vibe cell suspend front` ran
+  the front's suspend verb — the data plane and the control plane, off
+  — `vibe cell suspend laptop` put a roaming box to sleep that no packet
+  on this LAN can wake, and a cell with no `wake:` block went down with
+  no way back. The CLI is not a fleetd client, so it cannot call
+  `SuspendGuard`; it now applies the structural half itself from
+  `hosts.yaml` (front by name, class, wake path), and `--force`
+  overrides only the wake-path rung. The **receiving side** grew the
+  same refusal, because "the senders check and the receiver does not" is
+  this repo's most repeated defect and a fourth caller is always one
+  line away: a daemon whose `fleet.cell` is `front` refuses a REMOTE
+  `CellSuspend` outright. Local invocation is untouched — a human at the
+  front box typing the verb has declared it.
+  `TestCellSuspendHoldsTheStructuralRefusals`,
+  `TestCellSuspend_TheFrontRefusesARemoteSuspend`.
+- **REV2-2 — the wake alarmed for a box this schedule never suspended
+  (BLOCKER).** The wake half fires on its cron whether or not this
+  schedule is why the box is away — which is correct, the cron declared
+  it — but `failWake` did not know the difference. An `opportunistic`
+  cell switched off on Friday therefore produced, every single morning:
+  a packet, ten minutes of waiting, `wake_failed`, `slog.Error`, a
+  `fleet.wakeFailed` event and the default-ON C9 alarm. Design §4's
+  class table says an opportunistic cell's absence never alarms, ever,
+  and C9 already shipped and had to fix this exact bug. The alarm's own
+  justification is the fix: it is allowed into the default set only
+  because it is *"fleetd suspended this box and its own paired wake did
+  not bring it back"*, so it now fires only when the entry believes it
+  performed that suspend — `st.asleep`, **or** the reserved sleep record
+  was there to clear, which is what carries the fact across a fleetd
+  restart. A wake that finds nothing is still visible in `fleet_status`
+  and the log; it just is not a page.
+  `TestSleepSchedule_AWakeForABoxItNeverSuspendedDoesNotAlarm`.
+- **REV2-3 — the quiet window claimed silence fleetd was not running to
+  observe (MAJOR).** Rung 12 read the per-model activity map and, when
+  the cell had no stamp at all, *passed*. So a fleetd that came up at
+  23:29 — a container restart, a `-watch-config` reload, a crash-loop
+  recovery — saw one empty inflight frame (in-flight REPORTED zero, no
+  per-model stamp), concluded the box had been quiet for fifteen
+  minutes, and suspended the machine its operator had been using at
+  23:28. That operator is the entire reason §4 exists. C4's
+  `swapIdleFor` already measures unknown idleness from `Server.started`
+  for precisely this reason ("fleetd cannot claim silence it was not
+  running to observe"); the guard now does the same, and the deferral
+  names the missing evidence. The `cleanNight` fixture was itself the
+  tell: it asserted a clean night with *no* activity evidence, so it now
+  carries evidence of quiet (a request an hour ago) instead of an
+  absence of evidence.
+  `TestSuspendGuard_QuietWindowIsFlooredAtFleetdsOwnStart`.
+- **REV2-4 — the `observesActivity` rung cannot fire, and its test
+  asserted a different rung (MAJOR, ground rule 10).** Rung 11 is
+  reached only after rung 7 passed, and rung 7 passes only when
+  `inFlightSeen[cell]` — which is one of the two terms
+  `observesActivity` is an OR over. So rung 11 is unreachable by
+  construction. `TestSuspendGuard_NoActivityObservationChannelDefers`
+  claimed to pin it and asserted `"unknown is not zero"`, rung 7's
+  message: a name claiming more than the body proves, which is the
+  failure ground rule 10 was written for. The ladder is sound — rung 7
+  subsumes rung 11 — so the rung stays as belt-and-braces with a comment
+  saying so, and the test is renamed for what it proves and now pins the
+  **subsumption** (no observation channel ⇒ no reported count) that is
+  what actually makes the earlier rung answer first. No behaviour
+  change; the honesty is the fix.
+  `TestSuspendGuard_NoObservationChannelIsAnsweredByTheUnreportedRung`.
+- **REV2-5 — the wake's warms skipped a drained cell but not a held one
+  (MINOR).** REV-3 gave them C4's drain guard. A C11 hold is the same
+  declaration one step stronger — "fleetd must not act on its own warm
+  policy on this cell" — and a wake's declared `warm:` list is fleetd's
+  own policy. The queued half was already covered
+  (`dropHeldWarmsLocked`); this is the direct-through-the-front half,
+  and it skips on a HOLD specifically, not on any lease (C11's rule).
+  `TestSleepSchedule_WakeDoesNotWarmAHeldCell`.
+- **REV2-6 — `vibe fleet doctor` called a suspend that fails every night
+  OK (MINOR).** `checkSleep`'s default branch is right that a deferred
+  or abandoned night is the policy working (C13's rule). It also
+  swallowed `failed` — the state a suspend RPC that *errored* leaves
+  behind. The commonest cause is `cell_cmds.suspend` unset on the cell,
+  which fails identically at 23:30 every night forever while the audit
+  renders green and the box keeps drawing its 80 W. Now a WARN under its
+  own id, `sleep.suspend`, naming the likely cause; the deferred/skipped
+  control is pinned in the same test.
+  `TestDoctor_ASuspendThatFailsEveryNightIsNotOK`.
+- **REV2-7 — `suspend_cell` gave the front remediation advice (NIT).**
+  The way-back check ran ahead of the guard, and the front and
+  `always_on` cells carry no `wake:` block, so refusing them produced
+  "Add `cells.front.wake`, or pass force" — advice that reads as "then
+  it would be allowed", for a cell that may never sleep under any
+  configuration. Structural now answers first, then the way back, then
+  tonight's conditions; the ordering the doc describes is preserved for
+  the cells it was written about.
+  `TestSuspendCell_ForceNeverBypassesAStructuralRefusal`.
+
+### Looked at and deliberately left alone (adversarial pass)
+
+- **A `suspend_cell`-suspended box gets no `wake_failed` alarm either.**
+  REV2-2 keys the alarm on the schedule's own record, and the explicit
+  verb writes the operator's reason, not `SleepIntentReason`. A schedule
+  cannot distinguish "the operator suspended it with a verb" from "the
+  operator switched it off at the wall", and the class table's answer
+  when in doubt is silence.
+- **`sleep_schedule` on a cell that never announces is a bad morning,
+  and it stays refusable only by the operator.** The morning resume
+  depends entirely on C3's `desired_intent` path, so a cell with a
+  `daemon_url` but no announcer of its own would wake with its serving
+  stack stopped and no request to restart it (`SetIntent(serving)`
+  DELETES for a never-announced cell — C1's semantics). fleetd cannot
+  know at wiring time whether a cell will ever announce, and the fleet's
+  announce-only cells are `always_on`, which §1 already refuses. Noted
+  rather than guessed at.
+- **The MCP verb reports an error when the suspend succeeded but the
+  intent write failed.** That is C2's shape, shared verbatim with
+  `drain_cell` and `resume_cell`; changing it is a decision about all
+  three, not about this phase.
+- **The sleep block is guest-visible.** C12's grant is a ROUTE grant and
+  `/api/fleet/state` is on it, so a guest now reads when this house
+  sleeps. That follows C12's own rule ("anything on the fleet page is
+  guest-visible") and the alternative — a guest-shaped snapshot — is the
+  thing C9 and C12 both forbid. Flagged here because the next phase to
+  add a field to `StateSnapshot` inherits the same question.
+- **A wake sequence interrupted by `Close()` records a failed wake.**
+  `awaitCellReturn` returns on `s.done`, so a fleetd shutting down
+  mid-wake writes `wake_failed` into memory it is about to discard. It
+  is not persisted and the notifier is stopping alongside it; guarding
+  it would add a shutdown-shaped branch to a path whose correctness
+  under `-race` is currently trivial.

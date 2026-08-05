@@ -22,7 +22,7 @@ to be implementable on its own after that.
 | [C11](c11-hold-model.md) | hold_model: the pause button on the warm policy | ~450 lines | C2, C4, C5 | merged (#30); unit gates 1-11 green, 4 live gates UNRUN |
 | [C12](c12-guest-token.md) | Guest read-only token: sharing status without sharing drain | ~250 lines | C1, C5 | PR open; feature + self-review + adversarial-review commits; unit gates 1-14 (+11b) green, 3 live gates UNRUN |
 | [C13](c13-doctor.md) | `vibe fleet doctor`: the sit-down-after-two-weeks audit | ~1500 lines | C1-C12 (composition) | PR open, branched off C12; unit gates U1-U16 green, 4 live gates UNRUN |
-| [C14](c14-sleep-schedule.md) | `sleep_schedule`: the declared night, deferred by observation | ~1100 lines | C2, C3, C4, C11 | PR open, branched off C13; unit gates U1-U18 green, 6 live gates UNRUN |
+| [C14](c14-sleep-schedule.md) | `sleep_schedule`: the declared night, deferred by observation | ~1100 lines | C2, C3, C4, C11 | PR open, branched off C13; feature + self-review + adversarial-review commits (4 + 7 findings); unit gates U1-U18 green, 6 live gates UNRUN |
 
 C10 (await extensions) is the last of the three branches cut from
 `c9e8bcf` in parallel; C11 and then C9 landed ahead of it. None of the
@@ -166,7 +166,12 @@ diff for this phase is empty. The one trap worth remembering is that
 this only works because `CellSuspend` stamps the CELL's own intent
 before it freezes; without that, C3's conflict rule hands the sleep
 request back on the first heartbeat after waking and the box runs its
-own drain verb at 07:15.
+own drain verb at 07:15. Its adversarial pass found the two failure
+shapes this plan keeps producing, one of each: a guard that lived in
+only two of its three producers (`vibe cell suspend` held none of the
+structural refusals, so it could take the front down), and an alarm that
+paged about an opportunistic cell being switched off — the same
+class-table violation C9 shipped, here on a nightly cadence.
 
 A **post-merge reconciliation PR** (#26, 2026-08-03) closed the three
 items no single phase branch could reach, because each needed code from

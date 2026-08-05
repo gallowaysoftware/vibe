@@ -996,6 +996,18 @@ func (s *Server) checkSleep(rep *DoctorReport, snap StateSnapshot) {
 				Fix: "wake it by hand (`vibe cell wake " + e.Cell + "`), then find out which half failed: the packet " +
 					"(WoL disarmed in BIOS or by a driver's power management) or the box (it woke and its serving stack did not). " +
 					"Whether a NIC is armed is not observable from here — the fire drill is the test."})
+		case e.State == "failed":
+			// A deferred or abandoned night is the policy working (C13's
+			// rule) and reports OK below. A suspend that was ATTEMPTED and
+			// errored is not: the commonest cause is a cell with no
+			// cell_cmds.suspend, which fails identically every night
+			// forever while the box keeps drawing its idle watts — a
+			// permanent green on a schedule that has never once fired.
+			rep.Add(DoctorCheck{ID: "sleep.suspend", Cell: e.Cell, Level: LevelWarn,
+				Summary: "the last declared suspend of " + e.Cell + " failed",
+				Detail:  e.Detail,
+				Fix: "run `vibe cell suspend " + e.Cell + "` by hand to see the same error interactively. " +
+					"The usual cause is cell_cmds.suspend unset in that cell's config.yaml; the box keeps drawing its idle watts until it is."})
 		default:
 			sum := e.Cell + " sleeps " + e.SuspendCron + ", wakes " + e.WakeCron
 			if e.NextSuspend != nil && e.NextWake != nil {

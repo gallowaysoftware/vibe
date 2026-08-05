@@ -60,18 +60,24 @@ func (s *Server) toolSuspendCell(ctx context.Context, cell, reason string, force
 	if !ok {
 		return "", fmt.Errorf("unknown cell %q (not in hosts.yaml)", cell)
 	}
-	// The way BACK is checked before anything about tonight: nothing else
-	// in this fleet can bring a suspended box back, so "there is no wake
-	// path" is the answer the operator needs first, whatever else is also
-	// true about the cell right now.
+	block, ok := s.fleet.SuspendGuard(cell, 0)
+	// Structural first, ahead of everything — including the way back. A
+	// cell that may NEVER sleep does not want advice about its wake
+	// config: telling an operator to add `cells.front.wake` reads as
+	// "then it would be allowed", and it never is (review REV2-7).
+	if !ok && block.Structural {
+		return "", fmt.Errorf("not suspending %s: %s", cell, block.Why)
+	}
+	// Then the way BACK, ahead of anything about tonight: nothing else in
+	// this fleet can bring a suspended box back, so "there is no wake
+	// path" is the answer the operator needs before any of the reasons
+	// this particular night is a bad one.
 	if c.Wake == nil && !force {
 		return "", fmt.Errorf("cell %q has no wake: config in hosts.yaml — nothing could bring it back remotely. "+
 			"Add cells.%s.wake, or pass force if you are standing next to the box", cell, cell)
 	}
-	if block, ok := s.fleet.SuspendGuard(cell, 0); !ok {
-		if !force || block.Structural {
-			return "", fmt.Errorf("not suspending %s: %s", cell, block.Why)
-		}
+	if !ok && !force {
+		return "", fmt.Errorf("not suspending %s: %s", cell, block.Why)
 	}
 	client, err := s.cellClient(cell)
 	if err != nil {

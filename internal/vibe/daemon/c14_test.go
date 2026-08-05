@@ -222,6 +222,49 @@ func TestCellSuspend_NoStampWhenTheVerbFails(t *testing.T) {
 	}
 }
 
+// TestCellSuspend_TheFrontRefusesARemoteSuspend (review REV2-2, the
+// receiving half). The sleep schedule refuses the front at wiring time
+// and suspend_cell refuses it at the shared guard, but this repo's most
+// repeated defect is precisely the shape where the senders check and the
+// receiver does not — and a third caller with a token is one line away
+// at all times. A LOCAL invocation is untouched: a human at the front box
+// typing the verb has declared it.
+func TestCellSuspend_TheFrontRefusesARemoteSuspend(t *testing.T) {
+	newFront := func() *Daemon {
+		d := drainDaemon(t, Config{
+			CellCmds: CellCmds{Suspend: "true"},
+			Fleet:    FleetConfig{Cell: fleetcfg.FrontCell},
+		})
+		return d
+	}
+
+	d := newFront()
+	ran := false
+	d.SetCellCmdRunner(func(context.Context, string) (string, error) { ran = true; return "", nil })
+	ctx := context.WithValue(context.Background(), remoteInvocationKey{}, true)
+	_, err := d.CellSuspend(ctx, connect.NewRequest(&vibev1.CellSuspendRequest{}))
+	if connect.CodeOf(err) != connect.CodeFailedPrecondition {
+		t.Fatalf("got %v, want FailedPrecondition: a remote suspend of the front is a total fleet outage", err)
+	}
+	if !strings.Contains(err.Error(), "total fleet outage") {
+		t.Fatalf("err = %v, want the consequence named", err)
+	}
+	if ran {
+		t.Fatal("the front ran its suspend command for a remote caller")
+	}
+
+	// Local stays allowed — the operator is standing at the box.
+	d2 := newFront()
+	localRan := false
+	d2.SetCellCmdRunner(func(context.Context, string) (string, error) { localRan = true; return "", nil })
+	if _, err := d2.CellSuspend(context.Background(), connect.NewRequest(&vibev1.CellSuspendRequest{})); err != nil {
+		t.Fatalf("local suspend at the front box refused: %v", err)
+	}
+	if !localRan {
+		t.Fatal("local suspend did not run the verb")
+	}
+}
+
 // ─── the wiring's refusals ──────────────────────────────────────────────────
 
 func sleepHosts() *fleetcfg.File {

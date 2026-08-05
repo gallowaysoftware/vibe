@@ -95,10 +95,19 @@ func sleepServer(t *testing.T, class string) *Server {
 // cleanNight is the state in which every rung passes and the declared
 // suspend is CORRECT to fire: the cell announcing fresh and serving,
 // in-flight reported zero, activity observed, nothing recently used.
+//
+// The last clause is EVIDENCE of quiet, not an absence of evidence — the
+// box served something an hour ago and has been idle since. A fixture
+// with no activity stamp at all is a fleetd that has not watched long
+// enough to claim a quiet window, and the guard is required to defer on
+// it (review REV2-3).
 func cleanNight(t *testing.T, s *Server) {
 	t.Helper()
 	presenceOf(s, sleepCell)
 	s.trackInFlight(sleepCell, inflightFrame(t))
+	s.mu.Lock()
+	s.modelActivity[sleepCell+"\x00qwen"] = time.Now().Add(-time.Hour)
+	s.mu.Unlock()
 }
 
 func sleepEntry() SleepScheduleEntry {
@@ -346,22 +355,69 @@ func TestSuspendGuard_EveryRungDefersAndNamesItself(t *testing.T) {
 	}
 }
 
-// TestSuspendGuard_NoActivityObservationChannelDefers pins C4/C5's rule
-// on this path: "fleetd never looked" is not evidence of silence, and
-// the most consequential verb in the plan may not run on it.
-func TestSuspendGuard_NoActivityObservationChannelDefers(t *testing.T) {
+// TestSuspendGuard_NoObservationChannelIsAnsweredByTheUnreportedRung
+// (review REV2-4). This test used to be called
+// ...NoActivityObservationChannelDefers and asserted the UNREPORTED
+// IN-FLIGHT message — ground rule 10's exact failure, a name claiming
+// more than the body proves. The observesActivity rung cannot in fact
+// fire: it is reached only after the in-flight rung passed, and passing
+// that rung requires inFlightSeen[cell], which is one of the two things
+// observesActivity is an OR over. So the ladder is sound and the rung is
+// belt-and-braces; the test now says which rung answers, and pins the
+// subsumption that makes the other one unreachable.
+func TestSuspendGuard_NoObservationChannelIsAnsweredByTheUnreportedRung(t *testing.T) {
 	s := sleepServer(t, "opportunistic")
 	presenceOf(s, sleepCell)
-	// An announce with no inflight frame reports no count either, so
-	// reach the observation rung by handing it a reported zero without an
-	// events stream.
 	s.mu.Lock()
 	s.inFlight[sleepCell] = 0
 	s.inFlightSeen[sleepCell] = false
 	s.mu.Unlock()
+
+	if s.observesActivity(sleepCell) {
+		t.Fatal("fixture does not reach the case: fleetd has an observation channel")
+	}
 	block, ok := s.suspendGuard(sleepCell, time.Minute)
 	if ok || !strings.Contains(block.Why, "unknown is not zero") {
 		t.Fatalf("guard = (%q, %v), want the unreported-in-flight refusal", block.Why, ok)
+	}
+	// The subsumption itself: no observation channel implies no reported
+	// in-flight count, which is why the earlier rung always answers first.
+	if _, reported := s.InFlight(sleepCell); reported {
+		t.Fatal("in-flight reported without an observation channel: the two rungs have come apart and the observesActivity rung is now load-bearing")
+	}
+}
+
+// TestSuspendGuard_QuietWindowIsFlooredAtFleetdsOwnStart (review
+// REV2-3). The quiet window is a claim about a stretch fleetd was
+// WATCHING. With no request stamp for the cell the guard used to pass
+// straight through, so a fleetd restarted at 23:29 — a container
+// restart, a config reload — suspended the box its operator had been
+// using at 23:28. C4's swapIdleFor already measures unknown idleness
+// from Server.started for exactly this reason; so does this now.
+func TestSuspendGuard_QuietWindowIsFlooredAtFleetdsOwnStart(t *testing.T) {
+	s := sleepServer(t, "opportunistic")
+	presenceOf(s, sleepCell)
+	// A frame with no requests: in-flight REPORTED zero (so the earlier
+	// rungs pass) and not one per-model activity stamp.
+	s.trackInFlight(sleepCell, inflightFrame(t))
+	s.started = time.Now().Add(-time.Minute)
+
+	block, ok := s.suspendGuard(sleepCell, 15*time.Minute)
+	if ok {
+		t.Fatal("suspended on 15 minutes of silence fleetd was up for 1 of")
+	}
+	if !strings.Contains(block.Why, "was not running to observe") {
+		t.Fatalf("reason = %q, want it to name the missing evidence", block.Why)
+	}
+	if block.Structural || block.Absent {
+		t.Fatalf("block = %+v, want a plain deferral", block)
+	}
+
+	// Once fleetd HAS watched for the whole window, silence is evidence
+	// and the declared suspend fires.
+	s.started = time.Now().Add(-time.Hour)
+	if _, ok := s.suspendGuard(sleepCell, 15*time.Minute); !ok {
+		t.Fatal("still deferring after an hour of observed quiet: the floor became a permanent block")
 	}
 }
 
@@ -625,12 +681,133 @@ func TestSleepSchedule_FailedWakeIsVisibleAndAlarms(t *testing.T) {
 	}
 }
 
+// TestSleepSchedule_AWakeForABoxItNeverSuspendedDoesNotAlarm (review
+// REV2-1). The wake half fires on its cron whether or not this schedule
+// is why the box is away, and an opportunistic cell is allowed to be
+// simply switched off — design §4's class table says its absence never
+// alarms, forever. Before this fix the 07:15 wake sent its packet, found
+// nothing, and raised wake_failed + slog.Error + the event + the C9
+// alarm EVERY MORNING for as long as the box stayed off. That is the
+// same defect C9 shipped and had to fix: paging about an opportunistic
+// cell being switched off.
+//
+// The alarm's own justification is what draws the line — it is not an
+// observation of absence but "fleetd suspended this box and its own
+// paired wake did not bring it back". No suspend, no promise, no page.
+func TestSleepSchedule_AWakeForABoxItNeverSuspendedDoesNotAlarm(t *testing.T) {
+	s := sleepServer(t, "opportunistic")
+	sp, wp := &suspendProbe{}, &wakeProbe{}
+	e := sleepEntry()
+	cfg := sleepCfg(s, sp, wp, nil)
+	// No sleep record and st.asleep false: the operator switched the box
+	// off on Friday and it is Saturday morning.
+	events := subscribeHub(s)
+	st := &sleepScheduleState{Cell: sleepCell, WakeCron: wakeCronSpec}
+	s.sleepStates = append(s.sleepStates, st)
+	s.wg.Add(1)
+	s.runWakeSequence(e, st, cfg)
+
+	got := sleepStateOf(s, st)
+	if got.WakeFailedSince != nil {
+		t.Fatalf("state = %+v, want no wake_failed record: this schedule never suspended the box", got)
+	}
+	if conds := s.notifyConditions(StateSnapshot{Sleep: s.sleepReport()}); len(conds) != 0 {
+		t.Fatalf("alarm conditions = %+v, want none — the class table forbids paging on an opportunistic cell's absence", conds)
+	}
+	if waitForEventFast(events, EventWakeFailed) {
+		t.Fatal("fleet.wakeFailed raised for a box this schedule did not suspend")
+	}
+	// It is still VISIBLE: silence would be the other failure.
+	if !strings.Contains(got.Detail, "did not come back") || !strings.Contains(got.Detail, "did not suspend it") {
+		t.Fatalf("detail = %q, want the wake and the reason it is not a fault both named", got.Detail)
+	}
+	// And the packet still went out: the cron declared the wake.
+	if calls, _ := wp.got(); len(calls) != 1 {
+		t.Fatalf("wake calls = %v, want the declared wake still sent", calls)
+	}
+}
+
+// TestSleepSchedule_WakeDoesNotWarmAHeldCell (review REV2-5). REV-3 gave
+// the wake's warms C4's drain guard; a C11 hold is the same declaration
+// one step stronger — "fleetd must not act on its own warm policy on
+// this cell" — and the wake's declared warms are fleetd's own policy.
+// The queued half was already covered (dropHeldWarmsLocked); this is the
+// direct-through-the-front half.
+func TestSleepSchedule_WakeDoesNotWarmAHeldCell(t *testing.T) {
+	s := sleepServer(t, "opportunistic")
+	sp, wp, warm := &suspendProbe{}, &wakeProbe{}, &warmProbe{}
+	e := sleepEntry()
+	e.Warm = []string{"qwen"}
+	cfg := sleepCfg(s, sp, wp, warm)
+	presenceOf(s, sleepCell)
+	if _, err := s.SetHold(sleepCell, "challenger", "evaluating", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	st := &sleepScheduleState{Cell: sleepCell}
+	s.wg.Add(1)
+	s.runWakeSequence(e, st, cfg)
+
+	if got := warm.got(); len(got) != 0 {
+		t.Fatalf("warmed %v onto a held cell", got)
+	}
+	if d := sleepStateOf(s, st).Detail; !strings.Contains(d, "warms skipped") || !strings.Contains(d, "held") {
+		t.Fatalf("detail = %q, want the hold named as the skip reason", d)
+	}
+}
+
+// TestDoctor_ASuspendThatFailsEveryNightIsNotOK (review REV2-6). A
+// deferred or abandoned night is the policy working and reports OK
+// (C13's rule). A suspend that was ATTEMPTED and errored is a different
+// thing: the commonest cause is cell_cmds.suspend unset on the cell, and
+// that fails identically every night forever while the audit stays
+// green and the box keeps drawing its idle watts.
+func TestDoctor_ASuspendThatFailsEveryNightIsNotOK(t *testing.T) {
+	s := sleepServer(t, "opportunistic")
+	rep := DoctorReport{}
+	s.checkSleep(&rep, StateSnapshot{Sleep: &sleepStatus{Entries: []sleepScheduleState{
+		{Cell: sleepCell, SuspendCron: suspendCron, WakeCron: wakeCronSpec, State: "failed",
+			Detail: "suspend failed: failed_precondition: this daemon has no suspend verb configured (no intent recorded; the paired wake still fires)"},
+	}}})
+	if len(rep.Checks) != 1 || rep.Checks[0].Level != LevelWarn {
+		t.Fatalf("checks = %+v, want one WARN", rep.Checks)
+	}
+	if rep.Checks[0].ID != "sleep.suspend" {
+		t.Fatalf("id = %q, want sleep.suspend (the check names what it proves)", rep.Checks[0].ID)
+	}
+
+	// The control: a night that merely deferred is not a fault.
+	rep = DoctorReport{}
+	s.checkSleep(&rep, StateSnapshot{Sleep: &sleepStatus{Entries: []sleepScheduleState{
+		{Cell: sleepCell, SuspendCron: suspendCron, WakeCron: wakeCronSpec, State: "skipped",
+			Detail: "abandoned after the defer window (cell gpu-cell has 2 in-flight)"},
+	}}})
+	if len(rep.Checks) != 1 || rep.Checks[0].Level != LevelOK {
+		t.Fatalf("checks = %+v, want OK for a box that was genuinely busy", rep.Checks)
+	}
+}
+
 func subscribeHub(s *Server) chan Event {
 	ch := make(chan Event, 32)
 	s.mu.Lock()
 	s.subs[ch] = struct{}{}
 	s.mu.Unlock()
 	return ch
+}
+
+// waitForEventFast is waitForEvent for the negative assertion: the
+// event either already sat in the buffer (publish is synchronous into
+// the subscriber channel) or it is not coming.
+func waitForEventFast(ch chan Event, want string) bool {
+	for {
+		select {
+		case ev := <-ch:
+			if ev.Type == want {
+				return true
+			}
+		default:
+			return false
+		}
+	}
 }
 
 func waitForEvent(ch chan Event, want string) bool {

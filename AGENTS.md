@@ -992,6 +992,37 @@ optional.)
   - **`force` is about tonight's conditions, never configuration.** It
     skips the policy rungs and the cell's `require_idle` proof (an
     operator asking is not fleetd guessing) and skips nothing structural.
+  - **All THREE producers hold the structural refusals, including the
+    receiving side** (the adversarial-review pass; the CLI held none of
+    them, so `vibe cell suspend front` was a fleet outage and
+    `vibe cell suspend <roaming>` was an unwakeable box). The schedule
+    refuses at wiring, `suspend_cell` at `SuspendGuard`,
+    `cli.suspendPreflight` from `hosts.yaml` — and a daemon whose
+    `fleet.cell` is `front` refuses a REMOTE `CellSuspend` outright,
+    because "the senders check and the receiver does not" is this repo's
+    most repeated defect. Local invocation stays allowed: a human at the
+    front box has declared it. Structural is also answered FIRST, ahead
+    of the missing-wake-path message — telling an operator to add
+    `cells.front.wake` reads as "then it would be allowed".
+  - **`wake_failed` fires only for a suspend THIS schedule performed.**
+    The wake half runs on its cron whether or not the schedule is why
+    the box is away, so without the scope an `opportunistic` cell
+    switched off pages every single morning — the one thing design §4's
+    class table forbids outright, and the bug C9 already shipped once.
+    The test is `st.asleep` OR the reserved sleep record being there to
+    clear (that record is what carries the fact across a fleetd
+    restart). A wake that finds nothing is visible, never a page.
+  - **The quiet window is floored at `Server.started`** (C4's
+    `swapIdleFor` rule, verbatim): with no per-model activity stamp for
+    the cell, idle is measured from fleetd's own boot, because a fleetd
+    that came up at 23:29 must not conclude the box has been quiet since
+    23:15. The `observesActivity` rung is unreachable — rung 7 (`in-flight
+    unreported`) subsumes it, since passing rung 7 requires
+    `inFlightSeen[cell]` — and it stays as belt-and-braces with the
+    subsumption test-pinned; do not let a test claim to exercise it.
+  - The wake's declared warms skip a declared drain AND a C11 hold, and
+    doctor's `sleep.suspend` is a WARN when the last suspend ERRORED (a
+    deferred or abandoned night stays OK — that is the policy working).
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.

@@ -34,8 +34,17 @@ func TestSuspendCell_ForceNeverBypassesAStructuralRefusal(t *testing.T) {
 	s, _ := newTestFacade(t, suspendCells(fake.srv.URL), nil)
 	for _, cell := range []string{fleetcfg.FrontCell, "heavy", "typo"} {
 		for _, force := range []bool{false, true} {
-			if _, err := s.toolSuspendCell(t.Context(), cell, "goodnight", force); err == nil {
+			_, err := s.toolSuspendCell(t.Context(), cell, "goodnight", force)
+			if err == nil {
 				t.Fatalf("%s (force=%v) was suspended", cell, force)
+			}
+			// Review REV2-7: the reason must be the structural one. The
+			// front and always_on cells carry no wake: block, so the
+			// way-back check used to answer first and told the operator to
+			// add `cells.front.wake` — advice that reads as "then it would
+			// be allowed", for a cell that may never sleep.
+			if cell != "typo" && strings.Contains(err.Error(), "Add cells.") {
+				t.Fatalf("%s (force=%v) refused with wake-config advice: %v", cell, force, err)
 			}
 		}
 	}

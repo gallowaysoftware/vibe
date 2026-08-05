@@ -442,12 +442,20 @@ func (s *Server) runWakeSequence(e SleepScheduleEntry, st *sleepScheduleState, c
 		s.mu.Unlock()
 	}()
 
+	// Whether THIS schedule is why the box is away decides one thing only:
+	// whether a wake that does not deliver may alarm. The packet is sent
+	// either way — the cron declared it.
+	s.mu.Lock()
+	ours := st.asleep
+	s.mu.Unlock()
+
 	// The clear goes FIRST, before the packet. A box that comes back to
 	// find fleetd still requesting `drained` receives that request as
 	// desired_intent on its first heartbeat and runs its own
 	// cell_cmds.drain — a morning with the box powered on and the serving
 	// stack stopped.
 	cleared := s.clearSleepIntent(e.Cell)
+	ours = ours || cleared
 	var notes []string
 	if cleared {
 		notes = append(notes, "sleep intent cleared (resume requested)")
@@ -461,25 +469,31 @@ func (s *Server) runWakeSequence(e SleepScheduleEntry, st *sleepScheduleState, c
 	} else {
 		how, err := cfg.wakeFn(ctx, e.Cell)
 		if err != nil {
-			s.failWake(st, "wake could not be sent: "+err.Error())
+			s.failWake(st, strings.Join(append(notes, "wake could not be sent: "+err.Error()), "; "), ours)
 			return
 		}
 		notes = append(notes, "wake sent ("+how+")")
 	}
 
 	if !s.awaitCellReturn(ctx, e.Cell, e.WakeGrace, cfg.poll) {
-		s.failWake(st, strings.Join(append(notes, fmt.Sprintf("cell did not come back within %s", e.WakeGrace)), "; "))
+		s.failWake(st, strings.Join(append(notes, fmt.Sprintf("cell did not come back within %s", e.WakeGrace)), "; "), ours)
 		return
 	}
 	notes = append(notes, "cell returned")
 
 	// The wake fires whether or not this schedule was the reason the box
-	// was away, so the warms take C4's drain guard: warming a cell the
-	// operator has declared drained is the eviction fight the whole warm
-	// policy exists to avoid, and at 07:15 nobody is watching.
-	if in, drained := s.effectiveIntent(e.Cell); drained && in.State == "drained" {
+	// was away, so the warms take the same guards the warm loops take: a
+	// declared drain (C4 §1's eviction fight, at an hour when nobody is
+	// watching) and a C11 hold, which is the operator's declaration that
+	// fleetd must not act on its own warm policy on this cell at all.
+	in, drained := s.effectiveIntent(e.Cell)
+	h, held := s.HoldOn(e.Cell)
+	switch {
+	case drained && in.State == "drained":
 		notes = append(notes, "warms skipped: cell is drained ("+in.Reason+")")
-	} else {
+	case held:
+		notes = append(notes, "warms skipped: "+holdDetail(h))
+	default:
 		for _, m := range e.Warm {
 			notes = append(notes, s.wakeWarm(ctx, e.Cell, m, cfg))
 		}
@@ -514,18 +528,37 @@ func (s *Server) wakeWarm(ctx context.Context, cell, model string, cfg sleepLoop
 	return "warm " + model + " " + note
 }
 
-// failWake records the one thing in this phase that alarms. A wake that
-// silently fails is a morning with no fleet, so it is loud in four
-// places: the status, an ERROR log, an event, and C9's KindWakeFailed.
-func (s *Server) failWake(st *sleepScheduleState, detail string) {
+// failWake records a wake that did not deliver. `ours` is what decides
+// whether it may ALARM, and the distinction is the alarm's whole
+// justification: the class table says an opportunistic cell's absence
+// never pages, forever, so the only thing this phase is allowed to page
+// about is a suspend THIS schedule performed whose paired wake did not
+// bring the box back — a promise the control plane made and broke.
+//
+// A wake that fires on its cron against a box nobody here suspended (the
+// operator switched it off on Friday) found an absence, and an absence
+// of that class is not a fault. It stays visible in fleet_status and the
+// log; it does not page, does not set wake_failed_since, and does not
+// raise the event. C9 shipped exactly this bug once already — an alarm
+// on an opportunistic cell being switched off — and this one would have
+// fired every single morning.
+func (s *Server) failWake(st *sleepScheduleState, detail string, ours bool) {
 	now := time.Now().UTC()
 	s.mu.Lock()
+	cell := st.Cell
+	if !ours {
+		st.State = "skipped"
+		st.Detail = detail + " — this schedule did not suspend it (an opportunistic cell may simply be off)"
+		st.LastSkip = st.Detail
+		s.mu.Unlock()
+		slog.Info("scheduled wake found nothing to bring back", "cell", cell, "detail", detail)
+		return
+	}
 	if st.WakeFailedSince == nil {
 		st.WakeFailedSince = &now
 	}
 	st.LastWake = &now
 	st.State, st.Detail = "wake_failed", detail
-	cell := st.Cell
 	s.mu.Unlock()
 	slog.Error("scheduled wake did not bring the cell back", "cell", cell, "detail", detail)
 	s.publish(Event{Cell: cell, Type: EventWakeFailed})
@@ -639,13 +672,28 @@ func (s *Server) suspendGuard(cell string, quietFor time.Duration) (SuspendBlock
 	if models := s.pendingProbes(cell); len(models) > 0 {
 		return policy("a probe of %s on %s is outstanding — fleetd asked for that measurement", strings.Join(models, ","), cell)
 	}
+	// Defence in depth only: reaching here means the in-flight rung above
+	// already saw a frame from this cell, which is itself an observation
+	// channel, so observesActivity cannot currently be false here. It
+	// stays because the day in-flight becomes derivable from a second
+	// source is the day this rung matters again — and it is cheap.
 	if !s.observesActivity(cell) {
 		return policy("no activity evidence for %s (no events stream) — fleetd never looked, which is not the same as saw nothing", cell)
 	}
+	// The quiet window is a claim about a stretch fleetd was WATCHING, so
+	// with no request stamp for this cell it measures from fleetd's own
+	// start — C4's swapIdleFor rule verbatim, and for the same reason:
+	// fleetd cannot claim silence it was not running to observe. Without
+	// the floor a fleetd restarted at 23:29 reads "quiet forever" and
+	// suspends the box its operator was using at 23:28, which is exactly
+	// the human this window exists for.
 	if last, ok := s.cellLastActivity(cell); ok {
 		if idle := time.Since(last); idle < quietFor {
 			return policy("cell %s served a request %s ago (quiet window %s)", cell, idle.Round(time.Second), quietFor)
 		}
+	} else if watched := time.Since(s.started); watched < quietFor {
+		return policy("no request activity on record for %s and fleetd has only been watching for %s (quiet window %s) — it cannot claim silence it was not running to observe",
+			cell, watched.Round(time.Second), quietFor)
 	}
 	return SuspendBlock{}, true
 }
