@@ -516,10 +516,22 @@ weakened):
 
 **Gate results.**
 
-1. Probe-evidence gate (live) — **NOT RUN** (needs a real cell whose
-   announcer can be killed while llama-swap keeps serving).
-2. Drain-reason gate (live) — **NOT RUN** (needs a real drain plus a
-   fleetd restart).
+1. Probe-evidence gate (live) — **PASS (2026-08-05, local multi-cell
+   harness — [`scripts/fleetlab`](../../../scripts/fleetlab/README.md)).**
+   All three announcers SIGKILLed at once (two slim `vibe fleet announce`,
+   one in-daemon loop) with every llama-swap left serving. Staleness
+   landed at t+40–50 s and each cell then read `stale=true` but
+   `reachable=true host_reachable=true display=SERVING` — the announce
+   was retired, the probe was not — and `vibe cell await alpha --up`
+   returned on the probe alone. This is the substitution the design
+   asks for: a cell whose announcer is dead while its llama-swap serves.
+2. Drain-reason gate (live) — **PASS (2026-08-05, same harness).**
+   `drain_cell {cell: bravo, reason: …, eta: …}` through fleetd against
+   bravo's real cell daemon. Pre-ack the display was `INCONSISTENT`; the
+   ack landed at seq 25 and the intent was re-stored with
+   `intent.since == echo.since` to the nanosecond — the equality the
+   reason/ETA survival depends on. Reason and ETA then survived three
+   further heartbeats and a fleetd restart.
 3. Fingerprint-steady-state gate — PASS, as
    `TestRenderLoop_SteadyStateFingerprintDriftEnforced` (drift with an
    identical id set on an `always_on` cell ⇒ event + strict exclusion)
@@ -532,8 +544,12 @@ weakened):
    waiting for fleet.cellStale"). Predicate restored; suite green.
 5. Wait-status gate — PASS at unit level
    (`TestCellDrain_WaitSkipIsReported`, `TestPrintDrainReport_WaitStatus`,
-   `TestMCPDrainCellReportsSkippedWait`). The end-to-end run against a
-   real cell is folded into gate 2's live session.
+   `TestMCPDrainCellReportsSkippedWait`), and the end-to-end run landed
+   in the same 2026-08-05 harness session as gate 2:
+   `vibe cell drain bravo --wait 15s --reason 'gate 4a'` reported
+   `resident at drain: lab-embed-b / in-flight requests at drain: 0 /
+   waited for in-flight requests to reach zero before draining` — the
+   wait status printed from a real cell's real in-flight counter.
 6. Full inner loop — PASS, including `buf generate` for
    `CellDrainResponse.wait_status`.
 7. Adversarial self-review — PASS, landed as its own `review:` commit;

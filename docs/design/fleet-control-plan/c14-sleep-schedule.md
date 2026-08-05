@@ -4,9 +4,13 @@ Status: IN REVIEW (2026-08-05), feature + self-review + second-pass +
 **adversarial-review** commits (ground rule 9's separate pass).
 Branched off [C13](c13-doctor.md). Unit gates U1–U18 green on a full
 local inner loop (`-race -count=5 ./...`, `golangci-lint run` 0 issues,
-`gofmt -l .` silent, `go mod tidy` clean); the six live gates need a real
-box that really suspends and are **NOT RUN** — the implementing
-environment cannot reach the fleet (SSH blocked, LAN does not route). The
+`gofmt -l .` silent, `go mod tidy` clean); all six live gates are still
+**NOT RUN**. Re-assessed 2026-08-05 against the local multi-cell harness
+that ran most of the plan's other live gates
+([`scripts/fleetlab`](../../../scripts/fleetlab/README.md)): **four of
+the six genuinely need metal** — a box that enters S3, a wattmeter, a
+magic packet on a real NIC, a BIOS switch — and two (L3, L4) do not and
+are simply owed. The
 implementer's own review found 4 items (REV-1…REV-4); the separate
 adversarial pass found 7 more (REV2-1…REV2-7), including two that would
 have taken the fleet down or paged every morning. All eleven are fixed
@@ -548,7 +552,7 @@ and two cron evaluators in one package is how one of them silently rots.
   fleetd-route-list test extended with no new route (this phase adds
   none).
 
-### Live gates (need a real box that really suspends; NOT RUN here)
+### Live gates (four need a real box that really suspends; all NOT RUN — see the [gate table](#gates))
 
 - **L1 — one real night.** `gpu-cell` suspends at the declared minute
   with nothing running, and `fleet_status` shows OFF with
@@ -590,7 +594,19 @@ from the plan above and both are now reflected in the design sections:
 | gate | result |
 |---|---|
 | U1–U18 (unit) | **PASS** — `go build ./...`, `go vet ./...`, `go test -race -count=5 ./...`, `gofmt -l .` silent, `go mod tidy` clean, `golangci-lint run` 0 issues |
-| L1–L6 (live) | **NOT RUN** — they need a box that really suspends and a real night; the implementing environment cannot reach the fleet (SSH blocked, LAN does not route) |
+| L1 (one real night) | **NOT RUN — needs metal.** Two physical facts, not one: a box that actually enters S3 and comes back, and a wattmeter on its cord. The *schedule* half is separable and locally runnable — `cell_cmds.suspend` is a declared command, so a harness cell can point it at a no-op and the fire/defer decision can be watched end to end (`scripts/fleetlab` writes exactly such a stub) — but "suspends at the declared minute" and "measure the wall draw before and after" are the gate, and neither is simulable. |
+| L2 (the wake) | **NOT RUN — needs metal.** A magic packet on a real NIC reaching a powered-off machine, and that machine's BIOS/firmware honouring it. Loopback has no equivalent: there is nothing to wake. |
+| L3 (the operator at 23:29) | **NOT RUN, but no metal needed.** Runnable on `scripts/fleetlab` today: a real request at a lab cell creates a real inflight frame, the guard ladder reads the same counter it reads in production, and the stub suspend command makes the *decision* observable without suspending anything. Not attempted for session time. |
+| L4 (the mid-batch night) | **NOT RUN, but no metal needed.** Same shape as L3 with a lease held across the window; the lease and the guard are both fleetd-side. The one thing a lab cannot compress is the "all night" part — the deferral loop would have to be watched for the real duration or the schedule shortened, which weakens the gate slightly. |
+| L5 (the wake that fails) | **NOT RUN — needs metal.** A BIOS switch to disarm, and a real night to fail across. |
+| L6 (the drill) | **NOT RUN — needs metal.** A real box to suspend and wake, from a phone. |
+
+**Assessment (2026-08-05).** The 2026-08-05 harness run moved most of
+the plan's live gates off "needs the real fleet" by observing that they
+needed a second *cell*, not a second *box*. C14 is the phase where that
+observation genuinely does not apply: four of its six gates are about a
+machine's power state, which no number of processes on one box can
+stand in for. L3 and L4 are the exceptions and are owed.
 
 The four review fixes below are each **mutation-verified**: the guard
 was removed, the named test failed, the guard was restored.

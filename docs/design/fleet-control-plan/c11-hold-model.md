@@ -3,9 +3,11 @@
 Status: MERGED (2026-08-04) via PR #30, feature + adversarial-review
 commits. Unit gates 1–11 green on a full local inner loop
 (`-race -count=5 ./...`, `golangci-lint run` 0 issues, `gofmt -l .`
-silent, `go mod tidy` clean); the 4 live gates need real cells and are
-**NOT RUN** — neither the implementing nor the reviewing environment can
-reach the fleet (SSH blocked, LAN does not route). The independent
+silent, `go mod tidy` clean). Live gates **L1 and L4 PASSED on
+2026-08-05** and **L3 is PARTIAL**, all against the local multi-cell
+harness ([`scripts/fleetlab`](../../../scripts/fleetlab/README.md)) —
+real cells, real llama-swap residency, a real fleetd restart. L2 is
+unrun and needs no hardware. The independent
 review pass (ground rule 9) found 6 further items, all fixed and
 mutation-verified here — see the addendum at the end.
 
@@ -321,7 +323,7 @@ while looking like it does.
     `go test -race -count=5 ./...`, `golangci-lint run` — plus ground
     rule 9's adversarial self-review as its own commit.
 
-### Live gates (need real cells; NOT runnable from the implementing environment)
+### Live gates (need real cells — a second *cell*, not a second box; see the results at the end)
 
 L1. **The lunch test.** On the reference fleet: a warm target with a
     short `restore_after_idle`, a challenger warmed through the front,
@@ -426,9 +428,52 @@ and the named test observed to fail:
 | leak a hold into `CellSnapshot.Display` | `TestHold_DoesNotTouchAvailabilityIntentOrTheRender` |
 | delete the endpoint's `validateHoldRequest` call | `TestHold_ValidationRejectsBadTargetsAndDurations` (3 subtests) |
 
-Live gates L1–L4: **NOT RUN.** The implementing environment cannot
-reach the fleet (SSH blocked, the LAN does not route), and a fabricated
-hardware transcript is worse than an honest gap.
+Live gates, run 2026-08-05 against the local multi-cell harness
+([`scripts/fleetlab`](../../../scripts/fleetlab/README.md)) — a real
+fleetd with a configured warm target (`alpha/lab-chat`,
+`restore_after_idle: 2m`) against a real llama-swap cell:
+
+- **L1 — the lunch test: PASS.** With `lab-chat` resident and owned by
+  the warm target, a challenger (`lab-embed-a`) was loaded through the
+  cell, evicting it, and then held: `vibe cell hold alpha lab-embed-a
+  --for 30m --note "C11 L1 lunch test"`. For the next **4 minutes** —
+  twice the restore window, sampled every 20 s — the challenger stayed
+  `ready`, the default was **never** restored, and the warm target read
+  `{"state":"skipped","detail":"held: lab-embed-a, 30m left (C11 L1
+  lunch test)"}` with the remaining time counting down correctly
+  (30m → 26m). On `--release` the restore fired on the next evaluation:
+  `lab-chat` was `starting` within 10 s and the state became
+  `{"state":"holding","detail":"restored (swap idle 2m15s)"}`. The CLI's
+  own refusal text is the design's, verbatim: *not a pin: llama-swap's
+  own TTL can still unload the model — the hold only stops fleetd
+  causing it.*
+- **L2 — hold is not a pin: NOT RUN.** Runnable on the harness (set a
+  cell's llama-swap TTL below the hold and wait it out); not attempted,
+  because it costs a TTL window of wall clock and asserts a limitation
+  rather than a feature. No hardware involved.
+- **L3 — inheritance: PARTIAL.** The probe half ran and passes: with a
+  hold active, `probe_model {cell: alpha, model: lab-chat}` answered
+  `No probe issued: alpha is held: lab-chat, 10m left (C11 L3
+  inheritance).` and carried the previous measurement forward rather
+  than inventing one — the C8 guard reached by a C11 lease, which is
+  exactly what the gate is for. The `warm_schedule` half was not run
+  (the lab fleetd had no schedule configured at the time).
+- **L4 — survives a fleetd restart: PASS.** With a 30 m hold standing,
+  fleetd was SIGTERMed and restarted. `GET /api/fleet/leases` returned
+  the hold with `expires_at` **identical to the nanosecond**
+  (`2026-08-05T12:55:39.9060625Z` before and after), the warm target
+  went `waiting/watching` for one tick and then back to `skipped / held:
+  lab-embed-a, 26m left` — the correct remaining time — and it kept
+  suppressing for a further 2 minutes of sampling with the challenger
+  still resident.
+
+**One cosmetic observation, not filed as a bug.** In the 10 s sample
+immediately after `--release`, residency already showed `lab-chat
+starting` while the warm block still read `skipped / held: …`. The warm
+state is written after the restore's HTTP call returns, so during an
+in-flight restore the status shows the *previous* evaluation's reason.
+It self-corrects on the next tick and never misreports a completed
+action.
 
 ### Adversarial self-review (ground rule 9)
 

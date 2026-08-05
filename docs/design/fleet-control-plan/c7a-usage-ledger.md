@@ -395,18 +395,43 @@ with. Unset keeps the old behavior exactly.
 
 | gate | result |
 |---|---|
-| 1. Store gate (24 h soak) | **NOT RUN** — live, needs real cells |
-| 2. No-double-count | unit half **PASS** (`TestUsageFold_FrontCellIsSkippedStructurallyByName`); live half **NOT RUN** |
-| 3. Cache semantics | unit half **PASS** (`TestClassify_ChatAddsCacheAndEmbedDoesNot`, `TestClassify_NegativeCacheSentinelClampsToZero`); live half **NOT RUN** |
-| 4. Unmeasured | unit half **PASS** (`TestClassify_ZeroTokenTwoHundredIsUnmeasuredNotZero`, `TestClassify_NonTwoHundredIsErrorAndContributesNothing`); live half **NOT RUN** |
-| 5. Self-traffic | unit half **PASS** (`TestClassify_OneTokenChatRowIsAPokeExcludedFromBillableSums`); live half **NOT RUN** |
-| 6. Offline | unit analogue **PASS** (cumulative totals + `TestUsageLedger_FlushAndReplayAreIdempotent`); live **NOT RUN** |
+| 1. Store gate (24 h soak) | **PARTIAL** — the §0 claim ran compressed on the local multi-cell harness 2026-08-05: 1200 embeddings driven at one cell in 23 s took `/api/metrics/activity` `total` from 21 to 1221 and sqlite `min(id),max(id)` to `1 / 1221` — nothing pruned, so `store: {path:}` genuinely retires the 1000-row in-memory ring. A `swapctl stop`/`start` kept `total` and both ids. **The 24 h duration itself was not spanned**; nothing physical blocks it. |
+| 2. No-double-count | unit half **PASS** (`TestUsageFold_FrontCellIsSkippedStructurallyByName`); live half **PARTIAL** — 12 embeddings client → front → bravo: the front's own llama-swap logged all 12 (`total` 4 → 16) and bravo's ledger row moved exactly +12 req / +72 tokens, once, with `/api/fleet/usage` carrying **zero** front-attributed rows across 60 s of sampling and `grep -c '"cell":"front"' usage.jsonl` = 0. The harness front is a bare llama-swap with no collector, so the skip-by-name guard was proved by outcome rather than by driving front-collected rows into the fold — that half stays on the unit test. |
+| 3. Cache semantics | unit half **PASS** (`TestClassify_ChatAddsCacheAndEmbedDoesNot`, `TestClassify_NegativeCacheSentinelClampsToZero`); live half **PASS** — same 596-token prompt twice: run 1 `prompt_n=596 cache_n=0`, run 2 `prompt_n=1 cache_n=595`. Ledger delta over the pair `req +2, in_fresh +597, in_cached +595, out +28` — run 2 billed 596 input, not 1, avoiding a 596× undercount. An embedding on the same cell wrote `cache_tokens=-1` and folded as `basis=embed, in_cached=0`. |
+| 4. Unmeasured | unit half **PASS** (`TestClassify_ZeroTokenTwoHundredIsUnmeasuredNotZero`, `TestClassify_NonTwoHundredIsErrorAndContributesNothing`); live half **PARTIAL** — the error branch ran: two over-context chats returned 400, llama-swap wrote rows with status 400 and all token fields 0, and the ledger moved `err_req 10 → 12` with every token sum unchanged. The **cancelled-stream** branch could not be produced: SIGKILLing a client 3 s into a stream still left this llama-server build reporting `timings`, so the row metered normally (`status 200, output_tokens 32`) and `unmeasured_req` stayed 0. That is an upstream-build property, not a vibe defect — the branch needs a server that omits `timings` on abort. |
+| 5. Self-traffic | unit half **PASS** (`TestClassify_OneTokenChatRowIsAPokeExcludedFromBillableSums`); live half **PARTIAL** — the configured warm target's real 1-token completions were classified `poke_req` (reaching 5) with zero contribution to `req`/`in_fresh`/`in_cached`/`out`, and the arithmetic reconciles exactly against llama-swap's own totals (66 input / 24 cache / 3 output accounted for entirely by 3 pokes). Not exercised: a poke that is *not* one token, and probe traffic as a second self-traffic producer. |
+| 6. Offline | unit analogue **PASS** (cumulative totals + `TestUsageLedger_FlushAndReplayAreIdempotent`); live **PASS**, both halves — (a) whole cell down: 30 requests seeded (ledger 34 req / 212 tok, matching llama-swap's own stats), announcer SIGKILLed and llama-swap stopped for 100 s (fleetd showed `DRAINED?`, `reachable=false`), ledger frozen while offline and **still** 34/212 after the cell returned and announced five more times — no replay. (b) fleetd blind while the cell serves: the same reconcile, with no double count on return. |
 | 7. Restart idempotency | **PASS** (`TestUsageLedger_FlushAndReplayAreIdempotent`, incl. the kill-between-fold-and-flush case) |
-| 8. Epoch | unit half **PASS** (`TestPoll_IDResetMintsANewEpochAndReingests`, `TestUsageFold_SameEpoch*`, `TestUsageFold_NewEpochStartsANewRowAndKeepsTheOld`); live half (restart a cell's llama-swap on an in-memory store) **NOT RUN** |
+| 8. Epoch | unit half **PASS** (`TestPoll_IDResetMintsANewEpochAndReingests`, `TestUsageFold_SameEpoch*`, `TestUsageFold_NewEpochStartsANewRowAndKeepsTheOld`); live half **PASS** — cursor `last_row_id=1221`, epoch `b18eade6`, fleetd row 1221 req / 8034 tok; the `store:` block deleted and the llama-swap restarted so ids restarted at 1; five requests produced ids 1–5, the collector minted epoch `12705ad1` with `last_row_id=5, lost_rows=0`, and `/api/fleet/usage` then carried **two** rows for the same `(cell, model, basis)` — the old epoch preserved, the new one accumulating. Exactly the designed behaviour. |
 | 9. Timezone | **PASS** (`TestUsageDayKey_SplitsAtLocalMidnightNotUTCMidnight`, `TestUsageDayKey_HandlesBothDSTDiscontinuities`, `TestNoTruncateBasedDayBucketing` — the grep now walks the whole module, not two directories; see the review addendum) |
 | 10. MTP | **PASS** (`TestClassify_DraftTokensNeverEnterAnySum`) |
 | 11. Streaming contract | **PASS** — `git diff --stat internal/vibe/proxy/` empty; `git diff -- '*.go' \| grep -c stream_options` = 0 across the phase. Stated precisely: the phrase occurs exactly once in the whole diff, in the row above this one, naming the gate. Zero code occurrences. |
 | 12. Inner loop + review | **PASS** — build / vet / gofmt / mod tidy / `test -race -count=5 ./...` / `golangci-lint run` (0 issues), all re-run on the tree after the second review pass |
+
+### Live gate run (2026-08-05, local multi-cell harness)
+
+Gates 1–6 and 8 ran against
+[`scripts/fleetlab`](../../../scripts/fleetlab/README.md) — four real
+llama-swap v239 cells, each with this section's `store: {path:}` block
+merged in through `vibe router render --extras`, which is the config
+production does not have yet. Volumes are small and models are CPU
+embeddings; every arithmetic claim above reconciles against llama-swap's
+own `/api/metrics/stats`, but no claim about a *week* of real traffic is
+made.
+
+**One defect found, and it is the mirror of the epoch rule gate 8
+verifies.** `usagemeter.go:479` guards the id reset in one direction
+only: `maxID < cursor` means "the store restarted, mint an epoch".
+There is no guard for ids jumping *up* into a different store's history.
+Observed live: after the gate-8 sequence above, restoring the `store:`
+block and restarting made llama-swap serve the old 1221 rows again;
+`maxID=1221 > cursor=5` is indistinguishable from "new rows arrived", so
+rows 6–1221 were ingested a second time under the new epoch and fleetd
+held both `b18eade6` (1221 req) and `12705ad1` (1221 req) for 1221 real
+requests. The trigger is narrow and operator-inflicted (removing then
+restoring the store path) and llama-swap exposes no store identity to
+key on, so this may be WONTFIX — but the comment at `:476-478` describes
+only the downward case, and the upward one silently double counts.
 
 ### Adversarial self-review (ground rule 9)
 

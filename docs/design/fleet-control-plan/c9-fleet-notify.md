@@ -4,9 +4,11 @@ Status: EXECUTED + REVIEWED + SECOND (ADVERSARIAL) REVIEW PASS, PR #28
 OPEN — not merged (2026-08-04), off `feat/c9-fleet-notify`, branched off
 `main` at `c9e8bcf` (C8 merged) and since merged forward over C11
 (`e7adae4`).
-Every mechanically verifiable gate is green under `-race -count=5`; the
-four live gates need real hardware and are **NOT RUN** — see
-[§Execution](#execution-2026-08-04). Second v2-backlog item to land
+Every mechanically verifiable gate is green under `-race -count=5`.
+Live gates 14b and 14c **PASSED on 2026-08-05** against the local
+multi-cell harness ([`scripts/fleetlab`](../../../scripts/fleetlab/README.md));
+14a passed against a local webhook sink but not a phone; 14d is unrun.
+See [§Execution](#execution-2026-08-04). Second v2-backlog item to land
 ([futures](../fleet-control-futures.md) §2 item 2). Depends on C3
 (presence), C4 (the render loop's fingerprint pass), C2 (leases) and
 C8 only for the one alarm kind that is deliberately OFF by default.
@@ -338,7 +340,9 @@ like every other button.
 13. **Full inner loop** (ground rule 4) under `-race -count=5`, plus
     `golangci-lint run`, plus ground rule 9's adversarial self-review as
     its own commit.
-14. **Live gates (need real hardware; NOT RUN here).**
+14. **Live gates.** (Written as "need real hardware". Only (a)'s phone
+    half does; b, c and d need a multi-*cell* fleet, which a local
+    harness supplies — see the gate table for what ran.)
     a. A real ntfy topic receives `vibe fleet notify test` on a phone.
     b. A genuine always_on outage (stop the heavy cell's llama-swap)
        pages once after the dwell and sends one resolve when it returns.
@@ -429,7 +433,13 @@ Three things the doc did not spell out and the code had to decide:
 | 11. Role | **PASS** — both routes added to `daemon/fleet_registry_test.go:TestDaemon_FleetRegistryOff_NoMCP` |
 | 12. Streaming contract | **PASS** — `git diff --stat main..HEAD -- internal/vibe/proxy` is empty |
 | 13. Inner loop | **PASS** — build / vet / `gofmt -l .` (silent) / `go mod tidy` (clean) / `golangci-lint run` (0 issues) / `go test -race -count=5 ./...` run four times end to end, all green (see the honest note below) |
-| 14. Live gates (a–d) | **NOT RUN** — no route to the fleet's hardware from the implementing environment. No transcripts are fabricated |
+| 14a. explicit send reaches a real sink | **PARTIAL (2026-08-05, local multi-cell harness).** `vibe fleet notify test` was delivered twice to a real HTTP webhook receiver, carrying `Tags: vibe-fleet,explicit` and `Title: vibe fleet: test`. The webhook contract is exercised end to end; **ntfy.sh and a phone are not** — nothing here proves a real topic accepts the payload or that a push arrives. |
+| 14b. always_on outage pages once, resolves once | **PASS (2026-08-05, same harness).** The `always_on` front's llama-swap was SIGKILLed at 08:16:24 with no declared intent; display went `OFF/AWAY?` and **exactly one** delivery landed at 08:18:24 — the `KindCellAbsent` dwell to the second — with `Priority 4`, `Tags vibe-fleet,firing,cell_absent`. No repeat over the following 2.5 minutes of continued absence. The cell returned at 08:20:59 and **exactly one** resolve landed at 08:22:24 (the 1-minute ClearDwell plus one 15 s eval tick), tagged `resolved,cell_absent`. |
+| 14c. a real vacation window | **PASS (2026-08-05, same harness).** `notify away --until 2h`, then the front taken down: the alarm **fired** normally (`fired_at` recorded, dwell ran) and **nothing** was delivered — sink line count and `notify.delivery.sent` both frozen — while `fleet_status` showed `alarms[0] = {key: cell_absent/front, state: active}`, `suppressed: 1`, `suppressed_keys: [cell_absent/front]`, and the CLI printed `SUPPRESSED while away`. An explicit `notify test` during the window delivered immediately. `notify home` produced **exactly one** digest: `1 alarm notifications were suppressed while away: · cell_absent/front ×1 (STILL ACTIVE)`. Nine sink entries for the whole session, no duplicates anywhere. |
+| 14d. a def edited on the front but not pushed | **NOT RUN.** Runnable on the harness — it renders a `fingerprint: strict` def and the fingerprint-mismatch set is the alarm's producer — but it needs a 15-minute dwell and was not attempted. No hardware is involved. |
+| 14e. the class rule, in the field (bonus) | **PASS (2026-08-05, same harness)** — the gate C9's own §Finding argues for. An `opportunistic` cell had its daemon, llama-swap and host_probe all SIGKILLed in the same window as 14b's front outage and sat `OFF/AWAY` for 4+ minutes: **zero** notifications, from the same evaluator that was paging about the front at that moment. A `roaming` cell taken fully down for two minutes likewise produced zero. |
+| 14f. drain with an active lease (bonus) | **PASS (2026-08-05, same harness)** — an advisory lease was claimed, `vibe cell drain` first *refused* on a non-tty with the pre-drain lease report, and with `--yes` the alarm delivered with **zero** dwell: `bravo is drained (…) while 1 lease(s)/hold(s) are active: labbatch holds lab-embed-b`. |
+| 14g. a dead webhook cannot wedge the daemon (bonus) | **PASS (2026-08-05, same harness)** — the notifier was pointed at a true black hole (a listener that completes the handshake, reads the request and never writes a byte; a closed port would be a fast ECONNREFUSED and would not test this). Through 5 explicit sends plus a real alarm, `GET /api/fleet/state` answered 200 in 0.5–0.8 ms for 3 minutes while `delivery.retries` climbed 1 → 12. |
 
 **One honest note on gate 13.** An early full run printed a bare `FAIL`
 line through a `tail` pipeline that discarded the per-package detail; it

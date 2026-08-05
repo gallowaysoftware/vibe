@@ -715,13 +715,36 @@ that will mislead one.
 | 1 — race | **PASS.** `-race -count=20 -run TestWarmTarget` clean (43.9s). The pre-fix code was confirmed racy the same way: stashing the test fix reproduced a `DATA RACE` inside 20 runs. `-race -count=5 ./...` clean. |
 | 2 — panic | **PASS.** `TestRenderLoopNonLlamaDefWithAnnouncedHashDoesNotPanic`, five sub-cases (comfyui / http_server / tabby_api / cloud_peer / unpulled mlx). Each completes, keeps the unverifiable def (fail-open), writes, and re-renders on the next transition. |
 | 3 — config integrity | **PASS.** `TestRenderLoopEmptyDefsRefusesToOverwriteFrontConfig` (no write, `RenderCount` 0, file byte-identical) and `TestRenderLoopAllDefsExcludedStillWrites` (input-side proof). |
-| 4 — warm policy | **NOT RUN (live).** Needs a real cell. Every sub-case has a unit regression instead — drained skip, mid-generation eviction + completion-edge restart, `>1h` window, no-activity-evidence — but the live run is still owed. |
+| 4 — warm policy | **PASS (live, 2026-08-05)** — run on the local multi-cell harness (`scripts/fleetlab`), not the reference fleet. All four sub-cases, each preceded by a baseline proving the policy was live on that target first. (a) `vibe cell drain bravo` ⇒ **zero** warms for the whole drain (24 samples over 4 min), state `skipped / cell drained`. (b) a 1235-token completion ran 91 s against a 1 m window and was **not** evicted — status read `cell busy (1 in-flight)` throughout, residency never moved, and the idle window restarted at the completion edge (`idle 10s of 1m0s` at gen-end +10s). (c) `restore_after_idle: 2h` against a swap idle 67 min climbed monotonically past the hour — `1h0m35s`, `1h2m20s`, … `1h7m20s of 2h0m0s` — with no `1h0m0s` cap. (d) fleetd restarted onto a quiet resident swap: no restore under *or* over the window, `last_restore` null, and the detail named the evidence (`idle measured from fleetd start`). **Caveat:** CPU models. Every timing edge is real; nothing here exercises what a wrong eviction costs on a GPU. |
 | 5 — cron | **PASS.** Twelve-row table incl. all six both-restricted cases, `dow=7`, the century non-leap Feb-29. Cross-checked against Python `croniter`: nine of eleven checked rows agree exactly. The two that differ are the stepped-star rows, and croniter is the one out of step — it reads `*/2` as restricted, while cronie's `entry.c` sets `DOM_STAR`/`DOW_STAR` on any field whose first character is `*` (verified against cronie master). We follow the C implementation the format comes from; the divergence is recorded in the test. |
-| 6 — schedule guard | **PARTIAL.** The unit half passes (`TestScheduleGuardSkipsWhenTheGuardCannotBeEvaluated`: resolve failure skips, unknown in-flight skips, front-only alias fires labelled). The end-to-end run with a real malformed YAML in a live backends dir is **NOT RUN**. |
+| 6 — schedule guard | **PASS.** Unit half as before (`TestScheduleGuardSkipsWhenTheGuardCannotBeEvaluated`). Live half run 2026-08-05 on `scripts/fleetlab`: a `* * * * *` schedule fired cleanly on the minute (`last_note: warmed`, two consecutive fires), then a malformed `zz-broken.yaml` was dropped into the live backends dir — `vibe backend list` confirmed it breaks `LoadDefs` — and the next **four** consecutive fire slots all skipped with the parse error quoted in `fleet_status`. Removing the file restored firing on the next minute. |
 | 7 — shutdown | **PASS.** `TestCloseUnblocksAnInFlightWarm` — `Close()` returns well inside 3s against a warm that blocks until its context dies. |
 | 8 — inner loop | **PASS**, re-run after addendum 2's fixes: `go build ./...`, `go vet ./...`, `gofmt -l .` (empty), `go mod tidy` (go.mod/go.sum clean), `golangci-lint run` (0 issues), `go test -race -count=5 ./...` (24 packages ok, 0 failures), plus `-race -count=20 -run TestWarmTarget ./internal/vibe/fleetapi/` (44.1s, clean). |
 | 9 — adversarial pass | **DONE**, twice — the implementing agent's own pass (first addendum) and an independent one over the whole `3854d84..HEAD` diff (second addendum). The independent pass found 6 more, including two the first pass's own fixes had shipped untested. |
-| 10 — CI re-run | **NOT RUN** — this phase does not push. |
+| 10 — CI re-run | **NOT RUN** — this phase does not push. (PR #22 has since merged on green CI.) |
+
+### Live gate run (2026-08-05, local multi-cell harness)
+
+Gates 4 and 6 ran on [`scripts/fleetlab`](../../../scripts/fleetlab/README.md):
+four real llama-swap v239 processes with three different `hosts.yaml`
+classes, a real fleetd, both announcer shapes, CPU-only GGUFs, all on
+localhost. The assumption that these gates needed the reference fleet
+was wrong — they needed a second *cell*, which is a process.
+
+The run also found a defect no unit test covers: **`warm_targets` and
+`warm_schedule` bypass the `model_classes` guard that `warm_model`
+enforces.** `daemon/warm.go:65` validates the cell and warns about an
+unknown model, but never consults `hosts.ModelClasses`, so a target
+naming an `embed`-class model is accepted; `warmtarget.go:375` then POSTs
+a chat completion at an embeddings-only llama-server on every restore and
+takes an HTTP 500 (`the current context does not logits computation`).
+Per C6 a 5xx is a delivery failure, so the warm is queued on the announce
+piggyback and the cell-side verb succeeds one heartbeat later — the
+policy *works*, while `fleet_status` shows the target permanently
+`waiting … HTTP 500` with `last_restore: null`. The sibling path
+(`fleetmcp/fleetmcp.go:692`) refuses exactly this configuration with a
+written rationale; the config-declared path, which fires unattended,
+has no equivalent check.
 
 ## Addendum 1: the implementing agent's own review pass (2026-08-03)
 

@@ -1400,6 +1400,14 @@ planned. The short version an agent needs:
   `DELAY_S=90` for iteration, `420` for the real thing) and
   `kill-cancel-test.sh`. Client stall/timeout behavior is version-dependent —
   re-gate after client upgrades, not just server changes.
+- **Fleet-control gates**: `scripts/fleetlab/lab.sh up` stands a real
+  four-cell fleet (real llama-swap v239 processes, three `hosts.yaml`
+  classes, both announcer shapes, a real fleetd) on localhost with
+  scratch XDG dirs, so a control-plane change can be gated without the
+  physical fleet. Most gates the phase docs call "needs the real fleet"
+  need a second *cell*, not a second *box* — see
+  `scripts/fleetlab/README.md` for the short list that genuinely needs
+  metal.
 - **vamp** talks to models through :9000 (streaming warm requests tolerate
   llama-swap's `reasoning_content` loading chunks) and to ComfyUI through
   `/upstream/comfyui` — never :8188 directly, or the router can't see

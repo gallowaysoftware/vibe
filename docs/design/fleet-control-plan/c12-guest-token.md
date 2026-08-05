@@ -3,10 +3,13 @@
 Status: PR OPEN (2026-08-05), feature + self-review + **adversarial
 review** commits. Unit gates 1–14 (plus 11b) green on a full local inner
 loop (`go build`, `go vet`, `go test -race -count=5`, `golangci-lint
-run` 0 issues, `gofmt -l .` silent, `go mod tidy` clean); the 3 live
-gates need a real fleet and a real phone and are **NOT RUN** — the
-implementing environment cannot reach the fleet (SSH blocked, the LAN
-does not route). The author's self-review pass found 5 items; the
+run` 0 issues, `gofmt -l .` silent, `go mod tidy` clean). Live gate L2
+**PASSED on 2026-08-05** against the local multi-cell harness
+([`scripts/fleetlab`](../../../scripts/fleetlab/README.md)) — a 52-case
+route sweep run twice on two independent fleets; L1 is **PARTIAL** (the
+`X-Vibe-Auth` contract is verified at the HTTP layer, the page's DOM
+behaviour is not — that needs a browser, not a phone); L3 (rotation) is
+unrun. The author's self-review pass found 5 items; the
 separate adversarial pass (ground rule 9) found **7 more — one of them a
 BLOCKER that rotated the control-plane token** — 5 fixed with
 mutation-verified regression tests, 2 documented. See the two addenda at
@@ -627,9 +630,54 @@ and the named test observed to fail, then restored:
 | a route registered outside the table | `TestRoutes_NoHandlerIsRegisteredOutsideTheTable` |
 | guest denials counted into `auth_rejected` | `TestGuestToken_RejectionsCountSeparately` |
 
-Live gates L1–L3: **NOT RUN.** The implementing environment cannot reach
-the fleet (SSH blocked, the LAN does not route) and has no browser on
-it; a fabricated transcript is worse than an honest gap.
+Live gates, re-run 2026-08-05 against the local multi-cell harness
+([`scripts/fleetlab`](../../../scripts/fleetlab/README.md)) — a real
+fleetd with a real `guest_token_file`, on two independent lab fleets:
+
+- **L1 — the hallway test: PARTIAL.** The HTTP half is verified and the
+  DOM half is not. `GET /api/fleet/state` with the guest token carries
+  `X-Vibe-Auth: guest`; with the operator token it carries no such
+  header — which is the entire signal the page's read-only rendering
+  rides. The guest token was minted `0600` and logged
+  `guest read-only token CREATED (new) — share this value, not the
+  control-plane token` on first start and `loaded` on every restart.
+  **Not run:** driving a browser to confirm the buttons, the warm row
+  and the savings tab are actually absent. That needs a browser session;
+  a phone is convenient, not required.
+- **L2 — the boundary in the field: PASS.** With the guest token in
+  `$VIBE_TOKEN`: `vibe cell status` **works** and renders the full
+  table plus `(guest read-only token: on; 39 request(s) refused past its
+  two routes)`; `vibe cell drain bravo` →
+  `drain bravo: unauthenticated: 401 Unauthorized`; `vibe fleet doctor`
+  → the degraded path with `HTTP 401: read-only token: not permitted on
+  this path`. A 52-case sweep, run twice on two fleets, found exactly
+  two 200s for the guest token — `GET /api/fleet/state` and
+  `GET /api/fleet/events` — and 401 everywhere else including
+  `/mcp` (both methods), every RPC, usage, savings, doctor, leases,
+  wake, intent, announce and notify. Method is part of the key
+  (`POST`/`PUT`/`HEAD` on the two allowed paths all 401). Every bypass
+  shape 401s: trailing slash, double slash, `%2f`, `..`, `.`, trailing
+  `/.`, trailing `/..`, uppercase, `%00`, and traversals aimed at
+  token-only routes. `/ui/fleet`'s public exemption held exact-match and
+  GET-only with no token. The counters were checked arithmetically, not
+  impressionistically: one sweep moved `auth_rejected` +8 and
+  `guest_rejected` +33, matching exactly the 8 no-token and 33
+  guest-token refusals the run issued (reproduced +14/+39 on the second
+  fleet).
+- **L3 — rotation: NOT RUN.** `vibe token --guest --regenerate` plus a
+  fleetd restart. No physical blocker; dropped for session time.
+
+**One finding, no escalation.** `daemon/auth.go:189` evaluates the
+allowlist on `r.URL.Path`, which Go has already percent-decoded — not on
+the raw path, which `routes.go`'s comment and AGENTS.md both claim.
+Observable: `curl --path-as-is …/api%2ffleet%2fstate` with the guest
+token returns **404** (the middleware granted it on the decoded path,
+then ServeMux refused to route the encoded one) where every other bypass
+shape returns 401. The effective boundary is intact — `/api%2ffleet%2f{usage,doctor,savings}`
+and `/mc%70` all 401 for guest and for no-token, and the mux never routes
+an encoded path to a handler — but the invariant as documented is not the
+invariant as implemented, which matters the day a route is added whose
+mux matching and whose decoding differ.
 
 ### Author's self-review
 
