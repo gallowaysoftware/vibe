@@ -40,14 +40,18 @@ func states(ns []Notification) string {
 	return b.String()
 }
 
-// TestDefaultAlarmsAreExactlyTheClassTablesAlarmColumn pins the shipped
-// policy. The design doc §4 table's "alarm? yes" column is always_on
-// absence; the futures item adds persistent fingerprint drift and
-// drain-with-lease. Anything else in this list is a notifier the
-// operator will learn to ignore.
-func TestDefaultAlarmsAreExactlyTheClassTablesAlarmColumn(t *testing.T) {
+// TestDefaultAlarmsAreExactlyTheClassTablesAlarmColumnPlusWakeFailed
+// pins the shipped policy. The design doc §4 table's "alarm? yes"
+// column is always_on absence; the futures item adds persistent
+// fingerprint drift and drain-with-lease. C14 adds wake_failed, which
+// is NOT a class-table row and is allowed in for one reason only: it is
+// not an observation of absence (an opportunistic cell's absence never
+// alarms) but a declared action of the control plane's own that did not
+// complete. Anything else in this list is a notifier the operator will
+// learn to ignore.
+func TestDefaultAlarmsAreExactlyTheClassTablesAlarmColumnPlusWakeFailed(t *testing.T) {
 	got := DefaultAlarms()
-	want := []Kind{KindCellAbsent, KindFingerprint, KindDrainWithLease}
+	want := []Kind{KindCellAbsent, KindFingerprint, KindDrainWithLease, KindWakeFailed}
 	if len(got) != len(want) {
 		t.Fatalf("default alarms = %v, want %v", got, want)
 	}

@@ -54,6 +54,9 @@ const (
 	// ControlServiceCellResumeProcedure is the fully-qualified name of the ControlService's CellResume
 	// RPC.
 	ControlServiceCellResumeProcedure = "/vibe.v1.ControlService/CellResume"
+	// ControlServiceCellSuspendProcedure is the fully-qualified name of the ControlService's
+	// CellSuspend RPC.
+	ControlServiceCellSuspendProcedure = "/vibe.v1.ControlService/CellSuspend"
 )
 
 // ControlServiceClient is a client for the vibe.v1.ControlService service.
@@ -87,6 +90,14 @@ type ControlServiceClient interface {
 	// CellResume runs cell_cmds.resume, restoring JIT service after a drain.
 	// Same error contract as CellDrain.
 	CellResume(context.Context, *connect.Request[v1.CellResumeRequest]) (*connect.Response[v1.CellResumeResponse], error)
+	// CellSuspend runs cell_cmds.suspend — the box goes to sleep
+	// (fleet-control C14). Same error contract as CellDrain, plus
+	// FailedPrecondition when require_idle is set and the cell cannot prove
+	// it is idle. The configured command must RETURN (systemctl suspend is
+	// asynchronous by design); one that blocks until the machine freezes
+	// makes this RPC fail with a transport error, which the caller reports
+	// as an unknown outcome and records no intent for.
+	CellSuspend(context.Context, *connect.Request[v1.CellSuspendRequest]) (*connect.Response[v1.CellSuspendResponse], error)
 }
 
 // NewControlServiceClient constructs a client for the vibe.v1.ControlService service. By default,
@@ -154,6 +165,12 @@ func NewControlServiceClient(httpClient connect.HTTPClient, baseURL string, opts
 			connect.WithSchema(controlServiceMethods.ByName("CellResume")),
 			connect.WithClientOptions(opts...),
 		),
+		cellSuspend: connect.NewClient[v1.CellSuspendRequest, v1.CellSuspendResponse](
+			httpClient,
+			baseURL+ControlServiceCellSuspendProcedure,
+			connect.WithSchema(controlServiceMethods.ByName("CellSuspend")),
+			connect.WithClientOptions(opts...),
+		),
 	}
 }
 
@@ -168,6 +185,7 @@ type controlServiceClient struct {
 	pull         *connect.Client[v1.PullRequest, v1.PullProgress]
 	cellDrain    *connect.Client[v1.CellDrainRequest, v1.CellDrainResponse]
 	cellResume   *connect.Client[v1.CellResumeRequest, v1.CellResumeResponse]
+	cellSuspend  *connect.Client[v1.CellSuspendRequest, v1.CellSuspendResponse]
 }
 
 // Status calls vibe.v1.ControlService.Status.
@@ -215,6 +233,11 @@ func (c *controlServiceClient) CellResume(ctx context.Context, req *connect.Requ
 	return c.cellResume.CallUnary(ctx, req)
 }
 
+// CellSuspend calls vibe.v1.ControlService.CellSuspend.
+func (c *controlServiceClient) CellSuspend(ctx context.Context, req *connect.Request[v1.CellSuspendRequest]) (*connect.Response[v1.CellSuspendResponse], error) {
+	return c.cellSuspend.CallUnary(ctx, req)
+}
+
 // ControlServiceHandler is an implementation of the vibe.v1.ControlService service.
 type ControlServiceHandler interface {
 	// Status returns the daemon's current state.
@@ -246,6 +269,14 @@ type ControlServiceHandler interface {
 	// CellResume runs cell_cmds.resume, restoring JIT service after a drain.
 	// Same error contract as CellDrain.
 	CellResume(context.Context, *connect.Request[v1.CellResumeRequest]) (*connect.Response[v1.CellResumeResponse], error)
+	// CellSuspend runs cell_cmds.suspend — the box goes to sleep
+	// (fleet-control C14). Same error contract as CellDrain, plus
+	// FailedPrecondition when require_idle is set and the cell cannot prove
+	// it is idle. The configured command must RETURN (systemctl suspend is
+	// asynchronous by design); one that blocks until the machine freezes
+	// makes this RPC fail with a transport error, which the caller reports
+	// as an unknown outcome and records no intent for.
+	CellSuspend(context.Context, *connect.Request[v1.CellSuspendRequest]) (*connect.Response[v1.CellSuspendResponse], error)
 }
 
 // NewControlServiceHandler builds an HTTP handler from the service implementation. It returns the
@@ -309,6 +340,12 @@ func NewControlServiceHandler(svc ControlServiceHandler, opts ...connect.Handler
 		connect.WithSchema(controlServiceMethods.ByName("CellResume")),
 		connect.WithHandlerOptions(opts...),
 	)
+	controlServiceCellSuspendHandler := connect.NewUnaryHandler(
+		ControlServiceCellSuspendProcedure,
+		svc.CellSuspend,
+		connect.WithSchema(controlServiceMethods.ByName("CellSuspend")),
+		connect.WithHandlerOptions(opts...),
+	)
 	return "/vibe.v1.ControlService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case ControlServiceStatusProcedure:
@@ -329,6 +366,8 @@ func NewControlServiceHandler(svc ControlServiceHandler, opts ...connect.Handler
 			controlServiceCellDrainHandler.ServeHTTP(w, r)
 		case ControlServiceCellResumeProcedure:
 			controlServiceCellResumeHandler.ServeHTTP(w, r)
+		case ControlServiceCellSuspendProcedure:
+			controlServiceCellSuspendHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -372,4 +411,8 @@ func (UnimplementedControlServiceHandler) CellDrain(context.Context, *connect.Re
 
 func (UnimplementedControlServiceHandler) CellResume(context.Context, *connect.Request[v1.CellResumeRequest]) (*connect.Response[v1.CellResumeResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("vibe.v1.ControlService.CellResume is not implemented"))
+}
+
+func (UnimplementedControlServiceHandler) CellSuspend(context.Context, *connect.Request[v1.CellSuspendRequest]) (*connect.Response[v1.CellSuspendResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("vibe.v1.ControlService.CellSuspend is not implemented"))
 }

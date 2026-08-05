@@ -1,4 +1,4 @@
-# Fleet-control implementation plan (C0–C13)
+# Fleet-control implementation plan (C0–C14)
 
 Execution plan for [../fleet-control.md](../fleet-control.md). Each
 phase is one PR, independently shippable, and pays for itself before
@@ -22,6 +22,7 @@ to be implementable on its own after that.
 | [C11](c11-hold-model.md) | hold_model: the pause button on the warm policy | ~450 lines | C2, C4, C5 | merged (#30); unit gates 1-11 green, 4 live gates UNRUN |
 | [C12](c12-guest-token.md) | Guest read-only token: sharing status without sharing drain | ~250 lines | C1, C5 | PR open; feature + self-review + adversarial-review commits; unit gates 1-14 (+11b) green, 3 live gates UNRUN |
 | [C13](c13-doctor.md) | `vibe fleet doctor`: the sit-down-after-two-weeks audit | ~1500 lines | C1-C12 (composition) | PR open, branched off C12; unit gates U1-U16 green, 4 live gates UNRUN |
+| [C14](c14-sleep-schedule.md) | `sleep_schedule`: the declared night, deferred by observation | ~1100 lines | C2, C3, C4, C11 | PR open, branched off C13; unit gates U1-U18 green, 6 live gates UNRUN |
 
 C10 (await extensions) is the last of the three branches cut from
 `c9e8bcf` in parallel; C11 and then C9 landed ahead of it. None of the
@@ -137,6 +138,35 @@ a doctor that resolved credentials its own way would be testing its own
 code. Two gaps it surfaced rather than papered over: nothing has ever
 populated `versions.llama_swap`, and the slim announcer sent no versions
 or capacity block at all (fixed here).
+
+C14 (2026-08-05) is backlog item 9, `sleep_schedule`, and it is the
+first phase whose payoff is measured in watts: the opportunistic box
+idles ~80 W × 8 h/night for nothing. The entire design is one sentence —
+**a declared action, deferred by observation, is clean; observed
+idleness INITIATING action is rejected and stays rejected** — and the
+test applied to every line of it is that removing a guard could only
+ever make the suspend happen at a cron minute already named. Four rules
+it carries forward. **Only opportunistic cells sleep**, refused by name
+for the other two: always_on absence alarms by design (teaching the
+alarm evaluator that some always_on absences are fine is how a class
+taxonomy stops meaning anything), and a roaming box cannot receive a
+magic packet from another city. **Suspend is an RPC with no piggyback
+fallback** — the queue is at-least-once and retires on a HIGHER announce
+seq, which resets when a cell reboots, so the one verb whose redelivery
+is catastrophic is precisely the one that crosses the boundary the
+retirement rule depends on. **A suspend with no working wake is
+unwritable**: the wake is a required field on the same entry, and a wake
+cron that does not parse disables the suspend half too — a broken wake
+must never yield a box that sleeps forever, it yields a box that never
+sleeps. And **the sleeping box needs no new state anywhere**: it is
+recorded as axis 2's ordinary drained intent with a reserved reason and
+the wake time as the ETA, which renders as OFF with "asleep per
+sleep_schedule, eta 07:15" through code C1 already shipped — the page
+diff for this phase is empty. The one trap worth remembering is that
+this only works because `CellSuspend` stamps the CELL's own intent
+before it freezes; without that, C3's conflict rule hands the sleep
+request back on the first heartbeat after waking and the box runs its
+own drain verb at 07:15.
 
 A **post-merge reconciliation PR** (#26, 2026-08-03) closed the three
 items no single phase branch could reach, because each needed code from

@@ -89,6 +89,11 @@ func (f *fakeControl) CellResume(_ context.Context, req *connect.Request[vibev1.
 	return connect.NewResponse(&vibev1.CellResumeResponse{}), nil
 }
 
+func (f *fakeControl) CellSuspend(_ context.Context, req *connect.Request[vibev1.CellSuspendRequest]) (*connect.Response[vibev1.CellSuspendResponse], error) {
+	f.record("CellSuspend")
+	return connect.NewResponse(&vibev1.CellSuspendResponse{IdleStatus: "verified_idle"}), nil
+}
+
 func (f *fakeControl) Pull(_ context.Context, _ *connect.Request[vibev1.PullRequest], stream *connect.ServerStream[vibev1.PullProgress]) error {
 	f.record("Pull")
 	return stream.Send(&vibev1.PullProgress{Phase: vibev1.PullProgress_PHASE_DONE})

@@ -163,13 +163,29 @@ Medium:
    quotable. Counts only, never bodies. Note: cloud calls that bypass
    the front hole this ledger — routing cloud through the front is
    what makes it complete.
-9. **`sleep_schedule`** — warm_schedule's dual for opportunistic
-   cells: declared cron suspend, *guarded* (not triggered) by
-   in-flight requests and active leases, paired wake entry = WoL +
-   warm, status shows "asleep per schedule, wake 07:15". The 5090 box
-   idles ~80W × 8h/night for nothing. Declared-action-deferred-by-
-   observation is invariant-clean; the rejected direction (observed
-   idleness *initiating* action) stays rejected.
+9. **`sleep_schedule`** — **SHIPPED as
+   [C14](fleet-control-plan/c14-sleep-schedule.md) (2026-08-05).**
+   Declared cron suspend, guarded (not triggered) by in-flight requests,
+   leases, holds, a declared drain and a quiet window; paired wake entry
+   = clear-intent + WoL + warm. This entry's framing survived contact
+   intact: declared-action-deferred-by-observation is invariant-clean,
+   and the practical test that keeps it that way is that removing any
+   guard could only ever make the suspend happen at a cron minute
+   already named. Four notes for whoever reads this next. **Only
+   opportunistic cells sleep** — always_on is refused because its
+   absence alarms by design, roaming because a magic packet cannot reach
+   another city, and the front structurally. **Suspend gets no piggyback
+   fallback**: that queue is at-least-once and retires on a higher
+   announce seq, which resets on a cell reboot, so a redelivered suspend
+   is a box that puts itself back to sleep the morning after — it is an
+   RPC or it is refused. **A sleeping box needed no new state**: it is
+   axis 2's ordinary drained intent with a reserved reason and the wake
+   time as the ETA, so "asleep per schedule, wake 07:15" renders through
+   C1 code and the page diff is empty. And the wake half's failure is
+   the phase's one new **alarm** (`wake_failed`, default on) — not an
+   observation of absence, which for an opportunistic cell is normal
+   forever, but a declared action of the control plane's own that did
+   not complete.
 10. **Visible-repoint alias tier** — a catalog id (`best-coder`)
     whose resolution to a concrete cell model is *shown* in the
     catalog, re-resolves only on membership transitions, with a loud

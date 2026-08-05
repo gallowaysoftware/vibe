@@ -234,6 +234,23 @@ func (s *Server) notifyConditions(snap StateSnapshot) []fleetnotify.Condition {
 			})
 		}
 	}
+	// C14's undelivered wake, read off the same document (never off the
+	// loop's own fields): the snapshot IS what the page and `vibe cell
+	// status` render, so the pager cannot describe a fleet the status
+	// surfaces do not.
+	if snap.Sleep != nil {
+		for _, e := range snap.Sleep.Entries {
+			if e.WakeFailedSince == nil {
+				continue
+			}
+			out = append(out, fleetnotify.Condition{
+				Kind:  fleetnotify.KindWakeFailed,
+				Scope: e.Cell,
+				Detail: fmt.Sprintf("%s was suspended per sleep_schedule and the paired wake (%s) did not bring it back since %s: %s",
+					e.Cell, e.WakeCron, e.WakeFailedSince.Format(time.RFC3339), e.Detail),
+			})
+		}
+	}
 	for _, fp := range s.FingerprintMismatches() {
 		out = append(out, fleetnotify.Condition{
 			Kind:  fleetnotify.KindFingerprint,

@@ -920,6 +920,78 @@ optional.)
     `ctx.Err() != nil` a row names the BUDGET, never the host — "a host
     that is off and a broken TLS listener are indistinguishable" is a
     claim about a dial that happened.
+- **`sleep_schedule` (fleet-control C14).** The declared night:
+  `fleetapi/sleepsched.go` (the loop, the guard, the wake half, the
+  status block), `daemon/sleep.go` (validation + the suspend RPC caller),
+  `daemon/cell_suspend.go` + the `CellSuspend` RPC + `cell_cmds.suspend`,
+  `fleetmcp`'s `suspend_cell`, `vibe cell suspend`, doctor's
+  `sleep.schedule`, and C9's `wake_failed` alarm. It adds no HTTP route.
+  - **The invariant line is the whole design: a DECLARED action deferred
+    by observation is clean; observed idleness INITIATING action is
+    rejected and stays rejected** (design §9's GPU-idle heuristic, still
+    dead). The test for any change here: removing a guard could only ever
+    make the suspend happen at a cron minute already named.
+  - **Only `opportunistic` cells sleep**, refused by name for the rest:
+    `always_on` absence alarms by design (§4's class table — teaching the
+    alarm evaluator that some always_on absences are fine is how a
+    taxonomy stops meaning anything), a `roaming` box cannot receive a
+    magic packet from another city, and the front is refused
+    structurally. Those three are `SuspendBlock.Structural` and `force`
+    never bypasses them.
+  - **The guard ladder** (`suspendGuard`, shared by the loop and the MCP
+    verb): front / unknown / wrong class → refuse; declared drain (a
+    drained box is one the operator TOOK — suspending it mid-game is the
+    worst outcome available), C11 hold, **absence** (`Absent`: not a
+    deferral — the entry stops for the night and records NO intent),
+    unreported in-flight (C5's M2: unknown is not zero), in-flight > 0,
+    any active lease, an outstanding `probe` command, no
+    activity-observation channel, and the **quiet window** (`quiet_for`,
+    default 15m) over C4's per-model activity stamps. Absence is checked
+    BEFORE the in-flight rungs on purpose: an absent cell reports no
+    count either, and "in-flight unknown" would turn "there is no box
+    here" into a deferral that retries all night. Every skip is named in
+    `fleet_status.sleep`.
+  - **Suspend is an RPC with NO piggyback fallback.** The queue is
+    at-least-once and retires on a HIGHER announce seq, which resets when
+    a cell reboots — a redelivered `warm` costs a second, a redelivered
+    `suspend` is a box that puts itself back to sleep the morning after.
+    So `sleep_schedule` requires `daemon_url`, deliberately narrower than
+    C2's drain.
+  - **A suspend with no working wake is unwritable.** `wake:` is required
+    on the entry, `cells.<name>.wake` is required in hosts.yaml, and a
+    wake cron that fails to parse (or never fires) disables the **whole
+    entry, suspend half included** — a broken wake must never yield a box
+    that sleeps forever; it yields a box that never sleeps. Deferral is
+    bounded by `max_defer` (default 2h) AND by the paired wake: the
+    suspend never fires after its own wake.
+  - **The wake half's order is load-bearing**: clear the sleep intent
+    FIRST (a box that returns to a pending `drained` request runs its own
+    `cell_cmds.drain`), then the packet through C2's `SendWake`, then
+    await the return, then warm the declared models through the front.
+    The clear matches on the reserved reason only — an operator's own
+    `--reason gaming` drain survives a 07:15 wake untouched.
+  - **No new state anywhere.** A sleeping box is axis 2's ordinary
+    drained intent with `SleepIntentReason` and the wake time as the ETA,
+    which renders as OFF + "asleep per sleep_schedule, eta 07:15" through
+    C1 code: no display state, no intent vocabulary, no announce field,
+    and an empty diff for `fleet.html`. It works only because
+    `CellSuspend` **stamps the CELL's own local intent** on every
+    invocation path before reporting success — without it C3's conflict
+    rule hands the sleep request back on the first heartbeat after
+    waking. The stamp happens AFTER the command succeeds (a failed verb
+    records nothing).
+  - **`wake_failed` is the one new alarm and it is default-ON.** It is
+    not an observation of absence (an opportunistic cell's absence never
+    alarms, forever) but a declared action of the control plane's own
+    that did not complete. Read off the snapshot like every other C9
+    condition; cleared when the cell announces fresh.
+  - **The cron evaluator is `warmsched.go`'s, unforked** (a grep test
+    fails on a second `parseCron` in the package): it carries the Vixie
+    dom/dow textual-star rule, and two evaluators is how one of them
+    rots.
+  - **`force` is about tonight's conditions, never configuration.** It
+    skips the policy rungs and the cell's `require_idle` proof (an
+    operator asking is not fleetd guessing) and skips nothing structural.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.
@@ -1307,7 +1379,7 @@ planned. The short version an agent needs:
 
 ## Fleet control (node state / intent / presence, 2026-08-02+)
 
-`docs/design/fleet-control.md` is the design; the C0–C13 execution plan
+`docs/design/fleet-control.md` is the design; the C0–C14 execution plan
 lives in `docs/design/fleet-control-plan/` (one phase = one PR, each
 phase doc ends in acceptance gates that are the definition of done),
 and the ranked v2 backlog is `docs/design/fleet-control-futures.md`.

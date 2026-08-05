@@ -27,12 +27,16 @@ import (
 type fakeCellDaemon struct {
 	srv *httptest.Server
 
-	mu          sync.Mutex
-	drainCalls  int
-	resumeCalls int
-	failDrain   bool
-	drainDelay  time.Duration
-	waitStatus  string
+	mu           sync.Mutex
+	drainCalls   int
+	resumeCalls  int
+	suspendCalls int
+	lastRequire  bool
+	lastReason   string
+	failDrain    bool
+	failSuspend  bool
+	drainDelay   time.Duration
+	waitStatus   string
 }
 
 func (f *fakeCellDaemon) CellDrain(ctx context.Context, req *connect.Request[vibev1.CellDrainRequest]) (*connect.Response[vibev1.CellDrainResponse], error) {
@@ -71,6 +75,26 @@ func (f *fakeCellDaemon) CellResume(_ context.Context, _ *connect.Request[vibev1
 	f.resumeCalls++
 	f.mu.Unlock()
 	return connect.NewResponse(&vibev1.CellResumeResponse{}), nil
+}
+
+func (f *fakeCellDaemon) CellSuspend(_ context.Context, req *connect.Request[vibev1.CellSuspendRequest]) (*connect.Response[vibev1.CellSuspendResponse], error) {
+	f.mu.Lock()
+	f.suspendCalls++
+	f.lastRequire = req.Msg.RequireIdle
+	f.lastReason = req.Msg.Reason
+	fail := f.failSuspend
+	f.mu.Unlock()
+	if fail {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("2 request(s) in flight; not suspending"))
+	}
+	idle := fleetapi.SuspendIdleNotRequired
+	if req.Msg.RequireIdle {
+		idle = fleetapi.SuspendIdleVerified
+	}
+	return connect.NewResponse(&vibev1.CellSuspendResponse{
+		ResidentModels: []string{"qwen3.6-27b"},
+		IdleStatus:     idle,
+	}), nil
 }
 
 // The remaining RPCs are irrelevant to these tests; return unimplemented.

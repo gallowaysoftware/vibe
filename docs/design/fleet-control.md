@@ -184,6 +184,15 @@ The hold/prune split serves two masters: always-on consumers pin model
 ids that must never 404 (hold), while a roaming cell's models genuinely
 aren't part of the fleet when it's on a train (prune).
 
+*Amended C14.* An `opportunistic` cell may also be absent because a
+declared `sleep_schedule` put it there: a cron suspend, deferred by
+in-flight work, leases, holds, a declared drain and a quiet window, and
+paired with a wake that clears the record before sending the packet. It
+adds no state to this table — the sleeping box is an ordinary declared
+drain with a reserved reason and the wake time as its ETA, so it reads
+as OFF with "asleep per sleep_schedule, eta 07:15". Its absence still
+never alarms; what alarms is the wake that did not deliver.
+
 **The alarm column has a destination from C9** (`fleet.notify`): fleetd
 evaluates that column against this table's own derived display states
 and delivers it to one webhook. `always_on` absence alarms *only when
@@ -232,8 +241,9 @@ mux behind the same bearer auth, wire pattern cloned from
 | `fleet_notify_test(message?)` | C9 | send one message through the real webhook path (not an alarm: no dwell, no dedup, no away gate) |
 | `hold_model(cell, model, for?, note?)` | C11 | suspend fleetd's own warm policy on a cell until an expiry — the evaluation afternoon. Stored as a lease with `hold: true`; not a pin (llama-swap's TTL is untouched) |
 | `release_hold(cell, model)` | C11 | end a hold early; holds expire on their own |
+| `suspend_cell(cell, reason?, force?)` | C14 | put an opportunistic box to sleep (`cell_cmds.suspend`), guarded by in-flight work, leases, holds, an outstanding probe, recent activity and a declared drain. `force` overrides tonight's conditions, never the structural refusals (the front, the wrong class). `wake_cell` is the way back |
 
-**CLI.** `vibe cell status | await | drain | resume | wake | hold` — local
+**CLI.** `vibe cell status | await | drain | resume | wake | suspend | hold` — local
 verbs run the configured per-cell command; remote verbs go through the
 cell daemon's `:9001` Connect RPC (`${VIBE_API}`/`${VIBE_TOKEN}`
 machinery, already shipped). `vibe cell await <cell> --up` is the
@@ -382,7 +392,9 @@ start-duration history (built for exactly this).
    model. The six-client SSE gate's guarantees are preserved
    structurally, not re-verified per phase.
 2. **Intent is declared, availability is observed, residency is
-   llama-swap-owned.** No component stores what another owns.
+   llama-swap-owned.** No component stores what another owns. Its
+   corollary, made explicit by C14: a DECLARED action may be DEFERRED by
+   observation, and an observation may never INITIATE one.
 3. **No silent rerouting, no silent fallback** (inherited from
    router-lifecycle.md). The control plane changes what the catalog
    *says*, never where a request *goes*.
@@ -405,7 +417,7 @@ start-duration history (built for exactly this).
 | **olla / LiteLLM router** | Redundant with llama-swap peers / cloud-gateway-shaped respectively. |
 | **exo** | Solves a different problem (sharding one model across pooled devices). |
 | **Home Assistant / MQTT in the control loop** | Ground truth lives on boxes that already run a daemon; HA would be one more config surface — the disease pain 3 describes. Fine as a *consumer* of `/api/fleet/state` later. |
-| **GPU-idle auto-resume** (nvidia-smi polling + timer) | Heuristic that acts on its own; `--until-exit` is the deterministic version. |
+| **GPU-idle auto-resume** (nvidia-smi polling + timer) | Heuristic that acts on its own; `--until-exit` is the deterministic version. C14's `sleep_schedule` is the same line drawn once more: a cron DECLARES the suspend and observed idleness may only DEFER it. Observed idleness *initiating* an action stays rejected. |
 | **Pin-via-keep-warm for the heavy cell** | A pinned default re-warms on a timer and evicts the model the operator just swapped in. Restore-after-idle instead. |
 | **Blanket fail-closed fingerprints** | Fail-closed only for embed-class; a normalization bug must not yank a working chat model. |
 | **Registry on the data path** (absent-cells answered by fleetd with reasoned 503 bodies) | Nice UX, violates invariant 1. Revisit only if typed `UPSTREAM_DOWN` + status surfaces prove insufficient. |
