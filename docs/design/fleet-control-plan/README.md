@@ -12,17 +12,17 @@ to be implementable on its own after that.
 | [C2](c2-actuate.md) | Actuate: drain/resume RPCs, wake, `render --cell front` | ~450 lines | C1 | merged (#20) |
 | [C3](c3-announce.md) | The inversion: announce heartbeats, presence-derived render | ~600 lines | C2 | merged (#21) |
 | [C4](c4-comfort.md) | Comfort: warm targets, warm schedules, the fleet page | ~300 lines | C3 (a read-only page could ship after C1; its action buttons need C2, fingerprint badges C3) | merged (#22); its 3 live gates ran, gate 4 superseded by C5 |
-| [C5](c5-land-c4.md) | Land C4: the adversarial review pass C4 never got | ~400 lines | C4 | merged (#22); unit gates green, live gates 4 + 6 UNRUN |
-| [C6](c6-substrate-repair.md) | Substrate repair: the C1–C3 findings against merged code | ~500 lines | independent of C5 | merged (#23); unit gates green, live gates 1 + 2 UNRUN |
-| [C7a](c7a-usage-ledger.md) | The usage ledger: tokens per cell, per model, per day | ~710 lines | C4 | merged (#24); unit gates green, 7 live gates UNRUN |
-| [C7b](c7b-savings-screen.md) | The savings screen: what the fleet didn't spend | ~690 lines + ~100 KB data | C7a, C5 | merged (#25); unit gates green, live plausibility gate UNRUN |
-| [C8](c8-probe-model.md) | probe_model: throughput health against the model's own baseline | ~900 lines | C3, C4 | merged (#27); unit gates 1-10 green, 5 live gates UNRUN |
-| [C9](c9-fleet-notify.md) | `vibe fleet notify`: the alarm column, delivered | ~1100 lines | C2, C3, C4 | merged (#28); unit gates 1-13 green, 4 live gates UNRUN |
-| [C10](c10-await-extensions.md) | await extensions: `--model --ready`, `--idle`, the lease handshake | ~450 lines | C1, C2, C3, C4, C6, C9, C11 | merged (#29); unit gates 1-12 green (12 added by the C9 merge), 4 live gates UNRUN |
-| [C11](c11-hold-model.md) | hold_model: the pause button on the warm policy | ~450 lines | C2, C4, C5 | merged (#30); unit gates 1-11 green, 4 live gates UNRUN |
-| [C12](c12-guest-token.md) | Guest read-only token: sharing status without sharing drain | ~250 lines | C1, C5 | PR open; feature + self-review + adversarial-review commits; unit gates 1-14 (+11b) green, 3 live gates UNRUN |
-| [C13](c13-doctor.md) | `vibe fleet doctor`: the sit-down-after-two-weeks audit | ~1500 lines | C1-C12 (composition) | PR open, branched off C12; unit gates U1-U16 green, 4 live gates UNRUN |
-| [C14](c14-sleep-schedule.md) | `sleep_schedule`: the declared night, deferred by observation | ~1100 lines | C2, C3, C4, C11 | PR open, branched off C13; feature + self-review + adversarial-review commits (4 + 7 findings); unit gates U1-U18 green, 6 live gates UNRUN |
+| [C5](c5-land-c4.md) | Land C4: the adversarial review pass C4 never got | ~400 lines | C4 | merged (#22); unit gates green; **live gates 4 + 6 PASS** (harness, 2026-08-05) |
+| [C6](c6-substrate-repair.md) | Substrate repair: the C1–C3 findings against merged code | ~500 lines | independent of C5 | merged (#23); unit gates green; **live gates 1, 2 + 5's live half PASS** (harness) |
+| [C7a](c7a-usage-ledger.md) | The usage ledger: tokens per cell, per model, per day | ~710 lines | C4 | merged (#24); unit gates green; live halves of 3, 6, 8 **PASS**, 1, 2, 4, 5 **PARTIAL** (harness) |
+| [C7b](c7b-savings-screen.md) | The savings screen: what the fleet didn't spend | ~690 lines + ~100 KB data | C7a, C5 | merged (#25); unit gates green; live plausibility gate still UNRUN (needs a real week of priced traffic) |
+| [C8](c8-probe-model.md) | probe_model: throughput health against the model's own baseline | ~900 lines | C3, C4 | merged (#27); unit gates 1-10 green; **L1-L3 PASS** (harness, CPU models), L4-L5 unrun (wall clock) |
+| [C9](c9-fleet-notify.md) | `vibe fleet notify`: the alarm column, delivered | ~1100 lines | C2, C3, C4 | merged (#28); unit gates 1-13 green; **14b, 14c PASS** + 3 bonus gates (harness), 14a PARTIAL, 14d unrun |
+| [C10](c10-await-extensions.md) | await extensions: `--model --ready`, `--idle`, the lease handshake | ~450 lines | C1, C2, C3, C4, C6, C9, C11 | merged (#29); unit gates 1-12 green; **13b PASS**, 13a PARTIAL, 13c **VOID**, 13d unrun |
+| [C11](c11-hold-model.md) | hold_model: the pause button on the warm policy | ~450 lines | C2, C4, C5 | merged (#30); unit gates 1-11 green; **L1 + L4 PASS**, L3 PARTIAL (harness), L2 unrun |
+| [C12](c12-guest-token.md) | Guest read-only token: sharing status without sharing drain | ~250 lines | C1, C5 | PR open; feature + self-review + adversarial-review commits; unit gates 1-14 (+11b) green; **L2 PASS** (52-case sweep ×2 fleets), L1 PARTIAL (needs a browser), L3 unrun |
+| [C13](c13-doctor.md) | `vibe fleet doctor`: the sit-down-after-two-weeks audit | ~1500 lines | C1-C12 (composition) | PR open, branched off C12; unit gates U1-U16 green; **L1-L3 PASS** (harness), L4 PARTIAL (WoL needs metal) |
+| [C14](c14-sleep-schedule.md) | `sleep_schedule`: the declared night, deferred by observation | ~1100 lines | C2, C3, C4, C11 | PR open, branched off C13; feature + self-review + adversarial-review commits (4 + 7 findings); unit gates U1-U18 green; **6 live gates UNRUN — 4 of them genuinely need metal** |
 
 C10 (await extensions) is the last of the three branches cut from
 `c9e8bcf` in parallel; C11 and then C9 landed ahead of it. None of the
@@ -34,13 +34,38 @@ duplicated 20-line POST helper collapsed onto C9's `postFleet`, and the
 textual conflict in `cellAwaitCmd` resolved as a union of both flag
 sets (`c10-await-extensions.md`'s second addendum).
 
-**Merged is not live-gated.** Every C0–C7b PR merged on a green CI run
-of the mechanical inner loop. The live gates — the ones that need real
-cells, a real GPU and a real week of traffic — are UNRUN for C5, C6,
-C7a, C7b, C8, C9, C10, C11, C12 and C13, and each phase doc lists
-exactly which.
+**Merged is not live-gated** — and for eleven phases that sentence hid a
+mistake. Every C0–C7b PR merged on a green CI run of the mechanical
+inner loop, and every phase from C5 on marked its live gates "NOT RUN,
+needs the real fleet". On **2026-08-05** those gates were re-examined
+and most of them turned out not to need the real fleet at all: they
+needed a second **cell**, which is a process, not a machine. A local
+harness ([`scripts/fleetlab`](../../../scripts/fleetlab/README.md))
+stands four real llama-swap v239 cells, a real fleetd and both announcer
+shapes on one box, and moved ~40 gates from asserted to watched —
+surfacing five product defects that no unit test had.
+
 Ground rule 10 applies to this table: a status cell is a claim about a
-mechanical run.
+mechanical run. Two qualifications belong on every "PASS (harness)" in
+it:
+
+- **CPU models are not GPU models.** Every control-plane *edge* is real
+  — ready transitions, inflight frames, idle windows, activity rows,
+  TTL evictions — but nothing exercises a 6–10 minute cold start, VRAM
+  pressure, or an eviction that costs real money. Where a gate's claim
+  is about magnitude rather than mechanism, the magnitude is still owed.
+- **One box is not a fleet.** No SSH, no TLS, no WoL, no suspend/resume,
+  no laptop that leaves the building, no clock skew between hosts.
+
+What still genuinely needs metal, in full: a real suspend/resume cycle
+and a wattmeter (C14 L1); a magic packet on a real NIC plus the BIOS
+switch that arms it (C14 L2, L5; C13 L4's wake half); a laptop that
+physically leaves the LAN (C3 gate 1 against a real roaming box); a GPU
+under real VRAM pressure (C8 L2's spill, C10 13a's cold-start
+magnitude); a browser (C12 L1); and wall-clock duration — 24 h for
+C8 L4, a week of priced traffic for C7b's plausibility gate. Everything
+else that is still unrun is a time budget, and each phase doc says which
+of the two it is.
 
 Line counts are order-of-magnitude scoping signals, not budgets. Actual
 C0–C4 spend ran 3.6–4.5× the estimate in every phase; price that in.

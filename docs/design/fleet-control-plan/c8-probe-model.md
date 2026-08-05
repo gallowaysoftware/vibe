@@ -6,9 +6,13 @@ reconciliation PR). Feature commit, ground rule 9's adversarial
 self-review commit, and a second (independent) adversarial review
 commit — six further findings, all mutation-verified, listed in the
 [second addendum](#adversarial-review-addendum-second-pass). Every
-mechanically verifiable gate is green under `-race -count=5`, and the
-five live gates (L1–L5) are **NOT RUN** — they need real cells and a
-real GPU. See [§Execution](#execution-2026-08-04).
+mechanically verifiable gate is green under `-race -count=5`. Live gates
+L1–L3 **PASSED on 2026-08-05** against the local multi-cell harness
+([`scripts/fleetlab`](../../../scripts/fleetlab/README.md)) — real
+llama-swap cells and real probes, but CPU models, so the degradation in
+L2 was induced by throttle rather than by VRAM spill. L4 and L5 remain
+**NOT RUN** for wall-clock reasons, not hardware ones. See
+[§Execution](#execution-2026-08-04).
 
 C8 fills the `probe` slot [C3](c3-announce.md) §1 reserved on
 `AnnounceModel` and converts the design doc's
@@ -481,7 +485,11 @@ exact-match bearer exemption is untouched.
 | 8. Events fire on transitions only | **PASS** — `TestProbeEvents_FireOnTransitionsOnly` (mutation-verified), `TestProbeEvents_LosingEvidenceIsNotARecovery` |
 | 9. Streaming contract | **PASS** — `git diff --stat main..HEAD -- internal/vibe/proxy` is empty |
 | 10. Full inner loop + review commit | **PASS** — build / vet / `gofmt -l .` (silent) / `go mod tidy` (clean) / `go test -race -count=5 ./...` / `golangci-lint run` (0 issues), re-run after the review commit |
-| L1–L5 (live) | **NOT RUN** — every one needs real cells and a real GPU; the implementing environment cannot reach the fleet (SSH blocked, LAN does not route). No transcripts are offered. |
+| L1 (live) | **PASS (2026-08-05, local multi-cell harness)** — 6 real 64-token probes at a resident chat model on a real llama-swap cell: 16.282, 13.608, 15.725, 16.221, 16.096, 15.325 decode tok/s. The verdict stayed `unknown` for the first five (`samples_behind` 0…4) and became `ok` the moment the fifth sample landed: `{"value":15.325,"baseline_p50":16.096,"samples":5,"ratio":0.952,"verdict":"ok"}`. **Not covered:** the ±10% cross-check against manual `llama-bench` timing, and the model is a 7B on CPU rather than a GPU-resident model. |
+| L2 (live) | **PASS (2026-08-05, same harness), by a substituted cause.** Degradation was induced with a 30% duty-cycle `SIGSTOP`/`SIGCONT` throttle on the cell's llama-server, not by VRAM spill. The next probe read `{"value":4.506,"baseline_p50":15.910,"ratio":0.283,"verdict":"degraded"}`, `fleet.modelDegraded` landed on `/api/fleet/events` exactly once, `fleet_status.probe.degraded` listed the model, and removing the throttle returned it to `ok`. The "**degraded changes nothing**" half was checked hard: display, `reachable`, intent, class and the front's model list were identical before and after, and the rendered front config was **byte-identical** across both degraded episodes. Also confirmed: neither degraded sample entered the baseline window (11 attempts, 8 window entries), and a probe that exceeded `probeTimeout` produced a failed attempt with the previous measurement carried forward — never a fabricated slow reading. **Not covered:** spill-induced degradation, which is what an operator will actually hit. |
+| L3 (live) | **PASS (2026-08-05, same harness)** — `probe_model` at a non-resident model on two different cells refused with `a probe must not load it; warm it first`, and **zero** requests were issued: the cell's llama-swap log mentions of the model stayed at 0 across the window and the other cell's `/running` stayed `[]`. Verified from the upstream's own logs rather than `nvidia-smi`, which the CPU lab has no equivalent of. Bonus, same session: the 5-minute cell-side cooldown refused both producers (scheduler and MCP verb) from the same clock, carried the previous measurement forward, and refusals did not extend the cooldown. |
+| L4 (live) | **NOT RUN** — needs 24 h of wall clock with two cells on a 15-minute interval. Nothing physical blocks it; the harness can run it unattended. |
+| L5 (live) | **NOT RUN** — runnable on the harness (it has three real embedding cells) but not attempted: a warm plus six probes at a 5-minute cooldown is ~30 minutes on top of the chat baseline. A time budget, not a limitation. |
 
 ### Adversarial self-review (ground rule 9)
 

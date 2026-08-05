@@ -3,8 +3,13 @@
 Status: EXECUTED + REVIEWED + ADVERSARIALLY REVIEWED + MERGED WITH C9
 (2026-08-04), off `feat/c10-await-extensions`, merged with `main` at
 `03bb4d5` (C11 then C9).
-Every mechanically verifiable gate is green under `-race -count=5`; the
-four live gates need real hardware and are **NOT RUN** — see
+Every mechanically verifiable gate is green under `-race -count=5`.
+Live gate 13b **PASSED on 2026-08-05** against the local multi-cell
+harness ([`scripts/fleetlab`](../../../scripts/fleetlab/README.md)),
+13a passed in semantics but not in magnitude (a CPU model loads in
+seconds, not the 6–10 minutes the phase exists for), 13c turned out to
+be **unrunnable as written** — it describes a fleet state fleetd
+refuses to create — and 13d is unrun. See
 [§Execution](#execution-2026-08-04). Third v2-backlog item
 ([futures](../fleet-control-futures.md) §2 item 3). Depends on C1
 (`vibe cell await`, `/api/fleet/state`), C2 (advisory leases), C3
@@ -330,7 +335,9 @@ invocation is byte-for-byte unchanged in behaviour.
 11. **Full inner loop** (ground rule 4) under `-race -count=5`, plus
     `golangci-lint run`, plus ground rule 9's adversarial self-review as
     its own commit.
-12. **Live gates (need real hardware; NOT RUN here).**
+12. **Live gates.** (Written as "need real hardware"; the 2026-08-05
+    harness run showed that only (a)'s *magnitude* does — see the gate
+    table for what actually ran.)
     a. On the heavy cell: `vibe cell await gpu-cell --model <heavy>
        --ready` returns only after the model reports ready, and the
        elapsed time matches the 6–10 minute cold start the phase exists
@@ -341,7 +348,11 @@ invocation is byte-for-byte unchanged in behaviour.
        remove-edge frame the fold can see.
     c. The no-observation case: a cell fleetd holds no live
        `/api/events` stream to prints the no-evidence line and never
-       unblocks on `--idle`.
+       unblocks on `--idle`. **Ran on the local multi-cell harness
+       (2026-08-05): passes.** (The earlier wording of this gate said
+       "a cell fleetd holds no url for" — that state cannot exist,
+       since fleetd 400s an announce from a cell absent from the
+       registry; see #36.)
     d. The full primitive end to end on two shells: B waits for A's
        lease to expire.
 
@@ -439,7 +450,20 @@ Four things the doc did not spell out and the code had to decide:
 | 10. Streaming contract | **PASS** — `git diff --stat main..HEAD -- internal/vibe/proxy` is empty |
 | 11. Inner loop | **PASS** — `go build ./...`, `go vet ./...`, `gofmt -l .` (silent), `go mod tidy` (`git diff --exit-code` clean), `golangci-lint run` (0 issues), `go test -race -count=5 ./...` (exit 0, 27 packages ok, no DATA RACE), re-run end to end after the review commit |
 | 12. C9 union (`--notify` beside the lease claim) | added by the merge — see [§Merging C9](#merging-c9-2026-08-04) |
-| 13. Live gates (a–d) | **NOT RUN** — no route to the fleet's hardware from the implementing environment. No transcripts are fabricated |
+| 13a. `--model --ready` on a cold model | **PARTIAL (2026-08-05, local multi-cell harness)** — the semantics ran exactly as designed: with the model evicted to `stopped`, `vibe cell await alpha --model lab-chat --ready --timeout 5m` was still blocked 20 s in (`await alpha: up; lab-chat stopped`), a real chat request then loaded it, and await returned rc=0 on the ready edge naming the model. **The magnitude half is unmet**: the harness model loads in ~25 s, not the 6–10 minutes this phase exists for. Also run, and not in the original gate: a typo'd model against a reachable cell with a non-empty catalog failed fast — rc=1 in **0 seconds** with `--timeout 0`, printing the real catalog. |
+| 13b. `--idle` during and after a chat | **PASS (2026-08-05, same harness).** A real request created a genuine activity edge (`in_flight=1`, `1 request(s) in flight`); `vibe cell await bravo --idle 45s --timeout 4m` printed `idle 0s of 45s` while blocked and returned rc=0 at **exactly 45 s** elapsed with `bravo is up: idle 45s (>= 45s)`, fleetd's own block reading `idle_s=45.02`. That is the remove-edge frame the fold depends on, observed. The negative control ran too: with the cell drained and fleetd's `/api/events` stream dropped, the activity block became `{"observed":false, "reason":"no live event stream to bravo — fleetd is not watching it, so silence is not evidence of idleness"}` and a **10-second** window the cell had trivially satisfied for minutes did **not** unblock — it waited and said why. |
+| 13c. the announce-only case | **UNRUNNABLE AS WRITTEN — the gate is void, and no hardware would fix it.** Attempted directly: `vibe fleet announce --cell delta` for a cell absent from `hosts.yaml` is refused by fleetd with `HTTP 400: unknown cell "delta" (not in the registry)` (`fleetapi/announce.go:280`), and `vibe cell await delta` returns `unknown cell "delta" (not in fleetd's registry)` in 0 s. Combined with `fleetcfg.go:358` (every cell needs a `url`) and one watcher per registry cell, **the set of cells that may announce is exactly the set fleetd holds a url for** — so "a cell fleetd holds no url for" cannot exist. The reachable analogue is the stream-down case, which is 13b's negative control and passes. Restate the gate as that; see the note below. |
+| 13d. two shells, B waits for A's lease | **NOT RUN.** Runnable on the harness (leases are fleetd-side and both shells are local); not attempted. No hardware involved. |
+
+**On 13c.** The unreachable state is worth recording because two other
+things point at it. `warmtarget.go:463-470`'s `frontCanRoute` false
+branch and the "no front route at all" half of `queueWarm` are
+unreachable *from the warm-target loop* for the same reason
+(`daemon/warm.go:61` already skips targets naming a cell absent from
+`hosts.yaml`); they stay reachable from `warm_schedule`, where the cell
+comes from a def's `cell:` field and is never checked against
+`hosts.yaml`. No misbehaviour was observed. This is recorded so the next
+agent does not go hunting for a fleet state the code refuses to create.
 
 ### Adversarial self-review (ground rule 9)
 
@@ -668,9 +692,10 @@ retry loop exists for, so it is recorded rather than changed.
 
 ### Gates, re-run after the review commit
 
-Gates 1–11 **PASS** on the merged tree; the live gates (a–d) remain
-**NOT RUN** — no route to the fleet's hardware from the reviewing
-environment either, and no transcripts are fabricated. Full inner loop:
+Gates 1–11 **PASS** on the merged tree; the live gates (a–d) were still
+unrun at this point — they were run on 2026-08-05 against the local
+multi-cell harness, and the results are in the final gate table above.
+Full inner loop:
 `go build ./...`, `go vet ./...`, `gofmt -l .` silent, `go mod tidy`
 clean, `golangci-lint run` **0 issues**, `go test -race -count=5 ./...`
 **exit 0, 27 packages ok, no DATA RACE**. Gate 10 re-checked against the
@@ -755,14 +780,15 @@ Two consequences worth keeping:
 
 ### Gates, re-run after the C9 merge
 
-Gates 1–11 **PASS** on the merged tree, plus one new gate for the union;
-the live gates (now numbered 13) remain **NOT RUN** — still no route to
-the fleet's hardware, and no transcripts are fabricated.
+Gates 1–11 **PASS** on the merged tree, plus one new gate for the union.
+The live gates (now numbered 13) were unrun at merge time; they ran on
+2026-08-05 against the local multi-cell harness — see the [gate
+table](#gates-re-run-after-the-review-commit) above for 13a–13d.
 
 | gate | result |
 |---|---|
 | 12. C9 union | **PASS** — `TestCellAwaitNotify_FiresAfterTheLeaseClaimAndCarriesItsOutcome` (ordered route log `[lease notify]`, message = the terminal's line verbatim including fleetd's evidence qualification, plus the lease line), `TestCellAwaitNotify_ARefusedLeaseStillPagesAndStillFailsTheCommand`, `TestCellAwaitNotify_APlainWaitPagesOnceWithNoLeaseLine`, `TestCellAwaitNotify_AFailedWaitPagesNothing` (timeout and fail-fast typo), `TestCellAwaitNotify_APushFailureWarnsAndKeepsTheExitCode`, `TestNotifyPayloadIsBoundedAndPrintable`; mutation-verified three ways — pushing before the claim, skipping the push on a refusal, and building the message independently of `awaitSuccessLine` each fail a named test |
-| 13. Live gates (a–d) | **NOT RUN** — no route to the fleet's hardware from the implementing environment |
+| 13. Live gates (a–d) | ran 2026-08-05 on the local multi-cell harness: **13b PASS**, **13a PARTIAL** (semantics yes, cold-start magnitude no), **13c VOID** (describes a state fleetd refuses to create), **13d unrun**. Detail in the [gate table](#gates-re-run-after-the-review-commit) above |
 
 Full inner loop on the merged tree: `go build ./...`, `go vet ./...`,
 `gofmt -l .` silent, `go mod tidy` clean, `golangci-lint run`

@@ -12,10 +12,12 @@ Every fix in both is mutation-verified. Unit gates
 U1–U16 are green on a full local inner loop (`go build`, `go vet`,
 `go test -race -count=5`, `golangci-lint run` 0 issues, `gofmt -l .`
 silent, `go mod tidy` clean) plus a local end-to-end run of the real
-command against a real fleetd; the four live gates need the real fleet
-and are **NOT RUN** — neither the implementing nor the reviewing
-environment can reach it (SSH blocked, the LAN does not route). See
-[Execution](#execution).
+command against a real fleetd. Live gates **L1, L2 and L3 PASSED on
+2026-08-05** against the local multi-cell harness
+([`scripts/fleetlab`](../../../scripts/fleetlab/README.md)) — four real
+cells with real credentials and a real announcer to kill; **L4 is
+PARTIAL** (its kill-fleetd half ran; the reboot and the WoL wake need a
+physical box and a real NIC). See [Execution](#execution).
 
 Backlog item 7 in [fleet-control-futures.md](../fleet-control-futures.md)
 §2, the first Medium-tier item:
@@ -642,8 +644,9 @@ Mechanical (become tests in-repo):
   client-side ones.
 - **U16** The full inner loop green under `-race -count=5`.
 
-Live (need the real fleet; **NOT RUN** in the implementing environment —
-SSH is blocked and the LAN does not route):
+Live (written as "need the real fleet"; L1–L3 turned out to need a
+multi-*cell* fleet, which the 2026-08-05 harness supplies — see the
+[gate results](#gate-results) for what ran):
 
 - **L1** Run against the real fleet from a workstation: every check
   produces a verdict, and every `UNKNOWN` has a reason an operator can
@@ -715,7 +718,25 @@ certs or a real roaming laptop was tested.
 |---|---|
 | U1–U16 | PASS (`go build`, `go vet`, `go test -race -count=5 ./...`, `golangci-lint run` 0 issues, `gofmt -l .` silent, `go mod tidy` clean) |
 | U1 / U2 mutation-verified | PASS — injecting a `SetIntent` call into `Doctor` fails both the behavioural test (`intent.json changed across a doctor run`) and the source scan, at the right line |
-| L1–L4 | **NOT RUN** — need the real fleet, a real roaming laptop and a real WoL wake |
+| L1 | **PASS (2026-08-05, local multi-cell harness — [`scripts/fleetlab`](../../../scripts/fleetlab/README.md)).** 38 checks over 4 real cells: 0 FAIL / 4 WARN / 8 UNKNOWN / 26 OK, exit 2. The gate is judgement, and the judgement holds: every UNKNOWN named the missing evidence *and* a fix — `versions.llama_swap` ("a reserved announce field and no announcer populates it yet — this is a missing producer, not an unreachable fleet"), `disk.free` ("the announced disk figure is zero … a doctor must not invent either reading"), `probe.verdicts` ("nothing measures throughput on this fleet — no cell has produced a verdict, so *nothing is slow* is unproven"). The write-nothing promise was verified by snapshot/rerun/snapshot around four runs (3× `--json` + 1× the HTTP route): `intent.json`, `leases.json`, the usage ledger, the notify-scope file, `last-seen.json`, a cell's `cell-intent.json` and `model-probe.json` all byte-identical afterwards, cell-side probe `attempts` unmoved at 4, residency unchanged. **Caveat:** a lab fleet has no TLS, no real weights disk and no roaming laptop, so those checks were exercised in their not-configured / not-reporting branches. |
+| L2 | **PASS (2026-08-05, same harness).** The file behind `cells.bravo.token_file` was overwritten while bravo's daemon held the original cached: `FAIL auth.outbound bravo — the cell daemon REFUSED fleetd's credential / source: cells.bravo.token_file (…) unauthenticated: 401 Unauthorized / fix: drain/resume/unload for this cell will 401 until the two sides carry the same token.` The other three cells' `auth.outbound` stayed OK — the failure was scoped to one cell and named its source file, which is the whole gate. |
+| L3 | **PASS (2026-08-05, same harness).** Only the roaming cell's announcer was SIGKILLed; its host_probe and llama-swap kept answering. `WARN roaming.announcer charlie — the box answers but is not announcing / fleetd just reached this box at L4, so the announce agent is not loaded, not running, or is being rejected. auth.rejections is 24 and climbing, which makes the rejected explanation the likely one.` Both causes named, as designed. Then the host itself was taken down and the same check correctly became `UNKNOWN … box is away; whether its announcer would load is unknowable from here` — the distinction the check exists to make. |
+| L4 | **PARTIAL (2026-08-05).** The kill-fleetd half ran: pointed at a dead port the CLI produced `FAIL fleetd.reachable` with `fix: inference is unaffected — fleetd is read-and-request-only` and `UNKNOWN fleetd.checks — every fleet-side check is unevaluated`, while still evaluating the client-side ones. **The rest needs metal**: a physical box to reboot and a real NIC to receive a magic packet. `wake.configured` is by design a configuration check because arming is not observable from here, and this drill is the one test that could contradict it. Nothing local substitutes. |
+| bonus — defs parity | **PASS/PARTIAL (2026-08-05, same harness).** The shared backends dir was made a real git checkout: `defs.parity OK — every reporting cell is at a1cde82`. One cell was then given its own checkout one commit ahead: `WARN defs.parity — cells disagree about the def checkout / a1cde82: alpha, charlie · c2b8449: bravo`. **Then an uncommitted edit in the diverged checkout flipped the level back to OK** — see the note below. |
+| bonus — U13 / U15 | **PASS.** `--json` and the HTTP document agree on every `{id, subject, level}` except the CLI's extra `auth.client_env` check, which inspects the calling shell's `$VIBE_TOKEN` and cannot exist server-side (`cli/cmd_fleet_doctor.go:239`). And `auth.client_env` earned its place: it WARNed `$VIBE_TOKEN is set in THIS shell and overrides every per-cell token_file … for: bravo`, which predicted the exact 401 that `vibe cell drain bravo --yes` then produced, and which succeeded with the variable unset. |
+
+**The one thing the live run found.** `doctor.go:582` downgrades a
+**known** divergence from WARN to OK when the diverged cell's checkout
+goes dirty: two checkouts disagreeing reports `WARN defs.parity`, and
+adding an uncommitted edit to the already-diverged one reports
+`OK defs.parity — every reporting cell is at a1cde82. Uncomparable
+(working tree dirty): bravo (c2b8449).` The level an operator scans
+inverts at the moment the cell becomes *more* drifted. It is consistent
+with the pinned test (`TestDoctor_DefsParityTreatsADirtyCheckoutAsUncomparable`
+— dirty can neither agree nor disagree) and the excluded cell is named
+in the OK detail, so this is a judgement call rather than a defect. But
+if the intent is "a dirty tree is unknowable", a cell whose last
+*commit* is already known to differ could keep the WARN and say so.
 
 ### Adversarial self-review addendum
 

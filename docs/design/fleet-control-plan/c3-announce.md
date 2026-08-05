@@ -332,6 +332,34 @@ instead of ~50s late.
 6. Unit tests: canonicalization (flag order, port stripping),
    staleness state machine, class policy render matrix, conflict rule.
 
+### Independent re-run (2026-08-05, local multi-cell harness)
+
+Gate 1's class-policy half was re-run from scratch on
+[`scripts/fleetlab`](../../../scripts/fleetlab/README.md) — a fleet
+built for the purpose, with one cell of each class — and reproduced the
+reference fleet's result on different hardware:
+
+- **Prune half.** All three announcers SIGKILLed at once. Front render
+  before: `alpha=[lab-chat, lab-embed-a] bravo=[lab-embed-b]
+  charlie=[lab-embed-c]`. After staleness, fleetd logged `pruning roaming
+  cell from front render cell=charlie stale=true withdrawn=false` and
+  rewrote the config to alpha+bravo only — the `always_on` and
+  `opportunistic` cells **held** their model ids while equally stale.
+- **Hold half.** With the opportunistic cell's llama-swap actually
+  stopped, the front still listed it and
+  `POST /v1/embeddings model=lab-embed-b` returned **502** with
+  `peer proxy error: dial tcp …: connection refused` — the id resolved
+  and the failure was typed at the peer, not an unknown-model 404. That
+  is the gate's `UPSTREAM_DOWN` requirement, observed.
+- **Re-add hysteresis.** With the announcers restarted, `healthy_streak`
+  climbed 1…5 with the roaming cell's peer stanza absent throughout,
+  then `roaming cell re-added to front render cell=charlie
+  healthy_streak=5`. Re-add is slower than prune, as designed.
+
+What this re-run does **not** cover: a laptop that physically leaves the
+LAN. SIGKILL is a faithful stand-in for a vanished announcer and not for
+a vanished route.
+
 ## Out of scope
 
 The v2 `probe` throughput block (reserved only), warm targets/page
