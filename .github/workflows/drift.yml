@@ -1,0 +1,78 @@
+name: drift
+
+# The alarm for the next v239 -> v247.
+#
+# ci.yml's conformance job runs against PINNED llama-swap versions, so it can
+# never tell you that upstream moved. This one resolves LATEST at run time and
+# runs the same conformance list against it. It is allowed to be red: a red
+# run means the contract changed, not that anybody's PR is broken, which is
+# why it never touches the pull-request path and carries continue-on-error.
+#
+# When it goes red:
+#   1. Read the failing invariant — it names the semantic that moved.
+#   2. Re-record: see internal/swaptest/record_test.go's TestRecord doc
+#      comment. Commit the new fixtures/<version>/ BESIDE the existing ones.
+#   3. Add the Wire to internal/swaptest and teach the fold the new shape.
+#   4. Run scripts/fleetlab before any cell is upgraded. This job tells you
+#      the contract moved; only the lab tells you what it does to a fleet.
+#
+# It costs the inner loop nothing.
+
+on:
+  schedule:
+    # Mondays, 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  latest:
+    name: conformance (llama-swap latest, unpinned)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      LLAMA_CPP_VERSION: b10282
+      MODEL_URL: https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: true
+      - name: resolve llama-swap latest
+        id: resolve
+        run: |
+          set -euo pipefail
+          v=$(curl -sSfL https://api.github.com/repos/mostlygeek/llama-swap/releases/latest | \
+                sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "llama-swap latest is $v"
+      - name: report whether we have a recording for it
+        run: |
+          v="${{ steps.resolve.outputs.version }}"
+          if [ -d "internal/swaptest/fixtures/$v" ]; then
+            echo "internal/swaptest has recorded fixtures for $v."
+          else
+            echo "::warning::No recorded fixtures for llama-swap $v. If the conformance run below is red, re-record before upgrading any cell (see internal/swaptest TestRecord)."
+          fi
+      - name: fetch llama-swap latest + llama.cpp + a 1.2 MB model
+        run: |
+          set -euo pipefail
+          mkdir -p .upstream
+          v="${{ steps.resolve.outputs.version }}"
+          curl -sSfL -o /tmp/ls.tgz \
+            "https://github.com/mostlygeek/llama-swap/releases/download/${v}/llama-swap_${v#v}_linux_amd64.tar.gz"
+          tar xzf /tmp/ls.tgz -C .upstream llama-swap
+          curl -sSfL -o /tmp/lcpp.tgz \
+            "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_VERSION}/llama-${LLAMA_CPP_VERSION}-bin-ubuntu-x64.tar.gz"
+          rm -rf /tmp/lcpp && mkdir -p /tmp/lcpp && tar xzf /tmp/lcpp.tgz -C /tmp/lcpp
+          find /tmp/lcpp -type f \( -name 'llama-server' -o -name '*.so*' \) -exec cp -a {} .upstream/ \;
+          curl -sSfL -o .upstream/stories260K.gguf "$MODEL_URL"
+          chmod +x .upstream/llama-swap .upstream/llama-server
+          .upstream/llama-swap --version
+      - name: conformance against latest
+        env:
+          LLAMA_SWAP_BIN: ${{ github.workspace }}/.upstream/llama-swap
+          LLAMA_SERVER_BIN: ${{ github.workspace }}/.upstream/llama-server
+          LLAMA_GGUF: ${{ github.workspace }}/.upstream/stories260K.gguf
+          LD_LIBRARY_PATH: ${{ github.workspace }}/.upstream
+        run: go test -timeout 300s -v -run 'TestSwapContract/live' ./internal/swaptest/
