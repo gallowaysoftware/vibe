@@ -69,8 +69,15 @@ Run 2026-08-05 across three lab instances. It moved 40+ gates from
 that no unit test had — the ledger's epoch double-count, the warm path's
 missing model-class guard, the doctor's dirty-checkout inversion, the
 guest allowlist's decoded-path comparison, and a documented fleet state
-the code refuses to create. Per-phase results are in each phase doc's
-gate table; the harness is named there as `local multi-cell harness`.
+the code refuses to create. A second pass the same day
+([C17](../../docs/design/fleet-control-plan/c17-gate-closure.md)) ran the
+thirteen gates that had been recorded as "needs metal" but had simply
+never been attempted, moved fourteen rows, and found one more product
+defect (a cell's probe specs and announced fingerprints are frozen at
+announcer start, so `-watch-config` hot reload does not rebind the C8
+baseline key) plus one documented figure that was wrong by 3x. Per-phase
+results are in each phase doc's gate table; the harness is named there as
+`local multi-cell harness`.
 
 Two limits to state every time it is used:
 
@@ -95,24 +102,65 @@ Two limits to state every time it is used:
   vanish against a real roaming box; the lab substitutes SIGKILL).
 - A GPU under real VRAM pressure (C8 L2's spill-induced degradation, as
   opposed to an induced throttle; C10 13a's 6–10 minute cold start).
-- A browser (C12 L1's hallway test — a phone is convenient, not
-  required).
-- Wall-clock duration: 24 h for C8 L4's cap and C7a's soak, a week of
-  real traffic for C7b's plausibility gate. Nothing physical blocks
-  these; the harness can run them unattended.
+- ~~A browser (C12 L1's hallway test)~~ — closed 2026-08-05 by
+  `marionette.py`, which drives a headless Firefox. A phone was always
+  convenience; the remaining delta is screen size.
+- Wall-clock duration: 24 h for C8 L4's scheduling half and C7a's soak, a
+  week of real traffic for C7b's plausibility gate. Nothing physical
+  blocks these; the harness can run them unattended.
+
+## The gate scripts
+
+One script per gate, beside `lab.sh`. Each sources `gl.sh` (the scratch
+XDG triple + `state`/`mcp` helpers), drives a running lab, prints raw
+evidence, and cleans up whatever config it changed. Bring the lab up
+first (`FLEETLAB_DIR=/tmp/fleetlab ./lab.sh up`) and pass the same
+`FLEETLAB_DIR`.
+
+| script | gate | runtime |
+|---|---|---|
+| `gate-c7a-partials.sh` | C7a 2 + 5 — front-collected rows into the fold; a poke that is not one token; probe traffic as self-traffic | ~3 min |
+| `gate-c8-l4.sh` | C8 L4 — the 96/day cap at its boundary (the 24 h window is seeded on the cell's state file; the script says so) | ~5 min |
+| `gate-c8-l5.sh` | C8 L5 — embed probe baseline on a bge cell | ~25 min (5-minute cell-side cooldown) |
+| `gate-c8-l5-staleflags.sh` | C8 L5's flag-change half — currently a **FAIL**; isolates the cause | ~15 min |
+| `gate-c9-14a.sh` | C9 14a — a real ntfy topic accepts the payload (needs outbound network) | ~1 min |
+| `gate-c9-14d.sh` | C9 14d — a def edited on the front, not the cell → drift alarm, once, then resolve | ~9 min |
+| `gate-c10-13d.sh` | C10 13d — two shells, the lease handshake | ~4 min |
+| `gate-c11-l2.sh` | C11 L2 — a hold is not a pin (drops a def's TTL to 45 s) | ~7 min |
+| `gate-c11-l3.sh` | C11 L3 — a hold reaches the warm-schedule guard | ~7 min |
+| `gate-c12-l3.sh` | C12 L3 — guest token rotation across a fleetd restart | ~1 min |
+| `gate-c13-parity.sh` | C13's `defs.parity` — the dirty-and-diverged level, after #36 | ~3 min |
+| `gate-c14-l3.sh` | C14 L3 — a real request defers the declared suspend, then it fires | ~12 min |
+| `gate-c14-l4.sh` | C14 L4 — a lease defers the suspend until `max_defer` abandons it | ~10 min |
+| `marionette.py` | C12 L1's DOM half — drives headless Firefox over Marionette | ~1 min |
+| `gate-c15-warm-auth.sh` | C15 L1 — standalone rig (its own ports); see its header | ~10 min |
+
+`marionette.py` needs `firefox` on `$PATH`; nothing else here does.
+Two of these change fleetd config and restart it (`gate-c9-14d.sh`,
+`gate-c11-l3.sh`, `gate-c14-l3.sh`, `gate-c14-l4.sh`, `gate-c9-14a.sh`)
+— they back the file up and restore it, but do not run two of them at
+once against the same lab.
 
 ## Adding a gate
 
 Write it as a standalone script beside `lab.sh` that sources nothing
-from it except `./lab.sh env`, drives the fleet through the CLI or the
-HTTP API, and prints raw evidence rather than a verdict. The gate
-transcripts from the 2026-08-05 run were all of that shape, and the
+from it except `gl.sh` (or `./lab.sh env`), drives the fleet through the
+CLI or the HTTP API, and prints raw evidence rather than a verdict. The
+gate transcripts from the 2026-08-05 runs were all of that shape, and the
 reason is C13's rule in miniature: a rig that prints PASS is a rig that
 can print PASS while wrong. Print what happened; let the reader judge.
+
+Two habits worth copying, both learned the hard way on 2026-08-05:
+**read the field the answer is actually in** (`/api/fleet/usage` returns
+`buckets`, the warm block's key is `schedule`, an activity row nests
+`tokens`) — a `jq` typo prints an empty array that reads exactly like a
+feature not firing; and **compute cron minutes in the FLEET timezone**
+(`fleet.timezone`), not the shell's, or the declared minute arrives an
+hour late and the gate looks broken.
 
 ## Requirements
 
 `go`, `jq`, `socat`, `python3`, a llama-swap v239+ binary, a llama-server
 binary, and three small GGUFs (one chat + two embedding) named by
 `CHAT_GGUF` / `BGE_LARGE` / `BGE_M3`. Everything else the script writes
-itself.
+itself. `firefox` for `marionette.py`.
