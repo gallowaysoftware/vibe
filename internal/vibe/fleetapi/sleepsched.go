@@ -101,12 +101,11 @@ type sleepScheduleState struct {
 
 	// Loop-owned runtime, all touched under s.mu like warmTargetState's
 	// emptySince.
-	pendingSince time.Time
-	deferUntil   time.Time
-	pending      bool
-	asleep       bool
-	asleepSince  time.Time
-	waking       bool
+	deferUntil  time.Time
+	pending     bool
+	asleep      bool
+	asleepSince time.Time
+	waking      bool
 }
 
 // sleepStatus is the fleet_status block.
@@ -243,7 +242,7 @@ func (s *Server) sleepEntryLoop(e SleepScheduleEntry, sus, wake cronSpec, st *sl
 func (s *Server) evalSleepEntry(e SleepScheduleEntry, sus, wake cronSpec, st *sleepScheduleState, cfg sleepLoopConfig, now time.Time) {
 	s.reconcileSleepState(e, st)
 
-	if due, _ := s.sleepDue(st, now); due == sleepDueWake {
+	if s.sleepDue(st, now) == sleepDueWake {
 		next, ok := wake.nextFire(now, cfg.loc)
 		s.mu.Lock()
 		if ok {
@@ -272,7 +271,7 @@ func (s *Server) evalSleepEntry(e SleepScheduleEntry, sus, wake cronSpec, st *sl
 		}
 	}
 
-	if due, _ := s.sleepDue(st, now); due == sleepDueSuspend {
+	if s.sleepDue(st, now) == sleepDueSuspend {
 		next, ok := sus.nextFire(now, cfg.loc)
 		s.mu.Lock()
 		if ok {
@@ -283,7 +282,6 @@ func (s *Server) evalSleepEntry(e SleepScheduleEntry, sus, wake cronSpec, st *sl
 		}
 		if !st.asleep && !st.waking {
 			st.pending = true
-			st.pendingSince = now
 			p := now.UTC()
 			st.DeferredSince = &p
 			st.deferUntil = now.Add(e.MaxDefer)
@@ -323,18 +321,20 @@ const (
 	sleepDueWake
 )
 
-// sleepDue reports which half (if either) is due, reading the next-fire
-// pointers under the lock rather than carrying them out of it.
-func (s *Server) sleepDue(st *sleepScheduleState, now time.Time) (int, time.Time) {
+// sleepDue reports which half (if either) is due, dereferencing the
+// next-fire pointers under the lock rather than carrying them out of it.
+// The wake is checked first, which is what makes a suspend that survived
+// to its own wake minute get abandoned instead of fired.
+func (s *Server) sleepDue(st *sleepScheduleState, now time.Time) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if st.NextWake != nil && !now.Before(*st.NextWake) {
-		return sleepDueWake, *st.NextWake
+	switch {
+	case st.NextWake != nil && !now.Before(*st.NextWake):
+		return sleepDueWake
+	case st.NextSuspend != nil && !now.Before(*st.NextSuspend):
+		return sleepDueSuspend
 	}
-	if st.NextSuspend != nil && !now.Before(*st.NextSuspend) {
-		return sleepDueSuspend, *st.NextSuspend
-	}
-	return sleepDueNone, time.Time{}
+	return sleepDueNone
 }
 
 // reconcileSleepState is bookkeeping ONLY: it clears a wake_failed
