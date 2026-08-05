@@ -5,7 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -29,6 +32,7 @@ func (s *Server) watchCell(c Cell) {
 		default:
 		}
 		s.setCellUp(c.Name, false)
+		s.clearInFlight(c.Name)
 		if connected {
 			backoff = s.baseBackoff
 		}
@@ -124,45 +128,124 @@ func (s *Server) handleUpstream(cell, payload string) {
 	s.publish(ev)
 }
 
-// trackInFlight folds llama-swap's inflight frames into the per-cell
-// count. The frame's data is a JSON string carrying {"requests":[…]}
-// (verified on v239; operation add/remove frames carry the full list
-// too), so the count is len(requests) — never an increment guess.
-// Entries also feed per-model activity timestamps (fleetd-side clock),
-// the idle windows C4's warm targets restore on.
+// inflightEntry is one live request in llama-swap's inflight frames. The
+// id is load-bearing on v240+, where a remove edge carries nothing else.
+type inflightEntry struct {
+	ID    string `json:"id"`
+	Model string `json:"model"`
+}
+
+// trackInFlight folds llama-swap's inflight frames into the per-cell SET of
+// live requests, keyed by request id. The frame's data is a JSON string
+// (double-encoded: the SSE data field is an envelope whose data member is
+// itself JSON text), and its shape is VERSION-DEPENDENT in a way that is
+// not cosmetic:
+//
+//   - v239 sends the full list on every edge: {"requests":[…]}.
+//   - v240+ tags each frame with an "operation" and sends the DELTA —
+//     {"operation":"upsert","request":{…}} and {"operation":"remove","id":…} —
+//     with "requests" omitempty and therefore absent.
+//
+// Counting len(requests) reads every v240+ edge as ZERO in flight while
+// still reporting the count as known. That is the one reading this
+// subsystem may never produce: a reported zero is a positive claim of
+// idleness, and eight busy guards (drain, suspend, probe, both warm loops)
+// disarm on it silently.
+//
+// So an operation this code does not recognise DISARMS the cell —
+// s.inFlightSeen goes false, which every one of those guards already
+// renders as a refusal. Fail toward "no evidence", never toward
+// "confirmed idle": the drift nobody noticed is the normal case.
+//
+// Entries also feed per-model activity timestamps (fleetd-side clock), the
+// idle windows C4's warm targets restore on. Holding the model per id is
+// what lets a remove edge — which names only an id — still resolve a model
+// for the completion stamp below.
 func (s *Server) trackInFlight(cell string, data json.RawMessage) {
 	var inner string
 	if err := json.Unmarshal(data, &inner); err != nil {
 		return
 	}
 	var wrap struct {
-		Requests []struct {
-			Model string `json:"model"`
-		} `json:"requests"`
+		Operation string          `json:"operation"`
+		Requests  []inflightEntry `json:"requests"`
+		Request   *inflightEntry  `json:"request"`
+		ID        string          `json:"id"`
 	}
 	if err := json.Unmarshal([]byte(inner), &wrap); err != nil {
 		return
 	}
+
 	now := time.Now() // duration clock: keep the monotonic reading
-	present := make([]string, 0, len(wrap.Requests))
 	s.mu.Lock()
-	s.inFlight[cell] = len(wrap.Requests)
-	s.inFlightSeen[cell] = true
+	defer s.mu.Unlock()
+
 	// Every frame is an EDGE — an add or a remove — so any frame is
-	// request activity on this cell (C10). Recorded per CELL because
-	// that is the question a parked batch asks: the per-model map below
-	// goes quiet the moment llama-swap TTL-unloads the model somebody
-	// was using thirty seconds ago.
+	// request activity on this cell (C10). Recorded per CELL because that
+	// is the question a parked batch asks: the per-model map below goes
+	// quiet the moment llama-swap TTL-unloads the model somebody was
+	// using thirty seconds ago. Stamped even for a shape we cannot fold:
+	// not understanding a frame is not evidence that the cell is quiet,
+	// and every consumer of this stamp errs toward waiting.
 	s.lastInFlightFrame[cell] = now
+
+	set := s.inFlightReqs[cell]
+	if set == nil {
+		set = map[string]string{}
+	}
+	switch wrap.Operation {
+	case "", "snapshot":
+		// A full list REPLACES, so the count is len(requests) exactly as
+		// it was before ids entered this fold. The positional key keeps
+		// that true for an entry with no id: ids matter only across
+		// frames, and a full list carries no history.
+		set = make(map[string]string, len(wrap.Requests))
+		for i, r := range wrap.Requests {
+			key := r.ID
+			if key == "" {
+				key = "\x00pos" + strconv.Itoa(i)
+			}
+			set[key] = r.Model
+		}
+	case "upsert", "add":
+		if wrap.Request == nil {
+			s.disarmInFlightLocked(cell, wrap.Operation+" (no request)")
+			return
+		}
+		set[wrap.Request.ID] = wrap.Request.Model
+	case "remove":
+		id := wrap.ID
+		if id == "" && wrap.Request != nil {
+			id = wrap.Request.ID
+		}
+		if id == "" {
+			s.disarmInFlightLocked(cell, wrap.Operation+" (no id)")
+			return
+		}
+		// An unknown id is a no-op, not a signal: a remove for a request
+		// that started before this connection is exactly what a reconnect
+		// produces, and it says nothing about the rest of the set.
+		delete(set, id)
+	default:
+		s.disarmInFlightLocked(cell, wrap.Operation)
+		return
+	}
+
+	s.inFlightReqs[cell] = set
+	s.inFlight[cell] = len(set)
+	s.inFlightSeen[cell] = true
+	delete(s.inFlightUnknownOp, cell)
+
 	seen := map[string]bool{}
-	for _, r := range wrap.Requests {
-		if r.Model == "" {
+	present := make([]string, 0, len(set))
+	for _, model := range set {
+		if model == "" {
 			continue
 		}
-		s.modelActivity[cell+"\x00"+r.Model] = now
-		if !seen[r.Model] {
-			seen[r.Model] = true
-			present = append(present, r.Model)
+		s.modelActivity[cell+"\x00"+model] = now
+		if !seen[model] {
+			seen[model] = true
+			present = append(present, model)
 		}
 	}
 	// Frames are add/remove EDGES: a request stamps activity when it
@@ -174,8 +257,41 @@ func (s *Server) trackInFlight(cell string, data json.RawMessage) {
 			s.modelActivity[cell+"\x00"+m] = now
 		}
 	}
+	sort.Strings(present)
 	s.lastInFlightModels[cell] = present
-	s.mu.Unlock()
+}
+
+// disarmInFlightLocked un-reports the cell's in-flight count after a frame
+// shape this build cannot fold. It is the deliberate degradation path: the
+// alternative is reporting a count derived from a frame we did not
+// understand, and every wrong answer there is "idle".
+func (s *Server) disarmInFlightLocked(cell, op string) {
+	delete(s.inFlightReqs, cell)
+	delete(s.inFlight, cell)
+	s.inFlightSeen[cell] = false
+	s.lastInFlightModels[cell] = nil
+	if s.inFlightUnknownOp[cell] != op {
+		s.inFlightUnknownOp[cell] = op
+		slog.Warn("fleet: unrecognised llama-swap inflight frame — in-flight is now UNREPORTED for this cell, so every busy guard will refuse rather than assume idle. Upgrade vibe to a build that understands this llama-swap.",
+			"cell", cell, "operation", op)
+	}
+}
+
+// clearInFlight drops everything the in-flight fold knew about a cell when
+// its events stream ends. The count does not survive the connection that
+// produced it: the remove edges that would have closed those requests out
+// were delivered to nobody, and llama-swap re-seeds a fresh connection with
+// a current-state snapshot within milliseconds. lastInFlightFrame and
+// modelActivity deliberately survive — those are records of activity that
+// genuinely happened, not claims about now.
+func (s *Server) clearInFlight(cell string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.inFlightReqs, cell)
+	delete(s.inFlight, cell)
+	delete(s.inFlightSeen, cell)
+	delete(s.inFlightUnknownOp, cell)
+	s.lastInFlightModels[cell] = nil
 }
 
 // modelLastActivity returns when the model last served a request on

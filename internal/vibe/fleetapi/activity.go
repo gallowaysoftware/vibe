@@ -52,6 +52,7 @@ func (s *Server) activityFor(cell string) *CellActivity {
 	since, haveSince := s.cellUpSince[cell]
 	last, haveLast := s.lastInFlightFrame[cell]
 	count, reported := s.inFlight[cell], s.inFlightSeen[cell]
+	unknownOp := s.inFlightUnknownOp[cell]
 	s.mu.Unlock()
 
 	act := &CellActivity{Observed: up && haveSince}
@@ -103,6 +104,13 @@ func (s *Server) activityFor(cell string) *CellActivity {
 	act.IdleSeconds = &secs
 	if !reported {
 		act.Reason = "no inflight frame seen yet; idle measured from the stream connect"
+		if unknownOp != "" {
+			// Seen but not understood is a different evidence gap from
+			// never seen, and it is the one that means "upgrade this
+			// build". Reporting it as the first would send an operator
+			// looking for a dead events stream that is in fact healthy.
+			act.Reason = fmt.Sprintf("%s sent inflight frames this build cannot fold (operation %q) — the count is unreported, not zero; idle measured from the last frame", cell, unknownOp)
+		}
 	}
 	return act
 }
