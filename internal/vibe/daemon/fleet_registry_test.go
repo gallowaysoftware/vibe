@@ -226,6 +226,10 @@ cells:
 		// one, it must not inherit the page's exemption.
 		{http.MethodGet, "/ui/fleet/savings"},
 		{http.MethodGet, "/api/fleet/savings"},
+		// C12's guest grant is a TOKEN grant, not an anonymous one: the
+		// two routes a guest bearer reaches still 401 without a bearer.
+		{http.MethodGet, "/api/fleet/state"},
+		{http.MethodGet, "/api/fleet/events"},
 	} {
 		resp = req(tc.method, "http://"+httpAddr+tc.path, "", "")
 		resp.Body.Close()

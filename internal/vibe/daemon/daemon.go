@@ -197,6 +197,17 @@ type FleetConfig struct {
 	// TokenFile is the path to fleetd's bearer token. The path is config;
 	// the token value never enters a repo. Tilde-expanded at load.
 	TokenFile string `yaml:"token_file,omitempty"`
+	// GuestTokenFile is the path to the guest READ-ONLY bearer
+	// (fleet-control C12), honored on exactly GET /api/fleet/state and
+	// GET /api/fleet/events and refused everywhere else. Same convention
+	// as TokenFile: the path is config, the value never enters a repo.
+	// Empty is the default and means no guest credential exists at all —
+	// a fleet that never configures one behaves exactly as it did before
+	// C12. A missing file is MINTED at first start; anything else wrong
+	// with it (empty, too short, whitespace, or identical to the
+	// control-plane token) disables guest access and says so, because a
+	// misconfigured share token must fail closed rather than fail wide.
+	GuestTokenFile string `yaml:"guest_token_file,omitempty"`
 	// FrontConfig is the front's rendered llama-swap config path as seen
 	// from THIS daemon — set on fleetd (same-host mount) so the MCP
 	// render_front tool can diff a fresh render against it. Empty means
@@ -290,6 +301,7 @@ func LoadConfig() (Config, error) {
 		c.ProxyPort = defaultProxyPort
 	}
 	c.Fleet.TokenFile = expandTilde(c.Fleet.TokenFile)
+	c.Fleet.GuestTokenFile = expandTilde(c.Fleet.GuestTokenFile)
 	c.Fleet.FrontConfig = expandTilde(c.Fleet.FrontConfig)
 	c.Fleet.Notify.URLFile = expandTilde(c.Fleet.Notify.URLFile)
 	c.Fleet.Notify.TokenFile = expandTilde(c.Fleet.Notify.TokenFile)
@@ -363,6 +375,13 @@ type Daemon struct {
 	// in /api/fleet/state so a stale-token client is visible as a number,
 	// not buried in logs.
 	authRejected atomic.Int64
+	// guestEnabled/guestRejected are the C12 guest read-only bearer's two
+	// status fields: whether one is configured, and how many requests
+	// presented a valid one on a route its allowlist does not name. Never
+	// the token itself. Atomics because both are written during Run and
+	// read from every state snapshot.
+	guestEnabled  atomic.Bool
+	guestRejected atomic.Int64
 
 	// fleet is the fleetapi server, assigned in Run once constructed.
 	// CellDrain reads the local cell's inflight count from it.
@@ -512,6 +531,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else {
 		slog.Info("control-plane token loaded", "path", paths.TokenFile())
 	}
+	guestToken := d.loadGuestToken(token)
 
 	mux := http.NewServeMux()
 	mountPath, connectHandler := vibev1connect.NewControlServiceHandler(d)
@@ -627,7 +647,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// distinction into per-RPC interceptors. markRemote distinguishes
 	// fleetd-invoked cell verbs (fleetd writes intent) from local
 	// unix-socket ones (this daemon writes it).
-	httpSrv := &http.Server{Handler: bearerAuthMiddleware(token, &d.authRejected, markRemote(mux))}
+	httpSrv := &http.Server{Handler: bearerAuthMiddleware(authGuard{
+		token:         token,
+		guestToken:    guestToken,
+		rejected:      &d.authRejected,
+		guestRejected: &d.guestRejected,
+	}, markRemote(mux))}
 	errCh := make(chan error, 2)
 	serve := func(srv *http.Server, ln net.Listener) {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -1657,7 +1682,12 @@ func (d *Daemon) servicesStatus() []*vibev1.Status {
 // profile plus every running service. Same data protoStatus/servicesStatus
 // expose over Connect, reshaped for the JSON surface.
 func (d *Daemon) fleetDaemonInfo() fleetapi.DaemonInfo {
-	info := fleetapi.DaemonInfo{Services: []fleetapi.ServiceInfo{}, AuthRejected: d.authRejected.Load()}
+	info := fleetapi.DaemonInfo{
+		Services:      []fleetapi.ServiceInfo{},
+		AuthRejected:  d.authRejected.Load(),
+		GuestEnabled:  d.guestEnabled.Load(),
+		GuestRejected: d.guestRejected.Load(),
+	}
 	d.mu.Lock()
 	if d.active != nil {
 		info.ActiveProfile = d.active.Name

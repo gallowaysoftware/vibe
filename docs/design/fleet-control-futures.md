@@ -90,9 +90,23 @@ Small (days):
    plus an `ExecStopPost` hook on cell units that best-effort records
    out-of-band stops as intent. One line of packaging that decides
    whether the intent axis stays trustworthy.
-6. **Guest read-only token** — a second bearer honored only on
-   `GET /api/fleet/state` + `/events` (interim: reverse-proxy path
-   allowlist, zero code). Sharing status today means sharing drain.
+6. **Guest read-only token** — **SHIPPED as
+   [C12](fleet-control-plan/c12-guest-token.md) (2026-08-04).** A second
+   bearer honored only on `GET /api/fleet/state` + `/events`. Three
+   notes for whoever reads this next. The interim this entry named (a
+   reverse-proxy path allowlist) stays a valid deployment but was not
+   what shipped: the allowlist has to stay true across future phases,
+   and one in a file this repo cannot test is one that drifts the first
+   time a route is added — so the declaration lives in the route table
+   itself, `Access` has no safe zero value, and a route added without a
+   guest decision fails a test. **`/api/fleet/usage` and
+   `/api/fleet/savings` are refused to a guest** despite being read-only
+   GETs (item 8's ledger is a behavioural log of the household at day
+   resolution; the savings screen adds what the hardware and the power
+   cost). And the fleet page renders read-only for a guest, learning
+   which credential it holds from a response header on a request it
+   already makes — no probe, no new route, and no per-viewer field in
+   the one state document every surface renders.
 7. **Upstream: llama-swap SIGTERM-time stream grace** (found by C2's
    drain gate, 2026-08-02). The signal handler calls `CloseStreams()`
    before the graceful drain, which cancels in-flight inference

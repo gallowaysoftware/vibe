@@ -154,7 +154,7 @@ func TestBearerAuthMiddleware_AcceptsCorrectToken(t *testing.T) {
 		called = true
 		w.WriteHeader(http.StatusOK)
 	})
-	srv := httptest.NewServer(bearerAuthMiddleware("s3cret", nil, next))
+	srv := httptest.NewServer(bearerAuthMiddleware(authGuard{token: "s3cret"}, next))
 	t.Cleanup(srv.Close)
 
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
@@ -175,7 +175,7 @@ func TestBearerAuthMiddleware_AcceptsCorrectToken(t *testing.T) {
 func TestBearerAuthMiddleware_RejectsMissingHeader(t *testing.T) {
 	called := false
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true })
-	srv := httptest.NewServer(bearerAuthMiddleware("s3cret", nil, next))
+	srv := httptest.NewServer(bearerAuthMiddleware(authGuard{token: "s3cret"}, next))
 	t.Cleanup(srv.Close)
 
 	resp, err := srv.Client().Get(srv.URL + "/")
@@ -196,7 +196,7 @@ func TestBearerAuthMiddleware_RejectsMissingHeader(t *testing.T) {
 
 func TestBearerAuthMiddleware_RejectsWrongToken(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
-	srv := httptest.NewServer(bearerAuthMiddleware("s3cret", nil, next))
+	srv := httptest.NewServer(bearerAuthMiddleware(authGuard{token: "s3cret"}, next))
 	t.Cleanup(srv.Close)
 
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)

@@ -80,12 +80,21 @@
   #sv-notes { color: var(--dim); font-size: 12px; margin-top: 20px; }
   #sv-notes div { margin: 4px 0; }
   #sv-empty p { max-width: 60em; color: var(--dim); }
+  /* Guest mode (C12): the server told us this token is the read-only
+     one, so the page stops OFFERING what it cannot do. Hiding is a
+     courtesy — the middleware is the boundary, and a guest who forges
+     the class still gets a 401. */
+  #guest-chip { color: var(--amber); border-color: var(--amber); }
+  body.guest #warmrow { display: none; }
+  body.guest #nav-savings { display: none; }
+  #sv-guest { color: var(--dim); max-width: 60em; }
 </style>
 </head>
 <body>
 <header>
   <h1>fleet</h1>
   <span class="meta" id="fleetd-addr"></span>
+  <span class="chip" id="guest-chip" hidden>read-only</span>
   <nav id="views">
     <a href="#fleet" id="nav-fleet">fleet</a>
     <a href="#savings" id="nav-savings">savings</a>
@@ -117,6 +126,14 @@
        page adds exactly one route and no mutation surface" literally
        true: every figure here comes from one authed read-only GET. -->
   <section id="view-savings" hidden>
+    <!-- A guest bearer is refused on /api/fleet/savings by design (C12
+         §1: state is instantaneous, the ledger and its prices are the
+         household's history). Saying so is the honest answer; popping
+         the token gate would tell a guest their working token is
+         wrong. -->
+    <div id="sv-guest" hidden>This view needs the control-plane token. The read-only
+      token covers live fleet state only — not the usage ledger it is priced from.</div>
+    <div id="sv-body">
     <div id="sv-head"></div>
     <div id="sv-hero"></div>
     <details id="sv-caveat">
@@ -142,6 +159,7 @@
     </table>
     <div id="sv-payback"></div>
     <div id="sv-notes"></div>
+    </div>
   </section>
 </main>
 <script>
@@ -158,9 +176,32 @@ if (!token) { $("token-gate").style.display = "flex"; }
 
 function hdrs() { return token ? { "Authorization": "Bearer " + token } : {}; }
 
-async function api(path, opts) {
+// C12: the middleware stamps X-Vibe-Auth: guest on the two routes the
+// read-only bearer covers, so the page learns which credential it holds
+// from a request it was making anyway — no probe, no extra route, and no
+// per-viewer field in the state document (fleetapi has never known about
+// tokens and does not start now). If a proxy strips the header the page
+// just keeps its buttons and a click 401s, which is the un-polished
+// behaviour, not a broken one.
+let guest = false;
+function setGuest() {
+  if (guest) return;
+  guest = true;
+  document.body.classList.add("guest");
+  $("guest-chip").hidden = false;
+  if (location.hash === "#savings") showSavingsDenied();
+}
+
+// quiet suppresses the token gate on a 401: a guest hitting a route
+// their token does not cover has a perfectly good token, and re-prompting
+// would tell them otherwise.
+async function api(path, opts, quiet) {
   const r = await fetch(path, Object.assign({ headers: hdrs() }, opts || {}));
-  if (r.status === 401) { $("token-gate").style.display = "flex"; throw new Error("401"); }
+  if (r.headers.get("X-Vibe-Auth") === "guest") setGuest();
+  if (r.status === 401) {
+    if (!quiet) $("token-gate").style.display = "flex";
+    throw new Error("401");
+  }
   return r;
 }
 
@@ -263,11 +304,16 @@ function render(st) {
       b.onclick = () => runTool(b, tool, args);
       actions.appendChild(b);
     };
-    mk("drain", "drain_cell", { cell: c.name });
-    mk("resume", "resume_cell", { cell: c.name });
-    if (c.presence || c.class) mk("wake", "wake_cell", { cell: c.name });
-    for (const m of (c.models || []).filter(m => m.state && m.state !== "stopped")) {
-      mk("unload " + m.id, "unload_model", { cell: c.name, model: m.id });
+    // Every action here is a tools/call on /mcp, which the guest bearer
+    // does not reach. Rendering the buttons anyway would be a claim about
+    // the reader's authority the server has already contradicted.
+    if (!guest) {
+      mk("drain", "drain_cell", { cell: c.name });
+      mk("resume", "resume_cell", { cell: c.name });
+      if (c.presence || c.class) mk("wake", "wake_cell", { cell: c.name });
+      for (const m of (c.models || []).filter(m => m.state && m.state !== "stopped")) {
+        mk("unload " + m.id, "unload_model", { cell: c.name, model: m.id });
+      }
     }
     tb.appendChild(tr);
   }
@@ -314,7 +360,10 @@ function renderNotify(n) {
   if (n.delivery && n.delivery.last_error) parts.push("last delivery error: " + n.delivery.last_error);
   label.textContent = parts.join("  ·  ");
   row.appendChild(label);
-  if (!n.configured) return;
+  // The notify STATUS stays for a guest — it is fleet state, and an
+  // alarm nobody can see is the failure C9 exists to fix. The scope
+  // toggle and the test send do not.
+  if (!n.configured || guest) return;
   const mk = (text, tool, args) => {
     const b = document.createElement("button");
     b.textContent = text;
@@ -444,19 +493,29 @@ async function loadSavings(force) {
   // deliberately NOT wired to the state refresh: every SSE line would
   // otherwise recompute a ledger aggregate for a screen nobody is
   // looking at.
+  if (guest) { showSavingsDenied(); return; }
   if (savingsBusy) return;
   if (!force && Date.now() - savingsAt < 60000) return;
   savingsBusy = true;
   try {
-    const r = await api("/api/fleet/savings?window=" + encodeURIComponent(savingsWindow));
+    const r = await api("/api/fleet/savings?window=" + encodeURIComponent(savingsWindow), null, true);
     const sv = await r.json();
     savingsAt = Date.now();
     renderSavings(sv);
   } catch (e) {
     savingsAt = 0;
+    // A 401 here is the C12 answer, not a bad token: this view is the
+    // one read the guest bearer deliberately does not cover, and the
+    // header may not have arrived yet on a #savings deep link.
+    if (String(e && e.message) === "401") showSavingsDenied();
   } finally {
     savingsBusy = false;
   }
+}
+
+function showSavingsDenied() {
+  $("sv-guest").hidden = false;
+  $("sv-body").hidden = true;
 }
 
 function renderSavings(sv) {
