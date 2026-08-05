@@ -97,7 +97,10 @@ resolve_digest() {
 }
 
 have_recording() { [[ -d $REPO/internal/swaptest/fixtures/$1 ]]; }
-in_ci_matrix()   { grep -qE "^\s*llama-swap: \[.*\b$1\b.*\]" "$REPO/.github/workflows/ci.yml"; }
+# grep -E without \b: BSD grep does not have it, and this script claims to
+# run on the Darwin cell too.
+in_ci_matrix()   { grep -E "^[[:space:]]*llama-swap: \[" "$REPO/.github/workflows/ci.yml" |
+                     tr -d ' []' | tr ',' '\n' | grep -qx "$1"; }
 
 fetch_gguf() {
   [[ -s $GGUF ]] && return
@@ -255,7 +258,11 @@ cmd_pin() {
   local v=$1 tagdigest
   need_version "$v"
   say "pin $v"
-  have_recording "$v" || note "WARNING: no recording for $v. canary cannot have passed. Stop."
+  # A refusal, not a warning. "Note the warning and stop" is the checklist
+  # step nobody performs; a pin with no recording behind it is the
+  # 2026-08-05 configuration, printed as if it were a result.
+  have_recording "$v" ||
+    die "no internal/swaptest/fixtures/$v — canary cannot have passed. Run 'ritual.sh record $v' first."
   tagdigest=$(resolve_digest "$v") || exit 1
   local tag=${tagdigest%% *} digest=${tagdigest##* }
   note "Paste into deploy/front/.env on the FRONT host, and update the default in"

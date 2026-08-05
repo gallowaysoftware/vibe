@@ -1,8 +1,12 @@
 # C16 — The upgrade ritual: digest-pin the front, make the bump a sequence
 
 Status: **PR OPEN** (2026-08-05), off `feat/c16-upgrade-ritual` branched
-from `main` at `0c275fd`. Unit gates U1–U9 green on a full local inner
-loop. **Live gates L1 and L2 PASS** — the new conformance behaviours ran
+from `main` at `0c275fd`. Feature commit plus ground rule 9's adversarial
+self-review commit (five findings, one of them a test that would have
+reported two contradictory failures about one event — see the
+[self-review addendum](#adversarial-self-review-addendum)); every fix
+mutation-verified. Unit gates U1–U10 green on a full local inner loop.
+**Live gates L1 and L2 PASS** — the new conformance behaviours ran
 against real llama-swap v239 and v247 binaries, and the ritual's own
 `preflight`/`canary` steps ran end to end against a candidate the script
 fetched itself. L3 (the fleetlab half of `canary`) and L4 (the six-client
@@ -285,7 +289,8 @@ Unit (mechanical, in-repo):
 | U6 | `ritual.sh` is executable and every step invokes the rig it claims to compose | PASS |
 | U7 | `GatedSwapVersions()` equals the recorded fixture dirs | PASS |
 | U8 | `ci.yml`'s conformance matrix equals the recorded fixture dirs | PASS |
-| U9 | full inner loop: build, vet, `test -race -count=5`, gofmt, `go mod tidy`, golangci-lint | PASS |
+| U9 | C13's read-only source scan covers `upgrade.go` too, and passes | PASS |
+| U10 | full inner loop: build, vet, `test -race -count=5`, gofmt, `go mod tidy`, golangci-lint | PASS |
 
 Live (a real llama-swap binary, a real fleet, or real clients):
 
@@ -387,6 +392,68 @@ are checked in at `scripts/smoke/llama-swap/results-*.txt`.
 
 **L5 UNRUN.** Applying the pin and rolling cells needs the fleet; SSH is
 blocked and the LAN does not route from here.
+
+### Adversarial self-review addendum
+
+Ground rule 9, run against the feature commit. Five findings, all fixed
+with the fix mutation-verified.
+
+**REV-1 (blocker) — a test that would have reported two contradictory
+failures about one event.** B2's `inflClosed` was a buffered
+`chan time.Time` written once by the scanner goroutine and read by *two*
+assertions: (b) "the stream is still delivering 1.5s after SIGTERM" and
+(c) "it is force-closed at the grace deadline". Whichever ran first
+consumed the only value — so on a build that *did* cancel streams
+immediately (exactly the case B2 exists to notice) (b) would fail
+correctly and (c) would then block for 45s and report "the in-flight
+stream was still open", about a stream it had just watched close. The
+same buffered-channel mistake had already cost this build an hour in
+`startSwap`, where cleanup and `terminate` both waited on `done`.
+
+Fixed by closing the channel and recording the instant beside it
+(`atomic.Int64`), so every waiter observes it. Verified by shrinking the
+upstream to a 2-chunk stream: the fixed test fails in **0.71s** with
+`(b) stopped within 1.5s` **and** `(c) ended 404.862229ms after SIGTERM` —
+both true. The old shape would have added a 45s false claim.
+
+**REV-2 — C16's checks escaped C13's read-only structural scan.**
+`TestDoctor_ReadOnly…`'s AST scan enumerates the files on the doctor path
+by name (`doctor.go`, `../daemon/doctor.go`, `../fleetmcp/doctor.go`,
+`../cli/cmd_fleet_doctor.go`). `fleetapi/upgrade.go` contributes two
+checks to the report and *dials the front*, and was in none of them. A
+guard that lives in four of five files is C13's own lesson one file over.
+`upgrade.go` added to the list.
+
+**REV-3 — `ritual.sh pin` warned where it had to refuse.** It printed
+`WARNING: no recording for <v>. canary cannot have passed. Stop.` and
+then printed the `FRONT_IMAGE=` line anyway. That is precisely the
+checklist step nobody performs at 2am, and what it prints is the
+2026-08-05 configuration formatted as a result. Now a `die`.
+
+**REV-4 — `in_ci_matrix` used `grep -E '\b'`**, a GNU extension, in a
+script whose binary fetch claims Darwin support. Replaced with a
+`tr`/`grep -qx` pipeline.
+
+**REV-5 — the normalisation was untested in the direction that matters.**
+`ungatedSwapVersions` matches after trimming a build string, but the test
+only exercised `v260 (deadbeef)`, which is ungated whether or not the
+trim happens. Added `v239 (dd81801)` → gated, and stated in the test that
+the *reported* string stays verbatim.
+
+Two things looked wrong and are deliberate:
+
+- **`llamaSwapVersion` uses `context.Background()` with its own 2s
+  timeout** rather than the announce context, which is C4's `warmCtx`
+  smell. It is the existing shape of `fleetCapacity` on the same
+  heartbeat (`nvidia-smi`, 3s), and 2s is well inside the daemon's
+  `announceStopTimeout` of 3s, so it cannot extend shutdown past a bound
+  that already exists. Threading a context through
+  `Versions func() *AnnounceVersions` would change a C3 interface for no
+  reachable failure.
+- **`front.image_pin` is emitted on a non-registry daemon too**, as an
+  UNKNOWN beside `fleetd.role`'s WARN. Every other check behaves the same
+  way there, and the report already leads with "this daemon is not a
+  fleet registry".
 
 ## For the reconciliation pass
 

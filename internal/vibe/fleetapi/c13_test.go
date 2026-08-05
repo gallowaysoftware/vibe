@@ -216,6 +216,11 @@ func TestDoctor_ReachesNoMutatingVerb(t *testing.T) {
 	// mutate anything off-box.
 	for _, path := range []string{
 		"doctor.go",
+		// C16's two checks live beside the rest of the ritual rather than
+		// in doctor.go, and one of them dials the front. A file that
+		// contributes checks to the report is on the doctor path whatever
+		// it is called.
+		"upgrade.go",
 		"../daemon/doctor.go",
 		"../fleetmcp/doctor.go",
 		"../cli/cmd_fleet_doctor.go",

@@ -94,9 +94,12 @@ func TestUngatedSwapVersions_NamesOnlyWhatNothingReplays(t *testing.T) {
 	got := ungatedSwapVersions(map[string][]string{
 		"v239":            {"alpha"},
 		"v247":            {"bravo"},
+		"v239 (dd81801)":  {"echo"}, // a build string still names a gated release
 		"v251":            {"charlie"},
 		"v260 (deadbeef)": {"delta"},
 	})
+	// Reported VERBATIM, matched after normalisation: the operator needs
+	// the string the cell actually said.
 	want := []string{"v251", "v260 (deadbeef)"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("ungatedSwapVersions = %v, want %v", got, want)

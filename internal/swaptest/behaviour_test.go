@@ -149,7 +149,13 @@ func b2(t *testing.T, bin string) {
 	infl, inflCancel := sw.stream(t, `{"model":"conformance","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
 	defer inflCancel()
 	chunks := make(chan time.Time, 512)
-	inflClosed := make(chan time.Time, 1)
+	// CLOSED, with the instant recorded beside it. Both assertions below
+	// wait on this, and a buffered send lets the first one consume the
+	// only value — which would make the second report "still open" about a
+	// stream it had just watched close. Two contradictory failures from
+	// one event is worse than no assertion.
+	inflClosed := make(chan struct{})
+	var closedAt atomic.Int64
 	go func() {
 		sc := bufio.NewScanner(infl)
 		for sc.Scan() {
@@ -160,7 +166,8 @@ func b2(t *testing.T, bin string) {
 				}
 			}
 		}
-		inflClosed <- time.Now()
+		closedAt.Store(time.Now().UnixNano())
+		close(inflClosed)
 	}()
 
 	// Wait for the stream to be genuinely flowing: signalling a request
@@ -209,8 +216,8 @@ wait:
 
 	// (c) whatever is still running at the grace deadline is force-closed.
 	select {
-	case at := <-inflClosed:
-		d := at.Sub(sent)
+	case <-inflClosed:
+		d := time.Unix(0, closedAt.Load()).Sub(sent)
 		if d < sigtermGrace-5*time.Second || d > sigtermGrace+5*time.Second {
 			t.Errorf("the in-flight stream ended %s after SIGTERM; the measured grace on v239/v247 is %s. "+
 				"A cell unit's TimeoutStopSec is sized against this number.", d, sigtermGrace)
