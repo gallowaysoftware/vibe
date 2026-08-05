@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
 )
@@ -82,11 +83,15 @@ func (s *Server) toolSuspendCell(ctx context.Context, cell, reason string, force
 		// back to sleep the morning after.
 		return "", fmt.Errorf("cell %q has no daemon_url; the suspend verb is an RPC and has no announce fallback", cell)
 	}
+	// Same reason the schedule keeps it: the cell stamps its own echo
+	// while it is still running, so a record dated when the RPC returned
+	// outlives every echo and sits as an unackable request.
+	issued := time.Now().UTC()
 	resp, err := client.CellSuspend(ctx, reason, !force)
 	if err != nil {
 		return "", fmt.Errorf("suspend %s: %v", cell, err)
 	}
-	if _, err := s.fleet.SetIntent(cell, "drained", reason, ""); err != nil {
+	if _, err := s.fleet.SetIntentAt(cell, "drained", reason, "", issued); err != nil {
 		return "", fmt.Errorf("suspended %s but failed to record intent at fleetd: %v", cell, err)
 	}
 

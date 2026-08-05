@@ -1058,7 +1058,13 @@ func (s *Server) checkIntentHygiene(rep *DoctorReport, snap StateSnapshot) {
 		// every drain: the echo rides the next heartbeat. Only a request
 		// that has outlived the ack window is residue.
 		young := c.IntentPending && c.Intent != nil && time.Since(c.Intent.Since) <= staleRequestAge
-		if c.IntentPending && !young {
+		// A box asleep on a declared schedule (C14) cannot echo anything:
+		// that is what asleep means. Counting it as residue would turn
+		// this check yellow every night on a fleet doing exactly what it
+		// was configured to do — the permanent-WARN failure this file's
+		// own review pass had to fix three times.
+		asleep := c.Intent != nil && c.Intent.Reason == SleepIntentReason
+		if c.IntentPending && !young && !asleep {
 			pending = append(pending, c.Name)
 		}
 		switch c.Display {

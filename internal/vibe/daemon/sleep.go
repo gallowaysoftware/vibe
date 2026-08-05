@@ -81,9 +81,18 @@ func sleepEntries(cfg Config, hosts *fleetcfg.File) []fleetapi.SleepScheduleEntr
 	}
 
 	var out []fleetapi.SleepScheduleEntry
+	claimed := map[string]bool{}
 	for _, e := range cfg.SleepSchedule {
 		refuse := func(why string) {
 			slog.Warn("sleep_schedule entry refused", "cell", e.Cell, "why", why)
+		}
+		// One night per cell. Two entries for the same box are two loops
+		// arming two suspends against one machine, and the second one's
+		// RPC lands on something that is already freezing — a config typo
+		// that reads as a flaky suspend.
+		if claimed[e.Cell] {
+			refuse("a second sleep_schedule entry for this cell; one night per box")
+			continue
 		}
 		switch {
 		case e.Cell == "" || e.Suspend == "":
@@ -134,6 +143,7 @@ func sleepEntries(cfg Config, hosts *fleetcfg.File) []fleetapi.SleepScheduleEntr
 			}
 			entry.Warm = append(entry.Warm, m)
 		}
+		claimed[e.Cell] = true
 		out = append(out, entry)
 	}
 	return out

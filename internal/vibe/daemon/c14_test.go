@@ -286,6 +286,20 @@ func TestSleepEntries_AcceptsAndClamps(t *testing.T) {
 	}
 }
 
+// TestSleepEntries_OneNightPerCell (review finding): two entries for one
+// box are two loops arming two suspends against one machine, and the
+// second RPC lands on something already freezing — a config typo that
+// reads as a flaky suspend.
+func TestSleepEntries_OneNightPerCell(t *testing.T) {
+	got := sleepEntries(Config{SleepSchedule: []SleepScheduleEntry{
+		{Cell: "gpu-cell", Suspend: "30 23 * * *", Wake: "15 7 * * *"},
+		{Cell: "gpu-cell", Suspend: "0 1 * * *", Wake: "0 8 * * *"},
+	}}, sleepHosts())
+	if len(got) != 1 || got[0].Suspend != "30 23 * * *" {
+		t.Fatalf("entries = %+v, want only the first", got)
+	}
+}
+
 // TestSuspendCell_NoAnnounceFallback pins the delivery decision: the
 // suspend verb is an RPC, and a cell without daemon_url is an error
 // rather than a piggybacked command that would be redelivered after the

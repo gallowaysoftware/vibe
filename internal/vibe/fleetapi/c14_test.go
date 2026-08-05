@@ -689,6 +689,105 @@ func TestSleepSchedule_TheCellsOwnStampIsWhatPreventsTheGhostDrain(t *testing.T)
 	})
 }
 
+// ─── review findings ────────────────────────────────────────────────────────
+
+// TestSleepSchedule_TheSleepRecordIsNotAnUnackableRequest (REV-1). The
+// record is dated when the suspend was ISSUED, not when the RPC
+// answered, so the cell's own stamp — taken while it was still running —
+// is newer and C6's complied-drain branch resolves it. Dating it later
+// left every sleeping box showing "requested, awaiting ack" all night
+// for an ack a frozen machine cannot give, and turned `vibe fleet
+// doctor`'s intent hygiene yellow every morning.
+func TestSleepSchedule_TheSleepRecordIsNotAnUnackableRequest(t *testing.T) {
+	s := sleepServer(t, "opportunistic")
+	cleanNight(t, s)
+	sp := &suspendProbe{}
+	e := sleepEntry()
+	cfg := sleepCfg(s, sp, nil, nil)
+	now := time.Now()
+	st := armed(s, now)
+	s.evalSleepEntry(e, mustCron(t, e.Suspend), mustCron(t, e.Wake), st, cfg, now)
+
+	// The cell's last heartbeat before freezing carries its own stamp.
+	s.recordAnnounce(&AnnounceRequest{
+		V: AnnounceVersion, Cell: sleepCell, Seq: 2,
+		Intent: &AnnounceIntent{State: "drained", Since: time.Now().UTC()},
+	})
+	snap := s.Snapshot(context.Background())
+	var row CellSnapshot
+	for _, c := range snap.Cells {
+		if c.Name == sleepCell {
+			row = c
+		}
+	}
+	if row.Intent == nil || row.Intent.Reason != SleepIntentReason || row.Intent.ETA == "" {
+		t.Fatalf("intent = %+v, want the reason and eta preserved through the echo", row.Intent)
+	}
+	if row.IntentPending {
+		t.Fatal("the sleeping cell shows an unacked request: a frozen box cannot ack, so this reads as residue forever")
+	}
+
+	rep := DoctorReport{}
+	s.checkIntentHygiene(&rep, snap)
+	if len(rep.Checks) != 1 || rep.Checks[0].Level != LevelOK {
+		t.Fatalf("intent hygiene = %+v, want OK on a fleet doing exactly what it was configured to do", rep.Checks)
+	}
+}
+
+// TestDoctor_ASleepingBoxIsNotIntentResidue (REV-2) covers the case the
+// dating fix cannot reach: a cell that does not announce at all has no
+// echo to resolve the request with, so the pending flag stands. It is
+// still not residue.
+func TestDoctor_ASleepingBoxIsNotIntentResidue(t *testing.T) {
+	s := sleepServer(t, "opportunistic")
+	old := time.Now().Add(-6 * time.Hour).UTC()
+	rep := DoctorReport{}
+	s.checkIntentHygiene(&rep, StateSnapshot{Cells: []CellSnapshot{{
+		Name: sleepCell, Class: "opportunistic", Display: DisplayOff, IntentPending: true,
+		Intent: &Intent{State: "drained", Reason: SleepIntentReason, ETA: "07:15", Since: old},
+	}}})
+	if len(rep.Checks) != 1 || rep.Checks[0].Level != LevelOK {
+		t.Fatalf("intent hygiene = %+v, want OK: a box asleep on a declared schedule cannot echo", rep.Checks)
+	}
+
+	// The control: the same shape with an ordinary drain reason IS residue.
+	rep = DoctorReport{}
+	s.checkIntentHygiene(&rep, StateSnapshot{Cells: []CellSnapshot{{
+		Name: sleepCell, Class: "opportunistic", Display: DisplayOff, IntentPending: true,
+		Intent: &Intent{State: "drained", Reason: "gaming", Since: old},
+	}}})
+	if len(rep.Checks) != 1 || rep.Checks[0].Level != LevelWarn {
+		t.Fatalf("intent hygiene = %+v, want WARN for a request nothing has ever echoed", rep.Checks)
+	}
+}
+
+// TestSleepSchedule_WakeDoesNotWarmADrainedCell (REV-3). The wake fires
+// on its cron whether or not this schedule was why the box was away, so
+// its warms take C4's drain guard — warming a cell the operator declared
+// drained is the eviction fight the warm policy exists to avoid, and at
+// 07:15 nobody is watching.
+func TestSleepSchedule_WakeDoesNotWarmADrainedCell(t *testing.T) {
+	s := sleepServer(t, "opportunistic")
+	sp, wp, warm := &suspendProbe{}, &wakeProbe{}, &warmProbe{}
+	e := sleepEntry()
+	e.Warm = []string{"qwen"}
+	cfg := sleepCfg(s, sp, wp, warm)
+	presenceOf(s, sleepCell)
+	if _, err := s.SetIntent(sleepCell, "drained", "gaming", "10:00"); err != nil {
+		t.Fatal(err)
+	}
+	st := &sleepScheduleState{Cell: sleepCell}
+	s.wg.Add(1)
+	s.runWakeSequence(e, st, cfg)
+
+	if got := warm.got(); len(got) != 0 {
+		t.Fatalf("warmed %v into a cell the operator declared drained", got)
+	}
+	if d := sleepStateOf(s, st).Detail; !strings.Contains(d, "warms skipped") {
+		t.Fatalf("detail = %q, want the skip named", d)
+	}
+}
+
 // ─── U3: configuration refusals ─────────────────────────────────────────────
 
 func TestSleepSchedule_ABrokenWakeDisablesTheSuspendHalfToo(t *testing.T) {

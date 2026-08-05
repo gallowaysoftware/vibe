@@ -1,11 +1,13 @@
 # C14 — sleep_schedule: the declared night, deferred by observation
 
-Status: IN REVIEW (2026-08-05). Branched off [C13](c13-doctor.md). Unit
-gates U1–U18 green on a full local inner loop (`-race -count=5 ./...`,
-`golangci-lint run` 0 issues, `gofmt -l .` silent, `go mod tidy` clean);
-the live gates need a real box that really suspends and are **NOT RUN** —
-the implementing environment cannot reach the fleet (SSH blocked, LAN
-does not route). See the gate list for exactly which.
+Status: IN REVIEW (2026-08-05), feature + adversarial-review commits.
+Branched off [C13](c13-doctor.md). Unit gates U1–U18 green on a full
+local inner loop (`-race -count=5 ./...`, `golangci-lint run` 0 issues,
+`gofmt -l .` silent, `go mod tidy` clean); the six live gates need a real
+box that really suspends and are **NOT RUN** — the implementing
+environment cannot reach the fleet (SSH blocked, LAN does not route). The
+review pass found 4 items, all fixed and mutation-verified here — see the
+addendum at the end.
 
 Backlog item 9 in [fleet-control-futures.md](../fleet-control-futures.md)
 §2, Medium tier:
@@ -179,7 +181,7 @@ rules the shared guard actually holds.
 | 3 | class is not `opportunistic` | refuse | §1 |
 | 4 | declared drain (`effectiveIntent` = drained) | **defer** | a drained box is a box the operator TOOK — for gaming, for a build, for a bench. Suspending it mid-game is the single worst thing this phase could do, and the drain is the operator's own declaration that they are using the hardware |
 | 5 | active C11 hold | **defer** | a hold declares that fleetd must not act on its own policy on this cell; suspending it is the largest act available |
-| 6 | cell is absent (never announced / stale / withdrawn / unreachable) | **skip** | there is nothing to suspend. Not a deferral and not a failure: no intent is recorded, because fleetd did not put this box to sleep and must not claim it did |
+| 6 | cell is absent (never announced / stale / withdrawn / unreachable) | **skip** | there is nothing to suspend. Not a deferral and not a failure: no intent is recorded, because fleetd did not put this box to sleep and must not claim it did. It sits ABOVE the in-flight rungs deliberately — an absent cell reports no count either, and answering "in-flight unknown" would turn "there is no box here" into a deferral that retries all night |
 | 7 | in-flight count UNREPORTED | **defer** | C5's M2, verbatim: unknown is not zero. A cell fleetd cannot measure is a cell fleetd must not suspend |
 | 8 | in-flight > 0 | **defer** | someone is mid-generation |
 | 9 | any active lease on the cell | **defer** | "did I just strand a 19-hour job?" — the pre-drain question, asked automatically at 23:30 |
@@ -562,8 +564,95 @@ and two cron evaluators in one package is how one of them silently rots.
 - **L6 — the drill.** `vibe cell suspend gpu-cell` then `wake_cell` from
   a phone, start to finish, as the quarterly fire drill C13 asks for.
 
-## Execution
+## Execution (2026-08-05)
 
-Written before implementation; the Execution section, the gate results
-and the adversarial-review addendum are appended as they land, per
-ground rule 9 (a phase with only a feature commit is not done).
+### What shipped
+
+Everything in §10's table, in two commits: the feature, then the
+adversarial-review pass (ground rule 9). Two things came out differently
+from the plan above and both are now reflected in the design sections:
+
+- **Absence became a first-class guard outcome** (`SuspendBlock.Absent`)
+  rather than a check beside the ladder, and it moved ABOVE the
+  in-flight rungs. An absent cell reports no in-flight count either, so
+  in the original order "there is no box here" answered as "in-flight
+  unknown" and retried all night instead of stopping for it.
+- **`SuspendBlock` gained `Structural`** so the explicit verbs' `force`
+  has something principled to refuse: the front, an unknown cell and the
+  wrong class are configuration answers, not tonight's conditions.
+
+### Gates
+
+| gate | result |
+|---|---|
+| U1–U18 (unit) | **PASS** — `go build ./...`, `go vet ./...`, `go test -race -count=5 ./...`, `gofmt -l .` silent, `go mod tidy` clean, `golangci-lint run` 0 issues |
+| L1–L6 (live) | **NOT RUN** — they need a box that really suspends and a real night; the implementing environment cannot reach the fleet (SSH blocked, LAN does not route) |
+
+The three review fixes below are each **mutation-verified**: the guard
+was removed, the named test failed, the guard was restored.
+
+## Adversarial-review addendum (2026-08-05, 4 findings, all fixed with regression tests)
+
+**REV-1 — the sleep record was an unackable request, every night.**
+`SetIntent` stamps `since` at the moment it is called, which for a
+suspend is the moment the RPC *returned*. The cell stamps its own
+`drained` echo while it is still running — i.e. earlier — so the
+registry request was permanently newer than the only echo that would
+ever exist. Consequence: every sleeping box rendered `intent: asleep per
+sleep_schedule, eta 07:15 (requested, awaiting ack)` all night, waiting
+for an ack a frozen machine cannot give, and (REV-2) the doctor called
+it residue every morning. Fixed with `SetIntentAt`, which takes the
+instant the action was ISSUED — not a fudge, that is genuinely when the
+intent was formed — so C6's complied-drain branch resolves the request
+into the record, keeping the reason and the ETA and dropping the pending
+flag. `SetIntent` is now a one-line wrapper, so no other caller changed.
+The explicit `suspend_cell` verb takes the same path.
+
+**REV-2 — `intent.hygiene` would have turned yellow every morning.**
+Even with REV-1, a sleeping cell that does not announce at all has no
+echo to resolve anything, so the pending flag legitimately stands. C13's
+check counts a request unacked for longer than `staleRequestAge` as
+residue — which on a fleet doing exactly what it was configured to do
+would be a permanent WARN, the failure C13's own review pass had to fix
+three times. The check now recognises the reserved sleep reason and
+reports OK. The regression test carries its own control: the same shape
+with an ordinary drain reason is still WARN.
+
+**REV-3 — the wake warmed models into a cell the operator had drained.**
+The wake half fires on its cron whether or not this schedule was why the
+box was away. An operator who drained the box for gaming at 22:00 and
+was still playing at 07:15 would have had the declared models warmed
+onto that GPU — the exact eviction fight C4 §1 exists to prevent, at an
+hour when nobody is watching. The warms now take C4's drain guard and
+the skip is named in the status.
+
+**REV-4 — two entries for one cell were two loops racing one machine.**
+`sleep_schedule` did not dedupe by cell, so a copy-paste typo produced
+two independent suspend arms against one box; the second RPC lands on
+something already freezing and reads as a flaky suspend. One night per
+cell, refused loudly at wiring.
+
+### Looked at and deliberately left alone
+
+- **No early auto-resume.** A box that comes back before its wake (an
+  operator pressing the power button at 03:00) keeps its sleep record
+  until the declared wake clears it. Clearing it because the cell
+  reappeared would be an observation initiating an action, which is the
+  one thing this phase may not do — and the box is not stranded: the
+  display reads DRAINED with "asleep per sleep_schedule, eta 07:15",
+  which is the true sentence, and `vibe cell resume` is one command. The
+  entry's own `asleep` bookkeeping is cleared, since that is fleetd's
+  record of its own action rather than a statement about the box.
+- **A suspend RPC that dies in transport stays "outcome unknown".** If
+  the house's command blocks until the machine is frozen, the RPC fails
+  and no intent is recorded. Inferring "it probably suspended" from a
+  transport error is exactly the guess this plan refuses; the contract
+  (the command must return) is documented instead, and the paired wake
+  fires either way.
+- **The residual ghost-drain window is one heartbeat wide.** If the box
+  freezes between the suspend command returning and the local stamp, the
+  cell wakes echoing `serving`, takes fleetd's drained request, re-runs
+  its idempotent drain verb, echoes `drained`, and the wake's serving
+  request resumes it. It self-heals through C3/C6's own rules, and both
+  branches are pinned in
+  `TestSleepSchedule_TheCellsOwnStampIsWhatPreventsTheGhostDrain`.

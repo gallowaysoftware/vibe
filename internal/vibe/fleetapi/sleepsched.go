@@ -382,6 +382,13 @@ func (s *Server) trySuspend(e SleepScheduleEntry, st *sleepScheduleState, cfg sl
 		return
 	}
 
+	// The instant the suspend is ISSUED, kept for the record's `since`.
+	// The cell stamps its own drained echo while it is still running,
+	// i.e. after this instant — so a record stamped when the RPC RETURNED
+	// would be permanently newer than the only echo that will ever
+	// exist, and the entry would sit as "requested, awaiting ack" all
+	// night for an ack a sleeping box cannot give.
+	issued := time.Now().UTC()
 	ctx, cancel := s.warmCtx(suspendTimeout)
 	err := cfg.suspendFn(ctx, e.Cell, SleepIntentReason)
 	cancel()
@@ -399,7 +406,7 @@ func (s *Server) trySuspend(e SleepScheduleEntry, st *sleepScheduleState, cfg sl
 	}
 	s.mu.Unlock()
 	detail := "suspended"
-	if _, ierr := s.SetIntent(e.Cell, "drained", SleepIntentReason, eta); ierr != nil {
+	if _, ierr := s.SetIntentAt(e.Cell, "drained", SleepIntentReason, eta, issued); ierr != nil {
 		// The box IS asleep; failing to say why is a status problem, not a
 		// reason to misreport the verb. Loud either way.
 		slog.Error("suspended the cell but could not record intent", "cell", e.Cell, "err", ierr)
@@ -466,8 +473,16 @@ func (s *Server) runWakeSequence(e SleepScheduleEntry, st *sleepScheduleState, c
 	}
 	notes = append(notes, "cell returned")
 
-	for _, m := range e.Warm {
-		notes = append(notes, s.wakeWarm(ctx, e.Cell, m, cfg))
+	// The wake fires whether or not this schedule was the reason the box
+	// was away, so the warms take C4's drain guard: warming a cell the
+	// operator has declared drained is the eviction fight the whole warm
+	// policy exists to avoid, and at 07:15 nobody is watching.
+	if in, drained := s.effectiveIntent(e.Cell); drained && in.State == "drained" {
+		notes = append(notes, "warms skipped: cell is drained ("+in.Reason+")")
+	} else {
+		for _, m := range e.Warm {
+			notes = append(notes, s.wakeWarm(ctx, e.Cell, m, cfg))
+		}
 	}
 
 	now := time.Now().UTC()

@@ -83,6 +83,26 @@ func (s *Server) handleIntent(w http.ResponseWriter, r *http.Request) {
 // cell echoes serving at a newer time. For never-announced cells it
 // keeps the C1 meaning: delete (absence means serving).
 func (s *Server) SetIntent(cell, state, reason, eta string) (*Intent, error) {
+	return s.SetIntentAt(cell, state, reason, eta, time.Now().UTC())
+}
+
+// SetIntentAt is SetIntent with an explicit `since`, for the one class
+// of verb whose subject stops answering: a suspend (C14).
+//
+// The conflict rule compares the registry request against the cell's
+// echo, and the cell stamps its own `drained` while it is still running
+// — i.e. AFTER fleetd issued the RPC and BEFORE fleetd could record the
+// result. Stamping the record at the moment the RPC RETURNED therefore
+// makes it permanently newer than the only echo that will ever exist,
+// so the entry sits as "requested, awaiting ack" all night for an ack
+// the box cannot give while it is asleep, and `vibe fleet doctor`'s
+// intent hygiene calls it residue every morning.
+//
+// Passing the instant the action was ISSUED is not a fudge: that is
+// genuinely when the intent was formed. The cell's newer echo then
+// resolves the request through C6's complied-drain branch, which keeps
+// the reason and the ETA and drops the pending flag.
+func (s *Server) SetIntentAt(cell, state, reason, eta string, since time.Time) (*Intent, error) {
 	known := false
 	for _, c := range s.cells {
 		if c.Name == cell {
@@ -109,17 +129,18 @@ func (s *Server) SetIntent(cell, state, reason, eta string) (*Intent, error) {
 	s.mu.Unlock()
 
 	var stored *Intent
+	since = since.UTC()
 	switch state {
 	case "serving":
 		if announcing {
-			in := Intent{State: "serving", Since: time.Now().UTC()}
+			in := Intent{State: "serving", Since: since}
 			next[cell] = in
 			stored = &in
 		} else {
 			delete(next, cell)
 		}
 	case "drained":
-		in := Intent{State: "drained", Reason: reason, ETA: eta, Since: time.Now().UTC()}
+		in := Intent{State: "drained", Reason: reason, ETA: eta, Since: since}
 		next[cell] = in
 		stored = &in
 	default:
