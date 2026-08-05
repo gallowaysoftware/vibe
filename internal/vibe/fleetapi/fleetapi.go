@@ -121,6 +121,11 @@ type CellSnapshot struct {
 	// Presence is the cell's announce-derived state (C3), present once
 	// the cell has announced at least once.
 	Presence *Presence `json:"presence,omitempty"`
+	// Activity is the cell's request-activity evidence (C10): what
+	// fleetd can actually vouch for about how long this cell has been
+	// quiet. Always present, including when the answer is "no evidence" —
+	// an omitted field is how missing evidence gets read as idleness.
+	Activity *CellActivity `json:"activity,omitempty"`
 	// Display is the derived display state (design doc §4 table), computed
 	// at read time: SERVING / DRAINED / DRAINED? / OFF / OFF/AWAY /
 	// OFF/AWAY? / INCONSISTENT.
@@ -184,6 +189,11 @@ type Server struct {
 	mu     sync.Mutex
 	subs   map[chan Event]struct{}
 	cellUp map[string]bool
+	// cellUpSince is when the current /api/events connection to the cell
+	// was established (C10). It is the floor on any idle claim: fleetd
+	// cannot vouch for silence from before it was watching, and a
+	// reconnect is exactly when a long-running request is invisible.
+	cellUpSince map[string]time.Time
 	// lastState/startedAt key on cell+"\x00"+model so one map serves N
 	// cells without nesting.
 	lastState map[string]string
@@ -251,6 +261,11 @@ type Server struct {
 	// without it a long generation produces one stamp at start and reads
 	// as idle for its whole duration.
 	lastInFlightModels map[string][]string
+	// lastInFlightFrame is the cell-level analog of modelActivity (C10):
+	// every inflight frame is an EDGE, so any frame is request activity
+	// on that cell whether or not it names a model still resident. It
+	// dominates every per-model stamp on the cell by construction.
+	lastInFlightFrame map[string]time.Time
 
 	// usage is the C7a token ledger, nil outside the fleetd role (a
 	// single-box daemon has no announces to fold and no fleet to account
@@ -356,12 +371,14 @@ func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Op
 		maxBackoff:         30 * time.Second,
 		subs:               map[chan Event]struct{}{},
 		cellUp:             map[string]bool{},
+		cellUpSince:        map[string]time.Time{},
 		lastState:          map[string]string{},
 		startedAt:          map[string]time.Time{},
 		inFlight:           map[string]int{},
 		inFlightSeen:       map[string]bool{},
 		modelActivity:      map[string]time.Time{},
 		lastInFlightModels: map[string][]string{},
+		lastInFlightFrame:  map[string]time.Time{},
 		started:            time.Now(),
 		presence:           map[string]*Presence{},
 		commands:           map[string][]AnnounceCommand{},
@@ -627,6 +644,7 @@ func (s *Server) snapshotCell(ctx context.Context, c Cell) CellSnapshot {
 	// After the model list is complete, whichever way it was built (probe
 	// merge above, or presence in decorate when the cell answers nothing).
 	s.attachProbes(&snap)
+	snap.Activity = s.activityFor(c.Name)
 	sort.Slice(snap.Models, func(i, j int) bool { return snap.Models[i].ID < snap.Models[j].ID })
 	return snap
 }

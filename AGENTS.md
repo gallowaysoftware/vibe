@@ -707,6 +707,81 @@ optional.)
     blocks, and every request and backoff is bound to a context
     cancelled by `s.done` (C4's `warmCtx` rule). A 4xx is the far side
     answering and is never retried (C6's piggyback rule).
+- **await extensions (fleet-control C10).** `vibe cell await` grew
+  `--model <id> --ready`, `--idle <dur>`, `--unleased` and `--lease`
+  (`cli/cmd_cell_await.go` + `awaitCell`), fed by
+  `CellSnapshot.Activity` (`fleetapi/activity.go`). No new HTTP route,
+  no new MCP tool, no new store — every condition is a read of an axis
+  something else already owns.
+  - **Missing evidence is never idleness.** `--idle` unblocks only on a
+    computed window; where fleetd has no LIVE `/api/events` stream to
+    the cell it keeps waiting and prints why. This is C4/C5's rule (a
+    cell fleetd doesn't watch makes fleetd's own uptime the idle clock)
+    with a bigger blast radius: a wrong warm restore costs a model load,
+    a wrong `--idle` launches a 19-hour batch into a box in use. There
+    is no `--assume-idle` and there must not be one.
+  - **The window is floored at `cellUpSince`, not process start**: the
+    watcher's connect instant per cell, cleared on drop. fleetd may not
+    claim silence it was not connected to observe, and the reconnect is
+    exactly when a running generation is invisible. `lastInFlightFrame`
+    is the cell-level activity stamp — every inflight frame is an EDGE,
+    so ANY frame is activity, which C4's per-model map cannot say once
+    llama-swap TTL-unloads the model somebody just used.
+  - **Idle is cell-scoped even with `--model`** (the contended resource
+    is the GPU), a reported in-flight count > 0 outranks any window, and
+    an unreported count is still not a zero one. A count whose frame
+    PREDATES the current connection is neither: the remove edge was lost
+    with the stream, so it is reported as missing evidence (no window),
+    not as a live busy count that never resolves.
+  - **Every condition is judged against ONE snapshot** — "ready at
+    03:00 and idle at 03:05" is not "ready and idle". **The snapshot is
+    the only verdict**: a transition frame triggers an immediate re-poll
+    (which is what preserves C3's sub-second unblock) and never returns
+    on its own. `fleet.cellStale` means the ANNOUNCER died, and C6 keeps
+    such a cell `Reachable`, so taking it as a verdict reported a false
+    `--down` for a cell still serving. Conversely a frame that is NOT a
+    transition for this cell is not a reason to re-poll at all: fleetd
+    forwards every upstream llama-swap payload from every cell, and
+    `/api/fleet/state` is an uncached probe round of the whole fleet.
+  - **Any evidence gap fleetd qualifies is printed on the SUCCESS line
+    too**, not only while waiting. The gap that matters is "the stream
+    is live and no inflight frame has ever arrived": that is the one
+    reading of `--idle` resting on the cell's silence rather than on an
+    observed edge.
+  - **C6's fail-fast rule extends to model ids**: an id absent from a
+    REACHABLE cell's NON-EMPTY catalog is a typo and errors even under
+    `--timeout 0`; an unreachable cell or an empty catalog (a drained
+    cell announces one by design) keeps retrying, as does any transport
+    error. `--ready` against `front` is refused outright — peers-only,
+    C8's probeGuard reason.
+  - **Leases stay advisory**: `--unleased` is the WAITER opting to
+    respect other holders (its own holder is ignored, so a crashed run
+    can't deadlock on its own residue) and `--lease` claims one on
+    success; a refused claim fails the command, because a batch that
+    runs undeclared is invisible to the pre-drain report. A C11 hold is
+    one of those holders and is named as `held: <model>` (key on the
+    reserved holder, C11's rule); `--idle` alone does NOT consult holds,
+    because a hold suspends what FLEETD initiates and an operator's
+    batch is not fleetd guessing.
+  - **Every refusal fleetd would issue is issued BEFORE the wait**
+    (`validateAwaitFlags`): C11's reserved `hold` holder,
+    `fleetapi.MaxLeaseTTL`, control characters in
+    `--model`/`--lease`/`--lease-note`. The claim is POSTed after the
+    wait, so a late refusal under `--timeout 0` is a night wasted — and
+    `--unleased --lease hold` would additionally have stepped over the
+    operator's own declaration on its way to failing.
+  - **C9's `--notify` fires AFTER the `--lease` claim and reports its
+    outcome** (the one decision the C9/C10 merge had to make, since both
+    phases extended this command). Exactly one push either way: a refused
+    claim still pages, saying so, and still fails the command. The
+    question a human parked on a cell has is "is the box mine", which a
+    push sent before the claim cannot answer and a push skipped on
+    refusal answers with silence — the reading that sends someone to bed
+    believing a batch is running. The message repeats the terminal's
+    success line verbatim (`awaitSuccessLine`, the ONE renderer), because
+    the surface a sleeping operator reads is the last place an evidence
+    qualification may be dropped. A timeout or a fail-fast typo pushes
+    nothing: `--notify` is await-UNBLOCKED.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.

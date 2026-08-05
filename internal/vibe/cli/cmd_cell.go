@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
@@ -321,42 +322,78 @@ func cellAwaitCmd() *cobra.Command {
 		notify   bool
 		timeout  time.Duration
 		interval time.Duration
+		cond     awaitConds
 	)
 	cmd := &cobra.Command{
 		Use:   "await <cell>",
-		Short: "Block until a cell is reachable (--up) or unreachable (--down).",
+		Short: "Block until a cell is reachable (--up), unreachable (--down), warm (--ready) or quiet (--idle).",
 		Long: "Park a script on fleet state: `vibe cell await gpu-cell --up && ./overnight-batch.sh`.\n" +
 			"--up means the cell's llama-swap answers; intent is deliberately not consulted (routing truth rule).\n" +
-			"--notify pushes one message through fleetd's configured webhook when the wait ends — " +
-			"the await-unblocked half of C9, for a human parked on a cell rather than a script.",
+			"--model <id> --ready waits for llama-swap to report that model resident and ready — cell-up is not\n" +
+			"model-warm, and on the heavy cell that gap is 6-10 minutes.\n" +
+			"--idle <dur> waits until fleetd has OBSERVED that long without a request on the cell. Where fleetd\n" +
+			"has no live event stream to it there is no evidence, and await keeps waiting and says so rather\n" +
+			"than firing a batch into a busy box.\n" +
+			"--unleased waits for other consumers' advisory leases to clear; --lease <holder> takes one on\n" +
+			"success, which is what makes the pair a queue.\n" +
+			"--notify pushes one message through fleetd's configured webhook when the wait ends — the\n" +
+			"await-unblocked half of C9, for a human parked on a cell rather than a script. It is sent after\n" +
+			"the --lease claim and reports its outcome, so the one message a human reads is the one that says\n" +
+			"whether the box is theirs.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx := cmd.Context()
-			if ctx == nil {
-				ctx = context.Background()
+			ctx := cmdContext(cmd)
+			if up && down {
+				return fmt.Errorf("--up and --down are contradictory")
 			}
-			if down {
-				up = false
-			} else {
-				up = true // default
-			}
+			cond.wantUp = !down // --up is the default
 			if interval <= 0 {
 				return fmt.Errorf("--interval must be > 0")
+			}
+			if err := validateAwaitFlags(args[0], cond, cmd.Flags().Changed("lease-ttl")); err != nil {
+				return err
 			}
 			target, err := resolveFleetd(apiFlag)
 			if err != nil {
 				return err
 			}
-			err = awaitCell(ctx, cmd.OutOrStdout(), target, args[0], up, timeout, interval)
-			if err == nil && notify {
-				notifyAwaitUnblocked(cmd.OutOrStdout(), target, args[0], up)
+			out := cmd.OutOrStdout()
+			ev, err := awaitCell(ctx, out, target, args[0], cond, timeout, interval)
+			if err != nil {
+				// C9's rule, unchanged: --notify is await-UNBLOCKED. A
+				// timeout or a fail-fast typo is the script's business, and
+				// a phone that buzzes for both has taught its owner nothing.
+				return err
 			}
-			return err
+			// The claim, then the push, then the report. Ordering the push
+			// last is what lets it carry the lease outcome; see
+			// notifyAwaitUnblocked.
+			var leaseErr error
+			if cond.lease.holder != "" {
+				leaseErr = acquireLease(ctx, target, args[0], cond)
+			}
+			if notify {
+				notifyAwaitUnblocked(out, target, args[0], cond, ev, leaseErr)
+			}
+			if leaseErr != nil {
+				return fmt.Errorf("the wait was satisfied but the lease was refused: %w", leaseErr)
+			}
+			if cond.lease.holder != "" {
+				fmt.Fprintf(out, "lease held: %s on %s/%s for %s\n", cond.lease.holder, args[0], cond.model, cond.lease.ttl)
+			}
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&apiFlag, "api", "", "fleetd base URL (default: $VIBE_API, hosts.yaml fleetd_url, or the local daemon)")
 	cmd.Flags().BoolVar(&up, "up", false, "wait until the cell answers (default)")
 	cmd.Flags().BoolVar(&down, "down", false, "wait until the cell stops answering")
+	cmd.Flags().StringVar(&cond.model, "model", "", "the model this wait is about (with --ready)")
+	cmd.Flags().BoolVar(&cond.ready, "ready", false, "also wait until --model is resident and ready on the cell")
+	cmd.Flags().DurationVar(&cond.idle, "idle", 0, "also wait until the cell has been observed request-idle this long")
+	cmd.Flags().BoolVar(&cond.unleased, "unleased", false, "also wait until no other holder's advisory lease names the cell")
+	cmd.Flags().StringVar(&cond.lease.holder, "lease", "", "on success, take an advisory lease under this holder name")
+	cmd.Flags().DurationVar(&cond.lease.ttl, "lease-ttl", time.Hour, "TTL for --lease")
+	cmd.Flags().StringVar(&cond.lease.note, "lease-note", "", "note recorded with --lease (shown in the pre-drain report)")
 	cmd.Flags().BoolVar(&notify, "notify", false, "push a notification through fleetd's webhook when the wait ends")
 	cmd.Flags().DurationVar(&timeout, "timeout", 0, "give up after this long (0 = wait forever)")
 	cmd.Flags().DurationVar(&interval, "interval", 5*time.Second, "poll interval")
@@ -367,15 +404,42 @@ func cellAwaitCmd() *cobra.Command {
 // notifier. Best-effort by construction: the wait already ended, so a
 // failed push warns rather than failing a command whose whole job just
 // succeeded — and the failure names itself rather than being swallowed.
-func notifyAwaitUnblocked(out io.Writer, target fleetdTarget, cell string, up bool) {
-	state := "up"
-	if !up {
-		state = "down"
+//
+// It fires AFTER the --lease claim and reports that claim's outcome
+// (C9 + C10). The question a human parked on a cell has when the phone
+// buzzes is not "did the wait end" — it is "is the box mine". A push
+// sent before the claim cannot answer that, and a push skipped on a
+// refusal answers it with silence, which is the reading that sends
+// someone to bed believing a batch is running. So: exactly one message
+// either way, naming what happened, and the refusal still fails the
+// command.
+//
+// The message repeats the terminal's success line verbatim, because on
+// this path the terminal is the surface nobody is watching — and C10's
+// rule that a qualified evidence gap rides the SUCCESS line is worth
+// least if it is dropped from the only surface a sleeping operator
+// reads.
+func notifyAwaitUnblocked(out io.Writer, target fleetdTarget, cell string, cond awaitConds, ev awaitEval, leaseErr error) {
+	title := "vibe fleet: " + cell + " is " + upWord(cond.wantUp)
+	lines := []string{"the wait on " + cell + " ended: " + awaitSuccessLine(cell, cond.wantUp, ev)}
+	switch {
+	case leaseErr != nil:
+		title += ", but the lease was refused"
+		lines = append(lines,
+			notifyText("lease REFUSED for holder "+cond.lease.holder+": "+leaseErr.Error(), maxNotifyDetailBytes),
+			"the command exited non-zero and nothing is holding "+cell)
+	case cond.lease.holder != "":
+		lines = append(lines, fmt.Sprintf("lease held: %s on %s/%s for %s",
+			cond.lease.holder, cell, cond.model, cond.lease.ttl))
 	}
 	body := map[string]string{
-		"title":   "vibe fleet: " + cell + " is " + state,
-		"message": "the wait on " + cell + " ended: it is " + state,
+		"title": notifyText(title, maxNotifyTitleBytes),
+		// Not notifyText: the newlines between these lines are structure,
+		// and each line was made printable on its way in.
+		"message": clampBytes(strings.Join(lines, "\n"), maxNotifyMessageBytes),
 	}
+	// Deliberately not the command's context: a wait interrupted at the
+	// terminal still ended, and the push is the half of it a human sees.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := target.postFleet(ctx, "/api/fleet/notify/send", body, nil); err != nil {
@@ -383,17 +447,69 @@ func notifyAwaitUnblocked(out io.Writer, target fleetdTarget, cell string, up bo
 	}
 }
 
-// awaitCell blocks until the named cell's reachability matches wantUp.
+// The push's own budgets, deliberately under fleetd's (which rejects a
+// title carrying a control character or exceeding its announce-field
+// bound, and caps a message at 2000 bytes). These strings are assembled
+// from things that came off the wire — an evidence gap fleetd worded, a
+// refusal body fleetd wrote, up to 4 KB of it — and a --notify that 400s
+// is a human who never gets paged.
+const (
+	maxNotifyTitleBytes   = 200
+	maxNotifyDetailBytes  = 800
+	maxNotifyMessageBytes = 1500
+)
+
+// clampBytes truncates to a byte budget on a rune boundary. Splitting a
+// rune would not fail fleetd's printability check — the fragment decodes
+// to U+FFFD, which is printable — it would just render as garbage on the
+// phone.
+func clampBytes(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	const ell = "…"
+	for len(s)+len(ell) > max {
+		_, size := utf8.DecodeLastRuneInString(s)
+		if size == 0 {
+			break
+		}
+		s = s[:len(s)-size]
+	}
+	return s + ell
+}
+
+func notifyText(s string, max int) string { return clampBytes(termSafe(s), max) }
+
+// awaitCell blocks until every requested condition holds for the named
+// cell IN THE SAME SNAPSHOT (C10): evaluating them across different
+// polls would report "ready and idle" having never observed a moment
+// when both were true.
+//
 // C3 made transitions subscribable: it rides /api/fleet/events when the
 // stream works (cellUp/cellDown, cellReturned/cellStale/cellWithdrawn)
-// and falls back to the 5s poll when it doesn't. Intent is never
-// consulted — a drained cell that answers is up (routing truth rule).
-func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell string, wantUp bool, timeout, interval time.Duration) error {
+// and falls back to the poll interval when it doesn't. A transition for
+// THIS cell triggers an immediate re-poll — that is what keeps C3's
+// sub-second unblock — but the snapshot is what decides, always: an
+// event proves something moved, never that the cell is reachable, that a
+// model is warm or that a GPU is free. Intent is never consulted — a
+// drained cell that answers is up (routing truth rule).
+// The satisfied evaluation is RETURNED, not just printed: --notify's
+// message is built from it, and a push that describes the wait in
+// weaker terms than the terminal did is the same evidence gap C10
+// refuses everywhere else.
+func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell string, cond awaitConds, timeout, interval time.Duration) (awaitEval, error) {
+	// Cancelled on EVERY return, not just the --timeout path: the events
+	// goroutine below only exits on ctx, so a successful wait under
+	// `--timeout 0` used to leave it streaming until the caller's context
+	// died. Harmless in a process that exits next; a leak in a function
+	// that is also called from tests and could be called from a loop.
+	var cancel context.CancelFunc
 	if timeout > 0 {
-		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
 	}
+	defer cancel()
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 
@@ -408,77 +524,131 @@ func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell str
 		}
 	}()
 
-	matches := func(reachable bool) bool { return reachable == wantUp }
-	eventMatches := func(ev fleetEvent) bool {
+	// A transition frame is a WAKE-UP, never a verdict. The five types
+	// mean five different things and only the snapshot reconciles them:
+	// `fleet.cellStale` says the ANNOUNCER died, and C6's whole finding
+	// is that a dead announcer leaves a healthy cell serving
+	// (`snap.Reachable = probeOK`), so returning "down" on it reports the
+	// exact cell C6 kept reachable as gone. `fleet.cellReturned` says the
+	// announcer is back, which a drained echo can still render
+	// unreachable. Even `fleet.cellDown` is the events stream dropping,
+	// not the two GETs `Reachable` is defined by. Re-polling costs one
+	// round trip and keeps the sub-second unblock C3 built this for,
+	// while leaving ONE thing deciding — the same snapshot rule the
+	// composite conditions already follow.
+	eventRelevant := func(ev fleetEvent) bool {
 		if ev.Cell != cell {
 			return false
 		}
 		switch ev.Type {
-		case "fleet.cellUp", "fleet.cellReturned":
-			return wantUp
-		case "fleet.cellDown", "fleet.cellStale", "fleet.cellWithdrawn":
-			return !wantUp
+		case "fleet.cellUp", "fleet.cellDown", "fleet.cellStale",
+			"fleet.cellWithdrawn", "fleet.cellReturned":
+			return true
 		}
 		return false
 	}
 
+	var lastKey string
+	var printed bool
+	var lastUnmet []string
+	var lastErr error
 	for {
-		ok, err := checkCellReachable(ctx, target, cell, matches)
-		if err == nil && ok {
-			state := "up"
-			if !wantUp {
-				state = "down"
+		ev, err := evaluateAwait(ctx, target, cell, cond)
+		switch {
+		case err == nil && ev.ok:
+			fmt.Fprintln(out, awaitSuccessLine(cell, cond.wantUp, ev))
+			return ev, nil
+		case err == nil:
+			lastUnmet, lastErr = ev.unmet, nil
+			// On a CHANGE OF STATE, not of text. The status line carries a
+			// live idle counter, so deduplicating on the rendered line
+			// deduplicates nothing against a real fleetd — an overnight
+			// `--idle` wait would log one line per poll for eight hours.
+			if !printed || ev.key != lastKey {
+				lastKey, printed = ev.key, true
+				fmt.Fprintf(out, "await %s: %s\n", cell, ev.status)
 			}
-			fmt.Fprintf(out, "%s is %s\n", cell, state)
-			return nil
-		}
-		if errors.Is(err, errUnknownCell) {
-			// A typo'd cell name never becomes true by waiting, and
-			// --timeout 0 is the documented overnight-batch idiom: without
-			// this the command parks until the machine reboots.
-			return err
-		}
-		if err != nil && ctx.Err() == nil {
-			fmt.Fprintf(out, "await %s: %v (retrying)\n", cell, err)
-		}
-		select {
-		case <-ctx.Done():
-			if timeout > 0 {
-				return fmt.Errorf("timeout waiting for %s to come %s", cell, map[bool]string{true: "up", false: "down"}[wantUp])
+		case errors.Is(err, errUnknownCell), errors.Is(err, errUnknownModel):
+			// A typo never becomes true by waiting, and --timeout 0 is the
+			// documented overnight-batch idiom: without this the command
+			// parks until the machine reboots.
+			return awaitEval{}, err
+		default:
+			// A transport error is a restarting fleetd, which is exactly
+			// what the retry loop is for. An error caused by our OWN
+			// deadline expiring mid-poll is not evidence of anything and
+			// must not become the reported cause — it is the timeout.
+			if ctx.Err() == nil {
+				lastErr = err
+				fmt.Fprintf(out, "await %s: %v (retrying)\n", cell, err)
 			}
-			return ctx.Err()
-		case ev := <-events:
-			if streamAlive.Load() && eventMatches(ev) {
-				state := "up"
-				if !wantUp {
-					state = "down"
+		}
+		// Wait for the next REASON to re-evaluate. An unrelated frame is
+		// not one: fleetd forwards every upstream llama-swap payload
+		// (logData, modelStatus, metrics) from every cell onto this
+		// stream, and /api/fleet/state is an uncached probe round of the
+		// whole fleet. Re-polling per frame turns a long wait — which is
+		// the entire point of --idle — into a probe flood against the
+		// llama-swaps that are serving the traffic.
+		for repoll := false; !repoll; {
+			select {
+			case <-ctx.Done():
+				if timeout > 0 {
+					switch {
+					case lastErr != nil:
+						// fleetd was unreachable at the end: reporting "the cell
+						// never came up" would blame the cell for the registry.
+						return awaitEval{}, fmt.Errorf("timeout waiting for %s: last attempt failed: %w", cell, lastErr)
+					case cond.extras() && len(lastUnmet) > 0:
+						return awaitEval{}, fmt.Errorf("timeout waiting for %s: %s", cell, strings.Join(lastUnmet, "; "))
+					}
+					return awaitEval{}, fmt.Errorf("timeout waiting for %s to come %s", cell, upWord(cond.wantUp))
 				}
-				fmt.Fprintf(out, "%s is %s (%s)\n", cell, state, ev.Type)
-				return nil
+				return awaitEval{}, ctx.Err()
+			case ev := <-events:
+				if !streamAlive.Load() || !eventRelevant(ev) {
+					continue
+				}
+				repoll = true
+			case <-tick.C:
+				repoll = true
 			}
-		case <-tick.C:
 		}
 	}
+}
+
+// awaitSuccessLine is the ONE rendering of a satisfied wait. The
+// terminal line and the --notify push are both built from it, for the
+// same reason condResult exists: two surfaces describing one wait
+// differently is how a qualification gets dropped from the one a human
+// actually reads.
+func awaitSuccessLine(cell string, up bool, ev awaitEval) string {
+	return fmt.Sprintf("%s is %s%s", cell, upWord(up), successSuffix(ev))
+}
+
+// successSuffix appends the conditions beyond reachability to the
+// success line, so the script's log records what was actually true.
+func successSuffix(ev awaitEval) string {
+	if len(ev.extra) == 0 {
+		return ""
+	}
+	return ": " + strings.Join(ev.extra, "; ")
+}
+
+// evaluateAwait runs one /state poll and judges every condition against
+// that one document.
+func evaluateAwait(ctx context.Context, target fleetdTarget, cell string, cond awaitConds) (awaitEval, error) {
+	snap, err := target.fetchState(ctx)
+	if err != nil {
+		return awaitEval{}, err
+	}
+	return cond.evaluate(snap, cell)
 }
 
 // fleetEvent is the CLI's minimal decode of one /api/fleet/events frame.
 type fleetEvent struct {
 	Cell string `json:"cell"`
 	Type string `json:"type"`
-}
-
-// checkCellReachable runs one /state poll for the cell.
-func checkCellReachable(ctx context.Context, target fleetdTarget, cell string, matches func(bool) bool) (bool, error) {
-	snap, err := target.fetchState(ctx)
-	if err != nil {
-		return false, err
-	}
-	for _, c := range snap.Cells {
-		if c.Name == cell {
-			return matches(c.Reachable), nil
-		}
-	}
-	return false, fmt.Errorf("%w %q (not in fleetd's registry)", errUnknownCell, cell)
 }
 
 // errUnknownCell separates "fleetd answered and has never heard of this

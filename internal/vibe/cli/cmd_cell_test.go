@@ -147,7 +147,7 @@ func TestCellAwaitUnblocksOnTransition(t *testing.T) {
 	if terr != nil {
 		t.Fatal(terr)
 	}
-	err := awaitCell(t.Context(), &out, target, "gpu-cell", true, 5*time.Second, 50*time.Millisecond)
+	_, err := awaitCell(t.Context(), &out, target, "gpu-cell", awaitConds{wantUp: true}, 5*time.Second, 50*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,16 +161,21 @@ func TestCellAwaitUnblocksOnTransition(t *testing.T) {
 
 func TestCellAwaitViaEventsStream(t *testing.T) {
 	// fleetd with an SSE stream: the transition event must unblock the
-	// await before the poll interval matters.
-	state := fleetapi.StateSnapshot{
-		GeneratedAt: time.Now(),
-		Cells: []fleetapi.CellSnapshot{{
-			Name: "gpu-cell", URL: "http://gpu.lan:9000", Reachable: false,
-		}},
-	}
+	// await before the poll interval matters. The cell becomes reachable
+	// at the same moment the event is emitted — the event is what makes
+	// await LOOK, and the snapshot is what decides (C10 review: a
+	// fixture whose state contradicted its own event was asserting that
+	// the event alone could return, which is how `--down` unblocked on
+	// `fleet.cellStale` against a cell C6 deliberately keeps reachable).
+	var reachable atomic.Bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/fleet/state", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(state)
+		_ = json.NewEncoder(w).Encode(fleetapi.StateSnapshot{
+			GeneratedAt: time.Now(),
+			Cells: []fleetapi.CellSnapshot{{
+				Name: "gpu-cell", URL: "http://gpu.lan:9000", Reachable: reachable.Load(),
+			}},
+		})
 	})
 	mux.HandleFunc("GET /api/fleet/events", func(w http.ResponseWriter, r *http.Request) {
 		flusher := w.(http.Flusher)
@@ -178,6 +183,7 @@ func TestCellAwaitViaEventsStream(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		flusher.Flush()
 		time.Sleep(200 * time.Millisecond)
+		reachable.Store(true)
 		fmt.Fprintf(w, "event:message\ndata:{\"cell\":\"gpu-cell\",\"type\":\"fleet.cellReturned\"}\n\n")
 		flusher.Flush()
 		<-r.Context().Done()
@@ -191,7 +197,7 @@ func TestCellAwaitViaEventsStream(t *testing.T) {
 		t.Fatal(terr)
 	}
 	start := time.Now()
-	err := awaitCell(t.Context(), &out, target, "gpu-cell", true, 5*time.Second, 2*time.Second)
+	_, err := awaitCell(t.Context(), &out, target, "gpu-cell", awaitConds{wantUp: true}, 5*time.Second, 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +222,7 @@ func TestCellAwaitUnknownCellFailsFast(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
-	err := awaitCell(ctx, &out, target, "nope", true, 0, 50*time.Millisecond)
+	_, err := awaitCell(ctx, &out, target, "nope", awaitConds{wantUp: true}, 0, 50*time.Millisecond)
 	if !errors.Is(err, errUnknownCell) {
 		t.Errorf("unknown cell: got %v, want errUnknownCell", err)
 	}
@@ -233,7 +239,7 @@ func TestCellAwaitDown(t *testing.T) {
 	if terr != nil {
 		t.Fatal(terr)
 	}
-	if err := awaitCell(t.Context(), &out, target, "gpu-cell", false, 2*time.Second, 50*time.Millisecond); err != nil {
+	if _, err := awaitCell(t.Context(), &out, target, "gpu-cell", awaitConds{}, 2*time.Second, 50*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "gpu-cell is down") {
