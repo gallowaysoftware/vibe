@@ -780,7 +780,7 @@ func TestSavings_HTTPEndpointIsReadOnlyJSON(t *testing.T) {
 func TestFleetPage_SavingsIsAViewNotARoute(t *testing.T) {
 	s := newSavingsServer(t, savingsHosts())
 	mux := http.NewServeMux()
-	s.registerFleetPage(mux)
+	mux.HandleFunc(http.MethodGet+" "+fleetPagePath, fleetPageHandler(s))
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 

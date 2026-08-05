@@ -1,4 +1,4 @@
-# Fleet-control implementation plan (C0–C11)
+# Fleet-control implementation plan (C0–C12)
 
 Execution plan for [../fleet-control.md](../fleet-control.md). Each
 phase is one PR, independently shippable, and pays for itself before
@@ -18,8 +18,9 @@ to be implementable on its own after that.
 | [C7b](c7b-savings-screen.md) | The savings screen: what the fleet didn't spend | ~690 lines + ~100 KB data | C7a, C5 | merged (#25); unit gates green, live plausibility gate UNRUN |
 | [C8](c8-probe-model.md) | probe_model: throughput health against the model's own baseline | ~900 lines | C3, C4 | merged (#27); unit gates 1-10 green, 5 live gates UNRUN |
 | [C9](c9-fleet-notify.md) | `vibe fleet notify`: the alarm column, delivered | ~1100 lines | C2, C3, C4 | merged (#28); unit gates 1-13 green, 4 live gates UNRUN |
-| [C10](c10-await-extensions.md) | await extensions: `--model --ready`, `--idle`, the lease handshake | ~450 lines | C1, C2, C3, C4, C6, C9, C11 | PR #29 OPEN; unit gates 1-12 green (12 added by the C9 merge), 4 live gates UNRUN |
+| [C10](c10-await-extensions.md) | await extensions: `--model --ready`, `--idle`, the lease handshake | ~450 lines | C1, C2, C3, C4, C6, C9, C11 | merged (#29); unit gates 1-12 green (12 added by the C9 merge), 4 live gates UNRUN |
 | [C11](c11-hold-model.md) | hold_model: the pause button on the warm policy | ~450 lines | C2, C4, C5 | merged (#30); unit gates 1-11 green, 4 live gates UNRUN |
+| [C12](c12-guest-token.md) | Guest read-only token: sharing status without sharing drain | ~250 lines | C1, C5 | PR open; feature + self-review + adversarial-review commits; unit gates 1-14 (+11b) green, 3 live gates UNRUN |
 
 C10 (await extensions) is the last of the three branches cut from
 `c9e8bcf` in parallel; C11 and then C9 landed ahead of it. None of the
@@ -34,7 +35,7 @@ sets (`c10-await-extensions.md`'s second addendum).
 **Merged is not live-gated.** Every C0–C7b PR merged on a green CI run
 of the mechanical inner loop. The live gates — the ones that need real
 cells, a real GPU and a real week of traffic — are UNRUN for C5, C6,
-C7a, C7b, C8, C9, C10 and C11, and each phase doc lists exactly which.
+C7a, C7b, C8, C9, C10, C11 and C12, and each phase doc lists exactly which.
 Ground rule 10 applies to this table: a status cell is a claim about a
 mechanical run.
 
@@ -96,6 +97,22 @@ number can be *silly* lives in C7b (pricing, equivalence, energy,
 payback) and none of it can be judged until real counts exist to look
 at. C7a needs no new measurement mechanism — llama-swap already logs
 per-request token counts to SQLite.
+
+C12 (2026-08-04) is backlog item 6, and it carries one rule that
+outlives it: **the route table is the allowlist**. The guest bearer
+grants exactly `GET /api/fleet/state` and `GET /api/fleet/events`, and
+the enforcement is a positive lookup keyed on exact (method, path) —
+because a denylist silently grants every route added after it, and this
+plan added routes in eight of its twelve phases. So the declaration
+moved next to the mount: `fleetapi/routes.go` is simultaneously what
+`Register` mounts and what each route grants, `Access` has no safe zero
+value, and a route added without a decision fails a test rather than
+inheriting one. C5's `/ui/fleet` bearer exemption folded into the same
+table (unchanged: one entry, GET, exact-match, evaluated before
+path-cleaning). The phase's other decision worth carrying: `usage` and
+`savings` are refused to a guest even though both are read-only GETs —
+state is instantaneous, the ledger is the household's history, and the
+savings screen exposes more about the house than cell status does.
 
 A **post-merge reconciliation PR** (#26, 2026-08-03) closed the three
 items no single phase branch could reach, because each needed code from

@@ -52,6 +52,26 @@ fleet_registry: true
 fleet:
   front_config: /front-config/config.yaml
 
+  # C12: the guest READ-ONLY bearer. Honored on GET /api/fleet/state and
+  # GET /api/fleet/events and refused on everything else — /mcp, the
+  # RPCs, intent, wake, announce, leases, and both /api/fleet/usage and
+  # /api/fleet/savings (state is instantaneous; the ledger and its
+  # prices are the household's history). Hand it to a phone or a
+  # housemate; the fleet page renders read-only for it.
+  #
+  # Off unless this key is set. The daemon MINTS the file at first start
+  # (0600), so the path MUST be inside the mounted state dir —
+  # /state/vibe, which is $XDG_STATE_HOME/vibe and the one rw mount the
+  # compose marks required. A path one level up (/state/guest-token) is
+  # container-local: every recreate mints a fresh token and silently
+  # revokes every guest. Anything wrong with the file (empty, too short,
+  # whitespace, or a copy of the control-plane token — including
+  # pointing this key at /state/vibe/token) disables guest access loudly
+  # rather than granting more than intended.
+  # Read it with `vibe token --guest`; rotate with
+  # `vibe token --guest --regenerate` + a restart.
+  # guest_token_file: /state/vibe/guest-token
+
   # C9: the class table's alarm column, delivered to one webhook. Empty
   # (the default) means no notifications at all. The URL is a
   # CREDENTIAL — an ntfy topic URL is bearer-equivalent in both
@@ -203,6 +223,7 @@ the state dir, which the compose marks required:
 | file | why it matters |
 |---|---|
 | `token` | A recreate over an unmounted state dir silently mints a FRESH bearer token and every client 401s. The startup log says **"token CREATED (new)"** vs "token loaded" distinctly, and rejected-auth counts surface in `/api/fleet/state` and `vibe cell status` — check there first when clients 401. |
+| `guest-token` (C12, only if `fleet.guest_token_file` points here) | Same failure as `token`, one level down: a recreate over an unmounted state dir mints a FRESH guest token and every guest you have shared it with 401s. The startup log distinguishes "guest read-only token CREATED (new)" from "loaded". |
 | `intent.json` | Declared cell intent ("drained for gaming, eta 23:00"). Losing it turns a deliberate drain into a `DRAINED?` mystery. |
 | `last-seen.json` | Absent cells' last sightings. |
 | `start-history.json` | Cold-start ETAs for `warm_model` and the UI. |

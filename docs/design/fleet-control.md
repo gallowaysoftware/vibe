@@ -244,6 +244,16 @@ machinery, already shipped). `vibe cell await <cell> --up` is the
 `POST`/`DELETE /api/fleet/lease` (C2); `POST /api/fleet/announce` (C3);
 `POST /api/fleet/notify/scope` and `POST /api/fleet/notify/send` (C9).
 
+*Amended C12.* Every route is declared in one table
+(`fleetapi/routes.go`) that is both what the daemon mounts and what each
+route grants below the control-plane token: `AccessTokenOnly` (the
+default and everything undeclared, `/mcp` and the Connect RPCs
+included), `AccessGuest` (the optional read-only bearer — exactly
+`GET /api/fleet/state` and `GET /api/fleet/events`), `AccessPublic`
+(exactly `GET /ui/fleet`, C5's static-asset exemption). Enforcement
+stays in the daemon's bearer middleware, as a positive allowlist on
+exact (method, path) evaluated before the mux cleans the path.
+
 **Advisory leases (C2).** A batch consumer can register "I hold
 `<model>` on `<cell>`: mid-batch, N rows left" with a TTL. Leases are
 advisory only — they appear in the pre-drain report and in

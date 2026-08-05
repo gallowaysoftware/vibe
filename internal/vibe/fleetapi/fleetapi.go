@@ -72,6 +72,18 @@ type DaemonInfo struct {
 	// daemon start — a stale-token client shows up here as a rising
 	// number instead of being invisible until someone reads logs.
 	AuthRejected int64 `json:"auth_rejected"`
+	// GuestEnabled reports whether the C12 guest read-only bearer is
+	// configured on this daemon. The flag, never the value: the token is
+	// a credential and appears in no status document, no log line and no
+	// error string.
+	GuestEnabled bool `json:"guest_enabled,omitempty"`
+	// GuestRejected counts requests that presented a VALID guest token on
+	// a route the guest allowlist does not name. Deliberately NOT folded
+	// into AuthRejected: that counter answers "some client holds a stale
+	// token", and a guest reaching past their grant is a different fact
+	// that would otherwise turn a working signal into noise on the day
+	// someone shares a link.
+	GuestRejected int64 `json:"guest_rejected,omitempty"`
 }
 
 // Event is one frame on /api/fleet/events: an upstream llama-swap message
@@ -399,40 +411,6 @@ func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Op
 		notifyScope:        loadNotifyScope(opts.NotifyScopePath),
 		notifyScopePath:    opts.NotifyScopePath,
 		done:               make(chan struct{}),
-	}
-}
-
-// Register mounts the fleet endpoints on the daemon's existing mux. Auth is
-// the mux wrapper's business (bearer middleware on TCP, none on unix).
-// The intent endpoint exists only when the intent store is enabled
-// (fleetd role) — a single-box daemon has no fleet intent to record.
-func (s *Server) Register(mux *http.ServeMux) {
-	mux.HandleFunc("GET /api/fleet/state", s.handleState)
-	mux.HandleFunc("GET /api/fleet/events", s.handleEvents)
-	if s.intentPath != "" {
-		mux.HandleFunc("POST /api/fleet/intent", s.handleIntent)
-		mux.HandleFunc("POST /api/fleet/wake", s.handleWake)
-		mux.HandleFunc("POST /api/fleet/announce", s.handleAnnounce)
-		// C9. The scope route exists whether or not a webhook is
-		// configured (declaring away before wiring a sink is harmless);
-		// the send route answers 503 without one.
-		mux.HandleFunc("POST /api/fleet/notify/scope", s.handleNotifyScope)
-		mux.HandleFunc("POST /api/fleet/notify/send", s.handleNotifySend)
-		s.registerFleetPage(mux)
-	}
-	if s.leasePath != "" {
-		mux.HandleFunc("GET /api/fleet/leases", s.handleLeases)
-		mux.HandleFunc("POST /api/fleet/lease", s.handleLeaseMutate)
-		mux.HandleFunc("DELETE /api/fleet/lease", s.handleLeaseMutate)
-	}
-	if s.usage != nil {
-		mux.HandleFunc("GET /api/fleet/usage", s.handleUsage)
-		// The page's fourth read-only GET (after state/events/leases).
-		// Deliberately its own route rather than a field on
-		// /api/fleet/state: every SSE line debounce-refreshes state, and a
-		// ledger aggregate would recompute for a screen nobody is looking
-		// at. Every mutation still goes through POST /mcp.
-		mux.HandleFunc("GET /api/fleet/savings", s.handleSavings)
 	}
 }
 

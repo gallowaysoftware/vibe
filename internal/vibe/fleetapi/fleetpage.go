@@ -15,10 +15,17 @@ import (
 //go:embed fleet.html
 var fleetPageFS embed.FS
 
-// registerFleetPage mounts GET /ui/fleet (the path deliberately avoids
-// colliding with llama-swap's /ui on cells). fleetd role only.
-func (s *Server) registerFleetPage(mux *http.ServeMux) {
-	mux.HandleFunc("GET /ui/fleet", func(w http.ResponseWriter, r *http.Request) {
+// fleetPagePath is the page's route (deliberately avoiding a collision
+// with llama-swap's /ui on cells). It is the ONE AccessPublic entry in
+// the route table: the file carries no fleet data, and it must load in a
+// bare browser tab so its own token prompt can run.
+const fleetPagePath = "/ui/fleet"
+
+// fleetPageHandler serves the embedded page. It takes a *Server for the
+// route table's uniform handler signature and uses none of it — the page
+// is a static asset.
+func fleetPageHandler(*Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		data, err := fleetPageFS.ReadFile("fleet.html")
 		if err != nil {
 			http.Error(w, "page missing", http.StatusInternalServerError)
@@ -27,5 +34,5 @@ func (s *Server) registerFleetPage(mux *http.ServeMux) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write(data)
-	})
+	}
 }

@@ -782,6 +782,65 @@ optional.)
     the surface a sleeping operator reads is the last place an evidence
     qualification may be dropped. A timeout or a fail-fast typo pushes
     nothing: `--notify` is await-UNBLOCKED.
+- **Guest read-only token (fleet-control C12).** A second bearer
+  (`fleet.guest_token_file`) honored on exactly `GET /api/fleet/state`
+  and `GET /api/fleet/events`. Off unless configured; a fleet that never
+  sets the key behaves exactly as it did before C12.
+  - **`internal/vibe/fleetapi/routes.go` is the route registry AND the
+    allowlist.** One table is both what `Register` mounts and what each
+    route grants (`Access`: `AccessTokenOnly` | `AccessGuest` |
+    `AccessPublic`). **Add a route there or it is not mounted** — no
+    other non-test file in the package may call `mux.HandleFunc`, and a
+    grep test enforces it. `Access`'s zero value is `AccessUndecided`
+    and a test fails on it: "the next agent forgot" must not be spelled
+    the same way as "the next agent decided". Deciding is one line, and
+    the decision is `AccessTokenOnly` unless there is an argument.
+  - **Enforcement is a positive allowlist**, in daemon/auth.go via
+    `fleetapi.AccessFor(r.Method, r.URL.Path)`: exact (method, path), on
+    the RAW path before the mux cleans anything, everything undeclared
+    (`/mcp`, the whole Connect mount, typos, future routes) token-only.
+    Never a denylist, never a prefix, never `path.Clean`. **C5's
+    `/ui/fleet` exemption is now the table's one `AccessPublic` entry** —
+    same GET-only exact match, same six pinned bypass attempts.
+  - **The guest surface is state, never history.** `/api/fleet/usage`
+    and `/api/fleet/savings` are refused despite being read-only GETs:
+    tokens per cell per day is a record of when this house works and
+    when it was away, and the savings screen adds capital and
+    electricity cost. A guest sees what the fleet is doing NOW.
+  - **The grant is a ROUTE grant, not a field grant**: a guest reads the
+    whole state document — intent reasons, lease notes and all. No
+    guest-shaped variant of the snapshot (C9's rule that every surface
+    renders the same document), and the operational consequence is that
+    anything on the fleet page is guest-visible.
+  - **The token is a credential**: constant-time compared, never logged,
+    never in an error string, never in a status document. Only
+    `daemon.guest_enabled` (bool) and `daemon.guest_rejected` (count)
+    surface, and guest denials are counted SEPARATELY from
+    `auth_rejected` — that counter means "a client holds a stale token"
+    and folding guests in would destroy the signal.
+  - **Every misconfiguration fails CLOSED and non-fatally**: empty, too
+    short (<16), whitespace/control chars, unwritable, or **identical to
+    the control-plane token** all disable guest access with a loud
+    `slog.Error` while the daemon keeps serving. The identical-token
+    rung is the important one — such a token authenticates on the FIRST
+    comparison and would grant every verb. A missing file is minted
+    (0600) and logged CREATED-vs-loaded, C1's rule.
+  - **`guest_token_file` may never BE the control-plane token file**,
+    and that is checked on the PATH (`daemon.IsControlTokenFile`, before
+    the file is read) rather than on the value — because the loader
+    MINTS into a missing file, so the value comparison would run on a
+    value it had just written over the control-plane token.
+    `vibe token --guest` and `--guest --regenerate` refuse the same
+    configuration: printing it hands out the control-plane token under a
+    "share this" banner, and regenerating it rotates the control-plane
+    token from a command whose name says guest.
+  - **The page hides what a guest cannot do**, learning which credential
+    it holds from the `X-Vibe-Auth: guest` response header on a request
+    it already makes — no probe, no new route (C7b's rule), no
+    per-viewer field in the state document (fleetapi has never known
+    about tokens). Hiding is a COURTESY; the middleware is the boundary.
+    If the header is stripped the page just keeps its buttons and a
+    click 401s.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.

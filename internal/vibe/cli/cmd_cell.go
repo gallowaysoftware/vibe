@@ -159,6 +159,12 @@ func renderStatus(out io.Writer, base string, snap *fleetapi.StateSnapshot) {
 	if snap.Daemon.AuthRejected > 0 {
 		fmt.Fprintf(out, "  (auth rejections since start: %d — a client somewhere holds a stale token)", snap.Daemon.AuthRejected)
 	}
+	if snap.Daemon.GuestEnabled {
+		// A separate sentence from the line above on purpose: a guest
+		// reaching past their two routes is not a stale-token client, and
+		// C12 keeps the two counters apart so this one stays readable.
+		fmt.Fprintf(out, "  (guest read-only token: on; %d request(s) refused past its two routes)", snap.Daemon.GuestRejected)
+	}
 	fmt.Fprintln(out)
 	fmt.Fprintf(out, "%-14s %-13s %-14s %-34s %s\n", "CELL", "DISPLAY", "CLASS", "MODELS", "INTENT / LAST SEEN")
 	for _, c := range snap.Cells {
