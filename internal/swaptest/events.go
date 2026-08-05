@@ -47,9 +47,15 @@ type entryV247 struct {
 }
 
 // view renders an entry in the wire's own field set.
-func (w Wire) view(e inflightEntry) any {
+func (w Wire) view(e inflightEntry) any { return w.viewAt(e, false) }
+
+// viewAt renders an entry either as it looks when the request ARRIVES
+// (resp_headers empty, elapsed_ms 0) or as it looks once the upstream's
+// response headers have landed. Real v247 publishes both — two upserts for
+// the same id, the second carrying resp_headers and a non-zero elapsed_ms.
+func (w Wire) viewAt(e inflightEntry, responded bool) any {
 	if w == WireV247 {
-		return entryV247{
+		v := entryV247{
 			ID: e.ID, Timestamp: e.Timestamp, Model: e.Model, ReqPath: e.ReqPath, Method: e.Method,
 			ReqHeaders: map[string]string{
 				"Accept-Encoding": "gzip",
@@ -59,6 +65,15 @@ func (w Wire) view(e inflightEntry) any {
 			RemoteIP:    "127.0.0.1",
 			RespHeaders: map[string]string{},
 		}
+		if responded {
+			v.RespHeaders = map[string]string{
+				"Access-Control-Allow-Origin": "",
+				"Content-Type":                "application/json; charset=utf-8",
+				"Server":                      "llama.cpp",
+			}
+			v.ElapsedMs = 54
+		}
+		return v
 	}
 	return entryV239(e)
 }
@@ -124,7 +139,16 @@ func (c *Cell) inflightStartFramesLocked(e inflightEntry) []string {
 	c.live = append(c.live, e)
 	switch c.wire {
 	case WireV247:
-		return []string{frame("inflight", map[string]any{"operation": "upsert", "request": c.wire.view(e)})}
+		// TWO upserts for the same id, which is what a real v247 sends: one
+		// when the request arrives and one when the upstream's response
+		// headers land. Recorded in fixtures/v247/events-request.sse and
+		// re-observed live. It is the reason the consumer's fold has to be a
+		// SET — a counter reads the pair as two requests in flight and never
+		// gets back to zero on the single remove that retires them.
+		return []string{
+			frame("inflight", map[string]any{"operation": "upsert", "request": c.wire.viewAt(e, false)}),
+			frame("inflight", map[string]any{"operation": "upsert", "request": c.wire.viewAt(e, true)}),
+		}
 	default:
 		return []string{frame("inflight", map[string]any{"requests": c.wire.views(c.live)})}
 	}
@@ -187,9 +211,10 @@ func (c *Cell) modelStatusFrameLocked() string {
 
 // handleEvents serves the SSE stream. The connect burst reproduces the one
 // recorded off v239: logData, logData, modelStatus, inflight — all four
-// inside ~200ms of the connect. The trailing inflight snapshot is why
-// fleetapi's "no inflight frame seen yet" branch is a sub-second window in
-// production rather than a state a cell sits in.
+// inside ~200ms of the connect (v247 adds uiConfig and profileChanged
+// before the snapshot). The trailing inflight snapshot is why fleetapi's
+// "no inflight frame seen yet" branch is a sub-second window in production
+// rather than a state a cell sits in.
 func (c *Cell) handleEvents(w http.ResponseWriter, r *http.Request) {
 	fl, ok := w.(http.Flusher)
 	if !ok {
@@ -207,7 +232,12 @@ func (c *Cell) handleEvents(w http.ResponseWriter, r *http.Request) {
 	c.subs[st] = struct{}{}
 	dropAfter := c.dropAfter
 	burst := []string{
+		// TWO logData frames, as both recordings carry: llama-swap replays
+		// its whole log history on connect and it does not arrive as one
+		// frame. Their combined size is the thing that matters — 210 KB when
+		// v239 was recorded, against fleetapi's 8 MB scanner cap.
 		frame("logData", map[string]string{"data": "[INFO] llama-swap listening\n"}),
+		frame("logData", map[string]string{"data": "[INFO] loading config\n"}),
 		c.modelStatusFrameLocked(),
 	}
 	if c.wire == WireV247 {
@@ -265,13 +295,36 @@ func (c *Cell) broadcast(f string) {
 		subs = append(subs, s)
 	}
 	c.mu.Unlock()
+	dropped := 0
 	for _, s := range subs {
 		select {
 		case s.ch <- f:
 		case <-s.closed:
+			// Not a drop: the subscriber is gone, which is exactly what
+			// DropStreams and a client disconnect look like.
 		default:
+			dropped++
 		}
 	}
+	if dropped > 0 {
+		c.mu.Lock()
+		c.dropped += dropped
+		c.mu.Unlock()
+	}
+}
+
+// DroppedFrames counts frames this cell could not hand to a LIVE subscriber
+// because that subscriber's buffer was full.
+//
+// It exists so the number is never zero-by-assumption. A double that
+// silently discards an inflight edge produces a consumer stuck at a stale
+// count, and the test that notices fails somewhere else entirely, minutes
+// later, in a way that reads as a race in production code. NewCell fails
+// the test if this ends non-zero.
+func (c *Cell) DroppedFrames() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dropped
 }
 
 func (c *Cell) closeStreams() {

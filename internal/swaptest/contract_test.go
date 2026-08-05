@@ -37,6 +37,14 @@ type target struct {
 	model string
 }
 
+// fake reports whether this target is the double. It is the line between
+// "the wire may or may not do this" and "we wrote this and it must". A
+// llama.cpp build with no draft model reports -1 for draft tokens and one
+// with MTP reports a real number, so a live target cannot be REQUIRED to
+// produce the sentinel; the double can, and if it stops, the sentinel that
+// C7a's clamp exists for is no longer exercised anywhere.
+func (t target) fake() bool { return strings.HasPrefix(t.name, "fake/") }
+
 // targets enumerates every wire of the double plus the live binary when the
 // environment configures one (see live_test.go).
 func targets(t *testing.T) []target {
@@ -149,6 +157,9 @@ func i2(t *testing.T, tgt target) {
 		}
 	}
 	if !sawSentinel {
+		if tgt.fake() {
+			t.Fatalf("no -1 sentinel appeared in %d rows off the double. The sentinel is the whole reason C7a clamps; a double that stopped emitting it makes every assertion above pass over rows the wire does not produce", len(rows))
+		}
 		t.Logf("note: no -1 sentinel appeared in %d rows; the clamp is untested on this target", len(rows))
 	}
 }
@@ -157,14 +168,36 @@ func i2(t *testing.T, tgt target) {
 // parses llama.cpp's timings block out of the stream, so no stream_options
 // cooperation is needed — and a fake that zeroes tokens on
 // text/event-stream teaches the opposite of what production does.
+//
+// Two things here are load-bearing and were not, in the first version of
+// this file.
+//
+// The row must be one THIS call produced (id > the head before the drive).
+// resp_content_type is the only field that distinguishes a streamed request
+// from an identical unstreamed one — verified on a real v247 serving the
+// same model twice: stream=true logged text/event-stream, stream=false
+// logged "application/json; charset=utf-8". Accepting any older streaming
+// row lets a target that ignores `stream` entirely satisfy this.
+//
+// And a target that produced no streaming row FAILS. The earlier t.Skip
+// meant the correct fix to the double — telling the truth about
+// resp_content_type on an unstreamed reply — turned this invariant into a
+// green skip, which is the failure mode the whole package is about.
 func i3(t *testing.T, tgt target) {
+	before := headID(t, tgt)
 	drive(t, tgt, true)
 	// The row is written after the response completes, so give it a moment
-	// rather than reading once and skipping — a skip that is really a race
+	// rather than reading once and giving up — a miss that is really a race
 	// is an invariant quietly not checked.
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
+	var seen []string
 	for {
+		seen = nil
 		for _, r := range activityRows(t, tgt, 20) {
+			if r.ID <= before {
+				continue
+			}
+			seen = append(seen, fmt.Sprintf("%d:%s", r.ID, r.RespContentType))
 			if r.RespContentType != "text/event-stream" || r.RespStatusCode != 200 {
 				continue
 			}
@@ -174,7 +207,7 @@ func i3(t *testing.T, tgt target) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Skip("no 200 text/event-stream row on this target")
+			t.Fatalf("a stream:true completion produced no 200 text/event-stream row above id %d; rows seen: %v", before, seen)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

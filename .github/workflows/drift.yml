@@ -4,9 +4,17 @@ name: drift
 #
 # ci.yml's conformance job runs against PINNED llama-swap versions, so it can
 # never tell you that upstream moved. This one resolves LATEST at run time and
-# runs the same conformance list against it. It is allowed to be red: a red
-# run means the contract changed, not that anybody's PR is broken, which is
-# why it never touches the pull-request path and carries continue-on-error.
+# runs the same conformance list against it. It is MEANT to be red: a red run
+# means the contract changed, not that anybody's PR is broken, which is why it
+# never touches the pull-request path.
+#
+# It carries no continue-on-error, and that is the whole point. A job-level
+# continue-on-error makes the run CONCLUDE SUCCESS however the step went, so
+# GitHub sends no notification for a scheduled run and the only way to learn
+# that llama-swap broke the contract is to go and look at a tab nobody opens.
+# An alarm that cannot ring is not an alarm. Red here costs nothing — no PR
+# gates on this workflow — and it is the only automatic signal that arrives
+# before a `docker compose pull` on the front arms the change.
 #
 # When it goes red:
 #   1. Read the failing invariant — it names the semantic that moved.
@@ -28,7 +36,6 @@ jobs:
   latest:
     name: conformance (llama-swap latest, unpinned)
     runs-on: ubuntu-latest
-    continue-on-error: true
     env:
       LLAMA_CPP_VERSION: b10282
       MODEL_URL: https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf

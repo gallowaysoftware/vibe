@@ -21,17 +21,21 @@ type RowTokens struct {
 // has_capture and metadata included — a struct that omits them is not a
 // reason to believe llama-swap does.
 type Row struct {
-	ID              int64             `json:"id"`
-	Timestamp       string            `json:"timestamp"`
-	Model           string            `json:"model"`
-	ReqPath         string            `json:"req_path"`
-	RespContentType string            `json:"resp_content_type"`
-	RespStatusCode  int               `json:"resp_status_code"`
-	Tokens          RowTokens         `json:"tokens"`
-	DurationMs      int64             `json:"duration_ms"`
-	ErrorMsg        string            `json:"error_msg,omitempty"`
-	HasCapture      bool              `json:"has_capture,omitempty"`
-	Metadata        map[string]string `json:"metadata,omitempty"`
+	ID              int64     `json:"id"`
+	Timestamp       string    `json:"timestamp"`
+	Model           string    `json:"model"`
+	ReqPath         string    `json:"req_path"`
+	RespContentType string    `json:"resp_content_type"`
+	RespStatusCode  int       `json:"resp_status_code"`
+	Tokens          RowTokens `json:"tokens"`
+	DurationMs      int64     `json:"duration_ms"`
+	ErrorMsg        string    `json:"error_msg,omitempty"`
+	// has_capture is on EVERY real row (checked on v239 and v247 alike), so
+	// it is not omitempty here: a double whose rows are missing a key the
+	// wire always carries is a double a decoder can be written against and
+	// still fail in production.
+	HasCapture bool              `json:"has_capture"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
 }
 
 // handleActivity serves the paginated activity log. Ordering is newest-id

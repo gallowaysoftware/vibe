@@ -54,21 +54,24 @@ func captureFrames(t *testing.T, c *swaptest.Cell, drive func()) []swaptest.Reco
 	}()
 
 	// Drain the connect burst before driving, so the caller sees only what
-	// its own action produced.
-	burst := 0
-	for burst < 3 {
+	// its own action produced. The burst ENDS at its inflight snapshot, so
+	// drain until that frame rather than counting frames: the count differs
+	// per wire (v247 adds uiConfig and profileChanged) and a fixed count
+	// leaves the snapshot in the caller's sample, where it silently widens
+	// whatever shape the caller is about to compare.
+	for {
 		select {
 		case f, ok := <-frames:
 			if !ok {
 				t.Fatal("stream closed during the connect burst")
 			}
-			burst++
-			if f.Type == "inflight" {
-				burst = 3
+			if f.Type != "inflight" {
+				continue
 			}
 		case <-time.After(5 * time.Second):
 			t.Fatal("connect burst did not complete")
 		}
+		break
 	}
 
 	drive()

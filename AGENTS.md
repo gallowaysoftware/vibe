@@ -110,6 +110,20 @@ stand-in.
   uncompiled). Assert SEMANTICS, never bytes: v247 added five fields to the
   in-flight entry and two new frame types to the connect burst, all
   harmless, and a byte golden would have flapped on every one.
+- **The double may not INVENT a field's value, and a conformance invariant
+  may not `t.Skip`.** Two ways a green suite lies, both found by review on
+  the pass that introduced the double. It logged `resp_content_type:
+  text/event-stream` on every chat row whether or not the client asked to
+  stream, so "streaming rows carry tokens" was satisfied by a row nobody
+  streamed — and correcting the lie turned that invariant into a green
+  SKIP. If a field's value is not something the double actually models,
+  model it (`swaptest` honours `stream`, because a real v247 logs
+  `application/json; charset=utf-8` for the same completion unstreamed);
+  and a target that fails to produce the row an invariant is about must be
+  RED, not skipped. Assertions on the double's *own* output — the `-1`
+  sentinel, the wire shape — are required of `fake/` targets and merely
+  noted on live ones: llama.cpp may legitimately not report a counter, but
+  the double has no excuse.
 - **The local rigs stay.** `scripts/fleetlab` and
   `scripts/smoke/llama-swap/` are not made redundant by any of this — CI has
   no GPU, no real models, no SSH, no wattmeter, and its numbers would be

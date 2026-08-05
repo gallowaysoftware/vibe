@@ -191,12 +191,10 @@ func recordEvents(t *testing.T, base string, budget time.Duration, drive func())
 					go drive()
 					continue
 				}
-			} else if driven {
+			} else if driven && inflightIsTerminal(redacted) {
 				// The lifecycle capture is complete once the request that
 				// was driven has come and gone.
-				if strings.Contains(redacted, `\"requests\":[]`) || strings.Contains(redacted, `"operation":"remove"`) {
-					return out.Bytes(), sizes
-				}
+				return out.Bytes(), sizes
 			}
 		}
 		if drive == nil && sawInflight {
@@ -204,6 +202,45 @@ func recordEvents(t *testing.T, base string, budget time.Duration, drive func())
 		}
 	}
 	return out.Bytes(), sizes
+}
+
+// inflightIsTerminal reports whether an inflight frame retires the request
+// the recorder drove: an empty full list on v239, a remove edge on v240+.
+//
+// It DECODES the frame rather than matching a substring of it. The inner
+// payload is JSON inside a JSON string, so on the raw wire a remove edge
+// reads `\"operation\":\"remove\"` — a substring test for the unescaped
+// form can never fire, which is why the v247 capture ran to its full
+// timeout and swept in every unrelated request the router served meanwhile.
+// A recorder that over-captures writes other people's model names and
+// request paths into a fixture destined for a public repo, under a RECORDED
+// stamp that promises exactly two redactions.
+func inflightIsTerminal(rawFrame string) bool {
+	for _, line := range strings.Split(rawFrame, "\n") {
+		rest, ok := strings.CutPrefix(line, "data:")
+		if !ok {
+			continue
+		}
+		var env struct {
+			Type string `json:"type"`
+			Data string `json:"data"`
+		}
+		if json.Unmarshal([]byte(rest), &env) != nil || env.Type != "inflight" {
+			return false
+		}
+		var inner struct {
+			Operation string            `json:"operation"`
+			Requests  []json.RawMessage `json:"requests"`
+		}
+		if json.Unmarshal([]byte(env.Data), &inner) != nil {
+			return false
+		}
+		if inner.Operation == "remove" {
+			return true
+		}
+		return inner.Operation == "" && len(inner.Requests) == 0
+	}
+	return false
 }
 
 // redactFrame replaces a logData frame's payload with a marker, returning

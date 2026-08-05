@@ -143,6 +143,7 @@ type Cell struct {
 	// counters, for tests that assert on the double's own behaviour
 	connects int
 	streams  int
+	dropped  int
 }
 
 // NewCell starts a fake llama-swap and registers its shutdown with t.
@@ -189,6 +190,9 @@ func NewCell(t TB, opts ...Option) *Cell {
 	t.Cleanup(func() {
 		c.closeStreams()
 		_ = srv.Close()
+		if n := c.DroppedFrames(); n > 0 {
+			t.Errorf("swaptest: the double discarded %d SSE frame(s) into a full subscriber buffer. Whatever this test observed, it observed a stream with holes in it — treat every assertion above as unproven.", n)
+		}
 	})
 	return c
 }
@@ -277,9 +281,24 @@ func (c *Cell) SetModelState(id, state string) {
 // start edge, llama-swap's `activity` id frame, the completion edge, and
 // the activity row. It returns the row id.
 //
+// A chat request is recorded as STREAMING, because that is what every
+// recorded v239 operator row is (fixtures/v239/activity-page.json is all
+// text/event-stream). Use RequestJSON for the non-streaming shape.
+//
 // dur is recorded as duration_ms; nothing sleeps.
 func (c *Cell) Request(model, reqPath string, tok Tokens, dur time.Duration) int64 {
-	return c.request(model, reqPath, tok, dur, 200, "", contentTypeFor(reqPath))
+	return c.request(model, reqPath, tok, dur, 200, "", contentTypeFor(reqPath, true))
+}
+
+// RequestJSON is Request for a client that did NOT ask to stream. The only
+// difference on the wire is resp_content_type, and it is not cosmetic: the
+// same completion is logged "application/json; charset=utf-8" when
+// stream=false and "text/event-stream" when stream=true (verified against
+// real llama-swap v247, rows 1 and 2 of one instance). A double that
+// reports one content type for both teaches that resp_content_type is a
+// constant, and any assertion keyed on it then passes for the wrong reason.
+func (c *Cell) RequestJSON(model, reqPath string, tok Tokens, dur time.Duration) int64 {
+	return c.request(model, reqPath, tok, dur, 200, "", contentTypeFor(reqPath, false))
 }
 
 // Fail drives a request that the upstream refused. A 4xx still produces an
@@ -334,6 +353,8 @@ func (c *Cell) request(model, reqPath string, tok Tokens, dur time.Duration, sta
 		RespStatusCode:  status,
 		DurationMs:      dur.Milliseconds(),
 		ErrorMsg:        errMsg,
+		HasCapture:      true,
+		Metadata:        map[string]string{"fifo_priority": "0"},
 		Tokens: RowTokens{
 			CacheTokens:     tok.Cache,
 			DraftTokens:     tok.Draft,
@@ -344,6 +365,11 @@ func (c *Cell) request(model, reqPath string, tok Tokens, dur time.Duration, sta
 			TokensPerSecond: tok.TokensPerSecond,
 		},
 	}
+	// The row is stored BEFORE the activity frame announces its id. The
+	// frame carries a row id, so the row has to exist by the time anyone
+	// can act on it; a double that announces first hands every consumer a
+	// race it will not lose often enough to notice.
+	c.appendRow(row)
 	c.mu.Unlock()
 
 	for _, f := range startFrames {
@@ -353,19 +379,25 @@ func (c *Cell) request(model, reqPath string, tok Tokens, dur time.Duration, sta
 	for _, f := range endFrames {
 		c.broadcast(f)
 	}
+	return id
+}
 
-	c.mu.Lock()
+// appendRow stores one row in the ring. c.mu must be held.
+func (c *Cell) appendRow(row Row) {
 	c.rows = append(c.rows, row)
 	if c.ringCap > 0 && len(c.rows) > c.ringCap {
 		c.rows = c.rows[len(c.rows)-c.ringCap:]
 	}
-	c.mu.Unlock()
-	return id
 }
 
 // StartRequest opens a request and returns the closer, for tests that need
-// to observe the cell while work is genuinely in flight.
+// to observe the cell while work is genuinely in flight. The row it
+// eventually writes is the streaming shape; see startRequest.
 func (c *Cell) StartRequest(model, reqPath string) (id int64, done func(Tokens, time.Duration)) {
+	return c.startRequest(model, reqPath, true)
+}
+
+func (c *Cell) startRequest(model, reqPath string, stream bool) (id int64, done func(Tokens, time.Duration)) {
 	c.mu.Lock()
 	id = c.nextID
 	c.nextID++
@@ -390,31 +422,29 @@ func (c *Cell) StartRequest(model, reqPath string) (id int64, done func(Tokens, 
 		}
 		row := Row{
 			ID: id, Timestamp: time.Now().Format(time.RFC3339), Model: model,
-			ReqPath: reqPath, RespContentType: contentTypeFor(reqPath), RespStatusCode: 200,
+			ReqPath: reqPath, RespContentType: contentTypeFor(reqPath, stream), RespStatusCode: 200,
 			DurationMs: dur.Milliseconds(),
+			HasCapture: true,
+			Metadata:   map[string]string{"fifo_priority": "0"},
 			Tokens: RowTokens{
 				CacheTokens: tok.Cache, DraftTokens: tok.Draft, DraftAccTokens: tok.DraftAcc,
 				InputTokens: tok.Input, OutputTokens: tok.Output,
 				PromptPerSecond: tok.PromptPerSecond, TokensPerSecond: tok.TokensPerSecond,
 			},
 		}
+		c.appendRow(row)
 		c.mu.Unlock()
 		c.broadcast(activityFrame(id))
 		for _, f := range endFrames {
 			c.broadcast(f)
 		}
-		c.mu.Lock()
-		c.rows = append(c.rows, row)
-		if c.ringCap > 0 && len(c.rows) > c.ringCap {
-			c.rows = c.rows[len(c.rows)-c.ringCap:]
-		}
-		c.mu.Unlock()
 	}
 }
 
 func (c *Cell) handleChat(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Model    string           `json:"model"`
+		Stream   bool             `json:"stream"`
 		Messages []map[string]any `json:"messages"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Model == "" {
@@ -435,7 +465,11 @@ func (c *Cell) handleChat(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	delay := c.chatDelay
 	c.mu.Unlock()
-	_, done := c.StartRequest(body.Model, "/v1/chat/completions")
+	// The `stream` flag is honoured, not ignored. It is the ONE input that
+	// changes an activity row's resp_content_type, and a double that always
+	// logs text/event-stream lets "streaming rows carry tokens" pass over a
+	// row nobody streamed.
+	_, done := c.startRequest(body.Model, "/v1/chat/completions", body.Stream)
 	if delay > 0 {
 		select {
 		case <-time.After(delay):
@@ -446,6 +480,10 @@ func (c *Cell) handleChat(w http.ResponseWriter, r *http.Request) {
 		Cache: 0, Draft: NotReported, DraftAcc: NotReported, Input: 12, Output: 1,
 		PromptPerSecond: 1200, TokensPerSecond: 90,
 	}, 200*time.Millisecond)
+	if body.Stream {
+		c.writeChatStream(w, body.Model)
+		return
+	}
 	writeJSON(w, map[string]any{
 		"id":      "chatcmpl-swaptest",
 		"object":  "chat.completion",
@@ -453,6 +491,42 @@ func (c *Cell) handleChat(w http.ResponseWriter, r *http.Request) {
 		"choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": "ok"}, "finish_reason": "stop"}},
 		"usage":   map[string]any{"prompt_tokens": 12, "completion_tokens": 1, "total_tokens": 13},
 	})
+}
+
+// writeChatStream answers a streamed completion the way llama.cpp does,
+// down to the trailing timings block — which is what llama-swap parses to
+// fill an activity row on a chat path, and the reason a stream needs no
+// stream_options cooperation to be measured.
+func (c *Cell) writeChatStream(w http.ResponseWriter, model string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	fl, _ := w.(http.Flusher)
+	chunk := func(v any) {
+		b, _ := json.Marshal(v)
+		_, _ = w.Write([]byte("data: " + string(b) + "\n\n"))
+		if fl != nil {
+			fl.Flush()
+		}
+	}
+	chunk(map[string]any{
+		"id": "chatcmpl-swaptest", "object": "chat.completion.chunk", "model": model,
+		"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"role": "assistant", "content": "ok"}}},
+	})
+	chunk(map[string]any{
+		"id": "chatcmpl-swaptest", "object": "chat.completion.chunk", "model": model,
+		"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+		"usage":   map[string]any{"prompt_tokens": 12, "completion_tokens": 1, "total_tokens": 13},
+		"timings": map[string]any{
+			"prompt_n": 12, "prompt_ms": 10.0, "prompt_per_second": 1200.0,
+			"predicted_n": 1, "predicted_ms": 11.0, "predicted_per_second": 90.0,
+			"cache_n": 0,
+		},
+	})
+	_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	if fl != nil {
+		fl.Flush()
+	}
 }
 
 func (c *Cell) handleEmbed(w http.ResponseWriter, r *http.Request) {
@@ -476,15 +550,20 @@ func (c *Cell) handleEmbed(w http.ResponseWriter, r *http.Request) {
 // draft_acc_tokens alike, and every consumer must clamp rather than sum it.
 const NotReported int64 = -1
 
-func contentTypeFor(reqPath string) string {
-	if strings.Contains(reqPath, "chat") {
-		// Streaming responses DO carry full token counts: llama-swap parses
-		// llama.cpp's timings block out of the stream, so no stream_options
-		// cooperation is needed. A fake that zeroes tokens on
-		// text/event-stream teaches the opposite.
+// contentTypeFor is what llama-swap records in resp_content_type. Both
+// values were read off a real v247 serving the same model back to back:
+// stream=true logged "text/event-stream" (tokens 42 in / 8 out — streaming
+// responses DO carry full counts, because llama-swap parses llama.cpp's
+// timings block out of the stream and needs no stream_options cooperation),
+// and stream=false logged "application/json; charset=utf-8". The charset
+// suffix is llama.cpp's own header coming back through the proxy; a row
+// llama-swap generates itself carries the bare type, which is why Fail
+// writes "application/json" (see fixtures/*/activity-row-error.json).
+func contentTypeFor(reqPath string, stream bool) string {
+	if stream && strings.Contains(reqPath, "chat") {
 		return "text/event-stream"
 	}
-	return "application/json"
+	return "application/json; charset=utf-8"
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

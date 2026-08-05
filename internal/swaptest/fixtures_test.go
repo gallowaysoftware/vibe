@@ -46,6 +46,86 @@ func TestEveryWireHasARecording(t *testing.T) {
 	}
 }
 
+// TestEveryFixtureDirIsReachable is the other direction of the same rule.
+// Wires() is a hand-written list, so a recording committed for a version
+// nobody added a Wire for is read by NOTHING — it sits in the tree looking
+// like evidence while every test in the module ignores it. The failure
+// names the missing Wire, which is the actual next step.
+func TestEveryFixtureDirIsReachable(t *testing.T) {
+	dirs, err := swaptest.FixtureDirs()
+	if err != nil {
+		t.Fatalf("list fixture dirs: %v", err)
+	}
+	if len(dirs) == 0 {
+		t.Fatal("no fixture directories at all; the recordings are the only evidence this package has")
+	}
+	known := map[string]bool{}
+	for _, w := range swaptest.Wires() {
+		known[w.FixtureDir()] = true
+	}
+	for _, d := range dirs {
+		if !known[d] {
+			t.Errorf("fixtures/%s has no Wire in swaptest.Wires(), so nothing reads it. Add the Wire (and teach trackInFlight its shape) or delete the recording — a fixture no test loads is not evidence, it is decoration.", d)
+		}
+	}
+}
+
+// TestRecordedSentinelsAreExactlyMinusOne pins the sentinel VALUE against
+// the recordings rather than against the double. llama-swap reports -1 for
+// a token counter it could not observe, and every consumer clamps on that
+// exact value; a future build that reported -2, or that started using a
+// negative in a field that is meant to be a real count, would slip past
+// every clamp in this module. The recordings are the only place that claim
+// can be checked without a running binary.
+func TestRecordedSentinelsAreExactlyMinusOne(t *testing.T) {
+	for _, w := range swaptest.Wires() {
+		for _, name := range []string{"activity-page.json", "activity-row-error.json"} {
+			b, err := swaptest.Fixture(w, name)
+			if err != nil {
+				continue // not every recording carries every file
+			}
+			var page struct {
+				Data []json.RawMessage `json:"data"`
+			}
+			rows := []json.RawMessage{b}
+			if json.Unmarshal(b, &page) == nil && len(page.Data) > 0 {
+				rows = page.Data
+			}
+			for _, raw := range rows {
+				var row struct {
+					ID     int64 `json:"id"`
+					Tokens struct {
+						Cache    int64 `json:"cache_tokens"`
+						Draft    int64 `json:"draft_tokens"`
+						DraftAcc int64 `json:"draft_acc_tokens"`
+						Input    int64 `json:"input_tokens"`
+						Output   int64 `json:"output_tokens"`
+					} `json:"tokens"`
+				}
+				if err := json.Unmarshal(raw, &row); err != nil {
+					t.Errorf("%s/%s: decode row: %v", w, name, err)
+					continue
+				}
+				for field, v := range map[string]int64{
+					"cache_tokens": row.Tokens.Cache, "draft_tokens": row.Tokens.Draft,
+					"draft_acc_tokens": row.Tokens.DraftAcc,
+				} {
+					if v < 0 && v != -1 {
+						t.Errorf("%s/%s row %d: %s = %d; the only negative this module clamps is -1", w, name, row.ID, field, v)
+					}
+				}
+				for field, v := range map[string]int64{
+					"input_tokens": row.Tokens.Input, "output_tokens": row.Tokens.Output,
+				} {
+					if v < 0 {
+						t.Errorf("%s/%s row %d: %s = %d — a sentinel in a field nothing clamps", w, name, row.ID, field, v)
+					}
+				}
+			}
+		}
+	}
+}
+
 // TestFixtureShapeMatchesGenerated is the mechanism that keeps the double
 // honest. The recordings are raw wire bytes; the double GENERATES frames,
 // because a replay cannot answer a request a test just made. This asserts

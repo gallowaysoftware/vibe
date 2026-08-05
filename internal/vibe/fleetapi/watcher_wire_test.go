@@ -102,6 +102,21 @@ func TestInFlightWireTable(t *testing.T) {
 		wantRep:  true,
 		wantSeen: []string{"qwen3.6-27b"},
 	}, {
+		// Real v247 sends TWO upserts per request — one when it arrives and
+		// one when the upstream's response headers land, same id, richer
+		// body. Recorded in fixtures/v247/events-request.sse and re-observed
+		// live. A fold that increments would read one request as two and
+		// never return to zero on the single remove that retires it.
+		name: "v247 upserts the same id twice and it is still one request",
+		frames: []string{
+			`{"operation":"upsert","request":` + req1 + `}`,
+			`{"operation":"upsert","request":{"id":"93445","timestamp":"2026-08-05T10:48:49.012790876-03:00","model":"qwen3.6-27b","req_path":"/v1/chat/completions","method":"POST","resp_headers":{"Content-Type":"text/event-stream"},"elapsed_ms":54}}`,
+			`{"operation":"remove","id":"93445"}`,
+		},
+		wantN:    0,
+		wantRep:  true,
+		wantSeen: []string{"qwen3.6-27b"},
+	}, {
 		// A remove naming a request this connection never saw says nothing
 		// about the rest of the set — it is what a reconnect produces.
 		name: "v247 remove of an unknown id is a no-op",
@@ -158,6 +173,91 @@ func TestInFlightWireTable(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRecordedInflightFramesFoldThroughProduction replays the CHECKED-IN
+// RECORDED BYTES through the production fold, with no double anywhere in
+// the path.
+//
+// Everything else in this package tests the fold against frames a human
+// typed or a generator produced, and internal/swaptest only ever compares
+// its recordings to its own generator's SHAPE. That leaves the one link
+// that matters unasserted: the bytes a real llama-swap actually sent, read
+// by the code that has to read them. If a recording is re-captured and the
+// fold cannot follow it, this is what says so.
+func TestRecordedInflightFramesFoldThroughProduction(t *testing.T) {
+	for _, w := range swaptest.Wires() {
+		t.Run(w.String(), func(t *testing.T) {
+			frames, err := swaptest.RecordedFrames(w, "events-request.sse")
+			if err != nil {
+				t.Fatalf("read recording: %v", err)
+			}
+			s := wireServer(t)
+			var peak int
+			models := map[string]bool{}
+			inflight := 0
+			for _, f := range frames {
+				if f.Type != "inflight" {
+					continue
+				}
+				inflight++
+				for _, m := range modelsNamedIn(f.Inner) {
+					models[m] = true
+				}
+				s.trackInFlight("cell", wireFrame(f.Inner))
+				n, reported := s.InFlight("cell")
+				if !reported {
+					t.Fatalf("frame %d of the %s recording left the cell UNREPORTED — the build cannot fold a shape this llama-swap really sent: %s", inflight, w, f.Inner)
+				}
+				if n > peak {
+					peak = n
+				}
+			}
+			if inflight == 0 {
+				t.Fatal("the recording carries no inflight frame; this test asserted nothing")
+			}
+			if peak < 1 {
+				t.Fatalf("replaying %d recorded inflight frames never showed a single request in flight; peak was %d, and a reported zero is what disarms every busy guard", inflight, peak)
+			}
+			if n, _ := s.InFlight("cell"); n != 0 {
+				t.Errorf("the recording ends with the cell idle, the fold ends at %d in flight", n)
+			}
+			if len(models) == 0 {
+				t.Fatal("no model name appeared in the recording; the per-model check below is vacuous")
+			}
+			for m := range models {
+				if _, ok := s.modelLastActivity("cell", m); !ok {
+					t.Errorf("no activity stamp for %q after replaying the recording; C4's restore_after_idle window reads it as never-active", m)
+				}
+			}
+		})
+	}
+}
+
+// modelsNamedIn pulls every model name out of an inflight payload, in
+// either wire's shape.
+func modelsNamedIn(inner string) []string {
+	var wrap struct {
+		Requests []struct {
+			Model string `json:"model"`
+		} `json:"requests"`
+		Request *struct {
+			Model string `json:"model"`
+		} `json:"request"`
+	}
+	if json.Unmarshal([]byte(inner), &wrap) != nil {
+		return nil
+	}
+	var out []string
+	for _, r := range wrap.Requests {
+		if r.Model != "" {
+			out = append(out, r.Model)
+		}
+	}
+	if wrap.Request != nil && wrap.Request.Model != "" {
+		out = append(out, wrap.Request.Model)
+	}
+	return out
 }
 
 // TestInFlightUnknownShapeIsNotIdle states the consequence directly, in the

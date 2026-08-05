@@ -98,3 +98,20 @@ func RecordedFrames(w Wire, name string) ([]RecordedFrame, error) {
 
 // Wires is every wire version this package can speak.
 func Wires() []Wire { return []Wire{WireV239, WireV247} }
+
+// FixtureDirs lists every recorded directory on disk, whether or not a Wire
+// claims it. Wires() is hand-written; this reads the tree, and the gap
+// between the two is what TestEveryFixtureDirIsReachable exists to close.
+func FixtureDirs() ([]string, error) {
+	ents, err := fixtures.ReadDir("fixtures")
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range ents {
+		if e.IsDir() {
+			out = append(out, e.Name())
+		}
+	}
+	return out, nil
+}
