@@ -135,9 +135,13 @@ type AnnounceUsage struct {
 	// restarting at 1); fleetd then starts a new ledger row instead of
 	// reading the cell as flatlined for months.
 	Epoch string `json:"epoch"`
-	// LostRows counts activity rows the cell could not read back because
-	// they aged out of an in-memory ring between two polls. Reported, not
-	// absorbed: silent loss is indistinguishable from an idle cell.
+	// LostRows counts activity rows the cell read but did not fold: they
+	// aged out of an in-memory ring between two polls, or they arrived in
+	// a window whose own contents contradicted the cursor (a swapped or
+	// copied activity store — usagemeter's continuity check refuses such a
+	// window whole rather than double-counting into an append-only
+	// ledger). Reported, not absorbed: silent loss is indistinguishable
+	// from an idle cell.
 	LostRows int64 `json:"lost_rows,omitempty"`
 	// Models carries one entry per (model, basis) the cell has ever
 	// metered this epoch.

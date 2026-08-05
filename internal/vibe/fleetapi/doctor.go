@@ -1266,7 +1266,16 @@ func (s *Server) checkWarm(rep *DoctorReport, snap StateSnapshot, expl map[strin
 	}
 	for _, sc := range snap.Warm.Schedule {
 		if sc.NextFire == nil {
-			bad = append(bad, fmt.Sprintf("schedule %q (%s) has no resolved next fire", sc.Cron, sc.Model))
+			// The note is why, and it is the whole value of the row: an
+			// entry parks with no next fire for an invalid cron, for a spec
+			// that never fires, and (since the class guard) for a model the
+			// warm verb cannot be fired at. Reporting only "no resolved next
+			// fire" sends an operator to debug a cron field that is fine.
+			why := "no resolved next fire"
+			if sc.LastNote != "" {
+				why += " (" + sc.LastNote + ")"
+			}
+			bad = append(bad, fmt.Sprintf("schedule %q (%s): %s", sc.Cron, sc.Model, why))
 		}
 	}
 	det := scheduleSummary(snap.Warm.Schedule)

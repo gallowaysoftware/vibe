@@ -262,10 +262,110 @@ type entryKey struct {
 // counters live in ONE file written atomically, so a crash cannot leave
 // the cursor ahead of the counters (which would silently drop a burst).
 type state struct {
-	Epoch     string  `json:"epoch"`
-	LastRowID int64   `json:"last_row_id"`
-	LostRows  int64   `json:"lost_rows"`
-	Models    []Entry `json:"models"`
+	Epoch     string     `json:"epoch"`
+	LastRowID int64      `json:"last_row_id"`
+	LostRows  int64      `json:"lost_rows"`
+	Anchor    *rowAnchor `json:"anchor,omitempty"`
+	Models    []Entry    `json:"models"`
+}
+
+// rowAnchor fingerprints the row the cursor points AT: the newest row in
+// the log at the moment the previous poll pinned its window. It exists
+// because the id-reset rule below only answers the DOWNWARD question. A
+// store restored, copied or swapped for another whose ids sit ABOVE the
+// cursor presents exactly as a cell that served a lot while nobody was
+// reading — same epoch, ids jumped forward — and the collector folds the
+// whole log a second time into an APPEND-ONLY ledger that can never be
+// corrected. Ids alone cannot tell those apart. The anchor can: a log
+// that is the one the cursor came from still holds that row.
+type rowAnchor struct {
+	ID      int64     `json:"id"`
+	TS      time.Time `json:"ts"`
+	Model   string    `json:"model"`
+	ReqPath string    `json:"req_path"`
+	Status  int       `json:"status"`
+}
+
+func anchorOf(r ActivityRow) *rowAnchor {
+	return &rowAnchor{ID: r.ID, TS: r.Timestamp, Model: r.Model, ReqPath: r.ReqPath, Status: r.RespStatusCode}
+}
+
+func (a *rowAnchor) sameRow(r ActivityRow) bool {
+	return a.ID == r.ID && a.TS.Equal(r.Timestamp) && a.Model == r.Model &&
+		a.ReqPath == r.ReqPath && a.Status == r.RespStatusCode
+}
+
+// maxRowClockSkew is how far a row's timestamp may sit BEHIND the
+// anchor's before it stops being an ordering wobble and becomes evidence
+// of a different log. llama-swap stamps ts_created at request COMPLETION
+// and inserts the row then — verified on real traffic 2026-08-05: a
+// 7.18s request issued at 09:57:12 landed as a row stamped 09:57:19, and
+// 999 consecutive production rows carried zero timestamp inversions — so
+// within ONE store id order and timestamp order agree. The tolerance is
+// for a backwards clock correction on the cell, not for request overlap.
+const maxRowClockSkew = 5 * time.Minute
+
+// continuityBreak reports the evidence that the log being read is not the
+// log the cursor came from, or "" when nothing contradicts continuity.
+// Two free checks, one per shape the swap can take:
+//
+//   - the new store's ids OVERLAP the cursor: the row at the cursor id is
+//     still reachable in the walk-back and is a different row;
+//   - the new store's ids sit entirely ABOVE the cursor (the shape seen
+//     live): nothing at the cursor id is reachable, but rows claiming to
+//     be newer than it were recorded BEFORE it, which no single
+//     append-ordered log can produce.
+//
+// Deliberately not a check on "the anchor is unreachable" alone. On an
+// in-memory ring the anchor legitimately ages out, and refusing there
+// would drop genuinely new traffic on every cell that outruns its ring.
+// This is a test for CONTRADICTED continuity, not for unproven
+// continuity — a row count cross-check against /api/metrics/stats has the
+// same defect from the other side, since a ring's aged-out span and a
+// swapped store's id hole are numerically identical.
+//
+// Two identity changes it deliberately does NOT catch, both named so the
+// next reader does not assume otherwise: a store COPIED from a busier box
+// whose rows are all stamped after this cell's anchor (nothing in the
+// window contradicts anything), and two llama-swap instances sharing one
+// `store.path` (each reader sees one continuous log — there is no id
+// evidence to find, only a per-instance marker llama-swap does not
+// write). The first is rare; the second is a config error whose fix is
+// one path per cell.
+func continuityBreak(a *rowAnchor, atCursor *ActivityRow, rows []ActivityRow) string {
+	if a == nil {
+		// No anchor: a state file written before this rule existed, or a
+		// cell that has never folded a row. Nothing to contradict.
+		return ""
+	}
+	if atCursor != nil {
+		if a.sameRow(*atCursor) {
+			// The row the cursor was set from is still sitting at the
+			// cursor id, which PROVES this is the log the cursor came
+			// from. The clock scan below is the weaker test for when that
+			// proof is unavailable; running it anyway would let one
+			// out-of-order row — a backwards clock step larger than the
+			// tolerance is exactly what maxRowClockSkew is documented to
+			// absorb — discard a whole window of real traffic from a log
+			// whose identity is settled. These counters are cumulative and
+			// the ledger append-only, so that loss is permanent.
+			return ""
+		}
+		return fmt.Sprintf("id %d now holds %s %s at %s; the cursor was set from %s %s at %s",
+			a.ID, atCursor.Model, atCursor.ReqPath, atCursor.Timestamp.Format(time.RFC3339),
+			a.Model, a.ReqPath, a.TS.Format(time.RFC3339))
+	}
+	if a.TS.IsZero() {
+		return ""
+	}
+	floor := a.TS.Add(-maxRowClockSkew)
+	for _, r := range rows {
+		if !r.Timestamp.IsZero() && r.Timestamp.Before(floor) {
+			return fmt.Sprintf("row %d sits above cursor %d but was recorded at %s, before the cursor row at %s",
+				r.ID, a.ID, r.Timestamp.Format(time.RFC3339), a.TS.Format(time.RFC3339))
+		}
+	}
+	return ""
 }
 
 // Entry is one persisted (model, basis) cumulative counter set.
@@ -335,6 +435,7 @@ type Collector struct {
 	mu     sync.Mutex
 	epoch  string
 	cursor int64
+	anchor *rowAnchor
 	lost   int64
 	totals map[entryKey]Counters
 }
@@ -404,6 +505,7 @@ func (c *Collector) load() {
 		c.epoch = c.newEpoch()
 	}
 	c.cursor = st.LastRowID
+	c.anchor = st.Anchor
 	c.lost = st.LostRows
 	for _, e := range st.Models {
 		c.totals[entryKey{Model: e.Model, Basis: e.Basis}] = e.Counters
@@ -414,7 +516,7 @@ func (c *Collector) save() error {
 	if c.cfg.StatePath == "" {
 		return nil
 	}
-	st := state{Epoch: c.epoch, LastRowID: c.cursor, LostRows: c.lost}
+	st := state{Epoch: c.epoch, LastRowID: c.cursor, LostRows: c.lost, Anchor: c.anchor}
 	for k, v := range c.totals {
 		st.Models = append(st.Models, Entry{Model: k.Model, Basis: k.Basis, Counters: v})
 	}
@@ -465,9 +567,11 @@ func (c *Collector) Poll(ctx context.Context) error {
 		return err
 	}
 	var maxID int64
+	var headRow ActivityRow
 	for _, row := range head.Data {
 		if row.ID > maxID {
 			maxID = row.ID
+			headRow = row
 		}
 	}
 
@@ -480,12 +584,14 @@ func (c *Collector) Poll(ctx context.Context) error {
 		old := c.epoch
 		c.epoch = c.newEpoch()
 		c.cursor = 0
+		c.anchor = nil
 		c.lost = 0
 		c.totals = map[entryKey]Counters{}
 		c.logger.Info("llama-swap activity ids restarted; minted a new usage epoch",
 			"old_epoch", old, "new_epoch", c.epoch, "max_id", maxID)
 	}
 	cursor := c.cursor
+	anchor := c.anchor
 	c.mu.Unlock()
 
 	// Nothing new. (A reset above always leaves cursor at 0 and maxID at
@@ -494,13 +600,38 @@ func (c *Collector) Poll(ctx context.Context) error {
 		return nil
 	}
 
-	rows, seen, err := c.fetchSince(ctx, cursor, maxID)
+	rows, seen, atCursor, err := c.fetchSince(ctx, cursor, maxID)
 	if err != nil {
 		return err
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// A window whose own contents contradict the cursor is not folded at
+	// all. Under-counting a window and saying so is recoverable; a double
+	// count is not, because the ledger fleetd keeps is append-only and
+	// these totals are CUMULATIVE — a doubled total is a doubled delta on
+	// the next heartbeat and every heartbeat after it. Same honesty as
+	// the shortfall below: adopt the new head, report the rows that went
+	// uncounted, name the evidence.
+	if why := continuityBreak(anchor, atCursor, rows); why != "" {
+		c.lost += int64(seen)
+		c.cursor = maxID
+		c.anchor = anchorOf(headRow)
+		// Not the id span (max_id - cursor): on a swapped store the ids
+		// between the two never existed on this cell, and claiming
+		// thousands of phantom lost rows is a lie in the other direction.
+		c.logger.Warn("activity log is not the one this cursor came from; window skipped rather than double-counted",
+			"why", why, "cursor", cursor, "max_id", maxID, "rows_skipped", seen, "epoch", c.epoch)
+		if err := c.save(); err != nil {
+			c.logger.Warn("usage cursor not persisted; a restart will re-ingest rows already counted",
+				"path", c.cfg.StatePath, "err", err)
+			return err
+		}
+		return nil
+	}
+
 	for _, row := range rows {
 		if c.cfg.ModelFilter != nil && !c.cfg.ModelFilter(row.Model) {
 			continue
@@ -522,6 +653,7 @@ func (c *Collector) Poll(ctx context.Context) error {
 			"lost", expected-int64(seen), "cursor", cursor, "max_id", maxID)
 	}
 	c.cursor = maxID
+	c.anchor = anchorOf(headRow)
 	if err := c.save(); err != nil {
 		// The poll SUCCEEDED and only the durability failed, so this
 		// cannot ride PollAndSnapshot's debug-level "poll failed" line: a
@@ -537,23 +669,28 @@ func (c *Collector) Poll(ctx context.Context) error {
 }
 
 // fetchSince walks the activity log back from maxID to cursor,
-// newest-first, and returns the rows plus how many DISTINCT ids in
-// (cursor, maxID] it actually saw — the shortfall denominator.
+// newest-first, and returns the rows, how many DISTINCT ids in
+// (cursor, maxID] it actually saw — the shortfall denominator — and the
+// row currently sitting AT the cursor id, when the walk reached it. That
+// last one is the continuity anchor's counterpart: it is free here (the
+// walk already reads past the cursor to know it is done) and it is what
+// catches a swapped store whose ids overlap the old one's.
 //
 // maxID is pinned by the caller rather than derived here: rows inserted
 // mid-walk shift OFFSET pagination and can re-serve a row on a later
 // page. Ids are deduped for the same reason.
-func (c *Collector) fetchSince(ctx context.Context, cursor, maxID int64) ([]ActivityRow, int, error) {
+func (c *Collector) fetchSince(ctx context.Context, cursor, maxID int64) ([]ActivityRow, int, *ActivityRow, error) {
 	maxPages := c.cfg.MaxPages
 	if maxPages <= 0 {
 		maxPages = defaultMaxPages
 	}
 	var out []ActivityRow
+	var atCursor *ActivityRow
 	seen := map[int64]bool{}
 	for page := 1; page <= maxPages; page++ {
 		p, err := c.fetchPage(ctx, page, activityLimit)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, nil, err
 		}
 		if len(p.Data) == 0 {
 			break
@@ -566,6 +703,9 @@ func (c *Collector) fetchSince(ctx context.Context, cursor, maxID int64) ([]Acti
 			}
 			if row.ID <= cursor {
 				done = true
+				if row.ID == cursor && atCursor == nil {
+					atCursor = &row
+				}
 				continue
 			}
 			if seen[row.ID] {
@@ -578,7 +718,7 @@ func (c *Collector) fetchSince(ctx context.Context, cursor, maxID int64) ([]Acti
 			break
 		}
 	}
-	return out, len(seen), nil
+	return out, len(seen), atCursor, nil
 }
 
 func (c *Collector) fetchPage(ctx context.Context, page, limit int) (activityPage, error) {

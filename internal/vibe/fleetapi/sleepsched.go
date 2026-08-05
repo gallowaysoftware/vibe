@@ -512,6 +512,11 @@ func (s *Server) runWakeSequence(e SleepScheduleEntry, st *sleepScheduleState, c
 // the piggyback queue exactly as the warm schedule does (C6's rule: a
 // 4xx is the far side answering and stays an error).
 func (s *Server) wakeWarm(ctx context.Context, cell, model string, cfg sleepLoopConfig) string {
+	// The third producer of the same chat completion, and the one that
+	// fires at 07:15 with nobody watching.
+	if refused := s.warmClassRefusal(model); refused != "" {
+		return "warm " + model + " refused: " + refused
+	}
 	var err error
 	if s.frontCanRoute(cell) {
 		err = cfg.warmFn(ctx, cfg.frontURL, model)

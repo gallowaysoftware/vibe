@@ -381,6 +381,35 @@ stand-in.
     facade is what's incomplete. `esc()` is the TEXT escaper and
     `attr()` the attribute one — they stay separate because esc()'s
     output also feeds `textContent`.
+  - **`model_classes` guards EVERY warm producer, at both ends**
+    (`fleetcfg.File.WarmClassRefusal` — the ONE sentence, used by
+    fleetmcp's `warm_model`, both C4 loops, C14's post-wake warms and the
+    daemon's config load). Every warm in the fleet is `warmViaFront`, a
+    CHAT completion; hosts.yaml pinning an id to a non-chat class is the
+    declaration that it must not receive one. Until the 2026-08-05 live
+    gate only `warm_model` honoured it, and a `warm_schedule` fired five
+    500-ing chat completions at an embed-class id — then queued them to
+    the cell, because a 500 is a DELIVERY failure. So the refusal holds
+    at WIRING (a `skipped` status row and no goroutine; a refused
+    schedule carries no `next_fire`, and `warm.policy` reports its NOTE
+    rather than "no resolved next fire", which names a cron field that is
+    fine) and at FIRE time (`restore`, `evalScheduleEntry`, `wakeWarm`)
+    and in `queueWarm`. Do not "fix" a refused embed target by adding an
+    embed warm body: the right verb per class is a phase, and an embed
+    warm is a fully METERED request on C7a's `embed` basis, which has no
+    `poke_req` equivalent.
+    - **The test is "does it answer a chat completion", not "is the class
+      string `chat`"** (`fleetcfg.chatCapableClasses` = `chat` +
+      `vision`). A multimodal model is llama-server plus `--mmproj`: same
+      `/v1/chat/completions`, image as a content part, warmed by the same
+      1-token request. Four of the five producers are automated policy,
+      so a FALSE refusal is not a command failing in front of an operator
+      — it is a declared target that silently never fires and a
+      `warm.policy` yellow forever. `embed`/`rerank`/`stt`/`tts` each
+      answer their own route, and `classify` names llama.cpp's
+      sequence-classification family; a small model used FOR
+      classification but served on the chat route is class `chat`
+      (listing it documents ownership and gates nothing).
   - **Model-set changes are render triggers** (recordAnnounce): a cell
     that starts/stops serving a model re-renders like a membership
     transition.
@@ -468,7 +497,8 @@ stand-in.
     and keeps retrying transport errors; `--timeout 0` stays the
     overnight-batch idiom.
   - `model_classes` has a closed vocabulary (`fleetcfg.ModelClasses`);
-    `warm_model` skips `chat`-class entries and still refuses the rest.
+    the warm guard skips the CHAT-CAPABLE classes (`chat`, `vision`) and
+    still refuses the rest — see C4's `WarmClassRefusal` note.
     hosts.yaml tolerates fleet.md's top-level `hosts:` inventory as an
     inert key — `KnownFields(true)` stays on.
 - **Usage ledger (fleet-control C7a).** Tokens per cell, per model, per
@@ -522,6 +552,35 @@ stand-in.
     whole lifetime. `epoch` changes when the cell's activity ids restart
     (`max_id < cursor`) and starts a new row rather than flatlining the
     cell.
+  - **The cursor carries an ANCHOR, and a contradicted window is never
+    folded.** The epoch rule above only answers the DOWNWARD jump; a
+    store restored or swapped for one whose ids sit ABOVE the cursor
+    presents identically to a cell that served a lot while nobody was
+    reading, and the 2026-08-05 live gate watched every counter double
+    into the append-only ledger. So the state file records the id,
+    timestamp, model, `req_path` and status of the row the cursor points
+    at, and `Poll` refuses the whole window on either contradiction: the
+    row now AT the cursor id is a different request, or a row above the
+    cursor was recorded BEFORE the anchor (llama-swap stamps
+    `ts_created` at request COMPLETION and inserts then, so id order and
+    timestamp order agree within one store; `maxRowClockSkew` is for a
+    backwards clock step, not request overlap). A break adopts the new
+    head, folds nothing, adds the refused rows to `lost_rows` and names
+    the evidence — under-count and say so, never silently double-count.
+    It does NOT mint an epoch: the counters are the cell's LIFETIME
+    totals and must stay monotone. An UNREACHABLE anchor is deliberately
+    not a break — on an in-memory ring it ages out legitimately, and this
+    tests CONTRADICTED continuity, not unproven continuity (the same
+    reason a row-count cross-check against `/api/metrics/stats` was
+    rejected: a ring's aged-out span and a swapped store's id hole are
+    numerically identical). The two checks are a LADDER, not a
+    conjunction: a row still sitting at the cursor id that matches the
+    anchor PROVES the log's identity, so the clock scan is skipped —
+    running it anyway let one backwards clock step (the thing
+    `maxRowClockSkew` exists to absorb) discard a window of real traffic
+    from a settled log. Two identity changes it does NOT catch, named in
+    the code: a store copied from a busier box whose rows all postdate
+    the anchor, and two llama-swap instances sharing one `store.path`.
   - Storage is append-only JSONL (`paths.UsageLedgerFile()`), coalesced
     in memory, flushed on a 60s ticker and at shutdown, compacted at
     start via tmp+rename. Deliberately NOT `history.go`'s
