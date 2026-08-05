@@ -296,6 +296,9 @@ func TestDaemon_FleetRegistryOff_NoMCP(t *testing.T) {
 		// table to alarm on and no fleet scope to declare.
 		{http.MethodPost, "/api/fleet/notify/scope"},
 		{http.MethodPost, "/api/fleet/notify/send"},
+		// C13's doctor audits a FLEET: without the registry there is no
+		// membership, no presence and no credential to check.
+		{http.MethodGet, "/api/fleet/doctor"},
 	} {
 		req, _ := http.NewRequest(probe.method, "http://"+httpAddr+probe.path, strings.NewReader("{}"))
 		req.Header.Set("Authorization", "Bearer "+token)

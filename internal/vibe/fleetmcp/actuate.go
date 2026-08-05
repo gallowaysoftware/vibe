@@ -32,7 +32,9 @@ import (
 // The order deliberately DIVERGES from the CLI's (cmd_cell_actuate.go),
 // which puts $VIBE_TOKEN first: a human typing one command means the
 // override, but in a long-lived fleetd one env var must not silently
-// void every per-cell token_file in hosts.yaml.
+// void every per-cell token_file in hosts.yaml. Both orders live in
+// fleetcfg.CellCredential as named preferences (C13) so `vibe fleet
+// doctor` tests the credential this path actually uses.
 func (s *Server) cellClient(cell string) (*vibeclient.Client, error) {
 	c, ok := s.hosts.Cells[cell]
 	if !ok {
@@ -42,21 +44,14 @@ func (s *Server) cellClient(cell string) (*vibeclient.Client, error) {
 		return nil, nil
 	}
 	envToken := strings.TrimSpace(os.Getenv("VIBE_TOKEN"))
-	var token string
-	switch {
-	case c.TokenFile != "":
-		data, err := os.ReadFile(c.TokenFile)
-		if err != nil {
-			return nil, fmt.Errorf("cells.%s token_file %s: %v", cell, c.TokenFile, err)
-		}
-		token = strings.TrimSpace(string(data))
-		s.warnTokenShadowOnce(cell, envToken != "")
-	case envToken != "":
-		token = envToken
-	default:
-		token = vibeclient.ResolveToken()
+	cred, err := s.hosts.CellCredential(cell, envToken, fleetcfg.PreferCellFile, vibeclient.ResolveToken)
+	if err != nil {
+		return nil, err
 	}
-	return vibeclient.NewWithToken(c.DaemonURL, token), nil
+	if cred.Kind == fleetcfg.CredCellFile {
+		s.warnTokenShadowOnce(cell, envToken != "")
+	}
+	return vibeclient.NewWithToken(c.DaemonURL, cred.Token), nil
 }
 
 // warnTokenShadowOnce logs once when both $VIBE_TOKEN and a per-cell

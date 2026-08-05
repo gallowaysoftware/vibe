@@ -16,6 +16,18 @@ func Execute() error {
 	return rootCmd().Execute()
 }
 
+// ExitCode reports the process exit status a command asked for, or 0
+// when the error carries no preference. `vibe fleet doctor` is the one
+// caller today: its exit status IS part of its output (1 FAIL / 2 WARN /
+// 3 only-UNKNOWNs), and the report it already printed is the message, so
+// the caller must not also print an error line.
+func ExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	return doctorExitCode(err)
+}
+
 func rootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "vibe",

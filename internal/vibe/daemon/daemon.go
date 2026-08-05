@@ -382,6 +382,12 @@ type Daemon struct {
 	// read from every state snapshot.
 	guestEnabled  atomic.Bool
 	guestRejected atomic.Int64
+	// tokenMinted records that THIS start created the control-plane token
+	// rather than loading one — on fleetd, the signature of a container
+	// recreate over an unmounted state dir. Recorded rather than
+	// re-derived: a later read of the file answers "does a token exist
+	// now", which is a different question (C13's fleetd.token check).
+	tokenMinted atomic.Bool
 
 	// fleet is the fleetapi server, assigned in Run once constructed.
 	// CellDrain reads the local cell's inflight count from it.
@@ -526,6 +532,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		httpLn.Close()
 		return fmt.Errorf("load token: %w", err)
 	}
+	d.tokenMinted.Store(created)
 	if created {
 		slog.Warn("control-plane token CREATED (new) — no existing token file; clients must be re-provisioned with this token", "path", paths.TokenFile())
 	} else {
@@ -589,6 +596,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// second cell list.
 			Hosts:           hosts,
 			NotifyScopePath: paths.NotifyScopeFile(),
+			// C13: the two things the doctor cannot do from inside
+			// fleetapi — read this host, and call a cell with the
+			// credential the actuation verbs resolve. Both read-only.
+			DoctorHost: d.doctorHost,
+			CellAuth:   d.cellAuthProbe,
 		}
 		d.hosts = hosts
 	}

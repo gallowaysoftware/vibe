@@ -188,20 +188,13 @@ func resolveCellClient(cell string) (*vibeclient.Client, string, error) {
 	// for a human typing one command an explicit $VIBE_TOKEN must win, and
 	// an unreadable token_file is a hard error rather than a silent
 	// fallthrough to the local token — that swallow turned a typo'd path
-	// into an opaque 401 from the remote cell.
-	token := strings.TrimSpace(os.Getenv("VIBE_TOKEN"))
-	switch {
-	case token != "":
-	case c.TokenFile != "":
-		data, err := os.ReadFile(c.TokenFile)
-		if err != nil {
-			return nil, "", fmt.Errorf("read cells.%s.token_file: %w", cell, err)
-		}
-		token = strings.TrimSpace(string(data))
-	default:
-		token = vibeclient.ResolveToken()
+	// into an opaque 401 from the remote cell. Both orders are named
+	// preferences in fleetcfg (C13).
+	cred, err := hosts.CellCredential(cell, os.Getenv("VIBE_TOKEN"), fleetcfg.PreferEnv, vibeclient.ResolveToken)
+	if err != nil {
+		return nil, "", err
 	}
-	return vibeclient.NewWithToken(c.DaemonURL, token), cell, nil
+	return vibeclient.NewWithToken(c.DaemonURL, cred.Token), cell, nil
 }
 
 func hostsPath() string {
