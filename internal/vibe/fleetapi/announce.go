@@ -327,6 +327,18 @@ func validateAnnounce(req *AnnounceRequest) error {
 		if err := clean("models[].state", m.State); err != nil {
 			return err
 		}
+		// The one announce string that fed a status surface without
+		// hygiene, found by C9's review: id, state, versions, usage and
+		// C8's whole probe block (including probe.flags_sha256 on this same
+		// model) all get clean(), and the model-level flags_sha256 did not
+		// — while it lands in the presence document, the mismatch event's
+		// payload, and from C9 in an alarm's detail line. Consistency with
+		// its own sibling is the argument; a flags_sha256 is hex by
+		// construction, so a non-printable one is a broken or hostile cell
+		// either way.
+		if err := clean("models[].flags_sha256", m.FlagsSHA256); err != nil {
+			return err
+		}
 		if err := validateProbe(m.Probe); err != nil {
 			return err
 		}

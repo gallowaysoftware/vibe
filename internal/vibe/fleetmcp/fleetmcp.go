@@ -368,6 +368,37 @@ func (s *Server) mcpTools() []any {
 			},
 		},
 		map[string]any{
+			"name": "fleet_notify_scope",
+			"description": "Declare whether fleet ALARM notifications should be delivered right " +
+				"now: \"away\" (vacation — alarms still fire and stay visible in fleet_status, " +
+				"but delivery is withheld and coming home sends one digest naming what was " +
+				"missed) or \"home\". This gates notifications only: it drains nothing, changes " +
+				"no cell's state, and is never consulted for routing. Prefer setting `until` so " +
+				"the fleet un-mutes itself.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"scope":  map[string]any{"type": "string", "description": "\"away\" or \"home\"."},
+					"reason": map[string]any{"type": "string", "description": "Why (e.g. \"vacation\")."},
+					"until":  map[string]any{"type": "string", "description": "When away ends: an RFC3339 instant or a Go duration from now (e.g. \"336h\"). Away only."},
+				},
+				"required": []string{"scope"},
+			},
+		},
+		map[string]any{
+			"name": "fleet_notify_test",
+			"description": "Send a test notification through the configured webhook NOW. It is " +
+				"not an alarm: it skips the dwell, the dedup and the away gate, so it is also " +
+				"how you check the pager still works while away. An alerting path nobody has " +
+				"ever sent a message through is not an alerting path.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"message": map[string]any{"type": "string", "description": "Optional message body."},
+				},
+			},
+		},
+		map[string]any{
 			"name": "render_front",
 			"description": "Dry-run the front config render (vibe router render --cell front): " +
 				"renders the peers-only config from backend defs + hosts.yaml and returns the " +
@@ -513,6 +544,26 @@ func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMess
 			}
 		}
 		return s.toolRenderFront(ctx, args.DryRun)
+	case "fleet_notify_scope":
+		var args struct {
+			Scope  string `json:"scope"`
+			Reason string `json:"reason"`
+			Until  string `json:"until"`
+		}
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return "", fmt.Errorf("invalid arguments: %v", err)
+		}
+		return s.toolNotifyScope(args.Scope, args.Reason, args.Until)
+	case "fleet_notify_test":
+		var args struct {
+			Message string `json:"message"`
+		}
+		if len(rawArgs) > 0 {
+			if err := json.Unmarshal(rawArgs, &args); err != nil {
+				return "", fmt.Errorf("invalid arguments: %v", err)
+			}
+		}
+		return s.toolNotifyTest(args.Message)
 	default:
 		return "", fmt.Errorf("unknown tool %q", name)
 	}

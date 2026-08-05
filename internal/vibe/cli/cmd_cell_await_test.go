@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
 )
@@ -71,7 +72,7 @@ func TestCellAwaitReady_BlocksUntilLlamaSwapReportsTheModelReady(t *testing.T) {
 
 	var out bytes.Buffer
 	cond := awaitConds{wantUp: true, model: "qwen3.6-27b", ready: true}
-	if err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 5*time.Second, 20*time.Millisecond); err != nil {
+	if _, err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 5*time.Second, 20*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	if n := polls.Load(); n < 4 {
@@ -100,7 +101,7 @@ func TestCellAwaitReady_UnknownModelOnAReachableCellFailsFast(t *testing.T) {
 
 	var out bytes.Buffer
 	cond := awaitConds{wantUp: true, model: "qwen3.6-27", ready: true} // typo
-	err := awaitCell(ctx, &out, awaitTarget(t, ts), "gpu-cell", cond, 0, 20*time.Millisecond)
+	_, err := awaitCell(ctx, &out, awaitTarget(t, ts), "gpu-cell", cond, 0, 20*time.Millisecond)
 	if !errors.Is(err, errUnknownModel) {
 		t.Fatalf("err = %v, want errUnknownModel", err)
 	}
@@ -137,7 +138,7 @@ func TestCellAwaitReady_AnEmptyOrUnreachableCatalogIsNotAnUnknownModel(t *testin
 			defer cancel()
 			var out bytes.Buffer
 			cond := awaitConds{wantUp: true, model: "qwen3.6-27b", ready: true}
-			err := awaitCell(ctx, &out, awaitTarget(t, ts), "gpu-cell", cond, 0, 20*time.Millisecond)
+			_, err := awaitCell(ctx, &out, awaitTarget(t, ts), "gpu-cell", cond, 0, 20*time.Millisecond)
 			if errors.Is(err, errUnknownModel) {
 				t.Fatalf("called a model unknown without a catalog to judge it against: %v", err)
 			}
@@ -167,7 +168,7 @@ func TestCellAwaitReady_TransportErrorsKeepRetrying(t *testing.T) {
 
 	var out bytes.Buffer
 	cond := awaitConds{wantUp: true, model: "qwen3.6-27b", ready: true}
-	if err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 5*time.Second, 20*time.Millisecond); err != nil {
+	if _, err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 5*time.Second, 20*time.Millisecond); err != nil {
 		t.Fatalf("a transport error ended the wait: %v", err)
 	}
 	if !strings.Contains(out.String(), "(retrying)") {
@@ -243,7 +244,7 @@ func TestCellAwaitIdle_UnblocksOnObservedSilence(t *testing.T) {
 	})
 	var out bytes.Buffer
 	cond := awaitConds{wantUp: true, idle: 10 * time.Minute}
-	if err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 2*time.Second, 20*time.Millisecond); err != nil {
+	if _, err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 2*time.Second, 20*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "idle 15m0s (>= 10m0s)") {
@@ -262,7 +263,7 @@ func TestCellAwaitIdle_MissingEvidenceNeverUnblocksAndSaysWhy(t *testing.T) {
 	})
 	var out bytes.Buffer
 	cond := awaitConds{wantUp: true, idle: 10 * time.Minute}
-	err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 300*time.Millisecond, 20*time.Millisecond)
+	_, err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 300*time.Millisecond, 20*time.Millisecond)
 	if err == nil {
 		t.Fatal("unblocked with no activity evidence: that fires the parked batch into a busy cell")
 	}
@@ -284,7 +285,7 @@ func TestCellAwaitIdle_AnOlderFleetdSendsNoActivityBlockAndSaysSo(t *testing.T) 
 	})
 	var out bytes.Buffer
 	cond := awaitConds{wantUp: true, idle: 10 * time.Minute}
-	err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 200*time.Millisecond, 20*time.Millisecond)
+	_, err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 200*time.Millisecond, 20*time.Millisecond)
 	if err == nil {
 		t.Fatal("unblocked against a fleetd that reports no activity at all")
 	}
@@ -306,7 +307,7 @@ func TestCellAwaitTimeout_NamesTheRegistryFailureNotTheCell(t *testing.T) {
 
 	var out bytes.Buffer
 	cond := awaitConds{wantUp: true, model: "qwen", ready: true, idle: time.Minute}
-	err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 200*time.Millisecond, 20*time.Millisecond)
+	_, err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 200*time.Millisecond, 20*time.Millisecond)
 	if err == nil {
 		t.Fatal("no error")
 	}
@@ -349,7 +350,7 @@ func TestCellAwaitIdle_InFlightRequestsAreNotIdleEvenPastTheWindow(t *testing.T)
 
 	var out bytes.Buffer
 	cond := awaitConds{wantUp: true, idle: 10 * time.Minute}
-	err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 200*time.Millisecond, 20*time.Millisecond)
+	_, err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 200*time.Millisecond, 20*time.Millisecond)
 	if err == nil {
 		t.Fatal("unblocked on a busy cell")
 	}
@@ -373,7 +374,7 @@ func TestCellAwaitComposite_ConditionsMustHoldInTheSameSnapshot(t *testing.T) {
 	})
 	var out bytes.Buffer
 	cond := awaitConds{wantUp: true, model: "qwen", ready: true, idle: 10 * time.Minute}
-	err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 400*time.Millisecond, 20*time.Millisecond)
+	_, err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 400*time.Millisecond, 20*time.Millisecond)
 	if err == nil {
 		t.Fatal("unblocked on conditions that were never true in one snapshot")
 	}
@@ -442,7 +443,7 @@ func TestCellAwaitExtras_ATransitionEventDoesNotSatisfyAModelCondition(t *testin
 
 	var out bytes.Buffer
 	cond := awaitConds{wantUp: true, model: "qwen", ready: true}
-	err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 300*time.Millisecond, time.Second)
+	_, err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 300*time.Millisecond, time.Second)
 	if err == nil {
 		t.Fatalf("a cellUp event satisfied a --ready wait:\n%s", out.String())
 	}
@@ -476,7 +477,7 @@ func TestCellAwaitReleasesItsEventStreamOnSuccess(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	var out bytes.Buffer
-	if err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", awaitConds{wantUp: true}, 0, 20*time.Millisecond); err != nil {
+	if _, err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", awaitConds{wantUp: true}, 0, 20*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -486,30 +487,42 @@ func TestCellAwaitReleasesItsEventStreamOnSuccess(t *testing.T) {
 	}
 }
 
-// leaseFleetd is a fleetd with a mutable lease store, so a test can
-// exercise the whole primitive: wait for a holder to clear, then claim.
+// leaseFleetd is a fleetd with a mutable lease store and C9's notify
+// route, so a test can exercise the whole primitive: wait for a holder
+// to clear, claim, and page. `calls` is the ORDERED route log — the
+// C9/C10 merge decided that the push goes after the claim, and order is
+// the only thing that pins it.
 type leaseFleetd struct {
-	mu     sync.Mutex
-	leases []fleetapi.Lease
-	posted []map[string]string
-	status int
+	mu           sync.Mutex
+	leases       []fleetapi.Lease
+	posted       []map[string]string
+	notified     []map[string]string
+	calls        []string
+	status       int
+	notifyStatus int
+	activity     *fleetapi.CellActivity
 }
 
 func newLeaseFleetd(t *testing.T, models []fleetapi.ModelState) (*httptest.Server, *leaseFleetd) {
 	t.Helper()
-	f := &leaseFleetd{status: http.StatusOK}
+	f := &leaseFleetd{status: http.StatusOK, notifyStatus: http.StatusOK}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/fleet/state", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		leases := append([]fleetapi.Lease{}, f.leases...)
+		act := f.activity
 		f.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(statusState(awaitTestCell(models, idleActivity(1800), leases...)))
+		if act == nil {
+			act = idleActivity(1800)
+		}
+		_ = json.NewEncoder(w).Encode(statusState(awaitTestCell(models, act, leases...)))
 	})
 	mux.HandleFunc("POST /api/fleet/lease", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.mu.Lock()
 		f.posted = append(f.posted, body)
+		f.calls = append(f.calls, "lease")
 		st := f.status
 		f.mu.Unlock()
 		if st != http.StatusOK {
@@ -518,9 +531,30 @@ func newLeaseFleetd(t *testing.T, models []fleetapi.ModelState) (*httptest.Serve
 		}
 		_ = json.NewEncoder(w).Encode(map[string]string{"holder": body["holder"]})
 	})
+	mux.HandleFunc("POST /api/fleet/notify/send", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.mu.Lock()
+		f.notified = append(f.notified, body)
+		f.calls = append(f.calls, "notify")
+		st := f.notifyStatus
+		f.mu.Unlock()
+		if st != http.StatusOK {
+			http.Error(w, "fleet notifications are not configured", st)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "queued"})
+	})
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	return ts, f
+}
+
+// snapshot copies the recorded traffic under the lock.
+func (f *leaseFleetd) snapshot() (calls []string, notified []map[string]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string{}, f.calls...), append([]map[string]string{}, f.notified...)
 }
 
 // runAwait drives the real cobra command, which is the only path that
@@ -638,7 +672,7 @@ func TestCellAwaitProgressLinesPrintOnlyOnChange(t *testing.T) {
 	})
 	var out bytes.Buffer
 	cond := awaitConds{wantUp: true, idle: time.Hour}
-	_ = awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 300*time.Millisecond, 20*time.Millisecond)
+	_, _ = awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 300*time.Millisecond, 20*time.Millisecond)
 	if n := strings.Count(out.String(), "await gpu-cell:"); n != 1 {
 		t.Errorf("%d progress lines for one unchanged state:\n%s", n, out.String())
 	}
@@ -685,7 +719,7 @@ func TestCellAwaitDoesNotRePollOnUnrelatedEvents(t *testing.T) {
 
 	var out bytes.Buffer
 	cond := awaitConds{wantUp: true, idle: time.Hour}
-	_ = awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 600*time.Millisecond, 200*time.Millisecond)
+	_, _ = awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 600*time.Millisecond, 200*time.Millisecond)
 	// 600ms at a 200ms tick is 4 polls; anything near the ~600 frames the
 	// stream delivered means the poll rate is the fleet's event rate.
 	if n := polls.Load(); n > 12 {
@@ -752,7 +786,7 @@ func TestCellAwaitIdle_ASatisfiedWindowStillNamesTheEvidenceGap(t *testing.T) {
 
 	var out bytes.Buffer
 	cond := awaitConds{wantUp: true, idle: 10 * time.Minute}
-	if err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 2*time.Second, 20*time.Millisecond); err != nil {
+	if _, err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 2*time.Second, 20*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "no inflight frame seen yet") {
@@ -773,7 +807,7 @@ func TestCellAwaitProgressSurvivesAMovingIdleCounter(t *testing.T) {
 	})
 	var out bytes.Buffer
 	cond := awaitConds{wantUp: true, idle: time.Hour}
-	_ = awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 400*time.Millisecond, 20*time.Millisecond)
+	_, _ = awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", cond, 400*time.Millisecond, 20*time.Millisecond)
 	if polls.Load() < 5 {
 		t.Fatalf("only %d polls: the test did not exercise the moving counter", polls.Load())
 	}
@@ -839,7 +873,7 @@ func TestCellAwaitDown_AStaleAnnouncerIsNotADownCell(t *testing.T) {
 			t.Cleanup(ts.Close)
 
 			var out bytes.Buffer
-			err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", awaitConds{}, 300*time.Millisecond, time.Second)
+			_, err := awaitCell(t.Context(), &out, awaitTarget(t, ts), "gpu-cell", awaitConds{}, 300*time.Millisecond, time.Second)
 			if err == nil {
 				t.Fatalf("%s unblocked a --down wait against a cell that is still answering:\n%s", evType, out.String())
 			}
@@ -847,5 +881,187 @@ func TestCellAwaitDown_AStaleAnnouncerIsNotADownCell(t *testing.T) {
 				t.Errorf("err = %v", err)
 			}
 		})
+	}
+}
+
+// ─── the C9 union: --notify beside the lease claim ──────────────────────────
+//
+// C9 and C10 both grew `vibe cell await`. Everything below pins the one
+// question git could not answer: where the push sits relative to the
+// claim, and what a refusal does.
+
+// TestCellAwaitNotify_FiresAfterTheLeaseClaimAndCarriesItsOutcome is the
+// ordering decision itself. The push goes LAST, and its message is the
+// terminal's success line verbatim plus the claim's result — a page that
+// says "the wait ended" while the box went to someone else is a page
+// that lied, and the phone is the only surface a sleeping operator has.
+func TestCellAwaitNotify_FiresAfterTheLeaseClaimAndCarriesItsOutcome(t *testing.T) {
+	ts, f := newLeaseFleetd(t, []fleetapi.ModelState{{ID: "qwen", State: "ready"}})
+	// An observed window fleetd QUALIFIES: C10 puts the qualification on
+	// the success line, and dropping it from the push would be the same
+	// evidence gap on the surface that matters most.
+	secs, zero := 1800.0, 0
+	since := time.Now().Add(-time.Hour).UTC()
+	f.mu.Lock()
+	f.activity = &fleetapi.CellActivity{
+		Observed: true, ObservedSince: &since, InFlight: &zero, IdleSeconds: &secs,
+		Reason: "no inflight frame has ever arrived on this stream",
+	}
+	f.mu.Unlock()
+
+	out, err := runAwait(t, "gpu-cell", "--api", ts.URL, "--model", "qwen", "--ready",
+		"--idle", "10m", "--lease", "nightly-eval", "--lease-ttl", "2h", "--notify",
+		"--interval", "20ms", "--timeout", "2s")
+	if err != nil {
+		t.Fatalf("await failed: %v (%s)", err, out)
+	}
+	calls, notified := f.snapshot()
+	if len(calls) != 2 || calls[0] != "lease" || calls[1] != "notify" {
+		t.Fatalf("route order = %v, want exactly [lease notify]", calls)
+	}
+	msg := notified[0]["message"]
+	// The terminal's own success line, character for character: ONE
+	// renderer, so the two surfaces cannot describe one wait differently
+	// — and the qualification fleetd attached rides both.
+	var success string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if strings.HasPrefix(line, "gpu-cell is up") {
+			success = line
+		}
+	}
+	if success == "" {
+		t.Fatalf("no success line in output %q", out)
+	}
+	if !strings.Contains(msg, "the wait on gpu-cell ended: "+success) {
+		t.Errorf("notify message %q does not repeat the terminal line %q", msg, success)
+	}
+	for _, want := range []string{"qwen ready", "idle 30m0s (>= 10m0s)",
+		"no inflight frame has ever arrived on this stream",
+		"lease held: nightly-eval on gpu-cell/qwen for 2h0m0s"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("notify message %q is missing %q", msg, want)
+		}
+	}
+	if want := "vibe fleet: gpu-cell is up"; notified[0]["title"] != want {
+		t.Errorf("title = %q, want %q", notified[0]["title"], want)
+	}
+}
+
+// TestCellAwaitNotify_ARefusedLeaseStillPagesAndStillFailsTheCommand:
+// the case the ordering exists for. C10 fails the command on a refused
+// claim; skipping the push there would answer "is the box mine" with
+// silence, which reads as yes to someone who went to bed.
+func TestCellAwaitNotify_ARefusedLeaseStillPagesAndStillFailsTheCommand(t *testing.T) {
+	ts, f := newLeaseFleetd(t, []fleetapi.ModelState{{ID: "qwen", State: "ready"}})
+	f.mu.Lock()
+	f.status = http.StatusBadRequest
+	f.mu.Unlock()
+
+	out, err := runAwait(t, "gpu-cell", "--api", ts.URL, "--model", "qwen", "--ready",
+		"--lease", "nightly-eval", "--notify", "--interval", "20ms", "--timeout", "2s")
+	if err == nil || !strings.Contains(err.Error(), "lease was refused") {
+		t.Fatalf("err = %v (%s), want the command to fail on the refusal", err, out)
+	}
+	calls, notified := f.snapshot()
+	if len(calls) != 2 || calls[0] != "lease" || calls[1] != "notify" {
+		t.Fatalf("route order = %v, want exactly [lease notify]", calls)
+	}
+	if !strings.Contains(notified[0]["title"], "but the lease was refused") {
+		t.Errorf("title = %q: the page does not say the box is not ours", notified[0]["title"])
+	}
+	for _, want := range []string{"lease REFUSED for holder nightly-eval", "HTTP 400",
+		"the command exited non-zero and nothing is holding gpu-cell"} {
+		if !strings.Contains(notified[0]["message"], want) {
+			t.Errorf("notify message %q is missing %q", notified[0]["message"], want)
+		}
+	}
+}
+
+// TestCellAwaitNotify_APlainWaitPagesOnceWithNoLeaseLine keeps C9's own
+// invocation intact: --notify without --lease is one push about the
+// wait, and nothing about ownership.
+func TestCellAwaitNotify_APlainWaitPagesOnceWithNoLeaseLine(t *testing.T) {
+	ts, f := newLeaseFleetd(t, nil)
+	out, err := runAwait(t, "gpu-cell", "--api", ts.URL, "--up", "--notify",
+		"--interval", "20ms", "--timeout", "2s")
+	if err != nil {
+		t.Fatalf("await failed: %v (%s)", err, out)
+	}
+	calls, notified := f.snapshot()
+	if len(calls) != 1 || calls[0] != "notify" {
+		t.Fatalf("route calls = %v, want exactly [notify]", calls)
+	}
+	if got := notified[0]["message"]; !strings.Contains(got, "the wait on gpu-cell ended: gpu-cell is up") ||
+		strings.Contains(got, "lease") {
+		t.Errorf("notify message = %q", got)
+	}
+}
+
+// TestCellAwaitNotify_AFailedWaitPagesNothing: --notify is await-
+// UNBLOCKED (C9's word). A phone that buzzes for timeouts and typos too
+// has taught its owner to ignore it, which is the failure the whole
+// alarm policy is written against.
+func TestCellAwaitNotify_AFailedWaitPagesNothing(t *testing.T) {
+	ts, f := newLeaseFleetd(t, []fleetapi.ModelState{{ID: "qwen", State: "starting"}})
+	out, err := runAwait(t, "gpu-cell", "--api", ts.URL, "--model", "qwen", "--ready",
+		"--notify", "--interval", "20ms", "--timeout", "200ms")
+	if err == nil {
+		t.Fatalf("the wait unblocked on a starting model (%s)", out)
+	}
+	if calls, _ := f.snapshot(); len(calls) != 0 {
+		t.Errorf("a timed-out wait pushed %v", calls)
+	}
+
+	// Same for the fail-fast typo path, which never even reaches a poll
+	// the condition could satisfy.
+	_, err = runAwait(t, "gpu-cell", "--api", ts.URL, "--model", "qwn", "--ready",
+		"--notify", "--interval", "20ms", "--timeout", "0")
+	if err == nil {
+		t.Fatal("unknown model did not fail fast")
+	}
+	if calls, _ := f.snapshot(); len(calls) != 0 {
+		t.Errorf("a fail-fast typo pushed %v", calls)
+	}
+}
+
+// TestCellAwaitNotify_APushFailureWarnsAndKeepsTheExitCode: the wait
+// succeeded and the lease is held. An unconfigured webhook must not turn
+// that into a failed command — the delivery is the best-effort half.
+func TestCellAwaitNotify_APushFailureWarnsAndKeepsTheExitCode(t *testing.T) {
+	ts, f := newLeaseFleetd(t, []fleetapi.ModelState{{ID: "qwen", State: "ready"}})
+	f.mu.Lock()
+	f.notifyStatus = http.StatusServiceUnavailable
+	f.mu.Unlock()
+
+	out, err := runAwait(t, "gpu-cell", "--api", ts.URL, "--model", "qwen", "--ready",
+		"--lease", "nightly-eval", "--notify", "--interval", "20ms", "--timeout", "2s")
+	if err != nil {
+		t.Fatalf("a failed push failed the command: %v (%s)", err, out)
+	}
+	if !strings.Contains(out, "warning: --notify push failed") {
+		t.Errorf("the failure was swallowed: %q", out)
+	}
+	if !strings.Contains(out, "lease held: nightly-eval") {
+		t.Errorf("the lease report went missing: %q", out)
+	}
+}
+
+// TestNotifyPayloadIsBoundedAndPrintable: fleetd 400s a title carrying a
+// control character and caps the message, and the refusal body this
+// message quotes is up to 4 KB of whatever fleetd wrote. A --notify that
+// 400s is a human who never gets paged.
+func TestNotifyPayloadIsBoundedAndPrintable(t *testing.T) {
+	if got := notifyText("a\x1b[31mb\tc", 100); got != "a[31mb c" {
+		t.Errorf("notifyText = %q", got)
+	}
+	long := strings.Repeat("x", 5000)
+	if got := clampBytes(long, maxNotifyMessageBytes); len(got) > maxNotifyMessageBytes {
+		t.Errorf("clamped message = %d bytes, want <= %d", len(got), maxNotifyMessageBytes)
+	}
+	// A multi-byte rune must not be cut in half on the way out.
+	runes := strings.Repeat("é", 200)
+	got := clampBytes(runes, 101)
+	if len(got) > 101 || !utf8.ValidString(got) {
+		t.Errorf("clampBytes split a rune or overran: %q (%d bytes)", got, len(got))
 	}
 }

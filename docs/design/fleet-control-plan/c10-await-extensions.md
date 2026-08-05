@@ -1,7 +1,8 @@
 # C10 — await extensions: model-ready, cell-idle, and the lease handshake
 
-Status: EXECUTED + REVIEWED + ADVERSARIALLY REVIEWED (2026-08-04), off
-`feat/c10-await-extensions`, merged with `main` at `e7adae4` (C11).
+Status: EXECUTED + REVIEWED + ADVERSARIALLY REVIEWED + MERGED WITH C9
+(2026-08-04), off `feat/c10-await-extensions`, merged with `main` at
+`03bb4d5` (C11 then C9).
 Every mechanically verifiable gate is green under `-race -count=5`; the
 four live gates need real hardware and are **NOT RUN** — see
 [§Execution](#execution-2026-08-04). Third v2-backlog item
@@ -10,7 +11,10 @@ four live gates need real hardware and are **NOT RUN** — see
 (presence + the events stream), C4 (the inflight fold that answers "is
 this cell busy") and C6 (await's fail-fast rule). Branched off `main`
 at `c9e8bcf` (C8 merged; C9's PR #28 was open and is deliberately not
-depended on — see [§Merge order](#merge-order)).
+depended on — see [§Merge order](#merge-order)). C9 landed as #28 after
+this branch's review finished, and both phases extended
+`vibe cell await`; the union and the one semantic decision git could not
+make are in [§Merging C9](#merging-c9-2026-08-04).
 
 `vibe cell await gpu-cell --up && ./overnight-batch.sh` is the idiom C1
 shipped and the one this operator actually uses. It answers the wrong
@@ -376,6 +380,13 @@ consequences, both deliberate:
   land, fold `acquireLease` onto `postFleet` — the duplication is a
   merge-order artifact, not a design position.
 
+**What happened:** C9 merged first (#28). Both consequences played out
+as written — 4 files, 9 hunks, one of them code — and the resolution is
+recorded in [§Merging C9](#merging-c9-2026-08-04). It was mechanical
+except in one place, which the section argues rather than asserts: the
+two phases each appended a step to the END of the same wait, and only a
+human can say which step goes last.
+
 ## Execution (2026-08-04)
 
 ### What shipped
@@ -420,7 +431,8 @@ Four things the doc did not spell out and the code had to decide:
 | 9. Role/route | **PASS** — no HTTP route and no MCP tool added; `daemon/fleet_registry_test.go`'s probe list is untouched and still complete |
 | 10. Streaming contract | **PASS** — `git diff --stat main..HEAD -- internal/vibe/proxy` is empty |
 | 11. Inner loop | **PASS** — `go build ./...`, `go vet ./...`, `gofmt -l .` (silent), `go mod tidy` (`git diff --exit-code` clean), `golangci-lint run` (0 issues), `go test -race -count=5 ./...` (exit 0, 27 packages ok, no DATA RACE), re-run end to end after the review commit |
-| 12. Live gates (a–d) | **NOT RUN** — no route to the fleet's hardware from the implementing environment. No transcripts are fabricated |
+| 12. C9 union (`--notify` beside the lease claim) | added by the merge — see [§Merging C9](#merging-c9-2026-08-04) |
+| 13. Live gates (a–d) | **NOT RUN** — no route to the fleet's hardware from the implementing environment. No transcripts are fabricated |
 
 ### Adversarial self-review (ground rule 9)
 
@@ -649,10 +661,104 @@ retry loop exists for, so it is recorded rather than changed.
 
 ### Gates, re-run after the review commit
 
-Gates 1–11 **PASS** on the merged tree; gate 12 (live, a–d) remains
+Gates 1–11 **PASS** on the merged tree; the live gates (a–d) remain
 **NOT RUN** — no route to the fleet's hardware from the reviewing
 environment either, and no transcripts are fabricated. Full inner loop:
 `go build ./...`, `go vet ./...`, `gofmt -l .` silent, `go mod tidy`
 clean, `golangci-lint run` **0 issues**, `go test -race -count=5 ./...`
 **exit 0, 27 packages ok, no DATA RACE**. Gate 10 re-checked against the
 merge base: `git diff --stat main..HEAD -- internal/vibe/proxy` is empty.
+
+## Merging C9 (2026-08-04)
+
+C9 (`vibe fleet notify`) merged to `main` as #28 after this branch's
+adversarial pass finished. Both phases extended `vibe cell await`, so
+the merge conflicted in 4 files / 9 hunks — `cli/cmd_cell.go` (4),
+`AGENTS.md` (1), the plan README (3), the design doc's status line (1).
+**Both feature sets survive**; this is a union, not a choice. Eight of
+the nine hunks were textual. The ninth is the decision below.
+
+### The decision: `--notify` fires AFTER the lease claim
+
+C10's flow is *wait → claim the lease → report*, and a REFUSED claim
+fails the command (a batch that runs undeclared is invisible to the
+pre-drain report that exists to protect it). C9's is *wait → push one
+message*. Merged, three orderings were available:
+
+1. push before the claim,
+2. push after the claim, only on success,
+3. push after the claim, always, carrying its outcome.
+
+**Chosen: 3.** Argue it from what "await-unblocked" means to the person
+it is for — a human parked on a cell, away from the terminal, whose
+phone is the only surface they will read. Their question when it buzzes
+is not "did the wait end". It is **"is the box mine"**:
+
+- Ordering 1 answers a question they did not ask, and can answer it
+  wrongly: the page says `gpu-cell is up` while the lease went to
+  someone else and the command exited non-zero. A page that has to be
+  re-checked against a terminal is a page that failed.
+- Ordering 2 answers the refusal with **silence**, which reads as *no
+  news, still waiting* — the single worst reading, because it is
+  indistinguishable from the wait not having ended and it is the one
+  someone goes to bed on. Failure is exactly when the message matters
+  most; the notifier that only pages on success is C9's own
+  "learns-to-swipe-it-away" failure inverted.
+- Ordering 3 costs one bounded HTTP POST of latency (10 s client
+  timeout) on a wait usually measured in hours, and buys a message that
+  is true when it arrives.
+
+So: **exactly one push, sent last, naming the outcome.** On a refusal
+the title reads `… is up, but the lease was refused`, the body carries
+fleetd's own refusal and `the command exited non-zero and nothing is
+holding <cell>`, **and the command still fails** — C10's rule is
+unchanged; the push reports the failure rather than softening it.
+
+Two consequences worth keeping:
+
+- **`--notify` still fires only on an UNBLOCKED wait** (C9's rule,
+  untouched): a timeout and a fail-fast typo push nothing. The wait
+  ending is the event; the lease outcome rides along because it is the
+  same moment.
+- **The push repeats the terminal's success line verbatim.**
+  `awaitSuccessLine` is now the one renderer and both surfaces call it,
+  the same reason `condResult` exists. C10's rule that a qualification
+  fleetd attached to the evidence rides the SUCCESS line is worth least
+  precisely where it gets dropped — and the phone is the surface read by
+  the operator who is not watching the terminal. `awaitCell` therefore
+  RETURNS the satisfied `awaitEval` instead of only printing it.
+
+### The rest of the union
+
+- `cellAwaitCmd`: both flag sets, both help paragraphs. `--notify`
+  needs no new validation and composes with every condition.
+- `acquireLease` folded onto C9's `fleetdTarget.postFleet` exactly as
+  §Merge order predicted — same twenty lines, same error text
+  (`POST /api/fleet/lease: HTTP …`). The RunE's context boilerplate
+  became C9's `cmdContext`.
+- The push's payload is clamped and made printable before it is sent
+  (`notifyText` / `clampBytes`, budgets under fleetd's 256-byte title
+  and 2000-byte message). It quotes a refusal body fleetd wrote — up to
+  4 KB of it — and fleetd 400s a title with a control character in it. A
+  `--notify` that 400s is a human who never gets paged.
+- **Re-verified, still true:** `--lease hold` is refused BEFORE the wait
+  starts (`validateAwaitFlags` runs in RunE ahead of `resolveFleetd` and
+  `awaitCell`; `TestCellAwaitLease_ReservedHolderAndOverBoundTTLAreRefusedBeforeTheWait`
+  asserts no HTTP call is made). The merge moved nothing on that path.
+
+### Gates, re-run after the C9 merge
+
+Gates 1–11 **PASS** on the merged tree, plus one new gate for the union;
+the live gates (now numbered 13) remain **NOT RUN** — still no route to
+the fleet's hardware, and no transcripts are fabricated.
+
+| gate | result |
+|---|---|
+| 12. C9 union | **PASS** — `TestCellAwaitNotify_FiresAfterTheLeaseClaimAndCarriesItsOutcome` (ordered route log `[lease notify]`, message = the terminal's line verbatim including fleetd's evidence qualification, plus the lease line), `TestCellAwaitNotify_ARefusedLeaseStillPagesAndStillFailsTheCommand`, `TestCellAwaitNotify_APlainWaitPagesOnceWithNoLeaseLine`, `TestCellAwaitNotify_AFailedWaitPagesNothing` (timeout and fail-fast typo), `TestCellAwaitNotify_APushFailureWarnsAndKeepsTheExitCode`, `TestNotifyPayloadIsBoundedAndPrintable`; mutation-verified three ways — pushing before the claim, skipping the push on a refusal, and building the message independently of `awaitSuccessLine` each fail a named test |
+| 13. Live gates (a–d) | **NOT RUN** — no route to the fleet's hardware from the implementing environment |
+
+Full inner loop on the merged tree: `go build ./...`, `go vet ./...`,
+`gofmt -l .` silent, `go mod tidy` clean, `golangci-lint run`
+**0 issues**, `go test -race -count=5 ./...` **exit 0, no DATA RACE**.
+Gate 10 re-checked against the new merge base:
+`git diff --stat origin/main...HEAD -- internal/vibe/proxy` is empty.

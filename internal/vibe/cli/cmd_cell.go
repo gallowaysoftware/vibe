@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
@@ -318,6 +319,7 @@ func cellAwaitCmd() *cobra.Command {
 		apiFlag  string
 		up       bool
 		down     bool
+		notify   bool
 		timeout  time.Duration
 		interval time.Duration
 		cond     awaitConds
@@ -333,13 +335,14 @@ func cellAwaitCmd() *cobra.Command {
 			"has no live event stream to it there is no evidence, and await keeps waiting and says so rather\n" +
 			"than firing a batch into a busy box.\n" +
 			"--unleased waits for other consumers' advisory leases to clear; --lease <holder> takes one on\n" +
-			"success, which is what makes the pair a queue.",
+			"success, which is what makes the pair a queue.\n" +
+			"--notify pushes one message through fleetd's configured webhook when the wait ends — the\n" +
+			"await-unblocked half of C9, for a human parked on a cell rather than a script. It is sent after\n" +
+			"the --lease claim and reports its outcome, so the one message a human reads is the one that says\n" +
+			"whether the box is theirs.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx := cmd.Context()
-			if ctx == nil {
-				ctx = context.Background()
-			}
+			ctx := cmdContext(cmd)
 			if up && down {
 				return fmt.Errorf("--up and --down are contradictory")
 			}
@@ -355,16 +358,29 @@ func cellAwaitCmd() *cobra.Command {
 				return err
 			}
 			out := cmd.OutOrStdout()
-			if err := awaitCell(ctx, out, target, args[0], cond, timeout, interval); err != nil {
+			ev, err := awaitCell(ctx, out, target, args[0], cond, timeout, interval)
+			if err != nil {
+				// C9's rule, unchanged: --notify is await-UNBLOCKED. A
+				// timeout or a fail-fast typo is the script's business, and
+				// a phone that buzzes for both has taught its owner nothing.
 				return err
 			}
-			if cond.lease.holder == "" {
-				return nil
+			// The claim, then the push, then the report. Ordering the push
+			// last is what lets it carry the lease outcome; see
+			// notifyAwaitUnblocked.
+			var leaseErr error
+			if cond.lease.holder != "" {
+				leaseErr = acquireLease(ctx, target, args[0], cond)
 			}
-			if err := acquireLease(ctx, target, args[0], cond); err != nil {
-				return fmt.Errorf("the wait was satisfied but the lease was refused: %w", err)
+			if notify {
+				notifyAwaitUnblocked(out, target, args[0], cond, ev, leaseErr)
 			}
-			fmt.Fprintf(out, "lease held: %s on %s/%s for %s\n", cond.lease.holder, args[0], cond.model, cond.lease.ttl)
+			if leaseErr != nil {
+				return fmt.Errorf("the wait was satisfied but the lease was refused: %w", leaseErr)
+			}
+			if cond.lease.holder != "" {
+				fmt.Fprintf(out, "lease held: %s on %s/%s for %s\n", cond.lease.holder, args[0], cond.model, cond.lease.ttl)
+			}
 			return nil
 		},
 	}
@@ -378,10 +394,91 @@ func cellAwaitCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cond.lease.holder, "lease", "", "on success, take an advisory lease under this holder name")
 	cmd.Flags().DurationVar(&cond.lease.ttl, "lease-ttl", time.Hour, "TTL for --lease")
 	cmd.Flags().StringVar(&cond.lease.note, "lease-note", "", "note recorded with --lease (shown in the pre-drain report)")
+	cmd.Flags().BoolVar(&notify, "notify", false, "push a notification through fleetd's webhook when the wait ends")
 	cmd.Flags().DurationVar(&timeout, "timeout", 0, "give up after this long (0 = wait forever)")
 	cmd.Flags().DurationVar(&interval, "interval", 5*time.Second, "poll interval")
 	return cmd
 }
+
+// notifyAwaitUnblocked pushes the await's own result through fleetd's
+// notifier. Best-effort by construction: the wait already ended, so a
+// failed push warns rather than failing a command whose whole job just
+// succeeded — and the failure names itself rather than being swallowed.
+//
+// It fires AFTER the --lease claim and reports that claim's outcome
+// (C9 + C10). The question a human parked on a cell has when the phone
+// buzzes is not "did the wait end" — it is "is the box mine". A push
+// sent before the claim cannot answer that, and a push skipped on a
+// refusal answers it with silence, which is the reading that sends
+// someone to bed believing a batch is running. So: exactly one message
+// either way, naming what happened, and the refusal still fails the
+// command.
+//
+// The message repeats the terminal's success line verbatim, because on
+// this path the terminal is the surface nobody is watching — and C10's
+// rule that a qualified evidence gap rides the SUCCESS line is worth
+// least if it is dropped from the only surface a sleeping operator
+// reads.
+func notifyAwaitUnblocked(out io.Writer, target fleetdTarget, cell string, cond awaitConds, ev awaitEval, leaseErr error) {
+	title := "vibe fleet: " + cell + " is " + upWord(cond.wantUp)
+	lines := []string{"the wait on " + cell + " ended: " + awaitSuccessLine(cell, cond.wantUp, ev)}
+	switch {
+	case leaseErr != nil:
+		title += ", but the lease was refused"
+		lines = append(lines,
+			notifyText("lease REFUSED for holder "+cond.lease.holder+": "+leaseErr.Error(), maxNotifyDetailBytes),
+			"the command exited non-zero and nothing is holding "+cell)
+	case cond.lease.holder != "":
+		lines = append(lines, fmt.Sprintf("lease held: %s on %s/%s for %s",
+			cond.lease.holder, cell, cond.model, cond.lease.ttl))
+	}
+	body := map[string]string{
+		"title": notifyText(title, maxNotifyTitleBytes),
+		// Not notifyText: the newlines between these lines are structure,
+		// and each line was made printable on its way in.
+		"message": clampBytes(strings.Join(lines, "\n"), maxNotifyMessageBytes),
+	}
+	// Deliberately not the command's context: a wait interrupted at the
+	// terminal still ended, and the push is the half of it a human sees.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := target.postFleet(ctx, "/api/fleet/notify/send", body, nil); err != nil {
+		fmt.Fprintf(out, "warning: --notify push failed: %v\n", err)
+	}
+}
+
+// The push's own budgets, deliberately under fleetd's (which rejects a
+// title carrying a control character or exceeding its announce-field
+// bound, and caps a message at 2000 bytes). These strings are assembled
+// from things that came off the wire — an evidence gap fleetd worded, a
+// refusal body fleetd wrote, up to 4 KB of it — and a --notify that 400s
+// is a human who never gets paged.
+const (
+	maxNotifyTitleBytes   = 200
+	maxNotifyDetailBytes  = 800
+	maxNotifyMessageBytes = 1500
+)
+
+// clampBytes truncates to a byte budget on a rune boundary. Splitting a
+// rune would not fail fleetd's printability check — the fragment decodes
+// to U+FFFD, which is printable — it would just render as garbage on the
+// phone.
+func clampBytes(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	const ell = "…"
+	for len(s)+len(ell) > max {
+		_, size := utf8.DecodeLastRuneInString(s)
+		if size == 0 {
+			break
+		}
+		s = s[:len(s)-size]
+	}
+	return s + ell
+}
+
+func notifyText(s string, max int) string { return clampBytes(termSafe(s), max) }
 
 // awaitCell blocks until every requested condition holds for the named
 // cell IN THE SAME SNAPSHOT (C10): evaluating them across different
@@ -396,7 +493,11 @@ func cellAwaitCmd() *cobra.Command {
 // event proves something moved, never that the cell is reachable, that a
 // model is warm or that a GPU is free. Intent is never consulted — a
 // drained cell that answers is up (routing truth rule).
-func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell string, cond awaitConds, timeout, interval time.Duration) error {
+// The satisfied evaluation is RETURNED, not just printed: --notify's
+// message is built from it, and a push that describes the wait in
+// weaker terms than the terminal did is the same evidence gap C10
+// refuses everywhere else.
+func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell string, cond awaitConds, timeout, interval time.Duration) (awaitEval, error) {
 	// Cancelled on EVERY return, not just the --timeout path: the events
 	// goroutine below only exits on ctx, so a successful wait under
 	// `--timeout 0` used to leave it streaming until the caller's context
@@ -455,8 +556,8 @@ func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell str
 		ev, err := evaluateAwait(ctx, target, cell, cond)
 		switch {
 		case err == nil && ev.ok:
-			fmt.Fprintf(out, "%s is %s%s\n", cell, upWord(cond.wantUp), successSuffix(ev))
-			return nil
+			fmt.Fprintln(out, awaitSuccessLine(cell, cond.wantUp, ev))
+			return ev, nil
 		case err == nil:
 			lastUnmet, lastErr = ev.unmet, nil
 			// On a CHANGE OF STATE, not of text. The status line carries a
@@ -471,7 +572,7 @@ func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell str
 			// A typo never becomes true by waiting, and --timeout 0 is the
 			// documented overnight-batch idiom: without this the command
 			// parks until the machine reboots.
-			return err
+			return awaitEval{}, err
 		default:
 			// A transport error is a restarting fleetd, which is exactly
 			// what the retry loop is for. An error caused by our OWN
@@ -497,13 +598,13 @@ func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell str
 					case lastErr != nil:
 						// fleetd was unreachable at the end: reporting "the cell
 						// never came up" would blame the cell for the registry.
-						return fmt.Errorf("timeout waiting for %s: last attempt failed: %w", cell, lastErr)
+						return awaitEval{}, fmt.Errorf("timeout waiting for %s: last attempt failed: %w", cell, lastErr)
 					case cond.extras() && len(lastUnmet) > 0:
-						return fmt.Errorf("timeout waiting for %s: %s", cell, strings.Join(lastUnmet, "; "))
+						return awaitEval{}, fmt.Errorf("timeout waiting for %s: %s", cell, strings.Join(lastUnmet, "; "))
 					}
-					return fmt.Errorf("timeout waiting for %s to come %s", cell, upWord(cond.wantUp))
+					return awaitEval{}, fmt.Errorf("timeout waiting for %s to come %s", cell, upWord(cond.wantUp))
 				}
-				return ctx.Err()
+				return awaitEval{}, ctx.Err()
 			case ev := <-events:
 				if !streamAlive.Load() || !eventRelevant(ev) {
 					continue
@@ -514,6 +615,15 @@ func awaitCell(ctx context.Context, out io.Writer, target fleetdTarget, cell str
 			}
 		}
 	}
+}
+
+// awaitSuccessLine is the ONE rendering of a satisfied wait. The
+// terminal line and the --notify push are both built from it, for the
+// same reason condResult exists: two surfaces describing one wait
+// differently is how a qualification gets dropped from the one a human
+// actually reads.
+func awaitSuccessLine(cell string, up bool, ev awaitEval) string {
+	return fmt.Sprintf("%s is %s%s", cell, upWord(up), successSuffix(ev))
 }
 
 // successSuffix appends the conditions beyond reachability to the

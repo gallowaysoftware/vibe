@@ -2,17 +2,13 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
 	"time"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
-	"github.com/gallowaysoftware/vibe/internal/vibeclient"
 )
 
 // The await conditions (fleet-control C10). `vibe cell await X --up`
@@ -362,34 +358,16 @@ func upWord(up bool) string {
 // the COMMAND: the operator asked for the declaration, and a batch that
 // runs undeclared is invisible to the pre-drain report that exists to
 // protect it.
+//
+// The POST goes through C9's postFleet, which is the same twenty lines
+// this function carried on its own branch — merging the two phases is
+// what made the duplication visible.
 func acquireLease(ctx context.Context, target fleetdTarget, cell string, c awaitConds) error {
-	body, err := json.Marshal(map[string]string{
+	return target.postFleet(ctx, "/api/fleet/lease", map[string]string{
 		"cell":   cell,
 		"model":  c.model,
 		"holder": c.lease.holder,
 		"note":   c.lease.note,
 		"ttl":    c.lease.ttl.String(),
-	})
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.base+"/api/fleet/lease", strings.NewReader(string(body)))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if tok := vibeclient.ResolveToken(); tok != "" && !strings.HasPrefix(target.base, "http://vibe.local") {
-		req.Header.Set("Authorization", "Bearer "+tok)
-	}
-	resp, err := target.hc.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("POST /api/fleet/lease: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-	return nil
+	}, nil)
 }

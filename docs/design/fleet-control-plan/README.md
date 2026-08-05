@@ -17,27 +17,26 @@ to be implementable on its own after that.
 | [C7a](c7a-usage-ledger.md) | The usage ledger: tokens per cell, per model, per day | ~710 lines | C4 | merged (#24); unit gates green, 7 live gates UNRUN |
 | [C7b](c7b-savings-screen.md) | The savings screen: what the fleet didn't spend | ~690 lines + ~100 KB data | C7a, C5 | merged (#25); unit gates green, live plausibility gate UNRUN |
 | [C8](c8-probe-model.md) | probe_model: throughput health against the model's own baseline | ~900 lines | C3, C4 | merged (#27); unit gates 1-10 green, 5 live gates UNRUN |
-| C9 | `vibe fleet notify`: the alarm column, delivered | ~1100 lines | C2, C3, C4 | PR #28 OPEN on `feat/c9-fleet-notify`; its phase doc lands with it |
-| [C10](c10-await-extensions.md) | await extensions: `--model --ready`, `--idle`, the lease handshake | ~450 lines | C1, C2, C3, C4, C6, C11 | PR #29 OPEN; unit gates 1-11 green after the adversarial pass, 4 live gates UNRUN |
+| [C9](c9-fleet-notify.md) | `vibe fleet notify`: the alarm column, delivered | ~1100 lines | C2, C3, C4 | merged (#28); unit gates 1-13 green, 4 live gates UNRUN |
+| [C10](c10-await-extensions.md) | await extensions: `--model --ready`, `--idle`, the lease handshake | ~450 lines | C1, C2, C3, C4, C6, C9, C11 | PR #29 OPEN; unit gates 1-13 green after the adversarial pass and the C9 merge, 4 live gates UNRUN |
 | [C11](c11-hold-model.md) | hold_model: the pause button on the warm policy | ~450 lines | C2, C4, C5 | merged (#30); unit gates 1-11 green, 4 live gates UNRUN |
 
-C9 (`vibe fleet notify`) and C10 (await extensions) are open on their
-own branches, cut from `c9e8bcf` in parallel with C11. None of the three
-builds on the others; C11 landed first, so C10 carries the merge of
-`main` and the semantic reconciliation with the lease store a hold now
-shares (`c10-await-extensions.md`'s addendum records it).
+C10 (await extensions) is the last of the three branches cut from
+`c9e8bcf` in parallel; C11 and then C9 landed ahead of it. None of the
+three builds on the others, but C9 and C10 both extended
+`vibe cell await`, so C10 carries the merge and the one decision git
+could not make: `--notify` fires AFTER the `--lease` claim and reports
+its outcome. C10's phase doc records how the rest of it landed — the
+duplicated 20-line POST helper collapsed onto C9's `postFleet`, and the
+textual conflict in `cellAwaitCmd` resolved as a union of both flag
+sets (`c10-await-extensions.md`'s second addendum).
 
 **Merged is not live-gated.** Every C0–C7b PR merged on a green CI run
 of the mechanical inner loop. The live gates — the ones that need real
 cells, a real GPU and a real week of traffic — are UNRUN for C5, C6,
-C7a, C7b, C8, C10 and C11, and each phase doc lists exactly which.
+C7a, C7b, C8, C9, C10 and C11, and each phase doc lists exactly which.
 Ground rule 10 applies to this table: a status cell is a claim about a
 mechanical run.
-
-C9 and C10 were cut from `main` at `c9e8bcf` in parallel and neither
-builds on the other; C10's phase doc records the merge-order
-accommodation (one duplicated 20-line POST helper, one expected textual
-conflict in `cellAwaitCmd`).
 
 Line counts are order-of-magnitude scoping signals, not budgets. Actual
 C0–C4 spend ran 3.6–4.5× the estimate in every phase; price that in.
@@ -56,6 +55,14 @@ rule is that the measurement must never become an actuator — a probe
 runs only against an already-resident model, and a `degraded` verdict
 changes nothing but a display.
 
+C9 (2026-08-04) is the backlog's second item: the alarm column finally
+has a destination. Its one structural surprise is worth carrying
+forward — the futures entry's "SSE-events-to-webhook bridge" is the
+wrong shape for the policy it was meant to deliver, because two of the
+four default alarms have no event to forward (see the phase doc's
+opening section). It ships as a state differ over the same snapshot
+every other surface renders.
+
 C10 (2026-08-04) is the backlog's third item, and its one carried
 finding is a rule rather than a feature: **missing evidence is never
 idleness**. `--idle` had to answer "has this cell been quiet" for a
@@ -66,6 +73,10 @@ the softer version of this (fleetd's own uptime becoming the idle
 clock), so await refuses, visibly, instead of guessing. The idle window
 is also floored at the moment fleetd's watcher CONNECTED to the cell,
 not at process start: silence you were not there for is not silence.
+Landing after C9 gave it one decision git could not make: `--notify`
+and `--lease` both hang off the end of the same wait, and the push goes
+LAST, carrying the claim's outcome — a page that says the wait ended
+while the box went to someone else is a page that lied.
 
 C11 (2026-08-04) is backlog item 4, `hold_model`, and its one carried
 rule is about where declarations live: **a hold is a lease**. The lease

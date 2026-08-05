@@ -288,6 +288,10 @@ func TestDaemon_FleetRegistryOff_NoMCP(t *testing.T) {
 		{http.MethodGet, "/api/fleet/usage"},
 		// C7b prices that ledger; same role, same rule.
 		{http.MethodGet, "/api/fleet/savings"},
+		// C9's notifier is fleetd's too: a single-box daemon has no class
+		// table to alarm on and no fleet scope to declare.
+		{http.MethodPost, "/api/fleet/notify/scope"},
+		{http.MethodPost, "/api/fleet/notify/send"},
 	} {
 		req, _ := http.NewRequest(probe.method, "http://"+httpAddr+probe.path, strings.NewReader("{}"))
 		req.Header.Set("Authorization", "Bearer "+token)

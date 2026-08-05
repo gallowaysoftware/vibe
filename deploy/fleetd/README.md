@@ -52,6 +52,28 @@ fleet_registry: true
 fleet:
   front_config: /front-config/config.yaml
 
+  # C9: the class table's alarm column, delivered to one webhook. Empty
+  # (the default) means no notifications at all. The URL is a
+  # CREDENTIAL — an ntfy topic URL is bearer-equivalent in both
+  # directions — so it lives in its own 0600 file, mounted in, and never
+  # appears in a log, an error, or /api/fleet/state (which shows only
+  # "https://host/... (id 3f2a1b9c)").
+  #
+  # The default alarm set is exactly: an always_on cell absent with no
+  # DECLARED intent, a serving-flags mismatch that has persisted 15
+  # minutes, and a drain landing on a cell that still holds advisory
+  # leases. Everything else — an opportunistic box being off, a roaming
+  # laptop leaving, a degraded probe verdict — stays in fleet_status,
+  # deliberately.
+  notify:
+    url_file: /state/notify-url   # first line: https://ntfy.example.invalid/EXAMPLE-TOPIC
+    # token_file: /state/notify-token   # self-hosted ntfy with access control
+    # format: text                      # text (ntfy-native headers) | json
+    # alarms: [cell_absent, fingerprint_drift, drain_with_lease]
+    # dwell: {cell_absent: 2m, fingerprint_drift: 15m}
+    # rate_per_hour: 12
+    # burst: 4
+
 # C4: restore the cell's default model after the operator's swap goes
 # request-idle. Keyed on activity, never on a timer.
 warm_targets:
@@ -77,6 +99,16 @@ probe_targets:
     model: default-chat
     every: 6h
 ```
+
+**Notifications (C9).** Write the endpoint to the state volume once —
+`printf 'https://ntfy.sh/YOUR-TOPIC\n' > .../notify-url && chmod 600 …` —
+and prove the path works before you rely on it: `vibe fleet notify test`
+sends one message through the real delivery path (it is not an alarm, so
+it skips the dwell, the dedup and the away gate). Going on holiday is
+`vibe fleet notify away --reason vacation --until 336h`; alarms keep
+firing and stay visible in `fleet_status` the whole time, and
+`vibe fleet notify home` sends one digest naming what was suppressed.
+The `class` in `hosts.yaml` is what decides which absences alarm at all.
 
 **Timezone.** `warm_schedule` entries evaluate in the container's `TZ`,
 and an alpine base has no tzdata — set `TZ` in `.env` AND keep tzdata in

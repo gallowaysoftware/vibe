@@ -115,6 +115,13 @@ func UsageLedgerFile() string { return filepath.Join(StateHome(), "fleet", "usag
 // in the pre-drain report and fleet_status, never block anything.
 func LeasesFile() string { return filepath.Join(StateHome(), "fleet", "leases.json") }
 
+// NotifyScopeFile persists the declared away/home fleet notification
+// scope (fleet-control C9 §5). Its own file rather than a key in
+// intent.json: every reader of that store treats a key as a cell that
+// announces and echoes, and this declares something about the operator,
+// not about a cell.
+func NotifyScopeFile() string { return filepath.Join(StateHome(), "fleet", "notify-scope.json") }
+
 // TokenFile is the path to the daemon's bearer-token file. The token lives in
 // $XDG_STATE_HOME/vibe rather than $XDG_CONFIG_HOME because it's a generated
 // runtime secret, not user-authored configuration — same reasoning that puts
