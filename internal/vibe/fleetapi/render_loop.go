@@ -44,7 +44,14 @@ type RenderLoopConfig struct {
 	BackendsDir       string
 	LlamaServerBinary string
 	FrontConfigPath   string
-	Hosts             *fleetcfg.File
+	// FrontExtras is the operator-owned half of the front's config: a
+	// YAML file whose top-level sections merge into every render (the
+	// `--extras` merge). Without it the render emits only what it
+	// derives, so the front's `apiKeys:` — the credential C15 exists to
+	// present — is deleted on the first membership transition, and the
+	// fleet's warms start 401ing hours after someone configured them.
+	FrontExtras string
+	Hosts       *fleetcfg.File
 	// MinHealthyStreak is the re-add hysteresis: a pruned roaming cell's
 	// defs return only after this many consecutive fresh announces.
 	MinHealthyStreak int
@@ -225,6 +232,7 @@ func (rl *renderLoop) renderPass() error {
 		Cell:              fleetcfg.FrontCell,
 		Hosts:             rl.cfg.Hosts,
 		LlamaServerBinary: rl.cfg.LlamaServerBinary,
+		ExtrasPath:        rl.cfg.FrontExtras,
 		Warnf: func(format string, args ...any) {
 			slog.Warn(fmt.Sprintf("front render: "+format, args...))
 		},

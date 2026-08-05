@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
+	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
+	"github.com/gallowaysoftware/vibe/internal/vibe/router"
 )
 
 // fleet-control C15: the warm credential.
@@ -624,4 +626,66 @@ func doctorCheckByID(t *testing.T, rep DoctorReport, id string) DoctorCheck {
 	}
 	t.Fatalf("no %s check in the report", id)
 	return DoctorCheck{}
+}
+
+// ── U10: the render must not delete the credential ──────────────────────
+
+// TestFrontRenderPreservesTheOperatorsExtras: the front's config is a
+// derived artifact fleetd rewrites on every membership transition, and
+// the renderer emits nothing it did not derive. Without the extras merge
+// the first presence change deletes the front's apiKeys — a credential
+// fleetd erases is not a credential.
+func TestFrontRenderPreservesTheOperatorsExtras(t *testing.T) {
+	dir := t.TempDir()
+	extras := filepath.Join(dir, "front-extras.yaml")
+	if err := os.WriteFile(extras, []byte("apiKeys:\n  - the-front-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	front := newKeyedSwap(t, labSwapKey)
+	s := newC15Server(t, front, hostsWithKey(t, front.srv.URL, labSwapKey))
+
+	var gotExtras string
+	rl := &renderLoop{srv: s, cfg: RenderLoopConfig{
+		FrontExtras:     extras,
+		FrontConfigPath: filepath.Join(dir, "config.yaml"),
+		LoadDefs:        func(string) ([]*profile.BackendDef, error) { return nil, nil },
+		Render: func(_ []*profile.BackendDef, opts router.Options) (string, error) {
+			gotExtras = opts.ExtrasPath
+			return "models: {}\n", nil
+		},
+		WriteFile: func(string, []byte) error { return nil },
+	}}
+	if err := rl.renderPass(); err != nil {
+		t.Fatalf("render pass: %v", err)
+	}
+	if gotExtras != extras {
+		t.Fatalf("the render was given ExtrasPath %q, want %q — the front's apiKeys would be erased", gotExtras, extras)
+	}
+}
+
+func TestDoctorFrontExtras(t *testing.T) {
+	front := newKeyedSwap(t, labSwapKey)
+	keyed := hostsWithKey(t, front.srv.URL, labSwapKey)
+	unkeyed := hostsWithKeyPath(t, front.srv.URL, "")
+
+	for name, tc := range map[string]struct {
+		hosts *fleetcfg.File
+		host  DoctorHost
+		want  Level
+	}{
+		"keyed front, rendered config, no extras": {keyed, DoctorHost{FrontConfig: "/front/config.yaml"}, LevelFail},
+		"keyed front, rendered config, extras":    {keyed, DoctorHost{FrontConfig: "/front/config.yaml", FrontExtras: "/front/extras.yaml"}, LevelOK},
+		"keyed front, no render mount":            {keyed, DoctorHost{}, LevelOK},
+		"unkeyed front, rendered config":          {unkeyed, DoctorHost{FrontConfig: "/front/config.yaml"}, LevelOK},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newC15Server(t, front, tc.hosts)
+			rep := DoctorReport{}
+			s.checkFrontExtras(&rep, tc.host)
+			got := doctorCheckByID(t, rep, "front.extras")
+			if got.Level != tc.want {
+				t.Fatalf("level = %s (%s), want %s", got.Level, got.Summary, tc.want)
+			}
+		})
+	}
 }

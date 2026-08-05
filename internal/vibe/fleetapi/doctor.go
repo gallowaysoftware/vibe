@@ -152,6 +152,11 @@ type DoctorHost struct {
 	// render mount contract) — which is the only reason doctor may report
 	// anything about the front's disk.
 	FrontConfig string
+	// FrontExtras is fleet.front_extras: the operator-owned YAML merged
+	// into every front render. Its ABSENCE beside a front that declares a
+	// llama-swap API key is a finding, because the render then deletes the
+	// key from the config it rewrites (C15).
+	FrontExtras string
 	// TokenMinted reports that this start CREATED the control-plane token
 	// rather than loading one. On fleetd that is the signature of a
 	// container recreate over an unmounted state dir.
@@ -347,6 +352,7 @@ func (s *Server) checkAuth(ctx context.Context, rep *DoctorReport, snap StateSna
 		s.checkInbound(rep, c, pres[c.Name], snap.Daemon.AuthRejected)
 		s.checkSwapCredential(rep, c, expl)
 	}
+	s.checkFrontExtras(rep, host)
 	// Probed in PARALLEL, like Snapshot's own cell round: each call is
 	// bounded at 5s, and run serially a fleet with three boxes off would
 	// spend the whole report deadline dialling them — leaving the cells
@@ -503,6 +509,49 @@ func (s *Server) checkSwapCredential(rep *DoctorReport, c CellSnapshot, expl map
 			Detail: "whether it demands a key is unknowable from here — an unreachable llama-swap and one that is refusing every " +
 				"route except /health look identical to a probe that got no answer.",
 			Fix: "if it does run with apiKeys, set cells." + c.Name + ".swap_key_file."})
+	}
+}
+
+// checkFrontExtras answers the one way a correctly-configured C15
+// credential still stops working: the front's config is a DERIVED
+// artifact, rewritten by fleetd on every membership transition, and the
+// renderer emits only what it derives. A front with `apiKeys:` and no
+// `fleet.front_extras` therefore loses its keys at the next presence
+// change — hours after someone configured them, with nothing in between
+// to connect cause and effect.
+//
+// It is named for what it proves: whether the operator-owned half of the
+// front's config is declared, not whether the file's contents are right.
+func (s *Server) checkFrontExtras(rep *DoctorReport, host DoctorHost) {
+	id := "front.extras"
+	if host.FrontConfig == "" {
+		// No render mount: the front's config is hand-maintained and
+		// nothing here can overwrite anything. OK with the reason, never a
+		// permanent UNKNOWN on a fleet that is fine (C13).
+		rep.Add(DoctorCheck{ID: id, Cell: fleetcfg.FrontCell, Level: LevelOK,
+			Summary: "fleetd does not render the front's config, so nothing overwrites it",
+			Detail:  "fleet.front_config is unset: the registry is observe-only for the front (C1/C2 behaviour)."})
+		return
+	}
+	cred, err := s.hostsFile().SwapCredentialFor(fleetcfg.FrontCell)
+	keyed := err != nil || cred.Configured
+	switch {
+	case host.FrontExtras != "":
+		rep.Add(DoctorCheck{ID: id, Cell: fleetcfg.FrontCell, Level: LevelOK,
+			Summary: "the front's non-derived config is declared and merged into every render",
+			Detail:  "fleet.front_extras: " + host.FrontExtras})
+	case keyed:
+		rep.Add(DoctorCheck{ID: id, Cell: fleetcfg.FrontCell, Level: LevelFail,
+			Summary: "the front declares a llama-swap API key and fleetd renders its config with no front_extras",
+			Detail: "every membership transition rewrites " + host.FrontConfig + " from the backend defs alone, which emits no " +
+				"apiKeys: the front will stop demanding a key (or, on restart, stop accepting the one it had) and the fleet's " +
+				"warms will fail with no configuration having changed.",
+			Fix: "put the front's apiKeys (and any other hand-written section, e.g. store:) in a YAML file and name it in " +
+				"fleet.front_extras."})
+	default:
+		rep.Add(DoctorCheck{ID: id, Cell: fleetcfg.FrontCell, Level: LevelOK,
+			Summary: "the front's config is fully derived; nothing hand-written to preserve",
+			Detail:  "no llama-swap API key is declared for the front, which is the reference posture (LAN-only, no apiKeys)."})
 	}
 }
 
