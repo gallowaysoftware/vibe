@@ -35,8 +35,15 @@ discipline that stops the next one reaching the fleet.
 ```
 
 Nothing here touches production: scratch dirs under `$UPGRADE_DIR`, ports
-9810-9819, upstreams 6100+ — clear of the router on `:9000`, the daemon
-on `:9001` and `scripts/fleetlab`'s 9600-9799.
+9810-9819, upstreams 6100+ — clear of the router on `:9000` and the daemon
+on `:9001`.
+
+One thing to know before running `canary`: its second step hands off to
+`scripts/fleetlab`, which binds *its* fixed 9600-9799 range and whose
+`down` sweep is anchored on the shared upstream ports. A second lab on the
+same box will be killed by it — [futures item
+15](../../docs/design/fleet-control-futures.md) is the port-offset knob
+that fixes it, and it is why C16's own L4 gate went unrun.
 
 ## What each step catches
 
@@ -88,8 +95,12 @@ night are code, not instructions:
 - **"Check every cell is on the version you gated"** is
   `versions.llama_swap` — each cell announces its own llama-swap's
   `/api/version`, and fleetd reads the front's directly because the front
-  runs no announcer. A version with no recording in this build is a WARN
-  naming itself.
+  runs no announcer. One reader (`fleetapi.ReadSwapVersion`) for both, and
+  the endpoint is itself gated by `TestSwapContract` I6 against a real
+  binary, because a producer nothing replays goes silent on exactly the
+  upgrade that moves it. A version with no recording in this build is a
+  WARN naming itself, and a box that did NOT answer is named too — the
+  check may never render agreement over a silence.
 - **"Remember that both wires must keep passing"** is
   `TestGatedSwapVersionsMatchesRecordings` and
   `TestConformanceMatrixCoversEveryRecording`: the recordings, the CI

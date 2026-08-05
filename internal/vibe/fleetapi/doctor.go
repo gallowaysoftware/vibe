@@ -667,15 +667,52 @@ func (s *Server) checkVersions(ctx context.Context, rep *DoctorReport, snap Stat
 
 	// The llama-swap version matrix (futures item 13's canary → gate →
 	// fleet sequence is exactly the mid-state this catches).
+	//
+	// Which boxes this verdict does NOT cover belongs on EVERY branch, for
+	// the same reason defs.parity's absentNote does — and here it matters
+	// more, because the two silent shapes are the two the phase exists
+	// for. A cell whose vibe build predates the producer announces no
+	// version at all; the FRONT announces nothing ever, so a failed direct
+	// read removes it from the matrix entirely. Either way "every
+	// reporting cell runs v239" was rendered over a fleet where the box
+	// the 2026-08-05 incident happened to had said nothing.
 	vers := map[string][]string{}
+	var noVersion []string
 	for _, c := range snap.Cells {
 		p := pres[c.Name]
 		if p.Versions != nil && p.Versions.LlamaSwap != "" {
 			vers[p.Versions.LlamaSwap] = append(vers[p.Versions.LlamaSwap], c.Name)
+			continue
+		}
+		// The front is covered by the direct read below, not by an
+		// announce it structurally cannot send.
+		if p.Announcing && c.Name != fleetcfg.FrontCell {
+			noVersion = append(noVersion, c.Name)
 		}
 	}
+	frontUnread := false
 	if v := s.frontSwapVersion(ctx); v != "" {
 		vers[v] = append(vers[v], fleetcfg.FrontCell)
+	} else if s.hasFrontCell() {
+		frontUnread = true
+	}
+	sort.Strings(noVersion)
+	coverNote := ""
+	if frontUnread {
+		coverNote += " The FRONT did not answer GET /api/version, so the box this check exists for is not in this " +
+			"matrix — an older llama-swap, a gated admin API, or an unreachable front."
+	}
+	if len(noVersion) > 0 {
+		coverNote += " Announcing but reporting no llama-swap version: " + strings.Join(noVersion, ", ") +
+			" (a vibe build older than C16's producer)."
+	}
+	// Divergence is decided on the RELEASE, gating already is
+	// (ungatedSwapVersions normalises), and a build string beside the tag
+	// would otherwise read as two versions of one release. The Detail
+	// still prints the raw matrix, so nothing is hidden by the grouping.
+	releases := map[string]bool{}
+	for v := range vers {
+		releases[normalizeSwapVersion(v)] = true
 	}
 	ungated := ungatedSwapVersions(vers)
 	switch {
@@ -685,9 +722,9 @@ func (s *Server) checkVersions(ctx context.Context, rep *DoctorReport, snap Stat
 		// no cell could answer — an old announcer build, or a llama-swap
 		// that did not respond to its own cell.
 		rep.Add(DoctorCheck{ID: "versions.llama_swap", Level: LevelUnknown,
-			Summary: "no cell reports a llama-swap version",
-			Detail: "each cell reads its own llama-swap's /api/version and announces it. An empty matrix means the " +
-				"announcers predate that (C16) or their llama-swap did not answer — not that the fleet agrees.",
+			Summary: "no llama-swap version could be read anywhere in this fleet",
+			Detail: "each cell reads its own llama-swap's /api/version and announces it; fleetd reads the front's " +
+				"directly. An empty matrix means nobody answered — not that the fleet agrees." + coverNote,
 			Fix: "upgrade the cells' vibe build, then re-run."})
 	case len(ungated) > 0:
 		// The incident, stated as a check. Louder than mere divergence: a
@@ -697,21 +734,32 @@ func (s *Server) checkVersions(ctx context.Context, rep *DoctorReport, snap Stat
 			Summary: "cells run llama-swap " + strings.Join(ungated, ", ") + ", which this vibe build has no conformance recording for",
 			Detail: "gated versions: " + strings.Join(GatedSwapVersions(), ", ") + ". Matrix: " + shaGroups(vers) +
 				". The in-flight wire changed silently between v239 and v247 and every busy guard read the new shape " +
-				"as an idle cell; an ungated version is that risk, unmeasured.",
+				"as an idle cell; an ungated version is that risk, unmeasured." + coverNote,
 			Fix: "scripts/upgrade/ritual.sh canary <version> — it records the fixtures and replays the contract."})
-	case len(vers) > 1:
+	case len(releases) > 1:
 		rep.Add(DoctorCheck{ID: "versions.llama_swap", Level: LevelWarn,
 			Summary: "cells run different llama-swap versions",
-			Detail:  shaGroups(vers),
+			Detail:  shaGroups(vers) + "." + coverNote,
 			Fix:     "the upgrade ritual is canary cell → SSE gate → fleet; this is the mid-state."})
 	default:
 		var v string
 		for k := range vers {
 			v = k
 		}
+		// Still OK — defs.parity's precedent: a verdict over the boxes
+		// that answered is useful, and a permanent UNKNOWN because one
+		// cell runs an old build teaches an operator to ignore the level.
+		// But the sentence has to carry what it does not cover, and the
+		// front's silence goes in the SUMMARY, because the front appears
+		// in no other absence list on this report.
+		sum := "every reporting cell runs llama-swap " + v
+		if frontUnread {
+			sum += " — but the FRONT did not answer, and it is not in that count"
+		}
 		rep.Add(DoctorCheck{ID: "versions.llama_swap", Level: LevelOK,
-			Summary: "every reporting cell runs llama-swap " + v,
-			Detail:  "gated by this build's conformance recordings: " + strings.Join(GatedSwapVersions(), ", ")})
+			Summary: sum,
+			Detail: "gated by this build's conformance recordings: " + strings.Join(GatedSwapVersions(), ", ") +
+				"." + coverNote})
 	}
 }
 

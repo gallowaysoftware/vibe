@@ -43,7 +43,14 @@ const UnmanagedFrontImage = "unmanaged"
 // build. `repo:tag@sha256:…` is pinned — docker resolves the digest and
 // ignores the tag, which is why the reference stack keeps both: the tag
 // names the build for a human, the digest is the guarantee.
-func digestPinned(ref string) bool { return strings.Contains(ref, "@sha256:") }
+//
+// The digest half must be NON-EMPTY: a trailing `@sha256:` is a truncated
+// paste that docker refuses to pull, and reporting it as a pinned
+// deployment is the one answer that is wrong in both directions.
+func digestPinned(ref string) bool {
+	_, digest, ok := strings.Cut(ref, "@sha256:")
+	return ok && strings.TrimSpace(digest) != ""
+}
 
 // checkFrontImage reports whether the front's image reference is pinned.
 //
@@ -87,31 +94,37 @@ func (s *Server) checkFrontImage(rep *DoctorReport, host DoctorHost) {
 	}
 }
 
-// frontSwapVersion reads the FRONT's llama-swap version directly.
+// MaxSwapVersionLen bounds a llama-swap version string. fleetd's announce
+// hygiene bounds an announced one again at ingest (announce.go's clean,
+// 256 bytes, printable only); this is the tighter rule both READERS apply
+// before the value exists at all.
+const MaxSwapVersionLen = 64
+
+// ReadSwapVersion reads a llama-swap's own version off GET /api/version.
 //
-// The front is the one cell with no announcer by design (fleetd renders
-// its config; it serves no models of its own), so the announce-fed matrix
-// structurally excludes it — and the front is precisely the box the
-// 2026-08-05 incident happened to. A read-only GET on the address fleetd
-// already probes closes that hole without inventing an announcer.
+// ONE reader, because there are two producers and they must not drift:
+// each cell reads its own llama-swap for the announce block, and fleetd
+// reads the FRONT's directly (the front runs no announcer by design, and
+// it is precisely the box the 2026-08-05 incident happened to). The first
+// cut had two copies with two different hygiene rules — the front's
+// REJECTED an oversized answer while the cell's TRUNCATED it to 64 bytes,
+// and only the front's rejected control characters. Both directions were
+// wrong: a truncated version is a guess wearing a plausible shape, and an
+// announced control character makes fleetd's `clean` refuse the WHOLE
+// heartbeat, taking presence, the intent echo, usage and probes down with
+// a cosmetic field.
 //
-// Failure returns "" and the matrix simply has no front row, which the
-// check renders as an absence rather than as agreement.
-func (s *Server) frontSwapVersion(ctx context.Context) string {
-	var url string
-	for _, c := range s.cells {
-		if c.Name == fleetcfg.FrontCell {
-			url = c.URL
-		}
-	}
-	if url == "" {
+// So every failure — transport, status, JSON, hygiene — returns "". The
+// caller must render that as an ABSENCE and never as agreement.
+func ReadSwapVersion(ctx context.Context, client *http.Client, baseURL string) string {
+	if client == nil || strings.TrimSpace(baseURL) == "" {
 		return ""
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(url, "/")+"/api/version", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/api/version", nil)
 	if err != nil {
 		return ""
 	}
-	resp, err := s.snapClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return ""
 	}
@@ -126,12 +139,41 @@ func (s *Server) frontSwapVersion(ctx context.Context) string {
 		return ""
 	}
 	v := strings.TrimSpace(body.Version)
-	// The front is upstream software answering on a LAN address, so it is
-	// held to the same hygiene as an announce field (announce.go's clean).
-	if len(v) > 64 || !printableOneLine(v) {
+	// Upstream software answering on a LAN address is held to the same
+	// hygiene as an announce field (announce.go's clean).
+	if len(v) > MaxSwapVersionLen || !printableOneLine(v) {
 		return ""
 	}
 	return v
+}
+
+// frontSwapVersion reads the FRONT's llama-swap version directly, on the
+// address fleetd already probes — no announcer invented.
+//
+// Failure returns "", and checkVersions is responsible for SAYING SO: a
+// front the fleet could not read must not vanish into a verdict about the
+// cells that answered.
+func (s *Server) frontSwapVersion(ctx context.Context) string {
+	var url string
+	for _, c := range s.cells {
+		if c.Name == fleetcfg.FrontCell {
+			url = c.URL
+			break
+		}
+	}
+	return ReadSwapVersion(ctx, s.snapClient, url)
+}
+
+// hasFrontCell reports whether the registry carries a front with an
+// address to read. Without it "the front did not answer" and "there is no
+// front to ask" would be spelled the same way.
+func (s *Server) hasFrontCell() bool {
+	for _, c := range s.cells {
+		if c.Name == fleetcfg.FrontCell && strings.TrimSpace(c.URL) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func printableOneLine(s string) bool {

@@ -162,10 +162,14 @@ A cell's announced version is the fleet token's voice like everything else
 on that wire, and it already passes fleetd's `clean` hygiene
 (`announce.go`, 256 bytes, printable only) — the receiving side was
 already right. The sending side bounds it at 64 bytes anyway, and the
-front's direct read (which is *not* announce-shaped and so gets no
-`clean`) applies the same rule itself: over 64 bytes or non-printable
-returns `""`, which the matrix renders as a missing row rather than as
-agreement.
+front's direct read is *not* announce-shaped and gets no `clean` at all,
+so the rule has to live in the reader. It does, in exactly one place —
+`fleetapi.ReadSwapVersion`, shared by both producers: over 64 bytes or
+non-printable returns `""`, and the matrix then NAMES the box that did not
+answer rather than quietly omitting it. Both halves of that sentence were
+wrong in the first cut and are the review pass's A-1 and A-2 below; a
+truncating reader on the cell side could put an unprintable version on the
+wire, and fleetd's `clean` refuses the whole heartbeat over it.
 
 ### 4. What the ritual must catch, and where each thing is caught
 
@@ -292,6 +296,12 @@ Unit (mechanical, in-repo):
 | U8 | `ci.yml`'s conformance matrix equals the recorded fixture dirs | PASS |
 | U9 | C13's read-only source scan covers `upgrade.go` too, and passes | PASS |
 | U10 | full inner loop: build, vet, `test -race -count=5`, gofmt, `go mod tidy`, golangci-lint | PASS |
+| U11 | *(review)* the version matrix NAMES a front that did not answer and a cell that announced no version — on all four branches, and stays quiet when everyone answered | PASS |
+| U12 | *(review)* `ReadSwapVersion` rejects an over-long, unprintable or empty answer rather than truncating it, on both producers | PASS |
+| U13 | *(review)* an unprintable `versions.llama_swap` costs the cell its WHOLE announce (the consequence U12 exists to avoid) | PASS |
+| U14 | *(review)* `TestSwapContract` **I6** gates `GET /api/version` through the real reader, on both fake wires | PASS |
+| U15 | *(review)* two spellings of one llama-swap release are not divergence | PASS |
+| U16 | *(review)* `repo:tag@sha256:` with an empty digest is not a pin | PASS |
 
 Live (a real llama-swap binary, a real fleet, or real clients):
 
@@ -303,6 +313,7 @@ Live (a real llama-swap binary, a real fleet, or real clients):
 | L4 | the fleetlab half of `canary`: four real cells on the candidate binary, `lab.sh prove` green | **UNRUN** — see Execution |
 | L5 | `ritual.sh gate`: the six-client rig at `DELAY_S=90` against a candidate | **UNRUN** — a time budget (~15 min at 90s, ~45 at 420s) plus two manual clients |
 | L6 | the pin applied on the real front, doctor reporting `front.image_pin` OK and `versions.llama_swap` naming one version across the whole fleet | **UNRUN** — needs the fleet |
+| L7 | *(review)* the full `TestSwapContract` including **I6** against a real v239 **and** a real v247 binary, plus `TestSwapBehaviour` against real v239 | **PASS** — and I6 mutation-verified live: renaming the endpoint in `ReadSwapVersion` turns `live/exec/I6` red |
 
 ## Execution
 
@@ -486,6 +497,156 @@ Two things looked wrong and are deliberate:
   way there, and the report already leads with "this daemon is not a
   fleet registry".
 
+### Adversarial-review addendum (ground rule 9, second pass)
+
+An independent pass over the merged branch, against `origin/main`. Six
+findings, every fix mutation-verified — the mutation, the named test that
+went red, and the restore are listed per finding.
+
+**A-1 (major) — the version matrix read absence as agreement.** The whole
+reason `frontSwapVersion` exists is that the front announces nothing and
+is the box 2026-08-05 happened to. But a failed read simply removed the
+front from `vers`, and with any other cell reporting the check landed on
+
+```
+ok  versions.llama_swap  every reporting cell runs llama-swap v239
+```
+
+with no mention anywhere that the front had not answered. The same silence
+covered a *cell* whose vibe build predates C16's producer: it announces a
+versions block with `vibe` and `defs_sha` and no `llama_swap`, so
+`versions.reported` scores it OK ("versions block present") and the matrix
+drops it. That is the normal state of a fleet mid-vibe-upgrade — exactly
+when somebody asks which llama-swap the fleet is on.
+
+`defs.parity`, twenty lines earlier in the same function, already solved
+this: *"Which cells this verdict does NOT cover belongs on EVERY branch."*
+The matrix now carries the same note on all four branches, and the front's
+silence goes in the **Summary** rather than the Detail because the front
+appears in no other absence list on the report. The level is unchanged
+(C13's rule — a permanent UNKNOWN because one cell runs an old build
+teaches an operator to ignore the level), and the note disappears entirely
+when everyone answered, which is test-pinned in both directions.
+
+*Mutation:* force `coverNote` empty and drop the Summary clause →
+`TestDoctor_VersionMatrixNamesWhoDidNotAnswer` and all four subtests of
+`TestDoctor_VersionMatrixNamesTheSilentFrontOnEveryBranch` fail. Restored.
+
+**A-2 (major) — two readers, two hygiene rules, and the wrong one on the
+wire.** `daemon.llamaSwapVersion` and `Server.frontSwapVersion` were
+copies. The front's *rejected* an over-long or unprintable answer; the
+cell's **truncated** at 64 bytes and never looked at printability. Both
+directions are wrong:
+
+- a truncated version is a guess wearing a plausible shape, and it enters
+  the matrix as its own key — enough to raise a false
+  *"no conformance recording"* WARN, the loudest thing this check says;
+- an unprintable one is announced, and fleetd's `clean` refuses the
+  **whole announce** with 400. Not the field — the heartbeat. Presence,
+  the intent echo, the C7a usage feed and the C8 probe block all go with
+  it, permanently, because llama-swap keeps answering the same way. The
+  cell then goes stale and C9 pages about a box that is serving fine.
+
+§3 of this doc claimed the two sides "apply the same rule". They did not.
+There is now one reader — `fleetapi.ReadSwapVersion(ctx, client, baseURL)`
+— used by both producers, and it **rejects rather than truncates**. This
+is the repo's own "a guard that lives in one of four call paths is not a
+guard", at N=2.
+
+*Mutation:* restore the truncate-instead-of-reject branch →
+`TestReadSwapVersion_RejectsRatherThanTruncates`,
+`TestFrontSwapVersion_FailureIsAbsenceNotAgreement` (the author's own, on
+the other side) and `TestFleetVersions_NeverAnnouncesAValueFleetdWillRefuse`
+fail. Restored. `TestAnnounce_ControlCharVersionCostsTheWholeHeartbeat`
+states the consequence mechanically rather than in a comment.
+
+**A-3 (major) — the phase depends on an upstream endpoint the phase does
+not gate.** C16's thesis is that a behaviour this repo leans on must be
+replayed against a real binary before it is trusted. It then made
+`GET /api/version` the sole producer of the fleet's only *observed*
+version answer, and gated it with a hand-rolled `httptest` in
+`c16_test.go` — the fifty-first stand-in AGENTS.md names by number. The
+failure mode is the one the check exists to prevent, inverted: if a future
+release renames or gates the endpoint, every reader returns `""`, the
+matrix is empty, doctor reports UNKNOWN blaming *the announcers' vibe
+build*, and the ungated-version WARN can never fire — on precisely the
+upgrade large enough to move an endpoint.
+
+`internal/swaptest` now serves `/api/version` (reporting its own wire,
+which is the one value it does not have to invent) and `TestSwapContract`
+gained **I6**, folded through the REAL `fleetapi.ReadSwapVersion` like I1's
+in-flight fold and I2-I4's usagemeter classification. It runs on both fake
+wires and on the live binary, in both conformance jobs and the weekly
+drift job.
+
+*Mutation A:* remove the double's handler → I6 fails RED on
+`fake/v239` and `fake/v247` (not a skip — AGENTS.md's rule about a
+conformance invariant that cannot `t.Skip`). *Mutation B:* rename the path
+in `ReadSwapVersion` to `/api/version-renamed-upstream` and run the live
+target against a real v247 binary → `TestSwapContract/live/exec/I6` fails
+naming the missing producer. Both restored.
+
+**A-4 (minor) — divergence was decided on raw strings while gating was
+decided on normalised ones.** `ungatedSwapVersions` trims a build string
+off the release tag (its own table calls `v239 (dd81801)` a gated v239),
+but `len(vers) > 1` keyed on the raw strings, so those two spellings of
+one release read as *"cells run different llama-swap versions"* — a WARN
+telling an operator to finish a roll that is finished. Divergence now
+keys on the normalised release; the Detail still prints the raw matrix, so
+nothing is hidden by the grouping. *Mutation:* revert to `len(vers) > 1` →
+`TestDoctor_OneReleaseIsNotDivergence` fails. Restored.
+
+*(Measured while gating A-3: both real binaries answer `"version":"v239"`
+and `"version":"v247"` — the bare tag. The build string appears in
+`--version` output, not here. So A-4 is a latent false positive rather
+than a live one, and it is fixed at the cost of four lines.)*
+
+**A-5 (minor) — `digestPinned` called a truncated paste a pin.**
+`strings.Contains(ref, "@sha256:")` reports OK for `repo:tag@sha256:`,
+which is wrong in both directions at once: the operator is told the
+deployment is safely pinned, and docker refuses to pull it. Now the digest
+half must be non-empty. *Mutation:* restore the `Contains` form →
+`TestDigestPinned_EmptyDigestIsNotAPin` fails. Restored.
+
+**A-6 (nits, in `scripts/upgrade/` and the futures doc).**
+
+- `cmd_record`'s priming completion had no failure path, so a candidate
+  that served nothing still ran `TestRecord` — capturing an activity page
+  and an events stream from a wire that never carried a request. That is
+  the shape the in-flight bug hid inside. Now it kills the candidate and
+  `die`s.
+- The script header claimed *"every process it starts lives … on ports
+  9810-9819 … clear of scripts/fleetlab's 9600-9799"*, while `canary`
+  step 2 *is* `scripts/fleetlab` on those very ports. The header now says
+  so and points at futures item 15 — which matters, because the sweep it
+  describes is what makes a second lab unsafe.
+- The no-args usage was `sed -n '2,26p'`, pinned to line numbers that this
+  same commit moved; it printed a truncated help. Replaced with an `awk`
+  that prints the leading comment block.
+- Futures item 15 said fleetlab's ports blocked C16's **L3**; the gate
+  table and the Execution section both say **L4**. Corrected in the
+  futures doc.
+
+Two things this pass looked at and left alone:
+
+- **`checkVersions` dials the front serially, inside the report's one
+  deadline.** C13's rule is about fan-outs, and this is a single GET on a
+  client with a 3s timeout out of a 20s budget, on an address `Snapshot`
+  has already probed. Parallelising one dial buys nothing and adds a
+  goroutine to a read-only path.
+- **`llamaSwapVersion`'s `context.Background()`.** Reviewed again with the
+  author's reasoning and agreed: it is bounded at 2s, inside the daemon's
+  existing 3s `announceStopTimeout`, and threading a context through the
+  C3 `Versions func()` interface would change a cell-facing signature for
+  no reachable failure.
+
+Gates re-run after the fixes: `go build`, `go vet`, `gofmt -l .` silent,
+`go mod tidy` byte-identical, `golangci-lint run` **0 issues**,
+`go test -race ./...` green, `go test -race -count=5` green on
+`fleetapi`, `daemon`, `swaptest` and `cli`. `TestSwapContract` (all six
+invariants) against **real v239 and real v247** binaries: green on both.
+`TestSwapBehaviour` against real v239: B1 6.45s, B2 30.30s, green.
+
 ## For the reconciliation pass
 
 This branch does not touch `AGENTS.md`,
@@ -530,10 +691,23 @@ A new section, "The upgrade ritual (fleet-control C16)":
   declaration that the front runs no container). What catches a
   declaration nobody applied is the observed version matrix.
 - **`versions.llama_swap` has a producer** (C13 reported it UNKNOWN naming
-  the gap): each cell reads its own llama-swap's `GET /api/version`,
-  verified against real v239 and v247 binaries; fleetd reads the FRONT's
-  directly, because the front runs no announcer and is the box the
-  incident happened to. Failure yields absence, never a guess.
+  the gap): `fleetapi.ReadSwapVersion` is the ONE reader —
+  `GET /api/version`, verified against real v239 and v247 binaries — used
+  by both producers, each cell for its own llama-swap and fleetd directly
+  for the FRONT's (the front runs no announcer and is the box the incident
+  happened to). It **rejects rather than truncates**: a truncated version
+  is a guess that becomes its own matrix key, and an unprintable one makes
+  fleetd's `clean` refuse the cell's WHOLE announce — presence, intent
+  echo, usage and probes with it. The endpoint is gated like any other
+  upstream contract (`TestSwapContract` I6, folded through the real
+  reader, on both fake wires and a real binary); an upstream dependency
+  the conformance suite does not replay is the hole this phase exists to
+  close.
+- **Absence in the matrix is NAMED, on every branch.** A front that did
+  not answer and a cell whose vibe build predates the producer are both
+  silent in a way no other check reports, so `versions.llama_swap` carries
+  them the way `defs.parity` carries `absentNote` — and the front's
+  silence goes in the Summary, because it is in no other absence list.
 - **A version with no recording is a WARN ahead of plain divergence.**
   `fleetapi.GatedSwapVersions()`, `internal/swaptest/fixtures/` and
   `ci.yml`'s matrix are three copies of one fact, pinned to each other by

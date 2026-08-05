@@ -14,10 +14,14 @@
 # <version> is a llama-swap release tag: v247.
 #
 # It never touches production. Nothing here reads or writes ~/.config/vibe,
-# ~/.config/llama-swap, the daemon on :9001 or the router on :9000; every
-# process it starts lives under $UPGRADE_DIR (default /tmp/vibe-upgrade)
-# on ports 9810-9819 with upstreams at 6100+, clear of both production and
-# scripts/fleetlab's 9600-9799.
+# ~/.config/llama-swap, the daemon on :9001 or the router on :9000; the
+# processes it starts itself live under $UPGRADE_DIR (default
+# /tmp/vibe-upgrade) on ports 9810-9819 with upstreams at 6100+.
+#
+# The one exception is deliberate and worth knowing before you run it:
+# `canary` step 2 hands off to scripts/fleetlab, which binds ITS fixed
+# 9600-9799 range and whose `down` sweep is anchored on the shared upstream
+# ports. A second lab on this box will be killed by it (futures item 15).
 #
 # Knobs:
 #   UPGRADE_DIR    scratch root                    (default /tmp/vibe-upgrade)
@@ -163,8 +167,15 @@ EOF
   trap 'kill -TERM '"$pid"' 2>/dev/null' EXIT
   for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$port/running" >/dev/null && break; sleep 0.5; done
   # A completion first: the recording is of a wire that has carried traffic.
+  # A failure here must STOP: TestRecord would otherwise capture an
+  # activity page and an events stream from a wire that never carried a
+  # request, and a fixture recorded off an idle llama-swap is exactly the
+  # shape the in-flight bug hid inside.
   curl -sf -m 120 "http://127.0.0.1:$port/v1/chat/completions" -H 'Content-Type: application/json' \
-    -d '{"model":"conformance","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}' >/dev/null
+    -d '{"model":"conformance","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}' >/dev/null || {
+    kill -TERM $pid 2>/dev/null; trap - EXIT
+    die "the candidate served no completion — read $LOGS/record.log; a recording of an idle wire proves nothing"
+  }
   ( cd "$REPO" && SWAPTEST_RECORD_URL="http://127.0.0.1:$port" SWAPTEST_RECORD_MODEL=conformance \
       go test -count=1 -run TestRecord ./internal/swaptest/ )
   local rc=$?
@@ -287,5 +298,5 @@ case "${1:-}" in
   canary)    shift; cmd_canary    "${1:-}";;
   gate)      shift; cmd_gate      "${1:-}";;
   pin)       shift; cmd_pin       "${1:-}";;
-  *) sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2;;
+  *) awk 'NR>1 { if (/^#/) { sub(/^# ?/, ""); print; next } exit }' "${BASH_SOURCE[0]}"; exit 2;;
 esac

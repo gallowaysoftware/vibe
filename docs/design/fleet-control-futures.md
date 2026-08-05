@@ -238,7 +238,7 @@ Medium:
     (9600-9799, upstreams 5980-6019), so two lab instances cannot coexist
     on one box — and `down`'s sweep is anchored partly on that shared
     upstream range, so the second instance is entitled to kill the
-    first's processes. This blocked C16's L3 gate outright. One
+    first's processes. This blocked C16's L4 gate outright. One
     `FLEETLAB_PORT_BASE` knob threaded through `CELL_LIST` and the sweep
     patterns; small, and the parallel-agent workflow this repo now uses
     hits it immediately.

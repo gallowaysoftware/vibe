@@ -7,8 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 )
 
 // fleet-control C16 — the upgrade ritual. Two questions, deliberately
@@ -274,5 +278,213 @@ func TestUpgradeRitualIsRunnable(t *testing.T) {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("ritual.sh never mentions %q; the step it belongs to is prose, not a command", want)
 		}
+	}
+}
+
+// ─── adversarial review ─────────────────────────────────────────────────────
+
+// versionFleetWithFront is versionFleet's shape with a real front address,
+// so the direct /api/version read is exercised rather than refused by a
+// dead port.
+func versionFleetWithFront(t *testing.T, frontURL string, versions map[string]*AnnounceVersions) *Server {
+	t.Helper()
+	cells := []Cell{{Name: fleetcfg.FrontCell, URL: frontURL}}
+	names := make([]string, 0, len(versions))
+	for n := range versions {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		cells = append(cells, Cell{Name: n, URL: "http://127.0.0.1:1", Class: "always_on"})
+	}
+	s, _ := doctorServer(t, cells...)
+	for _, n := range names {
+		s.recordAnnounce(&AnnounceRequest{V: AnnounceVersion, Cell: n, Seq: 1,
+			Intent:   &AnnounceIntent{State: "serving", Since: time.Now().UTC()},
+			Versions: versions[n]})
+	}
+	return s
+}
+
+// TestDoctor_VersionMatrixNamesWhoDidNotAnswer is the review's headline
+// finding. `versions.llama_swap` reported
+//
+//	ok — every reporting cell runs llama-swap v239
+//
+// on a fleet where the FRONT had not answered at all and a second cell
+// announced no version. Both are the absent-evidence shape this repo keeps
+// relearning, and here they are the two silences the phase exists for: the
+// front is the box the 2026-08-05 incident happened to and the ONLY one
+// the direct read covers, and a cell on a vibe build older than C16's
+// producer is the normal state of a fleet mid-upgrade. Neither appears in
+// any other absence list on the report — defs.parity's absentNote covers
+// defs SHAs, not this field.
+func TestDoctor_VersionMatrixNamesWhoDidNotAnswer(t *testing.T) {
+	// A front that is up but has no /api/version (an older llama-swap, or
+	// a gated admin API): the read fails, the box vanishes from the matrix.
+	front := httptest.NewServer(http.HandlerFunc(http.NotFound))
+	defer front.Close()
+
+	s := versionFleetWithFront(t, front.URL, map[string]*AnnounceVersions{
+		"alpha": {LlamaSwap: "v239", Vibe: "v1", DefsSHA: "abc123"},
+		"bravo": {Vibe: "v0", DefsSHA: "abc123"}, // pre-C16 announcer
+	})
+	got := mustCheck(t, s.Doctor(context.Background()), "versions.llama_swap", "")
+	all := got.Summary + " " + got.Detail
+	if !strings.Contains(got.Summary, "FRONT did not answer") {
+		t.Errorf("summary = %q — a verdict that excludes the front must say so where an operator reads it; "+
+			"the front is the box this check was added for and appears in no other absence list", got.Summary)
+	}
+	if !strings.Contains(all, "bravo") {
+		t.Errorf("check = %q / %q — a cell that announces but reports no llama-swap version is invisible, "+
+			"so a fleet mid-upgrade reads as uniform", got.Summary, got.Detail)
+	}
+	if strings.Contains(all, "alpha") && !strings.Contains(all, "v239") {
+		t.Errorf("check = %q / %q — the cells that DID answer should still be named", got.Summary, got.Detail)
+	}
+}
+
+// TestDoctor_VersionMatrixNamesTheSilentFrontOnEveryBranch: the
+// qualification is not an OK-branch decoration. A divergent, ungated or
+// empty matrix hides the same box, and defs.parity's rule ("which cells
+// this verdict does NOT cover belongs on EVERY branch") is the precedent.
+func TestDoctor_VersionMatrixNamesTheSilentFrontOnEveryBranch(t *testing.T) {
+	front := httptest.NewServer(http.HandlerFunc(http.NotFound))
+	defer front.Close()
+
+	for _, tc := range []struct {
+		name  string
+		cells map[string]*AnnounceVersions
+	}{
+		{"empty", map[string]*AnnounceVersions{"alpha": {Vibe: "v0"}}},
+		{"divergent", map[string]*AnnounceVersions{"alpha": {LlamaSwap: "v239"}, "bravo": {LlamaSwap: "v247"}}},
+		{"ungated", map[string]*AnnounceVersions{"alpha": {LlamaSwap: "v260"}}},
+		{"agreed", map[string]*AnnounceVersions{"alpha": {LlamaSwap: "v239"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := versionFleetWithFront(t, front.URL, tc.cells)
+			got := mustCheck(t, s.Doctor(context.Background()), "versions.llama_swap", "")
+			if !strings.Contains(got.Summary+" "+got.Detail, "FRONT did not answer") {
+				t.Errorf("%s branch = %q / %q — the front's silence is dropped here", tc.name, got.Summary, got.Detail)
+			}
+		})
+	}
+}
+
+// TestDoctor_VersionMatrixStaysQuietWhenEveryoneAnswered: the note may not
+// become a permanent qualification on a healthy fleet (C13's rule about a
+// level nobody reads).
+func TestDoctor_VersionMatrixStaysQuietWhenEveryoneAnswered(t *testing.T) {
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/version" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"version":"v239"}`))
+	}))
+	defer front.Close()
+
+	s := versionFleetWithFront(t, front.URL, map[string]*AnnounceVersions{
+		"alpha": {LlamaSwap: "v239", DefsSHA: "abc123"},
+	})
+	got := mustCheck(t, s.Doctor(context.Background()), "versions.llama_swap", "")
+	if got.Level != LevelOK {
+		t.Fatalf("level = %q, want ok", got.Level)
+	}
+	if strings.Contains(got.Summary+" "+got.Detail, "did not answer") {
+		t.Errorf("check = %q / %q — every box answered; a permanent qualification teaches an operator to skip the line",
+			got.Summary, got.Detail)
+	}
+	if !strings.Contains(got.Summary, "v239") {
+		t.Errorf("summary = %q, want the version named", got.Summary)
+	}
+}
+
+// TestDoctor_OneReleaseIsNotDivergence: gating normalises a build string
+// off the release tag and the divergence branch did not, so `v239` beside
+// `v239 (dd81801)` — the exact pair `ungatedSwapVersions`' own table calls
+// one gated release — read as two versions of llama-swap.
+func TestDoctor_OneReleaseIsNotDivergence(t *testing.T) {
+	s := versionFleet(t, map[string]*AnnounceVersions{
+		"alpha": {LlamaSwap: "v239"},
+		"bravo": {LlamaSwap: "v239 (dd81801)"},
+	})
+	got := mustCheck(t, s.Doctor(context.Background()), "versions.llama_swap", "")
+	if got.Level != LevelOK {
+		t.Fatalf("two spellings of one release → %s (%q), want ok: the gating half already normalises them",
+			got.Level, got.Summary)
+	}
+}
+
+// TestDigestPinned_EmptyDigestIsNotAPin: `repo:tag@sha256:` is a truncated
+// paste docker refuses to pull, and calling it pinned is wrong in both
+// directions — the operator is told the deployment is safe AND the
+// deployment does not start.
+func TestDigestPinned_EmptyDigestIsNotAPin(t *testing.T) {
+	if digestPinned("ghcr.io/mostlygeek/llama-swap:v239-cpu-b9994@sha256:") {
+		t.Error("an empty digest was reported as a pin")
+	}
+	if digestPinned("ghcr.io/mostlygeek/llama-swap:v239-cpu-b9994@sha256:   ") {
+		t.Error("a whitespace digest was reported as a pin")
+	}
+	if !digestPinned("ghcr.io/mostlygeek/llama-swap:v239-cpu-b9994@sha256:6bae869") {
+		t.Error("a real pin stopped being recognised")
+	}
+}
+
+// TestReadSwapVersion_RejectsRatherThanTruncates: the two readers were two
+// copies with two rules. The cell-side one truncated an over-long answer
+// to 64 bytes — a guess wearing a plausible shape, which then enters the
+// matrix as its own version and can raise a false ungated-version WARN —
+// while the front-side one rejected it. One reader now, and it rejects.
+func TestReadSwapVersion_RejectsRatherThanTruncates(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"over long", `{"version":"` + strings.Repeat("v", 500) + `"}`},
+		{"just over the bound", `{"version":"` + strings.Repeat("v", MaxSwapVersionLen+1) + `"}`},
+		{"control character", "{\"version\":\"v2\\n39\"}"},
+		{"empty", `{"version":""}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			if got := ReadSwapVersion(context.Background(), srv.Client(), srv.URL); got != "" {
+				t.Fatalf("ReadSwapVersion = %q, want absence — a truncated or unprintable version is a guess, "+
+					"and an unprintable one makes fleetd's clean() refuse the whole announce", got)
+			}
+		})
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"version":" v239 ","commit":"dd81801"}`))
+	}))
+	defer srv.Close()
+	if got := ReadSwapVersion(context.Background(), srv.Client(), srv.URL); got != "v239" {
+		t.Fatalf("ReadSwapVersion = %q, want v239", got)
+	}
+	if got := ReadSwapVersion(context.Background(), srv.Client(), ""); got != "" {
+		t.Fatalf("ReadSwapVersion with no base URL = %q, want empty", got)
+	}
+}
+
+// TestAnnounce_ControlCharVersionCostsTheWholeHeartbeat states, in this
+// package, the consequence the cell-side reader's hygiene exists to avoid.
+// It is not a change — it is C3's rule working exactly as designed — but
+// without it the daemon-side test's reason lives only in a comment.
+func TestAnnounce_ControlCharVersionCostsTheWholeHeartbeat(t *testing.T) {
+	req := &AnnounceRequest{V: AnnounceVersion, Cell: "alpha", Seq: 1,
+		Intent:   &AnnounceIntent{State: "serving", Since: time.Now().UTC()},
+		Models:   []AnnounceModel{{ID: "m", State: "ready"}},
+		Versions: &AnnounceVersions{LlamaSwap: "v2\n39", Vibe: "v1", DefsSHA: "abc123"},
+	}
+	if err := validateAnnounce(req); err == nil {
+		t.Fatal("fleetd accepted a control character in versions.llama_swap")
+	}
+	// The point: the refusal is of the ANNOUNCE, so the intent echo, the
+	// models and the usage feed go with it. A producer that lets such a
+	// value onto the wire silences the cell, not just the field.
+	req.Versions.LlamaSwap = "v239"
+	if err := validateAnnounce(req); err != nil {
+		t.Fatalf("a clean version was refused: %v", err)
 	}
 }

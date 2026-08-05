@@ -2,10 +2,8 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -160,19 +158,23 @@ func fleetVersionsAt(backendsDir, llamaSwapURL string) *fleetapi.AnnounceVersion
 // blank field, never the announce itself.
 const llamaSwapVersionTimeout = 2 * time.Second
 
-// maxSwapVersionLen bounds what goes on the wire. fleetd's announce
-// hygiene bounds it again at ingest (announce.go's clean, 256 bytes) —
-// this is the sending side of the same rule, and the receiving side is
-// the one that matters.
-const maxSwapVersionLen = 64
+// swapVersionClient is its own client rather than http.DefaultClient: the
+// timeout belongs to this read, and a pooled connection to a llama-swap
+// that has wedged has no business being shared with the rest of the
+// daemon.
+var swapVersionClient = &http.Client{Timeout: llamaSwapVersionTimeout}
 
-// llamaSwapVersion reads the local llama-swap's own version.
+// llamaSwapVersion reads the local llama-swap's own version for the
+// announce block.
 //
 // GET /api/version answers {"version":"v239","commit":…,"build_date":…} and
 // was verified against real v239 and v247 binaries before this producer
 // was written — C13 reported the field UNKNOWN naming the missing
 // producer precisely because guessing an endpoint from a box that cannot
-// check it is worse than an honest gap. Every failure returns "", which
+// check it is worse than an honest gap.
+//
+// The read itself is fleetapi's, shared with the front-side reader, so the
+// two cannot drift on what they accept. Every failure returns "", which
 // doctor renders as "no cell reports a version", never as agreement.
 func llamaSwapVersion(baseURL string) string {
 	if baseURL == "" {
@@ -180,29 +182,7 @@ func llamaSwapVersion(baseURL string) string {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), llamaSwapVersionTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/api/version", nil)
-	if err != nil {
-		return ""
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return ""
-	}
-	var body struct {
-		Version string `json:"version"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&body); err != nil {
-		return ""
-	}
-	v := strings.TrimSpace(body.Version)
-	if len(v) > maxSwapVersionLen {
-		v = v[:maxSwapVersionLen]
-	}
-	return v
+	return fleetapi.ReadSwapVersion(ctx, swapVersionClient, baseURL)
 }
 
 // localLlamaSwapURL is the daemon's own router base. Same construction as
