@@ -6,11 +6,12 @@ self-review commit (five findings, one of them a test that would have
 reported two contradictory failures about one event — see the
 [self-review addendum](#adversarial-self-review-addendum)); every fix
 mutation-verified. Unit gates U1–U10 green on a full local inner loop.
-**Live gates L1 and L2 PASS** — the new conformance behaviours ran
-against real llama-swap v239 and v247 binaries, and the ritual's own
+**Live gates L1, L2 and L3 PASS** — the new conformance behaviours ran
+against real llama-swap v239 and v247 binaries, the ritual's own
 `preflight`/`canary` steps ran end to end against a candidate the script
-fetched itself. L3 (the fleetlab half of `canary`) and L4 (the six-client
-gate) are **UNRUN**, for the honest reason recorded in
+fetched itself, and both new doctor checks ran through a real fleetd
+beside a real llama-swap front. L4 (the fleetlab half of `canary`) and L5
+(the six-client gate) are **UNRUN**, for the honest reasons recorded in
 [Execution](#execution). See [Acceptance gates](#acceptance-gates).
 
 Backlog item 13 in [fleet-control-futures.md](../fleet-control-futures.md)
@@ -298,9 +299,10 @@ Live (a real llama-swap binary, a real fleet, or real clients):
 |---|---|---|
 | L1 | **B1 + B2 pass against a real v239 AND a real v247 binary**, and B1 fails when `sendLoadingState` is removed | **PASS** |
 | L2 | `ritual.sh preflight` and the conformance half of `canary` run end to end against a candidate the script fetched itself | **PASS** |
-| L3 | the fleetlab half of `canary`: four real cells on the candidate binary, `lab.sh prove` green | **UNRUN** — see Execution |
-| L4 | `ritual.sh gate`: the six-client rig at `DELAY_S=90` against a candidate | **UNRUN** — a time budget (~15 min at 90s, ~45 at 420s) plus two manual clients |
-| L5 | the pin applied on the real front, doctor reporting `front.image_pin` OK and `versions.llama_swap` naming one version | **UNRUN** — needs the fleet |
+| L3 | both new checks through the whole path — a real fleetd, a real llama-swap front, `vibe fleet doctor` — with `front.image_pin` moving UNKNOWN → WARN → OK → OK as the declaration changes and `versions.llama_swap` naming the version the front actually answers | **PASS** |
+| L4 | the fleetlab half of `canary`: four real cells on the candidate binary, `lab.sh prove` green | **UNRUN** — see Execution |
+| L5 | `ritual.sh gate`: the six-client rig at `DELAY_S=90` against a candidate | **UNRUN** — a time budget (~15 min at 90s, ~45 at 420s) plus two manual clients |
+| L6 | the pin applied on the real front, doctor reporting `front.image_pin` OK and `versions.llama_swap` naming one version across the whole fleet | **UNRUN** — needs the fleet |
 
 ## Execution
 
@@ -375,7 +377,36 @@ then ran the full `TestSwapContract|TestSwapBehaviour|TestRecordingIsCurrent`
 list against the fetched v247 binary over a real llama-server and a real
 GGUF: `ok … 38.688s`.
 
-**L3 UNRUN, and the reason is not "needs metal".** `scripts/fleetlab`
+**L3 PASS.** A real fleetd (`fleet_registry: true`, scratch XDG triple,
+control plane on `:9816`) beside a real llama-swap front on `:9815`, with
+`vibe fleet doctor` run four times against it, changing only
+`fleet.front_image`. Ports 9815-9817 and a scratch config dir, so nothing
+touched production or another agent's lab.
+
+```
+front llama-swap: {"build_date":"2026-07-11T21:47:14Z","commit":"dd81801","version":"v239"}
+
+### undeclared (front_image=<unset>)
+UNKNOWN front.image_pin      -      nothing declares which image the front runs
+OK      versions.llama_swap  -      every reporting cell runs llama-swap v239
+
+### floating tag (front_image=ghcr.io/mostlygeek/llama-swap:cpu)
+WARN    front.image_pin      -      front image is a floating tag: ghcr.io/mostlygeek/llama-swap:cpu
+
+### digest pinned (front_image=…v239-cpu-b9994@sha256:6bae869…)
+OK      front.image_pin      -      front image is digest-pinned
+
+### unmanaged (front_image=unmanaged)
+OK      front.image_pin      -      the front is declared not to run from a container image
+```
+
+Two things this proves that no unit test can. The declared half moves
+through all four verdicts with the deployment as its only input. And
+`versions.llama_swap` — UNKNOWN in every C13 transcript, because nothing
+had ever written the field — reports a real version read off a real
+llama-swap over HTTP, for the front, which announces nothing.
+
+**L4 UNRUN, and the reason is not "needs metal".** `scripts/fleetlab`
 binds fixed ports 9600-9799 and upstreams 5980-6019, and another agent's
 lab instance held them for the whole of this build. Two labs cannot
 coexist, and `lab.sh down`'s sweep is anchored partly on that shared
@@ -385,12 +416,12 @@ it is noted for the futures doc rather than papered over. The step is
 scripted and the command is
 `FLEETLAB_DIR=… LLAMA_SWAP=<candidate> ./scripts/upgrade/ritual.sh canary <v>`.
 
-**L4 UNRUN.** A time budget, not a hardware one: ~15 minutes at
+**L5 UNRUN.** A time budget, not a hardware one: ~15 minutes at
 `DELAY_S=90` for the automated five clients, ~45 at the recorded 420s, plus
 two manual clients. The rig itself is unchanged and its last recorded runs
 are checked in at `scripts/smoke/llama-swap/results-*.txt`.
 
-**L5 UNRUN.** Applying the pin and rolling cells needs the fleet; SSH is
+**L6 UNRUN.** Applying the pin and rolling cells needs the fleet; SSH is
 blocked and the LAN does not route from here.
 
 ### Adversarial self-review addendum
@@ -512,7 +543,7 @@ A new section, "The upgrade ritual (fleet-control C16)":
 
 - A `C16` row: *The upgrade ritual: digest-pin the front, make the bump a
   sequence* — ~700 lines, depends on #37's conformance work, status
-  "PR open; unit gates U1–U9 green; **L1 + L2 PASS**, L3–L5 unrun".
+  "PR open; unit gates U1-U10 green; **L1-L3 PASS**, L4-L6 unrun".
 - A paragraph after C14's, along the lines of: C16 (2026-08-05) is backlog
   item 13, and it is the first phase whose subject is the repo's own
   discipline rather than the fleet's state. Its one carried rule is that
@@ -527,9 +558,10 @@ A new section, "The upgrade ritual (fleet-control C16)":
   And **the mid-state is the normal state**: old recordings are kept
   rather than replaced and CI replays every one, because a fleet spends
   most of an upgrade with two llama-swap versions in it.
-- Also worth a line in the "what still needs metal" paragraph: L3 here is
+- Also worth a line in the "what still needs metal" paragraph: C16's L4 is
   blocked by `scripts/fleetlab`'s fixed ports rather than by hardware —
-  two lab instances cannot coexist on one box.
+  two lab instances cannot coexist on one box, which the parallel-agent
+  workflow now hits routinely.
 
 ### docs/design/fleet-control.md
 
