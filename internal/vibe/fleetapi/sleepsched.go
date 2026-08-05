@@ -521,7 +521,7 @@ func (s *Server) wakeWarm(ctx context.Context, cell, model string, cfg sleepLoop
 	if s.frontCanRoute(cell) {
 		err = cfg.warmFn(ctx, cfg.frontURL, model)
 	} else {
-		err = fmt.Errorf("cell %q has no front route (announce-only)", cell)
+		err = noFrontRoute(cell)
 	}
 	if err == nil {
 		return "warmed " + model

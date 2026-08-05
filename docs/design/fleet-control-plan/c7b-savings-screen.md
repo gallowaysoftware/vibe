@@ -235,7 +235,7 @@ single route, selected by **hash routing** (`#savings`).
 Hash routing is not a style preference. `/ui/fleet/savings` would need
 the bearer middleware's exact-match exemption (`daemon/auth.go:139-142`)
 widened to a prefix, which [C5](c5-land-c4.md) §7 forbids in as many
-words. A fragment never reaches the server, so `r.URL.Path` stays
+words. A fragment never reaches the server, so the request path stays
 `/ui/fleet`, deep links work in a bare tab, and C5's claim that the page
 adds exactly one route survives literally.
 

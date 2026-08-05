@@ -556,7 +556,19 @@ func (s *Server) checkVersions(rep *DoctorReport, snap StateSnapshot, pres map[s
 	}
 
 	// def-SHA parity.
-	clean := map[string][]string{} // sha -> cells
+	//
+	// Dirtiness may only ever ADD concern. `reported` holds every cell
+	// that names a SHA, dirty or not, and it is what decides DIVERGENCE;
+	// `clean` is the subset whose SHA also describes what is running, and
+	// it is what a verdict of AGREEMENT may rest on. The first cut dropped
+	// a dirty cell from the comparison entirely, so the 2026-08-05 live
+	// gate watched a correctly-reported divergence flip to OK the moment
+	// the diverged cell's checkout went dirty — a diagnostic going quiet
+	// exactly as the situation gets worse. A dirty tree can vouch for
+	// nobody, but it can still DISagree: base commits that differ, plus
+	// uncommitted edits on top of one of them.
+	reported := map[string][]string{} // sha -> cells, clean and dirty alike
+	clean := map[string][]string{}    // sha -> cells whose working tree is clean
 	var dirty, absent []string
 	for _, c := range snap.Cells {
 		p := pres[c.Name]
@@ -566,6 +578,7 @@ func (s *Server) checkVersions(rep *DoctorReport, snap StateSnapshot, pres map[s
 			}
 			continue
 		}
+		reported[p.Versions.DefsSHA] = append(reported[p.Versions.DefsSHA], c.Name)
 		if p.Versions.DefsDirty {
 			dirty = append(dirty, c.Name+" ("+p.Versions.DefsSHA+")")
 			continue
@@ -576,10 +589,7 @@ func (s *Server) checkVersions(rep *DoctorReport, snap StateSnapshot, pres map[s
 	sort.Strings(absent)
 	dirtyNote := ""
 	if len(dirty) > 0 {
-		// A dirty checkout's SHA does not describe what is running, so it
-		// can neither agree nor disagree. Counting it as agreement because
-		// the string matches is the absent-evidence mistake exactly.
-		dirtyNote = " Uncomparable (working tree dirty): " + strings.Join(dirty, ", ") + "."
+		dirtyNote = " Working tree dirty (the SHA names the base commit, not what is running): " + strings.Join(dirty, ", ") + "."
 	}
 	// Which cells this verdict does NOT cover belongs on EVERY branch. A
 	// divergence report that lists two SHAs on a four-cell fleet reads as
@@ -589,16 +599,39 @@ func (s *Server) checkVersions(rep *DoctorReport, snap StateSnapshot, pres map[s
 	if len(absent) > 0 {
 		absentNote = " Not reporting a SHA: " + strings.Join(absent, ", ") + "."
 	}
+	// fleetd's own checkout belongs on every branch that names SHAs, for
+	// the same reason absentNote does. The agreement branch spells out
+	// what a mismatch MEANS (the render comes from a different tree) and
+	// grades on it; the divergence branch cannot grade — it is already a
+	// WARN — but dropping the fact there hid it in the one report where
+	// "so which tree is the render coming from" is the operator's very
+	// next question.
+	hostNote := ""
+	if host.DefsSHA != "" {
+		hostSHA := host.DefsSHA
+		if host.DefsDirty {
+			hostSHA += ", dirty"
+		}
+		hostNote = " fleetd's own def checkout is at " + hostSHA + "."
+	}
 	switch {
-	case len(clean) == 0:
+	case len(reported) == 0:
 		rep.Add(DoctorCheck{ID: "defs.parity", Level: LevelUnknown,
-			Summary: "no cell reports a clean defs SHA",
-			Detail:  "nothing to compare." + dirtyNote + absentNote})
-	case len(clean) > 1:
+			Summary: "no cell reports a defs SHA",
+			Detail:  "nothing to compare." + hostNote + absentNote})
+	case len(reported) > 1:
 		rep.Add(DoctorCheck{ID: "defs.parity", Level: LevelWarn,
 			Summary: "cells disagree about the def checkout",
-			Detail:  shaGroups(clean) + "." + dirtyNote + absentNote,
+			Detail:  shaGroups(reported) + "." + hostNote + dirtyNote + absentNote,
 			Fix:     "converge the backend-def checkouts; a fingerprint mismatch downstream is this, one level up."})
+	case len(clean) == 0:
+		// One SHA across the fleet and not one cell can vouch for it. C13's
+		// own rule: a check that cannot compare says so distinctly rather
+		// than reporting health.
+		rep.Add(DoctorCheck{ID: "defs.parity", Level: LevelUnknown,
+			Summary: "no cell reports a clean defs SHA",
+			Detail: "every reporting cell's checkout is dirty, so the matching SHA proves nothing about what is running." +
+				hostNote + dirtyNote + absentNote})
 	default:
 		var sha string
 		for k := range clean {
@@ -606,9 +639,20 @@ func (s *Server) checkVersions(rep *DoctorReport, snap StateSnapshot, pres map[s
 		}
 		det := "every reporting cell is at " + sha + "."
 		lvl := LevelOK
-		if host.DefsSHA != "" && host.DefsSHA != sha && !host.DefsDirty {
+		// The same trap one level down: a fleetd on a DIFFERENT commit is a
+		// WARN because the render it writes comes from another tree, and
+		// `!host.DefsDirty` used to suppress that WARN in the strictly worse
+		// case where fleetd had edits on top of the different commit.
+		switch {
+		case host.DefsSHA != "" && host.DefsSHA != sha:
 			lvl = LevelWarn
-			det += fmt.Sprintf(" fleetd's own def checkout is at %s — the render it writes comes from a different tree than the cells serve.", host.DefsSHA)
+			hostSHA := host.DefsSHA
+			if host.DefsDirty {
+				hostSHA += ", dirty"
+			}
+			det += fmt.Sprintf(" fleetd's own def checkout is at %s — the render it writes comes from a different tree than the cells serve.", hostSHA)
+		case host.DefsSHA == sha && host.DefsDirty:
+			det += " fleetd's own checkout is at that SHA with a dirty working tree, so the render it writes is not any committed version."
 		}
 		rep.Add(DoctorCheck{ID: "defs.parity", Level: lvl, Summary: "def checkouts agree", Detail: det + dirtyNote + absentNote})
 	}

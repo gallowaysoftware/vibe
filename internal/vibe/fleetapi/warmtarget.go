@@ -338,7 +338,7 @@ func (s *Server) restore(t WarmTarget, st *warmTargetState, cfg warmLoopConfig, 
 	if s.frontCanRoute(t.Cell) {
 		err = cfg.warmFn(ctx, cfg.frontURL, t.Model)
 	} else {
-		err = fmt.Errorf("cell %q has no front route (announce-only)", t.Cell)
+		err = noFrontRoute(t.Cell)
 	}
 	if err != nil {
 		note, qerr := s.queueWarm(t.Cell, t.Model, err)
@@ -511,13 +511,27 @@ func (s *Server) queueWarm(cell, model string, cause error) (string, error) {
 }
 
 // frontCanRoute reports whether the front could route a warm to this
-// cell at all. The front's peer config is rendered from hosts.yaml
-// (render_loop.go), so a cell fleetd knows only through its announces
-// has no front route — the warm-loop analog of fleetmcp's "cell has no
-// daemon_url", and the case the piggyback queue exists for. Sending the
-// warm anyway would earn a definitive 404 from the front and, by the
-// rule above, correctly refuse the queue for the one cell that needs it.
+// cell at all. The front's peer config is rendered from the registry
+// (render_loop.go), and every registry cell carries a url — hosts.yaml
+// requires one — so a cell with no url here is a cell that is not in the
+// registry. Sending the warm anyway would earn a definitive 404 from the
+// front and, by the rule above, correctly refuse the queue.
 func (s *Server) frontCanRoute(cell string) bool { return s.cellURL(cell) != "" }
+
+// noFrontRoute names what the missing route actually IS.
+//
+// It used to say "(announce-only)", describing a cell fleetd knew only
+// through its announces — a state that cannot exist. hosts.yaml is the
+// single source of cell membership, and POST /api/fleet/announce refuses
+// a cell absent from it (announce.go), so nothing can announce itself
+// into the registry. What reaches here is a warm target, a backend def's
+// `cell:` or a sleep entry naming a box hosts.yaml has never heard of,
+// and "announce-only" sent the operator looking for a dead announcer
+// instead of a missing registry entry — which the piggyback attempt that
+// follows then confirmed with "has never announced".
+func noFrontRoute(cell string) error {
+	return fmt.Errorf("cell %q is not in fleetd's cell registry (hosts.yaml), so the front has no peer entry to route a warm through", cell)
+}
 
 // warmStatus is the fleet_status surface for the warm loops.
 type warmStatus struct {

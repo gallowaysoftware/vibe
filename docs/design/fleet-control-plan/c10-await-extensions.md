@@ -199,8 +199,14 @@ be evaluated* rather than *the cell never went idle*. There is no
 escape hatch is to drop `--idle`, which is at least honest about what
 the batch is doing.
 
-The cells this bites are the ones fleetd has no `url` for (announce-only
-membership), which is the same population C4's warm targets skip. The
+The cells this bites are the ones fleetd holds no live `/api/events`
+stream to — a cell behind NAT, or one whose `url` is in `hosts.yaml` and
+simply does not answer from where fleetd runs. (*Corrected 2026-08-05:
+this read "the ones fleetd has no `url` for (announce-only membership)".
+Every `hosts.yaml` cell carries a `url` — the loader requires one — and a
+cell absent from `hosts.yaml` cannot announce at all, so neither half of
+that sentence described a reachable state. The discriminator is and
+always was the observation channel, which is what the code checks.*) The
 one activity signal they do carry is C7a's announce-borne cumulative
 token counters; wiring those into an idle window is deliberately left
 alone (see [§Out of scope](#out-of-scope)).
@@ -333,14 +339,15 @@ invocation is byte-for-byte unchanged in behaviour.
        stays blocked, and unblocks 2 minutes after the last token —
        which also verifies that llama-swap v239 emits an inflight
        remove-edge frame the fold can see.
-    c. The announce-only case: a cell fleetd holds no `url` for prints
-       the no-evidence line and never unblocks on `--idle`.
+    c. The no-observation case: a cell fleetd holds no live
+       `/api/events` stream to prints the no-evidence line and never
+       unblocks on `--idle`.
     d. The full primitive end to end on two shells: B waits for A's
        lease to expire.
 
 ## Out of scope
 
-- **Idle for announce-only cells from C7a's usage counters.** The
+- **Idle for unwatched cells from C7a's usage counters.** The
   cumulative per-model token totals on each announce *are* an activity
   signal, at one-heartbeat resolution, for exactly the cells that have
   no events stream. It is the obvious next evidence channel and it is
@@ -522,9 +529,9 @@ happened stay immediate, because they already follow `assertSilent`.
   lease POST there is one poll interval in which another batch can
   unblock on the same cell. Leases are advisory; a real mutex is a
   different feature and this fleet has one operator.
-- **No `--idle` for announce-only cells.** §Out of scope names the
-  usage-counter channel that could serve them; today they get a refusal
-  with a reason, which is the correct failure.
+- **No `--idle` for cells fleetd does not watch.** §Out of scope names
+  the usage-counter channel that could serve them; today they get a
+  refusal with a reason, which is the correct failure.
 
 ### What the live gates would prove that the unit gates cannot
 

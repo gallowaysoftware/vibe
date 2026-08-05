@@ -487,9 +487,9 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) refr
 
 // ── savings view ───────────────────────────────────────────────────────────
 // A second VIEW at the same single route, selected by the URL fragment.
-// A fragment never reaches the server, so r.URL.Path stays /ui/fleet and
-// the bearer middleware's exact-match exemption does not have to widen
-// to a prefix — which C5 §7 forbids in as many words.
+// A fragment never reaches the server, so the request path stays
+// /ui/fleet and the bearer middleware's exact-match exemption does not
+// have to widen to a prefix — which C5 §7 forbids in as many words.
 let savingsAt = 0, savingsWindow = "30d", savingsBusy = false;
 
 function usd(v) { return v == null ? "—" : (v < 0 ? "-$" : "$") + Math.abs(v).toFixed(2); }

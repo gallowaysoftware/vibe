@@ -165,6 +165,17 @@ type authGuard struct {
 // grant every route added after it was written, and this plan adds
 // routes most phases.
 //
+// RAW means r.URL.EscapedPath(), not r.URL.Path. net/url decodes before
+// any of this runs — url.ParseRequestURI("/ui/%66leet") yields
+// URL.Path == "/ui/fleet" — so matching on .Path silently granted every
+// percent-encoded spelling of a declared route, while AGENTS.md and this
+// comment both claimed the raw path was the subject. Go's ServeMux
+// happens to route on the decoded path too, so nothing was reachable
+// that was not already reachable; what was wrong was the INVARIANT, and
+// it would become a hole the day anything routes on RawPath. An encoded
+// spelling is now simply a different string, and a miss is token-only —
+// the same answer /ui/fleet%2f has always got.
+//
 // Two levels sit below the control-plane token:
 //   - AccessPublic (exactly GET /ui/fleet): the fleet page is a static
 //     asset with no fleet data in it and must load in a bare browser tab
@@ -186,7 +197,7 @@ func bearerAuthMiddleware(g authGuard, next http.Handler) http.Handler {
 		}
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		access := fleetapi.AccessFor(r.Method, r.URL.Path)
+		access := fleetapi.AccessFor(r.Method, r.URL.EscapedPath())
 		if access == fleetapi.AccessPublic {
 			next.ServeHTTP(w, r)
 			return

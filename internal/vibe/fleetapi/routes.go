@@ -58,9 +58,10 @@ func (a Access) String() string {
 
 // Route is one mounted endpoint and what it grants. Method and Path are
 // matched EXACTLY: the middleware compares them against r.Method and
-// r.URL.Path before the mux cleans anything, so a trailing slash, a
-// traversal segment, a percent-encoded separator and a doubled leading
-// slash are all misses, and a miss is a 401.
+// r.URL.EscapedPath() before the mux cleans anything, so a trailing
+// slash, a traversal segment, a percent-encoded separator, a
+// percent-encoded ordinary character and a doubled leading slash are all
+// misses, and a miss is a 401.
 type Route struct {
 	Method string
 	Path   string
@@ -191,11 +192,12 @@ var accessByRoute = func() map[string]Access {
 // /mcp and the whole Connect RPC mount included, plus every route a
 // future phase adds without a decision — is AccessTokenOnly.
 //
-// The comparison is exact on both fields and performed on the RAW
-// request path, before the mux cleans it. Do not add prefix matching,
-// path.Clean, case folding or a regexp here: each of those turns one
-// declared hole into a family of them (C5, and its six pinned bypass
-// attempts).
+// The comparison is exact on both fields, and the caller passes the RAW
+// request path (r.URL.EscapedPath()), before the mux cleans it and
+// before net/url's decoding can turn %66 into an f. Do not add prefix
+// matching, path.Clean, url.PathUnescape, case folding or a regexp here:
+// each of those turns one declared hole into a family of them (C5, and
+// its pinned bypass attempts).
 func AccessFor(method, path string) Access {
 	a, ok := accessByRoute[method+" "+path]
 	if !ok || a == AccessUndecided {
