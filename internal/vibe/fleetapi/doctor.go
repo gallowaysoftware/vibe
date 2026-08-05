@@ -152,6 +152,13 @@ type DoctorHost struct {
 	// render mount contract) — which is the only reason doctor may report
 	// anything about the front's disk.
 	FrontConfig string
+	// FrontImage is fleet.front_image: the container image reference the
+	// front is DEPLOYED from, as declared to fleetd. fleetd has no docker
+	// socket and is a different container, so this is the one fact about
+	// the front's deployment it cannot observe — and an unpinned one is
+	// how the fleet's llama-swap changes without anybody deciding to.
+	// UnmanagedFrontImage is the declaration that there is no image.
+	FrontImage string
 	// TokenMinted reports that this start CREATED the control-plane token
 	// rather than loading one. On fleetd that is the signature of a
 	// container recreate over an unmounted state dir.
@@ -213,8 +220,9 @@ func (s *Server) Doctor(ctx context.Context) DoctorReport {
 	rep.Summary.Cells = len(snap.Cells)
 
 	s.checkFleetd(&rep, snap, host)
+	s.checkFrontImage(&rep, host)
 	s.checkAuth(ctx, &rep, snap, pres, host)
-	s.checkVersions(&rep, snap, pres, host)
+	s.checkVersions(ctx, &rep, snap, pres, host)
 	s.checkDisk(&rep, pres, host)
 	s.checkTLS(ctx, &rep)
 	s.checkWakeAndRoaming(&rep, snap, pres)
@@ -501,7 +509,7 @@ func (s *Server) checkOutbound(rep *DoctorReport, c CellSnapshot, p Presence, re
 
 // ─── versions and defs ──────────────────────────────────────────────────────
 
-func (s *Server) checkVersions(rep *DoctorReport, snap StateSnapshot, pres map[string]Presence, host DoctorHost) {
+func (s *Server) checkVersions(ctx context.Context, rep *DoctorReport, snap StateSnapshot, pres map[string]Presence, host DoctorHost) {
 	// Assert the evidence EXISTS before asserting parity over it —
 	// otherwise "every cell agrees" is what a fleet of silent cells looks
 	// like.
@@ -666,15 +674,31 @@ func (s *Server) checkVersions(rep *DoctorReport, snap StateSnapshot, pres map[s
 			vers[p.Versions.LlamaSwap] = append(vers[p.Versions.LlamaSwap], c.Name)
 		}
 	}
+	if v := s.frontSwapVersion(ctx); v != "" {
+		vers[v] = append(vers[v], fleetcfg.FrontCell)
+	}
+	ungated := ungatedSwapVersions(vers)
 	switch {
 	case len(vers) == 0:
-		// NOT a silent OK. The field is a C3 reservation that no announcer
-		// has ever filled; saying so is what keeps the next agent from
-		// reading this UNKNOWN as a bug in doctor.
+		// NOT a silent OK. C16 gave the field a producer (each cell reads
+		// its own llama-swap's /api/version), so an empty matrix now means
+		// no cell could answer — an old announcer build, or a llama-swap
+		// that did not respond to its own cell.
 		rep.Add(DoctorCheck{ID: "versions.llama_swap", Level: LevelUnknown,
 			Summary: "no cell reports a llama-swap version",
-			Detail: "versions.llama_swap is a reserved announce field and no announcer populates it yet, so the version " +
-				"matrix cannot be built. This is a missing producer, not an unreachable fleet."})
+			Detail: "each cell reads its own llama-swap's /api/version and announces it. An empty matrix means the " +
+				"announcers predate that (C16) or their llama-swap did not answer — not that the fleet agrees.",
+			Fix: "upgrade the cells' vibe build, then re-run."})
+	case len(ungated) > 0:
+		// The incident, stated as a check. Louder than mere divergence: a
+		// fleet uniformly on a version nothing here has replayed is not a
+		// mid-upgrade, it is an upgrade that skipped the ritual.
+		rep.Add(DoctorCheck{ID: "versions.llama_swap", Level: LevelWarn,
+			Summary: "cells run llama-swap " + strings.Join(ungated, ", ") + ", which this vibe build has no conformance recording for",
+			Detail: "gated versions: " + strings.Join(GatedSwapVersions(), ", ") + ". Matrix: " + shaGroups(vers) +
+				". The in-flight wire changed silently between v239 and v247 and every busy guard read the new shape " +
+				"as an idle cell; an ungated version is that risk, unmeasured.",
+			Fix: "scripts/upgrade/ritual.sh canary <version> — it records the fixtures and replays the contract."})
 	case len(vers) > 1:
 		rep.Add(DoctorCheck{ID: "versions.llama_swap", Level: LevelWarn,
 			Summary: "cells run different llama-swap versions",
@@ -686,7 +710,8 @@ func (s *Server) checkVersions(rep *DoctorReport, snap StateSnapshot, pres map[s
 			v = k
 		}
 		rep.Add(DoctorCheck{ID: "versions.llama_swap", Level: LevelOK,
-			Summary: "every reporting cell runs llama-swap " + v})
+			Summary: "every reporting cell runs llama-swap " + v,
+			Detail:  "gated by this build's conformance recordings: " + strings.Join(GatedSwapVersions(), ", ")})
 	}
 }
 

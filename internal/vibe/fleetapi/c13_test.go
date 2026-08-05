@@ -476,11 +476,12 @@ func versionFleet(t *testing.T, versions map[string]*AnnounceVersions) *Server {
 	return s
 }
 
-// TestDoctor_LlamaSwapMatrixNamesTheMissingProducer: versions.llama_swap
-// has been a reserved field since C3 with nothing writing it. An UNKNOWN
-// that says "no announcer fills this" is actionable; a silent OK would
-// claim a uniform fleet nobody measured.
-func TestDoctor_LlamaSwapMatrixNamesTheMissingProducer(t *testing.T) {
+// TestDoctor_LlamaSwapMatrixIsUnknownWhenNobodyAnswers: a silent OK would
+// claim a uniform fleet nobody measured. C13 shipped this UNKNOWN naming
+// the MISSING producer; C16 supplied one (each cell reads its own
+// llama-swap's /api/version), so an empty matrix now means nobody
+// ANSWERED — which is still not agreement, and the detail has to say so.
+func TestDoctor_LlamaSwapMatrixIsUnknownWhenNobodyAnswers(t *testing.T) {
 	s := versionFleet(t, map[string]*AnnounceVersions{
 		"a": {DefsSHA: "abc123"},
 		"b": {DefsSHA: "abc123"},
@@ -489,16 +490,23 @@ func TestDoctor_LlamaSwapMatrixNamesTheMissingProducer(t *testing.T) {
 	if got.Level != LevelUnknown {
 		t.Fatalf("no cell reports a version → %s, want unknown", got.Level)
 	}
-	if !strings.Contains(got.Detail, "populate") && !strings.Contains(got.Detail, "producer") {
-		t.Errorf("detail = %q, want the missing PRODUCER named so the unknown is not read as an unreachable fleet", got.Detail)
+	if !strings.Contains(got.Detail, "not that the fleet agrees") {
+		t.Errorf("detail = %q, want the absence stated so the unknown is not read as agreement", got.Detail)
 	}
 
+	// Two versions this build HAS recordings for: the mid-state of a roll,
+	// which is a warn about divergence and nothing worse. (A version with
+	// no recording is a different, louder branch — see c16_test.go.)
 	s2 := versionFleet(t, map[string]*AnnounceVersions{
 		"a": {LlamaSwap: "v239"},
-		"b": {LlamaSwap: "v241"},
+		"b": {LlamaSwap: "v247"},
 	})
-	if got := mustCheck(t, s2.Doctor(context.Background()), "versions.llama_swap", "").Level; got != LevelWarn {
-		t.Errorf("mixed llama-swap versions → %s, want warn (the upgrade ritual's mid-state)", got)
+	got2 := mustCheck(t, s2.Doctor(context.Background()), "versions.llama_swap", "")
+	if got2.Level != LevelWarn {
+		t.Errorf("mixed llama-swap versions → %s, want warn (the upgrade ritual's mid-state)", got2.Level)
+	}
+	if !strings.Contains(got2.Summary, "different llama-swap versions") {
+		t.Errorf("summary = %q, want the divergence branch rather than the ungated one", got2.Summary)
 	}
 }
 

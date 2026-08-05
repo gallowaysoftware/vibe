@@ -255,6 +255,14 @@ type FleetConfig struct {
 	// render_front tool can diff a fresh render against it. Empty means
 	// render-only, no diff.
 	FrontConfig string `yaml:"front_config,omitempty"`
+	// FrontImage is the container image reference the front is deployed
+	// from (fleet-control C16), declared so `vibe fleet doctor` can report
+	// an unpinned deployment. fleetd is a different container with no
+	// docker socket, so this cannot be observed — and a floating tag is
+	// how a routine `docker compose pull` moved the fleet onto a
+	// llama-swap whose in-flight wire every busy guard misread.
+	// fleetapi.UnmanagedFrontImage declares a front that runs no image.
+	FrontImage string `yaml:"front_image,omitempty"`
 	// Notify is the alarm-to-webhook bridge (fleet-control C9). Empty
 	// means no notifications — the design's "alarm? yes" column then
 	// terminates in an SSE stream nobody watches, which is the status

@@ -2,10 +2,13 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,7 +50,7 @@ func (d *Daemon) startAnnounce(ctx context.Context) error {
 		}
 	}
 
-	llamaSwapURL := "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(d.cfg.ProxyPort))
+	llamaSwapURL := d.localLlamaSwapURL()
 	probes, runProbe := modelprobe.Hooks(llamaSwapURL, paths.CellProbeFile(), cellDefs, d.cfg.LlamaBinary)
 
 	ann, err := fleetannounce.New(fleetannounce.Config{
@@ -118,11 +121,12 @@ func (d *Daemon) withdrawAnnounce() {
 	}
 }
 
-// fleetVersions fills the announce versions block: the vibe build and
-// the def checkout's git state — the "cell is N commits behind" context
-// a fingerprint mismatch report needs.
+// fleetVersions fills the announce versions block: the vibe build, the
+// def checkout's git state — the "cell is N commits behind" context a
+// fingerprint mismatch report needs — and the cell's own llama-swap
+// version.
 func (d *Daemon) fleetVersions() *fleetapi.AnnounceVersions {
-	return fleetVersionsAt(paths.BackendsDir())
+	return fleetVersionsAt(paths.BackendsDir(), d.localLlamaSwapURL())
 }
 
 // FleetVersions is the same block for announcers that are not a daemon
@@ -131,11 +135,14 @@ func (d *Daemon) fleetVersions() *fleetapi.AnnounceVersions {
 // versions at all, and before it the slim announcer passed no provider —
 // the heavy cell, whose def checkout is the one most likely to drift,
 // was the one cell that never said which checkout it had.
-func FleetVersions(backendsDir string) *fleetapi.AnnounceVersions {
-	return fleetVersionsAt(backendsDir)
+//
+// llamaSwapURL may be empty; the version is then simply not reported,
+// which doctor renders as UNKNOWN rather than as agreement.
+func FleetVersions(backendsDir, llamaSwapURL string) *fleetapi.AnnounceVersions {
+	return fleetVersionsAt(backendsDir, llamaSwapURL)
 }
 
-func fleetVersionsAt(backendsDir string) *fleetapi.AnnounceVersions {
+func fleetVersionsAt(backendsDir, llamaSwapURL string) *fleetapi.AnnounceVersions {
 	v := &fleetapi.AnnounceVersions{Vibe: buildinfo.String()}
 	if sha, err := gitOut(backendsDir, "rev-parse", "--short", "HEAD"); err == nil {
 		v.DefsSHA = sha
@@ -143,7 +150,65 @@ func fleetVersionsAt(backendsDir string) *fleetapi.AnnounceVersions {
 			v.DefsDirty = true
 		}
 	}
+	v.LlamaSwap = llamaSwapVersion(llamaSwapURL)
 	return v
+}
+
+// llamaSwapVersionTimeout bounds the local read. The heartbeat is the
+// cell's only evidence of life (C8's rule about the prober), so a
+// llama-swap that has wedged must cost the announce milliseconds and a
+// blank field, never the announce itself.
+const llamaSwapVersionTimeout = 2 * time.Second
+
+// maxSwapVersionLen bounds what goes on the wire. fleetd's announce
+// hygiene bounds it again at ingest (announce.go's clean, 256 bytes) —
+// this is the sending side of the same rule, and the receiving side is
+// the one that matters.
+const maxSwapVersionLen = 64
+
+// llamaSwapVersion reads the local llama-swap's own version.
+//
+// GET /api/version answers {"version":"v239","commit":…,"build_date":…} and
+// was verified against real v239 and v247 binaries before this producer
+// was written — C13 reported the field UNKNOWN naming the missing
+// producer precisely because guessing an endpoint from a box that cannot
+// check it is worse than an honest gap. Every failure returns "", which
+// doctor renders as "no cell reports a version", never as agreement.
+func llamaSwapVersion(baseURL string) string {
+	if baseURL == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), llamaSwapVersionTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/api/version", nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var body struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&body); err != nil {
+		return ""
+	}
+	v := strings.TrimSpace(body.Version)
+	if len(v) > maxSwapVersionLen {
+		v = v[:maxSwapVersionLen]
+	}
+	return v
+}
+
+// localLlamaSwapURL is the daemon's own router base. Same construction as
+// startAnnounce's, which is where the announce loop's copy comes from.
+func (d *Daemon) localLlamaSwapURL() string {
+	return "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(d.cfg.ProxyPort))
 }
 
 // fleetCapacity fills the announce capacity block: VRAM total/free from

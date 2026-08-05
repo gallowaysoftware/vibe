@@ -52,6 +52,18 @@ fleet_registry: true
 fleet:
   front_config: /front-config/config.yaml
 
+  # C16: the image reference deploy/front actually resolves. fleetd is a
+  # different container with no docker socket, so whether the front's
+  # deployment is PINNED is the one thing about it that can only be
+  # declared — and an unpinned front is how a routine `docker compose
+  # pull` moved this fleet onto a llama-swap whose in-flight wire every
+  # busy guard misread (2026-08-05). `vibe fleet doctor` reports it as
+  # front.image_pin; keep it in step with deploy/front/.env, and use the
+  # literal `unmanaged` if the front is not run from a container image.
+  # A declaration can go stale, which is what doctor's observed
+  # versions.llama_swap matrix is for.
+  front_image: ghcr.io/mostlygeek/llama-swap:v239-cpu-b9994@sha256:6bae869ec0908538e421172fd576288e87c1bc330acde24517992507218d2c7c
+
   # C12: the guest READ-ONLY bearer. Honored on GET /api/fleet/state and
   # GET /api/fleet/events and refused on everything else — /mcp, the
   # RPCs, intent, wake, announce, leases, and both /api/fleet/usage and
