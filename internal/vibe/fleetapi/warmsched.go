@@ -334,7 +334,7 @@ func (s *Server) evalScheduleEntry(e WarmScheduleEntry, spec cronSpec, st *warmS
 			err = warmFn(ctx, frontURL, e.Model)
 			cancel()
 		} else {
-			err = fmt.Errorf("cell %q has no front route (announce-only)", cell)
+			err = noFrontRoute(cell)
 		}
 		// The failure path is the piggyback fallback (C6 MIN-G's
 		// remaining half). `fired` stays FALSE when it queues: a queued

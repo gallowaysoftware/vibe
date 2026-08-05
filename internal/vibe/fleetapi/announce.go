@@ -274,6 +274,15 @@ func (s *Server) handleAnnounce(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("unsupported announce version %d (this fleetd speaks v=%d)", req.V, AnnounceVersion), http.StatusBadRequest)
 		return
 	}
+	// Membership is hosts.yaml and nothing else, and this refusal is what
+	// makes that true: a cell cannot announce itself into existence. So
+	// there is no such thing as a cell fleetd knows only through its
+	// announces — commissioning is install the daemon/announcer, add the
+	// hosts.yaml entry, point it at the registry (C3). Loosening this
+	// would make an announce a fleet-wide write from an unauthenticated
+	// NAME: the fleet token authenticates the connection, never the cell
+	// it claims to be (design §6), and an unknown name can then fake
+	// SERVING, prune a roaming catalog or cancel a pending drain.
 	known := false
 	for _, c := range s.cells {
 		if c.Name == req.Cell {

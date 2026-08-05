@@ -188,6 +188,19 @@ optional.)
     last_seen; probes are the fallback for never-announced cells.
     Staleness is `3×interval + 5s` from fleetd-side `received_at`
     only — seq is a per-boot hint, cell clocks are never consulted.
+  - **A cell cannot announce itself into existence.** hosts.yaml stays
+    the single source of membership: an announce naming a cell the
+    registry does not carry is refused `400 unknown cell`, so
+    commissioning is daemon/announcer + `hosts.yaml` entry + registry
+    URL — all three. What C3 retires is the inbound PORT, not the
+    membership record, and **"announce-only" everywhere in these docs
+    means fleetd cannot DIAL the cell** (no reachable inbound port, no
+    `daemon_url`), never that the cell is missing from hosts.yaml.
+    Several docs said the latter until 2026-08-05; they were describing
+    a state that has never been reachable. Do not loosen the check to
+    make them true — an announce accepting an unknown NAME is a
+    fleet-wide write from an unauthenticated one, and the fleet token
+    authenticates the connection, never the cell (design §6, below).
   - **The conflict rule**: registry intent is a REQUEST until the
     cell echoes it; a NEWER echo resolves it either way (complied or
     human override); older echo gets desired_intent handed back. The
@@ -287,10 +300,12 @@ optional.)
       `s.wg` goroutines, so an unlinked timeout blocks `Close()`.
   - **The fleet page** (fleetapi/fleet.html via embed.FS at
     `GET /ui/fleet`): static, framework-free, bearer-exempt as a static
-    asset ONLY (the ONE middleware exemption — exact-match, GET-only,
-    evaluated before mux path-cleaning, boundary test-pinned in
-    daemon/fleet_registry_test.go; do NOT widen it to a prefix match or
-    `path.Clean`). SSE (`/api/fleet/events`) drives debounced state
+    asset ONLY (the ONE middleware exemption — exact-match, GET-only, on
+    the escaped path, evaluated before mux path-cleaning, boundary
+    test-pinned in daemon/fleet_registry_test.go and
+    daemon/authpath_test.go; do NOT widen it to a prefix match,
+    `path.Clean` or a decoded path). SSE (`/api/fleet/events`) drives
+    debounced state
     refreshes; action buttons POST `/mcp` tools/call — never add
     mutation routes for it; if a button needs something new, the MCP
     facade is what's incomplete. `esc()` is the TEXT escaper and
@@ -394,9 +409,11 @@ optional.)
     error or a 5xx from the cell's admin port; the warm-target restore
     and the warm-schedule fire (`fleetapi.queueWarm`) queue a `warm`
     when the front cannot deliver, or when the cell has **no front
-    route at all** — the front's peers are rendered from `hosts.yaml`,
-    so a cell known only through its announces is the warm-loop analog
-    of "no daemon_url" and is queued without a pointless round trip. In
+    route at all** — the front's peers are rendered from `hosts.yaml`
+    and every registry cell carries a `url`, so "no front route" means
+    the cell is ABSENT from the registry (`fleetapi.noFrontRoute` says
+    so; it read "announce-only" until 2026-08-05, naming a state the
+    announce endpoint forbids). In
     every case a **4xx is the far side answering** and stays an error:
     telling an agent a refused verb is "queued for the next announce"
     is worse than failing. That decision needs a status, so
@@ -855,12 +872,28 @@ optional.)
     the same way as "the next agent decided". Deciding is one line, and
     the decision is `AccessTokenOnly` unless there is an argument.
   - **Enforcement is a positive allowlist**, in daemon/auth.go via
-    `fleetapi.AccessFor(r.Method, r.URL.Path)`: exact (method, path), on
-    the RAW path before the mux cleans anything, everything undeclared
-    (`/mcp`, the whole Connect mount, typos, future routes) token-only.
-    Never a denylist, never a prefix, never `path.Clean`. **C5's
-    `/ui/fleet` exemption is now the table's one `AccessPublic` entry** —
-    same GET-only exact match, same six pinned bypass attempts.
+    `fleetapi.AccessFor(r.Method, r.URL.EscapedPath())`: exact
+    (method, path), on the RAW path before the mux cleans anything,
+    everything undeclared (`/mcp`, the whole Connect mount, typos,
+    future routes) token-only. Never a denylist, never a prefix, never
+    `path.Clean`, never `url.PathUnescape`. **C5's `/ui/fleet` exemption
+    is now the table's one `AccessPublic` entry** — same GET-only exact
+    match, same six pinned bypass attempts.
+  - **RAW means `EscapedPath()`, and the difference is not academic.**
+    net/url decodes before the middleware runs
+    (`url.ParseRequestURI("/ui/%66leet")` → `URL.Path == "/ui/fleet"`,
+    `RawPath == "/ui/%66leet"`), so `r.URL.Path` is the DECODED path and
+    matching on it granted every percent-encoded spelling of a declared
+    route while this file claimed the opposite. Nothing was reachable
+    that was not already reachable — Go's ServeMux routes on the decoded
+    path too, so middleware and router agreed, and a positive exact
+    allowlist can only re-grant a route it already granted — but a
+    load-bearing security invariant stated falsely becomes a real hole
+    the day anything routes on `RawPath`. Fixed 2026-08-05 by matching
+    the code to the doc: an encoded spelling is a different string,
+    therefore a miss, therefore token-only — the answer `/ui/fleet%2f`
+    has always got. `/ui/%66leet` and `/api/fleet/%73tate` are pinned in
+    `daemon/authpath_test.go`.
   - **The guest surface is state, never history.** `/api/fleet/usage`
     and `/api/fleet/savings` are refused despite being read-only GETs:
     tokens per cell per day is a record of when this house works and
@@ -935,6 +968,17 @@ optional.)
     to find out is a mutation), `tls.not_after` not `tls.valid` (the
     chain is deliberately unverified — LAN certs are self-signed, and
     the message says so). Ground rule 10 applied to check names.
+  - **Missing evidence may only ever ADD concern, never subtract it.**
+    `defs.parity` decides DIVERGENCE over every cell that reports a SHA
+    and AGREEMENT only over the clean ones, because the first cut
+    dropped a dirty checkout from the comparison entirely: the
+    2026-08-05 live gate watched a correctly-reported divergence flip to
+    OK the moment the diverged cell went dirty, and a fleetd dirty on a
+    different commit suppressed its own WARN the same way. Dirty-and-
+    diverged is strictly worse than clean-and-diverged. The two
+    can't-compare shapes stay distinct UNKNOWNs — nobody reports a SHA,
+    versus everybody reports one SHA and no tree is clean — and neither
+    is an OK.
   - **The credential check uses the resolver the VERBS use.**
     `fleetcfg.CellCredential(cell, env, pref, localToken)` now holds
     C6's two deliberately-divergent precedences as named values

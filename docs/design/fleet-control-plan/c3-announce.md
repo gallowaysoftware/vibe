@@ -63,10 +63,15 @@ Implementation notes beyond the doc's letter:
   queues when the cell's llama-swap admin port does not answer. #26
   landed the other two, which are C4 files and could not be touched
   from C6's branch: the warm-target restore and the warm-schedule fire
-  queue a `warm` when the cell has no front route at all (it is known
-  only through its announces, so the front — whose peers are rendered
-  from `hosts.yaml` — cannot reach it) or when the front warm fails to
-  deliver.*
+  queue a `warm` when the front warm fails to deliver, or when the cell
+  has no front route at all.*
+  *(Corrected 2026-08-05: that second case was described here as "a cell
+  known only through its announces", which cannot happen — see §1's
+  commissioning line. The front's peers are rendered from `hosts.yaml`
+  and every `hosts.yaml` cell carries a `url`, so "no front route" means
+  the cell is **absent from the registry**: a def's `cell:`, a warm
+  target or a sleep entry naming a box that was never commissioned. The
+  error now says that instead.)*
   *All three share one rule: the queue is for DELIVERY failures.
   Transport errors and 5xx fall back; a definitive 4xx is the far side
   ANSWERING, and the cell would refuse the same verb identically, so it
@@ -189,6 +194,14 @@ Response:
   `:9001` — after C3, `daemon_url` is an optimization (lower latency
   for interactive drains), not a requirement. **Commissioning a new
   cell = install daemon/announcer + `hosts.yaml` entry + registry URL.**
+  All three, and the middle one is enforced: an announce naming a cell
+  the registry does not carry is refused `400 unknown cell`. There is
+  therefore no such thing as a cell fleetd knows only through its
+  announces — "announce-only" throughout this plan means fleetd cannot
+  DIAL the cell (no reachable inbound port, no `daemon_url`), never that
+  the cell is missing from `hosts.yaml`. Loosening the check would turn
+  every announce into a fleet-wide write from an unauthenticated name,
+  which §6's threat note already rules out.
 
 **Conflict rule (verbatim from the design panel; do not soften):** the
 cell's *echoed* intent is truth. `desired_intent` is a request; until
@@ -324,3 +337,52 @@ instead of ~50s late.
 The v2 `probe` throughput block (reserved only), warm targets/page
 (C4), any data-path tunneling (absent cells are answered by the front,
 never by fleetd — invariant 1).
+
+## Live-gate addendum (2026-08-05): "announce-only membership" was never a state
+
+Found while running the C4/C10/C13 live gates against a real 4-cell
+fleet on one box (four llama-swap v239 processes, a real fleetd, real
+announcers). Fixed on `fix/live-gate-truth`; **the code was right and
+the docs were wrong**, which is ground rule 8 doing its job.
+
+Several documents — this one's reconciliation note, the design doc's
+commissioning line, C10's evidence section, `AGENTS.md`'s piggyback
+rule, and a `frontCanRoute` comment plus a test *name* in `fleetapi` —
+described a cell "fleetd knows only through its announces", or one
+"fleetd has no `url` for". Neither can happen:
+
+- `POST /api/fleet/announce` refuses a cell absent from `hosts.yaml`
+  with `400 unknown cell "…" (not in the registry)`
+  (`fleetapi/announce.go`). A cell cannot announce itself into
+  existence.
+- `fleetcfg` requires a `url` on every cell it does carry, so every
+  registry cell has one.
+
+So §1's commissioning line is the correct statement of the contract and
+the rest were loose paraphrases of it: what C3 retires is the inbound
+PORT, not the membership record. The check stays exactly as strict — an
+announce endpoint that accepted unknown cell names would be a
+fleet-wide write from an unauthenticated NAME, and §6's threat note
+already says the fleet token authenticates the connection and never the
+cell it claims to be. A forged announce can fake SERVING, prune a
+roaming catalog or cancel a pending drain; letting it also *create* the
+cell it does that to is not a trade this plan makes.
+
+**"Announce-only" keeps its useful meaning and only that one**: fleetd
+cannot DIAL the cell (no reachable inbound port, no `daemon_url`), so
+announces are the only channel to it. That is the sense C4's
+`observesActivity`, C8's piggybacked probes and C10's `--idle` refusal
+all use, and all three were already correct.
+
+One code consequence. `warmtarget.go`'s "the cell has no front route"
+branch is reached when fleetd holds no `url` for a cell — which, given
+the above, means the cell is **not in the registry**. It said
+`(announce-only)`, which sent an operator looking for a dead announcer,
+and the piggyback attempt that follows then confirmed the wrong
+diagnosis with "cell has never announced". It now names the missing
+`hosts.yaml` entry (`fleetapi.noFrontRoute`, one helper for all three
+producers: the warm target, the warm schedule and C14's post-wake
+warm). The reachable production shape is a backend def whose `cell:`
+names a box that was never commissioned — the daemon already skips a
+`warm_target` naming an unknown cell at wiring, but nothing validates a
+def's `cell:` against `hosts.yaml`.

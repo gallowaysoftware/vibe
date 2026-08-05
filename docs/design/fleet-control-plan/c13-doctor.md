@@ -618,7 +618,11 @@ Mechanical (become tests in-repo):
   pre-C13 call sites did (the existing fleetmcp and CLI tests pass
   unchanged, plus a direct table test of both orders).
 - **U7** `defs.parity`: identical SHAs → `OK`; divergent → `WARN` listing
-  cells; `defs_dirty` → that cell `UNKNOWN`; none reported → `UNKNOWN`.
+  cells; every reporter `defs_dirty` on one SHA → `UNKNOWN`; none
+  reported → `UNKNOWN`. **A dirty checkout may only ADD concern**: a
+  dirty cell on a DIFFERENT SHA stays `WARN` (and so does a dirty fleetd
+  on a different SHA) — see the
+  [live-gate addendum](#live-gate-addendum-2026-08-05-dirtiness-silenced-a-real-divergence).
 - **U8** `versions.llama_swap` with no reporting cell → `UNKNOWN` whose
   message names the missing producer (not a silent `OK`).
 - **U9** `disk.free`: the three subjects are reported separately and the
@@ -904,3 +908,50 @@ Two things the pass looked at and left:
   extras are the same observation. The detail names both causes, and the
   declared-suppression fix above removes the drained/held case, which
   was the noisiest one.
+
+## Live-gate addendum (2026-08-05): dirtiness silenced a real divergence
+
+Found by standing a real 4-cell fleet up (four llama-swap v239
+processes, a real fleetd, real announcers, real traffic) and running
+these gates against it. Fixed on `fix/live-gate-truth`.
+
+With alpha, charlie and fleetd on one defs SHA and bravo on another,
+doctor reported exactly what it should: `WARN defs.parity — cells
+disagree about the def checkout`. Touching a file in bravo's checkout
+— nothing else; same divergence, same three boxes — flipped the same
+finding to `OK`.
+
+The cause is one line of the shape §5 exists to prevent, applied in the
+wrong direction. A dirty checkout's SHA does not describe what is
+running, so the first cut dropped the cell from the comparison
+entirely; with bravo gone, one SHA was left standing and the check
+reported agreement. But "cannot vouch for itself" is not "has nothing
+to say": a dirty tree can still **disagree**, and dirty-and-diverged is
+strictly more alarming than clean-and-diverged — different base
+commits, plus uncommitted edits on top of one of them. This is the
+worst failure available to a diagnostic, going quiet exactly as the
+situation gets worse, and it is `UNKNOWN`-is-not-`OK` wearing a
+different hat: absent evidence subtracted concern instead of adding it.
+
+The check now separates the two questions it was conflating.
+**Divergence** is decided over every cell that reports a SHA, dirty or
+not. **Agreement** may rest only on the clean ones. So:
+
+| fleet | verdict |
+|---|---|
+| every reporter clean, one SHA | `OK` |
+| any two reporters on different SHAs (dirty or not) | `WARN`, both SHAs named, dirty trees flagged |
+| one SHA, at least one clean reporter, some dirty | `OK`, naming the dirty cells |
+| one SHA, every reporter dirty | `UNKNOWN` — "the matching SHA proves nothing about what is running" |
+| nobody reports a SHA | `UNKNOWN` — nothing to compare |
+
+The same trap sat one level down and is fixed with it: fleetd's own
+checkout on a *different* commit from the cells is a `WARN` (the render
+it writes comes from another tree), and `!host.DefsDirty` suppressed
+that `WARN` in the strictly worse case where fleetd had edits on top of
+the different commit. A dirty fleetd on the *agreed* SHA now says so in
+the detail without changing the level.
+
+Both directions are mutation-proven in
+`fleetapi/defsparity_test.go`: restoring either line makes a named test
+fail with the live fleet's shape.

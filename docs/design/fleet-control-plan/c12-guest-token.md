@@ -155,21 +155,37 @@ methods, and every route this repo grows next included.
 Two properties, both inherited verbatim from C5's `/ui/fleet` exemption
 because that exemption is the strictest thing in the file:
 
-- **Exact match on `r.URL.Path`, evaluated before the mux cleans
-  anything.** Not a prefix, not `path.Clean`, not a regexp. So
-  `/api/fleet/state/`, `/api/fleet/state/../usage`, `/api/fleet/state%2f`,
-  `//api/fleet/state` and `/api/fleet/state/anything` are all misses,
-  and a miss is a 401.
+- **Exact match on the RAW request path, evaluated before the mux
+  cleans anything.** Not a prefix, not `path.Clean`, not a regexp, and
+  not decoded. So `/api/fleet/state/`, `/api/fleet/state/../usage`,
+  `/api/fleet/state%2f`, `//api/fleet/state`, `/api/fleet/%73tate` and
+  `/api/fleet/state/anything` are all misses, and a miss is a 401.
 - **Method-exact.** `POST /api/fleet/state` is a miss. Go's server
   passes the method through verbatim, so a lowercase `get` is a miss
   too.
 
-The middleware decides on the same string the mux routes with
-(`r.URL.Path`), and every place the two can diverge — cleaning, the
-trailing-slash redirect, `%2f` decoding — diverges in the strict
-direction: a request that fails the guest check never reaches a handler,
-and a request that passes it cannot be routed anywhere except the entry
-it matched.
+A request that fails the check never reaches a handler, and a request
+that passes it cannot be routed anywhere except the entry it matched.
+
+*(Corrected 2026-08-05, `fix/live-gate-truth`. This section said the
+middleware "decides on the same string the mux routes with
+(`r.URL.Path`), and every place the two can diverge … diverges in the
+strict direction", and the code passed `r.URL.Path`. But `r.URL.Path` is
+the DECODED path — net/url runs before any of this, and
+`url.ParseRequestURI("/ui/%66leet")` yields `URL.Path == "/ui/fleet"`
+with `RawPath == "/ui/%66leet"` — so percent-encoding an ordinary
+character diverged in the LOOSE direction: the middleware granted
+`/ui/%66leet` and `/api/fleet/%73tate` as if they were the declared
+routes. **Nothing was reachable that was not already reachable**, and it
+is worth being precise about why rather than overstating it: Go's
+ServeMux also routes on the decoded path, so middleware and router
+agreed on the target, and the allowlist is positive and exact, so a
+decoded match could only ever re-grant a route that string already
+granted. The defect is that a load-bearing security invariant was stated
+falsely — and it stops being harmless the moment anything routes on
+`RawPath` or the mux's matching changes. The middleware now reads
+`r.URL.EscapedPath()`, which is what "RAW" always claimed; the encoded
+spellings are pinned in `daemon/authpath_test.go`.)*
 
 The list itself is not hand-maintained beside the routes; it is
 **derived from them**. `internal/vibe/fleetapi/routes.go` holds one
@@ -456,7 +472,11 @@ The daemon reads the file once, at start, before the listeners serve.
    `GET //api/fleet/state`, `GET /api/fleet/state/sub` and
    `GET /api/fleet/statex` all 401 — the same six shapes C5 pinned for
    `/ui/fleet`, applied to the new hole.
-   `TestGuestToken_AllowlistIsExactMatchAndGETOnly`.
+   `TestGuestToken_AllowlistIsExactMatchAndGETOnly`. Percent-encoded
+   spellings of a declared route (`/ui/%66leet`, `/api/fleet/%73tate`)
+   join the battery from 2026-08-05 —
+   `TestAuth_PercentEncodedSpellingsAreNotTheDeclaredRoute`; see the
+   [live-gate addendum](#live-gate-addendum-2026-08-05-raw-meant-decoded).
 8. **C5's exemption is unweakened (integration).** The pre-existing
    `TestDaemon_FleetRegistry_Role` bypass battery passes untouched, and
    its list grows the two guest routes without a token (they must still
@@ -801,3 +821,42 @@ written next to it. And `notify.endpoint` / `delivery.last_error`, the
 two C9 fields a guest now reads, are redacted and scrubbed at the
 source (`WebhookSink.redacted`, `Deliverer.scrub`) — the guest grant
 does not leak the webhook credential.
+
+## Live-gate addendum (2026-08-05): "RAW" meant decoded
+
+Found while running the C12/C13 live gates against a real 4-cell fleet.
+Fixed on `fix/live-gate-truth`. This one is a **false invariant**, not
+an exploit, and the difference is the point.
+
+§2 said the allowlist matched "on the RAW path before the mux cleans
+anything", and `AGENTS.md` said the same. The code read `r.URL.Path`,
+which net/url has already percent-DECODED:
+`url.ParseRequestURI("/ui/%66leet")` yields `URL.Path == "/ui/fleet"`
+with `RawPath == "/ui/%66leet"`. So `GET /ui/%66leet` was served
+anonymously and `GET /api/fleet/%73tate` was served to a guest bearer,
+as if each were the declared route.
+
+**Nothing was reachable that was not already reachable**, and
+overstating that would be its own kind of dishonesty. Go's `ServeMux`
+routes on the decoded path too, so the middleware and the router agreed
+on which handler the request meant; and the allowlist is positive and
+exact, so a decoded match could only ever re-grant the route that
+string already granted. There is no bypass here to report.
+
+The defect is that a load-bearing security invariant was written down
+falsely — in the design doc, in `AGENTS.md`, and in the middleware's own
+comment — and the property those three documents claim is the one the
+next agent will rely on. It stops being harmless the first time
+anything in this daemon routes on `RawPath`, or Go's matching changes,
+or someone adds a route whose encoded and decoded spellings mean
+different things.
+
+Fixed by making the code match the doc rather than the reverse:
+`fleetapi.AccessFor(r.Method, r.URL.EscapedPath())`. `EscapedPath()`
+returns `RawPath` when it is a valid encoding of `Path` and re-encodes
+`Path` otherwise, so the plain spellings are unaffected and an encoded
+one is simply a different string — a miss, therefore token-only, which
+is the answer `/ui/fleet%2f` has always got. C5's six pinned bypass
+attempts pass unchanged, and the encoded family is pinned in
+`daemon/authpath_test.go`, which also asserts the net/url premise so a
+future stdlib change cannot quietly invalidate the test's reasoning.

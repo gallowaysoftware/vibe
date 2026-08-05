@@ -311,8 +311,14 @@ where no full daemon runs) heartbeats to fleetd —
 
 — and the response carries desired intent and piggybacked commands
 (drain, unload, warm), which **retires the inbound-port requirement
-entirely**: commissioning a new cell becomes "install the daemon, point
-it at the registry." Two rules keep it honest:
+entirely**: commissioning a new cell becomes "install the daemon, add
+its `hosts.yaml` entry, point it at the registry." The registry entry is
+not optional and never becomes so — `POST /api/fleet/announce` refuses a
+cell absent from `hosts.yaml`, because an announce that accepted an
+unknown NAME would be a fleet-wide write from an unauthenticated one
+(§6: the token authenticates the connection, never the cell it claims to
+be). What C3 retires is the inbound port, not the membership record.
+Two rules keep it honest:
 
 - **The cell's echo wins.** Registry-side intent is a *request* until
   the cell echoes it; the UI shows "drain requested, awaiting ack."
