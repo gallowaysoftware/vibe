@@ -75,6 +75,18 @@ func guestTokenPath() (string, error) {
 	if cfg.Fleet.GuestTokenFile == "" {
 		return "", fmt.Errorf("no guest read-only token is configured: set fleet.guest_token_file in %s and restart the daemon (it mints one at that path)", paths.ConfigFile())
 	}
+	// Refused, not obeyed. Printing this file would hand out the
+	// control-plane token under a banner that says "share this", and
+	// --regenerate would rotate the control-plane token from a command
+	// whose name says guest — every client 401s and nothing says why.
+	// The daemon refuses the same configuration (guest access stays off);
+	// this is the same refusal on the operator's side of it.
+	if daemon.IsControlTokenFile(cfg.Fleet.GuestTokenFile) {
+		return "", fmt.Errorf("fleet.guest_token_file in %s points at the control-plane token file (%s): "+
+			"guest access is disabled in that configuration, and rotating it here would revoke every "+
+			"control-plane client. Give the guest credential its own path",
+			paths.ConfigFile(), paths.TokenFile())
+	}
 	return cfg.Fleet.GuestTokenFile, nil
 }
 

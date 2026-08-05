@@ -257,6 +257,28 @@ func LoadOrCreateGuestToken(path, controlToken string) (string, bool, error) {
 	return tok, created, nil
 }
 
+// IsControlTokenFile reports whether path is the control-plane token
+// file. Both halves of C12 need it and neither may guess: pointing
+// fleet.guest_token_file at the control-plane token turns a "read-only"
+// credential into every verb in the fleet, and `vibe token --guest
+// --regenerate` against that path would silently rotate the
+// control-plane token instead — locking out every client from a command
+// whose name says guest.
+//
+// os.SameFile catches symlinks, bind mounts and two spellings of one
+// inode; the cleaned-string compare catches the case where the file does
+// not exist yet (the minting path, where SameFile has nothing to
+// compare).
+func IsControlTokenFile(path string) bool {
+	control := paths.TokenFile()
+	if a, errA := os.Stat(path); errA == nil {
+		if b, errB := os.Stat(control); errB == nil {
+			return os.SameFile(a, b)
+		}
+	}
+	return filepath.Clean(path) == filepath.Clean(control)
+}
+
 // loadGuestToken resolves the optional guest read-only bearer and
 // reports it (empty means guest access stays off). Every failure is
 // non-fatal and fails CLOSED: fleetd is read-and-request-only (design
@@ -266,6 +288,15 @@ func LoadOrCreateGuestToken(path, controlToken string) (string, bool, error) {
 func (d *Daemon) loadGuestToken(controlToken string) string {
 	path := d.cfg.Fleet.GuestTokenFile
 	if path == "" {
+		return ""
+	}
+	// Checked on the PATH, before the file is read, because the value
+	// comparison below cannot catch every spelling of it and because the
+	// read half of this call MINTS into a missing file — over the
+	// control-plane token, if that is where the operator pointed it.
+	if IsControlTokenFile(path) {
+		slog.Error("guest read-only token DISABLED (the control-plane token is unaffected)", "path", path,
+			"err", errors.New("guest_token_file is the control-plane token file; give the guest credential its own path"))
 		return ""
 	}
 	tok, created, err := LoadOrCreateGuestToken(path, controlToken)

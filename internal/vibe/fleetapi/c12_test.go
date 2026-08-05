@@ -249,3 +249,41 @@ func TestFleetPage_GuestModeIsWiredToTheHeaderNotAProbe(t *testing.T) {
 		t.Error("the page added a route to discover its own privilege; C12 §5 forbids it")
 	}
 }
+
+// TestFleetPage_A401FromMCPDoesNotPopTheTokenGate is the review's page
+// finding. §5's chosen degradation is "if a proxy strips the header the
+// page keeps its buttons and a click 401s" — but the 401 handler pops
+// the TOKEN GATE, which is the exact behaviour §5 says this phase must
+// not ship: a guest with a perfectly good token told it is invalid. A
+// /mcp 401 is ambiguous (stale control-plane token vs. guest past their
+// grant) and does not get to decide; /api/fleet/state can tell the two
+// apart, flash() re-runs refresh() 1.5s after the click, and a genuinely
+// dead token pops the gate there.
+func TestFleetPage_A401FromMCPDoesNotPopTheTokenGate(t *testing.T) {
+	data, err := fleetPageFS.ReadFile("fleet.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(data)
+	// The /mcp call is quiet: `}, true).then(...)` closes rpc()'s api()
+	// call. Matched as a block so an argument added later cannot silently
+	// shift `quiet` back to undefined.
+	if !regexp.MustCompile(`api\("/mcp",(.|\n)*?\n  \}, true\)`).MatchString(page) {
+		t.Error("rpc() must pass quiet=true: a 401 from /mcp is ambiguous, and popping the token gate " +
+			"tells a guest whose X-Vibe-Auth header was stripped that their working token is invalid")
+	}
+	// The button still fails LOUDLY, and the state fetch still gets to
+	// pop the gate for a token that really is dead.
+	if !strings.Contains(page, `flash(btn, old, "failed", true);`) {
+		t.Error("a refused action must still report failure on the button")
+	}
+	if !strings.Contains(page, `refresh().catch(() => {}); }, 1500)`) {
+		t.Error("flash() must re-run refresh(): /api/fleet/state is the route that can tell a stale " +
+			"control-plane token from a guest past their grant, and it pops the gate")
+	}
+	// Re-authenticating on #savings must not leave the un-hidden body
+	// empty until the 60s timer happens to fire.
+	if !strings.Contains(page, `if (location.hash === "#savings") loadSavings(true);`) {
+		t.Error("setAuthMode(false) must reload the savings view when it is the one on screen")
+	}
+}

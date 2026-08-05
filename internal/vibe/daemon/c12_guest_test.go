@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 )
 
 const goodGuest = "guest-tok-0123456789abcdef"
@@ -145,6 +147,47 @@ func TestGuestToken_DisabledLeavesTheDaemonServing(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "DISABLED") {
 		t.Errorf("a refused guest token must say so loudly:\n%s", buf.String())
+	}
+}
+
+// TestGuestToken_ControlPlaneTokenFileIsRefusedBeforeItIsRead is the
+// review's path-guard case. LoadOrCreateGuestToken MINTS into a missing
+// file, so a guest_token_file pointed at the control-plane token file
+// would overwrite the control-plane token with a fresh random value —
+// every client 401s, and the log calls it a guest token being created.
+// The value comparison in the ladder cannot see this: it runs AFTER the
+// minting branch, on the value the minting branch just wrote.
+func TestGuestToken_ControlPlaneTokenFileIsRefusedBeforeItIsRead(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	control := paths.TokenFile()
+	if err := os.MkdirAll(filepath.Dir(control), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately ABSENT: this is the ordering the value comparison
+	// cannot defend, and the only one where the damage is silent.
+	if _, err := os.Stat(control); !os.IsNotExist(err) {
+		t.Fatalf("control token file already exists at %s", control)
+	}
+
+	d := New(Config{Fleet: FleetConfig{GuestTokenFile: control}})
+	if got := d.loadGuestToken("control-plane-token-value-here"); got != "" {
+		t.Errorf("loadGuestToken = %q, want empty: guest_token_file is the control-plane token file", got)
+	}
+	if d.guestEnabled.Load() {
+		t.Error("guestEnabled set for a guest file that is the control-plane token file")
+	}
+	if _, err := os.Stat(control); !os.IsNotExist(err) {
+		t.Fatalf("the guest loader MINTED over the control-plane token file at %s; a read-only credential "+
+			"must never write the credential it is not", control)
+	}
+	if !strings.Contains(buf.String(), "control-plane token file") {
+		t.Errorf("the log must name the actual reason (the path), not the value comparison:\n%s", buf.String())
 	}
 }
 

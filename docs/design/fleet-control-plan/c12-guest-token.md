@@ -1,12 +1,16 @@
 # C12 — Guest read-only token: sharing status without sharing drain
 
-Status: PR OPEN (2026-08-04), feature + adversarial-review commits.
-Unit gates 1–14 green on a full local inner loop (`-race -count=5`,
-`golangci-lint run` 0 issues, `gofmt -l .` silent, `go mod tidy` clean);
-the 3 live gates need a real fleet and a real phone and are **NOT RUN** —
-the implementing environment cannot reach the fleet (SSH blocked, the
-LAN does not route). The self-review pass (ground rule 9) found 5 items,
-all fixed here — see the addendum at the end.
+Status: PR OPEN (2026-08-05), feature + self-review + **adversarial
+review** commits. Unit gates 1–14 (plus 11b) green on a full local inner
+loop (`go build`, `go vet`, `go test -race -count=5`, `golangci-lint
+run` 0 issues, `gofmt -l .` silent, `go mod tidy` clean); the 3 live
+gates need a real fleet and a real phone and are **NOT RUN** — the
+implementing environment cannot reach the fleet (SSH blocked, the LAN
+does not route). The author's self-review pass found 5 items; the
+separate adversarial pass (ground rule 9) found **7 more — one of them a
+BLOCKER that rotated the control-plane token** — 5 fixed with
+mutation-verified regression tests, 2 documented. See the two addenda at
+the end.
 
 Backlog item 6 in [fleet-control-futures.md](../fleet-control-futures.md)
 §2, one sentence long:
@@ -65,7 +69,7 @@ that has to stay true as this plan keeps adding routes:
 | `POST /api/fleet/intent` | writing axis 2 for any cell |
 | `POST /api/fleet/wake` | a magic packet at any cell, on demand |
 | `POST /api/fleet/announce` | **the cell voice.** Design §6's threat note: a forged announce can fake SERVING, prune a roaming catalog, or cancel a pending drain. A guest bearer that reached this route would be a fleet-wide write dressed as a read |
-| `GET /api/fleet/leases`, `POST`/`DELETE /api/fleet/lease` | reading and *deleting* other people's declarations, C11 holds included |
+| `GET /api/fleet/leases`, `POST`/`DELETE /api/fleet/lease` | *claiming and deleting* other people's declarations, C11 holds included. Note what this does **not** withhold: `cells[].leases` rides `/api/fleet/state`, so a guest already reads every holder, model and note. Denying the route denies the WRITE half and the whole-fleet listing, not the fact of a hold |
 | `POST /api/fleet/notify/scope`, `/notify/send` | muting the pager, or using it as an outbound message relay |
 | `GET /api/fleet/usage` | see below |
 | `GET /api/fleet/savings` | see below |
@@ -116,6 +120,21 @@ operator's head before they issue a token: **anything visible on the
 fleet page is visible to a guest**, including the free text an operator
 types into `--reason` and `--note`. Write those like a shared calendar
 entry.
+
+**And one consequence that deserves its own paragraph, because this
+section's own argument points the other way** (review finding 6). The
+notify block in the state document carries `scope`, `scope_since`,
+`scope_until` and `scope_reason` — so `vibe fleet notify --away --until
+2026-08-20 --reason "back from Spain the 20th"` is guest-readable, as an
+explicit statement that the house is empty and when it stops being
+empty. The case for denying `/api/fleet/usage` above is precisely that
+absence is sensitive and the ledger discloses it *by inference, at day
+resolution*; the away declaration discloses it outright, with an end
+date, on a route this phase grants. That is not a reason to fork the
+document (the two reasons against still hold) — it is a reason for the
+operator to know it, and for `--reason` on an away declaration to be
+written for the same audience as a shared calendar entry. It is listed
+under *Known and accepted* rather than fixed.
 
 **The CLI comes along for free, and that is intended.** `vibe cell
 status` reads exactly `/api/fleet/state`, and `vibe cell await`'s wait
@@ -224,18 +243,31 @@ reason:
 
 | condition | result |
 |---|---|
+| **the path IS the control-plane token file** | disabled, checked *before the file is read* |
 | file empty or whitespace | disabled |
 | token shorter than 16 chars | disabled |
 | token contains whitespace or control characters | disabled (it cannot survive an `Authorization` header intact) |
 | **token equals the control-plane token** | disabled |
 | mint failed (read-only mount, unwritable dir) | disabled |
 
-The fourth rung is the one that matters. An operator who copies the
+The value rung is the one that matters. An operator who copies the
 control-plane token into the guest file has built a guest credential
 that grants drain, and every test in this phase would still pass because
 the request would authenticate on the *first* comparison. Refusing to
 enable guest access is the only failure direction that cannot
 over-grant.
+
+The **path** rung above it exists because the value rung cannot be the
+only one (review finding 2). `LoadOrCreateGuestToken` *mints into a
+missing file* — so `guest_token_file: <the control-plane token file>`
+with that file absent writes a fresh random value over the control-plane
+token before any comparison happens, and the log calls it a guest token
+being created. Today `Run` loads the control-plane token first, so the
+file always exists by then and the value rung happens to catch it; that
+is an ordering, not a guard. `daemon.IsControlTokenFile` compares by
+inode (`os.SameFile`, so symlinks and two spellings of one path are the
+same file) and falls back to a cleaned-string compare when the file does
+not exist — which is exactly the case the inode compare cannot see.
 
 Refusing to *start* was considered and rejected: fleetd is
 read-and-request-only (invariant 4), and killing the fleet's
@@ -298,6 +330,18 @@ reads it. Three properties made this the chosen mechanism over adding a
   one. The failure mode of the polish is the un-polished behaviour, not
   a broken page.
 
+  *Amended by review finding 3.* That is only true if the 401 stops at
+  the button. The feature commit's `rpc()` went through the same `api()`
+  wrapper that pops the token gate, so the documented degradation
+  degraded to **the exact behaviour this section says must not ship** —
+  a guest with a working token told it is invalid. A `/mcp` 401 is
+  genuinely ambiguous (a stale control-plane token and a guest past
+  their grant look identical), so it no longer gets to decide:
+  `rpc()` is quiet, the button flashes `failed`, and `flash()`'s 1.5s
+  `refresh()` puts the verdict on `/api/fleet/state` — the one route
+  that can tell the two apart, and which still pops the gate for a token
+  that really is dead.
+
 What the guest page renders: the cell table, the models, the badges, the
 warnings, the live SSE updates, and a `read-only` chip in the header.
 What it hides: the per-cell action buttons, the warm row, the notify
@@ -323,7 +367,12 @@ load than a bored operator with one.
 
 - **Rotate**: `vibe token --guest --regenerate` writes a fresh value to
   the configured path; restart the daemon. Every guest is logged out and
-  must be re-given the new string.
+  must be re-given the new string. Both `--guest` forms refuse outright
+  when `guest_token_file` is the control-plane token file (review
+  finding 1): printing it would hand out the control-plane token under a
+  banner that says *share this*, and regenerating it would rotate the
+  control-plane token — every client 401s — from a command whose name
+  says guest.
 - **Revoke everyone**: same command, or empty the file, or remove
   `guest_token_file`; restart. There is no per-guest revocation because
   there are no per-guest tokens — that is the accepted cost of a
@@ -367,7 +416,11 @@ The daemon reads the file once, at start, before the listeners serve.
    no file, reports `guest_enabled` false, and answers 401 to every
    route for every token that is not the control-plane one — including a
    token that would have been a valid guest token had the feature been
-   on. `TestGuestToken_UnconfiguredIsOffAndMintsNothing`.
+   on. `TestGuestToken_UnconfiguredIsOffAndMintsNothing` (the mint and
+   the state fields) plus
+   `TestGuestToken_RoutesAreProbedAgainstAnUnconfiguredDaemonToo`, which
+   walks `fleetapi.Routes()` for the "every route" half — the original
+   test probed one (review finding 7).
 2. **Every route declares its access (unit, registry-completeness).**
    Walking `fleetapi.Routes()`: no entry may be `AccessUndecided`, no
    `(method, path)` may repeat, and `AccessFor` must agree with the
@@ -408,12 +461,23 @@ The daemon reads the file once, at start, before the listeners serve.
    `TestDaemon_FleetRegistry_Role` bypass battery passes untouched, and
    its list grows the two guest routes without a token (they must still
    401 — the guest grant is a *token* grant, not an anonymous one).
-9. **The fail-closed ladder (unit).** Each of empty file, short token,
-   whitespace in the token, and **a guest token equal to the
-   control-plane token** leaves guest access disabled with the daemon
-   still serving; the equal-token case additionally proves the value
-   still works as the control-plane token.
-   `TestGuestToken_MisconfigurationFailsClosed`.
+9. **The fail-closed ladder (unit + integration).** Each of empty file,
+   short token, whitespace in the token, and **a guest token equal to
+   the control-plane token** is refused by the loader:
+   `TestGuestToken_MisconfigurationFailsClosed`. Against a running
+   daemon, a refused file opens nothing and leaves the registry serving
+   (`TestGuestToken_RefusedFileOpensNothing`), and the equal-token case
+   leaves the copied credential working as the control-plane token
+   everywhere (`TestGuestToken_IdenticalToControlPlaneFailsClosedOverHTTP`).
+   The **path** rung — `guest_token_file` IS the control-plane token
+   file — is refused before the file is read and never mints over it:
+   `TestGuestToken_ControlPlaneTokenFileIsRefusedBeforeItIsRead`,
+   `TestGuestToken_PointedAtTheControlPlaneFileNeverRewritesIt`, and on
+   the operator's side `TestTokenGuest_RefusesTheControlPlaneTokenFile`.
+   *(The three integration tests and both path tests are review
+   findings 1, 2 and 5: the original gate text claimed the equal-token
+   case "proves the value still works as the control-plane token" and
+   the named test made no such assertion.)*
 10. **The credential does not leak (unit).** The guest token appears in
     no log line (a captured `slog` buffer, across both the loaded and
     the minted paths) and in no error string the loader returns; the
@@ -424,6 +488,16 @@ The daemon reads the file once, at start, before the listeners serve.
     `auth_rejected` and not `guest_rejected`; a valid guest token on
     `/mcp` increments `guest_rejected` and not `auth_rejected`.
     `TestGuestToken_RejectionsCountSeparately`.
+11b. **The auth-mode header rides the guest grant and nothing else
+    (integration).** `X-Vibe-Auth: guest` is present on exactly the
+    responses the GUEST bearer authorized: absent for the operator on
+    the same two routes, absent on every 401, absent on the public page.
+    `TestGuestToken_AuthModeHeaderRidesTheGuestGrantOnly` — added by
+    review finding 4, which is that the header had **no** server-side
+    test: deleting the `Set` left the suite green, and so did stamping
+    it on the operator's responses, and those two mutations produce
+    opposite user-visible bugs.
+
 12. **The page renders read-only without a new route (unit).** A static
     assertion over the embedded page: the mode is learned from the
     response header and applied in both directions, the action buttons /
@@ -431,7 +505,11 @@ The daemon reads the file once, at start, before the listeners serve.
     savings fetch does not pop the token gate, the read-only chip is
     class-driven (a `hidden` attribute on a `.chip` element does
     nothing), and no `whoami`-shaped route was added.
-    `TestFleetPage_GuestModeIsWiredToTheHeaderNotAProbe`.
+    `TestFleetPage_GuestModeIsWiredToTheHeaderNotAProbe`, plus
+    `TestFleetPage_A401FromMCPDoesNotPopTheTokenGate` (review finding 3):
+    an `/mcp` 401 is quiet, the button still flashes `failed`, `flash()`
+    still re-runs `refresh()`, and re-authenticating on `#savings`
+    reloads the view instead of un-hiding an empty one.
 13. **The CLI can read and rotate it (unit).** An unconfigured
     `--guest` names `guest_token_file` rather than a missing file;
     `vibe token --guest` prints the configured file so it can be
@@ -440,7 +518,8 @@ The daemon reads the file once, at start, before the listeners serve.
     restart requirement when accepted.
     `TestTokenGuest_UnconfiguredSaysHowToConfigureIt`,
     `TestTokenGuest_PrintsTheConfiguredFile`,
-    `TestTokenGuest_RegenerateRevokesEveryGuestAndSaysSo`.
+    `TestTokenGuest_RegenerateRevokesEveryGuestAndSaysSo`, and
+    `TestTokenGuest_RefusesTheControlPlaneTokenFile` (review finding 1).
 14. **Streaming contract + full inner loop (mechanical).**
     `git diff --stat main..HEAD -- internal/vibe/proxy` is empty;
     `go build ./...`, `go vet ./...`, `gofmt -l .` silent, `go mod tidy`
@@ -552,10 +631,11 @@ Live gates L1–L3: **NOT RUN.** The implementing environment cannot reach
 the fleet (SSH blocked, the LAN does not route) and has no browser on
 it; a fabricated transcript is worse than an honest gap.
 
-### Adversarial self-review (ground rule 9)
+### Author's self-review
 
-Five findings against the feature commit, all fixed in the review
-commit:
+Five findings against the feature commit, all fixed in the first review
+commit. (Ground rule 9's separate adversarial pass is the addendum at
+the very end of this document, and it found seven more.)
 
 1. **The read-only chip rendered for everyone (MAJOR, page).** The chip
    was `<span class="chip" id="guest-chip" hidden>`, and `.chip` sets
@@ -597,10 +677,19 @@ commit:
   serves `HEAD` to the operator. The table declares methods exactly and
   the page never issues one; this is C5's `/ui/fleet` behaviour applied
   to two more routes, and it errs strict.
-- **Pointing `guest_token_file` at the control-plane token file**
-  disables guest access via the identical-token rung, which is the
-  correct outcome by the same argument — but the log says "identical to
-  the control-plane token", not "you pointed it at the same file".
+- **A guest's away-window is readable.** `notify.scope` /
+  `scope_until` / `scope_reason` ride `/api/fleet/state`, so an away
+  declaration tells a guest the house is empty and when it stops being
+  (§1). Not fixed: forking the state document is the thing this phase
+  refuses to do, and a field filter is a denylist wearing a hat. Write
+  `--reason` accordingly.
+- **A REFUSED guest token is invisible outside the log.**
+  `guest_enabled: false` is what an operator sees whether they never
+  configured guest access or mis-mounted the file, and `vibe cell
+  status` prints nothing in either case. The `slog.Error` at start is
+  the only signal — the same shape of gap C1 built `auth_rejected` to
+  close for the control-plane token, left open here because closing it
+  needs a third status field for a state nobody should be in for long.
 - **No hot reload and no per-guest revocation** (§6). Rotation is
   fleet-wide and needs a daemon restart.
 - **The header is advisory.** A reverse proxy that strips
@@ -610,3 +699,105 @@ commit:
   Anyone holding it reads the whole state document from anywhere the
   control plane is reachable; `bind_all` on fleetd plus a shared token is
   a LAN-wide read. That is the feature, stated plainly.
+
+## Adversarial-review addendum (2026-08-05, 7 findings, 5 fixed with
+regression tests + 2 documented)
+
+Ground rule 9's separate pass over the feature + self-review commits.
+Findings 1–5 are fixed in the `review:` commit; each production change
+was reverted and the named test watched to FAIL, then restored. Findings
+6–7 are consequences the phase argued past rather than defects, and are
+now written down where an operator will meet them.
+
+1. **`vibe token --guest` disclosed and ROTATED the control-plane token
+   (BLOCKER, CLI).** `guest_token_file` pointing at the control-plane
+   token file is a configuration this doc already listed as reachable —
+   the daemon refuses it and logs why, and the operator's next move is
+   this command. It obeyed the path: `vibe token --guest` printed the
+   **control-plane token** under a banner that says share it, and
+   `vibe token --guest --regenerate --yes` **overwrote** it with a fresh
+   random value, locking out every control-plane client, from a command
+   whose name says guest and whose output says "restart the daemon for
+   the new guest token to take effect". Both forms now refuse, naming
+   both paths. Mutation: removing the guard makes the pre-fix behaviour
+   reproduce verbatim — the test prints the disclosed token and the
+   rotated value. `TestTokenGuest_RefusesTheControlPlaneTokenFile`.
+2. **The fail-closed ladder could mint over the control-plane token
+   (MAJOR, daemon).** The identical-token rung compares *values*, and it
+   runs **after** the branch that mints into a missing file — so
+   `guest_token_file: <the control-plane token file>` with that file
+   absent writes a random value over it and enables guest access on the
+   result. `Run`'s ordering hides this today (the control-plane token is
+   loaded first, so the file exists), which makes it an ordering rather
+   than a guard, and the log said "identical to the control-plane token"
+   rather than naming the actual mistake. `loadGuestToken` now refuses on
+   the PATH before reading, via `daemon.IsControlTokenFile`
+   (`os.SameFile`, falling back to a cleaned compare precisely when the
+   file does not exist).
+   `TestGuestToken_ControlPlaneTokenFileIsRefusedBeforeItIsRead`
+   (mutation: the guest loader is caught minting a 43-char token into
+   `$XDG_STATE_HOME/vibe/token`), plus the end-to-end
+   `TestGuestToken_PointedAtTheControlPlaneFileNeverRewritesIt`.
+3. **The documented degradation degraded to the banned behaviour
+   (MAJOR, page).** §5 accepts "a proxy strips the header, the buttons
+   render, a click 401s" as the un-polished fallback — but `rpc()` went
+   through the same `api()` wrapper that pops the token gate, so that
+   click produced *exactly* the outcome §5 says must not ship: a guest
+   with a working token told it is invalid, re-enter it. A `/mcp` 401
+   cannot distinguish a stale control-plane token from a guest past
+   their grant, so it no longer decides: `rpc()` is quiet, the button
+   still flashes `failed`, and `flash()`'s existing 1.5s `refresh()`
+   puts the verdict on `/api/fleet/state`, which pops the gate for a
+   token that really is dead. Also fixed alongside: re-authenticating
+   while on `#savings` un-hid a body that had never been rendered, so an
+   operator who pasted the control-plane token into a guest tab got a
+   blank savings screen for up to 60 s until the timer fired.
+   `TestFleetPage_A401FromMCPDoesNotPopTheTokenGate`.
+4. **`X-Vibe-Auth` had NO server-side test (MAJOR, test truth).** The
+   header is the entire mechanism behind §5, and the whole suite stayed
+   green under **both** mutations: deleting the `Set` (every guest gets
+   the operator page — buttons that 401 and a token gate that lies) and
+   stamping it on the operator's responses too (every operator page
+   renders read-only). Only the embedded page's *string* was asserted,
+   never the daemon's behaviour. Now pinned on both routes, in both
+   credential directions, plus absent on 401s and on the public page.
+   `TestGuestToken_AuthModeHeaderRidesTheGuestGrantOnly` (gate 11b).
+5. **Two gates claimed assertions their tests do not make (ground rule
+   10).** Gate 9 said the equal-token case "additionally proves the
+   value still works as the control-plane token" — its named test only
+   calls the loader and never starts a daemon; and "leaves guest access
+   disabled with the daemon still serving" was likewise unasserted. Gate
+   1 said "401 to every route" and probed one. Three integration tests
+   now make those claims true and the gate text names them:
+   `TestGuestToken_IdenticalToControlPlaneFailsClosedOverHTTP`,
+   `TestGuestToken_RefusedFileOpensNothing`,
+   `TestGuestToken_RoutesAreProbedAgainstAnUnconfiguredDaemonToo` (the
+   last derived from `fleetapi.Routes()`, so it covers future routes).
+6. **The away declaration is guest-readable, and §1 argues the opposite
+   (doc).** The judgement-call section spends twenty lines denying
+   `/api/fleet/usage` because absence is sensitive and the ledger leaks
+   it *by inference*; `notify.scope` / `scope_since` / `scope_until` /
+   `scope_reason` ride `/api/fleet/state` and leak it *outright, with an
+   end date*, on a route this phase grants. Not fixed — the two
+   arguments against forking the state document still hold — but §1 now
+   says so in its own paragraph and it is listed under Known and
+   accepted, because an operator cannot infer it from "anything on the
+   page is guest-visible".
+7. **The denial table overstated what `GET /api/fleet/leases` withholds
+   (doc).** Its row read "reading and *deleting* other people's
+   declarations, C11 holds included" — but `cells[].leases` rides
+   `/api/fleet/state`, so a guest already reads every holder, model and
+   note, C11 holds included. What the denial actually withholds is the
+   write half and the fleet-wide listing. Row corrected.
+
+Also checked and found correct, so the next reader does not re-derive
+it: the `deploy/fleetd/README.md` guest-token example was
+`/state/guest-token`, one level above the compose's only rw state mount
+(`/state/vibe` = `$XDG_STATE_HOME/vibe`) — a MINTED file there is
+container-local, so every recreate silently revokes every guest, which
+is the exact failure the same commit's state-contract table says the
+mount prevents. Corrected to `/state/vibe/guest-token` with the reason
+written next to it. And `notify.endpoint` / `delivery.last_error`, the
+two C9 fields a guest now reads, are redacted and scrubbed at the
+source (`WebhookSink.redacted`, `Deliverer.scrub`) — the guest grant
+does not leak the webhook credential.

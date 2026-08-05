@@ -60,13 +60,17 @@ fleet:
   # housemate; the fleet page renders read-only for it.
   #
   # Off unless this key is set. The daemon MINTS the file at first start
-  # (0600) — it belongs in the state volume so a container recreate does
-  # not silently revoke every guest. Anything wrong with it (empty, too
-  # short, whitespace, or a copy of the control-plane token) disables
-  # guest access loudly rather than granting more than intended.
+  # (0600), so the path MUST be inside the mounted state dir —
+  # /state/vibe, which is $XDG_STATE_HOME/vibe and the one rw mount the
+  # compose marks required. A path one level up (/state/guest-token) is
+  # container-local: every recreate mints a fresh token and silently
+  # revokes every guest. Anything wrong with the file (empty, too short,
+  # whitespace, or a copy of the control-plane token — including
+  # pointing this key at /state/vibe/token) disables guest access loudly
+  # rather than granting more than intended.
   # Read it with `vibe token --guest`; rotate with
   # `vibe token --guest --regenerate` + a restart.
-  # guest_token_file: /state/guest-token
+  # guest_token_file: /state/vibe/guest-token
 
   # C9: the class table's alarm column, delivered to one webhook. Empty
   # (the default) means no notifications at all. The URL is a

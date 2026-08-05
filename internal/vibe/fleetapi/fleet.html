@@ -199,6 +199,10 @@ function setAuthMode(isGuest) {
   if (!isGuest) {
     $("sv-guest").hidden = true;
     $("sv-body").hidden = false;
+    // The body we just un-hid is whatever was there when the guest
+    // arrived, which is nothing: re-authenticating on #savings must not
+    // leave an empty screen until the 60s timer happens to fire.
+    if (location.hash === "#savings") loadSavings(true);
   } else if (location.hash === "#savings") {
     showSavingsDenied();
   }
@@ -217,13 +221,22 @@ async function api(path, opts, quiet) {
   return r;
 }
 
+// A 401 from /mcp is AMBIGUOUS — a stale control-plane token and a
+// perfectly good guest token produce the same status — so it does not
+// get to pop the token gate. The button flashes "failed" (runTool's
+// catch) and flash() re-runs refresh() 1.5s later; /api/fleet/state is
+// the one route that can tell the two apart, and it pops the gate for a
+// genuinely dead token. Without this, a guest whose X-Vibe-Auth header
+// was stripped by a proxy — the degradation §5 calls acceptable —
+// clicks a button and is told their working token is invalid, which is
+// the exact behaviour C12 exists to remove.
 function rpc(tool, args) {
   return api("/mcp", {
     method: "POST",
     headers: Object.assign({ "Content-Type": "application/json" }, hdrs()),
     body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method: "tools/call",
                            params: { name: tool, arguments: args || {} } }),
-  }).then(r => r.json());
+  }, true).then(r => r.json());
 }
 
 function esc(s) { const d = document.createElement("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML; }

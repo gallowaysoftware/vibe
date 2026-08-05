@@ -750,6 +750,15 @@ optional.)
     rung is the important one — such a token authenticates on the FIRST
     comparison and would grant every verb. A missing file is minted
     (0600) and logged CREATED-vs-loaded, C1's rule.
+  - **`guest_token_file` may never BE the control-plane token file**,
+    and that is checked on the PATH (`daemon.IsControlTokenFile`, before
+    the file is read) rather than on the value — because the loader
+    MINTS into a missing file, so the value comparison would run on a
+    value it had just written over the control-plane token.
+    `vibe token --guest` and `--guest --regenerate` refuse the same
+    configuration: printing it hands out the control-plane token under a
+    "share this" banner, and regenerating it rotates the control-plane
+    token from a command whose name says guest.
   - **The page hides what a guest cannot do**, learning which credential
     it holds from the `X-Vibe-Auth: guest` response header on a request
     it already makes — no probe, no new route (C7b's rule), no
