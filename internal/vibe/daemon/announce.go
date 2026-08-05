@@ -122,11 +122,24 @@ func (d *Daemon) withdrawAnnounce() {
 // the def checkout's git state — the "cell is N commits behind" context
 // a fingerprint mismatch report needs.
 func (d *Daemon) fleetVersions() *fleetapi.AnnounceVersions {
+	return fleetVersionsAt(paths.BackendsDir())
+}
+
+// FleetVersions is the same block for announcers that are not a daemon
+// (`vibe fleet announce`, the slim cell form). Exported because C13's
+// def-SHA parity check is worthless when half the fleet reports no
+// versions at all, and before it the slim announcer passed no provider —
+// the heavy cell, whose def checkout is the one most likely to drift,
+// was the one cell that never said which checkout it had.
+func FleetVersions(backendsDir string) *fleetapi.AnnounceVersions {
+	return fleetVersionsAt(backendsDir)
+}
+
+func fleetVersionsAt(backendsDir string) *fleetapi.AnnounceVersions {
 	v := &fleetapi.AnnounceVersions{Vibe: buildinfo.String()}
-	dir := paths.BackendsDir()
-	if sha, err := gitOut(dir, "rev-parse", "--short", "HEAD"); err == nil {
+	if sha, err := gitOut(backendsDir, "rev-parse", "--short", "HEAD"); err == nil {
 		v.DefsSHA = sha
-		if dirty, err := gitOut(dir, "status", "--porcelain"); err == nil && dirty != "" {
+		if dirty, err := gitOut(backendsDir, "status", "--porcelain"); err == nil && dirty != "" {
 			v.DefsDirty = true
 		}
 	}
@@ -138,15 +151,24 @@ func (d *Daemon) fleetVersions() *fleetapi.AnnounceVersions {
 func (d *Daemon) fleetCapacity() *fleetapi.AnnounceCapacity {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	cap := &fleetapi.AnnounceCapacity{}
+	cap := FleetDiskCapacity(filepath.Dir(paths.StartHistoryFile()))
 	if free, err := d.nvidiaSMI(ctx); err == nil {
 		cap.VRAMFreeGB = free
 	}
 	if total, err := d.vramCapacity(ctx); err == nil {
 		cap.VRAMTotalGB = total
 	}
+	return cap
+}
+
+// FleetDiskCapacity is the capacity block a slim announcer can fill: the
+// disk half only, because a cell without a daemon has no VRAM probe
+// wired. An unreadable filesystem leaves the field at zero, which C13's
+// disk check reads as "not reported" rather than as "full".
+func FleetDiskCapacity(dir string) *fleetapi.AnnounceCapacity {
+	cap := &fleetapi.AnnounceCapacity{}
 	var st syscall.Statfs_t
-	if err := syscall.Statfs(filepath.Dir(paths.StartHistoryFile()), &st); err == nil {
+	if err := syscall.Statfs(dir, &st); err == nil {
 		cap.DiskFreeGB = float64(st.Bavail) * float64(st.Bsize) / (1 << 30)
 	}
 	return cap

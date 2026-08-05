@@ -841,6 +841,85 @@ optional.)
     about tokens). Hiding is a COURTESY; the middleware is the boundary.
     If the header is stripped the page just keeps its buttons and a
     click 401s.
+- **`vibe fleet doctor` (fleet-control C13).** The audit that answers
+  "is the fleet still put together correctly" — the question
+  `fleet_status` never asks. `fleetapi/doctor.go` (the report),
+  `GET /api/fleet/doctor` (fleetd-only, `AccessTokenOnly` in C12's
+  table), `fleetmcp`'s `fleet_doctor`, `cli/cmd_fleet_doctor.go`, and
+  `daemon/doctor.go` (the host facts + the outbound credential probe,
+  injected through `Options` exactly as `daemonInfo` is, so fleetapi
+  still knows nothing about tokens or the filesystem).
+  - **It is READ-ONLY and that is the feature**, because the command
+    exists to be run mid-incident: no drain, warm, unload, probe, wake,
+    render, queued command, intent write, lease, notification or config
+    write is reachable from it. Pinned TWICE — behaviourally (every
+    state file and both command queues byte-identical across a run) and
+    structurally (an AST scan of `doctor.go` for mutating identifiers).
+    Both are mutation-verified. The one write a doctor run can cause is
+    `last-seen.json`'s sighting record, because doctor's evidence is the
+    same `Snapshot` every other surface renders (C9's one-document
+    rule) — that is a property of READING state, and it is documented
+    rather than engineered around.
+  - **Four levels, and `UNKNOWN` is not `OK`.** A check that could not
+    be evaluated says so, with the reason, and carries its own exit code
+    (0 clean / 1 FAIL / 2 WARN / 3 only-UNKNOWNs — "the report is
+    incomplete"). This is C5's M2, C7a's `unmeasured_req`, C8's
+    under-5-samples verdict and C9's `fingerprint_source` as a first-
+    class output type. Never add a fifth level for "not applicable":
+    where a configuration legitimately has nothing to check (an
+    announce-only cell's outbound credential, a fleet with no https
+    endpoint, the front's absent announcer), the verdict is OK with the
+    reason — a permanent UNKNOWN on a healthy fleet teaches the operator
+    to ignore the level.
+  - **A check ID names what it PROVES**: `wake.configured` not
+    `wake.armed` (a NIC's arming is not observable, and sending a packet
+    to find out is a mutation), `tls.not_after` not `tls.valid` (the
+    chain is deliberately unverified — LAN certs are self-signed, and
+    the message says so). Ground rule 10 applied to check names.
+  - **The credential check uses the resolver the VERBS use.**
+    `fleetcfg.CellCredential(cell, env, pref, localToken)` now holds
+    C6's two deliberately-divergent precedences as named values
+    (`PreferCellFile` for the long-lived fleetd, `PreferEnv` for a human
+    typing one command); fleetmcp and the CLI both call it. A doctor
+    with its own resolver would test its own code. Inbound auth needs no
+    plumbing at all: the announce IS the credential test, since a cell
+    with a wrong token never reaches the presence table.
+  - **The one real derivation is `roaming.announcer`**: `host_probe` up
+    plus no fresh announce means the announce agent is not running (or
+    is being rejected — it says both, and cross-references
+    `auth_rejected`). Everything else composes existing status blocks.
+  - `versions.llama_swap` reports UNKNOWN naming the MISSING PRODUCER —
+    the field has been a C3 reservation nothing writes. Do not "fix"
+    that by guessing a llama-swap admin endpoint from a box that cannot
+    verify it. `vibe fleet announce` now sends the same versions +
+    capacity blocks the daemon does (`daemon.FleetVersions`,
+    `daemon.FleetDiskCapacity`) — before C13 the heavy cell reported
+    neither.
+  - **A DECLARED suppression is the policy working, and `WARN` is
+    subject to the same "permanent verdict on a healthy fleet" rule as
+    `UNKNOWN`** (the review pass; three checks broke it). `warm.policy`,
+    `probe.verdicts` and `usage.flow` route every skip through
+    `explainedCells`, which derives the reason from the **StateSnapshot**
+    — declared drain → C11 hold → class-normal absence, C11's ladder
+    order — never from a loop's detail prose, and reports an explained
+    skip as OK **with the reason named**. Without it one report called a
+    hold both "active" and "the warm policy not doing what it was
+    declared to do", and `vibe cell drain` turned two checks yellow for
+    its whole duration. A probe skip is a finding only when the target
+    was NEVER asked (`LastAsk == nil`): C8's guard set skips on in-flight
+    work and an unreported in-flight count, so "skipped right now" is
+    what a fleet in USE looks like. `intent.hygiene` gates BOTH buckets
+    on `staleRequestAge` — the window between a drain request and the
+    cell's echo is the normal middle of every drain — and `DRAINED?`
+    (no entry) and `INCONSISTENT` (declared, not yet reconciled) are
+    separate sentences; the second is not "undeclared".
+  - **Every fan-out shares the report's ONE deadline**, so nothing on
+    this path may be serial: the credential probes (self-review REV-1)
+    and the TLS dials (review pass) both shipped serial first, and both
+    produced rows describing endpoints that were never dialled. When
+    `ctx.Err() != nil` a row names the BUDGET, never the host — "a host
+    that is off and a broken TLS listener are indistinguishable" is a
+    claim about a dial that happened.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.
@@ -1228,9 +1307,10 @@ planned. The short version an agent needs:
 
 ## Fleet control (node state / intent / presence, 2026-08-02+)
 
-`docs/design/fleet-control.md` is the design; the C0–C4 execution plan
+`docs/design/fleet-control.md` is the design; the C0–C13 execution plan
 lives in `docs/design/fleet-control-plan/` (one phase = one PR, each
-phase doc ends in acceptance gates that are the definition of done).
+phase doc ends in acceptance gates that are the definition of done),
+and the ranked v2 backlog is `docs/design/fleet-control-futures.md`.
 The invariants an agent must not violate while implementing or
 touching adjacent code: the data plane (client → front → cell
 llama-swap) gains no new hop; availability is observed, intent is

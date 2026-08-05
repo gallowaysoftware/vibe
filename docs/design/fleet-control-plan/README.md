@@ -1,4 +1,4 @@
-# Fleet-control implementation plan (C0–C12)
+# Fleet-control implementation plan (C0–C13)
 
 Execution plan for [../fleet-control.md](../fleet-control.md). Each
 phase is one PR, independently shippable, and pays for itself before
@@ -21,6 +21,7 @@ to be implementable on its own after that.
 | [C10](c10-await-extensions.md) | await extensions: `--model --ready`, `--idle`, the lease handshake | ~450 lines | C1, C2, C3, C4, C6, C9, C11 | merged (#29); unit gates 1-12 green (12 added by the C9 merge), 4 live gates UNRUN |
 | [C11](c11-hold-model.md) | hold_model: the pause button on the warm policy | ~450 lines | C2, C4, C5 | merged (#30); unit gates 1-11 green, 4 live gates UNRUN |
 | [C12](c12-guest-token.md) | Guest read-only token: sharing status without sharing drain | ~250 lines | C1, C5 | PR open; feature + self-review + adversarial-review commits; unit gates 1-14 (+11b) green, 3 live gates UNRUN |
+| [C13](c13-doctor.md) | `vibe fleet doctor`: the sit-down-after-two-weeks audit | ~1500 lines | C1-C12 (composition) | PR open, branched off C12; unit gates U1-U16 green, 4 live gates UNRUN |
 
 C10 (await extensions) is the last of the three branches cut from
 `c9e8bcf` in parallel; C11 and then C9 landed ahead of it. None of the
@@ -35,7 +36,8 @@ sets (`c10-await-extensions.md`'s second addendum).
 **Merged is not live-gated.** Every C0–C7b PR merged on a green CI run
 of the mechanical inner loop. The live gates — the ones that need real
 cells, a real GPU and a real week of traffic — are UNRUN for C5, C6,
-C7a, C7b, C8, C9, C10, C11 and C12, and each phase doc lists exactly which.
+C7a, C7b, C8, C9, C10, C11, C12 and C13, and each phase doc lists
+exactly which.
 Ground rule 10 applies to this table: a status cell is a claim about a
 mechanical run.
 
@@ -113,6 +115,28 @@ path-cleaning). The phase's other decision worth carrying: `usage` and
 `savings` are refused to a guest even though both are read-only GETs —
 state is instantaneous, the ledger is the household's history, and the
 savings screen exposes more about the house than cell status does.
+
+C13 (2026-08-05) is backlog item 7, the first Medium-tier item, and it
+is almost entirely COMPOSITION: nearly every input already existed
+(presence, the announce versions block, defs_sha/defs_dirty,
+fingerprints, leases, the ledger, probe verdicts), and the value is in
+the diagnosis. Four rules it carries forward. **UNKNOWN is a level, and
+it is not OK** — this plan has been bitten by absent evidence reading as
+a healthy zero in five phases, and a doctor, whose reward is a screen of
+green, is where that mistake is cheapest to make. **A check is named for
+what it proves**: `wake.configured` not `wake.armed`, `tls.not_after`
+not `tls.valid` — ground rule 10 applied to check names, because an
+operator reading a screen of OK must be reading true sentences. **The
+report is read-only and that is tested twice**, behaviourally (state
+files and queues byte-identical across a run) and structurally (a source
+scan for mutating identifiers), because the command's whole value is
+being safe to run mid-incident. And **the credential check uses the
+resolver the actuation verbs use** (`fleetcfg.CellCredential`, which now
+holds both of C6's deliberately-divergent precedences as named values) —
+a doctor that resolved credentials its own way would be testing its own
+code. Two gaps it surfaced rather than papered over: nothing has ever
+populated `versions.llama_swap`, and the slim announcer sent no versions
+or capacity block at all (fixed here).
 
 A **post-merge reconciliation PR** (#26, 2026-08-03) closed the three
 items no single phase branch could reach, because each needed code from

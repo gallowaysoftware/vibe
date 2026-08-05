@@ -197,6 +197,10 @@ type Server struct {
 	// them down so cellDown→cellUp transitions resolve in milliseconds.
 	baseBackoff time.Duration
 	maxBackoff  time.Duration
+	// tlsDial bounds one doctor TLS handshake (C13). A field rather than
+	// the constant so a test can assert the FAN-OUT in milliseconds
+	// instead of burning the real 3s per endpoint.
+	tlsDial time.Duration
 
 	mu     sync.Mutex
 	subs   map[chan Event]struct{}
@@ -320,6 +324,16 @@ type Server struct {
 	fpMismatch   map[string]FingerprintMismatch
 	renderLoopOn bool
 
+	// doctorHost supplies the fleetd-HOST facts (disk, token minting,
+	// $VIBE_TOKEN presence, the def checkout) and cellAuth performs one
+	// read-only authenticated call per cell. Both are injected for the
+	// same reason daemonInfo is: this package knows nothing about the
+	// daemon's config, its token files or the filesystem under it, and
+	// C13 does not change that. Nil means the matching checks report
+	// UNKNOWN, never OK.
+	doctorHost func() DoctorHost
+	cellAuth   func(ctx context.Context, cell string) CellAuthResult
+
 	// started is this process's boot instant, immutable after New. The
 	// warm policy uses it as the idle floor for a model no inflight frame
 	// has ever mentioned: fleetd must never claim more silence than it
@@ -362,6 +376,13 @@ type Options struct {
 	// NotifyScopePath backs the declared away/home fleet scope (C9).
 	// Empty keeps the scope in memory only.
 	NotifyScopePath string
+	// DoctorHost supplies `vibe fleet doctor` with the host facts this
+	// package cannot read (C13). Nil leaves those checks UNKNOWN.
+	DoctorHost func() DoctorHost
+	// CellAuth performs ONE read-only authenticated call to a cell's own
+	// daemon, with the credential the actuation verbs resolve. Nil leaves
+	// the outbound half of the credential check UNKNOWN — never OK.
+	CellAuth func(ctx context.Context, cell string) CellAuthResult
 }
 
 // New builds a Server over the given cell registry. historyPath is the JSON
@@ -381,6 +402,7 @@ func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Op
 		streamClient:       &http.Client{},
 		baseBackoff:        500 * time.Millisecond,
 		maxBackoff:         30 * time.Second,
+		tlsDial:            tlsDialTimeout,
 		subs:               map[chan Event]struct{}{},
 		cellUp:             map[string]bool{},
 		cellUpSince:        map[string]time.Time{},
@@ -410,6 +432,8 @@ func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Op
 		fpMismatch:         map[string]FingerprintMismatch{},
 		notifyScope:        loadNotifyScope(opts.NotifyScopePath),
 		notifyScopePath:    opts.NotifyScopePath,
+		doctorHost:         opts.DoctorHost,
+		cellAuth:           opts.CellAuth,
 		done:               make(chan struct{}),
 	}
 }

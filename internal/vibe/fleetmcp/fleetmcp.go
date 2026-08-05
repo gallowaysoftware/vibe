@@ -368,6 +368,22 @@ func (s *Server) mcpTools() []any {
 			},
 		},
 		map[string]any{
+			"name": "fleet_doctor",
+			"description": "Is the fleet still put together correctly? A READ-ONLY audit that runs " +
+				"every 'is it still wired up' check at once: both-direction token auth per cell, " +
+				"def-SHA parity, the llama-swap version matrix, TLS expiry, disk headroom, wake " +
+				"configuration, whether each roaming cell's announcer is actually running, plus " +
+				"intent, lease, fingerprint, probe, warm, ledger and notification hygiene. Each " +
+				"check reports ok / warn / fail / UNKNOWN, and unknown means the check could not " +
+				"be evaluated — it never means fine. This tool CHANGES NOTHING: it drains, warms, " +
+				"unloads, probes and renders nothing, and is safe to call mid-incident. Fixes are " +
+				"the operator's, through the other tools.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		map[string]any{
 			"name": "fleet_notify_scope",
 			"description": "Declare whether fleet ALARM notifications should be delivered right " +
 				"now: \"away\" (vacation — alarms still fire and stay visible in fleet_status, " +
@@ -433,6 +449,12 @@ func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMess
 		timeout = time.Duration(probe.WaitSeconds)*time.Second + 75*time.Second
 	case "resume_cell", "wake_cell", "render_front":
 		timeout = 90 * time.Second
+	case "fleet_doctor":
+		// A read, but a wide one: the state snapshot's per-cell probes,
+		// one credential call per cell and one TLS dial per https
+		// endpoint, each individually bounded. 10s is the budget for ONE
+		// probe round.
+		timeout = 45 * time.Second
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -440,6 +462,8 @@ func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMess
 	switch name {
 	case "fleet_status":
 		return s.toolFleetStatus(ctx)
+	case "fleet_doctor":
+		return s.toolFleetDoctor(ctx)
 	case "warm_model":
 		var args struct {
 			Model string `json:"model"`

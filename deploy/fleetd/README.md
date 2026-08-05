@@ -251,11 +251,29 @@ wrong.
   browser cannot 401-and-then-prompt. The page carries no fleet data —
   every byte of state still requires the token, which it stores in
   `localStorage`.
+- Audit: `vibe fleet doctor` (C13) — the sit-down-after-two-weeks
+  command. Both-direction token auth per cell, def-SHA parity, the
+  llama-swap version matrix, cert expiry, disk headroom, wake
+  configuration, whether each roaming cell's announcer is actually
+  running, plus intent / lease / fingerprint / probe / warm / ledger /
+  notification hygiene. Every check reports OK / WARN / FAIL /
+  **UNKNOWN**, and UNKNOWN means the check could not be evaluated —
+  never that it passed. Exit codes: 0 clean, 1 a FAIL, 2 a WARN, 3 only
+  UNKNOWNs. It is READ-ONLY and safe to run mid-incident; it never
+  drains, warms, unloads, probes, wakes or renders anything.
+  - **The quarterly fire drill** it is meant to be paired with, 15
+    minutes: `docker compose stop fleetd` → `vibe fleet doctor` (the
+    degraded path: fleetd FAILs, fleet-side checks go UNKNOWN, cells are
+    probed directly and keep serving — invariant 4 in practice) →
+    `docker compose start fleetd` → reboot the front → `vibe fleet
+    doctor` again → one real `wake_cell`. That last step is the test
+    `wake.configured` cannot be: the control plane can see a MAC is
+    declared and cannot see whether the NIC is armed.
 - MCP: `POST http://<FLEETD_IPV4>:9001/mcp` (bearer) speaks
   initialize / tools-list / tools-call. Tools: `fleet_status`,
-  `warm_model`, `unload_model`, `drain_cell`, `resume_cell`,
-  `wake_cell`, `render_front` (dry-run only — fleetd's presence-driven
-  render loop owns the write path). `drain_cell`/`resume_cell` reach a
+  `fleet_doctor`, `warm_model`, `unload_model`, `drain_cell`,
+  `resume_cell`, `wake_cell`, `render_front` (dry-run only — fleetd's
+  presence-driven render loop owns the write path). `drain_cell`/`resume_cell` reach a
   cell through its `daemon_url` + `token_file`; without those they fall
   back to recording desired intent for the cell to pick up on its next
   announce. Registration for agent harnesses uses

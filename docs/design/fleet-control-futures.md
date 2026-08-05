@@ -130,12 +130,30 @@ Small (days):
 
 Medium:
 
-7. **`vibe fleet doctor`** — both-direction token auth per cell,
-   def-SHA parity, llama-swap version matrix, cert `notAfter` on the
-   proxy + registry, disk free on the front, WoL-armed assertion,
-   roaming-cell agent-loaded assertion. The sit-down-after-two-weeks
-   command. Pair with a quarterly 15-minute fire drill (kill fleetd,
-   reboot the front, run doctor, one WoL wake).
+7. **`vibe fleet doctor`** — **SHIPPED as
+   [C13](fleet-control-plan/c13-doctor.md) (2026-08-05).** Both-direction
+   token auth per cell, def-SHA parity, the llama-swap version matrix,
+   cert `notAfter`, disk free, wake configuration, the roaming-cell
+   announcer assertion, plus intent / lease / fingerprint / probe / warm
+   / ledger / notification hygiene. The quarterly fire drill this entry
+   pairs it with stays the other half — see below. Four notes for whoever
+   reads this next. **UNKNOWN is a level and it is not OK**: a check that
+   could not be evaluated says so, in its own block, with its own exit
+   code — the sit-down command is exactly where "I couldn't check" is
+   cheapest to score as "fine". **Checks are named for what they PROVE**:
+   `wake.configured`, not `wake.armed` — the control plane cannot see a
+   NIC's arming and sending a packet to find out is a mutation, which is
+   why this entry always paired the command with a drill. **Two of the
+   seven named inputs turned out not to exist**: nothing has ever
+   populated `versions.llama_swap` (a C3 reservation), so the matrix
+   reports UNKNOWN naming the missing producer rather than guessing at an
+   endpoint this repo cannot verify; and the slim announcer sent no
+   versions or capacity block at all, so the heavy cell — the box most
+   likely to drift — was the one cell reporting neither (fixed there).
+   And **"disk free on the front" is not fleetd's disk**: fleetd is its
+   own container, so the report separates fleetd's state dir, the front's
+   render mount (only where `fleet.front_config` declares the shared
+   mount) and each cell's announced capacity.
 8. **Usage rollups** — fleetd scrapes each cell's `/api/metrics` on
    the probe loop (llama-swap's are in-memory and vanish on restart),
    persists per-model × cell × day counts, exposes

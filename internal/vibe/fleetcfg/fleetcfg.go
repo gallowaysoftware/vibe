@@ -221,6 +221,84 @@ type File struct {
 	Pricing *Pricing `yaml:"pricing,omitempty"`
 }
 
+// CredentialPreference selects which of the two correct precedences a
+// caller applies when both $VIBE_TOKEN and a per-cell token_file could
+// answer. Both orders are right for their context and neither is
+// discoverable from a 401, which is why they live here as named values
+// instead of as two hand-rolled switch statements (fleet-control C13).
+type CredentialPreference int
+
+const (
+	// PreferCellFile is the LONG-LIVED process order (fleetd): the
+	// per-cell token_file wins and $VIBE_TOKEN is only the fallback for
+	// cells that declare none. One env var in a process that outlives
+	// every command must not silently void every per-cell credential in
+	// hosts.yaml (C6's NIT-E).
+	PreferCellFile CredentialPreference = iota
+	// PreferEnv is the INTERACTIVE order (the CLI): an explicit
+	// $VIBE_TOKEN wins, because exporting it for one command is exactly
+	// how an operator says "use this one".
+	PreferEnv
+)
+
+// Credential kinds — the machine-readable half of a resolution, so a
+// report can group by origin without parsing prose.
+const (
+	CredCellFile = "token_file"
+	CredEnv      = "env"
+	CredLocal    = "local"
+)
+
+// Credential is one resolved cell credential. Source is the ORIGIN, for
+// diagnostics and error messages; it never carries the token value.
+type Credential struct {
+	Token  string
+	Kind   string
+	Source string
+}
+
+// CellCredential resolves the bearer a caller should present to one
+// cell's daemon. localToken supplies the local box's own control-plane
+// token as the last resort (a func so the file read only happens when
+// that branch is actually taken); nil means "no local fallback".
+//
+// An unreadable or empty token_file is a typed error rather than a
+// silent fallthrough: both turn a typo into an opaque 401 from a remote
+// box, which is the failure C6's MIN-P fixed for the CLI and this makes
+// uniform.
+func (f *File) CellCredential(name, envToken string, pref CredentialPreference, localToken func() string) (Credential, error) {
+	if f == nil {
+		return Credential{}, fmt.Errorf("unknown cell %q (no hosts.yaml)", name)
+	}
+	c, ok := f.Cells[name]
+	if !ok {
+		return Credential{}, fmt.Errorf("unknown cell %q (not in hosts.yaml)", name)
+	}
+	envToken = strings.TrimSpace(envToken)
+	if pref == PreferEnv && envToken != "" {
+		return Credential{Token: envToken, Kind: CredEnv, Source: "$VIBE_TOKEN"}, nil
+	}
+	if c.TokenFile != "" {
+		data, err := os.ReadFile(c.TokenFile)
+		if err != nil {
+			return Credential{}, fmt.Errorf("read cells.%s.token_file %s: %w", name, c.TokenFile, err)
+		}
+		tok := strings.TrimSpace(string(data))
+		if tok == "" {
+			return Credential{}, fmt.Errorf("cells.%s.token_file %s is empty", name, c.TokenFile)
+		}
+		return Credential{Token: tok, Kind: CredCellFile, Source: "cells." + name + ".token_file (" + c.TokenFile + ")"}, nil
+	}
+	if envToken != "" {
+		return Credential{Token: envToken, Kind: CredEnv, Source: "$VIBE_TOKEN"}, nil
+	}
+	var tok string
+	if localToken != nil {
+		tok = strings.TrimSpace(localToken())
+	}
+	return Credential{Token: tok, Kind: CredLocal, Source: "this box's own control-plane token"}, nil
+}
+
 // ModelPricingFor returns the pricing claim for a local model id.
 func (f *File) ModelPricingFor(model string) (ModelPricing, bool) {
 	if f == nil || f.Pricing == nil {

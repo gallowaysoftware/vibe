@@ -163,6 +163,16 @@ func routeTable() []route {
 			handler: func(s *Server) http.HandlerFunc { return s.handleSavings },
 			enabled: usageLedgerOn,
 		},
+		// C13's doctor, on its own route for savings' reason and more so:
+		// it fans out to every cell twice and dials every https endpoint,
+		// which must never ride a document the page polls. Token-only
+		// without argument — the report names config paths, credential
+		// sources, disk figures and cert expiries.
+		{
+			Route:   Route{Method: http.MethodGet, Path: "/api/fleet/doctor", Access: AccessTokenOnly},
+			handler: func(s *Server) http.HandlerFunc { return s.handleDoctor },
+			enabled: fleetdRole,
+		},
 	}
 }
 
