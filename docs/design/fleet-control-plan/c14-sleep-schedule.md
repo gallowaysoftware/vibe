@@ -4,13 +4,14 @@ Status: IN REVIEW (2026-08-05), feature + self-review + second-pass +
 **adversarial-review** commits (ground rule 9's separate pass).
 Branched off [C13](c13-doctor.md). Unit gates U1–U18 green on a full
 local inner loop (`-race -count=5 ./...`, `golangci-lint run` 0 issues,
-`gofmt -l .` silent, `go mod tidy` clean); all six live gates are still
-**NOT RUN**. Re-assessed 2026-08-05 against the local multi-cell harness
-that ran most of the plan's other live gates
-([`scripts/fleetlab`](../../../scripts/fleetlab/README.md)): **four of
-the six genuinely need metal** — a box that enters S3, a wattmeter, a
-magic packet on a real NIC, a BIOS switch — and two (L3, L4) do not and
-are simply owed. The
+`gofmt -l .` silent, `go mod tidy` clean). Of the six live gates,
+**L3 and L4 PASSED on 2026-08-05** under [C17](c17-gate-closure.md)
+against the local multi-cell harness
+([`scripts/fleetlab`](../../../scripts/fleetlab/README.md)) — a real
+request deferring a declared suspend and then letting it fire, and a real
+lease deferring one until `max_defer` abandoned it. The other **four
+genuinely need metal**: a box that enters S3, a wattmeter, a magic packet
+on a real NIC, a BIOS switch. The
 implementer's own review found 4 items (REV-1…REV-4); the separate
 adversarial pass found 7 more (REV2-1…REV2-7), including two that would
 have taken the fleet down or paged every morning. All eleven are fixed
@@ -552,7 +553,7 @@ and two cron evaluators in one package is how one of them silently rots.
   fleetd-route-list test extended with no new route (this phase adds
   none).
 
-### Live gates (four need a real box that really suspends; all NOT RUN — see the [gate table](#gates))
+### Live gates (four need a real box that really suspends; L3 and L4 PASSED — see the [gate table](#gates))
 
 - **L1 — one real night.** `gpu-cell` suspends at the declared minute
   with nothing running, and `fleet_status` shows OFF with
@@ -596,17 +597,20 @@ from the plan above and both are now reflected in the design sections:
 | U1–U18 (unit) | **PASS** — `go build ./...`, `go vet ./...`, `go test -race -count=5 ./...`, `gofmt -l .` silent, `go mod tidy` clean, `golangci-lint run` 0 issues |
 | L1 (one real night) | **NOT RUN — needs metal.** Two physical facts, not one: a box that actually enters S3 and comes back, and a wattmeter on its cord. The *schedule* half is separable and locally runnable — `cell_cmds.suspend` is a declared command, so a harness cell can point it at a no-op and the fire/defer decision can be watched end to end (`scripts/fleetlab` writes exactly such a stub) — but "suspends at the declared minute" and "measure the wall draw before and after" are the gate, and neither is simulable. |
 | L2 (the wake) | **NOT RUN — needs metal.** A magic packet on a real NIC reaching a powered-off machine, and that machine's BIOS/firmware honouring it. Loopback has no equivalent: there is nothing to wake. |
-| L3 (the operator at 23:29) | **NOT RUN, but no metal needed.** Runnable on `scripts/fleetlab` today: a real request at a lab cell creates a real inflight frame, the guard ladder reads the same counter it reads in production, and the stub suspend command makes the *decision* observable without suspending anything. Not attempted for session time. |
-| L4 (the mid-batch night) | **NOT RUN, but no metal needed.** Same shape as L3 with a lease held across the window; the lease and the guard are both fleetd-side. The one thing a lab cannot compress is the "all night" part — the deferral loop would have to be watched for the real duration or the schedule shortened, which weakens the gate slightly. |
+| L3 (the operator at 23:29) | **PASS (2026-08-05, C17, `scripts/fleetlab/gate-c14-l3.sh`)** — on the local multi-cell harness, with the cron minutes computed from the wall clock **in the fleet timezone** and `cell_cmds.suspend` pointed at the lab's no-op stub, so the DECISION is observable without suspending a workstation. At the declared minute (21:51:00Z) with a real request 24 s old, the entry went `deferred` — `cell bravo served a request 24s ago (quiet window 5m0s)` — stamped `deferred_since` and rolled `next_suspend` to tomorrow. The session then continued at one request a minute and the age was re-derived on every tick: 24s → 1m24s → 2m24s → 3m24s. At **21:59:00Z**, 5m24s after the last request and the first minute tick past the quiet window, the suspend FIRED: `cell-verbs.log` recorded `fake-suspend bravo`, the entry read `asleep / suspended` with `last_suspend` stamped, the registry intent became `{"state":"drained","reason":"asleep per sleep_schedule","eta":"18:14"}`, and the CELL's own `cell-intent.json` carried `drained` at **the same nanosecond** — C14's "CellSuspend stamps the cell's own intent before it freezes", observed. **Two lab artifacts, not defects:** the display is `INCONSISTENT` rather than `OFF` because the stub suspend leaves bravo running and announcing, so C3's evidence-over-declaration rule contradicts the declared drain (on metal the box is gone and it renders OFF); and the first attempt declared its cron in the LOCAL zone rather than the fleet's, which C4's published `next_fire` caught on sight — the rule worked, the harness operator was the one who needed it. |
+| L4 (the mid-batch night) | **PASS (2026-08-05, C17, `scripts/fleetlab/gate-c14-l4.sh`)**, with `max_defer` shortened to 4 m — the substitution the row predicted, and the one thing the gate does not prove, since what "all night" adds is repetitions of a once-a-minute decision this run watched four times. A batch claimed a real lease through `vibe cell await bravo --model lab-embed-b --ready --lease overnight-batch --lease-ttl 30m`, then the box went quiet. At the declared minute (22:04:00Z) the entry went `deferred` naming **`1 active leases on bravo`** — and from 22:06 the quiet window was satisfied too, so for the last two minutes the lease was the ONLY blocker and the detail never changed. At `max_defer` (22:08:00Z) it abandoned, visibly: `skipped / abandoned after the defer window (1 active leases on bravo)`. Nothing was suspended (`cell-verbs.log` 0 bytes), **no intent was recorded** (`intent: null`), the display stayed `SERVING`, and two further minutes produced no return and no fire. |
 | L5 (the wake that fails) | **NOT RUN — needs metal.** A BIOS switch to disarm, and a real night to fail across. |
 | L6 (the drill) | **NOT RUN — needs metal.** A real box to suspend and wake, from a phone. |
 
-**Assessment (2026-08-05).** The 2026-08-05 harness run moved most of
-the plan's live gates off "needs the real fleet" by observing that they
-needed a second *cell*, not a second *box*. C14 is the phase where that
-observation genuinely does not apply: four of its six gates are about a
-machine's power state, which no number of processes on one box can
-stand in for. L3 and L4 are the exceptions and are owed.
+**Assessment (2026-08-05, amended by C17 the same day).** The 2026-08-05
+harness run moved most of the plan's live gates off "needs the real
+fleet" by observing that they needed a second *cell*, not a second
+*box*. C14 is the phase where that observation only partly applies:
+four of its six gates are about a machine's power state, which no number
+of processes on one box can stand in for. L3 and L4 were the exceptions,
+they were owed, and [C17](c17-gate-closure.md) paid them — both PASS,
+with every substitution (stub suspend verb, 4-minute `max_defer`,
+fleet-timezone cron arithmetic) named in the rows above.
 
 The four review fixes below are each **mutation-verified**: the guard
 was removed, the named test failed, the guard was restored.

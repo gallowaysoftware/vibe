@@ -17,7 +17,9 @@ command against a real fleetd. Live gates **L1, L2 and L3 PASSED on
 ([`scripts/fleetlab`](../../../scripts/fleetlab/README.md)) — four real
 cells with real credentials and a real announcer to kill; **L4 is
 PARTIAL** (its kill-fleetd half ran; the reboot and the WoL wake need a
-physical box and a real NIC). See [Execution](#execution).
+physical box and a real NIC). The bonus `defs.parity` gate, whose first
+run found a level inversion, **re-ran clean after #36 under
+[C17](c17-gate-closure.md)**. See [Execution](#execution).
 
 Backlog item 7 in [fleet-control-futures.md](../fleet-control-futures.md)
 §2, the first Medium-tier item:
@@ -722,7 +724,7 @@ certs or a real roaming laptop was tested.
 | L2 | **PASS (2026-08-05, same harness).** The file behind `cells.bravo.token_file` was overwritten while bravo's daemon held the original cached: `FAIL auth.outbound bravo — the cell daemon REFUSED fleetd's credential / source: cells.bravo.token_file (…) unauthenticated: 401 Unauthorized / fix: drain/resume/unload for this cell will 401 until the two sides carry the same token.` The other three cells' `auth.outbound` stayed OK — the failure was scoped to one cell and named its source file, which is the whole gate. |
 | L3 | **PASS (2026-08-05, same harness).** Only the roaming cell's announcer was SIGKILLed; its host_probe and llama-swap kept answering. `WARN roaming.announcer charlie — the box answers but is not announcing / fleetd just reached this box at L4, so the announce agent is not loaded, not running, or is being rejected. auth.rejections is 24 and climbing, which makes the rejected explanation the likely one.` Both causes named, as designed. Then the host itself was taken down and the same check correctly became `UNKNOWN … box is away; whether its announcer would load is unknowable from here` — the distinction the check exists to make. |
 | L4 | **PARTIAL (2026-08-05).** The kill-fleetd half ran: pointed at a dead port the CLI produced `FAIL fleetd.reachable` with `fix: inference is unaffected — fleetd is read-and-request-only` and `UNKNOWN fleetd.checks — every fleet-side check is unevaluated`, while still evaluating the client-side ones. **The rest needs metal**: a physical box to reboot and a real NIC to receive a magic packet. `wake.configured` is by design a configuration check because arming is not observable from here, and this drill is the one test that could contradict it. Nothing local substitutes. |
-| bonus — defs parity | **PASS/PARTIAL (2026-08-05, same harness).** The shared backends dir was made a real git checkout: `defs.parity OK — every reporting cell is at a1cde82`. One cell was then given its own checkout one commit ahead: `WARN defs.parity — cells disagree about the def checkout / a1cde82: alpha, charlie · c2b8449: bravo`. **Then an uncommitted edit in the diverged checkout flipped the level back to OK** — see the note below. |
+| bonus — defs parity | **PASS (re-run 2026-08-05 after #36, C17, `scripts/fleetlab/gate-c13-parity.sh`).** The first run found the inversion described in the note below; #36 fixed it (divergence now decides over every cell that reports a SHA, agreement only over the clean ones), and the exact sequence was re-run against a real four-cell fleet. (1) One clean SHA: `OK — every reporting cell is at 515d1bd.` (2) charlie given its own checkout one commit ahead: `WARN — cells disagree about the def checkout / 515d1bd: alpha, bravo · fb82b92: charlie. fleetd's own def checkout is at 515d1bd.` (3) **an uncommitted edit in the diverged checkout keeps the WARN**, and appends `Working tree dirty (the SHA names the base commit, not what is running): charlie (fb82b92).` (4) Control — the same dirt with the checkouts AGREED is `OK` with the dirt named. Dirty-and-diverged is now strictly worse than clean-and-diverged; the level no longer inverts at the moment a cell becomes more drifted. |
 | bonus — U13 / U15 | **PASS.** `--json` and the HTTP document agree on every `{id, subject, level}` except the CLI's extra `auth.client_env` check, which inspects the calling shell's `$VIBE_TOKEN` and cannot exist server-side (`cli/cmd_fleet_doctor.go:239`). And `auth.client_env` earned its place: it WARNed `$VIBE_TOKEN is set in THIS shell and overrides every per-cell token_file … for: bravo`, which predicted the exact 401 that `vibe cell drain bravo --yes` then produced, and which succeeded with the variable unset. |
 
 **The one thing the live run found.** `doctor.go:582` downgrades a
@@ -737,6 +739,13 @@ with the pinned test (`TestDoctor_DefsParityTreatsADirtyCheckoutAsUncomparable`
 in the OK detail, so this is a judgement call rather than a defect. But
 if the intent is "a dirty tree is unknowable", a cell whose last
 *commit* is already known to differ could keep the WARN and say so.
+
+**Resolved.** #36 took that reading: `defs.parity` now decides
+DIVERGENCE over every cell that reports a SHA and AGREEMENT only over
+the clean ones, so dirty-and-diverged stays a WARN with the dirt named
+beside it. C17 re-ran the exact four-step sequence against a real
+four-cell fleet on 2026-08-05 and watched the level hold — see the
+bonus row in the [gate table](#gate-results).
 
 ### Adversarial self-review addendum
 

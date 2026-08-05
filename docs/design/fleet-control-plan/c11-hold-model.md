@@ -4,10 +4,10 @@ Status: MERGED (2026-08-04) via PR #30, feature + adversarial-review
 commits. Unit gates 1–11 green on a full local inner loop
 (`-race -count=5 ./...`, `golangci-lint run` 0 issues, `gofmt -l .`
 silent, `go mod tidy` clean). Live gates **L1 and L4 PASSED on
-2026-08-05** and **L3 is PARTIAL**, all against the local multi-cell
+2026-08-05** and **L2/L3 PASSED under C17 the same day**, all against the local multi-cell
 harness ([`scripts/fleetlab`](../../../scripts/fleetlab/README.md)) —
-real cells, real llama-swap residency, a real fleetd restart. L2 is
-unrun and needs no hardware. The independent
+real cells, real llama-swap residency, a real fleetd restart, and (for
+L2) a real TTL eviction under a standing hold. The independent
 review pass (ground rule 9) found 6 further items, all fixed and
 mutation-verified here — see the addendum at the end.
 
@@ -447,17 +447,36 @@ fleetd with a configured warm target (`alpha/lab-chat`,
   own refusal text is the design's, verbatim: *not a pin: llama-swap's
   own TTL can still unload the model — the hold only stops fleetd
   causing it.*
-- **L2 — hold is not a pin: NOT RUN.** Runnable on the harness (set a
-  cell's llama-swap TTL below the hold and wait it out); not attempted,
-  because it costs a TTL window of wall clock and asserts a limitation
-  rather than a feature. No hardware involved.
-- **L3 — inheritance: PARTIAL.** The probe half ran and passes: with a
-  hold active, `probe_model {cell: alpha, model: lab-chat}` answered
-  `No probe issued: alpha is held: lab-chat, 10m left (C11 L3
-  inheritance).` and carried the previous measurement forward rather
-  than inventing one — the C8 guard reached by a C11 lease, which is
-  exactly what the gate is for. The `warm_schedule` half was not run
-  (the lab fleetd had no schedule configured at the time).
+- **L2 — hold is not a pin: PASS** (2026-08-05, C17,
+  `scripts/fleetlab/gate-c11-l2.sh`). The def's TTL was dropped to
+  **45 s** — an order of magnitude under a 20-minute hold — re-rendered,
+  and applied by llama-swap's `-watch-config`. The challenger was loaded
+  and held; at t+60 s llama-swap logged
+  `[INFO] <lab-embed-a> Unloading model, TTL of 45s reached` and
+  `/running` went empty. For the next **four minutes** the cell sat with
+  **nothing resident** while fleetd declined to fix it: the warm target
+  read `skipped / held: lab-embed-a, 19m…16m left` throughout, **no**
+  piggyback command was queued for the cell, and the front's rendered
+  config was **byte-identical** (same sha256) before and after. The CLI
+  had said so up front, verbatim: *not a pin: llama-swap's own TTL can
+  still unload the model — the hold only stops fleetd causing it.* On
+  `--release` the restore came back through C11's empty-grace window —
+  three ticks of `waiting / nothing resident (confirming)`, then
+  `holding / restored (nothing resident)`.
+- **L3 — inheritance: PASS** (probe half 2026-08-05; **schedule half
+  2026-08-05, C17, `scripts/fleetlab/gate-c11-l3.sh`**). The probe half:
+  with a hold active, `probe_model {cell: alpha, model: lab-chat}`
+  answered `No probe issued: alpha is held: lab-chat, 10m left (C11 L3
+  inheritance).` and carried the previous measurement forward rather than
+  inventing one — the C8 guard reached by a C11 lease. The schedule half
+  ran against a live `* * * * *` `warm_schedule`: two clean fires
+  (`last_note "warmed"` at 22:49:00 and 22:50:00), then a hold, then
+  **three cron minutes arrived and none warmed** — `last_fire` FROZEN at
+  22:50:00 while `next_fire` kept advancing, and `last_note` read
+  `skipped (held: lab-embed-a, 9m left (…) on alpha)`. `--release`
+  restored firing on the very next minute (22:53:00, 22:54:00). Both
+  guards are C4's and C8's; what the gate proves is that a hold reaches
+  them.
 - **L4 — survives a fleetd restart: PASS.** With a 30 m hold standing,
   fleetd was SIGTERMed and restarted. `GET /api/fleet/leases` returned
   the hold with `expires_at` **identical to the nanosecond**

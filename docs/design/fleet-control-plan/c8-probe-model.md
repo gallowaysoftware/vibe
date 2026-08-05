@@ -10,8 +10,13 @@ mechanically verifiable gate is green under `-race -count=5`. Live gates
 L1–L3 **PASSED on 2026-08-05** against the local multi-cell harness
 ([`scripts/fleetlab`](../../../scripts/fleetlab/README.md)) — real
 llama-swap cells and real probes, but CPU models, so the degradation in
-L2 was induced by throttle rather than by VRAM spill. L4 and L5 remain
-**NOT RUN** for wall-clock reasons, not hardware ones. See
+L2 was induced by throttle rather than by VRAM spill. **L4 and L5 ran
+under [C17](c17-gate-closure.md) the same day**: L4 PASSES at the cap
+boundary (with the 24 h window seeded on disk, stated in the row), L5's
+baseline half PASSES — and **L5's flag-change half FAILS against a real
+defect**: a cell's probe specs are frozen at announcer start, so a def
+edit hot-applied by `-watch-config` does NOT rebind the baseline key.
+That is C17 finding 1 and it is unfixed. See
 [§Execution](#execution-2026-08-04).
 
 C8 fills the `probe` slot [C3](c3-announce.md) §1 reserved on
@@ -488,8 +493,8 @@ exact-match bearer exemption is untouched.
 | L1 (live) | **PASS (2026-08-05, local multi-cell harness)** — 6 real 64-token probes at a resident chat model on a real llama-swap cell: 16.282, 13.608, 15.725, 16.221, 16.096, 15.325 decode tok/s. The verdict stayed `unknown` for the first five (`samples_behind` 0…4) and became `ok` the moment the fifth sample landed: `{"value":15.325,"baseline_p50":16.096,"samples":5,"ratio":0.952,"verdict":"ok"}`. **Not covered:** the ±10% cross-check against manual `llama-bench` timing, and the model is a 7B on CPU rather than a GPU-resident model. |
 | L2 (live) | **PASS (2026-08-05, same harness), by a substituted cause.** Degradation was induced with a 30% duty-cycle `SIGSTOP`/`SIGCONT` throttle on the cell's llama-server, not by VRAM spill. The next probe read `{"value":4.506,"baseline_p50":15.910,"ratio":0.283,"verdict":"degraded"}`, `fleet.modelDegraded` landed on `/api/fleet/events` exactly once, `fleet_status.probe.degraded` listed the model, and removing the throttle returned it to `ok`. The "**degraded changes nothing**" half was checked hard: display, `reachable`, intent, class and the front's model list were identical before and after, and the rendered front config was **byte-identical** across both degraded episodes. Also confirmed: neither degraded sample entered the baseline window (11 attempts, 8 window entries), and a probe that exceeded `probeTimeout` produced a failed attempt with the previous measurement carried forward — never a fabricated slow reading. **Not covered:** spill-induced degradation, which is what an operator will actually hit. |
 | L3 (live) | **PASS (2026-08-05, same harness)** — `probe_model` at a non-resident model on two different cells refused with `a probe must not load it; warm it first`, and **zero** requests were issued: the cell's llama-swap log mentions of the model stayed at 0 across the window and the other cell's `/running` stayed `[]`. Verified from the upstream's own logs rather than `nvidia-smi`, which the CPU lab has no equivalent of. Bonus, same session: the 5-minute cell-side cooldown refused both producers (scheduler and MCP verb) from the same clock, carried the previous measurement forward, and refusals did not extend the cooldown. |
-| L4 (live) | **NOT RUN** — needs 24 h of wall clock with two cells on a 15-minute interval. Nothing physical blocks it; the harness can run it unattended. |
-| L5 (live) | **NOT RUN** — runnable on the harness (it has three real embedding cells) but not attempted: a warm plus six probes at a 5-minute cooldown is ~30 minutes on top of the chat baseline. A time budget, not a limitation. |
+| L4 (live) | **PASS at the boundary (2026-08-05, C17, `scripts/fleetlab/gate-c8-l4.sh`)**, with the substitution stated plainly: the 24 h window was **pre-seeded on the cell's own state file** (`paths.CellProbeFile()`'s `attempts` array, which `attemptsSinceLocked` reads) rather than accumulated over 24 h, and the real `probe_model` verb then drove the real piggyback queue into the real budget code. Seeded 96-in-window → refused `daily cap reached (96 probes in the last 24h)` with the previous measurement carried forward and **no attempt spent** (still 96). Seeded 95-in-window + 6 rows 25–30 h old (101 on disk) → **allowed**, a real measurement landed (`{"value":15.677,"samples":4,"verdict":"unknown"}`), and the file pruned to 96 — the window rolls. Cooldown then cleared on disk so the CAP, not the 5-minute gap, answered the next ask: refused again, attempts still 96. Ledger half: one probe costs 101.7 tokens (6 rows). **Not covered:** 24 h of the SCHEDULER asking, which is wall clock and nothing else. |
+| L5 (live) | **SPLIT (2026-08-05, C17, `scripts/fleetlab/gate-c8-l5.sh` + `gate-c8-l5-staleflags.sh`).** Baseline half **PASS**: seven real 64-input batches at `lab-embed-c` on charlie (real bge-large-en-v1.5, real llama-swap), kind read off the rendered argv as `embed`, metric `embed_inputs_s` — 29.484, 28.684, 31.067, 30.303, 28.542, 29.222 inputs/s, `unknown` under 5 samples and then `{"samples":5,"ratio":0.968,"verdict":"ok"}`, `{"samples":6,"ratio":1.003,"verdict":"ok"}`. Flag-change half **FAIL**: with `--threads 4 → 3` re-rendered and **applied by llama-swap's `-watch-config`** (verified in `/running`'s argv), the next probe still announced `flags_sha256 3937ef13b048…`, scored the slower sample against the old baseline (`22.96` vs `29.01`, ratio 0.79) and folded it INTO that window (n → 9). Restarting the announcer — same def, same running argv, nothing else changed — produced the fresh key `b998ecc3044a…` at `samples: null, verdict: unknown`. Cause and repro: [C17 finding 1](c17-gate-closure.md#finding-1-product-defect-a-cells-probe-specs-and-fingerprints-are-frozen-at-announcer-start) — `modelprobe.Hooks` gets a defs slice loaded once at announcer start, while fleetd re-reads defs every render pass. Not fixed there (C17 ships no code); the gate is correct and the code is not. |
 
 ### Adversarial self-review (ground rule 9)
 
@@ -525,8 +530,14 @@ still costs budget.
 - **Probe traffic is metered as ordinary traffic by C7a.** A 64-token
   probe is not a poke (`output_tokens <= 1`), and llama-swap's `Metadata`
   is populated only by its internal handlers, so there is no way to tag
-  it. Bounded by the budget: ≤ ~25 k tokens/cell/day at the cap,
-  typically ~1 k.
+  it. Bounded by the budget — but the bound this bullet originally gave
+  ("≤ ~25 k tokens/cell/day at the cap, typically ~1 k") was a **chat**
+  figure, and C17 measured both kinds on the harness (2026-08-05):
+  **101.7 tokens per chat probe** (~9.8 k/cell/day at the 96 cap) and
+  **768.0 tokens per embed probe** (~**73.7 k**/cell/day), because
+  `embedBatch = 64` and `cannedEmbedInput` is a 14-word sentence. An
+  embed target costs roughly 3x the ceiling this bullet claimed. The
+  budget is doing its job; the sentence describing it was wrong.
 - **Between fleetd's guard evaluation and the cell's execution sits up to
   one heartbeat.** Work that starts inside that window meets a probe.
   The cost is one bounded completion, and the cell still re-checks
