@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 )
 
 // Warm targets (fleet-control C4 §1): restore a cell's default model
@@ -75,7 +77,7 @@ func (s *Server) startWarmLoopWithConfig(cfg warmLoopConfig) {
 		cfg.tick = 15 * time.Second
 	}
 	if cfg.warmFn == nil {
-		cfg.warmFn = warmViaFront
+		cfg.warmFn = s.warmViaFront
 	}
 	for _, t := range cfg.targets {
 		st := &warmTargetState{
@@ -145,6 +147,23 @@ func (s *Server) evalWarmTarget(t WarmTarget, st *warmTargetState, cfg warmLoopC
 	// mid-evaluation.
 	if h, held := s.HoldOn(t.Cell); held {
 		s.setWarmState(st, "skipped", holdDetail(h))
+		return
+	}
+	// Third rung, and above every evidence rung: the front's llama-swap has
+	// refused fleetd's credential, so this target cannot be warmed through
+	// the only channel it has (C15). It is answerable with no evidence at
+	// all, like a hold, and it must be answered HERE rather than only at
+	// the moment of firing — a refusal decided after the residency read
+	// clears `emptySince` on every skip (C11's rule), which makes the
+	// status row flap between "nothing resident (confirming)" and
+	// "skipped" on alternate ticks and buries the reason.
+	//
+	// Below the two declarations on purpose: a drained cell and a held one
+	// would not be warmed even with a working credential, and naming the
+	// front's key on a box the operator took for gaming is the wrong
+	// sentence.
+	if why, blocked := s.SwapAuthRefusal(fleetcfg.FrontCell); blocked {
+		s.setWarmState(st, "skipped", why)
 		return
 	}
 	if p := s.presenceFor(t.Cell); p != nil && p.Announcing {
@@ -332,6 +351,16 @@ func (s *Server) restore(t WarmTarget, st *warmTargetState, cfg warmLoopConfig, 
 		s.setWarmState(st, "skipped", refused)
 		return
 	}
+	// The same rung again at FIRE time, the shape `warmClassRefusal` uses:
+	// the check above keeps the status row honest, this one is what makes
+	// the rule hold for any producer that reaches `restore` another way.
+	// The warm is not queued to the cell either — a credential fleetd
+	// cannot present to the front is not something the cell can fix, and
+	// routing around the refusal would hide it.
+	if why, blocked := s.SwapAuthRefusal(fleetcfg.FrontCell); blocked {
+		s.setWarmState(st, "skipped", why)
+		return
+	}
 	ctx, cancel := s.warmCtx(warmTimeout)
 	defer cancel()
 	var err error
@@ -412,7 +441,14 @@ func (s *Server) warmClassRefusal(model string) string {
 
 // warmViaFront is the default warm: a 1-token chat completion through
 // the front — JIT is the start verb.
-func warmViaFront(ctx context.Context, frontURL, model string) error {
+//
+// A method since C15, because the request needs the FRONT's llama-swap
+// credential. frontURL and the credential must name the same cell, and
+// both come from the front entry in hosts.yaml: `warmViaFront` is the
+// name of the route, not a parameter — every caller passes the front's
+// url (daemon/warm.go, daemon/sleep.go), because a warm that reached a
+// cell directly would be the new data-plane hop the plan forbids.
+func (s *Server) warmViaFront(ctx context.Context, frontURL, model string) error {
 	body, err := json.Marshal(map[string]any{
 		"model":      model,
 		"max_tokens": 1,
@@ -427,17 +463,41 @@ func warmViaFront(ctx context.Context, frontURL, model string) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if err := s.AuthorizeSwap(req, fleetcfg.FrontCell); err != nil {
+		return err
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	s.NoteSwapStatus(fleetcfg.FrontCell, resp.StatusCode)
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return &warmHTTPError{Status: resp.StatusCode, Body: strings.TrimSpace(string(b))}
+		// The body is llama-swap's, not fleetd's: on a 401 it reads
+		// "unauthorized: invalid or missing API key", which says nothing
+		// about WHICH config is wrong. swapWarmError attaches the sentence
+		// that does, keeping the typed status the piggyback rule reads.
+		return s.swapWarmError(&warmHTTPError{Status: resp.StatusCode, Body: strings.TrimSpace(string(b))})
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	return nil
+}
+
+// swapWarmError decorates a front refusal with the credential diagnosis
+// when there is one. The wrapped value stays a *warmHTTPError so
+// definitiveWarmRefusal still sees the 4xx and refuses to queue it: a 401
+// is the front ANSWERING, and telling an operator the warm is "queued for
+// the next announce" would hide a broken credential behind a promise.
+func (s *Server) swapWarmError(he *warmHTTPError) error {
+	if he.Status != http.StatusUnauthorized && he.Status != http.StatusForbidden {
+		return he
+	}
+	why, _ := s.SwapAuthRefusal(fleetcfg.FrontCell)
+	if why == "" {
+		return he
+	}
+	return fmt.Errorf("%w — %s", he, why)
 }
 
 // warmHTTPError is a warm the front ANSWERED with a non-200. It is a

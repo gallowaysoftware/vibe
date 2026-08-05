@@ -62,6 +62,24 @@ type Cell struct {
 	// TokenFile is the path to that cell daemon's bearer token. The
 	// path is config; the token value never enters a repo.
 	TokenFile string `yaml:"token_file,omitempty"`
+	// SwapKeyFile is the path to the API key this cell's LLAMA-SWAP
+	// demands — one entry of its `apiKeys:` list (fleet-control C15).
+	//
+	// Deliberately NOT TokenFile reused: the two authenticate different
+	// servers. TokenFile is the cell's vibe DAEMON control plane, minted
+	// by vibe, and it can drain, resume and suspend the box; SwapKeyFile
+	// is llama-swap's own OpenAI + admin surface on the model port, a
+	// value the operator writes into llama-swap's config. They rotate on
+	// different schedules, and handing the drain-capable token to
+	// llama-swap would put it in a process that logs request metadata.
+	// The front settles it: in the reference deployment it is a llama-swap
+	// container with no vibe daemon at all, so it has no TokenFile to
+	// reuse — and it is exactly the cell every warm goes through.
+	//
+	// The path is config; the key value never enters this repo (ground
+	// rule 3). Same file on several cells is fine — they are paths, and a
+	// fleet keyed with one shared apiKey just points them all at it.
+	SwapKeyFile string `yaml:"swap_key_file,omitempty"`
 	// Wake carries the cell's Wake-on-LAN config (C2): fleetd sends the
 	// magic packet from its LAN position, or shells to Cmd when L2
 	// broadcast is unreachable from where fleetd runs (macvlan).
@@ -299,6 +317,68 @@ func (f *File) CellCredential(name, envToken string, pref CredentialPreference, 
 	return Credential{Token: tok, Kind: CredLocal, Source: "this box's own control-plane token"}, nil
 }
 
+// SwapCredential is one resolved llama-swap API key. Source names the
+// ORIGIN — the hosts.yaml key and the file path — and never the value:
+// the key is a credential, so it appears in no status document, no log
+// line and no error string (C9's webhook-URL rule, applied to the one
+// secret this phase adds).
+type SwapCredential struct {
+	// Key is the value to present as `Authorization: Bearer <key>`.
+	// Empty when Configured is false.
+	Key string
+	// Configured reports that the cell DECLARES a swap_key_file. It is
+	// the difference between "the front demands a key and we have none"
+	// (a misconfiguration) and "the key we hold was refused" (a rotation),
+	// which is the whole diagnostic value of this phase.
+	Configured bool
+	// Source is "cells.<name>.swap_key_file (<path>)", for operator-facing
+	// errors and the doctor's fix line. Never the key.
+	Source string
+}
+
+// SwapCredentialFor resolves the API key a caller must present to one
+// cell's llama-swap.
+//
+// A cell that declares no swap_key_file resolves to the unconfigured
+// zero value with a NIL error: llama-swap's default is no auth at all,
+// which is the reference fleet's posture, and turning that into an error
+// would break every single-box daemon. An unknown cell resolves the same
+// way — membership is s.cells' business (fleetapi) and hosts.yaml's
+// validate(), not this resolver's.
+//
+// A DECLARED key that cannot be resolved is a typed error and the caller
+// must fail CLOSED: sending the request unauthenticated turns an operator
+// typo into an opaque 401 from a box across the house, which is the exact
+// failure C6's MIN-P fixed for the daemon token.
+func (f *File) SwapCredentialFor(name string) (SwapCredential, error) {
+	if f == nil {
+		return SwapCredential{}, nil
+	}
+	c, ok := f.Cells[name]
+	if !ok || c.SwapKeyFile == "" {
+		return SwapCredential{}, nil
+	}
+	src := "cells." + name + ".swap_key_file (" + c.SwapKeyFile + ")"
+	data, err := os.ReadFile(c.SwapKeyFile)
+	if err != nil {
+		return SwapCredential{Configured: true, Source: src}, fmt.Errorf("read %s: %w", src, err)
+	}
+	key := strings.TrimSpace(string(data))
+	if key == "" {
+		return SwapCredential{Configured: true, Source: src}, fmt.Errorf("%s is empty", src)
+	}
+	// Checked here rather than left to net/http: a key with an embedded
+	// newline or tab is rejected by the transport with "invalid header
+	// field value" naming no config at all, and the operator then hunts a
+	// Go error instead of a stray byte in a key file. The offending byte
+	// is reported by POSITION — printing it would print part of the key.
+	if i := strings.IndexFunc(key, func(r rune) bool { return r < 0x20 || r == 0x7f }); i >= 0 {
+		return SwapCredential{Configured: true, Source: src},
+			fmt.Errorf("%s holds a control character at byte %d: an API key must be one line of printable text", src, i)
+	}
+	return SwapCredential{Key: key, Configured: true, Source: src}, nil
+}
+
 // ModelPricingFor returns the pricing claim for a local model id.
 func (f *File) ModelPricingFor(model string) (ModelPricing, bool) {
 	if f == nil || f.Pricing == nil {
@@ -338,6 +418,7 @@ func LoadFrom(path string) (*File, error) {
 	for name := range f.Cells {
 		c := f.Cells[name]
 		c.TokenFile = expandTilde(c.TokenFile)
+		c.SwapKeyFile = expandTilde(c.SwapKeyFile)
 		f.Cells[name] = c
 	}
 	return &f, nil

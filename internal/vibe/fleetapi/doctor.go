@@ -342,8 +342,10 @@ const (
 // ─── credentials, both directions ───────────────────────────────────────────
 
 func (s *Server) checkAuth(ctx context.Context, rep *DoctorReport, snap StateSnapshot, pres map[string]Presence, host DoctorHost) {
+	expl := explainedCells(snap)
 	for _, c := range snap.Cells {
 		s.checkInbound(rep, c, pres[c.Name], snap.Daemon.AuthRejected)
+		s.checkSwapCredential(rep, c, expl)
 	}
 	// Probed in PARALLEL, like Snapshot's own cell round: each call is
 	// bounded at 5s, and run serially a fleet with three boxes off would
@@ -440,6 +442,67 @@ func (s *Server) checkInbound(rep *DoctorReport, c CellSnapshot, p Presence, rej
 		}
 		rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelUnknown,
 			Summary: "never announced", Detail: det})
+	}
+}
+
+// checkSwapCredential is the THIRD credential in the fleet, and the one
+// nothing checked before C15: the API key a cell's llama-swap demands
+// (`apiKeys:`), as opposed to the cell daemon's bearer token
+// (auth.outbound) or fleetd's own (auth.inbound).
+//
+// The ID names what it proves. It is `swap.credential` — "fleetd can
+// present what this cell's llama-swap asks for" — not `swap.reachable`:
+// llama-swap exempts /health from apiKeys, so a cell can answer a health
+// check perfectly while refusing every route fleetd actually uses.
+func (s *Server) checkSwapCredential(rep *DoctorReport, c CellSnapshot, expl map[string]string) {
+	id := "swap.credential"
+	cred, resolveErr := s.hostsFile().SwapCredentialFor(c.Name)
+	if resolveErr != nil {
+		rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelFail,
+			Summary: "the declared llama-swap API key will not resolve",
+			Detail:  resolveErr.Error() + " — fleetd sends no request to this cell's llama-swap at all rather than sending one unauthenticated.",
+			Fix:     "restore the key file, or drop cells." + c.Name + ".swap_key_file if that llama-swap has no apiKeys."})
+		return
+	}
+	if f, bad := s.swapAuthState(c.Name); bad {
+		fix := "add cells." + c.Name + ".swap_key_file to hosts.yaml, holding one of that llama-swap's apiKeys values."
+		if f.Kind == SwapAuthRejected {
+			fix = "the key file and that llama-swap's apiKeys list have diverged; re-sync them (the value never lives in this repo)."
+		}
+		rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelFail,
+			Summary: "this cell's llama-swap is refusing fleetd's credential (" + f.Kind + ", since " + ago(f.Since) + " ago)",
+			Detail:  f.Detail,
+			Fix:     fix})
+		return
+	}
+	switch {
+	case cred.Configured && c.Reachable:
+		rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelOK,
+			Summary: "llama-swap API key declared and accepted",
+			Detail:  "source: " + cred.Source + " — this cell's /running and /v1/models answered fleetd with it."})
+	case cred.Configured:
+		// Not UNKNOWN: what this check proves is that fleetd can PRESENT
+		// the credential, and it can. Whether the far side likes it is
+		// unknowable while the box is off, and scoring an off
+		// opportunistic cell UNKNOWN forever is how an operator learns to
+		// ignore the level (C13).
+		rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelOK,
+			Summary: "llama-swap API key declared and resolvable",
+			Detail:  "source: " + cred.Source + ". Nothing has exercised it: this cell's llama-swap is not answering right now."})
+	case c.Reachable:
+		rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelOK,
+			Summary: "no llama-swap API key declared, and none demanded",
+			Detail:  "this cell's llama-swap is answering fleetd's probes unauthenticated, which is the reference posture (LAN-only, no apiKeys)."})
+	case expl[c.Name] != "":
+		rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelOK,
+			Summary: "no llama-swap API key declared; nothing to check while the cell is away",
+			Detail:  expl[c.Name] + "."})
+	default:
+		rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelUnknown,
+			Summary: "no llama-swap API key declared and this cell's llama-swap is not answering",
+			Detail: "whether it demands a key is unknowable from here — an unreachable llama-swap and one that is refusing every " +
+				"route except /health look identical to a probe that got no answer.",
+			Fix: "if it does run with apiKeys, set cells." + c.Name + ".swap_key_file."})
 	}
 }
 

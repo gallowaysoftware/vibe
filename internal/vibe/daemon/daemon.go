@@ -645,6 +645,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 			CellAuth:   d.cellAuthProbe,
 		}
 		d.hosts = hosts
+		// C15: resolve every declared llama-swap credential now, so a
+		// missing key file is an ERROR line at startup rather than a warm
+		// target that quietly stops firing.
+		checkSwapKeys(hosts)
 	}
 	fleet := fleetapi.New(
 		fleetCells,
