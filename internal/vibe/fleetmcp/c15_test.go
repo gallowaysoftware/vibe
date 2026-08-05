@@ -42,8 +42,8 @@ func newKeyedSwapCell(t *testing.T, key string) *keyedSwapCell {
 			http.Error(w, `{"error":"unauthorized: invalid or missing API key","src":"llama-swap"}`, http.StatusUnauthorized)
 			return
 		}
-		switch {
-		case r.URL.Path == "/v1/models":
+		switch r.URL.Path {
+		case "/v1/models":
 			_, _ = w.Write([]byte(`{"data":[{"id":"lab-chat"}]}`))
 		default:
 			_, _ = w.Write([]byte(`{"status":"ok"}`))

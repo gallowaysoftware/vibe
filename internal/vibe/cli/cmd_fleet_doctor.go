@@ -205,15 +205,23 @@ func degradedDoctor(target fleetdTarget, fleetdErr error) *fleetapi.DoctorReport
 	}
 	sort.Strings(names)
 	for _, n := range names {
-		up, _ := probeCellDirect(hosts.Cells[n].URL)
-		if up {
+		up, _, authNote := probeCellDirect(hosts, n)
+		switch {
+		case up:
 			rep.Add(fleetapi.DoctorCheck{ID: "cell.direct", Cell: n, Level: fleetapi.LevelOK,
 				Summary: "llama-swap answers directly (serving is unaffected by fleetd being down)"})
-			continue
+		case authNote != "":
+			// The cell ANSWERED and refused us. Reporting "no answer" would
+			// send the operator to the wrong box entirely (C15).
+			rep.Add(fleetapi.DoctorCheck{ID: "cell.direct", Cell: n, Level: fleetapi.LevelFail,
+				Summary: "llama-swap answers but refuses this box's credential",
+				Detail:  termSafe(authNote) + " — the cell is serving; it is the credential that is wrong.",
+				Fix:     "set or re-sync cells." + n + ".swap_key_file (its value is one of that llama-swap's apiKeys)."})
+		default:
+			rep.Add(fleetapi.DoctorCheck{ID: "cell.direct", Cell: n, Level: fleetapi.LevelWarn,
+				Summary: "no answer from " + termSafe(hosts.Cells[n].URL),
+				Detail:  "probed directly from this box; intent and presence are unavailable without fleetd."})
 		}
-		rep.Add(fleetapi.DoctorCheck{ID: "cell.direct", Cell: n, Level: fleetapi.LevelWarn,
-			Summary: "no answer from " + termSafe(hosts.Cells[n].URL),
-			Detail:  "probed directly from this box; intent and presence are unavailable without fleetd."})
 	}
 	return rep
 }
