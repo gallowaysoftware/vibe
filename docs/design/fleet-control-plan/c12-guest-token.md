@@ -1,11 +1,12 @@
 # C12 — Guest read-only token: sharing status without sharing drain
 
-Status: IN REVIEW (2026-08-04), PR pending. Unit gates 1–12 green on a
-full local inner loop (`-race -count=5 ./...`, `golangci-lint run` 0
-issues, `gofmt -l .` silent, `go mod tidy` clean); the 3 live gates need
-a real fleet and a real phone and are **NOT RUN** — the implementing
-environment cannot reach the fleet (SSH blocked, the LAN does not
-route).
+Status: PR OPEN (2026-08-04), feature + adversarial-review commits.
+Unit gates 1–14 green on a full local inner loop (`-race -count=5`,
+`golangci-lint run` 0 issues, `gofmt -l .` silent, `go mod tidy` clean);
+the 3 live gates need a real fleet and a real phone and are **NOT RUN** —
+the implementing environment cannot reach the fleet (SSH blocked, the
+LAN does not route). The self-review pass (ground rule 9) found 5 items,
+all fixed here — see the addendum at the end.
 
 Backlog item 6 in [fleet-control-futures.md](../fleet-control-futures.md)
 §2, one sentence long:
@@ -116,6 +117,13 @@ fleet page is visible to a guest**, including the free text an operator
 types into `--reason` and `--note`. Write those like a shared calendar
 entry.
 
+**The CLI comes along for free, and that is intended.** `vibe cell
+status` reads exactly `/api/fleet/state`, and `vibe cell await`'s wait
+reads `/api/fleet/state` + `/api/fleet/events`, so both work with
+`VIBE_TOKEN` set to the guest value. Everything that acts —
+`drain`/`resume`/`wake`/`hold`, an intent post, a lease claim — 401s.
+The guest surface is a property of the two routes, not of the browser.
+
 ### 2. Enforcement is a positive allowlist, and the route table is the registry
 
 A denylist ("everything except these paths") silently grants every route
@@ -136,6 +144,13 @@ because that exemption is the strictest thing in the file:
 - **Method-exact.** `POST /api/fleet/state` is a miss. Go's server
   passes the method through verbatim, so a lowercase `get` is a miss
   too.
+
+The middleware decides on the same string the mux routes with
+(`r.URL.Path`), and every place the two can diverge — cleaning, the
+trailing-slash redirect, `%2f` decoding — diverges in the strict
+direction: a request that fails the guest check never reaches a handler,
+and a request that passes it cannot be routed anywhere except the entry
+it matched.
 
 The list itself is not hand-maintained beside the routes; it is
 **derived from them**. `internal/vibe/fleetapi/routes.go` holds one
@@ -290,10 +305,19 @@ row's buttons (the notify *status* stays — it is state), and the savings
 nav link, with the savings view replaced by one line saying it needs the
 control-plane token.
 
-**The hiding is CSS and a class, and it is a courtesy, not a boundary.**
-A guest who opens devtools and POSTs `/mcp` gets a 401 from the server,
-which is the only place authority is decided. The page must never be
-the reason something is safe.
+**The hiding is one flag and a body class, and it is a courtesy, not a
+boundary.** A guest who opens devtools and POSTs `/mcp` gets a 401 from
+the server, which is the only place authority is decided. The page must
+never be the reason something is safe. The flag is set in BOTH
+directions (review finding 2): pasting the control-plane token into a
+tab that browsed as a guest gives the buttons back on the next state
+fetch, with no reload.
+
+**What a guest read costs, honestly**: `GET /api/fleet/state` is an
+uncached probe round of every cell, and it refreshes fleetd's
+last-seen bookkeeping. It touches no data plane and mutates no declared
+intent, but it is not free, and a bored guest with a refresh key is more
+load than a bored operator with one.
 
 ### 6. Rotation, revocation, and off by default
 
@@ -391,20 +415,43 @@ The daemon reads the file once, at start, before the listeners serve.
    still works as the control-plane token.
    `TestGuestToken_MisconfigurationFailsClosed`.
 10. **The credential does not leak (unit).** The guest token appears in
-    no log line, no error string, no `/api/fleet/state` body, and not in
-    the page. Asserted by scanning a captured `slog` buffer, the
-    rendered state JSON and every error returned by the loader for the
-    token value.
+    no log line (a captured `slog` buffer, across both the loaded and
+    the minted paths) and in no error string the loader returns; the
+    state-document half is asserted in gate 5's test, which greps the
+    guest's own `/api/fleet/state` body for both tokens.
     `TestGuestToken_NeverAppearsInLogsErrorsOrState`.
 11. **Counters split (integration).** A wrong token increments
     `auth_rejected` and not `guest_rejected`; a valid guest token on
     `/mcp` increments `guest_rejected` and not `auth_rejected`.
     `TestGuestToken_RejectionsCountSeparately`.
-12. **Streaming contract + full inner loop (mechanical).**
+12. **The page renders read-only without a new route (unit).** A static
+    assertion over the embedded page: the mode is learned from the
+    response header and applied in both directions, the action buttons /
+    notify controls / warm row / savings nav are conditioned on it, the
+    savings fetch does not pop the token gate, the read-only chip is
+    class-driven (a `hidden` attribute on a `.chip` element does
+    nothing), and no `whoami`-shaped route was added.
+    `TestFleetPage_GuestModeIsWiredToTheHeaderNotAProbe`.
+13. **The CLI can read and rotate it (unit).** An unconfigured
+    `--guest` names `guest_token_file` rather than a missing file;
+    `vibe token --guest` prints the configured file so it can be
+    shared; `--regenerate` warns that it revokes EVERY guest, leaves the
+    file untouched when declined, and prints the new value plus the
+    restart requirement when accepted.
+    `TestTokenGuest_UnconfiguredSaysHowToConfigureIt`,
+    `TestTokenGuest_PrintsTheConfiguredFile`,
+    `TestTokenGuest_RegenerateRevokesEveryGuestAndSaysSo`.
+14. **Streaming contract + full inner loop (mechanical).**
     `git diff --stat main..HEAD -- internal/vibe/proxy` is empty;
     `go build ./...`, `go vet ./...`, `gofmt -l .` silent, `go mod tidy`
     clean, `go test -race -count=5 ./...`, `golangci-lint run` — plus
     ground rule 9's adversarial self-review as its own commit.
+
+Two supporting tests sit under gates 2 and 5 without a gate number of
+their own: `TestAccessFor_IsExactMatchOnMethodAndPath` (the lookup, in
+isolation) and `TestRegister_MountsExactlyTheEnabledRoutes` (the table
+is what is actually served, in both role shapes — otherwise the access
+declarations would describe a surface nobody mounts).
 
 ### Live gates (need a real fleet; NOT runnable from the implementing environment)
 
@@ -414,12 +461,13 @@ L1. **The hallway test.** Configure `guest_token_file` on fleetd,
     there are no action buttons, no warm row and no savings tab; the
     header says read-only. Then paste the control-plane token in the
     same browser and confirm the full page returns.
-L2. **The boundary in the field.** With the guest token in `$VIBE_TOKEN`,
-    `vibe cell status` fails 401 (it reads `/api/fleet/state` — confirm
-    which half fails and that the failure is legible), `curl -H` on
-    `/api/fleet/usage`, `/api/fleet/savings` and `/mcp` all 401, and
-    `fleet_status` shows `guest_rejected` rising by exactly the number of
-    attempts.
+L2. **The boundary in the field.** With the guest token in `$VIBE_TOKEN`:
+    `vibe cell status` **works** (it reads only `/api/fleet/state` —
+    §1's intended consequence), `vibe cell drain` fails 401 and says
+    something legible, `curl -H` on `/api/fleet/usage`,
+    `/api/fleet/savings` and `/mcp` all 401, and `vibe cell status` with
+    the OPERATOR token then shows `guest_rejected` risen by exactly the
+    number of refused attempts and `auth_rejected` unmoved.
 L3. **Rotation.** `vibe token --guest --regenerate`, restart fleetd, and
     confirm the phone that had the old token gets a 401 and the token
     gate, and works again with the new value.
@@ -434,9 +482,11 @@ L3. **Rotation.** `vibe token --guest --regenerate`, restart fleetd, and
   variant of either — a rounded number is still the shape of the
   household's week.
 - **Rate limiting the guest.** A guest can hold `/api/fleet/events` open
-  like any authed client can; fleetd is read-and-request-only and an
-  abusive guest costs an SSE subscriber slot, not a request path. If
-  that ever matters it is a fleetd-wide concern, not a guest one.
+  and can refresh `/api/fleet/state` (a probe round of the fleet) as
+  fast as any authed client. That is not free (§5), but it touches no
+  data plane and no declared state, and a bound belongs on the routes
+  rather than on the credential — a fleetd-wide concern, not a guest
+  one.
 - **Hot-reloading the token file** (§6).
 - **Anonymous read.** The page is public because it contains no fleet
   data; the data always needs a bearer, guest included.
@@ -447,3 +497,116 @@ L3. **Rotation.** `vibe token --guest --regenerate`, restart fleetd, and
 
 Estimated ~250 lines + tests, on the plan's calibration (C0–C4 ran
 3.6–4.5× their estimates).
+
+## Execution (2026-08-04)
+
+### What shipped
+
+- **`fleetapi/routes.go`** (new) — `Access` + `AccessFor` + `Routes()` +
+  the table, and `Register` as a loop over it. `Register`'s old body
+  (four `if` blocks and thirteen `mux.HandleFunc` calls) is gone from
+  `fleetapi.go`; `registerFleetPage` became `fleetPageHandler` so the
+  page mounts through the same table with `AccessPublic` beside it.
+- **`daemon/auth.go`** — `authGuard` (two tokens, two counters),
+  the allowlist check through `fleetapi.AccessFor`,
+  `LoadOrCreateGuestToken` / `RegenerateGuestToken` /
+  `validateGuestToken` (the fail-closed ladder), `Daemon.loadGuestToken`
+  (non-fatal, logs path + created-vs-loaded), and the `X-Vibe-Auth`
+  header on guest-authorized responses.
+- **`daemon/daemon.go`** — `fleet.guest_token_file` (tilde-expanded),
+  the startup load before the listeners serve, `guestEnabled` /
+  `guestRejected` atomics into `DaemonInfo`.
+- **`cli/cmd_token.go`** — `--guest`, composable with `--regenerate`;
+  the confirmation prompt factored so both credentials share it with
+  different warnings.
+- **`cli/cmd_cell.go`** — one line in `vibe cell status` when guest
+  access is on, deliberately a separate sentence from the
+  `auth_rejected` one.
+- **`fleetapi/fleet.html`** — the read-only chip, `setAuthMode`, the
+  conditioned action buttons / notify controls / warm row / savings nav,
+  and the savings view's "needs the control-plane token" panel.
+
+### Gates
+
+Unit gates 1–14: **PASS**, run as the full inner loop — `go build ./...`,
+`go vet ./...`, `gofmt -l .` (silent), `go mod tidy` (clean),
+`golangci-lint run` (0 issues), `go test -race ./...` plus
+`-race -count=5` over `daemon`, `fleetapi`, `cli` and `fleetmcp`. Gate
+14 verified: the branch's diff against `main` touches no file under
+`internal/vibe/proxy`.
+
+Seven guards were **mutation-tested** — the production code was broken
+and the named test observed to fail, then restored:
+
+| mutation | test that failed |
+|---|---|
+| middleware serves any request carrying the guest token (allowlist check deleted) | `TestGuestToken_DeniedOnEveryRouteItDoesNotName`, `…ReachesNeitherMCPNorTheRPCs`, `…AllowlistIsExactMatchAndGETOnly` |
+| `AccessFor` returns `AccessGuest` on a miss (deny-by-default inverted) | `TestAccessFor_IsExactMatchOnMethodAndPath`, and three daemon tests |
+| `AccessFor` matches by prefix instead of exactly | `TestAccessFor_IsExactMatchOnMethodAndPath`, `TestGuestToken_AllowlistIsExactMatchAndGETOnly`, **and C5's own `TestDaemon_FleetRegistry_Role`** — the old exemption is still pinned through the new mechanism |
+| identical-to-control-plane rung removed from the ladder | `TestGuestToken_MisconfigurationFailsClosed/identical_to_the_control-plane_token` |
+| a route left `AccessUndecided` | `TestRoutes_EveryRouteDeclaresAnAccessLevel` |
+| a route registered outside the table | `TestRoutes_NoHandlerIsRegisteredOutsideTheTable` |
+| guest denials counted into `auth_rejected` | `TestGuestToken_RejectionsCountSeparately` |
+
+Live gates L1–L3: **NOT RUN.** The implementing environment cannot reach
+the fleet (SSH blocked, the LAN does not route) and has no browser on
+it; a fabricated transcript is worse than an honest gap.
+
+### Adversarial self-review (ground rule 9)
+
+Five findings against the feature commit, all fixed in the review
+commit:
+
+1. **The read-only chip rendered for everyone (MAJOR, page).** The chip
+   was `<span class="chip" id="guest-chip" hidden>`, and `.chip` sets
+   `display: inline-block` — an author display rule beats the UA sheet's
+   `[hidden] { display: none }`, so the badge showed on every load
+   including the operator's. Visibility is now driven by the body class
+   (`#guest-chip { display: none }` + `body.guest #guest-chip`), the
+   attribute is gone, and gate 12 asserts both halves so the next
+   `hidden` on a styled element is caught. The C7b savings panels are
+   unaffected — none of them carries a `display` rule of its own.
+2. **The guest flag was a one-way latch (MAJOR, page).** `setGuest()`
+   only ever turned guest mode ON, so a browser that first used a guest
+   token and then had the control-plane token pasted into the gate kept
+   the read-only UI — no buttons, no savings tab — until a manual
+   reload. Since the header rides only what the guest bearer authorized,
+   any non-401 response answers the question in both directions:
+   `setAuthMode(hasHeader)` now toggles the class and restores the
+   savings body.
+3. **A live gate asserted the wrong thing (doc).** L2 said `vibe cell
+   status` "fails 401" under a guest token. It does not: it reads
+   exactly `/api/fleet/state`, so it works — and that is a deliberate
+   consequence of granting the route rather than an accident. The gate
+   now asserts the working read and moves the 401 assertion to
+   `vibe cell drain`, and §1 states the CLI consequence outright.
+4. **"An abusive guest costs an SSE subscriber slot" was false (doc).**
+   `GET /api/fleet/state` is an uncached probe round of every cell and
+   refreshes last-seen bookkeeping, so a guest read is not free. The
+   out-of-scope entry now says what it actually costs and why the bound
+   still belongs on the routes rather than on the credential.
+5. **Gates named fewer tests than the phase has (doc, ground rule 10).**
+   The page test and the three CLI tests existed with no gate, and gate
+   10 claimed a state-body assertion that lives in gate 5's test. Gates
+   12 and 13 now name them, gate 10 says where its state half is, and
+   the two supporting tests are listed rather than left implicit.
+
+### Known and accepted (documented, not fixed)
+
+- **A guest's `HEAD` request 401s** even though Go's `GET` pattern
+  serves `HEAD` to the operator. The table declares methods exactly and
+  the page never issues one; this is C5's `/ui/fleet` behaviour applied
+  to two more routes, and it errs strict.
+- **Pointing `guest_token_file` at the control-plane token file**
+  disables guest access via the identical-token rung, which is the
+  correct outcome by the same argument — but the log says "identical to
+  the control-plane token", not "you pointed it at the same file".
+- **No hot reload and no per-guest revocation** (§6). Rotation is
+  fleet-wide and needs a daemon restart.
+- **The header is advisory.** A reverse proxy that strips
+  `X-Vibe-Auth` costs the page its read-only rendering, not its
+  correctness; the middleware is unaffected.
+- **The guest surface is only as trustworthy as the guest token.**
+  Anyone holding it reads the whole state document from anywhere the
+  control plane is reachable; `bind_all` on fleetd plus a shared token is
+  a LAN-wide read. That is the feature, stated plainly.

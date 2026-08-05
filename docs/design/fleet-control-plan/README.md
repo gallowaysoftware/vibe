@@ -19,7 +19,7 @@ to be implementable on its own after that.
 | [C8](c8-probe-model.md) | probe_model: throughput health against the model's own baseline | ~900 lines | C3, C4 | merged (#27); unit gates 1-10 green, 5 live gates UNRUN |
 | [C9](c9-fleet-notify.md) | `vibe fleet notify`: the alarm column, delivered | ~1100 lines | C2, C3, C4 | merged (#28); unit gates 1-13 green, 4 live gates UNRUN |
 | [C11](c11-hold-model.md) | hold_model: the pause button on the warm policy | ~450 lines | C2, C4, C5 | merged (#30); unit gates 1-11 green, 4 live gates UNRUN |
-| [C12](c12-guest-token.md) | Guest read-only token: sharing status without sharing drain | ~250 lines | C1, C5 | PR open; unit gates 1-12 green, 3 live gates UNRUN |
+| [C12](c12-guest-token.md) | Guest read-only token: sharing status without sharing drain | ~250 lines | C1, C5 | PR open; unit gates 1-14 green, 3 live gates UNRUN |
 
 C10 (await extensions) is still open on its own branch, cut from
 `c9e8bcf` in parallel with C9 and C11. None of the three builds on the

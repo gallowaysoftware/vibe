@@ -213,7 +213,11 @@ func TestFleetPage_GuestModeIsWiredToTheHeaderNotAProbe(t *testing.T) {
 	}
 	page := string(data)
 	for _, want := range []string{
-		`r.headers.get("X-Vibe-Auth") === "guest"`, // learned, not probed
+		// Learned from a response header, not probed — and applied in BOTH
+		// directions, so pasting the control-plane token into a tab that
+		// browsed as a guest gives the buttons back without a reload.
+		`if (r.status !== 401) setAuthMode(r.headers.get("X-Vibe-Auth") === "guest");`,
+		`document.body.classList.toggle("guest", isGuest);`,
 		`if (!guest) {`,                       // the action buttons
 		`if (!n.configured || guest) return;`, // the notify controls
 		`if (guest) { showSavingsDenied(); return; }`,
@@ -228,6 +232,17 @@ func TestFleetPage_GuestModeIsWiredToTheHeaderNotAProbe(t *testing.T) {
 	// savings fetch is the one call that does not pop the token gate.
 	if !regexp.MustCompile(`api\("/api/fleet/savings(.|\n)*?, null, true\)`).MatchString(page) {
 		t.Error("the savings fetch must pass quiet=true: a 401 there is C12's answer, not a bad token")
+	}
+	// The chip is class-driven. `.chip { display: inline-block }` is an
+	// author rule and beats the UA sheet's [hidden], so a hidden attribute
+	// on a .chip element does nothing and the read-only badge would render
+	// for the operator too.
+	if !strings.Contains(page, "#guest-chip { display: none;") ||
+		!strings.Contains(page, "body.guest #guest-chip { display: inline-block; }") {
+		t.Error("the read-only chip must be shown/hidden by the guest class, not by a hidden attribute")
+	}
+	if regexp.MustCompile(`id="guest-chip"[^>]*hidden`).MatchString(page) {
+		t.Error(`the chip carries a hidden attribute that .chip's display rule overrides`)
 	}
 	// And the page must not have grown a route to ask about privilege.
 	if strings.Contains(page, "/api/fleet/whoami") || strings.Contains(page, "/api/fleet/auth") {

@@ -83,8 +83,11 @@
   /* Guest mode (C12): the server told us this token is the read-only
      one, so the page stops OFFERING what it cannot do. Hiding is a
      courtesy — the middleware is the boundary, and a guest who forges
-     the class still gets a 401. */
-  #guest-chip { color: var(--amber); border-color: var(--amber); }
+     the class still gets a 401. Visibility is driven by the body class,
+     NOT by a hidden attribute: .chip sets display, and an author display
+     rule beats the UA sheet's [hidden] no matter what the markup says. */
+  #guest-chip { display: none; color: var(--amber); border-color: var(--amber); }
+  body.guest #guest-chip { display: inline-block; }
   body.guest #warmrow { display: none; }
   body.guest #nav-savings { display: none; }
   #sv-guest { color: var(--dim); max-width: 60em; }
@@ -94,7 +97,7 @@
 <header>
   <h1>fleet</h1>
   <span class="meta" id="fleetd-addr"></span>
-  <span class="chip" id="guest-chip" hidden>read-only</span>
+  <span class="chip" id="guest-chip">read-only</span>
   <nav id="views">
     <a href="#fleet" id="nav-fleet">fleet</a>
     <a href="#savings" id="nav-savings">savings</a>
@@ -183,13 +186,22 @@ function hdrs() { return token ? { "Authorization": "Bearer " + token } : {}; }
 // tokens and does not start now). If a proxy strips the header the page
 // just keeps its buttons and a click 401s, which is the un-polished
 // behaviour, not a broken one.
+// Both directions, not a one-way latch: pasting the control-plane token
+// into the gate of a tab that was browsing as a guest must give the
+// buttons back without a reload. Any non-401 response answers the
+// question, because the header rides only what the guest bearer
+// authorized.
 let guest = false;
-function setGuest() {
-  if (guest) return;
-  guest = true;
-  document.body.classList.add("guest");
-  $("guest-chip").hidden = false;
-  if (location.hash === "#savings") showSavingsDenied();
+function setAuthMode(isGuest) {
+  if (isGuest === guest) return;
+  guest = isGuest;
+  document.body.classList.toggle("guest", isGuest);
+  if (!isGuest) {
+    $("sv-guest").hidden = true;
+    $("sv-body").hidden = false;
+  } else if (location.hash === "#savings") {
+    showSavingsDenied();
+  }
 }
 
 // quiet suppresses the token gate on a 401: a guest hitting a route
@@ -197,7 +209,7 @@ function setGuest() {
 // would tell them otherwise.
 async function api(path, opts, quiet) {
   const r = await fetch(path, Object.assign({ headers: hdrs() }, opts || {}));
-  if (r.headers.get("X-Vibe-Auth") === "guest") setGuest();
+  if (r.status !== 401) setAuthMode(r.headers.get("X-Vibe-Auth") === "guest");
   if (r.status === 401) {
     if (!quiet) $("token-gate").style.display = "flex";
     throw new Error("401");
