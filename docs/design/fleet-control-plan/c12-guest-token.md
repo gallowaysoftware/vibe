@@ -856,7 +856,9 @@ Fixed by making the code match the doc rather than the reverse:
 returns `RawPath` when it is a valid encoding of `Path` and re-encodes
 `Path` otherwise, so the plain spellings are unaffected and an encoded
 one is simply a different string — a miss, therefore token-only, which
-is the answer `/ui/fleet%2f` has always got. C5's six pinned bypass
-attempts pass unchanged, and the encoded family is pinned in
+is the answer `/ui/fleet%2f` has always got. C5's pinned bypass
+attempts pass unchanged (the encoded spelling joins them, so the list is
+no longer six — it has grown in three phases and the count is not worth
+restating anywhere), and the encoded family is pinned in
 `daemon/authpath_test.go`, which also asserts the net/url premise so a
 future stdlib change cannot quietly invalidate the test's reasoning.

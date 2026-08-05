@@ -955,3 +955,15 @@ the detail without changing the level.
 Both directions are mutation-proven in
 `fleetapi/defsparity_test.go`: restoring either line makes a named test
 fail with the live fleet's shape.
+
+**Review pass.** The fleetd-vs-cells comparison existed only on the
+agreement branch, so the box writing the front's render dropped out of
+the report the moment the cells ALSO disagreed — the one report where
+"so which tree is the render coming from" is the operator's next
+question. fleetd's own checkout is now named on every branch that names
+SHAs; the agreement branch still grades on it, because that is the
+branch where a mismatch is the only finding there is. The pass also
+renamed `TestDoctor_DefsParityTreatsADirtyCheckoutAsUncomparable` —
+its name and comment stated the rule this addendum replaced, and its
+four subtests all still pass, which is precisely how a false rule
+survives (ground rule 10).

@@ -170,9 +170,9 @@ func TestGuestToken_ReachesNeitherMCPNorTheRPCs(t *testing.T) {
 	}
 }
 
-// TestGuestToken_AllowlistIsExactMatchAndGETOnly applies C5's six bypass
-// shapes to the new hole. Every one of these is a path a prefix match or
-// a path.Clean would let through.
+// TestGuestToken_AllowlistIsExactMatchAndGETOnly applies C5's bypass
+// shapes to the new hole. Every one of these is a path a prefix match, a
+// path.Clean or a decoded path would let through.
 func TestGuestToken_AllowlistIsExactMatchAndGETOnly(t *testing.T) {
 	f := startGuestFleetd(t)
 	for _, tc := range []struct{ method, path string }{

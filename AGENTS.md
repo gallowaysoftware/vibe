@@ -878,7 +878,9 @@ optional.)
     future routes) token-only. Never a denylist, never a prefix, never
     `path.Clean`, never `url.PathUnescape`. **C5's `/ui/fleet` exemption
     is now the table's one `AccessPublic` entry** — same GET-only exact
-    match, same six pinned bypass attempts.
+    match, and the same bypass family pinned in
+    `daemon/fleet_registry_test.go` (the list has grown with the phases;
+    do not quote a count at it).
   - **RAW means `EscapedPath()`, and the difference is not academic.**
     net/url decodes before the middleware runs
     (`url.ParseRequestURI("/ui/%66leet")` → `URL.Path == "/ui/fleet"`,
@@ -978,7 +980,11 @@ optional.)
     diverged is strictly worse than clean-and-diverged. The two
     can't-compare shapes stay distinct UNKNOWNs — nobody reports a SHA,
     versus everybody reports one SHA and no tree is clean — and neither
-    is an OK.
+    is an OK. fleetd's OWN checkout is named on every branch that names
+    SHAs, not only on the agreement one: the box writing the front's
+    render used to vanish from the report exactly when the cells also
+    disagreed, which is the report where "so which tree is the render
+    coming from" is the next question.
   - **The credential check uses the resolver the VERBS use.**
     `fleetcfg.CellCredential(cell, env, pref, localToken)` now holds
     C6's two deliberately-divergent precedences as named values

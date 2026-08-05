@@ -599,15 +599,30 @@ func (s *Server) checkVersions(rep *DoctorReport, snap StateSnapshot, pres map[s
 	if len(absent) > 0 {
 		absentNote = " Not reporting a SHA: " + strings.Join(absent, ", ") + "."
 	}
+	// fleetd's own checkout belongs on every branch that names SHAs, for
+	// the same reason absentNote does. The agreement branch spells out
+	// what a mismatch MEANS (the render comes from a different tree) and
+	// grades on it; the divergence branch cannot grade — it is already a
+	// WARN — but dropping the fact there hid it in the one report where
+	// "so which tree is the render coming from" is the operator's very
+	// next question.
+	hostNote := ""
+	if host.DefsSHA != "" {
+		hostSHA := host.DefsSHA
+		if host.DefsDirty {
+			hostSHA += ", dirty"
+		}
+		hostNote = " fleetd's own def checkout is at " + hostSHA + "."
+	}
 	switch {
 	case len(reported) == 0:
 		rep.Add(DoctorCheck{ID: "defs.parity", Level: LevelUnknown,
 			Summary: "no cell reports a defs SHA",
-			Detail:  "nothing to compare." + absentNote})
+			Detail:  "nothing to compare." + hostNote + absentNote})
 	case len(reported) > 1:
 		rep.Add(DoctorCheck{ID: "defs.parity", Level: LevelWarn,
 			Summary: "cells disagree about the def checkout",
-			Detail:  shaGroups(reported) + "." + dirtyNote + absentNote,
+			Detail:  shaGroups(reported) + "." + hostNote + dirtyNote + absentNote,
 			Fix:     "converge the backend-def checkouts; a fingerprint mismatch downstream is this, one level up."})
 	case len(clean) == 0:
 		// One SHA across the fleet and not one cell can vouch for it. C13's
@@ -615,7 +630,8 @@ func (s *Server) checkVersions(rep *DoctorReport, snap StateSnapshot, pres map[s
 		// than reporting health.
 		rep.Add(DoctorCheck{ID: "defs.parity", Level: LevelUnknown,
 			Summary: "no cell reports a clean defs SHA",
-			Detail:  "every reporting cell's checkout is dirty, so the matching SHA proves nothing about what is running." + dirtyNote + absentNote})
+			Detail: "every reporting cell's checkout is dirty, so the matching SHA proves nothing about what is running." +
+				hostNote + dirtyNote + absentNote})
 	default:
 		var sha string
 		for k := range clean {

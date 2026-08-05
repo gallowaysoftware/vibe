@@ -100,6 +100,31 @@ func TestDoctor_DefsParityFleetdDirtinessNeverDowngradesEither(t *testing.T) {
 	}
 }
 
+// TestDoctor_DefsParityNamesFleetdsOwnCheckoutOnTheDivergenceBranchToo.
+//
+// The fleetd-vs-cells comparison lived only on the agreement branch, so
+// the moment the cells ALSO disagreed the box writing the front's render
+// vanished from the report — in the one report where "so which tree is
+// the render coming from" is the operator's very next question. The
+// agreement branch still grades on it (that is where a mismatch is the
+// only finding); the divergence branch is already a WARN and just has to
+// carry the fact.
+func TestDoctor_DefsParityNamesFleetdsOwnCheckoutOnTheDivergenceBranchToo(t *testing.T) {
+	got := mustCheck(t, versionFleetWithHost(t, DoctorHost{Version: "v1", DefsSHA: "ccc333", DefsDirty: true},
+		map[string]*AnnounceVersions{
+			"alpha": {DefsSHA: "aaa111", Vibe: "v1"},
+			"bravo": {DefsSHA: "bbb222", Vibe: "v1"},
+		}).Doctor(context.Background()), "defs.parity", "")
+	if got.Level != LevelWarn {
+		t.Fatalf("level = %s (%s), want warn", got.Level, got.Detail)
+	}
+	for _, want := range []string{"aaa111", "bbb222", "ccc333", "dirty"} {
+		if !strings.Contains(got.Detail, want) {
+			t.Errorf("detail = %q, want it to carry %q", got.Detail, want)
+		}
+	}
+}
+
 // TestDoctor_DefsParityCannotCompareSaysSoDistinctly pins C13's own rule
 // on this check: UNKNOWN is not OK, and the two ways parity has nothing
 // to compare read as different sentences. "Nobody reports a SHA" and

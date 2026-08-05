@@ -395,12 +395,21 @@ func TestDoctor_OutboundAuthWithNoProberIsUnknownNotOK(t *testing.T) {
 	}
 }
 
-// TestDoctor_DefsParityTreatsADirtyCheckoutAsUncomparable: a dirty
-// working tree's SHA does not describe what is running, so it can
-// neither agree nor disagree. Counting it as agreement because the
+// TestDoctor_DefsParityAgreementRestsOnCleanCheckoutsOnly: a dirty
+// working tree's SHA does not describe what is running, so a verdict of
+// AGREEMENT may not rest on it. Counting it as agreement because the
 // string matches is the absent-evidence mistake this phase exists to
 // avoid.
-func TestDoctor_DefsParityTreatsADirtyCheckoutAsUncomparable(t *testing.T) {
+//
+// The name and the comment used to say "treats a dirty checkout as
+// UNCOMPARABLE", which the 2026-08-05 live gate showed is only half
+// true and the wrong half to state as a rule: a dirty tree can vouch
+// for nobody, but it can still DISAGREE, and dropping it from the
+// comparison flipped a real divergence to OK. Divergence is decided
+// over every cell that reports a SHA — see
+// defsparity_test.go, which pins that half. Ground rule 10: a test's
+// name is part of its assertion.
+func TestDoctor_DefsParityAgreementRestsOnCleanCheckoutsOnly(t *testing.T) {
 	t.Run("agreement", func(t *testing.T) {
 		s := versionFleet(t, map[string]*AnnounceVersions{
 			"a": {DefsSHA: "abc123", Vibe: "v1"},
