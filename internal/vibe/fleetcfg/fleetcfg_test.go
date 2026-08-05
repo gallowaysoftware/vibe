@@ -364,3 +364,49 @@ func TestWarmClassRefusal(t *testing.T) {
 		t.Errorf("nil hosts.yaml refused %q", why)
 	}
 }
+
+// TestWarmClassRefusal_VisionAnswersChatSoItIsNotRefused. The guard's
+// question is whether the model answers `/v1/chat/completions`, not
+// whether its class string is the word "chat". A vision model is
+// llama-server plus `--mmproj`: same endpoint, image as a content part,
+// warmed by the same 1-token completion. Refusing it costs a declared
+// warm target its whole life (permanent `skipped`, permanent
+// `warm.policy` WARN) for a warm that would have worked.
+func TestWarmClassRefusal_VisionAnswersChatSoItIsNotRefused(t *testing.T) {
+	f := &File{ModelClasses: map[string]string{
+		"gemma-vision": ModelClassVision,
+		"bge-embed":    "embed",
+		"kokoro":       "tts",
+		"bge-rerank":   "rerank",
+	}}
+	if why := f.WarmClassRefusal("gemma-vision"); why != "" {
+		t.Errorf("a vision-class id was refused: %q — it is a chat model that also takes images", why)
+	}
+	// And the classes that genuinely answer another endpoint stay refused,
+	// or the widening has eaten the guard.
+	for _, id := range []string{"bge-embed", "kokoro", "bge-rerank"} {
+		if why := f.WarmClassRefusal(id); why == "" {
+			t.Errorf("%s was not refused", id)
+		}
+	}
+	// The whole vocabulary, spelled out rather than derived from the map
+	// under test: a class added to ModelClasses later must fail here
+	// until someone decides which side of the line it is on.
+	want := map[string]bool{ // class -> refused
+		ModelClassChat: false, ModelClassVision: false,
+		"embed": true, "rerank": true, "classify": true, "stt": true, "tts": true,
+	}
+	if len(want) != len(ModelClasses) {
+		t.Fatalf("the vocabulary has %d classes and this table has %d — decide the new one", len(ModelClasses), len(want))
+	}
+	for _, class := range ModelClasses {
+		w, listed := want[class]
+		if !listed {
+			t.Fatalf("class %q is in ModelClasses but not in this table — does it answer a chat completion?", class)
+		}
+		f := &File{ModelClasses: map[string]string{"m": class}}
+		if refused := f.WarmClassRefusal("m") != ""; refused != w {
+			t.Errorf("class %q refused = %v, want %v", class, refused, w)
+		}
+	}
+}

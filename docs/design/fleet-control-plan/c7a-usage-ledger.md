@@ -637,6 +637,20 @@ rows it read and refused to `lost_rows`, and logs the evidence by name.
 It does NOT mint an epoch: the counters are the CELL's lifetime totals,
 they stay monotone, and fleetd's delta arithmetic keeps working.
 
+**Review pass (2026-08-05).** The two checks are a LADDER, not a
+conjunction. When the row still sitting at the cursor id IS the anchor's
+row, the log's identity is PROVEN and there is nothing left to test;
+running the clock scan anyway let a single backwards clock step larger
+than `maxRowClockSkew` — the one thing that constant is documented to
+absorb — discard a whole window of real traffic from a settled log, and
+the counters are cumulative into an append-only ledger, so the shortfall
+never comes back. Two identity changes stay uncaught and are now named in
+the code rather than left to be assumed: a store COPIED from a busier box
+whose rows all postdate this cell's anchor (nothing in the window
+contradicts anything), and two llama-swap instances sharing one
+`store.path` (each reader sees one continuous log; only a per-instance
+marker llama-swap does not write could tell).
+
 Deliberately NOT a check on an unreachable anchor. On an in-memory ring
 the anchor legitimately ages out and every surviving row is newer than it;
 refusing there would drop real traffic on every cell that outruns its

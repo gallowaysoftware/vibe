@@ -323,13 +323,34 @@ const maxRowClockSkew = 5 * time.Minute
 // continuity — a row count cross-check against /api/metrics/stats has the
 // same defect from the other side, since a ring's aged-out span and a
 // swapped store's id hole are numerically identical.
+//
+// Two identity changes it deliberately does NOT catch, both named so the
+// next reader does not assume otherwise: a store COPIED from a busier box
+// whose rows are all stamped after this cell's anchor (nothing in the
+// window contradicts anything), and two llama-swap instances sharing one
+// `store.path` (each reader sees one continuous log — there is no id
+// evidence to find, only a per-instance marker llama-swap does not
+// write). The first is rare; the second is a config error whose fix is
+// one path per cell.
 func continuityBreak(a *rowAnchor, atCursor *ActivityRow, rows []ActivityRow) string {
 	if a == nil {
 		// No anchor: a state file written before this rule existed, or a
 		// cell that has never folded a row. Nothing to contradict.
 		return ""
 	}
-	if atCursor != nil && !a.sameRow(*atCursor) {
+	if atCursor != nil {
+		if a.sameRow(*atCursor) {
+			// The row the cursor was set from is still sitting at the
+			// cursor id, which PROVES this is the log the cursor came
+			// from. The clock scan below is the weaker test for when that
+			// proof is unavailable; running it anyway would let one
+			// out-of-order row — a backwards clock step larger than the
+			// tolerance is exactly what maxRowClockSkew is documented to
+			// absorb — discard a whole window of real traffic from a log
+			// whose identity is settled. These counters are cumulative and
+			// the ledger append-only, so that loss is permanent.
+			return ""
+		}
 		return fmt.Sprintf("id %d now holds %s %s at %s; the cursor was set from %s %s at %s",
 			a.ID, atCursor.Model, atCursor.ReqPath, atCursor.Timestamp.Format(time.RFC3339),
 			a.Model, a.ReqPath, a.TS.Format(time.RFC3339))

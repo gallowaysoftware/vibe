@@ -10,6 +10,8 @@ package fleetapi
 
 import (
 	"context"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,8 +27,9 @@ func classedHosts() *fleetcfg.File {
 			"heavy": {URL: "http://127.0.0.1:1"},
 		},
 		ModelClasses: map[string]string{
-			"lab-embed-b": "embed",
-			"lab-chat":    fleetcfg.ModelClassChat,
+			"lab-embed-b":  "embed",
+			"lab-chat":     fleetcfg.ModelClassChat,
+			"lab-vision-b": fleetcfg.ModelClassVision,
 		},
 	}
 }
@@ -120,6 +123,42 @@ func TestWarmTarget_ChatClassModelStillWarms(t *testing.T) {
 	t.Fatal("a chat-class warm target never warmed; the guard caught the wrong thing")
 }
 
+// TestWarmTarget_VisionClassModelStillWarms is the false-positive guard
+// that matters most, because a vision entry is the one plausible
+// non-`chat` value an operator writes for a model the warm verb WORKS
+// on: a multimodal model is llama-server plus `--mmproj`, answering
+// `/v1/chat/completions` with the image as a content part. Refusing it
+// would cost a declared target its whole life — a permanent `skipped`
+// row and a permanent `warm.policy` WARN — for a warm that would have
+// succeeded, which is the class of regression a guard added at four
+// call sites at once is most likely to introduce.
+func TestWarmTarget_VisionClassModelStillWarms(t *testing.T) {
+	probe := &warmProbe{}
+	s := newClassedWarmServer(t)
+	if why := s.warmClassRefusal("lab-vision-b"); why != "" {
+		t.Fatalf("vision refused at the source: %q", why)
+	}
+	s.startWarmLoopWithConfig(warmLoopConfig{
+		targets:    []WarmTarget{{Cell: "heavy", Model: "lab-vision-b", RestoreAfterIdle: time.Millisecond}},
+		frontURL:   "http://front.test",
+		warmFn:     probe.warm,
+		tick:       10 * time.Millisecond,
+		emptyGrace: 10 * time.Millisecond,
+	})
+	if st := warmTargetStateOf(s, 0); st.State == "skipped" {
+		t.Fatalf("a vision target was refused at wiring: %+v", st)
+	}
+	presenceOf(s, "heavy")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(probe.got()) > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("a vision-class warm target never warmed")
+}
+
 // The schedule half. It is refused at wiring, so it carries no next_fire
 // for a warm that will never happen, and the goroutine never exists.
 func TestWarmSchedule_EmbedClassEntryIsRefusedAtWiringAndNeverFires(t *testing.T) {
@@ -142,8 +181,8 @@ func TestWarmSchedule_EmbedClassEntryIsRefusedAtWiringAndNeverFires(t *testing.T
 }
 
 // Fire time is the second half of the same rule: a producer that reaches
-// evalScheduleEntry another way is refused before the guard rungs, before
-// any cell resolve, and without touching last_fire.
+// evalScheduleEntry another way is refused ahead of every guard rung and
+// of whatever the cell resolve returned, and without touching last_fire.
 func TestWarmSchedule_EmbedClassIsRefusedAtFireTimeToo(t *testing.T) {
 	probe := &warmProbe{}
 	s := newClassedWarmServer(t)
@@ -214,5 +253,42 @@ func TestWarmClassRefusal_NoHostsFileRefusesNothing(t *testing.T) {
 	t.Cleanup(s.Close)
 	if why := s.warmClassRefusal("anything"); why != "" {
 		t.Errorf("refused %q with no hosts.yaml at all", why)
+	}
+}
+
+// TestDoctor_RefusedWarmScheduleReportsTheClassNotTheCron.
+//
+// The wiring refusal parks the entry with no next_fire, which is
+// correct — and lands it in `warm.policy`'s findings, which is also
+// correct, because a declared schedule that will never fire IS the warm
+// policy not doing what it was declared to do. What the check must not
+// do is describe it as a missing fire time and stop: three different
+// causes park an entry that way (an invalid cron, a spec with no fire
+// inside the scan horizon, and now a model the warm verb cannot be
+// fired at), and only one of them is about the cron field the message
+// quotes. C13's rule that a check names what it PROVES applies to the
+// detail line too.
+func TestDoctor_RefusedWarmScheduleReportsTheClassNotTheCron(t *testing.T) {
+	dir := t.TempDir()
+	s := New([]Cell{
+		{Name: fleetcfg.FrontCell, URL: "http://127.0.0.1:1"},
+		{Name: "heavy", URL: "http://127.0.0.1:1", Class: "always_on"},
+	}, filepath.Join(dir, "hist.json"), testDaemonInfo, Options{
+		IntentPath:   filepath.Join(dir, "intent.json"),
+		LastSeenPath: filepath.Join(dir, "last-seen.json"),
+		Hosts:        classedHosts(),
+	})
+	t.Cleanup(s.Close)
+	s.startScheduleLoopWithConfig([]WarmScheduleEntry{{Cron: "0 6 * * *", Model: "lab-embed-b"}},
+		func(string) (string, error) { return "heavy", nil }, time.UTC,
+		func(context.Context, string, string) error { return nil }, "http://front.test")
+
+	got := mustCheck(t, s.Doctor(context.Background()), "warm.policy", "")
+	if got.Level != LevelWarn {
+		t.Fatalf("warm.policy → %s (%s), want warn: a schedule that can never fire is a declared policy that is not running", got.Level, got.Detail)
+	}
+	if !strings.Contains(got.Detail, "embed-class") {
+		t.Errorf("detail = %q, want the refusal's reason carried — an operator reading only "+
+			"\"no resolved next fire\" goes and debugs a cron field that is fine", got.Detail)
 	}
 }

@@ -306,11 +306,25 @@ optional.)
     500-ing chat completions at an embed-class id — then queued them to
     the cell, because a 500 is a DELIVERY failure. So the refusal holds
     at WIRING (a `skipped` status row and no goroutine; a refused
-    schedule carries no `next_fire`) and at FIRE time (`restore`,
-    `evalScheduleEntry`, `wakeWarm`) and in `queueWarm`. Do not "fix" a
-    refused embed target by adding an embed warm body: the right verb
-    per class is a phase, and an embed warm is a fully METERED request on
-    C7a's `embed` basis, which has no `poke_req` equivalent.
+    schedule carries no `next_fire`, and `warm.policy` reports its NOTE
+    rather than "no resolved next fire", which names a cron field that is
+    fine) and at FIRE time (`restore`, `evalScheduleEntry`, `wakeWarm`)
+    and in `queueWarm`. Do not "fix" a refused embed target by adding an
+    embed warm body: the right verb per class is a phase, and an embed
+    warm is a fully METERED request on C7a's `embed` basis, which has no
+    `poke_req` equivalent.
+    - **The test is "does it answer a chat completion", not "is the class
+      string `chat`"** (`fleetcfg.chatCapableClasses` = `chat` +
+      `vision`). A multimodal model is llama-server plus `--mmproj`: same
+      `/v1/chat/completions`, image as a content part, warmed by the same
+      1-token request. Four of the five producers are automated policy,
+      so a FALSE refusal is not a command failing in front of an operator
+      — it is a declared target that silently never fires and a
+      `warm.policy` yellow forever. `embed`/`rerank`/`stt`/`tts` each
+      answer their own route, and `classify` names llama.cpp's
+      sequence-classification family; a small model used FOR
+      classification but served on the chat route is class `chat`
+      (listing it documents ownership and gates nothing).
   - **Model-set changes are render triggers** (recordAnnounce): a cell
     that starts/stops serving a model re-renders like a membership
     transition.
@@ -398,7 +412,8 @@ optional.)
     and keeps retrying transport errors; `--timeout 0` stays the
     overnight-batch idiom.
   - `model_classes` has a closed vocabulary (`fleetcfg.ModelClasses`);
-    `warm_model` skips `chat`-class entries and still refuses the rest.
+    the warm guard skips the CHAT-CAPABLE classes (`chat`, `vision`) and
+    still refuses the rest — see C4's `WarmClassRefusal` note.
     hosts.yaml tolerates fleet.md's top-level `hosts:` inventory as an
     inert key — `KnownFields(true)` stays on.
 - **Usage ledger (fleet-control C7a).** Tokens per cell, per model, per
@@ -473,7 +488,14 @@ optional.)
     tests CONTRADICTED continuity, not unproven continuity (the same
     reason a row-count cross-check against `/api/metrics/stats` was
     rejected: a ring's aged-out span and a swapped store's id hole are
-    numerically identical).
+    numerically identical). The two checks are a LADDER, not a
+    conjunction: a row still sitting at the cursor id that matches the
+    anchor PROVES the log's identity, so the clock scan is skipped —
+    running it anyway let one backwards clock step (the thing
+    `maxRowClockSkew` exists to absorb) discard a window of real traffic
+    from a settled log. Two identity changes it does NOT catch, named in
+    the code: a store copied from a busier box whose rows all postdate
+    the anchor, and two llama-swap instances sharing one `store.path`.
   - Storage is append-only JSONL (`paths.UsageLedgerFile()`), coalesced
     in memory, flushed on a 60s ticker and at shutdown, compacted at
     start via tmp+rename. Deliberately NOT `history.go`'s

@@ -291,8 +291,10 @@ func (s *Server) evalScheduleEntry(e WarmScheduleEntry, spec cronSpec, st *warmS
 	cell, err := cellOfModel(e.Model)
 	switch {
 	case refused != "":
-		// Answered before the guard rungs and before any resolve: this is
-		// a configuration refusal, not a condition of tonight.
+		// Answered ahead of every guard rung and of whatever the resolve
+		// returned: this is a permanent configuration refusal, not a
+		// condition of this minute, so no rung below it can overwrite it
+		// with a reason that reads as temporary.
 		note = "refused: " + refused
 	case err != nil:
 		note = fmt.Sprintf("skipped (cannot resolve cell for %s: %v)", e.Model, err)

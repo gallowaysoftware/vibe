@@ -306,6 +306,23 @@ rule rather than a property of one wiring path. The daemon names the same
 refusal at startup for `warm_targets`, `warm_schedule` and
 `sleep_schedule.warm`.
 
+**Review pass (2026-08-05).** The guard's question is whether the model
+ANSWERS a chat completion, not whether its class string is the word
+`chat`. The first cut refused everything but `chat`, which included
+`vision` — and a multimodal model is llama-server plus `--mmproj`: the
+same `/v1/chat/completions`, the image carried as a content part, warmed
+by the same 1-token request. Four of the five producers are automated
+policy, so a false refusal there is not a command failing in front of an
+operator; it is a declared `warm_target` that silently never fires for
+the life of the fleet and a `warm.policy` check that is yellow forever —
+the permanent-WARN failure C13's review pass had to fix three times.
+`fleetcfg.chatCapableClasses` is the line, and the whole vocabulary is
+pinned against a spelled-out table so a class added later has to be
+decided rather than inherited. The same pass carried the refusal's NOTE
+into `warm.policy`: three different causes park a schedule with no
+`next_fire`, and reporting only "no resolved next fire" sends an operator
+to debug a cron field that is fine.
+
 **No class-dispatched warm body was added, deliberately.** C8's prober
 does have an embed path, so "warm an embedding model" is a coherent want
 — but it needs the right verb per class, and on the two classes with an

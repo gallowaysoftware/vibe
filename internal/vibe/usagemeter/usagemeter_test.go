@@ -749,3 +749,54 @@ func TestPoll_OrdinaryGrowthWithTimestampsNeverTripsTheContinuityCheck(t *testin
 		t.Errorf("lost_rows = %d on an ordinary growing log", snap.LostRows)
 	}
 }
+
+// TestPoll_ProvenContinuityIsNotDiscardedByABackwardsClockStep.
+//
+// The two checks are a ladder, not a conjunction. When the row still
+// sitting at the cursor id IS the row the anchor was taken from, the log
+// is demonstrably the log the cursor came from and there is nothing left
+// to test; the clock scan exists only for the case where that proof is
+// unavailable (ids jumped clear of the cursor). Running it anyway made a
+// single backwards clock step larger than maxRowClockSkew — the one thing
+// that constant is documented to absorb — discard a whole window of REAL
+// traffic. These counters are cumulative and fleetd's ledger is
+// append-only, so the shortfall never comes back.
+func TestPoll_ProvenContinuityIsNotDiscardedByABackwardsClockStep(t *testing.T) {
+	swap := &fakeSwap{}
+	url := swap.start(t)
+	c := newCollector(t, url)
+
+	base := time.Date(2026, 8, 5, 10, 0, 0, 0, time.UTC)
+	rows := []ActivityRow{
+		stamped(chatRow(1, "qwen", 100, 0, 50), base),
+		stamped(chatRow(2, "qwen", 100, 0, 50), base.Add(time.Minute)),
+	}
+	swap.set(rows)
+	if err := c.Poll(context.Background()); err != nil {
+		t.Fatalf("poll 1: %v", err)
+	}
+	before := totalsFor(t, c, "qwen", BasisChat)
+	if before.Req != 2 {
+		t.Fatalf("setup: req = %d, want 2", before.Req)
+	}
+
+	// Same log, same rows 1 and 2 untouched — then NTP walks the cell's
+	// clock back an hour and it keeps serving.
+	stepped := base.Add(-time.Hour)
+	rows = append(rows,
+		stamped(chatRow(3, "qwen", 30, 0, 10), stepped),
+		stamped(chatRow(4, "qwen", 30, 0, 10), stepped.Add(time.Minute)),
+	)
+	swap.set(rows)
+	if err := c.Poll(context.Background()); err != nil {
+		t.Fatalf("poll 2: %v", err)
+	}
+
+	got := totalsFor(t, c, "qwen", BasisChat)
+	if got.Req != 4 || got.InFresh != before.InFresh+60 {
+		t.Fatalf("a window on a log whose identity is PROVEN was refused: %+v (was %+v)", got, before)
+	}
+	if snap := c.Snapshot(); snap.LostRows != 0 {
+		t.Errorf("lost_rows = %d — nothing was lost; the anchor row was right there at the cursor", snap.LostRows)
+	}
+}
