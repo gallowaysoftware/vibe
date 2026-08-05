@@ -48,12 +48,23 @@ Small (days):
    computable on the cell, whose registry may be down, and the keyspace
    is `(model, flags_sha256, metric)`), and a degraded model is NOT
    withdrawn from the render — see the phase doc §5 for why.
-2. **`vibe fleet notify`** — SSE-events-to-webhook bridge (ntfy or
-   similar), default policy = the class table's alarm column only
-   (always-on staleness, persistent fingerprint mismatch,
-   drain-with-active-lease, await-unblocked). Without it the design's
-   "alarm? yes" column terminates in an SSE stream nobody watches.
-   Gate on an away/home fleet-scope intent so vacation isn't noisy.
+2. **`vibe fleet notify`** — **SHIPPED as
+   [C9](fleet-control-plan/c9-fleet-notify.md) (2026-08-04.)** Default
+   policy is the class table's alarm column only (always_on absence,
+   persistent fingerprint mismatch, drain-with-active-lease), gated by
+   an away/home fleet-scope declaration. Three notes for whoever reads
+   this next. **It is not the SSE bridge this entry sketched**: a
+   persistent fingerprint mismatch publishes exactly ONE event ever
+   (renderPass runs on triggers, and a steady wrong hash triggers
+   nothing) and drain-with-lease publishes none at all, so the alarm
+   column is not expressible as an event forward — C9 evaluates
+   conditions against the same snapshot the page renders.
+   "**Await-unblocked**" landed in two pieces rather than a watch
+   registry: the resolve notification every fired alarm sends when it
+   clears, plus `vibe cell await --notify` for a human parked on a cell.
+   And the away scope lives in its own file, NOT in `intent.json` —
+   every reader of that store treats a key as a cell that announces and
+   echoes.
 3. **`vibe cell await --model <id> --ready` and `--idle <duration>`**
    — cell-up is not model-warm (a 6–10 min gap on the heavy cell),
    and resume-then-immediately-chatting shouldn't fire the parked

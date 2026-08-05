@@ -1,10 +1,11 @@
 # Fleet control: node state, intent, and the control plane
 
-Status: MERGED THROUGH C8 (2026-08-04) — C8 is probe_model, the first
-v2 backlog item to land. Every phase C0–C8 is on `main` (#18–#25, #27),
+Status: MERGED THROUGH C8 (2026-08-04), C9 IN REVIEW — C8 is
+probe_model and C9 is the alarm notifier, the first two v2 backlog items
+to land. Every phase C0–C8 is on `main` (#18–#25, #27),
 plus one post-merge reconciliation PR for the three items no
 single phase branch could reach. **Merged is not live-gated:** C5's,
-C6's, C7a's, C7b's and C8's live gates need real cells and were NOT run — the
+C6's, C7a's, C7b's, C8's and C9's live gates need real cells and were NOT run — the
 phase docs and the README's status column say per phase which gates are
 mechanical (green, repeated under `-race`) and which are still owed.
 That README's status column is the authoritative per-phase state.
@@ -180,6 +181,16 @@ The hold/prune split serves two masters: always-on consumers pin model
 ids that must never 404 (hold), while a roaming cell's models genuinely
 aren't part of the fleet when it's on a train (prune).
 
+**The alarm column has a destination from C9** (`fleet.notify`): fleetd
+evaluates that column against this table's own derived display states
+and delivers it to one webhook. `always_on` absence alarms *only when
+intent does not explain it* — a declared drain (DRAINED / OFF) is not an
+alarm, an absence with no entry (DRAINED?) is. `opportunistic` and
+`roaming` absence never alarms, and `INCONSISTENT` is a nag rather than
+a page. Delivery — never evaluation — is gated by a declared fleet-scope
+`notify.scope` (away/home) whose suppressions stay visible in
+`fleet_status` and are digested on return.
+
 **Membership** (which cells exist, which models each serves, with what
 flags) is *config, not state*: backend defs + the `cells:` map,
 rendered into the front's peers file. It changes rarely, through git.
@@ -214,6 +225,8 @@ mux behind the same bearer auth, wire pattern cloned from
 | `wake_cell(cell)` | C2 | Wake-on-LAN magic packet; explicit, never automatic |
 | `render_front(dry_run?)` | C2 | `vibe router render --cell front` (`--check` when dry_run) |
 | `probe_model(cell, model, rebaseline?)` | C8 | ask the cell to measure one RESIDENT model against its own baseline; refuses a cold model rather than loading it |
+| `fleet_notify_scope(scope, reason?, until?)` | C9 | declare away/home — gates alarm DELIVERY only; alarms keep firing and stay visible in fleet_status |
+| `fleet_notify_test(message?)` | C9 | send one message through the real webhook path (not an alarm: no dwell, no dedup, no away gate) |
 | `hold_model(cell, model, for?, note?)` | C11 | suspend fleetd's own warm policy on a cell until an expiry — the evaluation afternoon. Stored as a lease with `hold: true`; not a pin (llama-swap's TTL is untouched) |
 | `release_hold(cell, model)` | C11 | end a hold early; holds expire on their own |
 
@@ -225,7 +238,8 @@ machinery, already shipped). `vibe cell await <cell> --up` is the
 
 **HTTP.** Existing `GET /api/fleet/state` + `/api/fleet/events`; new
 `POST /api/fleet/intent` (C1); `POST /api/fleet/wake` and
-`POST`/`DELETE /api/fleet/lease` (C2); `POST /api/fleet/announce` (C3).
+`POST`/`DELETE /api/fleet/lease` (C2); `POST /api/fleet/announce` (C3);
+`POST /api/fleet/notify/scope` and `POST /api/fleet/notify/send` (C9).
 
 **Advisory leases (C2).** A batch consumer can register "I hold
 `<model>` on `<cell>`: mid-batch, N rows left" with a TTL. Leases are

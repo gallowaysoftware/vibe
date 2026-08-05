@@ -318,6 +318,7 @@ func cellAwaitCmd() *cobra.Command {
 		apiFlag  string
 		up       bool
 		down     bool
+		notify   bool
 		timeout  time.Duration
 		interval time.Duration
 	)
@@ -325,7 +326,9 @@ func cellAwaitCmd() *cobra.Command {
 		Use:   "await <cell>",
 		Short: "Block until a cell is reachable (--up) or unreachable (--down).",
 		Long: "Park a script on fleet state: `vibe cell await gpu-cell --up && ./overnight-batch.sh`.\n" +
-			"--up means the cell's llama-swap answers; intent is deliberately not consulted (routing truth rule).",
+			"--up means the cell's llama-swap answers; intent is deliberately not consulted (routing truth rule).\n" +
+			"--notify pushes one message through fleetd's configured webhook when the wait ends — " +
+			"the await-unblocked half of C9, for a human parked on a cell rather than a script.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -344,15 +347,40 @@ func cellAwaitCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return awaitCell(ctx, cmd.OutOrStdout(), target, args[0], up, timeout, interval)
+			err = awaitCell(ctx, cmd.OutOrStdout(), target, args[0], up, timeout, interval)
+			if err == nil && notify {
+				notifyAwaitUnblocked(cmd.OutOrStdout(), target, args[0], up)
+			}
+			return err
 		},
 	}
 	cmd.Flags().StringVar(&apiFlag, "api", "", "fleetd base URL (default: $VIBE_API, hosts.yaml fleetd_url, or the local daemon)")
 	cmd.Flags().BoolVar(&up, "up", false, "wait until the cell answers (default)")
 	cmd.Flags().BoolVar(&down, "down", false, "wait until the cell stops answering")
+	cmd.Flags().BoolVar(&notify, "notify", false, "push a notification through fleetd's webhook when the wait ends")
 	cmd.Flags().DurationVar(&timeout, "timeout", 0, "give up after this long (0 = wait forever)")
 	cmd.Flags().DurationVar(&interval, "interval", 5*time.Second, "poll interval")
 	return cmd
+}
+
+// notifyAwaitUnblocked pushes the await's own result through fleetd's
+// notifier. Best-effort by construction: the wait already ended, so a
+// failed push warns rather than failing a command whose whole job just
+// succeeded — and the failure names itself rather than being swallowed.
+func notifyAwaitUnblocked(out io.Writer, target fleetdTarget, cell string, up bool) {
+	state := "up"
+	if !up {
+		state = "down"
+	}
+	body := map[string]string{
+		"title":   "vibe fleet: " + cell + " is " + state,
+		"message": "the wait on " + cell + " ended: it is " + state,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := target.postFleet(ctx, "/api/fleet/notify/send", body, nil); err != nil {
+		fmt.Fprintf(out, "warning: --notify push failed: %v\n", err)
+	}
 }
 
 // awaitCell blocks until the named cell's reachability matches wantUp.
