@@ -65,7 +65,8 @@ jobs:
           curl -sSfL -o /tmp/lcpp.tgz \
             "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_VERSION}/llama-${LLAMA_CPP_VERSION}-bin-ubuntu-x64.tar.gz"
           rm -rf /tmp/lcpp && mkdir -p /tmp/lcpp && tar xzf /tmp/lcpp.tgz -C /tmp/lcpp
-          find /tmp/lcpp -type f \( -name 'llama-server' -o -name '*.so*' \) -exec cp -a {} .upstream/ \;
+          # cp -a: the ggml libraries need their soname symlinks (see ci.yml).
+          cp -a /tmp/lcpp/llama-*/. .upstream/
           curl -sSfL -o .upstream/stories260K.gguf "$MODEL_URL"
           chmod +x .upstream/llama-swap .upstream/llama-server
           .upstream/llama-swap --version

@@ -3,6 +3,7 @@ package swaptest_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -113,6 +114,7 @@ models:
 
 	url := fmt.Sprintf("http://127.0.0.1:%d", port)
 	deadline := time.Now().Add(60 * time.Second)
+	up := false
 	for time.Now().Before(deadline) {
 		rctx, rcancel := context.WithTimeout(context.Background(), time.Second)
 		req, _ := http.NewRequestWithContext(rctx, http.MethodGet, url+"/running", nil)
@@ -121,13 +123,51 @@ models:
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				return url
+				up = true
+				break
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("llama-swap did not answer /running on %s within 60s", url)
-	return ""
+	if !up {
+		t.Fatalf("llama-swap did not answer /running on %s within 60s", url)
+	}
+	requireUpstreamServes(t, url, model)
+	return url
+}
+
+// requireUpstreamServes proves the llama-server BEHIND llama-swap actually
+// runs before any invariant is asserted against this target.
+//
+// This exists because the first green CI run was a lie. The workflow copied
+// llama.cpp's shared objects with `find -type f`, which drops the versioned
+// soname symlinks, so llama-server exited immediately and llama-swap
+// answered every completion 500. Four of the five invariants passed anyway —
+// they exercise routing, in-flight tracking and the activity log, none of
+// which need an upstream — and the fifth SKIPPED, which reads exactly like
+// coverage. A conformance job whose model never loaded must be RED.
+func requireUpstreamServes(t *testing.T, url, model string) {
+	t.Helper()
+	body := fmt.Sprintf(`{"model":%q,"max_tokens":4,"messages":[{"role":"user","content":"hi"}]}`, model)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url+"/v1/chat/completions", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("the live target did not answer a completion: %v", err)
+	}
+	defer resp.Body.Close()
+	payload, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("the live target answered HTTP %d to a warm-up completion for %q: %s\n"+
+			"llama-swap is running but its upstream is not. Check LLAMA_SERVER_BIN's shared "+
+			"libraries (the ggml sonames need their symlinks) and that the port is free.",
+			resp.StatusCode, model, strings.TrimSpace(string(payload)))
+	}
 }
 
 func freePort(t *testing.T) int {
