@@ -2,7 +2,10 @@
 
 Status: **PR OPEN** (2026-08-05), off `feat/c13-doctor` branched from
 `feat/c12-guest-token` at `96f793c` (**C12 merges first**). Feature
-commit plus ground rule 9's adversarial self-review commit. Unit gates
+commit plus ground rule 9's adversarial self-review commit — five
+findings, three of them ways this command could have MISREPORTED, all
+fixed with mutation-verified regression tests (see the
+[addendum](#adversarial-self-review-addendum)). Unit gates
 U1–U16 are green on a full local inner loop (`go build`, `go vet`,
 `go test -race -count=5`, `golangci-lint run` 0 issues, `gofmt -l .`
 silent, `go mod tidy` clean) plus a local end-to-end run of the real
@@ -550,9 +553,13 @@ checks that are true at the client still run:
 - `hosts.yaml` parses and validates (a broken registry is the reason
   fleetd is not coming back, surprisingly often),
 - `auth.client_env` (§4),
-- `tls.not_after` for `fleetd_url` itself,
-- a direct TCP/HTTP probe of each cell's `url`, so the operator still
-  learns which boxes are up.
+- a direct HTTP probe of each cell's `url`, so the operator still learns
+  which boxes are up while the control plane is down.
+
+An https `fleetd_url` whose certificate has expired needs no separate
+check here: the transport error IS the diagnosis, and it rides the
+`fleetd.reachable` row's detail verbatim (`x509: certificate has
+expired`).
 
 `front.render_mount` deserves its own line here because it is the check
 whose absence is invisible: without `fleet.front_config`, the render
@@ -701,4 +708,63 @@ certs or a real roaming laptop was tested.
 
 ### Adversarial self-review addendum
 
-_Filled in by the review commit._
+Ground rule 9's separate pass, against the feature commit. Five
+findings, all fixed with mutation-verified regression tests. The theme
+is the one this command is most exposed to: **a diagnostic tool that
+misreports is worse than no tool**, and three of the five were ways
+this one could have lied.
+
+**REV-1 — the outbound credential probes ran serially** (would
+misdiagnose). Each probe is bounded at 5s and the report at 20s, so a
+fleet with three boxes off spends the whole deadline dialling them —
+and every cell *behind* those three then reports "context deadline
+exceeded" for a call that was never made. On a fleet whose whole point
+is opportunistic and roaming cells, that is the normal case, not the
+edge one. Fixed by fanning out exactly like `Snapshot`'s own cell round.
+Pinned by `TestDoctor_OutboundProbesRunInParallel` (mutation-verified:
+serial takes 1.05s for 7 cells at 150 ms each and fails the bound).
+
+**REV-2 — the TLS dial ignored the report's context.**
+`tls.DialWithDialer` takes a `net.Dialer` and no context, so a client
+that disconnected mid-report left one 3s dial per https endpoint
+running, and the `--timeout` flag did not bound them. Replaced with
+`tls.Dialer.DialContext`. Pinned by
+`TestDoctor_TLSDialHonoursTheReportContext` (a pre-cancelled context
+must return in well under the dial timeout).
+
+**REV-3 — `DoctorHost.Version` was collected and never rendered.** The
+daemon filled fleetd's own build and def SHA and nothing reported them,
+which is exactly the asymmetry `defs.parity` exists to catch: the box
+that writes the front's render is part of the fleet's version story.
+Now a `versions.reported` row of its own, carrying the DIRTY flag like
+any cell's.
+
+**REV-4 — the CLI's doctor fetch reused the state-sized HTTP client**
+(would misdiagnose, and worst of all). `resolveFleetd`'s client carries
+a 10s timeout sized for `/api/fleet/state`; the doctor report is bounded
+server-side at 20s and legitimately takes longer on a fleet with absent
+cells. A fleetd that was merely SLOW would have been reported as DEAD,
+with the degraded report's confident `FAIL fleetd did not answer` — the
+single worst output this command can produce, because it is rendered at
+exactly the moment an operator is deciding whether fleetd needs
+restarting. The request context (the `--timeout` flag) is the bound now;
+the transport is still the shared one so a unix-socket target still
+dials the socket. Pinned by
+`TestFleetDoctorFetchIgnoresTheStateSizedTimeout` (mutation-verified).
+
+**REV-5 — the local target rendered as `http://vibe.local`.** The
+unix-socket target carries a placeholder host so the URL parses;
+printing it as the address the report came from invites someone to curl
+a host that does not exist. Renders as "the local daemon (unix socket)".
+
+Two things the pass looked at and deliberately left:
+
+- **The report is not on the fleet page.** C4's page is a phone in a
+  hallway with three fat buttons; a 27-row audit is not a phone screen,
+  and adding it would mean either a new route or a doctor-shaped view of
+  a document the page does not otherwise fetch. The MCP tool covers the
+  agent case and the CLI covers the desk.
+- **`--json` does not sort by severity while the human renderer does.**
+  Deliberate: the JSON keeps emission order (grouped by subject) so two
+  runs diff cleanly, and a consumer that wants severity order has the
+  level on every check.

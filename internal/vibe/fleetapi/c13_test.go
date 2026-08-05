@@ -14,6 +14,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -806,5 +807,87 @@ func TestDoctor_MintedTokenPlusRejectionsIsTheUnmountedVolumeSignature(t *testin
 	}
 	if !strings.Contains(got.Detail, "state dir") {
 		t.Errorf("detail = %q, want the unmounted state dir named — that is the fix", got.Detail)
+	}
+}
+
+// ─── review-pass regressions ────────────────────────────────────────────────
+
+// TestDoctor_OutboundProbesRunInParallel pins REV-1. Each probe is
+// bounded at 5s, so a fleet with three boxes off would spend the whole
+// report deadline dialling them serially — and the cells behind them
+// would report "context deadline exceeded" for a call that was never
+// made. A misdiagnosis is worse than a slow report.
+func TestDoctor_OutboundProbesRunInParallel(t *testing.T) {
+	const cells, delay = 6, 150 * time.Millisecond
+	reg := []Cell{{Name: fleetcfg.FrontCell, URL: "http://127.0.0.1:1"}}
+	for i := range cells {
+		reg = append(reg, Cell{Name: fmt.Sprintf("cell-%d", i), URL: "http://127.0.0.1:1"})
+	}
+	dir := t.TempDir()
+	s := New(reg, filepath.Join(dir, "h.json"), testDaemonInfo, Options{
+		IntentPath: filepath.Join(dir, "intent.json"),
+		CellAuth: func(ctx context.Context, cell string) CellAuthResult {
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+			}
+			return CellAuthResult{Attempted: true, OK: true, Source: "test"}
+		},
+	})
+	t.Cleanup(s.Close)
+
+	start := time.Now()
+	rep := s.Doctor(context.Background())
+	elapsed := time.Since(start)
+	// Serial would be (cells+1)*delay ≈ 1.05s; parallel is one delay plus
+	// the snapshot round. The bound is deliberately loose — this asserts
+	// the SHAPE, not a benchmark.
+	if elapsed > time.Duration(cells)*delay {
+		t.Errorf("Doctor took %v for %d cells at %v each: the outbound probes are serial", elapsed, cells+1, delay)
+	}
+	for i := range cells {
+		if got := mustCheck(t, rep, "auth.outbound", fmt.Sprintf("cell-%d", i)).Level; got != LevelOK {
+			t.Errorf("cell-%d → %s", i, got)
+		}
+	}
+}
+
+// TestDoctor_TLSDialHonoursTheReportContext pins REV-2: the first cut
+// used tls.DialWithDialer, which ignores context entirely, so a
+// cancelled request left one 3s dial per https endpoint running.
+func TestDoctor_TLSDialHonoursTheReportContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	// 10.255.255.1 is RFC1918 space that does not answer; without context
+	// support this blocks for the full tlsDialTimeout.
+	lvl, _, _ := certNotAfter(ctx, "https://10.255.255.1:9443")
+	if elapsed := time.Since(start); elapsed > tlsDialTimeout/2 {
+		t.Errorf("certNotAfter took %v against a cancelled context; the dial ignores it", elapsed)
+	}
+	if lvl != LevelUnknown {
+		t.Errorf("level = %s, want unknown", lvl)
+	}
+}
+
+// TestDoctor_ReportsFleetdsOwnBuild pins REV-3: DoctorHost.Version was
+// collected and never rendered, which is precisely the asymmetry
+// defs.parity exists to catch — the box writing the front's render is
+// part of the fleet's version story.
+func TestDoctor_ReportsFleetdsOwnBuild(t *testing.T) {
+	dir := t.TempDir()
+	s := New([]Cell{{Name: fleetcfg.FrontCell, URL: "http://127.0.0.1:1"}},
+		filepath.Join(dir, "h.json"), testDaemonInfo, Options{
+			IntentPath: filepath.Join(dir, "intent.json"),
+			DoctorHost: func() DoctorHost {
+				return DoctorHost{Version: "v9.9.9", DefsSHA: "cafe123", DefsDirty: true}
+			},
+		})
+	t.Cleanup(s.Close)
+	got := mustCheck(t, s.Doctor(context.Background()), "versions.reported", "")
+	for _, want := range []string{"v9.9.9", "cafe123", "DIRTY"} {
+		if !strings.Contains(got.Detail, want) {
+			t.Errorf("detail = %q, want it to carry %q", got.Detail, want)
+		}
 	}
 }

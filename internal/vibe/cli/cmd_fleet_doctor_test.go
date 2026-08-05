@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
 )
@@ -212,5 +213,56 @@ cells:
 		if c.ID == "auth.client_env" && c.Level != fleetapi.LevelOK {
 			t.Errorf("no env token → %q, want ok", c.Level)
 		}
+	}
+}
+
+// ─── review-pass regressions ────────────────────────────────────────────────
+
+// TestFleetDoctorFetchIgnoresTheStateSizedTimeout pins REV-4, the one
+// misdiagnosis this command must not make. The shared fleetd client's
+// 10s timeout is sized for /api/fleet/state; the doctor report fans out
+// to every cell and every https endpoint and is bounded server-side at
+// 20s, so reusing that client reports a SLOW fleetd as a DEAD one.
+func TestFleetDoctorFetchIgnoresTheStateSizedTimeout(t *testing.T) {
+	t.Setenv("VIBE_TOKEN", "")
+	rep := fleetapi.DoctorReport{}
+	rep.Add(fleetapi.DoctorCheck{ID: "slow.but.alive", Level: fleetapi.LevelOK, Summary: "answered"})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/fleet/doctor", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(120 * time.Millisecond)
+		_ = json.NewEncoder(w).Encode(rep)
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	target, err := resolveFleetd(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stand in for "the report outlives the state-sized budget".
+	target.hc = &http.Client{Timeout: 20 * time.Millisecond, Transport: target.hc.Transport}
+
+	got, err := target.fetchDoctor(t.Context())
+	if err != nil {
+		t.Fatalf("fetchDoctor honoured the client timeout and reported a live fleetd as dead: %v", err)
+	}
+	if len(got.Checks) != 1 || got.Checks[0].ID != "slow.but.alive" {
+		t.Errorf("report = %+v", got)
+	}
+}
+
+// TestFleetDoctorNamesTheLocalSocketRatherThanItsPlaceholderHost pins
+// REV-5: the unix-socket target carries a placeholder host so the URL
+// parses, and printing it as an address invites someone to curl it.
+func TestFleetDoctorNamesTheLocalSocketRatherThanItsPlaceholderHost(t *testing.T) {
+	rep := &fleetapi.DoctorReport{Fleetd: "http://vibe.local"}
+	rep.Add(fleetapi.DoctorCheck{ID: "x", Level: fleetapi.LevelOK, Summary: "s"})
+	var out bytes.Buffer
+	renderDoctor(&out, rep, false)
+	if strings.Contains(out.String(), "vibe.local") {
+		t.Errorf("rendered the placeholder host as an address:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "unix socket") {
+		t.Errorf("output does not name the local socket:\n%s", out.String())
 	}
 }

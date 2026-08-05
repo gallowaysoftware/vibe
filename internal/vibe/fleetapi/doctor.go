@@ -11,6 +11,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
@@ -334,8 +335,26 @@ func (s *Server) checkAuth(ctx context.Context, rep *DoctorReport, snap StateSna
 	for _, c := range snap.Cells {
 		s.checkInbound(rep, c, pres[c.Name], snap.Daemon.AuthRejected)
 	}
-	for _, c := range snap.Cells {
-		s.checkOutbound(ctx, rep, c, pres[c.Name])
+	// Probed in PARALLEL, like Snapshot's own cell round: each call is
+	// bounded at 5s, and run serially a fleet with three boxes off would
+	// spend the whole report deadline dialling them — leaving the cells
+	// behind them reporting "context deadline exceeded" for a call that
+	// was never made. A misdiagnosis is worse than a slow report, and
+	// this command exists to diagnose.
+	results := make([]CellAuthResult, len(snap.Cells))
+	if s.cellAuth != nil {
+		var wg sync.WaitGroup
+		for i, c := range snap.Cells {
+			wg.Add(1)
+			go func(i int, name string) {
+				defer wg.Done()
+				results[i] = s.cellAuth(ctx, name)
+			}(i, c.Name)
+		}
+		wg.Wait()
+	}
+	for i, c := range snap.Cells {
+		s.checkOutbound(rep, c, pres[c.Name], results[i])
 	}
 
 	// The C6 finding, surfaced where it belongs. Before C6, $VIBE_TOKEN in
@@ -414,7 +433,7 @@ func (s *Server) checkInbound(rep *DoctorReport, c CellSnapshot, p Presence, rej
 	}
 }
 
-func (s *Server) checkOutbound(ctx context.Context, rep *DoctorReport, c CellSnapshot, p Presence) {
+func (s *Server) checkOutbound(rep *DoctorReport, c CellSnapshot, p Presence, res CellAuthResult) {
 	id := "auth.outbound"
 	if s.cellAuth == nil {
 		rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelUnknown,
@@ -422,7 +441,6 @@ func (s *Server) checkOutbound(ctx context.Context, rep *DoctorReport, c CellSna
 			Detail:  "this fleetd was built without one, so fleetd→cell auth is unchecked."})
 		return
 	}
-	res := s.cellAuth(ctx, c.Name)
 	fresh := p.Announcing && !p.Stale && !p.Withdrawn
 	switch {
 	case res.CredentialErr != "":
@@ -502,6 +520,19 @@ func (s *Server) checkVersions(rep *DoctorReport, snap StateSnapshot, pres map[s
 			rep.Add(DoctorCheck{ID: "versions.reported", Cell: c.Name, Level: LevelOK,
 				Summary: "versions block present", Detail: det})
 		}
+	}
+
+	// fleetd's own build and def checkout. Collected and then never
+	// reported in the first cut — which is exactly the asymmetry the
+	// parity check is about: the box writing the front's render is part
+	// of the fleet's version story.
+	if host.Version != "" || host.DefsSHA != "" {
+		det := "vibe " + orDash(host.Version) + ", defs " + orDash(host.DefsSHA)
+		if host.DefsDirty {
+			det += " (DIRTY)"
+		}
+		rep.Add(DoctorCheck{ID: "versions.reported", Level: LevelOK,
+			Summary: "fleetd's own build", Detail: det})
 	}
 
 	// def-SHA parity.
@@ -655,6 +686,9 @@ func dirOf(path string) string {
 // two chances to notice at a weekly sit-down.
 const tlsExpiryWarn = 21 * 24 * time.Hour
 
+// tlsDialTimeout bounds one endpoint's handshake.
+const tlsDialTimeout = 3 * time.Second
+
 // checkTLS reads the leaf certificate's notAfter on every https fleet
 // URL. It deliberately does NOT verify the chain, which is why the check
 // is named not_after: a LAN fleet's certs are self-signed or issued by a
@@ -711,16 +745,27 @@ func certNotAfter(ctx context.Context, raw string) (Level, string, string) {
 	if u.Port() == "" {
 		host = net.JoinHostPort(u.Hostname(), "443")
 	}
-	d := &net.Dialer{Timeout: 3 * time.Second}
 	// InsecureSkipVerify by design: this check reads an expiry, it does
-	// not judge a chain (see the doc comment on checkTLS).
-	conn, err := tls.DialWithDialer(d, "tcp", host, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // reads notAfter only; never used to carry data
+	// not judge a chain (see the doc comment on checkTLS). DialContext,
+	// not DialWithDialer: the latter ignores the report's context
+	// entirely, so a cancelled request left N dials running.
+	d := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: tlsDialTimeout},
+		Config:    &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // reads notAfter only; never used to carry data
+	}
+	dctx, cancel := context.WithTimeout(ctx, tlsDialTimeout)
+	defer cancel()
+	conn, err := d.DialContext(dctx, "tcp", host)
 	if err != nil {
 		return LevelUnknown, host + ": TLS dial failed", err.Error() +
 			" — a host that is off and a broken TLS listener are indistinguishable from here."
 	}
 	defer conn.Close()
-	certs := conn.ConnectionState().PeerCertificates
+	tc, ok := conn.(*tls.Conn)
+	if !ok {
+		return LevelUnknown, host + ": not a TLS connection", ""
+	}
+	certs := tc.ConnectionState().PeerCertificates
 	if len(certs) == 0 {
 		return LevelUnknown, host + ": no certificate presented", ""
 	}

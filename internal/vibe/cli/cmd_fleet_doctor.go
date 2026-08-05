@@ -67,6 +67,9 @@ func fleetDoctorCmd() *cobra.Command {
 			"Exit codes: 0 all clear, 1 a FAIL, 2 a WARN, 3 only UNKNOWNs (the report is " +
 			"incomplete).",
 		Args: cobra.NoArgs,
+		// A doctor's failure exit is a finding, never a usage error: the
+		// report above it is the message.
+		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -99,7 +102,6 @@ func fleetDoctorCmd() *cobra.Command {
 			if exitZero {
 				return nil
 			}
-			cmd.SilenceUsage = true
 			cmd.SilenceErrors = true
 			switch {
 			case rep.Summary.Fail > 0:
@@ -129,7 +131,15 @@ func (t fleetdTarget) fetchDoctor(ctx context.Context) (*fleetapi.DoctorReport, 
 	if tok := vibeclient.ResolveToken(); tok != "" && !strings.HasPrefix(t.base, "http://vibe.local") {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
-	resp, err := t.hc.Do(req)
+	// The shared client's 10s timeout is sized for /api/fleet/state. The
+	// doctor report fans out to every cell and every https endpoint and
+	// is bounded server-side at 20s, so reusing that client would report
+	// a SLOW fleetd as a DEAD one — the one misdiagnosis this command
+	// must not make. The request context (the --timeout flag) is the
+	// bound; the transport is the shared one so a unix-socket target
+	// still dials the socket.
+	hc := &http.Client{Transport: t.hc.Transport}
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -247,8 +257,10 @@ func clientDoctorChecks(rep *fleetapi.DoctorReport) {
 func renderDoctor(out io.Writer, rep *fleetapi.DoctorReport, omitOK bool) {
 	rep.SortBySeverity()
 	where := rep.Fleetd
-	if where == "" {
-		where = "local daemon"
+	if where == "" || strings.HasPrefix(where, "http://vibe.local") {
+		// The unix-socket target carries a placeholder host so the URL
+		// parses; printing it as an address invites someone to curl it.
+		where = "the local daemon (unix socket)"
 	}
 	fmt.Fprintf(out, "vibe fleet doctor — %s — %s\n", termSafe(where), rep.GeneratedAt.Local().Format("2006-01-02 15:04 MST"))
 	fmt.Fprintf(out, "%d cell(s) · %d checks · %d FAIL · %d WARN · %d UNKNOWN · %d OK\n\n",
@@ -307,7 +319,7 @@ func wrapDoctor(s string) []string {
 func doctorExitCode(err error) int {
 	var e errDoctorLevel
 	if errors.As(err, &e) {
-		return e.code
+		return e.ExitCode()
 	}
 	return 0
 }
