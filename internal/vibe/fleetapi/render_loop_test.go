@@ -102,6 +102,28 @@ func (p *renderProbe) waitWrite(t *testing.T, what string) string {
 	}
 }
 
+// waitRenderCount polls RenderCount up to 2s. The counter is
+// incremented AFTER WriteFile returns, so waitWrite can return one
+// instruction ahead of it and an immediate read races the loop
+// goroutine. (CI-only flake, 2026-08-04: "RenderCount = 1 after changed
+// render, want 2" on a run whose own log showed renders=2.) Assertions
+// that a write must NOT have happened stay immediate — they follow
+// assertSilent, which has already waited.
+func waitRenderCount(t *testing.T, s *Server, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got := s.RenderCount()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("RenderCount = %d, want %d", got, want)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // drain empties pending pass/write signals so a subsequent silence
 // assertion can't trip on an earlier render.
 func (p *renderProbe) drain() {
@@ -362,9 +384,7 @@ func TestRenderLoopRenderCap(t *testing.T) {
 	rlAnnounce(t, s, "laptop", rlServing(), nil)
 	probe.waitPass(t, "initial render", allDefs)
 	probe.waitWrite(t, "initial write")
-	if got := s.RenderCount(); got != 1 {
-		t.Fatalf("RenderCount = %d after first write, want 1", got)
-	}
+	waitRenderCount(t, s, 1)
 
 	probe.drain()
 	for i := 0; i < 10; i++ {
@@ -406,9 +426,7 @@ func TestRenderLoopUnchangedNoWrite(t *testing.T) {
 	probe.setVersion("v2")
 	s.noteRenderTrigger("gpu")
 	probe.waitWrite(t, "write after content change")
-	if got := s.RenderCount(); got != 2 {
-		t.Fatalf("RenderCount = %d after changed render, want 2", got)
-	}
+	waitRenderCount(t, s, 2)
 }
 
 // TestRenderLoopFingerprint covers C3 §5: mismatches always publish the

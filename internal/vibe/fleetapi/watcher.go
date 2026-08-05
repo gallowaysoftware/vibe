@@ -148,6 +148,12 @@ func (s *Server) trackInFlight(cell string, data json.RawMessage) {
 	s.mu.Lock()
 	s.inFlight[cell] = len(wrap.Requests)
 	s.inFlightSeen[cell] = true
+	// Every frame is an EDGE — an add or a remove — so any frame is
+	// request activity on this cell (C10). Recorded per CELL because
+	// that is the question a parked batch asks: the per-model map below
+	// goes quiet the moment llama-swap TTL-unloads the model somebody
+	// was using thirty seconds ago.
+	s.lastInFlightFrame[cell] = now
 	seen := map[string]bool{}
 	for _, r := range wrap.Requests {
 		if r.Model == "" {
@@ -248,7 +254,13 @@ func (s *Server) setCellUp(name string, up bool) {
 	}
 	s.cellUp[name] = up
 	if up {
-		s.lastSeen[name] = time.Now().UTC()
+		now := time.Now()
+		s.lastSeen[name] = now.UTC()
+		// Monotonic reading kept: this is a duration clock (C10's idle
+		// floor), and .UTC() would strip it.
+		s.cellUpSince[name] = now
+	} else {
+		delete(s.cellUpSince, name)
 	}
 	s.publishLocked(Event{Cell: name, Type: cellTransitionType(up)})
 	s.mu.Unlock()

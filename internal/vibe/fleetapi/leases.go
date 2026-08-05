@@ -29,9 +29,13 @@ import (
 // Bounds on the lease store. A lease is a HOLD a running consumer
 // refreshes, so a week is already generous; the count cap keeps a
 // runaway producer from turning an advisory note into an unbounded file
-// that every status surface then renders.
+// that every status surface then renders. MaxLeaseTTL is exported
+// because a client that claims a lease AFTER a wait (C10's `vibe cell
+// await --lease`) has to refuse an over-bound TTL before the wait
+// starts: learning the bound from a 400 at 03:00 is learning it too
+// late.
 const (
-	maxLeaseTTL = 168 * time.Hour
+	MaxLeaseTTL = 168 * time.Hour
 	maxLeases   = 512
 )
 
@@ -133,8 +137,8 @@ func (s *Server) handleLeaseMutate(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `ttl must be a positive Go duration string (e.g. "2h")`, http.StatusBadRequest)
 			return
 		}
-		if ttl > maxLeaseTTL {
-			http.Error(w, fmt.Sprintf("ttl exceeds the %s bound (a lease is a hold, not a reservation)", maxLeaseTTL), http.StatusBadRequest)
+		if ttl > MaxLeaseTTL {
+			http.Error(w, fmt.Sprintf("ttl exceeds the %s bound (a lease is a hold, not a reservation)", MaxLeaseTTL), http.StatusBadRequest)
 			return
 		}
 		// C11: the hold flag rides the same body, and its rules are the
