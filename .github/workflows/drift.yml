@@ -21,8 +21,10 @@ name: drift
 #   2. Re-record: see internal/swaptest/record_test.go's TestRecord doc
 #      comment. Commit the new fixtures/<version>/ BESIDE the existing ones.
 #   3. Add the Wire to internal/swaptest and teach the fold the new shape.
-#   4. Run scripts/fleetlab before any cell is upgraded. This job tells you
-#      the contract moved; only the lab tells you what it does to a fleet.
+#   4. Run scripts/upgrade/ritual.sh. This job tells you the contract moved;
+#      only the ritual (conformance -> fleetlab -> the six-client SSE gate)
+#      tells you what it does to a fleet, and only the digest pin on the
+#      front decides when the fleet finds out.
 #
 # It costs the inner loop nothing.
 
@@ -85,4 +87,4 @@ jobs:
           LLAMA_SERVER_BIN: ${{ github.workspace }}/.upstream/llama-server
           LLAMA_GGUF: ${{ github.workspace }}/.upstream/stories260K.gguf
           LD_LIBRARY_PATH: ${{ github.workspace }}/.upstream
-        run: go test -timeout 300s -v -run 'TestSwapContract/live' ./internal/swaptest/
+        run: go test -timeout 420s -v -run 'TestSwapContract/live|TestSwapBehaviour' ./internal/swaptest/

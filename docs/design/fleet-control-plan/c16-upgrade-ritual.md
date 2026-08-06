@@ -1,0 +1,963 @@
+# C16 — The upgrade ritual: digest-pin the front, make the bump a sequence
+
+Status: **PR OPEN** (2026-08-05), off `feat/c16-upgrade-ritual` branched
+from `main` at `0c275fd`. Feature commit plus ground rule 9's adversarial
+self-review commit (five findings, one of them a test that would have
+reported two contradictory failures about one event — see the
+[self-review addendum](#adversarial-self-review-addendum)); every fix
+mutation-verified. Unit gates U1–U10 green on a full local inner loop.
+**Live gates L1, L2 and L3 PASS** — the new conformance behaviours ran
+against real llama-swap v239 and v247 binaries, the ritual's own
+`preflight`/`canary` steps ran end to end against a candidate the script
+fetched itself, and both new doctor checks ran through a real fleetd
+beside a real llama-swap front. L4 (the fleetlab half of `canary`) and L5
+(the six-client gate) are **UNRUN**, for the honest reasons recorded in
+[Execution](#execution). See [Acceptance gates](#acceptance-gates).
+
+Backlog item 13 in [fleet-control-futures.md](../fleet-control-futures.md)
+§2:
+
+> **The upgrade ritual** — digest-pin the front image, keep the
+> six-client SSE gate as a checked-in runnable script, and make "canary
+> cell → gate → fleet" the only sanctioned llama-swap bump. The SSE
+> keepalive defense is upstream *behavior*, not structure; it is only as
+> durable as the discipline around upgrades.
+
+## The motivating incident (2026-08-05)
+
+`ghcr.io/mostlygeek/llama-swap:cpu` was found serving **v247**, not the
+**v239** the fleet runs and every phase doc's gate transcript describes.
+
+v240+ replaced the `/api/events` in-flight wire. A `requests` array became
+operation-tagged deltas — `{"operation":"upsert","request":{…}}`,
+`{"operation":"remove","id":"93376"}` — with `requests` `omitempty` and
+therefore **absent**. vibe counted the length of an array that was no
+longer on the wire, got `0`, and reported that zero as *known*. Eight busy
+guards disarm on a reported zero: C2's `drain --wait` quiescence, C14's
+suspend, C8's probe guard, both C4 warm loops, the pre-drain report.
+
+Nothing failed. Nothing paged. And the trigger was not a decision —
+`deploy/front/docker-compose.yaml:30` read
+`${FRONT_IMAGE:-ghcr.io/mostlygeek/llama-swap:cpu}`, so a routine
+`docker compose pull` on the front host was the whole of it. Meanwhile
+`deploy/front/README.md:94` *recommended* pinning a digest. Advice the
+shipped default contradicts is advice nobody follows.
+
+PR #37 fixed the parser and added a wire-versioned double plus a
+conformance matrix over v239 and v247. That closed the hole. This phase
+closes the *path* — and it is worth being precise about why the two are
+different work. #37 makes a wire change visible **once it is on a box you
+are testing**. Nothing in the repo decided *when* a box gets a new
+llama-swap, and nothing reported that one had.
+
+## What this is not
+
+- **Not a version policy.** Nothing here refuses to run a new llama-swap,
+  and nothing auto-upgrades anything. The fleet is allowed to be
+  heterogeneous — that is the normal state during any roll — and the
+  repo's job is that both wires stay gated, not that one wins.
+- **Not a deployment tool.** `ritual.sh pin` prints a line to paste. It
+  does not `docker compose up`, does not ssh anywhere, does not restart a
+  cell. Actuation across the fleet has one channel (the daemon's bearer
+  control plane, invariant 5) and an upgrade script is not it.
+- **Not a replacement for the six-client rig.** `scripts/smoke/llama-swap`
+  stays exactly what it is. This phase makes the ritual *compose* it, and
+  adds the mechanical 8-second half of the same question so CI can hold
+  the floor between full runs.
+- **Not observability of the front's container.** fleetd has no docker
+  socket and must not grow one. It reports what it is *told* about the
+  front's image, beside what it can *observe* about the front's version,
+  and says which is which.
+
+## Design
+
+### 1. The pin is the default, not the advice
+
+`deploy/front/docker-compose.yaml` and `deploy/front/.env.example` both
+ship
+
+```
+ghcr.io/mostlygeek/llama-swap:v239-cpu-b9994@sha256:6bae869ec0908538e421172fd576288e87c1bc330acde24517992507218d2c7c
+```
+
+The tag half names the build for a human; the digest half is what docker
+resolves. `docker compose pull` on the front can no longer change which
+llama-swap the fleet talks to.
+
+v239 rather than "whatever `:cpu` is today" because the reference stack
+should ship the build this repo can make claims about: `deploy/front/README.md`'s
+verified `-watch-config` drain grace, its unauthenticated-`/health`
+warning, and this phase's SIGTERM measurements were all taken on it, and
+`internal/swaptest/fixtures/v239` is a recording of its wire. Moving to
+v247 is not a diff — it is `ritual.sh`, which is the point.
+
+`TestReferenceFrontStackShipsADigestPin` reads both files and asserts the
+shape of the default. It is offline by construction (CI has no network and
+cannot resolve a digest), and it exists because the previous state of the
+world was a README recommending what the compose file undid.
+
+### 2. Two doctor checks, because neither answers the other's question
+
+**`front.image_pin` is a DECLARATION.** `fleet.front_image` in fleetd's
+config; the reference deployment sets it to the same reference `.env`
+resolves. Four verdicts:
+
+| value | level | why |
+|---|---|---|
+| contains `@sha256:` | OK | pinned |
+| any other reference | **WARN** | a floating tag: *"a `docker compose pull` on the front host can change which llama-swap the whole fleet talks to, with no change to this repo and no event anywhere"* |
+| `unmanaged` | OK | the front is declared not to run from a container image — a systemd llama-swap on the front box is a supported deployment with no tag to float |
+| unset | UNKNOWN | nothing declares it; the fix names both of the above |
+
+The `unmanaged` literal is a closed vocabulary rather than a silent empty,
+for C13's reason: *"the operator decided"* and *"nobody told fleetd"* must
+not be spelled the same way. Without it, the legitimate non-container
+deployment would sit on a permanent UNKNOWN, which is the thing C13's rule
+forbids — and with it, an undeclared front is honestly unknown rather than
+quietly OK (`TestFrontImagePin_UndeclaredIsNotOK`).
+
+fleetd cannot observe this. It is a different container on a host whose
+docker socket it must not have, so a declaration is the only honest
+mechanism — and a declaration can drift from the deployment. Which is why:
+
+**`versions.llama_swap` is an OBSERVATION**, and it finally has a
+producer. C13 shipped this check reporting UNKNOWN *naming the missing
+producer*, because guessing an admin endpoint from a box that cannot
+verify it is worse than an honest gap. The endpoint exists:
+`GET /api/version` → `{"version":"v239","commit":"dd81801","build_date":…}`,
+verified here against real v239 and v247 binaries and against the
+production router before a line of the producer was written.
+
+Two feeds, because the fleet has two shapes of cell:
+
+- **Cells announce it.** `daemon.fleetVersionsAt` reads its own
+  llama-swap's `/api/version` with a 2s timeout and puts it in the
+  versions block the heartbeat already carries. The slim announcer
+  (`vibe fleet announce`) gets the same producer, C13's rule. Any failure
+  leaves the field empty — never a guess — and the announce is never held
+  up for it, because the heartbeat is the cell's only evidence of life.
+- **fleetd reads the front's directly.** The front runs no announcer by
+  design (fleetd renders its config; it serves no models), so the
+  announce-fed matrix structurally excluded the one box the incident
+  happened to. One read-only GET on the address fleetd already probes
+  closes that without inventing an announcer.
+
+And the matrix gained the check the incident actually needed: a version
+this build has **no conformance recording for** is a WARN naming itself,
+ahead of the plain-divergence branch. A fleet uniformly on an ungated
+version is not a mid-upgrade; it is an upgrade that skipped the ritual,
+and it is invisible to every other check — the wire either parses or reads
+as an idle cell.
+
+`fleetapi.GatedSwapVersions()` is a hand-written list, because production
+has no business importing a test double.
+`TestGatedSwapVersionsMatchesRecordings` and
+`TestConformanceMatrixCoversEveryRecording` tie it to
+`internal/swaptest/fixtures/` and to `ci.yml`'s matrix: three copies of one
+fact, two tests that fail when they disagree.
+
+### 3. Untrusted input, on both feeds
+
+A cell's announced version is the fleet token's voice like everything else
+on that wire, and it already passes fleetd's `clean` hygiene
+(`announce.go`, 256 bytes, printable only) — the receiving side was
+already right. The sending side bounds it at 64 bytes anyway, and the
+front's direct read is *not* announce-shaped and gets no `clean` at all,
+so the rule has to live in the reader. It does, in exactly one place —
+`fleetapi.ReadSwapVersion`, shared by both producers: over 64 bytes or
+non-printable returns `""`, and the matrix then NAMES the box that did not
+answer rather than quietly omitting it. Both halves of that sentence were
+wrong in the first cut and are the review pass's A-1 and A-2 below; a
+truncating reader on the cell side could put an unprintable version on the
+wire, and fleetd's `clean` refuses the whole heartbeat over it.
+
+### 4. What the ritual must catch, and where each thing is caught
+
+Derived from the incident, one row per failure it could have had:
+
+| failure | caught by | runs |
+|---|---|---|
+| the `/api/events` in-flight wire changes | `TestSwapContract` I1, I5 — folded through the REAL `fleetapi` parser, so an unrecognised shape must reach *unknown* | CI, both pins, every PR |
+| `/api/metrics/activity` changes shape | `TestSwapContract` I2–I4 — classified through the REAL `usagemeter` | CI, both pins |
+| **the SSE keepalive disappears** | **`TestSwapBehaviour` B1** (new) | CI, both pins |
+| **SIGTERM stream handling changes** | **`TestSwapBehaviour` B2** (new) | CI, both pins |
+| upstream moves at all | `drift.yml` against `latest`, unpinned | CI, Mondays |
+| what any of it does to a *fleet* | `scripts/fleetlab` on the candidate | `ritual.sh canary` |
+| real clients not tolerating the keepalive | `scripts/smoke/llama-swap` | `ritual.sh gate` |
+| the fleet sitting on an ungated version | `versions.llama_swap` | every `vibe fleet doctor` |
+| the deployment floating | `front.image_pin` | every `vibe fleet doctor` |
+
+The two new ones are the phase's real technical content, because they are
+*behaviours*, and a wire double cannot hold a behaviour. Both need a
+llama-swap PROCESS (a signal is not a wire), so both are env-gated on
+`LLAMA_SWAP_BIN` exactly as the live conformance target is; neither needs
+llama.cpp, because the upstream is an in-test HTTP server whose readiness
+and stream pacing are the parameters under test. That also isolates the
+question to llama-swap's own behaviour: a real llama-server dying on the
+same signal would be answering a different one.
+
+**B1 — the loading-state keepalive.** A streaming completion is issued at
+a model whose upstream refuses health checks for 6s. The client must be
+receiving bytes within 2s; the first frame must be a delta an OpenAI SSE
+parser accepts (not an error payload, which also arrives fast); the
+upstream must still be unready at that instant; and the *same stream* must
+go on to carry the upstream's own tokens. Mutation-verified: with
+`sendLoadingState: false` the first byte arrives at 6.27s and the test
+fails naming the stall timer.
+
+**B2 — SIGTERM.** Measured, not assumed, and the measurement corrected a
+documented claim — see [the finding](#the-c2-sigterm-claim-is-mis-attributed)
+below. Three assertions: `/api/events` closes within 2s of the signal;
+an in-flight *inference* stream is still delivering 1.5s later; and it is
+force-closed 30s ± 5s after the signal. The window is bounded on **both**
+sides because either direction is something an operator must act on — a
+shorter grace truncates generations the cell unit was configured to
+protect, a longer one needs a matching `TimeoutStopSec`.
+
+### 5. The ritual is a script
+
+`scripts/upgrade/ritual.sh`, five subcommands, `$UPGRADE_DIR` scratch
+dirs, ports 9810-9819 and upstreams 6100+ — clear of production's
+`:9000`/`:9001` and of `scripts/fleetlab`'s 9600-9799.
+
+- **`preflight <v>`** fetches the release binary, resolves the front
+  image's newest `<v>-cpu-b*` digest off ghcr with an anonymous token and
+  `curl`, and reports whether the repo has a recording for `<v>` and
+  whether `ci.yml` replays it.
+- **`record <v>`** stands the candidate over a real llama-server and runs
+  `TestRecord`, then says to commit the new `fixtures/<v>/` **beside** the
+  old ones.
+- **`canary <v>`** runs `TestSwapContract | TestSwapBehaviour |
+  TestRecordingIsCurrent` against the candidate, and on success brings up
+  `scripts/fleetlab` on that binary and runs `lab.sh prove`. A failure
+  stops and says not to pin.
+- **`gate <v>`** builds `slowmodel`, stands the candidate with the
+  smoke rig's stanza, and runs `run-smoke.sh` + `kill-cancel-test.sh`.
+- **`pin <v>`** prints the `FRONT_IMAGE=` line and the four things a human
+  still does.
+
+`TestUpgradeRitualIsRunnable` asserts the script is executable and that
+each step actually invokes the rig it claims to compose — a ritual that
+only prints instructions is the prose it replaced.
+
+### 6. Automatable versus human, decided honestly
+
+The full split is in `scripts/upgrade/README.md`. The decision that
+matters here: **nobody performs a checklist at 2am**, so every step whose
+omission caused the incident is code rather than an instruction.
+
+- "check the front image is pinned" → `front.image_pin`, plus a shipped
+  default that is already right.
+- "check every cell is on the version you gated" → `versions.llama_swap`.
+- "remember both wires must keep passing" → two tests over three copies of
+  one fact.
+- "re-record after a bump" → `TestRecordingIsCurrent`, which fires on the
+  box where the upgrade happened.
+
+What stays human, with no pretending: applying the pin, recreating the
+front container, rolling cells one at a time, reading the doctor report,
+and the two manual clients in the six-client gate (Open WebUI and pi).
+Those are four commands and two browser sessions against a real fleet;
+writing them down as a checklist is the honest treatment, because there is
+no mechanism here that could perform them.
+
+## Files
+
+| file | what |
+|---|---|
+| `deploy/front/docker-compose.yaml` | digest-pinned default + why |
+| `deploy/front/.env.example` | the same pin, and the pointer to the ritual |
+| `deploy/front/README.md` | "the image is digest-pinned, and moving the pin is a procedure" |
+| `internal/vibe/fleetapi/upgrade.go` | `front.image_pin`, `readSwapVersion` (+ its authorizer), `ReadOwnSwapVersion`, `frontSwapVersion`, `GatedSwapVersions`, `ungatedSwapVersions` |
+| `internal/vibe/fleetapi/doctor.go` | the two call sites + the ungated branch of `versions.llama_swap` |
+| `internal/vibe/daemon/daemon.go` | `fleet.front_image` |
+| `internal/vibe/daemon/doctor.go` | `DoctorHost.FrontImage` |
+| `internal/vibe/daemon/announce.go` | the `/api/version` producer, both announcer shapes; the cell-side (unauthenticated) entry point, with C15 §8's reason at the call site |
+| `internal/vibe/cli/cmd_fleet.go` | the slim announcer passes its llama-swap URL |
+| `internal/swaptest/behaviour_test.go` | B1 + B2 |
+| `internal/swaptest/gated_test.go` | recordings ↔ `GatedSwapVersions` ↔ `ci.yml` |
+| `internal/vibe/fleetapi/c16_test.go` | the doctor checks + the reference-stack pin + the runnable ritual + the four C15-composition tests |
+| `internal/vibe/fleetapi/c15_test.go` | `/api/version` on the keyed llama-swap double; `TestOnlyTheCellSideReaderSkipsSwapAuth` beside C15's scan |
+| `internal/vibe/fleetapi/c13_test.go` | the read-only scan learns one exemption, by enclosing function and by identifier |
+| `internal/swaptest/contract_test.go` | I6 reads through `ReadOwnSwapVersion` |
+| `scripts/upgrade/ritual.sh`, `README.md` | the ritual |
+| `.github/workflows/ci.yml`, `drift.yml` | `TestSwapBehaviour` joins both conformance jobs |
+
+## Acceptance gates
+
+Unit (mechanical, in-repo):
+
+| # | gate | result |
+|---|---|---|
+| U1 | `front.image_pin` returns OK / WARN / UNKNOWN / FAIL for pinned, floating, undeclared, `unmanaged` and control-character values, each naming its reason | PASS |
+| U2 | an undeclared front image is never OK | PASS (separate test, so U1's table cannot drift into asserting it) |
+| U3 | `ungatedSwapVersions` names exactly the reported versions with no recording, normalising `v260 (deadbeef)` to its tag | PASS |
+| U4 | `frontSwapVersion` reads the front's `/api/version`; a 404, non-JSON, control-character or over-long answer, and a fleet with no front cell, all yield absence | PASS |
+| U5 | the reference front stack's compose **default** and `.env.example` are both digest-pinned | PASS |
+| U6 | `ritual.sh` is executable and every step invokes the rig it claims to compose | PASS |
+| U7 | `GatedSwapVersions()` equals the recorded fixture dirs | PASS |
+| U8 | `ci.yml`'s conformance matrix equals the recorded fixture dirs | PASS |
+| U9 | C13's read-only source scan covers `upgrade.go` too, and passes | PASS |
+| U10 | full inner loop: build, vet, `test -race -count=5`, gofmt, `go mod tidy`, golangci-lint | PASS |
+| U11 | *(review)* the version matrix NAMES a front that did not answer and a cell that announced no version — on all four branches, and stays quiet when everyone answered | PASS |
+| U12 | *(review)* `ReadSwapVersion` rejects an over-long, unprintable or empty answer rather than truncating it, on both producers | PASS |
+| U13 | *(review)* an unprintable `versions.llama_swap` costs the cell its WHOLE announce (the consequence U12 exists to avoid) | PASS |
+| U14 | *(review)* `TestSwapContract` **I6** gates `GET /api/version` through the real reader, on both fake wires | PASS |
+| U15 | *(review)* two spellings of one llama-swap release are not divergence | PASS |
+| U16 | *(review)* `repo:tag@sha256:` with an empty digest is not a pin | PASS |
+| U17 | *(merge)* the fleetd→front version read carries the front's declared key, and an UNRESOLVABLE declaration sends no request at all | PASS |
+| U18 | *(merge)* the reference fleet (no key declared anywhere) reads the version with no `Authorization` header and records no failure | PASS |
+| U19 | *(merge)* a 401 on the version read lands in `NoteSwapStatus`/`SwapAuthRefusal` exactly as the other producers' do, and an accepted read retires it | PASS |
+| U20 | *(merge)* the cell-side reader (`ReadOwnSwapVersion`) sends no credential, is the ONLY function allowed to skip the authorizer, and has NO caller inside `fleetapi` — the exported wrapper is not a second way to drop the credential | PASS |
+| U21 | *(merge)* C15's `TestEveryLlamaSwapRequestIsAuthorized` still fails for a genuinely unauthorized builder (scratch-file mutation) | PASS |
+| U22 | *(merge)* C13's read-only scan still fails for the same verbs in a neighbouring function, for a different verb inside the exempt one, and for an exemption that stopped firing | PASS |
+| U23 | *(review)* a repaired key file retires the recorded failure on the SAME fleetd, proven by stubbing `clearSwapAuth` out | PASS |
+
+Live (a real llama-swap binary, a real fleet, or real clients):
+
+| # | gate | result |
+|---|---|---|
+| L1 | **B1 + B2 pass against a real v239 AND a real v247 binary**, and B1 fails when `sendLoadingState` is removed | **PASS** |
+| L2 | `ritual.sh preflight` and the conformance half of `canary` run end to end against a candidate the script fetched itself | **PASS** |
+| L3 | both new checks through the whole path — a real fleetd, a real llama-swap front, `vibe fleet doctor` — with `front.image_pin` moving UNKNOWN → WARN → OK → OK as the declaration changes and `versions.llama_swap` naming the version the front actually answers | **PASS** |
+| L4 | the fleetlab half of `canary`: four real cells on the candidate binary, `lab.sh prove` green | **UNRUN** — see Execution |
+| L5 | `ritual.sh gate`: the six-client rig at `DELAY_S=90` against a candidate | **UNRUN** — a time budget (~15 min at 90s, ~45 at 420s) plus two manual clients |
+| L6 | the pin applied on the real front, doctor reporting `front.image_pin` OK and `versions.llama_swap` naming one version across the whole fleet | **UNRUN** — needs the fleet |
+| L7 | *(review)* the full `TestSwapContract` including **I6** against a real v239 **and** a real v247 binary, plus `TestSwapBehaviour` against real v239 | **PASS** — and I6 mutation-verified live: renaming the endpoint in `ReadSwapVersion` turns `live/exec/I6` red |
+
+## Execution
+
+### Verified upstream facts
+
+Everything this phase asserts about llama-swap was measured on this box
+before it was written down, against `~/.local/bin/llama-swap` (v239, the
+version production runs) and a v247 binary extracted from
+`ghcr.io/mostlygeek/llama-swap:cpu`:
+
+- **`:cpu` is v247.** `docker run … --version` →
+  `version: v247 (40027d6), built at 2026-08-04T05:36:51Z`. The digest
+  behind the tag today is `sha256:a928468…`; `v239-cpu-b9994` is
+  `sha256:6bae869…`. The incident report is confirmed independently.
+- **`GET /api/version` exists on both** and answers the same shape. Also
+  answered by the production router on `:9000` (a read-only GET).
+- **The loading-state keepalive** emits `reasoning_content` delta frames
+  from ~5 ms into a cold start, continuously, and the same stream then
+  carries the real answer.
+- **SIGTERM**, measured three ways — see the finding below.
+
+### The C2 SIGTERM claim is mis-attributed
+
+C2's gate 2 recorded, and AGENTS.md and `fleet-control.md` repeat, that
+*"llama-swap's SIGTERM path cancels in-flight streams immediately (v239
+verified: `CloseStreams()` precedes the graceful drain)"*. Measured
+directly, on v239 and again on v247:
+
+| observation | v239 | v247 |
+|---|---|---|
+| `/api/events` SSE closes after SIGTERM | **1.2 ms** | 1.4 ms |
+| an in-flight inference stream is cancelled | **no** — kept delivering | no |
+| a 20s stream that started 2s before SIGTERM | completed, `[DONE]` | completed |
+| a 60s stream | force-closed at **30.003 s** with `http server shutdown error: context deadline exceeded`, truncated cleanly | same |
+
+So `CloseStreams()` closes the **event/UI** streams. Inference streams get
+the same 30s grace that `deploy/front/README.md` already documents for a
+`-watch-config` reload — the two are the same behaviour, not the contrast
+C2 drew.
+
+**The operational conclusion is unchanged.** C2's own transcript records a
+~39 s essay stream, which is longer than the grace and therefore *would*
+have been truncated; `drain --wait` quiescing before the stop is exactly
+right either way, and `TimeoutStopSec` must still exceed the grace. What
+changes is the attribution — and futures item 7 ("upstream: SIGTERM-time
+stream grace") is aimed at behaviour that does not exist as described:
+upstream already grants 30s, and the request worth making is that the
+grace be configurable.
+
+This is a doc correction across files this branch may not touch; it is
+written up under [For the reconciliation pass](#for-the-reconciliation-pass)
+rather than applied. B2 now pins the measured behaviour, so the next
+change to it is a test failure rather than a rediscovery.
+
+### Gate results
+
+**L1 PASS.** `TestSwapBehaviour` against `LLAMA_SWAP_BIN=~/.local/bin/llama-swap`
+(v239): B1 6.44 s, B2 30.31 s, both green. Against the v247 binary: B1
+6.50 s, B2 30.30 s, both green. Mutation runs, each reverted after:
+`sendLoadingState: false` → B1 fails at 6.27 s naming the stall timer;
+`sigtermGrace = 10s` → B2's force-close assertion fails. The suite is not
+vacuous in either direction.
+
+**L2 PASS.** `ritual.sh preflight v239` fetched the release binary,
+reported `version: v239 (dd81801)`, resolved
+`ghcr.io/mostlygeek/llama-swap:v239-cpu-b9994@sha256:6bae869…` (the exact
+string now shipped as the compose default), and confirmed both the
+recording and the CI matrix entry. `preflight v247` resolved
+`v247-cpu-b10276@sha256:a928468…` — which is what `:cpu` currently points
+at, closing the loop on the incident. The conformance half of `canary`
+then ran the full `TestSwapContract|TestSwapBehaviour|TestRecordingIsCurrent`
+list against the fetched v247 binary over a real llama-server and a real
+GGUF: `ok … 38.688s`.
+
+**L3 PASS.** A real fleetd (`fleet_registry: true`, scratch XDG triple,
+control plane on `:9816`) beside a real llama-swap front on `:9815`, with
+`vibe fleet doctor` run four times against it, changing only
+`fleet.front_image`. Ports 9815-9817 and a scratch config dir, so nothing
+touched production or another agent's lab.
+
+```
+front llama-swap: {"build_date":"2026-07-11T21:47:14Z","commit":"dd81801","version":"v239"}
+
+### undeclared (front_image=<unset>)
+UNKNOWN front.image_pin      -      nothing declares which image the front runs
+OK      versions.llama_swap  -      every reporting cell runs llama-swap v239
+
+### floating tag (front_image=ghcr.io/mostlygeek/llama-swap:cpu)
+WARN    front.image_pin      -      front image is a floating tag: ghcr.io/mostlygeek/llama-swap:cpu
+
+### digest pinned (front_image=…v239-cpu-b9994@sha256:6bae869…)
+OK      front.image_pin      -      front image is digest-pinned
+
+### unmanaged (front_image=unmanaged)
+OK      front.image_pin      -      the front is declared not to run from a container image
+```
+
+Two things this proves that no unit test can. The declared half moves
+through all four verdicts with the deployment as its only input. And
+`versions.llama_swap` — UNKNOWN in every C13 transcript, because nothing
+had ever written the field — reports a real version read off a real
+llama-swap over HTTP, for the front, which announces nothing.
+
+**L4 UNRUN, and the reason is not "needs metal".** `scripts/fleetlab`
+binds fixed ports 9600-9799 and upstreams 5980-6019, and another agent's
+lab instance held them for the whole of this build. Two labs cannot
+coexist, and `lab.sh down`'s sweep is anchored partly on that shared
+upstream port range — running mine would have been entitled to kill
+theirs. This is a harness limitation worth fixing (a port-offset knob) and
+it is noted for the futures doc rather than papered over. The step is
+scripted and the command is
+`FLEETLAB_DIR=… LLAMA_SWAP=<candidate> ./scripts/upgrade/ritual.sh canary <v>`.
+
+**L5 UNRUN.** A time budget, not a hardware one: ~15 minutes at
+`DELAY_S=90` for the automated five clients, ~45 at the recorded 420s, plus
+two manual clients. The rig itself is unchanged and its last recorded runs
+are checked in at `scripts/smoke/llama-swap/results-*.txt`.
+
+**L6 UNRUN.** Applying the pin and rolling cells needs the fleet; SSH is
+blocked and the LAN does not route from here.
+
+### Adversarial self-review addendum
+
+Ground rule 9, run against the feature commit. Five findings, all fixed
+with the fix mutation-verified.
+
+**REV-1 (blocker) — a test that would have reported two contradictory
+failures about one event.** B2's `inflClosed` was a buffered
+`chan time.Time` written once by the scanner goroutine and read by *two*
+assertions: (b) "the stream is still delivering 1.5s after SIGTERM" and
+(c) "it is force-closed at the grace deadline". Whichever ran first
+consumed the only value — so on a build that *did* cancel streams
+immediately (exactly the case B2 exists to notice) (b) would fail
+correctly and (c) would then block for 45s and report "the in-flight
+stream was still open", about a stream it had just watched close. The
+same buffered-channel mistake had already cost this build an hour in
+`startSwap`, where cleanup and `terminate` both waited on `done`.
+
+Fixed by closing the channel and recording the instant beside it
+(`atomic.Int64`), so every waiter observes it. Verified by shrinking the
+upstream to a 2-chunk stream: the fixed test fails in **0.71s** with
+`(b) stopped within 1.5s` **and** `(c) ended 404.862229ms after SIGTERM` —
+both true. The old shape would have added a 45s false claim.
+
+**REV-2 — C16's checks escaped C13's read-only structural scan.**
+`TestDoctor_ReadOnly…`'s AST scan enumerates the files on the doctor path
+by name (`doctor.go`, `../daemon/doctor.go`, `../fleetmcp/doctor.go`,
+`../cli/cmd_fleet_doctor.go`). `fleetapi/upgrade.go` contributes two
+checks to the report and *dials the front*, and was in none of them. A
+guard that lives in four of five files is C13's own lesson one file over.
+`upgrade.go` added to the list.
+
+**REV-3 — `ritual.sh pin` warned where it had to refuse.** It printed
+`WARNING: no recording for <v>. canary cannot have passed. Stop.` and
+then printed the `FRONT_IMAGE=` line anyway. That is precisely the
+checklist step nobody performs at 2am, and what it prints is the
+2026-08-05 configuration formatted as a result. Now a `die`.
+
+**REV-4 — `in_ci_matrix` used `grep -E '\b'`**, a GNU extension, in a
+script whose binary fetch claims Darwin support. Replaced with a
+`tr`/`grep -qx` pipeline.
+
+**REV-5 — the normalisation was untested in the direction that matters.**
+`ungatedSwapVersions` matches after trimming a build string, but the test
+only exercised `v260 (deadbeef)`, which is ungated whether or not the
+trim happens. Added `v239 (dd81801)` → gated, and stated in the test that
+the *reported* string stays verbatim.
+
+Two things looked wrong and are deliberate:
+
+- **`llamaSwapVersion` uses `context.Background()` with its own 2s
+  timeout** rather than the announce context, which is C4's `warmCtx`
+  smell. It is the existing shape of `fleetCapacity` on the same
+  heartbeat (`nvidia-smi`, 3s), and 2s is well inside the daemon's
+  `announceStopTimeout` of 3s, so it cannot extend shutdown past a bound
+  that already exists. Threading a context through
+  `Versions func() *AnnounceVersions` would change a C3 interface for no
+  reachable failure.
+- **`front.image_pin` is emitted on a non-registry daemon too**, as an
+  UNKNOWN beside `fleetd.role`'s WARN. Every other check behaves the same
+  way there, and the report already leads with "this daemon is not a
+  fleet registry".
+
+### Adversarial-review addendum (ground rule 9, second pass)
+
+An independent pass over the merged branch, against `origin/main`. Six
+findings, every fix mutation-verified — the mutation, the named test that
+went red, and the restore are listed per finding.
+
+**A-1 (major) — the version matrix read absence as agreement.** The whole
+reason `frontSwapVersion` exists is that the front announces nothing and
+is the box 2026-08-05 happened to. But a failed read simply removed the
+front from `vers`, and with any other cell reporting the check landed on
+
+```
+ok  versions.llama_swap  every reporting cell runs llama-swap v239
+```
+
+with no mention anywhere that the front had not answered. The same silence
+covered a *cell* whose vibe build predates C16's producer: it announces a
+versions block with `vibe` and `defs_sha` and no `llama_swap`, so
+`versions.reported` scores it OK ("versions block present") and the matrix
+drops it. That is the normal state of a fleet mid-vibe-upgrade — exactly
+when somebody asks which llama-swap the fleet is on.
+
+`defs.parity`, twenty lines earlier in the same function, already solved
+this: *"Which cells this verdict does NOT cover belongs on EVERY branch."*
+The matrix now carries the same note on all four branches, and the front's
+silence goes in the **Summary** rather than the Detail because the front
+appears in no other absence list on the report. The level is unchanged
+(C13's rule — a permanent UNKNOWN because one cell runs an old build
+teaches an operator to ignore the level), and the note disappears entirely
+when everyone answered, which is test-pinned in both directions.
+
+*Mutation:* force `coverNote` empty and drop the Summary clause →
+`TestDoctor_VersionMatrixNamesWhoDidNotAnswer` and all four subtests of
+`TestDoctor_VersionMatrixNamesTheSilentFrontOnEveryBranch` fail. Restored.
+
+**A-2 (major) — two readers, two hygiene rules, and the wrong one on the
+wire.** `daemon.llamaSwapVersion` and `Server.frontSwapVersion` were
+copies. The front's *rejected* an over-long or unprintable answer; the
+cell's **truncated** at 64 bytes and never looked at printability. Both
+directions are wrong:
+
+- a truncated version is a guess wearing a plausible shape, and it enters
+  the matrix as its own key — enough to raise a false
+  *"no conformance recording"* WARN, the loudest thing this check says;
+- an unprintable one is announced, and fleetd's `clean` refuses the
+  **whole announce** with 400. Not the field — the heartbeat. Presence,
+  the intent echo, the C7a usage feed and the C8 probe block all go with
+  it, permanently, because llama-swap keeps answering the same way. The
+  cell then goes stale and C9 pages about a box that is serving fine.
+
+§3 of this doc claimed the two sides "apply the same rule". They did not.
+There is now one reader — `fleetapi.ReadSwapVersion(ctx, client, baseURL)`
+— used by both producers, and it **rejects rather than truncates**. This
+is the repo's own "a guard that lives in one of four call paths is not a
+guard", at N=2.
+
+*Mutation:* restore the truncate-instead-of-reject branch →
+`TestReadSwapVersion_RejectsRatherThanTruncates`,
+`TestFrontSwapVersion_FailureIsAbsenceNotAgreement` (the author's own, on
+the other side) and `TestFleetVersions_NeverAnnouncesAValueFleetdWillRefuse`
+fail. Restored. `TestAnnounce_ControlCharVersionCostsTheWholeHeartbeat`
+states the consequence mechanically rather than in a comment.
+
+**A-3 (major) — the phase depends on an upstream endpoint the phase does
+not gate.** C16's thesis is that a behaviour this repo leans on must be
+replayed against a real binary before it is trusted. It then made
+`GET /api/version` the sole producer of the fleet's only *observed*
+version answer, and gated it with a hand-rolled `httptest` in
+`c16_test.go` — the fifty-first stand-in AGENTS.md names by number. The
+failure mode is the one the check exists to prevent, inverted: if a future
+release renames or gates the endpoint, every reader returns `""`, the
+matrix is empty, doctor reports UNKNOWN blaming *the announcers' vibe
+build*, and the ungated-version WARN can never fire — on precisely the
+upgrade large enough to move an endpoint.
+
+`internal/swaptest` now serves `/api/version` (reporting its own wire,
+which is the one value it does not have to invent) and `TestSwapContract`
+gained **I6**, folded through the REAL `fleetapi.ReadSwapVersion` like I1's
+in-flight fold and I2-I4's usagemeter classification. It runs on both fake
+wires and on the live binary, in both conformance jobs and the weekly
+drift job.
+
+*Mutation A:* remove the double's handler → I6 fails RED on
+`fake/v239` and `fake/v247` (not a skip — AGENTS.md's rule about a
+conformance invariant that cannot `t.Skip`). *Mutation B:* rename the path
+in `ReadSwapVersion` to `/api/version-renamed-upstream` and run the live
+target against a real v247 binary → `TestSwapContract/live/exec/I6` fails
+naming the missing producer. Both restored.
+
+**A-4 (minor) — divergence was decided on raw strings while gating was
+decided on normalised ones.** `ungatedSwapVersions` trims a build string
+off the release tag (its own table calls `v239 (dd81801)` a gated v239),
+but `len(vers) > 1` keyed on the raw strings, so those two spellings of
+one release read as *"cells run different llama-swap versions"* — a WARN
+telling an operator to finish a roll that is finished. Divergence now
+keys on the normalised release; the Detail still prints the raw matrix, so
+nothing is hidden by the grouping. *Mutation:* revert to `len(vers) > 1` →
+`TestDoctor_OneReleaseIsNotDivergence` fails. Restored.
+
+*(Measured while gating A-3: both real binaries answer `"version":"v239"`
+and `"version":"v247"` — the bare tag. The build string appears in
+`--version` output, not here. So A-4 is a latent false positive rather
+than a live one, and it is fixed at the cost of four lines.)*
+
+**A-5 (minor) — `digestPinned` called a truncated paste a pin.**
+`strings.Contains(ref, "@sha256:")` reports OK for `repo:tag@sha256:`,
+which is wrong in both directions at once: the operator is told the
+deployment is safely pinned, and docker refuses to pull it. Now the digest
+half must be non-empty. *Mutation:* restore the `Contains` form →
+`TestDigestPinned_EmptyDigestIsNotAPin` fails. Restored.
+
+**A-6 (nits, in `scripts/upgrade/` and the futures doc).**
+
+- `cmd_record`'s priming completion had no failure path, so a candidate
+  that served nothing still ran `TestRecord` — capturing an activity page
+  and an events stream from a wire that never carried a request. That is
+  the shape the in-flight bug hid inside. Now it kills the candidate and
+  `die`s.
+- The script header claimed *"every process it starts lives … on ports
+  9810-9819 … clear of scripts/fleetlab's 9600-9799"*, while `canary`
+  step 2 *is* `scripts/fleetlab` on those very ports. The header now says
+  so and points at futures item 15 — which matters, because the sweep it
+  describes is what makes a second lab unsafe.
+- The no-args usage was `sed -n '2,26p'`, pinned to line numbers that this
+  same commit moved; it printed a truncated help. Replaced with an `awk`
+  that prints the leading comment block.
+- Futures item 15 said fleetlab's ports blocked C16's **L3**; the gate
+  table and the Execution section both say **L4**. Corrected in the
+  futures doc.
+
+Two things this pass looked at and left alone:
+
+- **`checkVersions` dials the front serially, inside the report's one
+  deadline.** C13's rule is about fan-outs, and this is a single GET on a
+  client with a 3s timeout out of a 20s budget, on an address `Snapshot`
+  has already probed. Parallelising one dial buys nothing and adds a
+  goroutine to a read-only path.
+- **`llamaSwapVersion`'s `context.Background()`.** Reviewed again with the
+  author's reasoning and agreed: it is bounded at 2s, inside the daemon's
+  existing 3s `announceStopTimeout`, and threading a context through the
+  C3 `Versions func()` interface would change a cell-facing signature for
+  no reachable failure.
+
+Gates re-run after the fixes: `go build`, `go vet`, `gofmt -l .` silent,
+`go mod tidy` byte-identical, `golangci-lint run` **0 issues**,
+`go test -race ./...` green, `go test -race -count=5` green on
+`fleetapi`, `daemon`, `swaptest` and `cli`. `TestSwapContract` (all six
+invariants) against **real v239 and real v247** binaries: green on both.
+`TestSwapBehaviour` against real v239: B1 6.45s, B2 30.30s, green.
+
+### The merge-forward composition failure: the version read carried no credential (C15 × C16)
+
+C15 (the llama-swap credential) and this phase were written in parallel
+off the same base. Each is correct alone. Merged, C15's structural scan
+went red on this phase's code:
+
+```
+--- FAIL: TestEveryLlamaSwapRequestIsAuthorized
+    c15_test.go: upgrade.go: ReadSwapVersion builds an HTTP request to a
+    llama-swap without calling AuthorizeSwap — every fleetd→llama-swap
+    call carries the cell's credential (C15)
+```
+
+Not a false positive, and not a test to soften. `/api/version` is gated
+by llama-swap's `apiKeys` like everything except `/health`, and this
+reader renders a 401 as `""` — so on a fleet that had done nothing wrong
+but set a key, `versions.llama_swap` would have gone quiet about the
+FRONT, the one box this check exists for and the one the 2026-08-05
+incident happened to. This phase's own A-3 finding had already named the
+shape ("an ungated upstream dependency in the phase whose thesis is
+gating upstream contracts"); the credential is the same sentence one
+layer down. The scan found mechanically what two review passes read past.
+
+**Why it is not a one-line change.** `ReadSwapVersion` had two callers
+with opposite postures: `Server.frontSwapVersion` (fleetd → the FRONT's
+llama-swap, which must carry that cell's credential) and
+`daemon.llamaSwapVersion` (a CELL reading its own 127.0.0.1 llama-swap,
+which has no `fleetapi.Server` and no `hosts.yaml` to resolve one from —
+C15 §8 scopes the cell-side dialers out on purpose, as a different config
+surface). Making it a method breaks the second; leaving it alone defeats
+C15.
+
+**The shape chosen.** One reader, two postures, and the difference is a
+parameter that cannot be defaulted:
+
+```go
+func readSwapVersion(ctx context.Context, auth *Server, cell string,
+                     client *http.Client, baseURL string) string
+```
+
+- `Server.frontSwapVersion` passes `s` and `fleetcfg.FrontCell`. The
+  request carries the front's credential; an UNRESOLVABLE declaration
+  returns before `client.Do` (AuthorizeSwap's contract: fleetd sends
+  nothing rather than sending it unauthenticated); a cell that declares
+  no key leaves the request untouched, which is the reference fleet.
+- `ReadOwnSwapVersion(ctx, client, baseURL)` is the exported cell-side
+  entry point — the only caller that passes `nil` — used by
+  `daemon/announce.go` and by `swaptest`'s I6. The reason it is
+  unauthenticated is written in its doc comment, next to the reader,
+  rather than left as a bare `nil` at three call sites.
+- The response status folds into `NoteSwapStatus` in the same place every
+  other producer folds it (`getJSON`, `streamCell`, `warmViaFront`: after
+  the response, before the status check), so a 401 arms the sticky
+  refusal and a 200 retires it. It is deliberately NOT gated by
+  `SwapAuthRefusal` on the way in — checked, not assumed: C15 gates the
+  automated loops and explicitly does not gate an operator's own verb,
+  and this read is reached from `vibe fleet doctor`.
+
+**Alternatives evaluated, and why not.**
+
+- *An injected `authorize func(*http.Request) error`* (the obvious
+  candidate). It works, but the authorizer is then invisible to C15's
+  scan — the enclosing function calls `authorize(req)`, not
+  `AuthorizeSwap` — so the scan has to be taught a new shape in the same
+  commit that adds the first thing it does not recognise. Passing the
+  `*Server` keeps the scan's rule and its implementation exactly as C15
+  wrote them, and carries `NoteSwapStatus` too, which a bare authorize
+  func cannot.
+- *Moving the reader out of `fleetapi` so the scan's scope matches its
+  rule.* This is the dodge it looks like: the fleetd→front read is still
+  a fleetd→llama-swap request, and relocating it converts a mechanical
+  guarantee into a naming convention. Rejected for the same reason A-3
+  rejected a hand-rolled `httptest` for an upstream contract.
+- *The wrapper building and authorizing the request and passing it in.*
+  Then the URL and the `/api/version` path live at the call sites, which
+  is two copies of the endpoint this phase spent A-3 gating — and the
+  live mutation that proves I6 works (rename the path in the reader)
+  stops being a single edit.
+
+**The hole the chosen shape opens, and the test that closes it.** A
+nilable authorizer means a future fleetd producer could satisfy C15's
+scan by taking the same parameter and always receiving `nil`. So
+`TestOnlyTheCellSideReaderSkipsSwapAuth` scans `fleetapi`'s non-test
+sources for `readSwapVersion` calls and fails if any function other than
+`ReadOwnSwapVersion` passes a nil authorizer, with inertness guards in
+both directions (fewer than two call sites, or an exemption that stopped
+existing, is a failure rather than a quiet pass).
+
+**The second collision: C13's read-only scan.** Fixing C15's complaint
+turned C13's `TestDoctor_ReachesNoMutatingVerb` red, because C15 put
+`AuthorizeSwap` and `NoteSwapStatus` on the banned list and C16 put
+`upgrade.go` on the scanned-files list. Both were right when written, and
+they meet in exactly one function.
+
+Resolved by exempting `readSwapVersion` — by enclosing function AND by
+identifier, so every other caller in every other doctor file stays red,
+and with an "an exemption that never fired is a hole" guard so it cannot
+outlive its reason. It is admissible under C13 §1's own qualification 1:
+doctor's evidence is `Server.Snapshot`, which already probes this same
+front through `getJSON` with this same authorizer on this same run, so
+the credential record is a state READ's own bookkeeping (like
+`last-seen.json`'s sighting) rather than one of the three axes. Nothing
+on the path drains, warms, queues, renders or writes a file, which is
+what §1's rule actually enumerates — and U1, the behavioural half that
+§1 calls "the assertion that matters", is untouched and green.
+
+**Mutation record** (each mutation applied, the named test observed red,
+the mutation restored):
+
+| mutation | red |
+|---|---|
+| drop the `AuthorizeSwap` call from `readSwapVersion` | `TestEveryLlamaSwapRequestIsAuthorized`, `TestFrontSwapVersion_CarriesTheFrontsCredential`, `TestFrontSwapVersion_UnresolvableCredentialSendsNothing`, `TestFrontSwapVersion_401FeedsTheCredentialMachinery` |
+| drop the `NoteSwapStatus` call | `TestFrontSwapVersion_401FeedsTheCredentialMachinery` |
+| `frontSwapVersion` passes `nil` instead of `s` | `TestOnlyTheCellSideReaderSkipsSwapAuth` |
+| a deliberately unauthorized request builder added to `fleetapi` (scratch file, since removed) | `TestEveryLlamaSwapRequestIsAuthorized` — the scan still catches what it was written for |
+| a banned verb (`NoteSwapStatus`) in a NEIGHBOURING function of `upgrade.go` | `TestDoctor_ReachesNoMutatingVerb` — the exemption does not spread |
+| a different banned verb (`recordSwapAuth`) INSIDE `readSwapVersion` | `TestDoctor_ReachesNoMutatingVerb` — the exemption is per identifier |
+| `readSwapVersion` stops calling `AuthorizeSwap` | `TestDoctor_ReachesNoMutatingVerb` — the stale-exemption guard |
+
+Gates re-run after the fix: `go build ./...`, `go vet ./...`,
+`gofmt -l .` silent, `go mod tidy` byte-identical,
+`golangci-lint run` **0 issues**, `go test -race -count=2` green on
+`fleetapi`, `fleetmcp` and `daemon`, and `go test -race ./...` green
+across the module (`swaptest` included, so I6 still reads the endpoint
+through the real reader).
+
+#### Adversarial review of the fix: two findings
+
+Both found by mutation — the fix was re-verified by breaking it, not by
+reading it.
+
+**1. The exemption is EXPORTED, and that is a second door onto the same
+room.** `TestOnlyTheCellSideReaderSkipsSwapAuth` guarded the nil
+*argument*, so it watched the door marked `readSwapVersion(ctx, nil, …)`.
+But `ReadOwnSwapVersion` has to be exported for the cell-side callers,
+and a fleetd producer inside `fleetapi` could simply call it: no `nil`
+written anywhere, and no `http.NewRequest` in the calling function for
+C15's scan to see. Demonstrated — a six-line `(*Server)` method reading a
+cell's version through it left the whole suite green, including both
+scans and C13's.
+
+That is the hole the previous paragraph claimed was closed, in a wider
+form. Closed now by the same test: this package must contain **no call**
+to `ReadOwnSwapVersion` at all. Its callers are the cell-side ones, which
+live in other packages; fleetd's path is `frontSwapVersion`. The scan is
+scoped to `fleetapi` — where the reader lives and where the next version
+producer would naturally be written — and `fleetmcp`'s twin still covers
+that package's three producers by the request-builder rule.
+
+**2. "A later accepted call retires it" was asserting nothing.** The
+retire half of `TestFrontSwapVersion_401FeedsTheCredentialMachinery`
+built a SECOND `Server` and asserted no failure was recorded on it — but
+a fresh `Server` starts with an empty `swapAuth` map, so the assertion
+held whether or not anything ever cleared. Demonstrated: with
+`clearSwapAuth` stubbed out to do nothing, the test stayed green.
+
+Rewritten to repair the thing an operator repairs, on ONE `Server`: the
+key file starts holding a value the front rejects (which also gives this
+path its first `SwapAuthRejected` coverage — `SwapCredentialFor` reads
+the file per call, so no restart is involved), then is rewritten with the
+right value and re-read. The stubbed `clearSwapAuth` is now red.
+
+| mutation | red |
+|---|---|
+| a fleetd producer in `fleetapi` reads a cell's version via the exported `ReadOwnSwapVersion` (scratch file, since removed) | `TestOnlyTheCellSideReaderSkipsSwapAuth` — after the fix; **green before it** |
+| `clearSwapAuth` stubbed to a no-op | `TestFrontSwapVersion_401FeedsTheCredentialMachinery` — after the fix; **green before it** (C15's own `TestSwapAuth_ClearsOnTheFirstAcceptedCall` was the only thing covering it) |
+
+Re-verified unchanged by the review: the whole mutation table above still
+reproduces; C15's scan still fails for a genuinely unauthorized request
+builder dropped into the package; the unresolvable-credential path still
+sends **zero** requests to a hit-recording front; the unkeyed reference
+fleet still reads its version with no `Authorization` header at all; and
+`frontSwapVersion` is reached only from `Doctor` (via `checkVersions`),
+which is an operator verb — never a ticker — so declining to gate it on
+`SwapAuthRefusal` is the rule C15 wrote, not an omission.
+
+Gates re-run after the review fixes: `go build ./...`, `go vet ./...`,
+`gofmt -l .` silent, `go mod tidy` byte-identical, `golangci-lint run`
+**0 issues**, `go test -race ./...` green across the module.
+
+## For the reconciliation pass
+
+This branch does not touch `AGENTS.md`,
+`docs/design/fleet-control-plan/README.md` or
+`docs/design/fleet-control.md`. What belongs in each:
+
+### AGENTS.md
+
+Under "Test doubles and upstream contracts", after the fixtures bullets:
+
+- **Two upstream BEHAVIOURS are gated, not just the wire**
+  (`internal/swaptest/behaviour_test.go`, C16). The loading-state
+  keepalive (a streaming completion at a still-loading model must be
+  delivering parseable delta frames within 2s, and the same stream must go
+  on to carry the model's own tokens) and SIGTERM's stream handling
+  (`/api/events` closes at once; in-flight *inference* streams are NOT
+  cancelled; anything still running at the 30s grace is force-closed).
+  Both are env-gated on `LLAMA_SWAP_BIN` because a signal is not a wire,
+  and both use an in-test HTTP upstream so the question stays about
+  llama-swap rather than about llama.cpp. The grace window is bounded on
+  both sides on purpose — either direction changes what
+  `TimeoutStopSec` has to be.
+- **`llama-swap's SIGTERM path does NOT cancel in-flight inference
+  streams.`** Correct the C2 bullet under "Fleet actuation": measured on
+  v239 and v247, `CloseStreams()` closes the EVENT streams (`/api/events`
+  drops in ~1ms) while inference streams keep flowing and are force-closed
+  at a hardcoded 30s — the same grace a `-watch-config` reload gets, not a
+  contrast with it. `drain --wait` is unaffected and still required: a
+  generation longer than the grace is truncated either way, which is what
+  C2's ~39s essay actually observed.
+
+A new section, "The upgrade ritual (fleet-control C16)":
+
+- **The front image is digest-pinned by default**, and moving the pin is
+  `scripts/upgrade/ritual.sh` (preflight → record → canary → gate → pin),
+  never an edit. `TestReferenceFrontStackShipsADigestPin` fails if the
+  reference compose default or `.env.example` goes back to a floating tag.
+- **`front.image_pin` is declared, `versions.llama_swap` is observed, and
+  the pair is the point.** fleetd has no docker socket and must not grow
+  one, so whether the deployment is pinned can only be declared
+  (`fleet.front_image`, with `unmanaged` as the closed-vocabulary
+  declaration that the front runs no container). What catches a
+  declaration nobody applied is the observed version matrix.
+- **`versions.llama_swap` has a producer** (C13 reported it UNKNOWN naming
+  the gap): `fleetapi.readSwapVersion` is the ONE reader —
+  `GET /api/version`, verified against real v239 and v247 binaries — used
+  by both producers, each cell for its own llama-swap and fleetd directly
+  for the FRONT's (the front runs no announcer and is the box the incident
+  happened to). ONE reader, TWO postures: the fleetd path
+  (`frontSwapVersion`) carries the front's C15 credential and folds the
+  status back through `NoteSwapStatus`, and `ReadOwnSwapVersion` is the
+  cell-side entry point that presents none, because C15 §8 scopes the
+  cell-side dialers out. `TestOnlyTheCellSideReaderSkipsSwapAuth` is what
+  keeps the second from becoming a way around C15's scan. It **rejects
+  rather than truncates**: a truncated version
+  is a guess that becomes its own matrix key, and an unprintable one makes
+  fleetd's `clean` refuse the cell's WHOLE announce — presence, intent
+  echo, usage and probes with it. The endpoint is gated like any other
+  upstream contract (`TestSwapContract` I6, folded through the real
+  reader, on both fake wires and a real binary); an upstream dependency
+  the conformance suite does not replay is the hole this phase exists to
+  close.
+- **Absence in the matrix is NAMED, on every branch.** A front that did
+  not answer and a cell whose vibe build predates the producer are both
+  silent in a way no other check reports, so `versions.llama_swap` carries
+  them the way `defs.parity` carries `absentNote` — and the front's
+  silence goes in the Summary, because it is in no other absence list.
+- **A version with no recording is a WARN ahead of plain divergence.**
+  `fleetapi.GatedSwapVersions()`, `internal/swaptest/fixtures/` and
+  `ci.yml`'s matrix are three copies of one fact, pinned to each other by
+  two tests. Adding a recording without adding it to the other two is red.
+
+### docs/design/fleet-control-plan/README.md
+
+- A `C16` row: *The upgrade ritual: digest-pin the front, make the bump a
+  sequence* — ~700 lines, depends on #37's conformance work, status
+  "PR open; unit gates U1-U10 green; **L1-L3 PASS**, L4-L6 unrun".
+- A paragraph after C14's, along the lines of: C16 (2026-08-05) is backlog
+  item 13, and it is the first phase whose subject is the repo's own
+  discipline rather than the fleet's state. Its one carried rule is that
+  **a defence that lives in upstream behaviour is only as durable as the
+  pin under it**: the SSE keepalive and SIGTERM's stream grace are things
+  llama-swap *does*, not things this repo owns, and a floating tag on the
+  front turned "we verified this" into "we verified this once". Two
+  corollaries worth keeping. **The declared and the observed halves are
+  both required** — fleetd cannot see the front's image and a config value
+  cannot see the running version, so `front.image_pin` and
+  `versions.llama_swap` are a pair, and either alone reads as an answer.
+  And **the mid-state is the normal state**: old recordings are kept
+  rather than replaced and CI replays every one, because a fleet spends
+  most of an upgrade with two llama-swap versions in it.
+- Also worth a line in the "what still needs metal" paragraph: C16's L4 is
+  blocked by `scripts/fleetlab`'s fixed ports rather than by hardware —
+  two lab instances cannot coexist on one box, which the parallel-agent
+  workflow now hits routinely.
+
+### docs/design/fleet-control.md
+
+- §7 (or wherever C2's drain semantics are stated): correct the SIGTERM
+  claim as above — event streams are cancelled immediately, inference
+  streams get a hardcoded 30s grace, and `drain --wait` remains the answer
+  because a generation longer than the grace is truncated.
+- The "honest gaps" / upstream-opportunity list: futures item 7 should be
+  restated as *"make llama-swap's 30s shutdown grace configurable"*, not
+  *"stop cancelling streams on SIGTERM"* — the latter describes behaviour
+  upstream does not have.
+- The status table's `fleet doctor` row (or §3's fleetd description): note
+  that `versions.llama_swap` now has a producer, and that the front's
+  version is read directly because it runs no announcer.
+
+### fleet-control-futures.md (this branch DOES own it)
+
+Item 13 is marked SHIPPED with the three notes worth carrying, and item 7
+gets the correction. A new small item is added for `scripts/fleetlab`'s
+fixed ports.
+
+One line belongs to **C15's** entry rather than this one, and is left for
+C15's reconciliation pass because that item is not in the futures doc
+yet: when *"the cell-side llama-swap credential"* is written up, the seam
+it lands at now has a name — `fleetapi.ReadOwnSwapVersion`, the one
+entry point that deliberately presents none, with the reason in its doc
+comment. Closing that item means giving it an authorizer and deleting
+the exemption in `TestOnlyTheCellSideReaderSkipsSwapAuth`, which fails
+if the exemption outlives its caller.

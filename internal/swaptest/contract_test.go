@@ -75,6 +75,7 @@ func TestSwapContract(t *testing.T) {
 			t.Run("I3_streaming_rows_carry_tokens", func(t *testing.T) { i3(t, tgt) })
 			t.Run("I4_refused_requests_still_log_a_row", func(t *testing.T) { i4(t, tgt) })
 			t.Run("I5_connect_delivers_current_state", func(t *testing.T) { i5(t, tgt) })
+			t.Run("I6_api_version_names_the_build", func(t *testing.T) { i6(t, tgt) })
 		})
 	}
 }
@@ -415,4 +416,47 @@ func headID(t *testing.T, tgt target) int64 {
 		return 0
 	}
 	return rows[0].ID
+}
+
+// I6 gates the endpoint C16's doctor check reads.
+//
+// `versions.llama_swap` is the fleet's only OBSERVED answer to "which
+// llama-swap is actually running", and its whole producer is one GET. An
+// endpoint a production reader depends on and no conformance target
+// exercises is the shape this phase exists to retire: if a future release
+// renames or gates `/api/version`, every reader returns "" and the check
+// designed to notice an ungated upgrade goes SILENT on exactly the
+// upgrade big enough to move an endpoint.
+//
+// Folded through the REAL reader (fleetapi.ReadOwnSwapVersion — the
+// unauthenticated entry point onto the same core the front-side read
+// uses; the conformance target is a double or a binary this test started,
+// which is what "own" means here), like I1's
+// in-flight fold and I2-I4's usagemeter classification, so a decoder that
+// stops parsing the real payload fails here rather than in a doctor
+// report nobody reruns.
+func i6(t *testing.T, tgt target) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	got := fleetapi.ReadOwnSwapVersion(ctx, &http.Client{Timeout: 10 * time.Second}, tgt.url)
+	if got == "" {
+		t.Fatalf("GET %s/api/version produced no version through fleetapi.ReadOwnSwapVersion. "+
+			"doctor's versions.llama_swap has no other producer, so this reads as \"nobody answered\" "+
+			"on a fleet that is running something.", tgt.url)
+	}
+	if len(got) > fleetapi.MaxSwapVersionLen {
+		t.Errorf("version %q is longer than the reader's bound (%d)", got, fleetapi.MaxSwapVersionLen)
+	}
+	// The double has no excuse for a value that is not its own wire; a
+	// live binary reports whatever it reports (the recordings are named
+	// for the release, not for the build string beside it).
+	if tgt.fake() {
+		want := strings.TrimPrefix(tgt.name, "fake/")
+		if got != want {
+			t.Errorf("the double on wire %s reports version %q; a fake that invents a version lets a test "+
+				"assert a value production can never see", want, got)
+		}
+	} else {
+		t.Logf("live llama-swap reports version %q", got)
+	}
 }

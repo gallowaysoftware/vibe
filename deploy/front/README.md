@@ -34,6 +34,7 @@ the values are meant to be replaced rather than inherited.
   `-watch-config` sees atomic-rename (tmp+rename) writes — a re-render
   reloads the catalog with no container restart and no outage.
 - `.env.example` — copy to `.env`; every `REPLACE-` marker is required.
+  `FRONT_IMAGE` arrives already digest-pinned — see below.
 
 ## Bring-up order
 
@@ -82,6 +83,38 @@ otherwise gated, give the peer an `apiKey`.
   never corrupted bytes). `docker restart` is only needed for flag or
   image changes.
 
+## The image is digest-pinned, and moving the pin is a procedure
+
+`FRONT_IMAGE` ships as `<repo>:<tag>@sha256:<digest>` in both
+`docker-compose.yaml` and `.env.example`. The tag half is for humans; the
+digest half is what docker resolves. That means `docker compose pull` on
+this host **cannot** change which llama-swap the fleet runs.
+
+That is not caution for its own sake. On 2026-08-05 the floating `:cpu`
+tag was found serving v247 against a fleet gated on v239: v240+ replaced
+the `/api/events` in-flight wire (`requests` array →
+`{"operation":"upsert","request":…}` / `{"operation":"remove","id":…}`,
+`requests` omitempty), vibe counted the absent array as **zero in
+flight**, and a reported zero is what disarms `drain --wait`, C14's
+suspend, C8's probe guard and both warm loops. The parser is fixed and
+both wires are now gated (`internal/swaptest`), but the trigger — a
+routine pull — is a discipline problem, not a code problem.
+
+**To move the pin**, run the ritual rather than editing this file:
+
+```
+scripts/upgrade/ritual.sh preflight <version>   # resolve + report the candidate
+scripts/upgrade/ritual.sh canary   <version>    # conformance + a real 4-cell fleet
+scripts/upgrade/ritual.sh gate     <version>    # the six-client SSE cold-start gate
+scripts/upgrade/ritual.sh pin      <version>    # print the .env line to paste
+```
+
+`scripts/upgrade/README.md` says what each step catches and which parts a
+human still has to watch. `vibe fleet doctor` reports an unpinned
+deployment as `front.image_pin`, and the llama-swap version each cell is
+actually running as `versions.llama_swap` — declaration and observation,
+because a pin that was never applied looks exactly like a pin that was.
+
 ## Notes
 
 - The per-peer `models:` lists are DERIVED, not maintained: fleetd
@@ -91,8 +124,10 @@ otherwise gated, give the peer an `apiKey`.
   whole edit — the front's catalog follows on the cell's next announce.
   Hand edits are an emergency tool only: the next render overwrites
   them, and `-watch-config` means even that costs no outage.
-- The image floats on `:cpu` by default; pin a digest with `FRONT_IMAGE`
-  in `.env` once you have verified a build (see `.env.example`).
+- The behavioural claims above (`-watch-config`'s 30s drain, `/health`
+  answering unauthenticated, SIGTERM's stream handling) were verified on
+  the pinned build. They are upstream *behaviour*, so they are only as
+  durable as the pin and the ritual that moves it.
 - Cold models "just work" through the front: it relays the owning cell's
   loading state to the client while the model JIT-loads (proven
   unbuffered through two hops, router-lifecycle §17).

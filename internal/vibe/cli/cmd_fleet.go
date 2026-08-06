@@ -262,7 +262,7 @@ func fleetAnnounceCmd() *cobra.Command {
 				// other (C13): def-SHA parity across the fleet is worthless
 				// when the cell most likely to drift is the one that never
 				// says which checkout it has. Same producer as the daemon's.
-				Versions: func() *fleetapi.AnnounceVersions { return daemon.FleetVersions(paths.BackendsDir()) },
+				Versions: func() *fleetapi.AnnounceVersions { return daemon.FleetVersions(paths.BackendsDir(), llamaSwap) },
 				// Disk only — a box with no daemon has no VRAM probe wired,
 				// and an invented zero would read as a full card.
 				Capacity: func() *fleetapi.AnnounceCapacity {

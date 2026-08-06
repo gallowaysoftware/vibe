@@ -118,15 +118,16 @@ Small (days):
    already makes — no probe, no new route, and no per-viewer field in
    the one state document every surface renders.
 7. **Upstream: llama-swap SIGTERM-time stream grace** (found by C2's
-   drain gate, 2026-08-02). The signal handler calls `CloseStreams()`
-   before the graceful drain, which cancels in-flight inference
-   streams immediately — unit stop is NOT a graceful drain on v239
-   (contrast `-watch-config` reloads, which do drain 30s). C2 works
-   around it with `drain --wait` (quiescence before stop); the real
-   fix is upstream: don't cancel inference streams on SIGTERM, or make
-   the grace configurable. Until it lands, keep `--wait` as the
-   documented answer and don't assume unit-stop is graceful anywhere
-   else in the design.
+   drain gate, 2026-08-02) — **RESTATED, see item 14.** The finding as
+   written is mis-attributed: measured directly for C16 on both v239 and
+   v247, `CloseStreams()` closes the **event** streams (`/api/events`
+   drops in ~1 ms) and in-flight *inference* streams keep flowing until a
+   hardcoded 30 s deadline force-closes them — the same grace a
+   `-watch-config` reload gets, not a contrast with it. C2's ~39 s essay
+   stream was longer than that grace, which is why it looked cancelled.
+   `drain --wait` (quiescence before stop) remains correct and required,
+   and `TimeoutStopSec` must still exceed the grace. The upstream ask
+   that survives is item 14's: make the 30 s configurable.
 
 Medium:
 
@@ -206,11 +207,41 @@ Medium:
     cold-standby runbook (the gpu-cell can run `llama-swap:cpu` with
     the same peers file in ~10 minutes). The front host dying is the
     one total-fleet outage; don't build HA, write down the path.
-13. **The upgrade ritual** — digest-pin the front image, keep the
-    six-client SSE gate as a checked-in runnable script, and make
-    "canary cell → gate → fleet" the only sanctioned llama-swap bump.
-    The SSE keepalive defense is upstream *behavior*, not structure;
-    it is only as durable as the discipline around upgrades.
+13. **The upgrade ritual** — **SHIPPED as
+    [C16](fleet-control-plan/c16-upgrade-ritual.md) (2026-08-05).**
+    Digest-pinned front image as the shipped default,
+    `scripts/upgrade/ritual.sh` (preflight → record → canary → gate →
+    pin), and two doctor checks. This entry's framing was right and its
+    emphasis was slightly off. **The keepalive is not the only upstream
+    behaviour the fleet leans on**: SIGTERM's treatment of in-flight
+    streams is the other, and it now has a conformance invariant beside
+    the keepalive's — measuring it corrected a claim C2 made and three
+    documents repeat (see below). **The declared and observed halves are
+    both required**: fleetd has no docker socket, so "is the deployment
+    pinned" can only be declared (`front.image_pin`), and a declaration
+    nobody applied is caught only by observing what each cell actually
+    runs (`versions.llama_swap`, which finally has a producer —
+    `GET /api/version`, verified against real v239 and v247 binaries).
+    And **the mid-state is the normal state**: recordings accumulate
+    rather than replace, so a fleet halfway through a roll is a gated
+    configuration rather than an untested one.
+14. **Make llama-swap's shutdown grace configurable** (upstream;
+    supersedes item 7's framing). Measured on v239 and v247 for C16:
+    SIGTERM closes the `/api/events` streams within ~1 ms, does **not**
+    cancel in-flight inference streams, and force-closes whatever is
+    still running at a hardcoded 30 s. Item 7 asked upstream to stop
+    cancelling streams on SIGTERM; upstream does not cancel them. The
+    real ask is that the 30 s be a flag, so a cell whose generations run
+    longer can stop cleanly. `drain --wait` stays the local answer either
+    way and `TimeoutStopSec` must still exceed the grace.
+15. **A port offset for `scripts/fleetlab`.** It binds fixed ports
+    (9600-9799, upstreams 5980-6019), so two lab instances cannot coexist
+    on one box — and `down`'s sweep is anchored partly on that shared
+    upstream range, so the second instance is entitled to kill the
+    first's processes. This blocked C16's L4 gate outright. One
+    `FLEETLAB_PORT_BASE` knob threaded through `CELL_LIST` and the sweep
+    patterns; small, and the parallel-agent workflow this repo now uses
+    hits it immediately.
 
 Large:
 

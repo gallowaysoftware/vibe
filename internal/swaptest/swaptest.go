@@ -184,6 +184,7 @@ func NewCell(t TB, opts ...Option) *Cell {
 	mux.HandleFunc("/v1/chat/completions", c.handleChat)
 	mux.HandleFunc("/v1/embeddings", c.handleEmbed)
 	mux.HandleFunc("/unload", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/api/version", c.handleVersion)
 
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() { _ = srv.Serve(ln) }()
@@ -202,6 +203,23 @@ func (c *Cell) URL() string { return c.url }
 
 // Wire reports which protocol version this cell speaks.
 func (c *Cell) Wire() Wire { return c.wire }
+
+// handleVersion answers GET /api/version, the endpoint C16's
+// versions.llama_swap check reads on every cell and on the front.
+//
+// The double reports its OWN wire as the version, which is the one value
+// here it does not have to invent: a Cell IS a v239 or a v247 wire, and
+// nothing else about the payload is load-bearing. `commit` and
+// `build_date` are present because the real answer carries them and a
+// decoder that grew a dependency on either must fail against the fake
+// too, not only against a binary CI may not have.
+func (c *Cell) handleVersion(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{
+		"version":    c.wire.String(),
+		"commit":     "0000000",
+		"build_date": "2026-01-01T00:00:00Z",
+	})
+}
 
 // ─── catalog ────────────────────────────────────────────────────────────────
 

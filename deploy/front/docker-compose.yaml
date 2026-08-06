@@ -23,11 +23,17 @@
 services:
 
   front:
-    # Float the tag or pin a digest via FRONT_IMAGE in .env. Pinning
-    # (ghcr.io/mostlygeek/llama-swap:cpu@sha256:...) is recommended: it
-    # makes upgrades deliberate, and it keeps the -watch-config verification
-    # (deploy/front/README.md) meaningful against a known build.
-    image: ${FRONT_IMAGE:-ghcr.io/mostlygeek/llama-swap:cpu}
+    # DIGEST-PINNED BY DEFAULT (fleet-control C16). The tag half names the
+    # build for a human; the @sha256 half is what docker resolves, so
+    # `docker compose pull` cannot change which llama-swap this fleet runs.
+    #
+    # On 2026-08-05 the floating `:cpu` tag was found to be serving v247
+    # while the fleet was gated on v239. v240+ changed the /api/events
+    # in-flight wire, vibe read the new shape as ZERO in flight, and eight
+    # busy guards — drain --wait, suspend, the probe guard, both warm loops
+    # — disarm on a reported zero. A routine pull on this host was the whole
+    # trigger. Moving the pin is the ritual in scripts/upgrade/, not an edit.
+    image: ${FRONT_IMAGE:-ghcr.io/mostlygeek/llama-swap:v239-cpu-b9994@sha256:6bae869ec0908538e421172fd576288e87c1bc330acde24517992507218d2c7c}
     container_name: ${FRONT_NAME:-fleet-front}
     restart: unless-stopped
     # The image defaults to listening on 8080; pin the canonical fleet port.

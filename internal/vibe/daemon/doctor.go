@@ -32,6 +32,7 @@ func (d *Daemon) doctorHost() fleetapi.DoctorHost {
 		StateDir:      filepath.Dir(paths.IntentFile()),
 		FrontConfig:   d.cfg.Fleet.FrontConfig,
 		FrontExtras:   d.cfg.Fleet.FrontExtras,
+		FrontImage:    d.cfg.Fleet.FrontImage,
 		TokenMinted:   d.tokenMinted.Load(),
 		EnvTokenSet:   strings.TrimSpace(os.Getenv("VIBE_TOKEN")) != "",
 		Version:       buildinfo.String(),
@@ -39,7 +40,7 @@ func (d *Daemon) doctorHost() fleetapi.DoctorHost {
 	}
 	// The same git read the announce versions block uses, so fleetd's own
 	// parity reference and a cell's are the same measurement.
-	if v := fleetVersionsAt(paths.BackendsDir()); v != nil {
+	if v := fleetVersionsAt(paths.BackendsDir(), ""); v != nil {
 		h.DefsSHA, h.DefsDirty = v.DefsSHA, v.DefsDirty
 	}
 	return h

@@ -220,11 +220,46 @@ func TestDoctor_ReachesNoMutatingVerb(t *testing.T) {
 		"Deactivate": "stops a profile",
 		"Shutdown":   "stops a daemon",
 	}
+	// The ONE exemption, keyed by the enclosing function so it cannot
+	// spread to a neighbouring check, and named here rather than removed
+	// from `banned` so every other doctor-path caller of these two stays
+	// red.
+	//
+	// C15 and this rule genuinely collide in exactly one place. C16's
+	// version matrix reads the FRONT's `GET /api/version` (the front runs
+	// no announcer, and it is the box the incident happened to), and C15's
+	// rule is that EVERY fleetd→llama-swap request carries that cell's
+	// credential and folds the status back into its record. A doctor check
+	// that dialled a keyed front without the credential would read a 401
+	// as "the front did not answer" — the check going quiet about the one
+	// box it exists for.
+	//
+	// It is admissible under §1's own qualification 1: doctor's evidence
+	// is `Server.Snapshot`, which already probes this same front through
+	// `getJSON` with this same authorizer on this same run, so the
+	// credential record is a state READ's own bookkeeping (like
+	// last-seen.json's sighting) and not one of the three axes. Nothing
+	// here drains, warms, queues, renders or writes a file, which is what
+	// §1's list of verbs actually enumerates — and U1, the behavioural
+	// half and the assertion §1 calls the one that matters, is unchanged
+	// and untouched by this.
+	exempt := map[string]map[string]string{
+		"readSwapVersion": {
+			"AuthorizeSwap":  "the version read IS a fleetd→llama-swap request (C15)",
+			"NoteSwapStatus": "the same request's status, folded back exactly as getJSON folds the snapshot probe's",
+		},
+	}
+	fired := map[string]int{}
 	// Every file on the doctor path, not just this one. The scan used to
 	// cover fleetapi/doctor.go alone, which is the file LEAST able to
 	// mutate anything off-box.
 	for _, path := range []string{
 		"doctor.go",
+		// C16's two checks live beside the rest of the ritual rather than
+		// in doctor.go, and one of them dials the front. A file that
+		// contributes checks to the report is on the doctor path whatever
+		// it is called.
+		"upgrade.go",
 		"../daemon/doctor.go",
 		"../fleetmcp/doctor.go",
 		"../cli/cmd_fleet_doctor.go",
@@ -233,6 +268,25 @@ func TestDoctor_ReachesNoMutatingVerb(t *testing.T) {
 		file, err := parser.ParseFile(fset, path, nil, 0)
 		if err != nil {
 			t.Fatalf("parse %s: %v", path, err)
+		}
+		// The enclosing function of a position, so the exemption can be
+		// scoped to one function rather than to a whole file. Whole-file
+		// inspection is kept exactly as it was — a call in a var
+		// initialiser or a stray func literal still gets scanned, with no
+		// enclosing name and therefore no exemption available to it.
+		var decls []*ast.FuncDecl
+		for _, d := range file.Decls {
+			if fn, ok := d.(*ast.FuncDecl); ok {
+				decls = append(decls, fn)
+			}
+		}
+		enclosing := func(pos token.Pos) string {
+			for _, fn := range decls {
+				if pos >= fn.Pos() && pos <= fn.End() {
+					return fn.Name.Name
+				}
+			}
+			return ""
 		}
 		ast.Inspect(file, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
@@ -246,13 +300,30 @@ func TestDoctor_ReachesNoMutatingVerb(t *testing.T) {
 			case *ast.SelectorExpr:
 				name = fn.Sel.Name
 			}
-			if why, bad := banned[name]; bad {
-				t.Errorf("%s calls %s (%s). Doctor is read-only and safe to run mid-incident; if a check "+
-					"genuinely needs this, the phase doc's §1 promise has to change first.",
-					fset.Position(call.Pos()), name, why)
+			why, bad := banned[name]
+			if !bad {
+				return true
 			}
+			in := enclosing(call.Pos())
+			if _, ok := exempt[in][name]; ok {
+				fired[in+"."+name]++
+				return true
+			}
+			t.Errorf("%s calls %s (%s). Doctor is read-only and safe to run mid-incident; if a check "+
+				"genuinely needs this, the phase doc's §1 promise has to change first.",
+				fset.Position(call.Pos()), name, why)
 			return true
 		})
+	}
+	// An exemption nobody uses is an exemption nobody reviewed. If the
+	// version read stops calling these, the exemption goes with it rather
+	// than sitting there as a hole for the next producer to find.
+	for fn, names := range exempt {
+		for name := range names {
+			if fired[fn+"."+name] == 0 {
+				t.Errorf("the %s exemption for %s never fired — delete it; a stale exemption is a hole", fn, name)
+			}
+		}
 	}
 }
 
@@ -485,11 +556,12 @@ func versionFleet(t *testing.T, versions map[string]*AnnounceVersions) *Server {
 	return s
 }
 
-// TestDoctor_LlamaSwapMatrixNamesTheMissingProducer: versions.llama_swap
-// has been a reserved field since C3 with nothing writing it. An UNKNOWN
-// that says "no announcer fills this" is actionable; a silent OK would
-// claim a uniform fleet nobody measured.
-func TestDoctor_LlamaSwapMatrixNamesTheMissingProducer(t *testing.T) {
+// TestDoctor_LlamaSwapMatrixIsUnknownWhenNobodyAnswers: a silent OK would
+// claim a uniform fleet nobody measured. C13 shipped this UNKNOWN naming
+// the MISSING producer; C16 supplied one (each cell reads its own
+// llama-swap's /api/version), so an empty matrix now means nobody
+// ANSWERED — which is still not agreement, and the detail has to say so.
+func TestDoctor_LlamaSwapMatrixIsUnknownWhenNobodyAnswers(t *testing.T) {
 	s := versionFleet(t, map[string]*AnnounceVersions{
 		"a": {DefsSHA: "abc123"},
 		"b": {DefsSHA: "abc123"},
@@ -498,16 +570,23 @@ func TestDoctor_LlamaSwapMatrixNamesTheMissingProducer(t *testing.T) {
 	if got.Level != LevelUnknown {
 		t.Fatalf("no cell reports a version → %s, want unknown", got.Level)
 	}
-	if !strings.Contains(got.Detail, "populate") && !strings.Contains(got.Detail, "producer") {
-		t.Errorf("detail = %q, want the missing PRODUCER named so the unknown is not read as an unreachable fleet", got.Detail)
+	if !strings.Contains(got.Detail, "not that the fleet agrees") {
+		t.Errorf("detail = %q, want the absence stated so the unknown is not read as agreement", got.Detail)
 	}
 
+	// Two versions this build HAS recordings for: the mid-state of a roll,
+	// which is a warn about divergence and nothing worse. (A version with
+	// no recording is a different, louder branch — see c16_test.go.)
 	s2 := versionFleet(t, map[string]*AnnounceVersions{
 		"a": {LlamaSwap: "v239"},
-		"b": {LlamaSwap: "v241"},
+		"b": {LlamaSwap: "v247"},
 	})
-	if got := mustCheck(t, s2.Doctor(context.Background()), "versions.llama_swap", "").Level; got != LevelWarn {
-		t.Errorf("mixed llama-swap versions → %s, want warn (the upgrade ritual's mid-state)", got)
+	got2 := mustCheck(t, s2.Doctor(context.Background()), "versions.llama_swap", "")
+	if got2.Level != LevelWarn {
+		t.Errorf("mixed llama-swap versions → %s, want warn (the upgrade ritual's mid-state)", got2.Level)
+	}
+	if !strings.Contains(got2.Summary, "different llama-swap versions") {
+		t.Errorf("summary = %q, want the divergence branch rather than the ungated one", got2.Summary)
 	}
 }
 

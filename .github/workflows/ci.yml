@@ -42,6 +42,11 @@ jobs:
 
   # internal/swaptest's conformance list, run against a REAL llama-swap.
   #
+  # TestSwapBehaviour rides along (fleet-control C16): the loading-state
+  # keepalive and SIGTERM's treatment of in-flight streams are upstream
+  # BEHAVIOURS no wire shape can express, and they are what
+  # `vibe cell drain --wait` and every cold-start client depend on. ~40s.
+  #
   # A SEPARATE job so the blocking `test` job's ~15s stays ~15s; the two run
   # in parallel, so PR wall-clock is unchanged.
   #
@@ -124,4 +129,4 @@ jobs:
           LLAMA_SERVER_BIN: ${{ github.workspace }}/.upstream/llama-server
           LLAMA_GGUF: ${{ github.workspace }}/.upstream/stories260K.gguf
           LD_LIBRARY_PATH: ${{ github.workspace }}/.upstream
-        run: go test -timeout 300s -v -run TestSwapContract ./internal/swaptest/
+        run: go test -timeout 420s -v -run 'TestSwapContract|TestSwapBehaviour' ./internal/swaptest/
