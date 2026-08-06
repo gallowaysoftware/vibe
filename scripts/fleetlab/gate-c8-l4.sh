@@ -13,8 +13,11 @@ source "$(dirname "$0")/gl.sh"
 CELL=alpha; MODEL=lab-chat; PORT=9641
 PROBEFILE=$LAB/state/ann-$CELL/vibe/fleet/model-probe.json
 
+# /api/fleet/usage returns `buckets`, not `rows`. Reading `.rows[]?` yields
+# {req:null,out:null,...} against a ledger holding real counts — an empty
+# jq path that prints exactly like a probe that cost nothing.
 usage_row() { curl -fsS -m 20 -H "Authorization: Bearer $VIBE_TOKEN" "$VIBE_API/api/fleet/usage" \
-  | jq -c "[.rows[]? | select(.cell==\"$CELL\" and .model==\"$MODEL\")] | {req:(map(.req)|add), out:(map(.out)|add), in_fresh:(map(.in_fresh)|add), in_cached:(map(.in_cached)|add)}"; }
+  | jq -c "[.buckets[]? | select(.cell==\"$CELL\" and .model==\"$MODEL\")] | {n:length, req:(map(.req)|add), out:(map(.out)|add), in_fresh:(map(.in_fresh)|add), in_cached:(map(.in_cached)|add)}"; }
 seed() { # $1 = count inside the window, $2 = count OUTSIDE it (older than 24h)
   python3 - "$PROBEFILE" "$1" "$2" "$MODEL" <<'PY'
 import json,sys,datetime
@@ -88,7 +91,8 @@ hr "4. what one probe costs the C7a ledger"
 sleep 30
 echo "# ledger after: $(usage_row)"
 echo "# llama-swap's own rows for the probe request(s):"
-curl -fsS -m 10 "http://127.0.0.1:$PORT/api/metrics/activity" | jq -c '[.data[] | select(.model=="'"$MODEL"'")][-3:] | .[] | {id,model,req_path,input_tokens,cache_tokens,output_tokens,resp_status_code}'
+# llama-swap v239 nests the counts under `tokens`; the flat names read null.
+curl -fsS -m 10 "http://127.0.0.1:$PORT/api/metrics/activity" | jq -c '[.data[] | select(.model=="'"$MODEL"'")][-3:] | .[] | {id,model,req_path,input_tokens:.tokens.input_tokens,cache_tokens:.tokens.cache_tokens,output_tokens:.tokens.output_tokens,resp_status_code}'
 
 hr "5. restore the cell's real probe state"
 [[ -f $PROBEFILE.c17bak ]] && { kill -TERM "$(cat "$LAB/run/announce-$CELL.pid")" 2>/dev/null; sleep 2; mv "$PROBEFILE.c17bak" "$PROBEFILE"; restart_announcer; }

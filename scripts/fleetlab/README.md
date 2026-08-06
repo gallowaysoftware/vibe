@@ -133,13 +133,13 @@ first (`FLEETLAB_DIR=/tmp/fleetlab ./lab.sh up`) and pass the same
 | `gate-c14-l3.sh` | C14 L3 — a real request defers the declared suspend, then it fires | ~12 min |
 | `gate-c14-l4.sh` | C14 L4 — a lease defers the suspend until `max_defer` abandons it | ~10 min |
 | `marionette.py` | C12 L1's DOM half — drives headless Firefox over Marionette | ~1 min |
-| `gate-c15-warm-auth.sh` | C15 L1 — standalone rig (its own ports); see its header | ~10 min |
 
 `marionette.py` needs `firefox` on `$PATH`; nothing else here does.
-Two of these change fleetd config and restart it (`gate-c9-14d.sh`,
-`gate-c11-l3.sh`, `gate-c14-l3.sh`, `gate-c14-l4.sh`, `gate-c9-14a.sh`)
-— they back the file up and restore it, but do not run two of them at
-once against the same lab.
+**Five** of these change fleetd config and restart it (`gate-c9-14a.sh`,
+`gate-c9-14d.sh`, `gate-c11-l3.sh`, `gate-c14-l3.sh`, `gate-c14-l4.sh`) —
+they back the file up to the same `config.yaml.c17bak` and restore it, so
+do not run two of them at once against the same lab, and do not start one
+while a previous run's backup is still on disk.
 
 ## Adding a gate
 
@@ -150,13 +150,36 @@ gate transcripts from the 2026-08-05 runs were all of that shape, and the
 reason is C13's rule in miniature: a rig that prints PASS is a rig that
 can print PASS while wrong. Print what happened; let the reader judge.
 
-Two habits worth copying, both learned the hard way on 2026-08-05:
-**read the field the answer is actually in** (`/api/fleet/usage` returns
-`buckets`, the warm block's key is `schedule`, an activity row nests
-`tokens`) — a `jq` typo prints an empty array that reads exactly like a
-feature not firing; and **compute cron minutes in the FLEET timezone**
-(`fleet.timezone`), not the shell's, or the declared minute arrives an
-hour late and the gate looks broken.
+Four habits worth copying, learned the hard way on 2026-08-05 — the first
+three the same way twice, because C17's own first cut shipped six rigs
+that broke rule 1 (see its adversarial-review addendum).
+
+1. **Read the field the answer is actually in.** `/api/fleet/usage`
+   returns `buckets`, not `rows`; the warm block's key is `schedule`; an
+   activity row nests `tokens`; the announced `flags_sha256` is on
+   `.cells[].presence.models[]`, and `.cells[].models[]` has no such field;
+   `.cells[]` has no `commands` — the piggyback queue rides the announce
+   RESPONSE and is drained on delivery, so it is not readable from state at
+   all. A wrong `jq` path prints `null` or an empty array, which reads
+   exactly like the feature not firing. **Check every evidence expression
+   against a state document you have actually looked at**, because a rig
+   whose columns are structurally constant is worse than no rig: it prints
+   a healthy-looking zero under a heading that promises a measurement.
+2. **fleetd's log is `state/fleetd/vibe/daemon.log`.** `logs/fleetd.log`
+   holds only pre-handler stdout, i.e. nothing. `gl.sh` exports `$DLOG`.
+3. **A grep is not a control check.** `/warm/i` over `document.body.innerText`
+   matches the footer's warm-target summary whether or not the warm row is
+   rendered; test the element (`#warmrow`), and name the field after what
+   it interrogates.
+4. **Compute cron minutes in the FLEET timezone** (`fleet.timezone`), not
+   the shell's, or the declared minute arrives an hour late and the gate
+   looks broken.
+
+If a rig re-renders a cell config, use `gl.sh`'s `render_cell` rather than
+open-coding `router render` + the startPort `sed`: the renderer hardcodes
+`startPort: 5800`, which is **production's** upstream range on this box, and
+`render_cell` fails loudly if the rewrite did not apply. `lab.sh` has
+always checked this; the first cut of the C17 rigs did not.
 
 ## Requirements
 

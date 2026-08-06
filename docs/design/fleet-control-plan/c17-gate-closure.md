@@ -127,7 +127,7 @@ harness:
 
 The chat figure sits comfortably inside the stated bound. The embed one
 is ~3x over it, and it is not an accident of the lab: `embedBatch = 64`
-and `cannedEmbedInput` is a 14-word sentence
+and `cannedEmbedInput` is a 12-word sentence
 (`internal/vibe/modelprobe/modelprobe.go:77,482`), so ~768 prompt tokens
 is what the shipped probe sends at any embedding model. The bound was
 written from the chat probe and never revisited when the embed one
@@ -314,10 +314,19 @@ GUEST TOKEN                              OPERATOR TOKEN
 chip: block|"read-only"                  chip: display:none
 buttons: []                              buttons: ["drain","resume","wake"] x4 cells,
                                                   + "warm", "away", "test"  (15)
-no `savings` tab                         `savings` tab present
-no warm row                              warm row + "warm goes through the front"
+#nav-savings: display:none               `savings` tab present
+#warmrow:     display:none               #warmrow: display:flex
+              offsetParent null                    + "warm goes through the front"
 4 cell rows, live status, footer counters — both
 ```
+
+The warm-row line is stated as `#warmrow`'s own computed style because
+the first cut of this rig asked a page-wide `/warm/i` regex instead, and
+that is a different question with a different answer — see the
+[addendum](#adversarial-review-addendum) finding A7. The distinction the
+corrected reading exposes is worth keeping: `#warmrow` is **in the DOM**
+for a guest and hidden by `body.guest #warmrow { display: none }`. The
+page is a courtesy; the middleware is the boundary (C12 §1).
 
 And the "updates live" half, with the guest token loaded and **no
 reload**, while an operator drained and resumed a cell from a shell:
@@ -495,9 +504,12 @@ anything and about the honesty of what it wrote.
 | G1. No production code changes | **PASS** — `git diff main..HEAD --stat -- internal/ cmd/ proto/` is empty. |
 | G2. Streaming contract | **PASS** — `git diff --stat main..HEAD -- internal/vibe/proxy` is empty (vacuously, by G1). |
 | G3. No new dependencies | **PASS** — `go mod tidy` leaves `go.mod`/`go.sum` byte-identical; the browser client is stdlib Python driving a browser that is not in the module. |
-| G4. Full inner loop | **PASS** — `go build ./...`, `go vet ./...`, `go test -race -timeout 240s ./...`, `gofmt -l .` silent, `go mod tidy` clean, `golangci-lint run` (v2.12.2) 0 issues. |
+| G4. Full inner loop | **PASS** — `go build ./...`, `go vet ./...`, `go test -race -timeout 240s ./...`, `gofmt -l .` silent, `go mod tidy` clean, `golangci-lint run` (v2.12.2) 0 issues. Re-run after the review commit at `-count=5` (rc=0, 0 FAIL across 38 packages). One note for whoever re-runs it: `golangci-lint` reported five phantom issues from a **stale cache** naming a worktree that no longer exists; `golangci-lint cache clean` then gave 0. A cached lint result is not a lint run. |
 | G5. Every gate row this phase touched names how it was run | **PASS** — each edited row carries the script name and the date, and every substitution (seeded budget window, shortened dwell, shortened `max_defer`, stub suspend verb, CPU models) is named in the row itself, not only here. |
-| G6. Shared files untouched | **PASS** — `AGENTS.md`, `docs/design/fleet-control-plan/README.md` and `docs/design/fleet-control.md` are unmodified on this branch; everything that belongs in them is in the next section. |
+| G6. Shared files untouched | **PASS** — `AGENTS.md`, `docs/design/fleet-control-plan/README.md` and `docs/design/fleet-control.md` are unmodified on this branch; everything that belongs in them is in the next section. Re-verified after the review commit. |
+| G7. Every evidence line in every rig can produce evidence | **PASS after the review commit; it was FAIL before** — nine rig defects, six of them a column that was structurally constant, found and fixed in the [adversarial-review addendum](#adversarial-review-addendum). This gate did not exist in the first cut, which is why they shipped; it is stated here so the next measurement pass inherits it. Each of the fourteen rigs' `jq` paths, greps and DOM selectors was run against a live four-cell lab and confirmed to MOVE when the fleet moved. |
+| G8. No rig can act outside `$FLEETLAB_DIR` | **PASS after the review commit** — `gate-c13-parity.sh` could `git commit` in the operator's own repository on a wrong `FLEETLAB_DIR` (finding A1); every `cd` is now `git -C` behind an existence check, verified by running the rig from inside a scratch repo with a bogus lab dir and watching it refuse with that repo untouched. The four rigs that re-render a cell config now go through `gl.sh`'s `render_cell`, which FAILS if the `startPort` rewrite did not apply — `vibe router render` hardcodes `5800`, which is production's upstream range on this box. |
+| G9. No rig prints a credential | **PASS after the review commit** — `gate-c12-l3.sh` piped `vibe token --guest --regenerate`'s stdout, which is the new bearer, straight into the transcript (finding A9). It is now redacted to `<guest token redacted; sha256 …>`, verified live. Every other rig passes tokens in headers only. |
 
 ## For the reconciliation pass
 
@@ -563,3 +575,106 @@ conflict axis). Here is exactly what belongs in each.
 Nothing is owed. C17 changes no design decision. If its roadmap section
 tracks gate state, it should pick up the same status strings as the plan
 README above.
+
+## Adversarial-review addendum
+
+Ground rule 9's separate pass, run against the two commits above by an
+independent reviewer on 2026-08-05 with the harness up
+(`FLEETLAB_DIR=/tmp/fleetlab-c17rev`, a second lab instance; production
+llama-swap :9000 and vibe :9001 untouched). **Nine findings, all fixed
+here.** Six of them are one defect wearing six hats, and it is the defect
+this phase exists to name — so it is worth stating plainly rather than
+softening:
+
+> **C17's own rigs shipped six evidence lines that could not produce
+> evidence.** Every one printed `null`, `0` or `"none"` regardless of what
+> the fleet was doing, under a heading promising a measurement. Three gate
+> rows this phase flipped from NOT RUN/PARTIAL to PASS cited one of them.
+> A gate rig is a test; a column that is structurally constant is a test
+> asserting less than its name claims (ground rule 10), and "absent
+> evidence reads as a healthy value" is the failure the plan README already
+> records in five phases (and C13 built a whole check level around). Making
+> it again while writing the gate-honesty phase is the joke telling itself,
+> and it is the reason G7 below now exists as a standing gate.
+
+Every one below was reproduced against a live four-cell lab and the fix
+verified the same way: the pre-fix expression and the post-fix expression
+were run back to back against the same document, and only the post-fix one
+moved when the fleet moved.
+
+| # | severity | finding |
+|---|---|---|
+| A1 | **BLOCKER** | `gate-c13-parity.sh` ran `cd "$LAB/etc/vibe/backends"` bare, under `set -uo pipefail` with **no** `-e`, and then `git init`, `git config user.email/name`, `git add -A`, `git commit`. With a wrong or absent `FLEETLAB_DIR` the `cd` fails, the shell stays in the operator's CWD, and those four commands run **in the operator's own repository**. Reproduced in a scratch repo: the rig rewrote the repo's local `user.email`/`user.name` to `lab@fleetlab` and committed the working tree as *"fleetlab defs"*. Fixed: `git -C` throughout, plus an explicit `[[ -d $DEFS ]] \|\| exit 1`. |
+| A2 | major | `gate-c8-l4.sh`'s `usage_row()` read `.rows[]?` from `/api/fleet/usage`, which returns **`buckets`**. Measured live: with one real completion folded, the shipped expression returns `{"req":null,"out":null,"in_fresh":null,"in_cached":null}` and `.buckets[]?` returns `{"req":1,"out":2,"in_fresh":31,"in_cached":0}`. This is the line behind the L4 row's *"Ledger half: one probe costs 101.7 tokens"* — a figure the rig cannot produce (it came from `gate-c7a-partials.sh`, which reads the activity API correctly). |
+| A3 | major | `gate-c8-l4.sh`'s last line read `input_tokens` / `cache_tokens` / `output_tokens` flat off a llama-swap activity row; v239 **nests them under `tokens`**. Live: shipped form → `{"input_tokens":null,"cache_tokens":null,"output_tokens":null}`; `.tokens.*` → `{"input_tokens":31,"cache_tokens":0,"output_tokens":2}`. Both A2 and A3 are the exact mistakes this phase's own README section tells the next author to avoid. |
+| A4 | major | `gate-c8-l5.sh` and `gate-c9-14d.sh` read the announced fingerprint at `.cells[].models[].flags_sha256`. That is the merged `/running` + `/v1/models` view (`ModelState`), which has **no such field**; the announced hash lives at `.cells[].presence.models[]`. Live: the shipped path returns `null`, the presence path returns `fd4b94606e78…`. `gate-c8-l5.sh:52` therefore printed `(changed: NO)` unconditionally — the very claim finding 1 makes, asserted by a probe that could only ever say NO. |
+| A5 | major | `gate-c9-14d.sh`'s `inrender()` matched `$MODEL:` as a mapping key. The front render is **peers-only**: a model is a sequence item (`            - lab-embed-a`) under its cell's `models:` list. Live: shipped form `0`, corrected form `1`, against a config where the model is plainly present. The column printed `render_stanzas=0` for the whole run — indistinguishable from the strict-fingerprint exclusion the C9 14d row reports. |
+| A6 | major | `gate-c11-l2.sh` proved *"no piggyback command was queued for the cell"* with `.cells[].commands // "none"`. **`.cells[]` has no `commands` key** — the queue rides the announce RESPONSE and is drained on delivery, so it is not readable from state at all, and the expression prints `"none"` whether fleetd queued a warm or not. Live `[.cells[]\|keys]\|add\|unique` = `["activity","class","display","host_reachable","last_seen","models","name","presence","reachable","url"]`. Replaced with a real observable and re-measured — see below. |
+| A7 | major | `marionette.py` reported `warm_row_visible` from `/warm/i.test(document.body.innerText)`, which is not a control check: the footer's `warm targets: lab-chat@alpha holding` summary matches it for a guest too. Re-run under a real headless Firefox with the guest token: shipped field says **`true`**, while `#warmrow` computes `display: none` with `offsetParent === null`. The C12 L1 row's *"no warm row"* did not reproduce. Fixed to interrogate `#warmrow` and `#nav-savings` by id, with the page-wide regex kept under the honest name `page_text_mentions_warm`; C12's row corrected. |
+| A8 | minor | Two rigs grepped `$LAB/logs/fleetd.log` for evidence. fleetd installs its own handler and writes every `slog` line to **`state/fleetd/vibe/daemon.log`**; `logs/fleetd.log` is **0 bytes** on a healthy lab. Both greps returned nothing, forever, under the headings *"fleetd's own log:"* and a guest-token check. `gl.sh` now exports `$DLOG` and both rigs use it. Verified: the real log carries `flags fingerprint mismatch`, `excluding strict-fingerprint def from front render` and `guest read-only token CREATED (new)`. |
+| A9 | minor | `gate-c12-l3.sh` ran `vibe token --guest --regenerate --yes` with its stdout going straight into the transcript. That command **prints the new bearer** (`cli/cmd_token.go:134`) — so the rig, which hashes the token on the two lines either side, emitted the live credential in cleartext into a document written to be pasted into a PR. Now redacted to `<guest token redacted; sha256 …>`; the `#`-prefixed advice line is preserved. |
+
+Four smaller items, fixed in the same commit:
+
+- **The four rigs that re-render a cell config dropped `lab.sh`'s
+  verification of the `startPort` rewrite.** `vibe router render`
+  hardcodes `startPort: 5800`, which is **production's** upstream range on
+  this box; `lab.sh` has always checked the `sed` applied and warned. The
+  new rigs open-coded the render and the `sed` without the check, so a
+  silent failure would point a lab cell's upstreams at production's ports
+  — against the one rule the harness exists to keep. Collapsed onto a
+  shared `gl.sh` `render_cell` helper that **fails the rig** if the
+  rewrite did not apply.
+- `gate-c12-l3.sh`'s step-6 heading asserted the **opposite** of the
+  behaviour the row records and blesses (it read *"guest_rejected must
+  carry the old-token refusals"*; the correct and observed answer is
+  `auth_rejected`). A future runner reading the rig would conclude the
+  gate failed. Corrected, with the reasoning inline.
+- The harness README listed **`gate-c15-warm-auth.sh`**, which lives on
+  another unmerged wave-1 branch and is not in this tree, and said *"Two
+  of these change fleetd config"* above a list of **five**. Both fixed;
+  reaching into a sibling branch's files is what the wave's one
+  orchestration rule exists to prevent. `marionette.py`'s docstring
+  referenced a `gate-c12-l1.sh` that does not exist — it is run directly.
+- `cannedEmbedInput` is a **12**-word sentence, not 14 (finding 2 and C8's
+  bullet); C8's L5 row said "seven real 64-input batches" above a list of
+  six, the seventh belonging to the failing half.
+
+**What the re-measurement changed, and what it did not.** Both product
+findings survive intact, and one of them is now better evidenced than it
+was:
+
+- **Finding 1 stands, and its second half is now directly observed.** The
+  claim that "the announced C3 `flags_sha256` is equally stale" had no
+  working evidence line behind it (A4). Measured with the corrected path:
+  alpha announced `fd4b94606e78`, `lab-embed-a.yaml` was edited
+  `--threads 4 → 6`, the cell was re-rendered and `-watch-config` applied
+  it, and **100 s and six announces later the cell was still announcing
+  `fd4b94606e78`** — while fleetd, which re-reads defs per pass, logged
+  `flags fingerprint mismatch … mode=strict` and
+  `excluding strict-fingerprint def from front render`, and `lab-embed-a`
+  **left the front's rendered peers** (`front_renders` 1 → 2). The
+  spurious-mismatch and strict-exclusion consequences are no longer
+  inferred from the baseline half; they were watched.
+- **Finding 2 stands** (arithmetic re-checked: 101.7 × 96 ≈ 9.8 k,
+  768 × 96 = 73 728 ≈ 73.7 k, versus the documented ≤ 25 k), and the
+  anchors `modelprobe.go:77,482` verify.
+- **C11 L2's verdict stands on its other three legs** — four minutes with
+  nothing resident, `warm.targets[].state = skipped` naming the hold
+  throughout, and a byte-identical front config — none of which A6
+  touched. What A6 removed was a fourth leg that was never load-bearing
+  and never real. The rig now reads fleetd's own warm actuations, which
+  is a number that moves: the row is restated on the re-run.
+
+Nothing in this addendum changes a gate's VERDICT except C12 L1's
+warm-row clause, which is corrected rather than withdrawn (the row's
+`#warmrow` reading is stronger than the regex it replaces). Two rows —
+C8 L4's ledger half and C9 14d's render column — keep their verdicts but
+lose an evidence sentence the rig could not have produced; both are
+restated on what was actually observed.
+
+Full inner loop re-run after the review commit: `go build ./...`,
+`go vet ./...`, `go test -race -timeout 240s -count=5 ./...`, `gofmt -l .`
+silent, `go mod tidy` clean, `golangci-lint run` (v2.12.2) 0 issues.
+`git diff main..HEAD -- internal/ cmd/ proto/ go.mod go.sum` is still
+empty, and the three shared files are still untouched.

@@ -28,9 +28,7 @@ echo "# baselines: $(baselines)"
 
 hr "1. set --threads 3 again, WITHOUT restarting the announcer"
 sed -i 's/"--embeddings", "--threads", "4"/"--embeddings", "--threads", "3"/' "$LAB/etc/vibe/backends/$MODEL.yaml"
-"$BIN" router render --cell "$CELL" --extras "$LAB/cells/$CELL/extras.yaml" \
-  --llama-server "${LLAMA_SERVER:-$HOME/.local/bin/llama-server}" --out "$LAB/cells/$CELL/config.yaml" >/dev/null 2>&1
-sed -i "s/^startPort: 5800$/startPort: $SPORT/" "$LAB/cells/$CELL/config.yaml"
+render_cell "$CELL" "$SPORT" || exit 1
 sleep 10; load
 echo "# running argv now: $(argv)   <- llama-swap -watch-config applied it"
 sleep 320
@@ -50,8 +48,6 @@ echo "# baselines: $(baselines)"
 
 hr "3. restore"
 sed -i 's/"--embeddings", "--threads", "3"/"--embeddings", "--threads", "4"/' "$LAB/etc/vibe/backends/$MODEL.yaml"
-"$BIN" router render --cell "$CELL" --extras "$LAB/cells/$CELL/extras.yaml" \
-  --llama-server "${LLAMA_SERVER:-$HOME/.local/bin/llama-server}" --out "$LAB/cells/$CELL/config.yaml" >/dev/null 2>&1
-sed -i "s/^startPort: 5800$/startPort: $SPORT/" "$LAB/cells/$CELL/config.yaml"
+render_cell "$CELL" "$SPORT"
 restart_announcer
 hr done

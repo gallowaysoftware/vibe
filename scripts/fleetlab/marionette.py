@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
 """Minimal Marionette client: drive a real headless Firefox over TCP 2828.
 
-Used by gate-c12-l1.sh to answer the DOM half of C12 L1 — which controls the
-page actually renders under a guest token — with a real browser engine rather
-than by reading the HTML source.
+Answers the DOM half of C12 L1 — which controls the page actually renders
+under a guest token — with a real browser engine rather than by reading the
+HTML source. Run it directly:
+
+    python3 marionette.py http://127.0.0.1:9721/ui/fleet "$TOKEN" out.json
+
+once with the guest token and once with the operator token, and diff.
+
+Every field here names the element it interrogates. A page-wide innerText
+regex is NOT a control check: `warm` appears in the footer's warm-target
+summary whether or not #warmrow is rendered, so a field called
+`warm_row_visible` backed by /warm/i reports the wrong answer as soon as a
+warm target exists. `page_text_mentions_warm` is kept, under a name that
+says what it is.
 """
 import json, socket, subprocess, sys, time, os, shutil
 
@@ -89,7 +100,12 @@ def main():
                 .filter(n => document.body.innerText.includes(n)),
             savings_tab_visible: [...document.querySelectorAll('a,button')]
                 .some(e => vis(e) && /savings/i.test(e.textContent)),
-            warm_row_visible: /warm/i.test(document.body.innerText),
+            savings_nav_visible: vis(document.getElementById('nav-savings')),
+            warm_row_visible: vis(document.getElementById('warmrow')),
+            warm_row_exists_in_dom: !!document.getElementById('warmrow'),
+            // NOT the warm-row check: the footer's "warm targets: …" summary
+            // matches this whenever a warm target is configured, guest or not.
+            page_text_mentions_warm: /warm/i.test(document.body.innerText),
             body_len: document.body.innerText.length,
           });
         """)

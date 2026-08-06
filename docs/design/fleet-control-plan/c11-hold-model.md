@@ -455,9 +455,18 @@ fleetd with a configured warm target (`alpha/lab-chat`,
   `[INFO] <lab-embed-a> Unloading model, TTL of 45s reached` and
   `/running` went empty. For the next **four minutes** the cell sat with
   **nothing resident** while fleetd declined to fix it: the warm target
-  read `skipped / held: lab-embed-a, 19m…16m left` throughout, **no**
-  piggyback command was queued for the cell, and the front's rendered
-  config was **byte-identical** (same sha256) before and after. The CLI
+  read `skipped / held: lab-embed-a, 19m…16m left` throughout, fleetd's
+  own **warm-target actuation count for the cell did not move** (2 before
+  the hold, 2 after the four minutes — a number that had stepped 0 → 2
+  earlier in the same session, so it is a live counter and not a
+  constant), and the front's rendered config was **byte-identical** (same
+  sha256) before and after. *(Re-measured 2026-08-05 by C17's own review
+  pass: the first cut of this row proved the no-warm half with
+  `.cells[].commands`, a field the state document does not have — the
+  piggyback queue rides the announce RESPONSE and is drained on delivery,
+  so that expression printed `"none"` unconditionally. The verdict is
+  unchanged; the evidence is now something that can say otherwise. See
+  C17 finding A6.)* The CLI
   had said so up front, verbatim: *not a pin: llama-swap's own TTL can
   still unload the model — the hold only stops fleetd causing it.* On
   `--release` the restore came back through C11's empty-grace window —

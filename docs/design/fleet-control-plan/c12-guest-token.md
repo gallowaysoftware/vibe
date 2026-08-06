@@ -667,11 +667,22 @@ fleetd with a real `guest_token_file`, on two independent lab fleets:
   client (no Go dependency, nothing in the module), which seeds
   `localStorage`'s `vibeFleetToken` and reloads. Under the **guest**
   token: the `read-only` chip is visible, `#token-gate` is not, there are
-  **zero** visible buttons, there is **no** `savings` tab and **no** warm
-  row, and all four cells render with live status. Under the
-  **operator** token in the same browser: the chip is `display:none` and
-  fifteen buttons appear (`drain`/`resume`/`wake` ×4 cells, plus `warm`,
-  `away`, `test`), with the `savings` tab and the warm row. The
+  **zero** visible buttons, `#nav-savings` and `#warmrow` both compute to
+  `display: none` with `offsetParent === null`, and all four cells render
+  with live status. Under the **operator** token in the same browser: the
+  chip is `display:none`, `#warmrow` computes to `display: flex`, and the
+  action buttons appear (`drain`/`resume`/`wake` ×4 cells, plus `warm`,
+  `away`, `test`, and `unload <model>` per resident model), with the
+  `savings` tab. **Corrected by C17's own review pass** (2026-08-05): the
+  first cut of this row said the guest sees "no warm row" on the strength
+  of a page-wide `/warm/i` regex over `document.body.innerText`, which is
+  not a control check — the footer's `warm targets: …` summary matches it
+  for a guest too, and a re-run says `true` where the row said no. The
+  claim now rests on `#warmrow`'s own computed visibility, which is what
+  `body.guest #warmrow { display: none }` actually controls, and the
+  distinction it hides is worth stating: the row is **hidden by CSS, not
+  absent from the DOM** — the boundary is the middleware, exactly as §1
+  says, and the page is a courtesy. The
   "updates live" half ran too — with the guest page open and **no
   reload**, an operator's `vibe cell drain bravo` moved the row
   `SERVING → INCONSISTENT (requested, awaiting ack) → DRAINED`, and

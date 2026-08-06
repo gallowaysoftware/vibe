@@ -34,8 +34,15 @@ restart_announcer() { # $1 = XDG_CONFIG_HOME
   sleep 25
 }
 notifyblk() { state | jq -c '.notify | {alarms, delivery: {sent: .delivery.sent, failed: .delivery.failed}, fingerprint_source}'; }
-fp() { state | jq -r ".cells[]|select(.name==\"$CELL\")|.models[]|select(.id==\"$MODEL\")|.flags_sha256[0:12]"; }
-inrender() { grep -c "^        $MODEL:\|    $MODEL:" "$FRONTCFG"; }
+# The ANNOUNCED fingerprint is on the presence block; `.cells[].models[]` is
+# the merged /running view and has no flags_sha256, so reading it there
+# prints `null` for the whole run — the drift and its absence look identical.
+fp() { state | jq -r ".cells[]|select(.name==\"$CELL\")|.presence.models[]|select(.id==\"$MODEL\")|.flags_sha256[0:12]"; }
+# The front render is peers-only: a model is a SEQUENCE ITEM under its
+# cell's `models:` list (`            - lab-embed-a`), never a mapping key.
+# Matching `$MODEL:` counts 0 whether the strict def is in the render or
+# not, which is the answer this gate exists to distinguish.
+inrender() { grep -c "^ *- $MODEL\$" "$FRONTCFG"; }
 sinklines() { grep -c . "$SINK" 2>/dev/null || echo 0; }
 
 hr "0. give $CELL its own config root — a real cell does not share the front's defs dir"
@@ -72,7 +79,8 @@ for i in $(seq 1 16); do
 done
 echo "# the alarm deliveries:"; grep -a "fingerprint" "$SINK" | tail -5
 echo "# events stream carried:"; timeout 5 curl -sN -H "Authorization: Bearer $VIBE_TOKEN" "$VIBE_API/api/fleet/events" | head -5 || true
-echo "# fleetd's own log:"; grep -a -i "fingerprint" "$LAB/logs/fleetd.log" | tail -5
+echo "# fleetd's own log ($DLOG — NOT logs/fleetd.log, which stays empty):"
+grep -a -i "fingerprint\|strict-fingerprint" "$DLOG" | tail -5
 
 hr "4. push the def to the cell — the two sides agree again"
 cp "$LAB/etc/vibe/backends/$MODEL.yaml" "$CELLETC/vibe/backends/$MODEL.yaml"

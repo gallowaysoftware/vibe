@@ -21,6 +21,10 @@ ensure_resident() { # a probe must never load a model; an OPERATOR may
   fi
 }
 probeblk() { state | jq -c ".cells[]|select(.name==\"$CELL\")|.models[]|select(.id==\"$MODEL\")|.probe"; }
+# The ANNOUNCED fingerprint is on the presence block. `.cells[].models[]` is
+# the merged /running + /v1/models view and carries no flags_sha256 at all,
+# so reading it there prints `null` before and after a def edit — which is
+# indistinguishable from the staleness this half is trying to detect.
 baselines() { jq -c '{attempts:(.attempts|length), baselines:[.baselines[]|{model,metric,flags:(.flags_sha256[0:12]),n:(.samples|length),verdict}]}' "$PROBEFILE" 2>/dev/null; }
 
 hr "0. the def's kind is read off the rendered argv (C8 §4): --embeddings => embed"
@@ -40,15 +44,13 @@ done
 
 hr "F1. a serving flag changes: --threads 4 -> 3 on this def only"
 echo "# baseline key before: $(baselines)"
-BEFORE=$(state | jq -r ".cells[]|select(.name==\"$CELL\")|.models[]|select(.id==\"$MODEL\")|.flags_sha256")
+BEFORE=$(state | jq -r ".cells[]|select(.name==\"$CELL\")|.presence.models[]|select(.id==\"$MODEL\")|.flags_sha256")
 echo "# announced flags_sha256 before: ${BEFORE:0:12}"
 sed -i 's/"--embeddings", "--threads", "4"/"--embeddings", "--threads", "3"/' "$LAB/etc/vibe/backends/$MODEL.yaml"
 grep -n extra_args "$LAB/etc/vibe/backends/$MODEL.yaml"
-"$BIN" router render --cell "$CELL" --extras "$LAB/cells/$CELL/extras.yaml" \
-  --llama-server "${LLAMA_SERVER:-$HOME/.local/bin/llama-server}" --out "$LAB/cells/$CELL/config.yaml" 2>&1 | tail -3
-sed -i "s/^startPort: 5800$/startPort: $SPORT/" "$LAB/cells/$CELL/config.yaml"
+render_cell "$CELL" "$SPORT" || exit 1
 echo "# waiting for -watch-config + a fresh announce"; sleep 45
-AFTER=$(state | jq -r ".cells[]|select(.name==\"$CELL\")|.models[]|select(.id==\"$MODEL\")|.flags_sha256")
+AFTER=$(state | jq -r ".cells[]|select(.name==\"$CELL\")|.presence.models[]|select(.id==\"$MODEL\")|.flags_sha256")
 echo "# announced flags_sha256 after:  ${AFTER:0:12}   (changed: $([[ $BEFORE != "$AFTER" ]] && echo yes || echo NO))"
 
 hr "F2. wait out the cooldown, then probe on the NEW flags"
@@ -61,7 +63,5 @@ echo "--- cell-side: $(baselines)"
 
 hr "F3. restore the def"
 sed -i 's/"--embeddings", "--threads", "3"/"--embeddings", "--threads", "4"/' "$LAB/etc/vibe/backends/$MODEL.yaml"
-"$BIN" router render --cell "$CELL" --extras "$LAB/cells/$CELL/extras.yaml" \
-  --llama-server "${LLAMA_SERVER:-$HOME/.local/bin/llama-server}" --out "$LAB/cells/$CELL/config.yaml" >/dev/null 2>&1
-sed -i "s/^startPort: 5800$/startPort: $SPORT/" "$LAB/cells/$CELL/config.yaml"
+render_cell "$CELL" "$SPORT"
 hr done
