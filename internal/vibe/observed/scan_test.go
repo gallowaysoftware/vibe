@@ -1,6 +1,7 @@
 package observed
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -86,6 +87,7 @@ var discardedKnownBitExempt = map[string]string{}
 func TestObservedIsNeverReadWithADiscardedKnownBit(t *testing.T) {
 	files, fset := scanFiles(t)
 	reads, dropped := 0, 0
+	used := map[string]bool{}
 	for path, f := range files {
 		ast.Inspect(f, func(n ast.Node) bool {
 			var lhs []ast.Expr
@@ -118,8 +120,12 @@ func TestObservedIsNeverReadWithADiscardedKnownBit(t *testing.T) {
 				return true
 			}
 			dropped++
-			key := path + ":" + id.Name
+			// Keyed on the LINE. The identifier is always "_", so a
+			// file-scoped key would let one exemption cover every future
+			// dropped bit in the same file.
+			key := fmt.Sprintf("%s:%d", path, fset.Position(id.Pos()).Line)
 			if _, exempt := discardedKnownBitExempt[key]; exempt {
+				used[key] = true
 				return true
 			}
 			t.Errorf("%s:%d: reads an observed.Value and discards the known bit. "+
@@ -134,6 +140,11 @@ func TestObservedIsNeverReadWithADiscardedKnownBit(t *testing.T) {
 	// this scan pass over nothing.
 	if reads < 8 {
 		t.Fatalf("found %d two-value Observed() reads across the module, expected the migrated call sites (%d dropped) — this scan is inert", reads, dropped)
+	}
+	for key := range discardedKnownBitExempt {
+		if !used[key] {
+			t.Errorf("exemption %q matches no read: it is STALE (the line moved, or the read is gone). Re-point it or delete it.", key)
+		}
 	}
 }
 
@@ -202,6 +213,7 @@ func TestNoNewValueAndKnownBitFieldPair(t *testing.T) {
 	if structs < 100 {
 		t.Fatalf("examined %d struct types — the scan is inert", structs)
 	}
+	t.Logf("examined %d struct types", structs)
 	for key := range evidencePairExempt {
 		if !used[key] {
 			t.Errorf("exemption %q matches no field pair: it is STALE. Re-point it or delete it — "+
@@ -284,6 +296,7 @@ func TestNoNewMeasurementAndBoolReturn(t *testing.T) {
 	if funcs < 500 {
 		t.Fatalf("examined %d functions with results — the scan is inert", funcs)
 	}
+	t.Logf("examined %d functions with results", funcs)
 	for key := range measurementReturnExempt {
 		if !used[key] {
 			t.Errorf("exemption %q matches no function: it is STALE. Re-point it or delete it.", key)

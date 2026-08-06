@@ -25,6 +25,19 @@
 // either the deprecated ParseDir-plus-Check dance or golang.org/x/tools,
 // and this repo adds no dependency. A syntactic scan over-reports rather
 // than under-reports, which is the safe direction for a guard.
+//
+// Two limits, both inherited from C15's hand-rolled version and both
+// worth knowing before relying on a rule:
+//
+//   - The unit is a FuncDecl. A trigger inside a package-level `var f =
+//     func() {…}` is invisible. Nothing in this module is written that
+//     way, and MinProducers is what would make the omission visible if a
+//     producer moved there.
+//   - Matching is on the final identifier of a call, so `s.AuthorizeSwap`
+//     and `other.AuthorizeSwap` are the same to this scan. That is the
+//     over-reporting direction for Trigger and the under-reporting one
+//     for Require; the behavioural test beside each rule is what covers
+//     the difference.
 package astscan
 
 import (

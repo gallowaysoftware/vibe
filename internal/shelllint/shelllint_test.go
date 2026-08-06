@@ -86,6 +86,11 @@ func TestUnguardedCd(t *testing.T) {
 	if got := lintText(t, "cd \"$LAB\"\nset -e\n"); len(got) != 1 {
 		t.Errorf("a cd before `set -e` was treated as guarded: %v", got)
 	}
+	// An && that comes BEFORE the cd chains off something else. This is
+	// the C17 blocker with one more statement on the line.
+	if got := lintText(t, "set -uo pipefail\ncd \"$LAB\"; git init && git add -A\n"); len(got) != 1 {
+		t.Errorf("an && to the RIGHT of the cd was read as guarding it: %v", got)
+	}
 }
 
 func TestRmRfBareVar(t *testing.T) {

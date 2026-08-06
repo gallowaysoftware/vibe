@@ -528,6 +528,89 @@ where it would go if someone wants it.
 The five `rm -rf` edits to the rigs are `bash -n` clean and were reviewed
 by hand; they change no behaviour except aborting on an empty variable.
 
+## Adversarial self-review addendum
+
+Ground rule 9's second line item, run against this phase's own diff. Four
+findings, each fixed and each re-verified by breaking the fix rather than
+by reading it. The theme is the one this phase is about: **a check that
+watches for a shape can carry the same shape**.
+
+**REV-1. `Restore` dropped the file mode.** `Apply` preserved perms;
+`Restore` hardcoded `0o644`. One registry entry mutates an *executable*
+shell rig, so after that entry a worker's tree differed from the one the
+baseline ran against — in a way that would surface as a later entry
+failing for a reason nobody could find. Fixed: `Restore` stats the file
+and preserves its mode. This is class 2 (the sending side guards, the
+receiving side doesn't) in the harness that exists to catch class 2.
+
+**REV-2. `CopyTree` did not skip a git WORKTREE's `.git`.** The skip
+list was consulted only for directories, and this plan's parallel-agent
+workflow runs every phase in a worktree, where `.git` is a FILE pointing
+at the main repository. The copy therefore carried a gitdir pointer into
+a tree that is not that worktree. Harmless to `go test`, and exactly the
+sort of thing that stops being harmless once something in the harness
+shells out to git. Fixed: the skip list is consulted for files too.
+
+**REV-3. The discarded-known-bit exemption was keyed on the file.** The
+key was `path + ":" + id.Name`, and the identifier in question is
+*always* `_` — so one exemption would have covered every future dropped
+bit in the same file. That is the "an exemption is a hole nobody is
+watching" failure, in the phase that introduced the rule. Fixed: keyed on
+`path:line`, matching `shelllint`'s convention, plus the stale-exemption
+check the other two scans already had and this one did not.
+
+**REV-4. `cdHandled` was a whole-line `Contains`.** It tested
+`Contains(line, "cd ") && Contains(line, "&&")`, so
+`cd "$LAB"; git init && git add -A` read as guarded — which is the C17
+blocker *verbatim* with one more statement on the line, in the rule
+written to catch the C17 blocker. The first attempt at the fix ("the
+`&&` must come after the `cd`") was still wrong for exactly that line,
+and only failed the new test case that was written for it. Fixed
+properly: the operator has to be inside the `cd`'s **own command** —
+the segment from `cd` to the next `;` or newline.
+
+**One inertness floor was wrong in the safe direction and is recorded
+rather than silently corrected.** `TestObservedIsNeverReadWithADiscardedKnownBit`'s
+floor was written at 8 against an assumed count; the real number of
+two-value `Observed()` reads in production source is 10. Left at 8 —
+close enough to catch a rollback, loose enough not to fail on one
+call site being refactored away. The other two scans log their
+denominators (623 struct types, 1718 functions with results) so the next
+agent can see what a floor of 100 / 500 is actually buying.
+
+**Mutation record** (each mutation applied, the named test observed red,
+the mutation restored):
+
+| mutation | red |
+|---|---|
+| exemption key back to `path + ":" + id.Name`, with TWO dropped bits planted in `activity.go` and ONE exempted | `TestObservedIsNeverReadWithADiscardedKnownBit` reports **1** finding after the fix and **0** before it — the single exemption covered both reads |
+| `cdHandled` back to `Contains(line, "cd ") && Contains(line, "&&")` | `TestUnguardedCd`'s new `cd "$LAB"; git init && git add -A` case; **green before the fix** |
+| the same, with the first (wrong) fix — "the && must come after the cd" | the same case, still red: recorded because it is the reason the test case exists |
+| `Restore` hardcodes `0o644` again | **not caught by any test.** Recorded as a known gap rather than papered over: no registry entry currently runs after the shell one on the same worker, so nothing observes the mode |
+| the `.git`-file skip removed | **not caught.** Same status; the copy is still correct for `go test`, and the fix is against a future step that shells out to git |
+
+The last two are honest about what they are: correctness fixes in the
+harness's own plumbing, where the harness cannot mutation-verify a
+property nothing asserts. Both are one line and both carry the reason at
+the point of the fix, which is the evidence level this plan gives a NIT.
+
+**Re-verified unchanged by the review**: 16/16 registry mutations still
+caught; the three module-wide scans still green with their exemption
+tables intact; `scripts/` still clean under all three shell rules;
+C15's two scans still fail for a genuinely unauthorized request builder
+(registry entry `c15/streamCell drops the llama-swap credential`); and
+`TestOnlyTheCellSideReaderSkipsSwapAuth`, C15's nil-authorizer guard, is
+untouched — this phase changed the rule engine under it, not the
+exemption it watches.
+
+**Two known limits of `astscan`, written into its doc comment rather than
+fixed**, because both are inherited from C15's hand-rolled version and
+neither is reachable from current code: the unit is a `FuncDecl` (a
+trigger inside a package-level `var f = func(){…}` is invisible), and
+matching is on a call's final identifier (`s.AuthorizeSwap` and
+`other.AuthorizeSwap` are the same string). `MinProducers` is what makes
+the first visible if a producer ever moves there.
+
 ## For the reconciliation pass
 
 This branch does not touch `AGENTS.md`,

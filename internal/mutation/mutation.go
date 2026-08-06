@@ -320,7 +320,9 @@ func CopyTree(src, dst string) error {
 			}
 			return os.MkdirAll(filepath.Join(dst, rel), 0o755)
 		}
-		if !d.Type().IsRegular() {
+		// A git WORKTREE's .git is a file pointing at the main repo, not a
+		// directory, so the skip list above never sees it.
+		if !d.Type().IsRegular() || skipDirs[d.Name()] {
 			return nil
 		}
 		return copyFile(path, filepath.Join(dst, rel))
@@ -382,7 +384,17 @@ func (m Mutation) Apply(root string) (original []byte, err error) {
 	return b, nil
 }
 
-// Restore puts the original bytes back.
+// Restore puts the original bytes back, preserving the mode.
+//
+// The mode matters: one registry entry mutates an executable shell rig,
+// and restoring it 0o644 would leave the worker's tree subtly different
+// from the one the baseline ran against — the sort of drift that makes a
+// later entry in the same worker fail for a reason nobody can find.
 func (m Mutation) Restore(root string, original []byte) error {
-	return os.WriteFile(filepath.Join(root, m.File), original, 0o644)
+	path := filepath.Join(root, m.File)
+	perm := os.FileMode(0o644)
+	if info, err := os.Stat(path); err == nil {
+		perm = info.Mode().Perm()
+	}
+	return os.WriteFile(path, original, perm)
 }

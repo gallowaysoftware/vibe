@@ -165,7 +165,19 @@ func hasErrExit(setCmd string) bool {
 // an explicit `|| …`, or a subshell that chains with `&&` (the
 // `( cd "$X" && cmd )` idiom, where a failed cd stops the chain).
 func cdHandled(line string) bool {
-	return strings.Contains(line, "||") || (strings.Contains(line, "cd ") && strings.Contains(line, "&&"))
+	i := strings.Index(line, "cd ")
+	if i < 0 {
+		return false
+	}
+	// The operator has to be in the cd's OWN command. `cd "$X"; git init
+	// && git add -A` contains a `&&` after the cd and chains off `git
+	// init` — which is the C17 blocker with one more statement on the
+	// line, and the reading a whole-line Contains() gets wrong.
+	seg := line[i:]
+	if j := strings.IndexAny(seg, ";\n"); j >= 0 {
+		seg = seg[:j]
+	}
+	return strings.Contains(seg, "||") || strings.Contains(seg, "&&")
 }
 
 // rmTarget walks rm's arguments: every leading -flag is consumed (the
