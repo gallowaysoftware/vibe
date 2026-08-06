@@ -59,6 +59,11 @@ func newKeyedSwap(t *testing.T, key string) *keyedSwap {
 			_, _ = w.Write([]byte(`{"running":[{"model":"default-model","state":"ready","ttl":300}]}`))
 		case "/v1/models":
 			_, _ = w.Write([]byte(`{"data":[{"id":"default-model"}]}`))
+		case "/api/version":
+			// Gated by apiKeys like everything except /health — the branch
+			// above is what a keyed v239 answers an uncredentialed reader,
+			// and it is why C16's version read had to join this scan.
+			_, _ = w.Write([]byte(`{"version":"v239","commit":"dd81801","build_date":"2026-01-01T00:00:00Z"}`))
 		case "/api/events":
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)
@@ -533,8 +538,87 @@ func TestSwapKeyNeverAppearsInAnySurface(t *testing.T) {
 //
 // fleetmcp's three producers are pinned by the twin of this test in that
 // package.
+//
+// It caught C16's `/api/version` reader on the merge forward — a genuine
+// cross-phase composition failure, found mechanically. That reader serves
+// two postures (fleetd→front, and a cell reading its own localhost
+// llama-swap), so it takes its authorizer as a nilable parameter and this
+// scan sees the call; TestOnlyTheCellSideReaderSkipsSwapAuth below is
+// what keeps `nil` from becoming a way around the scan.
 func TestEveryLlamaSwapRequestIsAuthorized(t *testing.T) {
 	assertRequestsAuthorized(t, ".", "AuthorizeSwap")
+}
+
+// TestOnlyTheCellSideReaderSkipsSwapAuth guards the ONE exemption above.
+//
+// `readSwapVersion` authorizes when it is handed a Server and does not
+// when it is handed nil, which is correct — a cell reading its own
+// 127.0.0.1 llama-swap has no hosts.yaml to resolve a credential from
+// (C15 §8) — and is also the shape of an escape hatch: a fleetd producer
+// could satisfy the scan above by taking the same parameter and always
+// receiving nil. So the nil is allowed in exactly one function, by name,
+// and any other caller that passes it fails here.
+func TestOnlyTheCellSideReaderSkipsSwapAuth(t *testing.T) {
+	const reader, exempt = "readSwapVersion", "ReadOwnSwapVersion"
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read .: %v", err)
+	}
+	fset := token.NewFileSet()
+	calls, unauthorized := 0, 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, filepath.Join(".", name), nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			fn, ok := n.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				return true
+			}
+			ast.Inspect(fn.Body, func(m ast.Node) bool {
+				call, ok := m.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				id, ok := call.Fun.(*ast.Ident)
+				if !ok || id.Name != reader {
+					return true
+				}
+				calls++
+				if len(call.Args) < 2 {
+					t.Errorf("%s: %s calls %s with %d args — the authorizer is the second one; "+
+						"this scan cannot read the new shape", name, fn.Name.Name, reader, len(call.Args))
+					return true
+				}
+				arg, ok := call.Args[1].(*ast.Ident)
+				if !ok || arg.Name != "nil" {
+					return true
+				}
+				unauthorized++
+				if fn.Name.Name != exempt {
+					t.Errorf("%s: %s reads a llama-swap's version with a nil authorizer. Only %s may — it is a box "+
+						"reading its OWN localhost llama-swap (C15 §8). A fleetd→cell read passes the Server, or the "+
+						"credential is silently dropped on the day someone sets apiKeys.", name, fn.Name.Name, exempt)
+				}
+				return true
+			})
+			return true
+		})
+	}
+	// Inertness guards, both directions: a renamed reader would make this
+	// scan pass over nothing, and an exemption that stopped existing would
+	// make it pass over code that no longer needs it.
+	if calls < 2 {
+		t.Fatalf("found %d call(s) to %s — expected the fleetd path and the cell-side one; the scan is inert", calls, reader)
+	}
+	if unauthorized != 1 {
+		t.Fatalf("found %d unauthorized %s call(s), want exactly 1 (%s)", unauthorized, reader, exempt)
+	}
 }
 
 func assertRequestsAuthorized(t *testing.T, dir, authorizer string) {

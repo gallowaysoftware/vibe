@@ -220,6 +220,36 @@ func TestDoctor_ReachesNoMutatingVerb(t *testing.T) {
 		"Deactivate": "stops a profile",
 		"Shutdown":   "stops a daemon",
 	}
+	// The ONE exemption, keyed by the enclosing function so it cannot
+	// spread to a neighbouring check, and named here rather than removed
+	// from `banned` so every other doctor-path caller of these two stays
+	// red.
+	//
+	// C15 and this rule genuinely collide in exactly one place. C16's
+	// version matrix reads the FRONT's `GET /api/version` (the front runs
+	// no announcer, and it is the box the incident happened to), and C15's
+	// rule is that EVERY fleetd→llama-swap request carries that cell's
+	// credential and folds the status back into its record. A doctor check
+	// that dialled a keyed front without the credential would read a 401
+	// as "the front did not answer" — the check going quiet about the one
+	// box it exists for.
+	//
+	// It is admissible under §1's own qualification 1: doctor's evidence
+	// is `Server.Snapshot`, which already probes this same front through
+	// `getJSON` with this same authorizer on this same run, so the
+	// credential record is a state READ's own bookkeeping (like
+	// last-seen.json's sighting) and not one of the three axes. Nothing
+	// here drains, warms, queues, renders or writes a file, which is what
+	// §1's list of verbs actually enumerates — and U1, the behavioural
+	// half and the assertion §1 calls the one that matters, is unchanged
+	// and untouched by this.
+	exempt := map[string]map[string]string{
+		"readSwapVersion": {
+			"AuthorizeSwap":  "the version read IS a fleetd→llama-swap request (C15)",
+			"NoteSwapStatus": "the same request's status, folded back exactly as getJSON folds the snapshot probe's",
+		},
+	}
+	fired := map[string]int{}
 	// Every file on the doctor path, not just this one. The scan used to
 	// cover fleetapi/doctor.go alone, which is the file LEAST able to
 	// mutate anything off-box.
@@ -239,6 +269,25 @@ func TestDoctor_ReachesNoMutatingVerb(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", path, err)
 		}
+		// The enclosing function of a position, so the exemption can be
+		// scoped to one function rather than to a whole file. Whole-file
+		// inspection is kept exactly as it was — a call in a var
+		// initialiser or a stray func literal still gets scanned, with no
+		// enclosing name and therefore no exemption available to it.
+		var decls []*ast.FuncDecl
+		for _, d := range file.Decls {
+			if fn, ok := d.(*ast.FuncDecl); ok {
+				decls = append(decls, fn)
+			}
+		}
+		enclosing := func(pos token.Pos) string {
+			for _, fn := range decls {
+				if pos >= fn.Pos() && pos <= fn.End() {
+					return fn.Name.Name
+				}
+			}
+			return ""
+		}
 		ast.Inspect(file, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
@@ -251,13 +300,30 @@ func TestDoctor_ReachesNoMutatingVerb(t *testing.T) {
 			case *ast.SelectorExpr:
 				name = fn.Sel.Name
 			}
-			if why, bad := banned[name]; bad {
-				t.Errorf("%s calls %s (%s). Doctor is read-only and safe to run mid-incident; if a check "+
-					"genuinely needs this, the phase doc's §1 promise has to change first.",
-					fset.Position(call.Pos()), name, why)
+			why, bad := banned[name]
+			if !bad {
+				return true
 			}
+			in := enclosing(call.Pos())
+			if _, ok := exempt[in][name]; ok {
+				fired[in+"."+name]++
+				return true
+			}
+			t.Errorf("%s calls %s (%s). Doctor is read-only and safe to run mid-incident; if a check "+
+				"genuinely needs this, the phase doc's §1 promise has to change first.",
+				fset.Position(call.Pos()), name, why)
 			return true
 		})
+	}
+	// An exemption nobody uses is an exemption nobody reviewed. If the
+	// version read stops calling these, the exemption goes with it rather
+	// than sitting there as a hole for the next producer to find.
+	for fn, names := range exempt {
+		for name := range names {
+			if fired[fn+"."+name] == 0 {
+				t.Errorf("the %s exemption for %s never fired — delete it; a stale exemption is a hole", fn, name)
+			}
+		}
 	}
 }
 

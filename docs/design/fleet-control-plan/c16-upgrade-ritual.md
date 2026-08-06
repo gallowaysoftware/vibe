@@ -268,15 +268,18 @@ no mechanism here that could perform them.
 | `deploy/front/docker-compose.yaml` | digest-pinned default + why |
 | `deploy/front/.env.example` | the same pin, and the pointer to the ritual |
 | `deploy/front/README.md` | "the image is digest-pinned, and moving the pin is a procedure" |
-| `internal/vibe/fleetapi/upgrade.go` | `front.image_pin`, `frontSwapVersion`, `GatedSwapVersions`, `ungatedSwapVersions` |
+| `internal/vibe/fleetapi/upgrade.go` | `front.image_pin`, `readSwapVersion` (+ its authorizer), `ReadOwnSwapVersion`, `frontSwapVersion`, `GatedSwapVersions`, `ungatedSwapVersions` |
 | `internal/vibe/fleetapi/doctor.go` | the two call sites + the ungated branch of `versions.llama_swap` |
 | `internal/vibe/daemon/daemon.go` | `fleet.front_image` |
 | `internal/vibe/daemon/doctor.go` | `DoctorHost.FrontImage` |
-| `internal/vibe/daemon/announce.go` | the `/api/version` producer, both announcer shapes |
+| `internal/vibe/daemon/announce.go` | the `/api/version` producer, both announcer shapes; the cell-side (unauthenticated) entry point, with C15 §8's reason at the call site |
 | `internal/vibe/cli/cmd_fleet.go` | the slim announcer passes its llama-swap URL |
 | `internal/swaptest/behaviour_test.go` | B1 + B2 |
 | `internal/swaptest/gated_test.go` | recordings ↔ `GatedSwapVersions` ↔ `ci.yml` |
-| `internal/vibe/fleetapi/c16_test.go` | the doctor checks + the reference-stack pin + the runnable ritual |
+| `internal/vibe/fleetapi/c16_test.go` | the doctor checks + the reference-stack pin + the runnable ritual + the four C15-composition tests |
+| `internal/vibe/fleetapi/c15_test.go` | `/api/version` on the keyed llama-swap double; `TestOnlyTheCellSideReaderSkipsSwapAuth` beside C15's scan |
+| `internal/vibe/fleetapi/c13_test.go` | the read-only scan learns one exemption, by enclosing function and by identifier |
+| `internal/swaptest/contract_test.go` | I6 reads through `ReadOwnSwapVersion` |
 | `scripts/upgrade/ritual.sh`, `README.md` | the ritual |
 | `.github/workflows/ci.yml`, `drift.yml` | `TestSwapBehaviour` joins both conformance jobs |
 
@@ -302,6 +305,12 @@ Unit (mechanical, in-repo):
 | U14 | *(review)* `TestSwapContract` **I6** gates `GET /api/version` through the real reader, on both fake wires | PASS |
 | U15 | *(review)* two spellings of one llama-swap release are not divergence | PASS |
 | U16 | *(review)* `repo:tag@sha256:` with an empty digest is not a pin | PASS |
+| U17 | *(merge)* the fleetd→front version read carries the front's declared key, and an UNRESOLVABLE declaration sends no request at all | PASS |
+| U18 | *(merge)* the reference fleet (no key declared anywhere) reads the version with no `Authorization` header and records no failure | PASS |
+| U19 | *(merge)* a 401 on the version read lands in `NoteSwapStatus`/`SwapAuthRefusal` exactly as the other producers' do, and an accepted read retires it | PASS |
+| U20 | *(merge)* the cell-side reader (`ReadOwnSwapVersion`) sends no credential, and is the ONLY function allowed to skip the authorizer | PASS |
+| U21 | *(merge)* C15's `TestEveryLlamaSwapRequestIsAuthorized` still fails for a genuinely unauthorized builder (scratch-file mutation) | PASS |
+| U22 | *(merge)* C13's read-only scan still fails for the same verbs in a neighbouring function, for a different verb inside the exempt one, and for an exemption that stopped firing | PASS |
 
 Live (a real llama-swap binary, a real fleet, or real clients):
 
@@ -647,6 +656,132 @@ Gates re-run after the fixes: `go build`, `go vet`, `gofmt -l .` silent,
 invariants) against **real v239 and real v247** binaries: green on both.
 `TestSwapBehaviour` against real v239: B1 6.45s, B2 30.30s, green.
 
+### The merge-forward composition failure: the version read carried no credential (C15 × C16)
+
+C15 (the llama-swap credential) and this phase were written in parallel
+off the same base. Each is correct alone. Merged, C15's structural scan
+went red on this phase's code:
+
+```
+--- FAIL: TestEveryLlamaSwapRequestIsAuthorized
+    c15_test.go: upgrade.go: ReadSwapVersion builds an HTTP request to a
+    llama-swap without calling AuthorizeSwap — every fleetd→llama-swap
+    call carries the cell's credential (C15)
+```
+
+Not a false positive, and not a test to soften. `/api/version` is gated
+by llama-swap's `apiKeys` like everything except `/health`, and this
+reader renders a 401 as `""` — so on a fleet that had done nothing wrong
+but set a key, `versions.llama_swap` would have gone quiet about the
+FRONT, the one box this check exists for and the one the 2026-08-05
+incident happened to. This phase's own A-3 finding had already named the
+shape ("an ungated upstream dependency in the phase whose thesis is
+gating upstream contracts"); the credential is the same sentence one
+layer down. The scan found mechanically what two review passes read past.
+
+**Why it is not a one-line change.** `ReadSwapVersion` had two callers
+with opposite postures: `Server.frontSwapVersion` (fleetd → the FRONT's
+llama-swap, which must carry that cell's credential) and
+`daemon.llamaSwapVersion` (a CELL reading its own 127.0.0.1 llama-swap,
+which has no `fleetapi.Server` and no `hosts.yaml` to resolve one from —
+C15 §8 scopes the cell-side dialers out on purpose, as a different config
+surface). Making it a method breaks the second; leaving it alone defeats
+C15.
+
+**The shape chosen.** One reader, two postures, and the difference is a
+parameter that cannot be defaulted:
+
+```go
+func readSwapVersion(ctx context.Context, auth *Server, cell string,
+                     client *http.Client, baseURL string) string
+```
+
+- `Server.frontSwapVersion` passes `s` and `fleetcfg.FrontCell`. The
+  request carries the front's credential; an UNRESOLVABLE declaration
+  returns before `client.Do` (AuthorizeSwap's contract: fleetd sends
+  nothing rather than sending it unauthenticated); a cell that declares
+  no key leaves the request untouched, which is the reference fleet.
+- `ReadOwnSwapVersion(ctx, client, baseURL)` is the exported cell-side
+  entry point — the only caller that passes `nil` — used by
+  `daemon/announce.go` and by `swaptest`'s I6. The reason it is
+  unauthenticated is written in its doc comment, next to the reader,
+  rather than left as a bare `nil` at three call sites.
+- The response status folds into `NoteSwapStatus` in the same place every
+  other producer folds it (`getJSON`, `streamCell`, `warmViaFront`: after
+  the response, before the status check), so a 401 arms the sticky
+  refusal and a 200 retires it. It is deliberately NOT gated by
+  `SwapAuthRefusal` on the way in — checked, not assumed: C15 gates the
+  automated loops and explicitly does not gate an operator's own verb,
+  and this read is reached from `vibe fleet doctor`.
+
+**Alternatives evaluated, and why not.**
+
+- *An injected `authorize func(*http.Request) error`* (the obvious
+  candidate). It works, but the authorizer is then invisible to C15's
+  scan — the enclosing function calls `authorize(req)`, not
+  `AuthorizeSwap` — so the scan has to be taught a new shape in the same
+  commit that adds the first thing it does not recognise. Passing the
+  `*Server` keeps the scan's rule and its implementation exactly as C15
+  wrote them, and carries `NoteSwapStatus` too, which a bare authorize
+  func cannot.
+- *Moving the reader out of `fleetapi` so the scan's scope matches its
+  rule.* This is the dodge it looks like: the fleetd→front read is still
+  a fleetd→llama-swap request, and relocating it converts a mechanical
+  guarantee into a naming convention. Rejected for the same reason A-3
+  rejected a hand-rolled `httptest` for an upstream contract.
+- *The wrapper building and authorizing the request and passing it in.*
+  Then the URL and the `/api/version` path live at the call sites, which
+  is two copies of the endpoint this phase spent A-3 gating — and the
+  live mutation that proves I6 works (rename the path in the reader)
+  stops being a single edit.
+
+**The hole the chosen shape opens, and the test that closes it.** A
+nilable authorizer means a future fleetd producer could satisfy C15's
+scan by taking the same parameter and always receiving `nil`. So
+`TestOnlyTheCellSideReaderSkipsSwapAuth` scans `fleetapi`'s non-test
+sources for `readSwapVersion` calls and fails if any function other than
+`ReadOwnSwapVersion` passes a nil authorizer, with inertness guards in
+both directions (fewer than two call sites, or an exemption that stopped
+existing, is a failure rather than a quiet pass).
+
+**The second collision: C13's read-only scan.** Fixing C15's complaint
+turned C13's `TestDoctor_ReachesNoMutatingVerb` red, because C15 put
+`AuthorizeSwap` and `NoteSwapStatus` on the banned list and C16 put
+`upgrade.go` on the scanned-files list. Both were right when written, and
+they meet in exactly one function.
+
+Resolved by exempting `readSwapVersion` — by enclosing function AND by
+identifier, so every other caller in every other doctor file stays red,
+and with an "an exemption that never fired is a hole" guard so it cannot
+outlive its reason. It is admissible under C13 §1's own qualification 1:
+doctor's evidence is `Server.Snapshot`, which already probes this same
+front through `getJSON` with this same authorizer on this same run, so
+the credential record is a state READ's own bookkeeping (like
+`last-seen.json`'s sighting) rather than one of the three axes. Nothing
+on the path drains, warms, queues, renders or writes a file, which is
+what §1's rule actually enumerates — and U1, the behavioural half that
+§1 calls "the assertion that matters", is untouched and green.
+
+**Mutation record** (each mutation applied, the named test observed red,
+the mutation restored):
+
+| mutation | red |
+|---|---|
+| drop the `AuthorizeSwap` call from `readSwapVersion` | `TestEveryLlamaSwapRequestIsAuthorized`, `TestFrontSwapVersion_CarriesTheFrontsCredential`, `TestFrontSwapVersion_UnresolvableCredentialSendsNothing`, `TestFrontSwapVersion_401FeedsTheCredentialMachinery` |
+| drop the `NoteSwapStatus` call | `TestFrontSwapVersion_401FeedsTheCredentialMachinery` |
+| `frontSwapVersion` passes `nil` instead of `s` | `TestOnlyTheCellSideReaderSkipsSwapAuth` |
+| a deliberately unauthorized request builder added to `fleetapi` (scratch file, since removed) | `TestEveryLlamaSwapRequestIsAuthorized` — the scan still catches what it was written for |
+| a banned verb (`NoteSwapStatus`) in a NEIGHBOURING function of `upgrade.go` | `TestDoctor_ReachesNoMutatingVerb` — the exemption does not spread |
+| a different banned verb (`recordSwapAuth`) INSIDE `readSwapVersion` | `TestDoctor_ReachesNoMutatingVerb` — the exemption is per identifier |
+| `readSwapVersion` stops calling `AuthorizeSwap` | `TestDoctor_ReachesNoMutatingVerb` — the stale-exemption guard |
+
+Gates re-run after the fix: `go build ./...`, `go vet ./...`,
+`gofmt -l .` silent, `go mod tidy` byte-identical,
+`golangci-lint run` **0 issues**, `go test -race -count=2` green on
+`fleetapi`, `fleetmcp` and `daemon`, and `go test -race ./...` green
+across the module (`swaptest` included, so I6 still reads the endpoint
+through the real reader).
+
 ## For the reconciliation pass
 
 This branch does not touch `AGENTS.md`,
@@ -691,11 +826,17 @@ A new section, "The upgrade ritual (fleet-control C16)":
   declaration that the front runs no container). What catches a
   declaration nobody applied is the observed version matrix.
 - **`versions.llama_swap` has a producer** (C13 reported it UNKNOWN naming
-  the gap): `fleetapi.ReadSwapVersion` is the ONE reader —
+  the gap): `fleetapi.readSwapVersion` is the ONE reader —
   `GET /api/version`, verified against real v239 and v247 binaries — used
   by both producers, each cell for its own llama-swap and fleetd directly
   for the FRONT's (the front runs no announcer and is the box the incident
-  happened to). It **rejects rather than truncates**: a truncated version
+  happened to). ONE reader, TWO postures: the fleetd path
+  (`frontSwapVersion`) carries the front's C15 credential and folds the
+  status back through `NoteSwapStatus`, and `ReadOwnSwapVersion` is the
+  cell-side entry point that presents none, because C15 §8 scopes the
+  cell-side dialers out. `TestOnlyTheCellSideReaderSkipsSwapAuth` is what
+  keeps the second from becoming a way around C15's scan. It **rejects
+  rather than truncates**: a truncated version
   is a guess that becomes its own matrix key, and an unprintable one makes
   fleetd's `clean` refuse the cell's WHOLE announce — presence, intent
   echo, usage and probes with it. The endpoint is gated like any other

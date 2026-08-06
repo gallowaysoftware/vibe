@@ -200,6 +200,129 @@ func TestFrontSwapVersion_FailureIsAbsenceNotAgreement(t *testing.T) {
 	}
 }
 
+// ── C15 composition: the version read is a fleetd→llama-swap call ───────
+//
+// This phase's reader landed on a branch cut before C15 and merged after
+// it, and the fleetd half went out with no credential. C15's structural
+// scan caught it; these four state what the scan cannot — what the wire
+// carries, what happens when it cannot be built, and where the refusal is
+// recorded. The helpers are C15's (keyedSwap, hostsWith*), deliberately:
+// a second llama-swap double with a second idea of what apiKeys means is
+// how the two halves would drift again.
+
+// TestFrontSwapVersion_CarriesTheFrontsCredential is the regression. A
+// keyed front 401s /api/version exactly as it 401s /running, and this
+// reader renders a 401 as "" — so an unauthenticated read makes the
+// version matrix go quiet about the ONE box C16 exists for, on a fleet
+// whose only fault was setting a key.
+func TestFrontSwapVersion_CarriesTheFrontsCredential(t *testing.T) {
+	front := newKeyedSwap(t, labSwapKey)
+	s := newC15Server(t, front, hostsWithKey(t, front.srv.URL, labSwapKey))
+	if got := s.frontSwapVersion(t.Context()); got != "v239" {
+		t.Fatalf("frontSwapVersion through a keyed front = %q, want v239", got)
+	}
+	req := <-front.seen
+	if req.URL.Path != "/api/version" {
+		t.Fatalf("first request was %s, want /api/version", req.URL.Path)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer "+labSwapKey {
+		t.Fatalf("Authorization = %q, want the front's declared key as a bearer", got)
+	}
+}
+
+// TestFrontSwapVersion_UnresolvableCredentialSendsNothing: AuthorizeSwap's
+// contract is that a DECLARED key which will not resolve means no request
+// is sent at all. Sending it unauthenticated instead would turn an
+// operator typo into an opaque 401 from a box across the house — and here
+// it would additionally read as "the front did not answer", which is a
+// sentence about the front rather than about hosts.yaml.
+func TestFrontSwapVersion_UnresolvableCredentialSendsNothing(t *testing.T) {
+	front := newKeyedSwap(t, labSwapKey)
+	missing := filepath.Join(t.TempDir(), "gone.key")
+	s := newC15Server(t, front, hostsWithKeyPath(t, front.srv.URL, missing))
+
+	if got := s.frontSwapVersion(t.Context()); got != "" {
+		t.Fatalf("frontSwapVersion = %q, want absence", got)
+	}
+	if n := front.requests(); n != 0 {
+		t.Fatalf("the front saw %d request(s) with an unresolvable credential declared, want 0 — fail CLOSED", n)
+	}
+	f, bad := s.swapAuthState(fleetcfg.FrontCell)
+	if !bad || f.Kind != SwapAuthUnresolvable {
+		t.Fatalf("swap auth state = %+v (recorded=%v), want %s", f, bad, SwapAuthUnresolvable)
+	}
+}
+
+// TestFrontSwapVersion_UnkeyedFleetIsUntouched: the reference fleet
+// declares no key anywhere, llama-swap runs without apiKeys, and the read
+// must work with no header at all. A credential half of a feature that
+// breaks the posture 99% of this fleet runs is not a fix.
+func TestFrontSwapVersion_UnkeyedFleetIsUntouched(t *testing.T) {
+	front := newKeyedSwap(t, "")
+	s := newC15Server(t, front, hostsWithKeyPath(t, front.srv.URL, ""))
+	if got := s.frontSwapVersion(t.Context()); got != "v239" {
+		t.Fatalf("frontSwapVersion on an unkeyed fleet = %q, want v239", got)
+	}
+	req := <-front.seen
+	if got := req.Header.Get("Authorization"); got != "" {
+		t.Fatalf("Authorization = %q on a fleet that declares no key, want none", got)
+	}
+	if _, bad := s.swapAuthState(fleetcfg.FrontCell); bad {
+		t.Fatal("a successful unkeyed read recorded a credential failure")
+	}
+}
+
+// TestFrontSwapVersion_401FeedsTheCredentialMachinery: the status folds
+// into the cell's record the same way every other producer's does
+// (getJSON, streamCell, warmViaFront all call NoteSwapStatus after the
+// response). Without it the version read is the one fleetd→llama-swap
+// call whose 401 teaches the fleet nothing: doctor's swap.credential goes
+// on saying the front is fine, and the sticky refusal that stops the warm
+// loops from 401ing 5,760 times a day never arms.
+func TestFrontSwapVersion_401FeedsTheCredentialMachinery(t *testing.T) {
+	front := newKeyedSwap(t, labSwapKey)
+	s := newC15Server(t, front, hostsWithKeyPath(t, front.srv.URL, ""))
+
+	if got := s.frontSwapVersion(t.Context()); got != "" {
+		t.Fatalf("frontSwapVersion against a front that refused = %q, want absence", got)
+	}
+	f, bad := s.swapAuthState(fleetcfg.FrontCell)
+	if !bad || f.Kind != SwapAuthUnauthorized {
+		t.Fatalf("swap auth state = %+v (recorded=%v), want %s", f, bad, SwapAuthUnauthorized)
+	}
+	why, blocked := s.SwapAuthRefusal(fleetcfg.FrontCell)
+	if !blocked || !strings.Contains(why, "swap_key_file") {
+		t.Fatalf("SwapAuthRefusal = (%q, %v), want the no-retry-loop rule armed and naming the config", why, blocked)
+	}
+
+	// And a later accepted call retires it, so a fixed key file is not
+	// reported as broken forever.
+	s2 := newC15Server(t, front, hostsWithKey(t, front.srv.URL, labSwapKey))
+	if got := s2.frontSwapVersion(t.Context()); got != "v239" {
+		t.Fatalf("frontSwapVersion after the key was fixed = %q, want v239", got)
+	}
+	if _, bad := s2.swapAuthState(fleetcfg.FrontCell); bad {
+		t.Fatal("an accepted read left a credential failure recorded")
+	}
+}
+
+// TestReadOwnSwapVersion_PresentsNoCredential pins the OTHER posture, so
+// that "the cell side is unauthenticated" is a tested fact with a reason
+// rather than an oversight nobody wrote down. C15 §8 scopes the cell-side
+// dialers out — they take `--llama-swap <url>` on the CLI and a slim
+// announcer's box may hold no hosts.yaml — and closing that gap is C15's
+// recorded futures item, not something this phase invents a second
+// credential surface for.
+func TestReadOwnSwapVersion_PresentsNoCredential(t *testing.T) {
+	swap := newKeyedSwap(t, "")
+	if got := ReadOwnSwapVersion(t.Context(), swap.srv.Client(), swap.srv.URL); got != "v239" {
+		t.Fatalf("ReadOwnSwapVersion = %q, want v239", got)
+	}
+	if h := (<-swap.seen).Header.Get("Authorization"); h != "" {
+		t.Fatalf("the cell-side reader sent %q; it has no hosts.yaml to resolve a credential from", h)
+	}
+}
+
 // TestReferenceFrontStackShipsADigestPin is the whole first half of this
 // phase, mechanically. deploy/front/README.md RECOMMENDED pinning while
 // docker-compose.yaml floated the tag, and advice that the shipped default
@@ -449,8 +572,8 @@ func TestReadSwapVersion_RejectsRatherThanTruncates(t *testing.T) {
 				_, _ = w.Write([]byte(tc.body))
 			}))
 			defer srv.Close()
-			if got := ReadSwapVersion(context.Background(), srv.Client(), srv.URL); got != "" {
-				t.Fatalf("ReadSwapVersion = %q, want absence — a truncated or unprintable version is a guess, "+
+			if got := ReadOwnSwapVersion(context.Background(), srv.Client(), srv.URL); got != "" {
+				t.Fatalf("ReadOwnSwapVersion = %q, want absence — a truncated or unprintable version is a guess, "+
 					"and an unprintable one makes fleetd's clean() refuse the whole announce", got)
 			}
 		})
@@ -459,11 +582,11 @@ func TestReadSwapVersion_RejectsRatherThanTruncates(t *testing.T) {
 		_, _ = w.Write([]byte(`{"version":" v239 ","commit":"dd81801"}`))
 	}))
 	defer srv.Close()
-	if got := ReadSwapVersion(context.Background(), srv.Client(), srv.URL); got != "v239" {
-		t.Fatalf("ReadSwapVersion = %q, want v239", got)
+	if got := ReadOwnSwapVersion(context.Background(), srv.Client(), srv.URL); got != "v239" {
+		t.Fatalf("ReadOwnSwapVersion = %q, want v239", got)
 	}
-	if got := ReadSwapVersion(context.Background(), srv.Client(), ""); got != "" {
-		t.Fatalf("ReadSwapVersion with no base URL = %q, want empty", got)
+	if got := ReadOwnSwapVersion(context.Background(), srv.Client(), ""); got != "" {
+		t.Fatalf("ReadOwnSwapVersion with no base URL = %q, want empty", got)
 	}
 }
 

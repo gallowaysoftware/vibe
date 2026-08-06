@@ -428,16 +428,19 @@ func headID(t *testing.T, tgt target) int64 {
 // designed to notice an ungated upgrade goes SILENT on exactly the
 // upgrade big enough to move an endpoint.
 //
-// Folded through the REAL reader (fleetapi.ReadSwapVersion), like I1's
+// Folded through the REAL reader (fleetapi.ReadOwnSwapVersion — the
+// unauthenticated entry point onto the same core the front-side read
+// uses; the conformance target is a double or a binary this test started,
+// which is what "own" means here), like I1's
 // in-flight fold and I2-I4's usagemeter classification, so a decoder that
 // stops parsing the real payload fails here rather than in a doctor
 // report nobody reruns.
 func i6(t *testing.T, tgt target) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	got := fleetapi.ReadSwapVersion(ctx, &http.Client{Timeout: 10 * time.Second}, tgt.url)
+	got := fleetapi.ReadOwnSwapVersion(ctx, &http.Client{Timeout: 10 * time.Second}, tgt.url)
 	if got == "" {
-		t.Fatalf("GET %s/api/version produced no version through fleetapi.ReadSwapVersion. "+
+		t.Fatalf("GET %s/api/version produced no version through fleetapi.ReadOwnSwapVersion. "+
 			"doctor's versions.llama_swap has no other producer, so this reads as \"nobody answered\" "+
 			"on a fleet that is running something.", tgt.url)
 	}

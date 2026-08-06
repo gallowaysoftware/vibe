@@ -176,13 +176,21 @@ var swapVersionClient = &http.Client{Timeout: llamaSwapVersionTimeout}
 // The read itself is fleetapi's, shared with the front-side reader, so the
 // two cannot drift on what they accept. Every failure returns "", which
 // doctor renders as "no cell reports a version", never as agreement.
+//
+// The UNAUTHENTICATED half of that shared reader, deliberately: this is a
+// cell reading its own 127.0.0.1 llama-swap, and C15 §8 scopes the
+// cell-side dialers out of the credential (different config surface — a
+// slim announcer's box may hold no hosts.yaml). If this cell keys its own
+// llama-swap, `/api/version` 401s and the announce carries no version;
+// the fix is C15's recorded futures item, not a credential invented here.
+// fleetapi.ReadOwnSwapVersion's doc comment is the long form.
 func llamaSwapVersion(baseURL string) string {
 	if baseURL == "" {
 		return ""
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), llamaSwapVersionTimeout)
 	defer cancel()
-	return fleetapi.ReadSwapVersion(ctx, swapVersionClient, baseURL)
+	return fleetapi.ReadOwnSwapVersion(ctx, swapVersionClient, baseURL)
 }
 
 // localLlamaSwapURL is the daemon's own router base. Same construction as

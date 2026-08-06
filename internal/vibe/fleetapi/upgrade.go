@@ -100,7 +100,7 @@ func (s *Server) checkFrontImage(rep *DoctorReport, host DoctorHost) {
 // before the value exists at all.
 const MaxSwapVersionLen = 64
 
-// ReadSwapVersion reads a llama-swap's own version off GET /api/version.
+// readSwapVersion reads a llama-swap's own version off GET /api/version.
 //
 // ONE reader, because there are two producers and they must not drift:
 // each cell reads its own llama-swap for the announce block, and fleetd
@@ -116,7 +116,21 @@ const MaxSwapVersionLen = 64
 //
 // So every failure — transport, status, JSON, hygiene — returns "". The
 // caller must render that as an ABSENCE and never as agreement.
-func ReadSwapVersion(ctx context.Context, client *http.Client, baseURL string) string {
+//
+// ONE reader, TWO postures, and the difference is the parameter that
+// cannot be defaulted (C15's composition with this phase). `auth` is the
+// fleetd Server whose credential the request must carry, and `cell` names
+// which cell's credential that is: /api/version is gated by llama-swap's
+// `apiKeys` like everything except /health, so fleetd reading a keyed
+// front WITHOUT the credential gets a 401, which this reader renders as
+// an absence — the version matrix would then go quiet about the one box
+// it exists for, on a fleet that had done nothing wrong but set a key.
+//
+// `auth` is nil for exactly one caller, ReadOwnSwapVersion, which is a
+// box reading its OWN localhost llama-swap and has no hosts.yaml to
+// resolve a credential from. Nothing else may pass nil, and
+// TestOnlyTheCellSideReaderSkipsSwapAuth fails if anything does.
+func readSwapVersion(ctx context.Context, auth *Server, cell string, client *http.Client, baseURL string) string {
 	if client == nil || strings.TrimSpace(baseURL) == "" {
 		return ""
 	}
@@ -124,11 +138,30 @@ func ReadSwapVersion(ctx context.Context, client *http.Client, baseURL string) s
 	if err != nil {
 		return ""
 	}
+	if auth != nil {
+		// Fail CLOSED: a declared key that will not resolve means no
+		// request is sent at all (AuthorizeSwap's contract), and the
+		// refusal is already recorded as SwapAuthUnresolvable by the
+		// resolver. Sending it anyway would turn an operator typo into a
+		// 401 from a box across the house.
+		if err := auth.AuthorizeSwap(req, cell); err != nil {
+			return ""
+		}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return ""
 	}
 	defer resp.Body.Close()
+	if auth != nil {
+		// Same place every other producer folds it in (getJSON,
+		// streamCell, warmViaFront): after the response, before the status
+		// check, so a 401 lands in the credential record and a 200 clears
+		// it. Not gated by SwapAuthRefusal on the way in — this read is
+		// reached from `vibe fleet doctor`, and C15's no-retry-loop rule
+		// deliberately does not gate an operator's own verb.
+		auth.NoteSwapStatus(cell, resp.StatusCode)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return ""
 	}
@@ -147,12 +180,36 @@ func ReadSwapVersion(ctx context.Context, client *http.Client, baseURL string) s
 	return v
 }
 
+// ReadOwnSwapVersion reads a llama-swap's version presenting NO
+// credential. It is the CELL-side entry point: the announcer's version
+// producer (daemon/announce.go) reads the llama-swap on its own
+// 127.0.0.1, and `internal/swaptest`'s conformance target reads a double
+// or a binary the test itself started.
+//
+// Unauthenticated on purpose, and the purpose is written here rather than
+// left at the call sites so the next agent finds it beside the reader:
+// C15 §8 scopes the cell-side dialers OUT — `fleetannounce`, C8's
+// `modelprobe` and the cell's own usage collector take `--llama-swap
+// <url>` on the CLI and a slim announcer's box may hold no `hosts.yaml`
+// at all, so there is no per-cell credential to resolve here. A cell that
+// keys its OWN llama-swap loses this field (and, per C15 §8's recorded
+// hazard, its announced model list) until that futures item lands. It is
+// the reference fleet — only the FRONT is keyed — that this serves today.
+//
+// fleetd must never call this: its path is frontSwapVersion, which
+// carries the front's credential.
+func ReadOwnSwapVersion(ctx context.Context, client *http.Client, baseURL string) string {
+	return readSwapVersion(ctx, nil, "", client, baseURL)
+}
+
 // frontSwapVersion reads the FRONT's llama-swap version directly, on the
 // address fleetd already probes — no announcer invented.
 //
 // Failure returns "", and checkVersions is responsible for SAYING SO: a
 // front the fleet could not read must not vanish into a verdict about the
-// cells that answered.
+// cells that answered. Since C15 that includes a credential fleetd could
+// not resolve: no request goes out, and the front is reported as unread
+// rather than as agreeing with whatever the cells said.
 func (s *Server) frontSwapVersion(ctx context.Context) string {
 	var url string
 	for _, c := range s.cells {
@@ -161,7 +218,7 @@ func (s *Server) frontSwapVersion(ctx context.Context) string {
 			break
 		}
 	}
-	return ReadSwapVersion(ctx, s.snapClient, url)
+	return readSwapVersion(ctx, s, fleetcfg.FrontCell, s.snapClient, url)
 }
 
 // hasFrontCell reports whether the registry carries a front with an
