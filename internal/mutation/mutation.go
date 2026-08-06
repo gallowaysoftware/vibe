@@ -44,6 +44,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/gallowaysoftware/vibe/internal/astscan"
 )
 
 // Mutation is one guard and the edit that disarms it.
@@ -250,6 +252,20 @@ var Registry = []Mutation{
 			"git init / git config / git add -A / git commit. With a wrong FLEETLAB_DIR the cd " +
 			"fails, the shell stays in the operator's CWD, and the rig commits their working tree.",
 	},
+	{
+		Name:     "c21/a git write that does not name its repository",
+		File:     "scripts/fleetlab/gate-c13-parity.sh",
+		Find:     "git -C \"$DEFS\" init -q .",
+		Replace:  "git init -q .",
+		Pkg:      "./internal/shelllint/",
+		MustFail: []string{"TestScriptsAreSafe"},
+		Why: "the OTHER half of the C17 blocker. The cd rule catches the chdir that fails; this is " +
+			"what a failed chdir then lets loose — `git init`, `git config user.*`, `git add -A`, " +
+			"`git commit` in whatever repository the shell is standing in, which in the C17 " +
+			"reproduction was the operator's own. gate-c13-parity.sh was rewritten to use `git -C` " +
+			"everywhere BECAUSE of that incident, and nothing until now stopped the next rig " +
+			"dropping it again.",
+	},
 
 	// ── the doctor's read-only promise ────────────────────────────────
 	{
@@ -315,9 +331,18 @@ func RepoRoot(dir string) (string, error) {
 }
 
 // skipDirs are excluded from the working copy: version control, cached
-// upstream binaries and build output are all irrelevant to a mutation and
-// dominate the copy time.
-var skipDirs = map[string]bool{".git": true, ".upstream": true, "__pycache__": true, "node_modules": true}
+// upstream binaries, agent scratch space and build output are all
+// irrelevant to a mutation and dominate the copy time.
+//
+// .claude is not merely scratch. This repo runs one git WORKTREE per
+// parallel agent under .claude/worktrees/, so copying it means copying a
+// complete second (and ninth) checkout of this module into every worker's
+// tree — and then the module-wide scans in internal/vibe/observed and
+// internal/shelllint, which several registry entries name as their
+// MustFail test, run over all of them. astscan.ForeignDir below is the
+// general form; this entry is the cheap one that stops the walk before it
+// stats nine thousand files.
+var skipDirs = map[string]bool{".git": true, ".upstream": true, ".claude": true, "__pycache__": true, "node_modules": true}
 
 // CopyTree makes a working copy of the repo. Cheap enough to do per
 // worker (~8 MB of source) and the only way two mutations can be applied
@@ -332,7 +357,7 @@ func CopyTree(src, dst string) error {
 			return err
 		}
 		if d.IsDir() {
-			if skipDirs[d.Name()] {
+			if skipDirs[d.Name()] || astscan.ForeignDir(src, path) {
 				return filepath.SkipDir
 			}
 			return os.MkdirAll(filepath.Join(dst, rel), 0o755)

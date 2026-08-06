@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -350,6 +351,64 @@ func TestRunnerRequiresEVERYNamedTestToFail(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "UNPROTECTED") || !strings.Contains(err.Error(), "TestRoutes_EveryRouteDeclaresAnAccessLevel") {
 		t.Fatalf("err = %v, want an UNPROTECTED finding naming the test that stayed green", err)
+	}
+}
+
+// TestCopyTreeStopsAtANestedCheckout: several registry entries name a
+// MODULE-WIDE scan as their MustFail test (the three in
+// internal/vibe/observed, and TestScriptsAreSafe). Those scans run inside
+// the worker's copy, so anything CopyTree drags in becomes part of what
+// they examine. This repo keeps a git worktree per parallel agent under
+// .claude/worktrees/ — a full second copy of the module, whose .git is a
+// FILE and not a directory — and copying one in makes every module-wide
+// scan report the same finding twice under a path no exemption can name.
+func TestCopyTreeStopsAtANestedCheckout(t *testing.T) {
+	src := t.TempDir()
+	write := func(rel, body string) {
+		t.Helper()
+		path := filepath.Join(src, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("go.mod", "module example.com/m\n")
+	// The source is itself a worktree: .git is a file at its root, and the
+	// copy must still descend into the tree it names.
+	write(".git", "gitdir: /elsewhere/.git/worktrees/src\n")
+	write("internal/pkg/pkg.go", "package pkg\n")
+	write("scripts/rig.sh", "set -euo pipefail\n")
+	write(".claude/worktrees/agent-a1/.git", "gitdir: /elsewhere\n")
+	write(".claude/worktrees/agent-a1/internal/pkg/pkg.go", "package pkg\n")
+	write("tmp/checkout/.git/HEAD", "ref: refs/heads/main\n")
+	write("tmp/checkout/internal/pkg/pkg.go", "package pkg\n")
+	write("contrib/vendored/go.mod", "module example.com/other\n")
+	write("contrib/vendored/x.go", "package other\n")
+
+	dst := filepath.Join(t.TempDir(), "copy")
+	if err := CopyTree(src, dst); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	var got []string
+	if err := filepath.WalkDir(dst, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			rel, _ := filepath.Rel(dst, path)
+			got = append(got, filepath.ToSlash(rel))
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(got)
+	want := []string{"go.mod", "internal/pkg/pkg.go", "scripts/rig.sh"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("copied %v, want %v — a foreign checkout in the worker's tree is examined by every "+
+			"module-wide scan a registry entry names", got, want)
 	}
 }
 

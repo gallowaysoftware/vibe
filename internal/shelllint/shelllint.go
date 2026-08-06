@@ -1,5 +1,5 @@
 // Package shelllint is the mechanical form of one real blocker
-// (fleet-control C20, class 8).
+// (fleet-control C20, class 8; extended in C21).
 //
 // `gate-c13-parity.sh` ran `cd "$LAB/etc/vibe/backends"` bare, under
 // `set -uo pipefail` with **no** `-e`, and then `git init`,
@@ -13,30 +13,43 @@
 // The rigs under scripts/ are not incidental. They are where every live
 // gate in this plan runs, they run beside a production llama-swap on
 // :9000 and a production vibe daemon on :9001, and they are written
-// fast under time pressure. Three rules, all cheap, all with written
+// fast under time pressure. Four rules, all cheap, all with written
 // exemptions:
 //
 //  1. a `cd` whose failure is not handled, in a script without `set -e`;
-//  2. `rm -rf` on a bare variable expansion, where an unset or EMPTY
-//     variable makes the target `/` or the current directory;
-//  3. a `pkill`/`killall` pattern with no variable in it, which cannot
-//     be scoped to this rig's own processes and is entitled to kill a
-//     sibling lab's (futures item 15 is the same hazard, from the port
-//     side).
+//  2. `rm -rf` on a path segment an empty variable would erase, which
+//     makes the target `/`, the current directory, or — the C21
+//     addition — the target's own PARENT;
+//  3. a `pkill`/`killall` that cannot be scoped to this rig's own
+//     processes, and is therefore entitled to kill a sibling lab's
+//     (futures item 15 is the same hazard, from the port side);
+//  4. a git WRITE verb that does not name the repository it writes to.
+//     Rule 1 catches the bad `cd`; this is what makes a bad `cd`
+//     catastrophic rather than merely wrong, and it is the other half of
+//     the C17 blocker.
 //
 // No external linter: shellcheck is a binary this repo does not vendor
-// and CI would have to install, and these three rules are the ones this
+// and CI would have to install, and these rules are the ones this
 // project's own history produced.
+//
+// C21 also widened the walk from scripts/ to the whole module. install.sh
+// is the script this project asks strangers to pipe into sh, and it had
+// never been linted; internal/install_test.sh had never been linted
+// either. A linter whose root excludes the most-executed shell script in
+// the repository is not a coverage story, it is a coincidence.
 package shelllint
 
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/gallowaysoftware/vibe/internal/astscan"
 )
 
 // Finding is one flagged line.
@@ -55,54 +68,161 @@ func (f Finding) String() string {
 // Key is the exemption key: file plus rule plus line text is too brittle,
 // file plus rule too coarse. File + line number moves with any edit, which
 // is deliberate — an exemption should not survive the line it exempts.
+//
+// Known coarseness: two findings of the SAME rule on the same line share a
+// key, so one exemption covers both. Reachable only by writing two
+// hazardous commands of one kind on one line (`rm -rf "$A"; rm -rf "$B"`);
+// recorded rather than fixed because a per-occurrence index would make
+// every existing key depend on the order of matches within a line.
 func (f Finding) Key() string { return fmt.Sprintf("%s:%d:%s", f.File, f.Line, f.Rule) }
 
 const (
-	RuleUnguardedCd = "unguarded-cd"
-	RuleRmRfVar     = "rm-rf-bare-var"
-	RuleBroadKill   = "unscoped-kill"
+	RuleUnguardedCd  = "unguarded-cd"
+	RuleRmRfVar      = "rm-rf-bare-var"
+	RuleBroadKill    = "unscoped-kill"
+	RuleGitWriteHere = "git-write-no-repo"
 )
+
+// Stats is what the lint EXAMINED, not what it found. Every rule needs its
+// own denominator: the file count says the walk ran, and says nothing
+// about whether a rule's pattern still matches anything. A repo that
+// stopped using `pkill` would retire rule 3 in silence, which is the exact
+// failure mode this package exists to prevent in shell scripts.
+type Stats struct {
+	Files int
+	// Cd counts cd commands in command position, guarded or not.
+	Cd int
+	// RmRecursive counts rm invocations carrying a recursive flag.
+	RmRecursive int
+	// Kill counts pkill/killall invocations.
+	Kill int
+	// GitWrite counts git invocations whose subcommand writes.
+	GitWrite int
+}
 
 var (
 	setLine = regexp.MustCompile(`^\s*set\s+[-+a-zA-Z\s]*`)
-	// A cd at the start of a command position: line start, or after ; && || ( {.
-	cdLine   = regexp.MustCompile(`(^|[;&|(){}]\s*)cd\s`)
-	rmCmd    = regexp.MustCompile(`(^|[;&|(){}'"]|\s)rm\s`)
-	killLine = regexp.MustCompile(`\b(pkill|killall)\b([^\n]*)`)
-	// ${VAR:?...} and ${VAR:-...} both make an empty expansion safe: the
-	// first aborts, the second substitutes.
-	guardedExpansion = regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_]*:[?+-]`)
-	bareExpansion    = regexp.MustCompile(`\$\{?[A-Za-z_][A-Za-z0-9_]*\}?`)
+	// Command position: line start — INDENTED or not, because a rig's
+	// commands live inside functions and an anchor of `^` alone saw only
+	// the top-level ones — or after ; && || | ( ) { }, or after one of the
+	// keywords that introduces a command. `then cd "$LAB"` used to be
+	// invisible to this rule for want of the keyword alternative.
+	cmdPos  = `(?:^\s*|[;&|(){}]\s*|\b(?:then|do|else)\s+)`
+	cdLine  = regexp.MustCompile(cmdPos + `cd\s`)
+	gitLine = regexp.MustCompile(cmdPos + `git\s`)
+	rmCmd   = regexp.MustCompile(`(^|[;&|(){}'"]|\s)rm\s`)
+	// `[^;\n]*` rather than `[^\n]*` so a SECOND kill on the same line is
+	// its own match. `pkill -f "$LAB/x"; pkill -f llama-swap` was read as
+	// one invocation — the scoped one — and the unscoped half, which on
+	// this box reaches the production llama-swap on :9000, was never
+	// examined at all.
+	killLine = regexp.MustCompile(`\b(pkill|killall)\b([^;\n]*)`)
+	// pkill's full-command-line match: `-f`, a bundle carrying it
+	// (`pkill -9f`), or the long form `--full`.
+	killFullMatch = regexp.MustCompile(`(^|\s)(--full\b|-[0-9a-zA-Z]*f)`)
+	// ${VAR:?...} aborts on empty and ${VAR:-...} substitutes, so neither
+	// can collapse to nothing.
+	//
+	// `:+` used to be in this class and is NOT a guard: `${VAR:+word}`
+	// expands to the EMPTY string exactly when VAR is empty, which is the
+	// hazard rather than the fix.
+	guardedExpansion = regexp.MustCompile(`^\$\{[A-Za-z_][A-Za-z0-9_]*:[?-]`)
+	// Positional and special parameters are expansions too, and they are
+	// the ones a rig helper reaches for: `clean() { rm -rf "$1"; }` called
+	// with no argument is `rm -rf ""`, and `"$@"` empty is the same.
+	varExpansion = regexp.MustCompile(`^\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\}|[0-9@*])`)
 )
 
-// Lint scans every .sh file under root.
-func Lint(root string) ([]Finding, int, error) {
+// gitWriteVerbs is an allow-list rather than a deny-list: an unknown
+// subcommand is assumed to be a read. Over-reporting is the safe direction
+// for rules 1-3, but not for this one — the point is that every entry here
+// can leave a permanent change in whichever repository the shell happens
+// to be standing in, and a list padded with `log` and `status` would be
+// exempted into uselessness on its first run.
+//
+// `clone` is deliberately absent: its destination is an explicit argument
+// and it creates the repository it writes to.
+var gitWriteVerbs = map[string]bool{
+	"init": true, "add": true, "commit": true, "config": true,
+	"checkout": true, "switch": true, "restore": true, "reset": true,
+	"clean": true, "rm": true, "mv": true, "apply": true, "am": true,
+	"cherry-pick": true, "rebase": true, "merge": true, "revert": true,
+	"stash": true, "tag": true, "branch": true, "push": true,
+	"fetch": true, "pull": true, "remote": true, "submodule": true,
+	"worktree": true, "gc": true, "prune": true, "update-ref": true,
+	"symbolic-ref": true, "sparse-checkout": true, "filter-branch": true,
+	"notes": true, "replace": true,
+}
+
+// Lint scans every .sh file under root, which is expected to be a module
+// root. Findings and exemption keys are keyed on the path RELATIVE to
+// root, so they read the way a reviewer types a path and do not embed the
+// name of whichever checkout directory the tests happen to run in.
+func Lint(root string) ([]Finding, Stats, error) {
 	var out []Finding
-	files := 0
+	var stats Stats
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() || !strings.HasSuffix(d.Name(), ".sh") {
+		if d.IsDir() {
+			if skipDir(root, path, d.Name()) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
-		files++
-		f, err := os.Open(path)
-		if err != nil {
-			return err
+		if !strings.HasSuffix(d.Name(), ".sh") {
+			return nil
 		}
-		defer f.Close()
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
 			return err
 		}
-		out = append(out, lintFile(filepath.ToSlash(filepath.Join(filepath.Base(root), rel)), f)...)
+		stats.Files++
+		findings, err := lintPath(filepath.ToSlash(rel), path, &stats)
+		if err != nil {
+			return err
+		}
+		out = append(out, findings...)
 		return nil
 	})
-	return out, files, err
+	return out, stats, err
 }
 
-func lintFile(name string, r interface{ Read([]byte) (int, error) }) []Finding {
+// skipDir keeps the walk inside this module's own tree. Without it, a
+// checkout of this repo parked under .claude/worktrees/ — which is how
+// every parallel agent works here — contributes a second copy of every
+// rig, under keys no exemption can name, and the lint fails locally while
+// passing in CI. See astscan.ForeignDir.
+func skipDir(root, path, name string) bool {
+	if path == root {
+		return false
+	}
+	if name == "node_modules" {
+		return true
+	}
+	if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
+		return true
+	}
+	return astscan.ForeignDir(root, path)
+}
+
+// lintPath opens and lints one file. The open/close pair is a function
+// rather than a `defer` inside the walk callback: deferring there holds
+// every descriptor until the whole walk finishes.
+func lintPath(name, path string, stats *Stats) ([]Finding, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return lintFile(name, f, stats), nil
+}
+
+func lintFile(name string, r io.Reader, stats *Stats) []Finding {
+	if stats == nil {
+		stats = &Stats{}
+	}
 	var out []Finding
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
@@ -121,30 +241,46 @@ func lintFile(name string, r interface{ Read([]byte) (int, error) }) []Finding {
 				errexit = true
 			}
 		}
-		if !errexit && cdLine.MatchString(line) && !cdHandled(line) {
-			out = append(out, Finding{name, n, RuleUnguardedCd, raw,
-				"a cd whose failure nothing handles, in a script with no `set -e`: the shell keeps " +
-					"running in the operator's own directory. Use `cd … || exit 1`, `( cd … && … )`, or `set -e`."})
-		}
-		if loc := rmCmd.FindStringIndex(line); loc != nil {
-			if arg, recursive := rmTarget(line[loc[1]:]); recursive && needsEmptyGuard(arg) {
-				out = append(out, Finding{name, n, RuleRmRfVar, raw,
-					"rm -rf on a bare variable expansion: `set -u` catches UNSET but not EMPTY, and an " +
-						"empty expansion here deletes the current directory or /. Use ${VAR:?} so an empty value aborts."})
+		if locs := cdLine.FindAllStringIndex(line, -1); locs != nil {
+			stats.Cd += len(locs)
+			if !errexit && !cdHandled(line) {
+				out = append(out, Finding{name, n, RuleUnguardedCd, raw,
+					"a cd whose failure nothing handles, in a script with no `set -e`: the shell keeps " +
+						"running in the operator's own directory. Use `cd … || exit 1`, `( cd … && … )`, or `set -e`."})
 			}
 		}
-		if m := killLine.FindStringSubmatch(line); m != nil {
-			// Only the kill's OWN arguments count. `pkill -f llama-swap ||
-			// echo "$?"` used to satisfy the rule, because a `$` anywhere
-			// to the right of the verb read as if it had scoped the
-			// pattern — as did a `$` in a trailing comment, before
-			// stripComment learned to remove one.
-			if !strings.Contains(killArgs(m[2]), "$") {
-				out = append(out, Finding{name, n, RuleBroadKill, raw,
-					"a kill pattern with no variable in it cannot be scoped to this rig: it matches a " +
-						"sibling lab's processes, and on this box a production llama-swap and vibe daemon. " +
-						"Anchor it on the rig's own path or port base."})
+		// EVERY rm on the line, not the first. `rm -rf "${A:?}"; rm -rf
+		// "$B"` used to be judged entirely on its careful half.
+		for _, loc := range rmCmd.FindAllStringIndex(line, -1) {
+			arg, recursive := rmTarget(line[loc[1]:])
+			if !recursive {
+				continue
 			}
+			stats.RmRecursive++
+			if why := unsafeRmTarget(arg); why != "" {
+				out = append(out, Finding{name, n, RuleRmRfVar, raw, why})
+			}
+		}
+		for _, m := range killLine.FindAllStringSubmatch(line, -1) {
+			stats.Kill++
+			if why := unscopedKill(m[1], m[2]); why != "" {
+				out = append(out, Finding{name, n, RuleBroadKill, raw, why})
+			}
+		}
+		for _, loc := range gitLine.FindAllStringIndex(line, -1) {
+			verb, pinned := gitInvocation(line[loc[1]:])
+			if !gitWriteVerbs[verb] {
+				continue
+			}
+			stats.GitWrite++
+			if pinned {
+				continue
+			}
+			out = append(out, Finding{name, n, RuleGitWriteHere, raw,
+				"`git " + verb + "` with no -C/--git-dir writes to whichever repository the shell is " +
+					"standing in. That is the C17 blocker's second half: a failed `cd` upstream of this " +
+					"line does not stop it, it re-points it at the operator's own checkout, where the rig " +
+					"rewrote the git identity and committed the working tree. Use `git -C \"$DIR\" …`."})
 		}
 	}
 	return out
@@ -232,17 +368,150 @@ func rmTarget(rest string) (target string, recursive bool) {
 	}
 }
 
-// needsEmptyGuard reports whether an rm -rf target begins with a variable
-// expansion that an empty value would turn into "" or "/…".
-func needsEmptyGuard(arg string) bool {
-	trimmed := strings.Trim(arg, `"'`)
-	if !strings.HasPrefix(trimmed, "$") {
-		return false
+// unsafeRmTarget reports why an `rm -rf` target is unsafe, or "".
+//
+// Two positions matter, and C20 shipped only the first:
+//
+//   - the target BEGINS with an unguarded expansion. Empty, the target
+//     becomes "/…" (the filesystem root) or "" (the current directory).
+//     This is the C20 rule, with one hole closed: it used to accept any
+//     target containing a guarded expansion ANYWHERE, so
+//     `rm -rf "$LAB/${SUB:?}"` — unguarded exactly where it matters —
+//     scanned clean.
+//   - the final path SEGMENT is entirely an unguarded expansion. Empty,
+//     the target collapses to its own parent: `rm -rf "${LAB:?}/$CELL"`
+//     with no CELL set deletes the whole lab rather than one cell, and
+//     the `:?` on the front is what makes it read as careful.
+//
+// A command substitution counts as an unguarded expansion in either
+// position: `$(…)` that prints nothing is empty in exactly the same way.
+func unsafeRmTarget(arg string) string {
+	t := strings.Trim(arg, `"'`)
+	if tok := leadingExpansion(t); tok != "" && !guardedExpansion.MatchString(tok) {
+		return "rm -rf on a target that BEGINS with a bare variable expansion: `set -u` catches UNSET " +
+			"but not EMPTY, and an empty expansion here deletes the current directory or /. " +
+			"Use ${VAR:?} so an empty value aborts."
 	}
-	if guardedExpansion.MatchString(trimmed) {
-		return false
+	segs := pathSegments(t)
+	if n := len(segs); n > 1 && segs[n-1] == "" {
+		segs = segs[:n-1] // a trailing slash
 	}
-	return bareExpansion.MatchString(trimmed)
+	if n := len(segs); n > 1 && collapsesToNothing(segs[n-1]) {
+		return "rm -rf whose LAST path segment is a bare variable expansion: empty, the target collapses " +
+			"to its own parent — `rm -rf \"${LAB:?}/$CELL\"` with no CELL deletes the whole lab, and the " +
+			"guard on the front is what makes it read as careful. Use ${VAR:?} on every segment."
+	}
+	return ""
+}
+
+// leadingExpansion returns the expansion token at the start of s, or "".
+func leadingExpansion(s string) string {
+	if !strings.HasPrefix(s, "$") {
+		return ""
+	}
+	if strings.HasPrefix(s, "${") {
+		if end := matching(s, '{', '}'); end > 0 {
+			return s[:end]
+		}
+		return s
+	}
+	if strings.HasPrefix(s, "$(") {
+		if end := matching(s, '(', ')'); end > 0 {
+			return s[:end]
+		}
+		return s
+	}
+	return varExpansion.FindString(s)
+}
+
+// matching returns the index just past the closer that balances the opener
+// at s[1], or -1.
+func matching(s string, open, close byte) int {
+	depth := 0
+	for i := 1; i < len(s); i++ {
+		switch s[i] {
+		case open:
+			depth++
+		case close:
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return -1
+}
+
+// pathSegments splits on '/' without cutting inside an expansion:
+// `${LAB:-/tmp/none}` carries a slash that is not a path separator.
+func pathSegments(s string) []string {
+	var out []string
+	start, depth := 0, 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '{', '(':
+			depth++
+		case '}', ')':
+			if depth > 0 {
+				depth--
+			}
+		case '/':
+			if depth == 0 {
+				out = append(out, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(out, s[start:])
+}
+
+// collapsesToNothing reports whether a path segment is made ENTIRELY of
+// unguarded expansions, so an empty value erases the whole segment.
+// `lab-$ID` does not qualify: empty, it is still "lab-".
+func collapsesToNothing(seg string) bool {
+	rest, n := seg, 0
+	for rest != "" {
+		tok := leadingExpansion(rest)
+		if tok == "" {
+			return false // literal text survives an empty expansion
+		}
+		if guardedExpansion.MatchString(tok) {
+			return false
+		}
+		rest = rest[len(tok):]
+		n++
+	}
+	return n > 0
+}
+
+// unscopedKill reports why a kill cannot be confined to this rig, or "".
+//
+// Three separate ways to be unscoped, and C20 pinned only the third:
+//
+//   - `killall` matches by process NAME. There is no argument that can
+//     narrow it to one lab, so it is always entitled to a sibling's
+//     processes and to the production llama-swap on :9000.
+//   - `pkill` WITHOUT -f matches by process name too. `pkill "$RIG"` has
+//     a variable in it and is exactly as unscoped as `pkill llama-server`.
+//   - `pkill -f` with no variable in its own arguments is a pattern that
+//     cannot name this rig's paths or ports.
+func unscopedKill(verb, args string) string {
+	own := killArgs(args)
+	switch {
+	case verb == "killall":
+		return "killall matches by process NAME, which cannot be narrowed to one rig: it is entitled to a " +
+			"sibling lab's processes and to the production llama-swap on :9000. Use `pkill -f` with a " +
+			"pattern anchored on this rig's own path or port base."
+	case !killFullMatch.MatchString(own):
+		return "pkill without -f matches by process NAME, so every llama-server on the box is in scope " +
+			"however specific the pattern looks. Use `pkill -f` and anchor the pattern on this rig's own " +
+			"path or port base."
+	case !strings.Contains(own, "$"):
+		return "a kill pattern with no variable in it cannot be scoped to this rig: it matches a " +
+			"sibling lab's processes, and on this box a production llama-swap and vibe daemon. " +
+			"Anchor it on the rig's own path or port base."
+	}
+	return ""
 }
 
 // killArgs narrows a kill line to the verb's own command, so a variable
@@ -256,6 +525,30 @@ func killArgs(rest string) string {
 		}
 	}
 	return rest
+}
+
+// gitInvocation reads git's global options and returns its subcommand plus
+// whether the repository was named explicitly. `git -C "$DIR" add -A` is
+// pinned; `git add -A` writes wherever the shell is standing.
+func gitInvocation(rest string) (verb string, pinned bool) {
+	fields := strings.Fields(rest)
+	for i := 0; i < len(fields); i++ {
+		f := fields[i]
+		switch {
+		case f == "-C":
+			pinned = true
+			i++ // the directory
+		case f == "-c":
+			i++ // the config assignment
+		case strings.HasPrefix(f, "--git-dir") || strings.HasPrefix(f, "--work-tree"):
+			pinned = true
+		case strings.HasPrefix(f, "-"):
+			// another global option (--no-pager, -P, --exec-path=…)
+		default:
+			return f, pinned
+		}
+	}
+	return "", pinned
 }
 
 // stripComment removes a whole-line comment and a TRAILING one.
