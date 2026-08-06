@@ -242,16 +242,42 @@ func (rl *renderLoop) renderPass() error {
 			}
 		}
 	}
+	// Alias ownership is decided over the DECLARED def set, before either
+	// overlay removes anything. Both overlays below drop defs, and the
+	// renderer resolves aliases from what it is handed — so without this,
+	// pruning a roaming cell (or excluding a strict fingerprint mismatch)
+	// hands that def's aliases to a co-claimant on another cell, and an id
+	// a consumer pinned keeps answering while naming a different model.
+	// That is the repoint C21 rejected, arrived at by accident; the
+	// declared owner keeps its aliases even when it is not rendered, so an
+	// exclusion makes the alias disappear (invariant 3's fail-loud
+	// direction) instead of moving it.
+	//
+	// The RESOLUTION reads the declared set; the CALL sits after both
+	// overlays anyway, because its error aborts the pass and
+	// applyFingerprints is the only thing that evaluates C9's
+	// persistent-drift set. Resolving first let one unresolvable alias
+	// freeze that set on its last value — pinning a mismatch that had been
+	// repaired, or never seeing one that had appeared — while the notify
+	// status kept reporting the evaluator as live.
+	declared := defs
 	pres := rl.srv.presenceSnapshot()
 
 	defs = rl.applyClassPolicy(defs, pres)
 	defs = rl.applyFingerprints(defs, pres)
+
+	aliasWinners, err := router.ResolveAliases(declared)
+	if err != nil {
+		return fmt.Errorf("resolve aliases: %w", err)
+	}
+	rl.warnOrphanedAliases(declared, defs, aliasWinners)
 
 	opts := router.Options{
 		Cell:              fleetcfg.FrontCell,
 		Hosts:             rl.cfg.Hosts,
 		LlamaServerBinary: rl.cfg.LlamaServerBinary,
 		ExtrasPath:        rl.cfg.FrontExtras,
+		AliasWinners:      aliasWinners,
 		Warnf: func(format string, args ...any) {
 			slog.Warn(fmt.Sprintf("front render: "+format, args...))
 		},
@@ -276,6 +302,34 @@ func (rl *renderLoop) renderPass() error {
 	}
 	slog.Info("front config re-rendered from presence", "path", rl.cfg.FrontConfigPath, "renders", rl.srv.renderWrites.Add(1))
 	return nil
+}
+
+// warnOrphanedAliases names the catalog ids the overlays just removed.
+// An exclusion takes a def's aliases out of the catalog instead of
+// handing them to a co-claimant (C21), and every other line the pass
+// writes names a CELL: "pruning roaming cell laptop" does not tell an
+// operator that `best-coder` stopped resolving, and the co-claimant's box
+// is still up, so the natural reading is that the id should still answer.
+// It fires only for defs the overlays dropped — the exclusions inside
+// Render (unassigned, trial, other cells') already warn by name there, so
+// a steady fleet adds no lines.
+func (rl *renderLoop) warnOrphanedAliases(declared, kept []*profile.BackendDef, winners map[string][]string) {
+	if len(winners) == 0 || len(declared) == len(kept) {
+		return
+	}
+	rendered := make(map[string]bool, len(kept))
+	for _, d := range kept {
+		rendered[d.Name] = true
+	}
+	for _, d := range declared {
+		if rendered[d.Name] || len(winners[d.Name]) == 0 {
+			continue
+		}
+		slog.Warn("front catalog: alias left with its declared owner",
+			"model", d.Name, "cell", d.Cell,
+			"aliases", strings.Join(winners[d.Name], ","),
+			"note", "an exclusion removes a catalog id, it never re-points one; move router.alias_owner to repoint it")
+	}
 }
 
 // applyClassPolicy prunes roaming cells' defs per presence (design doc
