@@ -118,12 +118,28 @@ type CellSnapshot struct {
 	URL       string       `json:"url"`
 	Reachable bool         `json:"reachable"`
 	Models    []ModelState `json:"models"`
-	// HostReachable is nil when the cell has no host_probe configured —
-	// without it the host/cell distinction is unknowable (OFF/AWAY?).
-	HostReachable *bool      `json:"host_reachable,omitempty"`
-	Class         string     `json:"class,omitempty"`
-	Intent        *Intent    `json:"intent,omitempty"`
-	LastSeen      *time.Time `json:"last_seen,omitempty"`
+	// HostReachable is nil when nothing was OBSERVED about the host:
+	// either the cell has no host_probe configured — without it the
+	// host/cell distinction is unknowable (OFF/AWAY?) — or the probe was
+	// attempted and the snapshot's budget ran out first, which
+	// HostProbeUnfinished marks.
+	HostReachable *bool `json:"host_reachable,omitempty"`
+	// HostProbeUnfinished separates fleetd's two silences. A configured
+	// host_probe that did not answer inside snapshotTimeout used to land
+	// here as host_reachable:false, and false renders OFF/AWAY — so
+	// "fleetd was too busy to finish its own snapshot" was displayed to
+	// the operator as "your machine is switched off". This field is the
+	// only difference between that and nil-because-unconfigured.
+	//
+	// It is not the (value, known) pair observed.Value replaces: nil
+	// ALREADY means unknown on this wire, so dropping this field can only
+	// lose the REASON for an unknown, never turn one into a confident
+	// value. The invariant is one-directional and pinned by test — true
+	// implies HostReachable == nil.
+	HostProbeUnfinished bool       `json:"host_probe_unfinished,omitempty"`
+	Class               string     `json:"class,omitempty"`
+	Intent              *Intent    `json:"intent,omitempty"`
+	LastSeen            *time.Time `json:"last_seen,omitempty"`
 	// Leases are the active advisory holds naming this cell (C2) — the
 	// pre-drain "would I strand a batch job?" answer, advisory only.
 	Leases []Lease `json:"leases,omitempty"`
@@ -211,6 +227,23 @@ type Server struct {
 	// the constant so a test can assert the FAN-OUT in milliseconds
 	// instead of burning the real 3s per endpoint.
 	tlsDial time.Duration
+	// snapTimeout bounds one probe round, and hostDial bounds the host
+	// probe inside it. Fields for tlsDial's reason, which applies here
+	// verbatim and was simply not carried across: the only way to
+	// exercise either deadline is to make a cell hang, and burning 3s per
+	// assertion is how a deadline ends up with no test at all.
+	//
+	// Lowering snapTimeout is enough on its own: the round's context is
+	// the binding constraint and snapClient's own Timeout sits above it.
+	// RAISING it past snapshotTimeout would not work — the client would
+	// cut each probe at the constant — which is a bound on the seam, not
+	// a use for it.
+	snapTimeout time.Duration
+	hostDial    time.Duration
+	// hostConnect performs the host probe's dial. tlsDial's argument does
+	// not reach far enough here — see hostDialer for why a timeout alone
+	// leaves the SYN-blackhole path untestable.
+	hostConnect hostDialer
 
 	mu     sync.Mutex
 	subs   map[chan Event]struct{}
@@ -439,6 +472,9 @@ func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Op
 		baseBackoff:        500 * time.Millisecond,
 		maxBackoff:         30 * time.Second,
 		tlsDial:            tlsDialTimeout,
+		snapTimeout:        snapshotTimeout,
+		hostDial:           hostProbeTimeout,
+		hostConnect:        dialTCP,
 		subs:               map[chan Event]struct{}{},
 		cellUp:             map[string]bool{},
 		cellUpSince:        map[string]time.Time{},
@@ -503,7 +539,7 @@ func (s *Server) Close() {
 // ─── state snapshot ─────────────────────────────────────────────────────────
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), snapshotTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.snapTimeout)
 	defer cancel()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.Snapshot(ctx))
@@ -542,7 +578,7 @@ func (s *Server) Snapshot(ctx context.Context) StateSnapshot {
 	// disconnecting mid-round must not poison every follower's snapshot
 	// with a degraded all-unreachable result. The round still completes
 	// (bounded by its own deadline) and followers share the result.
-	probe, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotTimeout)
+	probe, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.snapTimeout)
 	defer cancel()
 	f.snap = s.probeSnapshot(probe)
 	return f.snap
@@ -611,8 +647,14 @@ func (s *Server) snapshotCell(ctx context.Context, c Cell) CellSnapshot {
 	snap := CellSnapshot{Name: c.Name, URL: c.URL, Class: c.Class, Models: []ModelState{}}
 
 	if c.HostProbe != "" {
-		snap.HostReachable = new(bool)
-		*snap.HostReachable = probeTCP(ctx, c.HostProbe)
+		// Two-value read on purpose: the known bit is the difference
+		// between "this box did not answer" and "fleetd ran out of time
+		// to ask", and the ladder renders the first one as OFF/AWAY.
+		if up, probed := probeTCP(ctx, c.HostProbe, s.hostDial, s.hostConnect).Observed(); probed {
+			snap.HostReachable = &up
+		} else {
+			snap.HostProbeUnfinished = true
+		}
 	}
 
 	var runWrap struct {

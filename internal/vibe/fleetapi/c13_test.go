@@ -1014,33 +1014,9 @@ func TestDoctor_ReportsFleetdsOwnBuild(t *testing.T) {
 
 // ─── adversarial-review-pass regressions (ground rule 9) ────────────────────
 
-// tlsBlackhole accepts TCP and never speaks TLS, so every dial burns the
-// whole dial timeout — what a powered-down box behind a DROP rule looks
-// like, and the only shape that exposes a serial fan-out.
-func tlsBlackhole(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { ln.Close() })
-	go func() {
-		var held []net.Conn
-		defer func() {
-			for _, c := range held {
-				c.Close()
-			}
-		}()
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			held = append(held, c)
-		}
-	}()
-	return ln.Addr().String()
-}
+// tlsBlackhole moved to u1_deadline_test.go: it is this package's only
+// far-side-that-hangs primitive and now has two callers, one of which
+// exists to pin what it CANNOT stall (connect(2), hence hostDialer).
 
 // TestDoctor_TLSDialsRunInParallel is REV-1 one subsystem over: the
 // credential probes were fanned out and the TLS dials were left serial,
