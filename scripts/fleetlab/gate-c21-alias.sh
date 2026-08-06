@@ -164,10 +164,15 @@ p=$(peer_of best-embed); echo "front config: best-embed -> peer '${p:-<absent>}'
 [[ -z $p ]]; check "best-embed is ABSENT from the catalog (pre-C21 it named alpha's lab-embed-a)" $?
 [[ $(has_model best-embed) == False ]]; check "the front's /v1/models no longer lists best-embed" $?
 echo "--- an embeddings request for the departed alias ---"
-code=$(curl -s -o /tmp/c21-embed.out -w '%{http_code}' -m 60 -X POST "$FRONT/v1/embeddings" \
+# Body under $LAB, not a fixed /tmp name: every other rig here keeps its
+# artifacts in the lab dir, and `curl -o` on a predictable world-writable
+# path follows whatever symlink is already sitting there.
+out=$LAB/c21-embed.out
+code=$(curl -s -o "$out" -w '%{http_code}' -m 60 -X POST "$FRONT/v1/embeddings" \
   -H 'Content-Type: application/json' -d '{"model":"best-embed","input":"proof"}')
-echo "HTTP $code"; head -c 400 /tmp/c21-embed.out; echo
-[[ $code != 200 ]]; check "the departed alias FAILS rather than being answered by another cell's model" $?
+echo "HTTP $code"; head -c 400 "$out"; echo
+# 000 is curl failing to connect, which is not evidence about the catalog.
+[[ $code != 200 && $code != 000 ]]; check "the departed alias FAILS rather than being answered by another cell's model" $?
 p=$(peer_of lab-embed-a); [[ $p == alpha ]]; check "alpha keeps serving its own id throughout" $?
 
 hr "7. the owner comes home"

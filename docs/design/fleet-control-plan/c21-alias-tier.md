@@ -1,9 +1,11 @@
 # C21 — the visible-repoint alias tier: REJECTED, and the invisible one that already shipped
 
 Status: **PR OPEN**, off `feat/c21-alias-tier` branched from `main` at
-`e144f8b`. Two commits: the decision + the fix, and ground rule 9's
+`e144f8b`. Three commits: the decision + the fix, ground rule 9's
 adversarial self-review (§8b — five findings, two fixed, one a silent
-disarming of the fix itself). Backlog item 10
+disarming of the fix itself), and the independent adversarial review pass
+(§8c — nine findings, seven fixed, one blocker-shaped ordering defect and
+one gate row that claimed a scenario its test never ran). Backlog item 10
 ([fleet-control-futures.md](../fleet-control-futures.md) §2), whose entry
 asks for a decision rather than a feature:
 
@@ -296,7 +298,7 @@ the loud direction. No reference-fleet or `scripts/fleetlab` def hits it.
 | file | change |
 |---|---|
 | `internal/vibe/router/render.go` | `Options.AliasWinners`; exported `ResolveAliases`; `aliasClaimants`; `Render` resolves over the declared set |
-| `internal/vibe/fleetapi/render_loop.go` | `renderPass` resolves before the overlays and passes `AliasWinners`; the collision error fails the pass |
+| `internal/vibe/fleetapi/render_loop.go` | `renderPass` resolves over the DECLARED set and passes `AliasWinners`; the collision error fails the pass; `warnOrphanedAliases` names the ids an overlay removed (§8c REV2-1, REV2-4) |
 | `internal/vibe/router/alias_scope_test.go` | 7 tests: the unassigned / trial / cross-cell transfers, the `AliasWinners` seam, the collision that must not heal, the cloud-peer exclusion, the non-nil-map guard |
 | `internal/vibe/fleetapi/c21_test.go` | 4 tests through the **real** `router.Render` in the loop's seam: prune-does-not-repoint, collision-does-not-heal, alias-returns-with-its-owner, and the `AliasWinners` non-nil guard |
 | `scripts/fleetlab/gate-c21-alias.sh` | the L1 rig (§8) |
@@ -315,13 +317,17 @@ surface.
 | U2 | An excluded **trial** owner's alias does not transfer, and the trial exclusion still warns | PASS |
 | U3 | A **cell** render does not give the losing claimant an alias another cell's def owns; the owner's own render keeps it | PASS |
 | U4 | `ResolveAliases` + `AliasWinners`: a winner absent from the render is emitted nowhere; the pruned cell has no peer stanza | PASS |
-| U5 | An unresolvable collision stays an error with one claimant missing | PASS |
+| U5 | An unresolvable collision stays an error with one claimant missing — and resolving over the SURVIVOR set alone silently hands the alias over, which is the defect (§8c REV2-3 rewrote this body; as shipped it resolved the identical slice twice and nothing was ever missing) | PASS |
 | U6 | `ResolveAliases` ignores cloud_peer defs (their ids come from `cloud_peer.models`) | PASS |
 | U7 | Through the real renderer in the loop: pruning the roaming **owner** removes the alias from the catalog and does not repoint it at the co-claimant's cell | PASS |
 | U8 | Through the real renderer: an unresolvable collision renders **nothing**, before and after the prune (`RenderCount == 0`) | PASS |
 | U9 | Through the real renderer: the alias returns with its declared owner after C3's re-add hysteresis, and the co-claimant never holds it | PASS |
 | U10 | `ResolveAliases` returns a NON-NIL map with nothing to resolve (no defs / no aliases / only a cloud peer) — a nil map re-enables `Render`'s fallback | PASS |
 | U11 | The render loop passes a non-nil `AliasWinners` on every pass, including on a fleet that declares no aliases at all | PASS |
+| U12 | Through the real renderer: the STRICT-FINGERPRINT exclusion (§6 trigger 2) does not transfer the alias either — the claim §7 makes and nothing exercised (§8c REV2-2) | PASS |
+| U13 | A collision error still leaves C9's fingerprint-mismatch set evaluated (§8c REV2-1) | PASS |
+| U14 | The pass NAMES the alias that left with a pruned owner, and stays silent when the pruned def owns none (§8c REV2-4, both halves) | PASS |
+| U15 | comfyui defs are alias claimants: their declared alias survives and their name reserves (§8c REV2-5) | PASS |
 
 **Mutation-verified**, five production predicates, each reverted,
 confirmed red on a named test, restored:
@@ -531,6 +537,155 @@ shows a pruned roaming cell as drift. That predates C21 (the peer stanzas
 already differed); the alias is now one more line in a diff that was
 already there.
 
+## 8c. Adversarial-review addendum (ground rule 9, independent pass)
+
+An independent pass over the two feature commits. Nine findings, seven
+fixed on this branch, one recorded as pre-existing-and-accepted, one
+recorded as needing a surface decision this pass declined to make alone.
+Every fix is mutation-verified: the mutation, the test it turns red, and
+that the guard is not inert are all listed below.
+
+**REV2-1 (fixed, blocker-shaped — an abort that took the drift alarm with
+it).** `renderPass` resolved aliases *before* `applyClassPolicy` and
+`applyFingerprints`, and returns the collision error. `applyFingerprints`
+is the only thing in this process that evaluates C9's persistent-drift
+set (`setFingerprintMismatches`, rebuilt every pass, preserving
+`FirstSeen`), and `applyClassPolicy` is the only thing that maintains the
+prune/re-add hysteresis. So one unresolvable alias anywhere in the
+checkout froze that set on its last value **forever**, while
+`notifyStatus`'s `fingerprint_source` — which keys on `renderLoopOn`, not
+on whether a pass has run — kept reporting the evaluator as live. A
+mismatch that had since been repaired keeps paging; one that appeared
+after the collision is never seen. That is this plan's recurring defect
+class, absent evidence read as current, on the one subsystem whose job is
+not being silent.
+
+The resolution still reads the DECLARED set — `declared := defs` before
+the overlays — but the CALL moved after them, so a failing pass fails
+having done the same bookkeeping every other failing pass does. This
+restores the pre-C21 side-effect ordering exactly: before this phase the
+collision error came out of `Render`, downstream of both overlays.
+Pinned by U13, red on the shipped ordering.
+
+**REV2-2 (fixed, incomplete guard — 1 of 2 triggers tested).** §7 claims
+`renderPass` fixes triggers 1 *and* 2, trigger 2 being C3/C5's strict
+fingerprint exclusion — "the mechanism that exists to stop silent
+retrieval damage causes some". All four loop tests drive the class-policy
+prune; nothing anywhere exercised the fingerprint overlay's half, at
+either layer. It is genuinely fixed, but it was asserted, not proven, and
+this plan has already shipped a gate row whose body did not run its own
+scenario. U12 now drives it through the real renderer: a strict-mode
+owner excluded for drifted flags takes `best-embed` out of the catalog
+rather than handing it to the co-claimant on the other cell.
+
+**REV2-3 (fixed, a test that asserted less than its name — ground rule
+10).** `TestResolveAliases_CollisionStaysAnErrorWithOneClaimantMissing`
+called `ResolveAliases(all)` twice on the identical slice, with the
+comment "so the error survives the prune". No claimant is ever missing;
+the two calls are the same call. Gate row U5 then reported the scenario
+as PASS. This is exactly the
+`TestWarmTarget_SkipsAbsentAndDrainedCells` shape ground rule 10 was
+written about, in the phase whose thesis is that a mechanism heals itself
+into a wrong answer. The body now does both halves: resolving over the
+SURVIVOR set is shown succeeding and handing `best-coder` to the
+co-claimant — the defect, reproduced — and the declared set is shown
+still refusing.
+
+**REV2-4 (fixed, the fail-loud direction was silent to the operator).**
+After the fix an excluded owner's alias vanishes from the catalog, and
+nothing anywhere says so. The prune's own line names a CELL
+(`pruning roaming cell laptop`); every exclusion *inside* `Render` warns
+by name; the disappearance of `best-coder` — a catalog id a consumer
+pinned — produces nothing at all. The operator's evidence is a harness
+404 next to a co-claimant's box that is plainly up, which is the reading
+§6 says nobody made for five phases. `warnOrphanedAliases` names the
+model, its cell and the ids that left, once per pass, only for defs the
+overlays dropped (the in-`Render` exclusions already warn there, so a
+steady fleet adds no lines). U14 pins both halves — that it fires, and
+that a pruned def owning no alias stays quiet, because a warning attached
+to "a def was dropped" rather than "a winning alias was dropped" is a
+line on every roaming prune forever.
+
+**REV2-5 (fixed, an untested predicate in the new code).** A sweep of
+`aliasClaimants`'s four predicates found that dropping `ComfyUI` from it
+turned no test red — comfyui defs become `models:` entries like the other
+two kinds and `RouterOpts` is accepted on any def, so dropping them would
+delete a declared alias from every catalog and free its name for another
+claimant. U15 covers claim, name reservation and collision. (The other
+three predicates were already caught: cloud_peer by U6, `External` by the
+router package's golden tests, mlx by `TestRender_MLXTenant`.)
+
+**REV2-6 (fixed, rig safety).** `gate-c21-alias.sh` wrote the embeddings
+response body to a fixed `/tmp/c21-embed.out` — every other rig in
+`scripts/fleetlab` keeps its artifacts under `$LAB`, and `curl -o` on a
+predictable world-writable path follows whatever symlink is already
+there. It also accepted curl's `000` (could not connect) as proof that
+the departed alias fails, which is a rig that passes when the front is
+down.
+
+**REV2-7 (fixed, doc drift).** The reconciliation section's README row
+claimed "unit gates U1–U9 green, 3 predicates mutation-verified" against
+§8's own U1–U11 and five mutations, and the AGENTS.md block described
+`renderPass` as calling `ResolveAliases` "**before** `applyClassPolicy`
+and `applyFingerprints`", which REV2-1 makes wrong. Both corrected in
+place.
+
+**REV2-8 (NOT fixed — needs a surface decision).** A failing `renderPass`
+is invisible to every surface this plan has: no field in
+`/api/fleet/state`, nothing on the fleet page, no `vibe fleet doctor`
+check, no C9 condition. Its only trace is
+`slog.Warn("presence-derived render failed")` in a containerized fleetd's
+log. That is pre-existing — the zero-defs gate, the `front_extras` gate
+and every `Render` error have always been silent — but C21 creates the
+first **permanent** instance of it: §7 records, correctly, that an
+unresolvable collision now freezes the front catalog instead of healing
+into a repoint. A frozen catalog stops tracking the fleet indefinitely
+(new models never appear, pruned cells never leave) while `front_renders`
+sits still and every display reads green, which is the same "absent
+evidence read as healthy" the README's C13 paragraph says this plan has
+been bitten by in five phases. Not taken here because the fix is a new
+status surface — a `front_render` block in the state doc plus a
+`render.current` doctor check — and §7's own rule is that a rejection
+should not grow one. It belongs to whoever owns the next fleetd status
+phase; see the reconciliation section.
+
+**REV2-9 (checked, pre-existing, accepted).** The strict-fingerprint
+exclusion is driven by announce data, and the fleet token is every cell's
+voice (design §6). After C21 a forged mismatch against a strict def
+removes both the def's id and its aliases from the fleet catalog, where
+before it removed the id and MOVED the alias to another cell's model.
+Both outcomes are bad and the new one is the fail-loud half; enforcement
+is still bound to the def's HOME cell, so a cross-cell announce cannot
+reach it. Recorded rather than changed.
+
+**Mutation-verified**, this pass's own guards. Each mutation applied to
+the fixed tree, `go build` confirmed clean (a mutation the compiler
+catches is not evidence), the suite run, the named test confirmed red,
+the tree restored:
+
+| mutation | red |
+|---|---|
+| `renderPass` resolves before the overlays again (the shipped ordering) | U13 only — U14 stays green, so the two fixes are independent |
+| `warnOrphanedAliases` call removed | U14 only |
+| `warnOrphanedAliases` warns for every dropped def, aliases or not | U14's quiet half only — the inert-guard check |
+| `renderPass` resolves over the SURVIVORS (`defs`, not `declared`) | U12, U13, U14, U7, U8 |
+| `aliasClaimants` drops comfyui defs | U15 (nothing before this pass) |
+| `resolveAliases` picks `all[0]` instead of erroring on zero owners | U5, U8, U15, `TestRender_AliasCollision` |
+
+Inner loop on the reviewed tree, go test's OWN exit status: `go build`,
+`go vet`, `gofmt -l .` silent, `go mod tidy` byte-identical,
+`golangci-lint run` **0 issues**, `go test -race ./...` **exit 0**, and
+`go test -race -count=5` over `fleetapi` + `router` + `daemon` +
+`modeltry` + `cli` **exit 0**.
+
+**Not re-run by this pass: L1 and L2.** The rig's ports are fixed
+(`:9640`, `:9721`) and collide with the band reserved for a concurrent
+agent's lab, so the live transcripts in §8 stand as the build pass's runs,
+not this one's. The review's production delta is an ordering change with
+identical rendered output plus one log line, and neither L1 nor L2
+asserts on either — but ground rule 10 means that is an argument, not a
+run, and it is recorded as one.
+
 ## 9. What this phase deliberately does not do
 
 - **No `resolve_best` verb.** §4 names it as the sanctioned shape and §10
@@ -604,7 +759,7 @@ Two smaller edits in the same file:
 
 Status-table row:
 
-> | [C21](c21-alias-tier.md) | The visible-repoint alias tier: **rejected**, and the invisible one that already shipped | ~35 lines + 9 tests | C2, C3 | PR open; unit gates U1–U9 green, 3 predicates mutation-verified; **L1 + L2 PASS** (harness, 2026-08-06) |
+> | [C21](c21-alias-tier.md) | The visible-repoint alias tier: **rejected**, and the invisible one that already shipped | ~55 lines + 15 tests | C2, C3 | PR open; feature + self-review + adversarial-review commits (5 + 9 findings); unit gates U1–U15 green, 11 predicates mutation-verified; **L1 + L2 PASS** (harness, 2026-08-06, build pass — not re-run after the review commit) |
 
 And a prose paragraph in the sequence after C19's:
 
@@ -646,9 +801,14 @@ Under the fleet-control section, a new bullet block:
 >     it.** `router.Render` resolves over `aliasClaimants(defs)` — every
 >     external model def it was handed, before its own cell/trial/front
 >     selection — and `fleetapi.renderPass` calls the exported
->     `router.ResolveAliases` on the full `LoadDefs` result **before**
->     `applyClassPolicy` and `applyFingerprints` drop anything, passing the
->     winners as `router.Options.AliasWinners`. Both sites are required:
+>     `router.ResolveAliases` on the full `LoadDefs` result (kept in
+>     `declared` before `applyClassPolicy` and `applyFingerprints` drop
+>     anything), passing the winners as `router.Options.AliasWinners`. The
+>     CALL sits AFTER both overlays on purpose: its error aborts the pass,
+>     and `applyFingerprints` is the only thing that evaluates C9's
+>     persistent-drift set — resolving first froze that set on its last
+>     value while the notify status still called the evaluator live.
+>     Both sites are required:
 >     the second excludes defs the first can never see. Resolving over the
 >     survivors is how a pruned roaming owner silently handed `best-coder`
 >     to another cell's model — measured end to end against merged `main`
@@ -668,3 +828,26 @@ Under the fleet-control section, a new bullet block:
 >     re-resolution, a `best-*` namespace, or a per-request fallback.
 >     `scripts/fleetlab/gate-c21-alias.sh` serves a real completion through
 >     a declared alias and proves the departed one 404s.
+>   - **An alias that leaves the catalog is named in the log**
+>     (`warnOrphanedAliases`). The prune's own line names a CELL, and the
+>     co-claimant's box is still up, so nothing connected "laptop pruned"
+>     to "`best-coder` stopped resolving". It fires only for defs the
+>     overlays dropped — the exclusions inside `Render` warn there — and
+>     only when the dropped def actually WON an alias.
+
+### A carried gap, for whoever owns the next fleetd status surface
+
+**A failing `renderPass` is invisible to every surface.** No field in
+`/api/fleet/state`, nothing on the fleet page, no `vibe fleet doctor`
+check, no C9 condition — only `slog.Warn("presence-derived render
+failed")` inside a container. Pre-existing (the zero-defs gate, the
+`front_extras` gate and every `Render` error have always been silent),
+but C21 creates the first PERMANENT instance: an unresolvable alias
+collision now correctly stays an error instead of healing into a repoint,
+so the front catalog can stop tracking the fleet indefinitely while
+`front_renders` sits still and every display reads green. Suggested
+shape, deliberately not built in a rejection phase: a `front_render`
+block on `StateSnapshot` carrying the last failure and its first-seen
+time (the `swap_auth` block is the precedent — absent means healthy),
+plus a `render.current` doctor check named for what it proves. See §8c
+REV2-8.

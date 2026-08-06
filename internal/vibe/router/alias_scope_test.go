@@ -143,21 +143,65 @@ func TestRenderFront_AliasWinnersDropsAnAbsentOwnersAlias(t *testing.T) {
 // unresolvable collision must not heal by attrition. Resolving over the
 // survivors made a two-claimant/no-owner config render fine the moment the
 // roaming claimant left — the render error disappearing WAS the repoint.
+//
+// Both halves are exercised, because the delta is the whole point: the
+// SURVIVOR set resolves cleanly and hands the alias to whoever is left
+// (that is the defect, reproduced), while the DECLARED set — what fleetd
+// now passes — still refuses.
 func TestResolveAliases_CollisionStaysAnErrorWithOneClaimantMissing(t *testing.T) {
-	owner := claimDef("laptop-coder", "laptop", false, "best-coder")
-	rival := claimDef("gpu-coder", "gpu", false, "best-coder")
-	all := []*profile.BackendDef{owner, rival}
+	departed := claimDef("laptop-coder", "laptop", false, "best-coder")
+	survivor := claimDef("gpu-coder", "gpu", false, "best-coder")
+	declared := []*profile.BackendDef{departed, survivor}
+	survivors := []*profile.BackendDef{survivor}
 
-	if _, err := ResolveAliases(all); err == nil {
+	if _, err := ResolveAliases(declared); err == nil {
 		t.Fatal("two claimants, no alias_owner: want an error")
 	}
+	// The defect, reproduced: over the survivors alone the misconfiguration
+	// resolves itself, silently, in the co-claimant's favour.
+	repointed, err := ResolveAliases(survivors)
+	if err != nil {
+		t.Fatalf("resolving over the survivors: %v", err)
+	}
+	if got, want := repointed["gpu-coder"], []string{"best-coder"}; !slices.Equal(got, want) {
+		t.Fatalf("survivor-set resolution = %v, want %v — the premise of this test no longer holds", got, want)
+	}
 	// fleetd resolves over the checkout, so the error survives the prune.
-	winners, err := ResolveAliases(all)
+	winners, err := ResolveAliases(declared)
 	if err == nil {
 		t.Fatal("want the same error after the roaming claimant is pruned")
 	}
 	if winners != nil {
 		t.Errorf("winners = %v, want nil beside an error", winners)
+	}
+}
+
+// TestResolveAliases_ComfyUIDefsAreClaimants: RouterOpts is accepted on
+// any def and Render turns comfyui defs into models: entries like the
+// other two kinds, so a comfyui def both claims its aliases and reserves
+// its name. Dropping it from aliasClaimants would delete a declared alias
+// from every catalog and let another def claim the name — and no test
+// noticed until this one.
+func TestResolveAliases_ComfyUIDefsAreClaimants(t *testing.T) {
+	comfy := &profile.BackendDef{
+		Name: "comfy", Cell: "gpu",
+		Router:  &profile.RouterOpts{Aliases: []string{"images"}},
+		Backend: profile.Backend{External: true, ComfyUI: &profile.ComfyUIBackend{Dir: "/srv/comfy", Port: 8188}},
+	}
+	rival := claimDef("gpu-coder", "gpu", false, "images")
+
+	if _, err := ResolveAliases([]*profile.BackendDef{comfy, rival}); err == nil {
+		t.Error("two claimants of \"images\" with no owner: want a collision error")
+	}
+	winners, err := ResolveAliases([]*profile.BackendDef{comfy})
+	if err != nil {
+		t.Fatalf("ResolveAliases: %v", err)
+	}
+	if got, want := winners["comfy"], []string{"images"}; !slices.Equal(got, want) {
+		t.Errorf("winners[comfy] = %v, want %v (a comfyui def's declared alias must survive)", got, want)
+	}
+	if _, err := ResolveAliases([]*profile.BackendDef{comfy, claimDef("other", "gpu", false, "comfy")}); err == nil {
+		t.Error("an alias equal to a comfyui def's NAME must stay an error (def names are canonical ids)")
 	}
 }
 
