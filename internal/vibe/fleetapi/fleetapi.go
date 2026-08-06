@@ -170,6 +170,11 @@ type StateSnapshot struct {
 	// resolved next suspend and next wake, what is deferring it, and any
 	// wake this schedule promised and did not deliver.
 	Sleep *sleepStatus `json:"sleep,omitempty"`
+	// SwapAuth is the C15 llama-swap credential status: the cells whose
+	// llama-swap is refusing fleetd, why, and when automated calls resume.
+	// Absent means every cell fleetd has called accepted it — the
+	// reference fleet's steady state. It carries no key value.
+	SwapAuth *swapAuthStatus `json:"swap_auth,omitempty"`
 }
 
 // snapshotTimeout bounds the per-cell /running + /v1/models probes so one
@@ -303,9 +308,15 @@ type Server struct {
 	usage *usageLedger
 
 	// hosts is the parsed hosts.yaml — read here for C7b's pricing,
-	// power and capital config only. Cell MEMBERSHIP still travels
-	// through s.cells; this is not a second cell list.
+	// power and capital config and C15's per-cell llama-swap credential.
+	// Cell MEMBERSHIP still travels through s.cells; this is not a second
+	// cell list.
 	hosts *fleetcfg.File
+	// swapAuth records each cell's current llama-swap credential failure
+	// (C15), keyed by cell. Empty is the healthy state; an entry both
+	// suppresses automated calls to that llama-swap and surfaces in
+	// fleet_status and the doctor. It never holds a key value.
+	swapAuth map[string]swapAuthFailure
 	// prices overrides the embedded price table (tests only). nil uses
 	// the vendored artifact.
 	prices *prices.Table
@@ -449,6 +460,7 @@ func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Op
 		leasePath:          opts.LeasePath,
 		usage:              usage,
 		hosts:              opts.Hosts,
+		swapAuth:           map[string]swapAuthFailure{},
 		prices:             opts.Prices,
 		fpMismatch:         map[string]FingerprintMismatch{},
 		notifyScope:        loadNotifyScope(opts.NotifyScopePath),
@@ -554,6 +566,12 @@ func (s *Server) probeSnapshot(ctx context.Context) StateSnapshot {
 		}(i, c)
 	}
 	wg.Wait()
+	// Built AFTER the probe round, not with the rest of the header: a
+	// credential failure discovered by THIS round belongs in the document
+	// that reports the cell as unreachable, not in the next one. A reader
+	// who has to poll twice to learn why is a reader who concludes the box
+	// is off.
+	resp.SwapAuth = s.swapAuthReport()
 	return resp
 }
 
@@ -613,8 +631,8 @@ func (s *Server) snapshotCell(ctx context.Context, c Cell) CellSnapshot {
 			Model string `json:"model"`
 		} `json:"models"`
 	}
-	runErr := s.getJSON(ctx, c.URL+"/running", &runWrap)
-	modErr := s.getJSON(ctx, c.URL+"/v1/models", &modWrap)
+	runErr := s.getJSON(ctx, c.Name, c.URL+"/running", &runWrap)
+	modErr := s.getJSON(ctx, c.Name, c.URL+"/v1/models", &modWrap)
 	running, models := runWrap.Running, modWrap.Data
 	snap.Reachable = runErr == nil || modErr == nil
 	if snap.Reachable {
@@ -673,9 +691,17 @@ func (s *Server) snapshotCell(ctx context.Context, c Cell) CellSnapshot {
 	return snap
 }
 
-func (s *Server) getJSON(ctx context.Context, url string, out any) error {
+// getJSON reads one llama-swap JSON endpoint on a named cell. The cell
+// name is a parameter and not derivable from the url because it selects
+// the credential (C15): every request fleetd sends to a llama-swap goes
+// through AuthorizeSwap, and the status it gets back updates that cell's
+// credential record.
+func (s *Server) getJSON(ctx context.Context, cell, url string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
+		return err
+	}
+	if err := s.AuthorizeSwap(req, cell); err != nil {
 		return err
 	}
 	resp, err := s.snapClient.Do(req)
@@ -683,6 +709,7 @@ func (s *Server) getJSON(ctx context.Context, url string, out any) error {
 		return err
 	}
 	defer resp.Body.Close()
+	s.NoteSwapStatus(cell, resp.StatusCode)
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("GET %s: status %d", url, resp.StatusCode)

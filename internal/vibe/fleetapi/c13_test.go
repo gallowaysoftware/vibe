@@ -200,6 +200,15 @@ func TestDoctor_ReachesNoMutatingVerb(t *testing.T) {
 		"Enqueue":           "sends a notification",
 		"recordAnnounce":    "mutates presence",
 		"noteRenderTrigger": "triggers a render",
+		// C15: resolving a credential is read-only, but RECORDING one is
+		// not — and `swapCredential` records an unresolvable declaration on
+		// the way past. The doctor reads `hosts.SwapCredentialFor` directly
+		// for exactly that reason, and this is the line that keeps it there.
+		"swapCredential": "records a credential failure",
+		"recordSwapAuth": "writes the credential-failure record",
+		"clearSwapAuth":  "clears the credential-failure record",
+		"NoteSwapStatus": "writes the credential-failure record",
+		"AuthorizeSwap":  "resolves and records a credential",
 		// The RPC verbs. The daemon half of this path holds a vibeclient,
 		// which is the one place in the whole command where reaching for an
 		// actuation call is a one-line edit — and the behavioural test

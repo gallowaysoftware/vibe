@@ -33,7 +33,11 @@ func (d *Daemon) startCloudSpendLoop(hosts *fleetcfg.File) {
 	if !ok || front.URL == "" {
 		return
 	}
-	poll := cloudSpendPoller(front.URL, paths.FrontCloudUsageFile(), paths.BackendsDir())
+	// The front's own llama-swap credential (C15): /api/metrics/activity
+	// is gated by apiKeys like every route except /health, so without it
+	// the cloud line renders "not measured" on a fleet that is spending
+	// money.
+	poll := cloudSpendPoller(front.URL, front.SwapKeyFile, paths.FrontCloudUsageFile(), paths.BackendsDir())
 	if poll == nil {
 		return
 	}
@@ -42,11 +46,12 @@ func (d *Daemon) startCloudSpendLoop(hosts *fleetcfg.File) {
 
 // cloudSpendPoller builds the polling closure. Exposed as a package
 // function (not a method) so it is testable without a whole daemon.
-func cloudSpendPoller(frontURL, statePath, backendsDir string) func(context.Context) *fleetapi.AnnounceUsage {
+func cloudSpendPoller(frontURL, swapKeyFile, statePath, backendsDir string) func(context.Context) *fleetapi.AnnounceUsage {
 	var mu sync.Mutex
 	ids := map[string]bool{}
 	coll, err := usagemeter.New(usagemeter.Config{
 		LlamaSwapURL: frontURL,
+		APIKeyFile:   swapKeyFile,
 		StatePath:    statePath,
 		ModelFilter: func(model string) bool {
 			mu.Lock()
