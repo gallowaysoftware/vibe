@@ -162,12 +162,12 @@ func TestInFlightWireTable(t *testing.T) {
 			for _, f := range tc.frames {
 				s.trackInFlight("cell", wireFrame(f))
 			}
-			n, reported := s.InFlight("cell")
+			n, reported := s.InFlight("cell").Observed()
 			if n != tc.wantN || reported != tc.wantRep {
 				t.Fatalf("InFlight = (%d, %v), want (%d, %v)", n, reported, tc.wantN, tc.wantRep)
 			}
 			for _, m := range tc.wantSeen {
-				if _, ok := s.modelLastActivity("cell", m); !ok {
+				if _, ok := s.modelLastActivity("cell", m).Observed(); !ok {
 					t.Errorf("no per-model activity stamp for %s; C4's restore_after_idle window reads it as never-active", m)
 				}
 			}
@@ -205,7 +205,7 @@ func TestRecordedInflightFramesFoldThroughProduction(t *testing.T) {
 					models[m] = true
 				}
 				s.trackInFlight("cell", wireFrame(f.Inner))
-				n, reported := s.InFlight("cell")
+				n, reported := s.InFlight("cell").Observed()
 				if !reported {
 					t.Fatalf("frame %d of the %s recording left the cell UNREPORTED — the build cannot fold a shape this llama-swap really sent: %s", inflight, w, f.Inner)
 				}
@@ -219,14 +219,14 @@ func TestRecordedInflightFramesFoldThroughProduction(t *testing.T) {
 			if peak < 1 {
 				t.Fatalf("replaying %d recorded inflight frames never showed a single request in flight; peak was %d, and a reported zero is what disarms every busy guard", inflight, peak)
 			}
-			if n, _ := s.InFlight("cell"); n != 0 {
+			if n, _ := s.InFlight("cell").Observed(); n != 0 {
 				t.Errorf("the recording ends with the cell idle, the fold ends at %d in flight", n)
 			}
 			if len(models) == 0 {
 				t.Fatal("no model name appeared in the recording; the per-model check below is vacuous")
 			}
 			for m := range models {
-				if _, ok := s.modelLastActivity("cell", m); !ok {
+				if _, ok := s.modelLastActivity("cell", m).Observed(); !ok {
 					t.Errorf("no activity stamp for %q after replaying the recording; C4's restore_after_idle window reads it as never-active", m)
 				}
 			}
@@ -271,7 +271,7 @@ func TestInFlightUnknownShapeIsNotIdle(t *testing.T) {
 	s.setCellUp("cell", true)
 	s.trackInFlight("cell", wireFrame(`{"operation":"whatever-v260-does"}`))
 
-	if n, reported := s.InFlight("cell"); reported {
+	if n, reported := s.InFlight("cell").Observed(); reported {
 		t.Fatalf("InFlight = (%d, reported) after an unparseable frame; a reported zero disarms drain, suspend, probe and both warm loops at once", n)
 	}
 	act := s.activityFor("cell")
@@ -297,13 +297,13 @@ func TestPerModelActivityStampsOnBothEdgesAcrossWires(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s := wireServer(t)
 			s.trackInFlight("cell", wireFrame(tc.start))
-			started, ok := s.modelLastActivity("cell", "qwen")
+			started, ok := s.modelLastActivity("cell", "qwen").Observed()
 			if !ok {
 				t.Fatal("the start edge left no activity stamp")
 			}
 			time.Sleep(3 * time.Millisecond)
 			s.trackInFlight("cell", wireFrame(tc.end))
-			finished, ok := s.modelLastActivity("cell", "qwen")
+			finished, ok := s.modelLastActivity("cell", "qwen").Observed()
 			if !ok {
 				t.Fatal("the completion edge left no activity stamp — a generation longer than the idle window reads as idle")
 			}
@@ -333,21 +333,21 @@ func TestInFlightClearedOnStreamDrop(t *testing.T) {
 	t.Cleanup(s.Close)
 
 	wireWait(t, "the connect snapshot", func() bool {
-		_, reported := s.InFlight("gpu")
+		_, reported := s.InFlight("gpu").Observed()
 		return reported
 	})
 
 	// Open a request and leave it open, then kill the stream under it.
 	_, done := cell.StartRequest("qwen", "/v1/chat/completions")
 	wireWait(t, "the start edge", func() bool {
-		n, _ := s.InFlight("gpu")
+		n, _ := s.InFlight("gpu").Observed()
 		return n == 1
 	})
 	before := cell.Connects()
 	cell.DropStreams()
 
 	wireWait(t, "the count to be discarded with the connection", func() bool {
-		_, reported := s.InFlight("gpu")
+		_, reported := s.InFlight("gpu").Observed()
 		return !reported
 	})
 
@@ -357,12 +357,12 @@ func TestInFlightClearedOnStreamDrop(t *testing.T) {
 		t.Fatal("fleetd never reconnected")
 	}
 	wireWait(t, "the re-seeded count", func() bool {
-		n, reported := s.InFlight("gpu")
+		n, reported := s.InFlight("gpu").Observed()
 		return reported && n == 1
 	})
 	done(swaptest.Tokens{Input: 10, Output: 4}, 50*time.Millisecond)
 	wireWait(t, "the completion edge", func() bool {
-		n, reported := s.InFlight("gpu")
+		n, reported := s.InFlight("gpu").Observed()
 		return reported && n == 0
 	})
 }
@@ -391,7 +391,7 @@ func TestOversizedLogDataDoesNotFlapTheCell(t *testing.T) {
 	if got := cell.Connects(); got != connects {
 		t.Errorf("a 1 MB logData frame caused %d reconnect(s); the scanner buffer is meant to absorb it", got-connects)
 	}
-	if _, reported := s.InFlight("gpu"); !reported {
+	if _, reported := s.InFlight("gpu").Observed(); !reported {
 		t.Error("the cell went unreported across a large logData frame")
 	}
 
@@ -403,7 +403,7 @@ func TestOversizedLogDataDoesNotFlapTheCell(t *testing.T) {
 		t.Fatal("an over-cap logData frame neither survived nor reconnected; the stream is wedged")
 	}
 	wireWait(t, "the cell to recover", func() bool {
-		_, reported := s.InFlight("gpu")
+		_, reported := s.InFlight("gpu").Observed()
 		return reported
 	})
 }

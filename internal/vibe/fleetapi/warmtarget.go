@@ -242,7 +242,7 @@ func (s *Server) applyWarmEval(t WarmTarget, st *warmTargetState, cfg warmLoopCo
 		// evicted mid-stream: the timestamp map only records the frames
 		// that mention a model, and a long request produces no frame
 		// between its start and its completion.
-		if n, reported := s.InFlight(t.Cell); reported && n > 0 {
+		if n, reported := s.InFlight(t.Cell).Observed(); reported && n > 0 {
 			s.setWarmState(st, "waiting", fmt.Sprintf("cell busy (%d in-flight)", n))
 			return
 		}
@@ -280,7 +280,7 @@ func (s *Server) applyWarmEval(t WarmTarget, st *warmTargetState, cfg warmLoopCo
 func (s *Server) observesActivity(cell string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.inFlightSeen[cell] || s.cellUp[cell]
+	return s.inFlight[cell].IsKnown() || s.cellUp[cell]
 }
 
 // swapIdleFor reports the SHORTEST idle window across the resident
@@ -294,7 +294,7 @@ func (s *Server) swapIdleFor(cell string, residents []string) (time.Duration, st
 	minIdle := time.Duration(-1)
 	var unknown []string
 	for _, id := range residents {
-		last, ok := s.modelLastActivity(cell, id)
+		last, ok := s.modelLastActivity(cell, id).Observed()
 		var idle time.Duration
 		if !ok {
 			unknown = append(unknown, id)

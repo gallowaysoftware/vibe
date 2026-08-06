@@ -314,7 +314,7 @@ func (s *Server) evalScheduleEntry(e WarmScheduleEntry, spec cronSpec, st *warmS
 		unguarded = " (unguarded: no def/cell)"
 		slog.Warn("warm schedule model has no def/cell — firing unguarded", "model", e.Model)
 	default:
-		n, reported := s.InFlight(cell)
+		n, reported := s.InFlight(cell).Observed()
 		switch {
 		case !reported:
 			note = fmt.Sprintf("skipped (cell %s in-flight unknown — no eviction fight)", cell)

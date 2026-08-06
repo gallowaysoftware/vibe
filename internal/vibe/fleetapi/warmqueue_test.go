@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/observed"
 )
 
 // warmQueueFixture builds a cell that is in the registry (so the front
@@ -211,8 +213,7 @@ func schedQueueFixture(t *testing.T, warmErr error) (*Server, *warmProbe, WarmSc
 	probe.err = warmErr
 	presenceOf(s, "heavy", AnnounceModel{ID: entry.Model, State: "stopped"})
 	s.mu.Lock()
-	s.inFlight["heavy"] = 0
-	s.inFlightSeen["heavy"] = true
+	s.inFlight["heavy"] = observed.Known(0)
 	s.mu.Unlock()
 	return s, probe, entry, spec, st, now
 }

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gallowaysoftware/vibe/internal/astscan"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 	"github.com/gallowaysoftware/vibe/internal/vibe/router"
@@ -546,7 +547,11 @@ func TestSwapKeyNeverAppearsInAnySurface(t *testing.T) {
 // scan sees the call; TestOnlyTheCellSideReaderSkipsSwapAuth below is
 // what keeps `nil` from becoming a way around the scan.
 func TestEveryLlamaSwapRequestIsAuthorized(t *testing.T) {
-	assertRequestsAuthorized(t, ".", "AuthorizeSwap")
+	// Four producers today: getJSON, readSwapVersion, warmViaFront,
+	// streamCell. The floor is what makes a rename or a deletion visible
+	// (C20) — raise it when a producer is added, never lower it to make a
+	// removal quiet.
+	assertRequestsAuthorized(t, ".", "AuthorizeSwap", 4)
 }
 
 // TestOnlyTheCellSideReaderSkipsSwapAuth guards the ONE exemption above.
@@ -638,58 +643,33 @@ func TestOnlyTheCellSideReaderSkipsSwapAuth(t *testing.T) {
 	}
 }
 
-func assertRequestsAuthorized(t *testing.T, dir, authorizer string) {
+// assertRequestsAuthorized is C15's scan, expressed on C20's reusable
+// rule engine (internal/astscan). Two things changed and neither weakens
+// it: the inertness floor is now the ACTUAL producer count rather than
+// "more than zero", so deleting three of the four producers is caught
+// too; and the same declaration now serves fleetmcp's twin and the warm
+// class rule below. The scan itself is mutation-pinned in
+// internal/mutation's registry, in both packages.
+func assertRequestsAuthorized(t *testing.T, dir, authorizer string, minProducers int) {
 	t.Helper()
-	// ParseFile per source file rather than parser.ParseDir: the latter is
-	// deprecated as of Go 1.25, and this scan wants every non-test .go file
-	// in the directory regardless of package association anyway.
-	entries, err := os.ReadDir(dir)
+	r := astscan.Rule{
+		Name:    "every fleetd→llama-swap request carries the cell's credential (C15)",
+		Dir:     dir,
+		Trigger: []string{"NewRequestWithContext", "NewRequest"},
+		Require: []string{authorizer},
+		// The nil-authorizer escape hatch is guarded separately and by
+		// name in TestOnlyTheCellSideReaderSkipsSwapAuth: this rule sees
+		// the CALL, that one sees what was passed.
+		MinProducers: minProducers,
+		Because: "every fleetd→llama-swap call carries the cell's credential, or it 401s silently " +
+			"on the day someone sets apiKeys (C15).",
+	}
+	res, err := r.Check()
 	if err != nil {
-		t.Fatalf("read %s: %v", dir, err)
+		t.Fatal(err)
 	}
-	fset := token.NewFileSet()
-	found := 0
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		file, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		ast.Inspect(file, func(n ast.Node) bool {
-			fn, ok := n.(*ast.FuncDecl)
-			if !ok || fn.Body == nil {
-				return true
-			}
-			builds, authorizes := false, false
-			ast.Inspect(fn.Body, func(m ast.Node) bool {
-				sel, ok := m.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				switch sel.Sel.Name {
-				case "NewRequestWithContext", "NewRequest":
-					builds = true
-				case authorizer:
-					authorizes = true
-				}
-				return true
-			})
-			if builds {
-				found++
-				if !authorizes {
-					t.Errorf("%s: %s builds an HTTP request to a llama-swap without calling %s — "+
-						"every fleetd→llama-swap call carries the cell's credential (C15)",
-						name, fn.Name.Name, authorizer)
-				}
-			}
-			return true
-		})
-	}
-	if found == 0 {
-		t.Fatalf("no request builders found in %s — the scan is inert and would pass on an empty package", dir)
+	if err := r.Err(res); err != nil {
+		t.Error(err)
 	}
 }
 

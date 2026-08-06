@@ -28,7 +28,7 @@ TIMEBOX=$((DELAY_S + 120))
 RESULTS_FILE="$RESULTS_DIR/results-$(date +%Y%m%d-%H%M%S).txt"
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "${WORK:?}"' EXIT
 
 ROWS=()
 FAILED=0

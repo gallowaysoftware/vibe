@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/observed"
 )
 
 // warmProbe captures warm calls and scripts llama-swap cells.
@@ -400,8 +402,7 @@ func TestScheduleGuardSkipsBusyAndLeased(t *testing.T) {
 
 	// Due now; cell busy → skip with note, no fire.
 	s.mu.Lock()
-	s.inFlight["heavy"] = 2
-	s.inFlightSeen["heavy"] = true
+	s.inFlight["heavy"] = observed.Known(2)
 	s.schedStates = []*warmScheduleState{{Cron: entry.Cron, Model: entry.Model, NextFire: &now}}
 	s.mu.Unlock()
 	s.mu.Lock()
@@ -417,7 +418,7 @@ func TestScheduleGuardSkipsBusyAndLeased(t *testing.T) {
 
 	// Idle but leased → still skipped (the first mechanical lease consumer).
 	s.mu.Lock()
-	s.inFlight["heavy"] = 0
+	s.inFlight["heavy"] = observed.Known(0)
 	s.leases["heavy\x00default-model\x00batch"] = Lease{Cell: "heavy", Model: "default-model", Holder: "batch", ExpiresAt: now.Add(time.Hour)}
 	s.mu.Unlock()
 	s.evalScheduleEntry(entry, spec, st, cellOf, time.UTC, probe.warm, "http://front.test", now.Add(time.Minute))

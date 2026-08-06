@@ -40,7 +40,7 @@ SLOWMODEL_LOG="${SLOWMODEL_LOG:-/tmp/slowmodel.log}"
 PROMPT="say hi in three words"
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "${WORK:?}"' EXIT
 
 VERDICT=PASS
 

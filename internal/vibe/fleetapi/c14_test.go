@@ -361,7 +361,7 @@ func TestSuspendGuard_EveryRungDefersAndNamesItself(t *testing.T) {
 // IN-FLIGHT message — ground rule 10's exact failure, a name claiming
 // more than the body proves. The observesActivity rung cannot in fact
 // fire: it is reached only after the in-flight rung passed, and passing
-// that rung requires inFlightSeen[cell], which is one of the two things
+// that rung requires an in-flight count reported for the cell, which is one of the two things
 // observesActivity is an OR over. So the ladder is sound and the rung is
 // belt-and-braces; the test now says which rung answers, and pins the
 // subsumption that makes the other one unreachable.
@@ -369,8 +369,7 @@ func TestSuspendGuard_NoObservationChannelIsAnsweredByTheUnreportedRung(t *testi
 	s := sleepServer(t, "opportunistic")
 	presenceOf(s, sleepCell)
 	s.mu.Lock()
-	s.inFlight[sleepCell] = 0
-	s.inFlightSeen[sleepCell] = false
+	delete(s.inFlight, sleepCell)
 	s.mu.Unlock()
 
 	if s.observesActivity(sleepCell) {
@@ -382,7 +381,7 @@ func TestSuspendGuard_NoObservationChannelIsAnsweredByTheUnreportedRung(t *testi
 	}
 	// The subsumption itself: no observation channel implies no reported
 	// in-flight count, which is why the earlier rung always answers first.
-	if _, reported := s.InFlight(sleepCell); reported {
+	if _, reported := s.InFlight(sleepCell).Observed(); reported {
 		t.Fatal("in-flight reported without an observation channel: the two rungs have come apart and the observesActivity rung is now load-bearing")
 	}
 }

@@ -321,7 +321,7 @@ func drainWithFleet(t *testing.T, cell *inflightCell) *Daemon {
 	// before a drain; the test must establish the same precondition.
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		if _, reported := fleet.InFlight("front"); reported {
+		if _, reported := fleet.InFlight("front").Observed(); reported {
 			break
 		}
 		if time.Now().After(deadline) {

@@ -51,7 +51,7 @@ func (s *Server) activityFor(cell string) *CellActivity {
 	up := s.cellUp[cell]
 	since, haveSince := s.cellUpSince[cell]
 	last, haveLast := s.lastInFlightFrame[cell]
-	count, reported := s.inFlight[cell], s.inFlightSeen[cell]
+	count, reported := s.inFlight[cell].Observed()
 	unknownOp := s.inFlightUnknownOp[cell]
 	s.mu.Unlock()
 

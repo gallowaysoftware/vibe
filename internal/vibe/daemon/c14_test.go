@@ -137,7 +137,7 @@ func fleetWithInFlight(t *testing.T, frame string) *fleetapi.Server {
 	t.Cleanup(f.Close)
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, ok := f.InFlight(fleetcfg.FrontCell); ok {
+		if _, ok := f.InFlight(fleetcfg.FrontCell).Observed(); ok {
 			return f
 		}
 		time.Sleep(2 * time.Millisecond)

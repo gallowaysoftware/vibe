@@ -19,6 +19,8 @@ import (
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/observed"
 )
 
 // ─── §2 crash and config integrity ──────────────────────────────────────────
@@ -434,15 +436,15 @@ func inflightFrame(t *testing.T, models ...string) json.RawMessage {
 func TestTrackInFlightParsesRealFrames(t *testing.T) {
 	s := newWarmServer(t, []Cell{{Name: "heavy", URL: "http://127.0.0.1:1"}})
 
-	if n, reported := s.InFlight("heavy"); reported || n != 0 {
+	if n, reported := s.InFlight("heavy").Observed(); reported || n != 0 {
 		t.Fatalf("InFlight before any frame = (%d, %v), want (0, false)", n, reported)
 	}
 	s.trackInFlight("heavy", inflightFrame(t, "challenger", "challenger"))
-	n, reported := s.InFlight("heavy")
+	n, reported := s.InFlight("heavy").Observed()
 	if !reported || n != 2 {
 		t.Fatalf("InFlight = (%d, %v), want (2, true)", n, reported)
 	}
-	started, ok := s.modelLastActivity("heavy", "challenger")
+	started, ok := s.modelLastActivity("heavy", "challenger").Observed()
 	if !ok {
 		t.Fatal("no per-model activity recorded; the frame parsed vacuously")
 	}
@@ -454,10 +456,10 @@ func TestTrackInFlightParsesRealFrames(t *testing.T) {
 	// re-stamped — "last activity" means started OR finished.
 	time.Sleep(5 * time.Millisecond)
 	s.trackInFlight("heavy", inflightFrame(t))
-	if n, _ := s.InFlight("heavy"); n != 0 {
+	if n, _ := s.InFlight("heavy").Observed(); n != 0 {
 		t.Fatalf("InFlight after the remove frame = %d, want 0", n)
 	}
-	finished, ok := s.modelLastActivity("heavy", "challenger")
+	finished, ok := s.modelLastActivity("heavy", "challenger").Observed()
 	if !ok {
 		t.Fatal("activity entry vanished on the remove frame")
 	}
@@ -467,7 +469,7 @@ func TestTrackInFlightParsesRealFrames(t *testing.T) {
 
 	// A frame that is NOT double-encoded must be ignored, not misparsed.
 	s.trackInFlight("heavy", json.RawMessage(`{"requests":[{"model":"x"}]}`))
-	if n, _ := s.InFlight("heavy"); n != 0 {
+	if n, _ := s.InFlight("heavy").Observed(); n != 0 {
 		t.Errorf("a bare (non-double-encoded) frame changed the count: %d", n)
 	}
 }
@@ -500,8 +502,7 @@ func TestScheduleGuardSkipsWhenTheGuardCannotBeEvaluated(t *testing.T) {
 	t.Run("defs unreadable", func(t *testing.T) {
 		s, probe, entry, spec, st, now := schedFixture(t)
 		s.mu.Lock()
-		s.inFlight["heavy"] = 3
-		s.inFlightSeen["heavy"] = true
+		s.inFlight["heavy"] = observed.Known(3)
 		s.mu.Unlock()
 		boom := func(string) (string, error) { return "", os.ErrPermission }
 		s.evalScheduleEntry(entry, spec, st, boom, time.UTC, probe.warm, "http://front.test", now)

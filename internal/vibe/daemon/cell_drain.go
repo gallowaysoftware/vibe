@@ -66,7 +66,7 @@ func (d *Daemon) CellDrain(ctx context.Context, req *connect.Request[vibev1.Cell
 	report := &vibev1.CellDrainResponse{ActiveLeases: []*vibev1.LeaseView{}}
 	report.ResidentModels = d.probeResidentModels(ctx)
 	if d.fleet != nil {
-		if n, ok := d.fleet.InFlight(d.localCellKey()); ok {
+		if n, ok := d.fleet.InFlight(d.localCellKey()).Observed(); ok {
 			n64 := int64(n)
 			report.InFlightRequests = &n64
 		}
@@ -152,14 +152,26 @@ func (d *Daemon) awaitQuiescence(ctx context.Context) (string, error) {
 		return fleetapi.DrainWaitSkippedNoInflight, nil
 	}
 	cell := d.localCellKey()
-	if _, reported := d.fleet.InFlight(cell); !reported {
+	if !d.fleet.InFlight(cell).IsKnown() {
 		slog.Info("no inflight report from the local cell; proceeding without waiting", "cell", cell)
 		return fleetapi.DrainWaitSkippedNoInflight, nil
 	}
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
-		n, _ := d.fleet.InFlight(cell)
+		// The count can go UNREPORTED mid-wait: the cell's events stream
+		// drops (clearInFlight) or sends a frame this build cannot fold
+		// (disarmInFlightLocked). This loop used to spell that
+		// `n, _ := InFlight(cell)`, read the zero, and return "waited" —
+		// telling an operator who asked for quiescence that the cell went
+		// quiet, when what actually went quiet was fleetd's evidence. The
+		// answer is the one wait_status that already means "no data",
+		// not a claim about the box (fleet-control C20).
+		n, reported := d.fleet.InFlight(cell).Observed()
+		if !reported {
+			slog.Info("the local cell's in-flight report stopped mid-wait; not claiming quiescence", "cell", cell)
+			return fleetapi.DrainWaitSkippedNoInflight, nil
+		}
 		if n == 0 {
 			return fleetapi.DrainWaitWaited, nil
 		}

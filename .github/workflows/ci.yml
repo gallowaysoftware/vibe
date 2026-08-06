@@ -40,6 +40,42 @@ jobs:
           go mod tidy
           git diff --exit-code go.mod go.sum
 
+  # The mutation harness (fleet-control C20): internal/mutation's registry
+  # of {production line, edit that breaks it, tests that must go red},
+  # applied to a copy of the tree one entry at a time.
+  #
+  # It answers the repo owner's mandate directly — "add tests to catch this
+  # stuff, relying on reviews for logic isn't working". Every adversarial
+  # review in this plan has hand-verified guards exactly this way; the
+  # registry is that table, run on every PR.
+  #
+  # A SEPARATE job for the same reason as the conformance matrix: each
+  # entry is a package recompile, and the blocking `test` job's ~15s is an
+  # asset. The two extra jobs run in parallel with it, so PR wall-clock is
+  # set by whichever is slowest, not by the sum.
+  #
+  # Measured on a workstation: 21s with a warm build cache, 58s with a
+  # cold GOCACHE (16 mutations, 4 workers, one tree copy each). The
+  # baseline round is what warms the cache, so the per-entry cost after it
+  # is a single package rebuild.
+  # TestMutationRegistryIsCurrent — the staleness half — costs milliseconds
+  # and deliberately runs in the BLOCKING job instead, because an entry
+  # that has come detached from the line it guards must be visible even on
+  # a PR nobody waits for this job on.
+  mutation:
+    name: mutation harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: true
+      - name: mutation harness
+        env:
+          VIBE_MUTATION_TEST: "1"
+        run: go test -count=1 -timeout 900s -v ./internal/mutation/
+
   # internal/swaptest's conformance list, run against a REAL llama-swap.
   #
   # TestSwapBehaviour rides along (fleet-control C16): the loading-state
