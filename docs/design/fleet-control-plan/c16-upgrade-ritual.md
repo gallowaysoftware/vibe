@@ -897,3 +897,12 @@ A new section, "The upgrade ritual (fleet-control C16)":
 Item 13 is marked SHIPPED with the three notes worth carrying, and item 7
 gets the correction. A new small item is added for `scripts/fleetlab`'s
 fixed ports.
+
+One line belongs to **C15's** entry rather than this one, and is left for
+C15's reconciliation pass because that item is not in the futures doc
+yet: when *"the cell-side llama-swap credential"* is written up, the seam
+it lands at now has a name — `fleetapi.ReadOwnSwapVersion`, the one
+entry point that deliberately presents none, with the reason in its doc
+comment. Closing that item means giving it an authorizer and deleting
+the exemption in `TestOnlyTheCellSideReaderSkipsSwapAuth`, which fails
+if the exemption outlives its caller.
