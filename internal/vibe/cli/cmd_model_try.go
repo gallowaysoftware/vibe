@@ -93,6 +93,9 @@ func modelTryCmd() *cobra.Command {
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmdContext(cmd)
+			if err := validateTrialGate(quiet, minFreeGB, now); err != nil {
+				return err
+			}
 			runner, err := newTrialRunner(minFreeGB)
 			if err != nil {
 				return err
@@ -186,6 +189,31 @@ func modelTryEndCmd() *cobra.Command {
 	return cmd
 }
 
+// validateTrialGate refuses the two flag values that silently disable a
+// guard instead of relaxing it. Both are decided before anything is
+// written, C10's rule: a refusal fleetd would issue anyway is issued
+// BEFORE the twenty-minute pull.
+//
+// `--idle 0` is the important one. The deferral IS this phase — a config
+// write truncates streams and evicts residents — and `awaitConds.evalIdle`
+// only runs when the window is positive, so a zero would apply as soon as
+// the cell answered, with none of `--now`'s sentence about what that
+// costs. Skipping the wait is spelled `--now`, exactly once.
+func validateTrialGate(quiet time.Duration, minFreeGB float64, now bool) error {
+	if quiet <= 0 && !now {
+		return fmt.Errorf("--idle %s is not a wait: an idle window of zero applies the config the moment the cell answers, "+
+			"which is what --now does — and --now says what it costs. Pass a positive --idle, or pass --now", quiet)
+	}
+	if minFreeGB < 0 {
+		return fmt.Errorf("--min-free %g is negative", minFreeGB)
+	}
+	if minFreeGB == 0 {
+		return fmt.Errorf("--min-free 0 is not \"no floor\" — it is silently the %.0f GiB default, because zero is how the flag says \"unset\". "+
+			"Pass a positive floor, or --skip-disk-check to remove it entirely", float64(modeltry.DefaultMinFreeBytes)/(1<<30))
+	}
+	return nil
+}
+
 // newTrialRunner resolves everything from the same sources the render
 // path uses, so a trial's config write and `vibe router render` can never
 // disagree about which cell this box is or which binary it renders.
@@ -272,13 +300,21 @@ func runModelTry(ctx context.Context, out io.Writer, runner *modeltry.Runner, ap
 		fmt.Fprintln(out, "--dry-run: the def that would be written:")
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, yamlDef)
-		// Close the journal Plan opened. A --dry-run that leaves one
-		// behind makes the very next real invocation resume a trial the
-		// operator never started — and if they changed a flag between
-		// the two, it would be refused as a DIFFERENT trial. From
-		// `planned` this is the real rollback path with nothing to undo.
-		if _, err := runner.End(ctx, t, false); err != nil {
+		// Close the journal Plan opened — and ONLY one Plan opened. A
+		// --dry-run that leaves a fresh journal behind makes the very next
+		// real invocation resume a trial the operator never started; a
+		// --dry-run that closes a RESUMED one performs the whole rollback
+		// (drop the def, re-render the cell's config, evict every resident
+		// model) under a flag whose entire promise is that nothing happens.
+		// `End` works from any state, so the decision cannot live there.
+		closed, err := runner.DiscardIfFresh(ctx, t)
+		if err != nil {
 			return err
+		}
+		if !closed {
+			fmt.Fprintf(out, "a trial of %s is already in flight at state %s — --dry-run left it exactly as it was.\n", t.Def, t.State)
+			fmt.Fprintln(out, "`vibe model try status` shows it; `vibe model try end` rolls it back.")
+			return nil
 		}
 		fmt.Fprintln(out, "nothing was downloaded, nothing on this box changed, and no trial is open.")
 		fmt.Fprintln(out, "re-run without --dry-run to perform it.")
@@ -298,7 +334,7 @@ func runModelTry(ctx context.Context, out io.Writer, runner *modeltry.Runner, ap
 	if terr != nil {
 		return terr
 	}
-	if err := trialDeclareAndWait(ctx, out, target, t, gate); err != nil {
+	if err := trialDeclareAndWait(ctx, out, runner, target, t, gate); err != nil {
 		return err
 	}
 
@@ -338,7 +374,13 @@ func runModelTry(ctx context.Context, out io.Writer, runner *modeltry.Runner, ap
 // apply. The wait goes between them and the write, because it is the only
 // thing standing between a declared config change and somebody's
 // truncated generation.
-func trialDeclareAndWait(ctx context.Context, out io.Writer, target fleetdTarget, t *modeltry.Trial, gate trialGateOpts) error {
+// Each declaration is written to the JOURNAL the moment it is taken, not
+// at the end of the sequence: everything after this point can fail (the
+// bank, the render, the write), and a declaration that only exists in
+// this process's memory is one `vibe model try end` will never release.
+// Its cost is four hours of a suspended warm policy, plus a re-run that
+// parks forever on `--unleased` against the trial's own hold.
+func trialDeclareAndWait(ctx context.Context, out io.Writer, runner *modeltry.Runner, target fleetdTarget, t *modeltry.Trial, gate trialGateOpts) error {
 	if t.State != modeltry.StateStaged {
 		return nil // already applied; the declarations were made then
 	}
@@ -370,6 +412,10 @@ func trialDeclareAndWait(ctx context.Context, out io.Writer, target fleetdTarget
 			"a config rewrite nothing announced is invisible to the pre-drain report that exists to protect running work", t.Cell, err)
 	}
 	t.Leased = true
+	if err := runner.Save(t); err != nil {
+		return fmt.Errorf("declared the lease on %s/%s but could not record it in the journal (%w) — `vibe model try end` would not release it; release it by hand (`vibe cell lease` semantics: cell=%s model=%s holder=%s) or wait %s for it to expire",
+			t.Cell, t.Def, err, t.Cell, t.Def, modeltry.TrialLeaseHolder, trialLeaseTTL)
+	}
 	fmt.Fprintf(out, "declared: lease %s on %s/%s\n", modeltry.TrialLeaseHolder, t.Cell, t.Def)
 
 	// The hold: C11, on the INCUMBENT, so fleetd's warm-target restore
@@ -382,6 +428,10 @@ func trialDeclareAndWait(ctx context.Context, out io.Writer, target fleetdTarget
 		fmt.Fprintln(out, "         fleetd may reload the incumbent mid-trial and evict the candidate. The numbers would still be real; they would just be measuring a different afternoon.")
 	case held:
 		t.Held = true
+		if serr := runner.Save(t); serr != nil {
+			return fmt.Errorf("declared the hold on %s/%s but could not record it in the journal (%w) — `vibe model try end` would not release it; release it with `vibe cell hold --release` or wait %s",
+				t.Cell, t.Incumbent, serr, trialHoldTTL)
+		}
 		fmt.Fprintf(out, "declared: hold on %s/%s for the duration (fleetd's warm policy will not evict the candidate)\n", t.Cell, t.Incumbent)
 	default:
 		fmt.Fprintf(out, "a hold already exists on %s/%s — left alone, and this trial will not release it\n", t.Cell, t.Incumbent)

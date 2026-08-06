@@ -293,6 +293,25 @@ func (c *Cell) SetModelState(id, state string) {
 	c.broadcast(frame)
 }
 
+// RemoveModel drops a model from the catalog, which is what a real
+// llama-swap does a `-watch-config` poll interval after its config stops
+// declaring one. Modelled here rather than in a caller because "the id is
+// gone from /v1/models" is the only observable a config rollback has, and
+// a test that could not produce it could only assert the failure case.
+func (c *Cell) RemoveModel(id string) {
+	c.mu.Lock()
+	kept := c.models[:0]
+	for _, m := range c.models {
+		if m.ID != id {
+			kept = append(kept, m)
+		}
+	}
+	c.models = kept
+	frame := c.modelStatusFrameLocked()
+	c.mu.Unlock()
+	c.broadcast(frame)
+}
+
 // ─── the request lifecycle ──────────────────────────────────────────────────
 
 // Request drives one complete request through the double: the in-flight

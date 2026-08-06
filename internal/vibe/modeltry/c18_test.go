@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"github.com/gallowaysoftware/vibe/internal/swaptest"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 	"github.com/gallowaysoftware/vibe/internal/vibe/hfdownload"
+	"github.com/gallowaysoftware/vibe/internal/vibe/modelprobe"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 	"github.com/gallowaysoftware/vibe/internal/vibe/router"
 )
@@ -1056,4 +1059,347 @@ func anyLogContains(entries []LogEntry, sub string) bool {
 		}
 	}
 	return false
+}
+
+// ── the adversarial-review pass's findings ──────────────────────────────
+
+// TestTrialVRAMEstimateIsNotTheIncumbentsNumber. estimated_vram_gb is a
+// hand-measured claim about the INCUMBENT's weights, and the report puts
+// it in a column headed by the candidate's name. Inheriting it makes the
+// two sides equal by construction on the one row that answers "and how
+// much bigger is it" — the sentence the resource half of the comparison
+// exists for.
+func TestTrialVRAMEstimateIsNotTheIncumbentsNumber(t *testing.T) {
+	r := smallRig(t)
+	inc := mustDef(t, r, incName)
+	if inc.EstimatedVRAMGB <= 0 {
+		t.Fatalf("the fixture must declare one for this test to mean anything: %v", inc.EstimatedVRAMGB)
+	}
+	got := deriveDef(inc, "trial-x", "/models/new.gguf", testCell)
+	if got.EstimatedVRAMGB != 0 {
+		t.Fatalf("the trial inherited the incumbent's VRAM estimate (%v): the report would print a number nobody measured under the candidate's name",
+			got.EstimatedVRAMGB)
+	}
+	m := Measurement{Model: "trial-x", VRAMEstimateGB: got.EstimatedVRAMGB}
+	if vram(m) != "not declared" {
+		t.Fatalf("an undeclared estimate must render as undeclared, got %q", vram(m))
+	}
+}
+
+// TestEndWaitsForLlamaSwapToDropTheTrial. `-watch-config` polls on its
+// own 2 s cadence, so a single catalog read taken microseconds after the
+// re-render finds the trial still listed on EVERY healthy rollback, and
+// told the operator to restart llama-swap — a warning that fires on the
+// success path is one nobody reads on the failure path.
+func TestEndWaitsForLlamaSwapToDropTheTrial(t *testing.T) {
+	r := smallRig(t)
+	run := r.runner(func(o *Options) { o.CatalogWait = 10 * time.Second })
+	ctx := context.Background()
+	if _, err := run.render(true); err != nil {
+		t.Fatal(err)
+	}
+	tr, def, err := run.Plan(ctx, planReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Fetch(ctx, tr, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Stage(tr, def); err != nil {
+		t.Fatal(err)
+	}
+	r.swap.SetModelState(tr.Def, "stopped")
+	if _, err := run.Apply(ctx, tr); err != nil {
+		t.Fatal(err)
+	}
+	// A real -watch-config cell drops the id a poll interval AFTER the
+	// write, not during it.
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		r.swap.RemoveModel(tr.Def)
+	}()
+	rep, err := run.End(ctx, tr, false)
+	if err != nil {
+		t.Fatalf("end: %v (%v)", err, rep.Steps)
+	}
+	if rep.StillInCatalog {
+		t.Fatalf("end reported the trial still in the catalog after llama-swap dropped it: %q", rep.Note)
+	}
+	if rep.Note != "" {
+		t.Fatalf("a clean rollback must print no restart warning, got %q", rep.Note)
+	}
+}
+
+// TestEndStillReportsACatalogThatNeverLetGo is the other half: a cell
+// whose llama-swap does not watch its config keeps serving the trial, and
+// that must survive the poll rather than be waited into silence.
+func TestEndStillReportsACatalogThatNeverLetGo(t *testing.T) {
+	r := smallRig(t)
+	run := r.runner(func(o *Options) { o.CatalogWait = 50 * time.Millisecond })
+	ctx := context.Background()
+	tr, def, err := run.Plan(ctx, planReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Fetch(ctx, tr, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Stage(tr, def); err != nil {
+		t.Fatal(err)
+	}
+	r.swap.SetModelState(tr.Def, "stopped")
+	if _, err := run.Apply(ctx, tr); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := run.End(ctx, tr, false)
+	if err != nil {
+		t.Fatalf("end: %v", err)
+	}
+	if !rep.StillInCatalog || !strings.Contains(rep.Note, "restart it") {
+		t.Fatalf("a llama-swap that never reloaded must still be reported: still=%v note=%q", rep.StillInCatalog, rep.Note)
+	}
+}
+
+// TestEndRerendersAStagedTrialTheConfigStillNames. `staged` promises the
+// TRIAL never wrote the config — not that nobody else ran
+// `vibe router render` between the staging and the rollback. After that,
+// removing the def alone leaves the cell serving a trial `end` has just
+// reported closed.
+func TestEndRerendersAStagedTrialTheConfigStillNames(t *testing.T) {
+	r := smallRig(t)
+	run := r.runner()
+	ctx := context.Background()
+	if _, err := run.render(true); err != nil {
+		t.Fatal(err)
+	}
+	before := readOrEmpty(t, r.configPath)
+
+	tr, def, err := run.Plan(ctx, planReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Fetch(ctx, tr, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Stage(tr, def); err != nil {
+		t.Fatal(err)
+	}
+	// Somebody runs `vibe router render` while the trial is staged.
+	if _, err := run.render(true); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(readOrEmpty(t, r.configPath), tr.Def) {
+		t.Fatal("the setup did not put the trial in the config")
+	}
+	if tr.State != StateStaged {
+		t.Fatalf("state %q", tr.State)
+	}
+	if _, err := run.End(ctx, tr, false); err != nil {
+		t.Fatal(err)
+	}
+	got := readOrEmpty(t, r.configPath)
+	if strings.Contains(got, tr.Def) {
+		t.Fatalf("`end` reported the trial closed while the cell's config still serves it:\n%s", got)
+	}
+	if got != before {
+		t.Fatalf("the config was not restored:\nwant:\n%s\ngot:\n%s", before, got)
+	}
+}
+
+// TestEndDoesNotWriteAConfigTheTrialNeverTouched is the fail-closed half
+// of the same fix: on the ordinary staged rollback the trial never wrote
+// the config, and `end` must not become an implicit `vibe router render`
+// that creates one.
+func TestEndDoesNotWriteAConfigTheTrialNeverTouched(t *testing.T) {
+	r := smallRig(t)
+	run := r.runner()
+	ctx := context.Background()
+	tr, def, err := run.Plan(ctx, planReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Fetch(ctx, tr, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Stage(tr, def); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run.End(ctx, tr, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(r.configPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("`end` created a llama-swap config on a box that had none: %v", err)
+	}
+}
+
+// TestResumeRefusesADifferentRevisionOrDest. The identity check decides
+// whether a re-run RESUMES; a revision or a --dest it ignores is one the
+// operator typed and the trial silently did not use.
+func TestResumeRefusesADifferentRevisionOrDest(t *testing.T) {
+	base := planReq()
+	base.Revision = "abc123"
+	r := smallRig(t)
+	if _, _, err := r.runner().Plan(context.Background(), base); err != nil {
+		t.Fatal(err)
+	}
+	moved := base
+	moved.Revision = "def456"
+	if _, _, err := r.runner().Plan(context.Background(), moved); err == nil || !strings.Contains(err.Error(), "already in flight") {
+		t.Fatalf("a different --revision must not resume the old one, got %v", err)
+	}
+	elsewhere := base
+	elsewhere.Dest = filepath.Join(r.dir, "other-models")
+	if _, _, err := r.runner().Plan(context.Background(), elsewhere); err == nil || !strings.Contains(err.Error(), "already in flight") {
+		t.Fatalf("a different --dest must not resume weights at the old path, got %v", err)
+	}
+	same := base
+	if again, _, err := r.runner().Plan(context.Background(), same); err != nil || again == nil {
+		t.Fatalf("the identical request must still resume: %v", err)
+	}
+}
+
+// TestResumeRestagesADefTheIncumbentChanged. Resuming re-derives the def
+// from the CURRENT incumbent precisely so an edit made mid-trial is
+// picked up; a Stage that returned early at `staged` discarded that and
+// kept serving the derivation from before the edit.
+func TestResumeRestagesADefTheIncumbentChanged(t *testing.T) {
+	r := smallRig(t)
+	ctx := context.Background()
+	tr, def, err := r.runner().Plan(ctx, planReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.runner().Fetch(ctx, tr, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.runner().Stage(tr, def); err != nil {
+		t.Fatal(err)
+	}
+	if got := readOrEmpty(t, tr.DefPath); !strings.Contains(got, "context: 65536") {
+		t.Fatalf("the fixture's context did not reach the def:\n%s", got)
+	}
+	// The operator halves the incumbent's context budget between the
+	// staging and the apply, which is exactly the edit REV-1's
+	// re-derivation exists to pick up.
+	r.writeDef(incName, strings.Replace(mustRead(t, filepath.Join(r.backends, incName+".yaml")), "context: 65536", "context: 32768", 1))
+
+	again, def2, err := r.runner().Plan(ctx, planReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.runner().Stage(again, def2); err != nil {
+		t.Fatal(err)
+	}
+	got := readOrEmpty(t, again.DefPath)
+	if !strings.Contains(got, "context: 32768") {
+		t.Fatalf("the staged def still carries the pre-edit derivation:\n%s", got)
+	}
+	if again.State != StateStaged {
+		t.Fatalf("state %q", again.State)
+	}
+}
+
+// TestWarmErrorsAreStrippedOfControlCharacters. Everything llama-swap
+// says lands in a Note that is SAVED to the journal and re-printed by
+// every later `vibe model try status`; an escape sequence there is an
+// injection into the operator's terminal, replayed forever. Same rule as
+// cli.termSafe, held at the point the string is stored.
+func TestWarmErrorsAreStrippedOfControlCharacters(t *testing.T) {
+	r := smallRig(t, swaptest.WithModels(swaptest.Model{ID: incName, State: "ready"}))
+	hostile := "\x1b[2Jcleared your scrollback\x07"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, hostile, http.StatusBadRequest)
+	}))
+	t.Cleanup(srv.Close)
+	run := r.runner(func(o *Options) { o.LlamaSwapURL = srv.URL })
+	err := run.warm(context.Background(), incName, "chat")
+	if err == nil {
+		t.Fatal("want a warm failure")
+	}
+	if strings.ContainsAny(err.Error(), "\x1b\x07") {
+		t.Fatalf("a control character from llama-swap reached the journal and the terminal: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "cleared your scrollback") {
+		t.Fatalf("the readable half of the message must survive: %q", err.Error())
+	}
+}
+
+func mustRead(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// TestMeasureNeverWritesTheCellsSharedProbeState. C8's baseline file is a
+// whole-file rewrite from in-memory state, and until C18 the cell daemon's
+// prober was its only writer. A trial is a SECOND process holding it for
+// the twenty minutes two cold loads take: writing it back deletes every
+// baseline sample and every budget entry the daemon recorded in that
+// window, silently, from the record whose whole value is being the one
+// multi-sample number the report prints.
+func TestMeasureNeverWritesTheCellsSharedProbeState(t *testing.T) {
+	r := smallRig(t)
+	ctx := context.Background()
+	probePath := filepath.Join(r.dir, "state", "model-probe.json")
+
+	// Seed it the way the cell daemon does: a writable prober, several
+	// probes, an advancing clock. Building the key by hand would test the
+	// test's idea of the key rather than C8's.
+	defs, err := router.LoadDefs(r.backends)
+	if err != nil {
+		t.Fatal(err)
+	}
+	specs := modelprobe.SpecsFromDefs(defs, "/usr/bin/llama-server")
+	base, tick := time.Now().Add(-24*time.Hour), 0
+	daemonProber, err := modelprobe.New(modelprobe.Config{
+		LlamaSwapURL: r.swap.URL(), StatePath: probePath,
+		Specs: func(m string) modelprobe.Spec { return specs[m] },
+		Now:   func() time.Time { tick++; return base.Add(time.Duration(tick) * 10 * time.Minute) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.swap.SetModelState(incName, "ready")
+	for n := 0; n < 6; n++ {
+		if res := daemonProber.Run(ctx, incName, false); res != nil && res.Note != "" {
+			t.Fatalf("seed probe %d: %s", n, res.Note)
+		}
+	}
+	seeded := readOrEmpty(t, probePath)
+	if !strings.Contains(seeded, incName) {
+		t.Fatalf("the seed did not record the incumbent:\n%s", seeded)
+	}
+
+	run := r.runner(func(o *Options) { o.ProbeStatePath = probePath })
+	tr, def, err := run.Plan(ctx, planReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Fetch(ctx, tr, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Stage(tr, def); err != nil {
+		t.Fatal(err)
+	}
+	r.swap.SetModelState(tr.Def, "ready")
+	if _, err := run.Apply(ctx, tr); err != nil {
+		t.Fatal(err)
+	}
+	cmp, err := run.Measure(ctx, tr)
+	if err != nil {
+		t.Fatalf("measure: %v", err)
+	}
+	// It was READ — the daemon's rolling window is on the report, which is
+	// why the trial holds this file at all.
+	if cmp.Incumbent.Samples <= 0 || cmp.Incumbent.BaselineP50 <= 0 {
+		t.Fatalf("the daemon's baseline did not reach the report (samples=%d p50=%v; note %q)",
+			cmp.Incumbent.Samples, cmp.Incumbent.BaselineP50, cmp.Incumbent.Note)
+	}
+	// And it was not written: byte-for-byte what the daemon left.
+	if got := readOrEmpty(t, probePath); got != seeded {
+		t.Fatalf("the trial rewrote the cell daemon's probe state, discarding whatever it recorded meanwhile:\nwant:\n%s\ngot:\n%s", seeded, got)
+	}
 }

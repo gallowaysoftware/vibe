@@ -5,15 +5,20 @@ Status: **PR OPEN**, off `feat/c18-model-try` branched from `main` at
 [fleet-control-futures.md](../fleet-control-futures.md) §2) — the weekly
 loop the futures doc calls "the year's dominant toil".
 
-Two commits: the feature, and ground rule 9's adversarial self-review
-(**seven findings, one of them a blocker** — see the
-[addendum](#adversarial-self-review-addendum-ground-rule-9)).
-Unit gates U1–U13 green on a full local inner loop (`go build`,
-`go vet`, `go test -race ./...` repeated, `gofmt -l .` silent,
-`go mod tidy` byte-clean, `golangci-lint run` 0 issues). Twelve
-production predicates are **mutation-verified**: reverted one at a time,
-each confirmed to turn a NAMED test red, then restored. One fix
-(atomic def write) is deliberately NOT mutation-verified and says so.
+Three commits: the feature, ground rule 9's adversarial self-review
+(**seven findings, one blocker** — see the
+[addendum](#adversarial-self-review-addendum-ground-rule-9)), and an
+independent adversarial-review pass over both (**eleven findings, one
+blocker** — see the
+[second addendum](#adversarial-review-addendum-ground-rule-9-second-pass)).
+Unit gates U1–U14 green on a full local inner loop (`go build`,
+`go vet`, `go test -race ./...` ×5 on the touched packages plus
+`-race ./...` whole-module, `gofmt -l .` silent, `go mod tidy`
+byte-clean, `golangci-lint run` 0 issues). Twenty-three production
+predicates are **mutation-verified**: reverted one at a time, each
+confirmed to turn a NAMED test red by reading `go test`'s own exit
+status, then restored. One fix (atomic def write) is deliberately NOT
+mutation-verified and says so.
 
 **Live gates: see [Acceptance gates](#acceptance-gates).** The rig is
 committed (`scripts/fleetlab/gate-c18.sh`); whether it ran is recorded
@@ -371,6 +376,8 @@ fleetd producer.
 | `internal/vibe/router/render.go` | the front-render exclusion |
 | `internal/vibe/paths/paths.go` | `ModelTrialFile` |
 | `internal/vibe/cli/root.go` | mount `model` |
+| `internal/vibe/modelprobe/modelprobe.go` | `Config.ReadOnly` (review pass): the cell daemon owns the probe state file; a trial reads it and writes nothing |
+| `internal/swaptest/swaptest.go` | `Cell.RemoveModel` (review pass): a config reload dropping an id is the only observable a rollback has |
 | `scripts/fleetlab/gate-c18.sh` | the live rig |
 
 No new HTTP route, no new MCP tool, no proto change, no new store on
@@ -395,6 +402,7 @@ fleetd, no new dependency, and an **empty diff for `internal/vibe/proxy`**.
 | U11 | a corrupt journal is an ERROR, never "no trial"; the journal survives a process death; the staged def round-trips through the real loader and equals `--dry-run`'s preview | `TestCorruptJournalIsNeverReadAsNoTrial`, `TestJournalSurvivesAProcessDeath`, `TestStagedDefRoundTripsThroughTheRealLoader` |
 | U13 | re-running RESUMES the same trial and refuses a different one; a journal from another cell or another config path is refused by both `Plan` and `end`; a FAILED rollback keeps the journal and the banked config | `TestReRunningResumesTheSameTrial`, `TestJournalFromAnotherCellOrConfigIsRefused`, `TestFailedRollbackKeepsTheJournalAndTheBackup` |
 | U12 | the trial takes a lease and a hold-on-the-incumbent, leaves an existing hold alone in both directions, refuses to apply undeclared, skips re-declaring on resume, and rolls back with fleetd gone | `TestTrialNowDeclaresTheLeaseAndTheHold`, `TestTrialLeavesAnExistingHoldAloneInBothDirections`, `TestEndReleasesOnlyWhatTheTrialTook`, `TestTrialRefusesToApplyUndeclared`, `TestTrialDeclarationsAreSkippedOnResume`, `TestEndStillRollsBackWhenFleetdIsGone` |
+| U14 | the adversarial-review pass's eleven findings: `--dry-run` never rolls back a resumed trial and still closes its own journal; both declarations are on disk before the apply; the candidate's VRAM estimate is not the incumbent's; `end` waits for llama-swap to drop the id and still reports one that never went; `end` re-renders a staged trial the config still names and writes nothing when it does not; `--idle 0` and `--min-free 0` are refused; a different `--revision`/`--dest` does not resume; a re-derived def is restaged; llama-swap's body is scrubbed; the cell's shared probe state is never rewritten | `TestDryRunNeverRollsBackAnInFlightTrial`, `TestTrialDeclarationsAreOnDiskBeforeTheApply`, `TestTrialVRAMEstimateIsNotTheIncumbentsNumber`, `TestEndWaitsForLlamaSwapToDropTheTrial`, `TestEndStillReportsACatalogThatNeverLetGo`, `TestEndRerendersAStagedTrialTheConfigStillNames`, `TestEndDoesNotWriteAConfigTheTrialNeverTouched`, `TestTrialGateRefusesAZeroIdleWindow`, `TestTrialGateRefusesAZeroMinFree`, `TestResumeRefusesADifferentRevisionOrDest`, `TestResumeRestagesADefTheIncumbentChanged`, `TestWarmErrorsAreStrippedOfControlCharacters`, `TestMeasureNeverWritesTheCellsSharedProbeState` |
 
 **Mutation-verified predicates (12).** Each production line reverted,
 the named test confirmed red, the line restored:
@@ -420,8 +428,15 @@ syscalls. It is here on the argument, not on a red test.
 | L4 | `end` from each of the five journal states, with the config compared byte-for-byte against a pre-trial copy | **UNRUN** |
 | L5 | the magnitude gate: a real GPU, a real 20 GB pull, a real cold start on both sides, and a report a human agrees with | **UNRUN — needs metal.** CPU models are not GPU models (the plan README's standing qualification): nothing in a lab exercises a 6–10 minute cold start or VRAM pressure, and this phase's whole output is a magnitude. |
 
-**L1–L4 were NOT RUN in this session** and the rig records that rather
-than a number. The reason is the one C16 hit and
+**L1–L4 were NOT RUN, in either session** — and the review pass found
+that the rig as first committed could not have been: it named an
+incumbent def and a candidate directory the lab has never created, ran
+under fleetd's config rather than the cell's, and pointed `--dest` at
+the incumbent's own weights (REV2-8). It has been rewritten against what
+`scripts/fleetlab/lab.sh` actually writes and its premises were checked
+against a real lab tree, but the corrected rig has **not been executed
+either**, so every row above stays UNRUN. A gate claim is a claim about
+a mechanical run. The reason is the one C16 hit and
 [futures item 15](../fleet-control-futures.md) names: `scripts/fleetlab`
 binds fixed ports (9600-9799, upstreams 5980-6019) with no offset knob,
 this phase was built alongside a sibling phase in the same checkout, and
@@ -503,6 +518,188 @@ injectable clock while sleeping on the wall clock, which spins forever
 under a frozen `Now`; both are `time.Now` now, with the reason written
 down.
 
+## Adversarial-review addendum (ground rule 9, second pass)
+
+An independent adversarial pass over the merged feature + self-review
+commits. **Eleven findings, one blocker.** All fixed in a third commit;
+every production predicate below was mutation-verified — reverted one at
+a time, the NAMED test confirmed red by reading `go test`'s own exit
+status, then restored.
+
+**REV2-1 (BLOCKER) — `--dry-run` performed a full rollback of an
+in-flight trial and reported that nothing had changed.** REV-1 taught
+`Plan` to RESUME an open journal; REV-7 taught `--dry-run` to close "the
+journal Plan opened" by calling `End`. Composed, they are a rollback
+wearing the word *dry*: on a trial already `applied`, `vibe model try
+<same args> --dry-run` removed the trial def, re-rendered the cell's
+llama-swap config — which `-watch-config` reloads, evicting every
+resident model and truncating anything past 30 s — deleted the journal,
+and printed *"nothing was downloaded, nothing on this box changed, and
+no trial is open."* The operator's next `status` reports no trial on a
+box whose models were just evicted. `End` works from any state, so the
+decision cannot live in `End`: `Trial.Resumed` (process-local, never
+serialized) records which of the two `Plan` did, and
+`Runner.DiscardIfFresh` closes only a journal this invocation opened.
+Pinned by `TestDryRunNeverRollsBackAnInFlightTrial`, which drives the
+real sequence to `applied` and then dry-runs it.
+
+**REV2-2 (major) — the two declarations were never written to the
+journal until the apply had already succeeded.** `trialDeclareAndWait`
+set `t.Leased` / `t.Held` in memory; the next `save` was inside `Apply`,
+*after* `bankConfig` and the render. Anything that failed in between —
+an unwritable config dir, a def someone else broke, a killed process —
+lost both records. Then `vibe model try end` releases nothing (it
+releases exactly what the journal says the trial took), the lease and
+the C11 hold sit for four hours suppressing the fleet's warm policy
+invisibly, and the re-run parks forever: `--unleased` skips the trial's
+own *lease* holder but not the reserved `hold` holder, so the trial
+deadlocks against its own declaration. Each declaration is now persisted
+the moment it is taken, and a journal write that fails fails the command
+with the manual release. `TestTrialDeclarationsAreOnDiskBeforeTheApply`
+reads the journal back the way a later process would.
+
+**REV2-3 (major) — the candidate's VRAM estimate was the incumbent's
+number.** `deriveDef` copied `estimated_vram_gb`, and `measureOne` reads
+it back off the def to fill the report's *estimated VRAM* row under the
+candidate's name. So the one row that answers "and how much bigger is
+it" — the row the phase doc introduces with *"a model that is 15% faster
+and 40% larger has not obviously won"* — was equal on both sides by
+construction, for every trial, forever. A hand-measured claim about
+another model's weights presented as a measurement of this one; the
+repo's absent-evidence-as-a-healthy-value class, in the report the whole
+phase exists to print. Not inherited now, and it renders "not declared".
+An external def is never VRAM-preflighted, so nothing else wanted it.
+
+**REV2-4 (major) — `end` told the operator to restart llama-swap on
+every successful rollback.** `stillListed` read `/v1/models` ONCE,
+microseconds after the re-render. A real `-watch-config` llama-swap
+notices a config change on its own ~2 s poll (C0's measured gate), so
+the read always found the trial still listed and printed *"llama-swap has
+not reloaded — restart it to finish the rollback"*, which evicts
+everything resident. `Apply` already knew this and polls; the rollback
+side did not. It now polls the same `CatalogWait` budget for the id to
+LEAVE, and an unreadable catalog is still reported as unverified rather
+than as gone. A warning that fires on the success path is one nobody
+reads on the failure path.
+
+**REV2-5 (major) — `--idle 0` silently disabled the deferral that is the
+whole phase.** `awaitConds.evalIdle` only runs when the window is
+positive, and C18 never called C10's `validateAwaitFlags`. So
+`--idle 0` (or any negative duration) applied the config the moment the
+cell answered — which is what `--now` does, minus `--now`'s sentence
+about truncated generations and evicted residents — while printing
+*"waiting for bravo to be observed idle for 0s (fleetd's evidence, not a
+guess)"*. Skipping the wait is spelled `--now`, exactly once.
+`validateTrialGate` refuses it before the twenty-minute pull, C10's
+issue-the-refusal-first rule.
+
+**REV2-6 (major) — a `staged` rollback left the cell serving the
+trial.** `end` re-rendered only from `applied`, on the reasoning that
+`staged` never wrote the config. That is a promise about what the TRIAL
+did, not about what anyone else did: an operator (or `vibe start`) who
+runs `vibe router render` while a trial is staged puts the trial into
+the cell's llama-swap config, and then `end` removes the def, re-renders
+nothing, and reports *"trial closed"* while the id is still being
+served — with its def gone, so the next render cannot even reproduce it.
+`end` now re-renders from `staged` too, gated on the config actually
+declaring the trial as a `models:` key, so the ordinary path still writes
+nothing and cannot create a config on a box that has none
+(`TestEndDoesNotWriteAConfigTheTrialNeverTouched` pins that half).
+
+**REV2-7 (major) — the trial's prober rewrote the cell daemon's probe
+state.** `Measure` builds a `modelprobe.Prober` on
+`paths.CellProbeFile()`, which until C18 had exactly one writer: the cell
+daemon's own prober. The file is a whole-file rewrite from in-memory
+state (`history.go`'s shape), so a second process holding it for the
+twenty minutes two cold loads take discards every baseline sample and
+every 96/day budget entry the daemon recorded in that window — including
+the rolling window the report calls *the only multi-sample number on the
+page*. `modelprobe.Config.ReadOnly` loads and never writes back; the
+trial reads the incumbent's window to print it and leaves the file
+byte-for-byte as it found it. `TestMeasureNeverWritesTheCellsSharedProbeState`
+seeds the file through a real writable prober so the baseline key is
+C8's, not the test's idea of it.
+
+**REV2-8 (major, rig) — `scripts/fleetlab/gate-c18.sh` could not run.**
+The committed rig was gated UNRUN and shipped as "the next person with a
+free lab runs them rather than re-derives them"; it named an incumbent
+def (`lab-chat-b`) and a candidate directory (`$LAB/models/`) that
+`scripts/fleetlab/lab.sh` has never created, so it exits 2 at its own
+precondition check. Verified mechanically against a real lab tree at
+`/tmp/fleetlab` (defs are `lab-chat`, `lab-embed-{a,b,c}`; there is no
+`$LAB/models`). Three more, each of which stops the run one step later:
+it exported gl.sh's `XDG_CONFIG_HOME=$LAB/etc`, which is **fleetd's**
+config and declares no `fleet.cell` at all, so `vibe model try` refuses
+before it starts; `--dest $(dirname $CANDIDATE)` with the candidate
+being the incumbent's own GGUF resolves to the weights path a def
+already serves, which `Plan` refuses by design; and step 4 sent a chat
+completion to bravo's only def, an **embedding** server. Rewritten
+against what `lab.sh` actually writes: bravo's own `etc-bravo` config,
+`lab-embed-b` as the incumbent, a copied candidate under a name no def
+serves, `PORT`/`SPORT` derived from the lab rather than hardcoded, and
+the embed request C18's own kind detection would issue. It also now
+re-applies lab.sh's `startPort` rewrite after every render and refuses to
+continue if it does not take — `vibe router render` emits
+`startPort: 5800`, which gl.sh names as production's upstream range on
+this box, and `try`'s apply is a render. **Still UNRUN** (see the gate
+table).
+
+**REV2-9 (minor) — the resume identity ignored `--revision` and
+`--dest`.** `Plan` compared def name, repo, file and `--like`. Re-running
+with a corrected `--revision` therefore RESUMED the old one silently and
+served the revision the operator had just replaced; a different `--dest`
+kept the weights at the old path. Both are part of what the trial IS, and
+both are now in the comparison, with the open trial's revision and
+weights path named in the refusal.
+
+**REV2-10 (minor) — resuming at `staged` discarded the re-derivation.**
+REV-1 states that resuming re-derives the def from the CURRENT incumbent
+"so a def edit made between the fetch and the apply is picked up rather
+than silently serving a stale derivation". `Stage` returned early on
+`staged`, which is precisely the state between the fetch and the apply,
+so the re-derived def was computed and thrown away. `Stage` now compares
+the derived bytes to the file, restages when they differ, and restores
+the previous def if the re-derived one does not render — a `staged` trial
+already has a def the box renders, so failing the way a first stage fails
+would leave the journal describing a file that is not there.
+
+**REV2-11 (minor) — llama-swap's response body reached the terminal
+unscrubbed.** A non-200 warm puts 512 bytes of the far side's body into
+`Measurement.Note`, which is SAVED to the journal and re-printed by every
+later `vibe model try status`. `cli.termSafe` exists for exactly this and
+could not be applied here, because the string is stored before any
+renderer sees it; `printableSnippet` holds the same rule at the point of
+capture.
+
+**Mutation-verified predicates (11).** `DiscardIfFresh`'s resumed guard
+and its call site (two mutations); both declaration saves; the dropped
+`estimated_vram_gb`; `stillListed`'s poll deadline; `end`'s staged
+re-render, in both directions (it must fire when the config names the
+trial and must NOT fire when it does not); the `--idle` refusal; the
+`--min-free 0` refusal; the resume identity's revision and dest terms
+(two mutations); `Stage`'s restage branch; `printableSnippet`;
+`modelprobe`'s `ReadOnly`.
+
+**Also looked at and found sound**, so the next pass need not re-derive
+it: the front-render exclusion covers every renderer because there is one
+`Render`; `deriveDef` drops all seven fleet claims and `router.ModelCmd`
+renders `${PORT}` unconditionally, so a pinned `port:` on the incumbent
+cannot collide; `resolveAliases` skips a self-alias, so the trial's
+`alias: <own name>` is inert; the C15 AST scans are package-scoped to
+`fleetapi` and `fleetmcp` and C18 is neither, and its unauthenticated
+loopback requests match C8's and C16's cell-side posture; `Apply` banks
+before it renders; `End` keeps the journal and the bank on a failed
+rollback; the `warmCtx`-style bound on every request is present
+(`warmTimeout`, the 5 s catalog timeout) and no goroutine outlives the
+command.
+
+**One thing named rather than fixed.** A trial def is a new untracked
+file in the fleet's def checkout for the trial's duration, so C13's
+`defs.parity` reports that cell's tree DIRTY while a trial is open. That
+is true and it is what dirty means; a future phase that wants doctor to
+say "dirty, and it is a trial" needs `defs_dirty` to carry a reason,
+which is a wire change this branch is not making.
+
 ## For the reconciliation pass
 
 Everything below belongs in a shared doc this branch may not touch
@@ -583,6 +780,52 @@ Everything below belongs in a shared doc this branch may not touch
 >     reported the same metric — `decode_tok_s` excludes queueing and
 >     `e2e_tok_s` does not.
 >   - Cell-local by construction: `--cell` must be this box's own cell.
+>   - **`--dry-run` closes only a journal IT opened.** `Plan` resumes an
+>     open trial and `End` works from any state, so "close the journal
+>     Plan opened" performed a full rollback of somebody's in-flight
+>     trial — def removed, cell config re-rendered, every resident model
+>     evicted — under a flag whose whole promise is that nothing
+>     happens, and then printed "nothing on this box changed". The
+>     decision cannot live in `End`; it is `Trial.Resumed` (never
+>     serialized) plus `Runner.DiscardIfFresh`.
+>   - **A declaration is journalled the moment it is taken**, not when
+>     the sequence finishes. `end` releases exactly what the journal
+>     says the trial took, so a lease or hold that lived only in the
+>     process's memory is one nothing ever releases — four hours of a
+>     suppressed warm policy, plus a re-run that parks forever because
+>     `--unleased` skips the trial's own LEASE holder and not the
+>     reserved `hold` one.
+>   - **`estimated_vram_gb` is NOT inherited.** It is a hand-measured
+>     claim about the incumbent's weights, and the report prints it in a
+>     column headed by the candidate's name; copying it made the
+>     resource half of the comparison equal by construction on every
+>     trial. Undeclared renders as "not declared".
+>   - **Both sides of the catalog observation POLL.** `-watch-config`
+>     notices a write on its own ~2 s cadence, so a single read taken
+>     right after a render answers about the config that was there
+>     before it: `Apply` waits for the id to APPEAR and `end` waits for
+>     it to LEAVE, on the same budget. A restart warning that fires on
+>     every successful rollback is one nobody reads on the failure path.
+>   - **`--idle 0` is refused, not honoured.** `awaitConds.evalIdle`
+>     only runs on a positive window, so a zero silently skipped the
+>     deferral that is the whole phase, without `--now`'s sentence about
+>     what that costs. Skipping the wait is spelled `--now`, once.
+>     `--min-free 0` is refused for the same shape of reason: zero is
+>     how the flag spells "unset", so it restored the default floor
+>     instead of removing it.
+>   - **A `staged` rollback re-renders when the config still names the
+>     trial.** `staged` promises the TRIAL never wrote the config, not
+>     that nobody else ran `vibe router render` in between; after that,
+>     removing the def alone leaves the cell serving a trial `end` has
+>     just reported closed, with no def left to reproduce it. Gated on
+>     the config actually declaring the id, so the ordinary path still
+>     writes nothing and cannot create a config on a box with none.
+>   - **The trial's prober is READ-ONLY on the cell's probe state**
+>     (`modelprobe.Config.ReadOnly`). That file is a whole-file rewrite
+>     from memory and the cell daemon's prober is its owner; a second
+>     process holding it for the twenty minutes two cold loads take
+>     discards every baseline sample and budget entry recorded meanwhile
+>     — including the rolling window the report exists to print.
 >     Every step writes a file on the box that will serve the model and
 >     fleetd is read-and-request-only; cross-cell `try` is a phase, not
 >     a flag.
@@ -596,7 +839,7 @@ Everything below belongs in a shared doc this branch may not touch
 Table row:
 
 ```
-| [C18](c18-model-try.md) | `vibe model try`: the churn loop as one command | ~1400 lines | C0, C2, C4, C8, C10, C11, C14 (composition) | PR open; unit gates U1-U13 green, 12 predicates mutation-verified; **live gates L1-L4 UNRUN (lab port contention — futures item 15), L5 needs metal** |
+| [C18](c18-model-try.md) | `vibe model try`: the churn loop as one command | ~1400 lines | C0, C2, C4, C8, C10, C11, C14 (composition) | PR open; feature + self-review + adversarial-review commits (7 + 11 findings, one blocker each); unit gates U1-U14 green, 23 predicates mutation-verified; **live gates L1-L4 UNRUN — the rig as first committed could not run and has been corrected but not executed; L5 needs metal** |
 ```
 
 And a paragraph in the phase-notes prose:
@@ -626,12 +869,34 @@ And a paragraph in the phase-notes prose:
 > trial. Its honest boundary is that `--cell` must name the box you are
 > on: every step writes a file where the model will run, fleetd is
 > read-and-request-only, and cross-cell `try` is a phase rather than a
-> flag.
+> flag. Its adversarial pass found the phase's own composition biting
+> back twice: the self-review's two fixes met each other and turned
+> `--dry-run` into a silent full rollback of an in-flight trial (`Plan`
+> resumes; `End` works from any state; "close the journal Plan opened"
+> does not distinguish), and `Measure` made a short-lived second writer
+> of C8's cell-side probe file, whose whole-file rewrite discards every
+> baseline sample the cell daemon recorded while a trial runs. Both are
+> the same shape: a component that was correct alone acquiring a second
+> caller.
 
 ### For `docs/design/fleet-control.md`
 
 Nothing. C18 adds no state axis, no display state, no route and no
 protocol.
+
+### For `scripts/fleetlab/README.md`
+
+> `gate-c18.sh` runs against **bravo**, the only lab cell with a full
+> vibe cell daemon and therefore the only one with a `fleet.cell:` for
+> `vibe model try` to place a trial on. It must export bravo's own
+> `XDG_CONFIG_HOME=$LAB/etc-bravo` — gl.sh's `$LAB/etc` is *fleetd's*
+> config, which declares no `fleet.cell` at all. bravo's only def is
+> `lab-embed-b`, an embedding server, so the trial is an embed trial and
+> every request in the rig is `/v1/embeddings`. And because `try`'s
+> apply IS a `vibe router render`, it writes `startPort: 5800` —
+> production's upstream range on this box — so the rig re-applies
+> lab.sh's rewrite after every render and exits rather than continue if
+> it does not take.
 
 ### Cross-branch note
 

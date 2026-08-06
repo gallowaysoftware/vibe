@@ -54,6 +54,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 	"github.com/gallowaysoftware/vibe/internal/vibe/hfdownload"
@@ -163,6 +164,13 @@ type Trial struct {
 	// is append-only and capped; a trial that has been resumed six times
 	// should say so.
 	Log []LogEntry `json:"log,omitempty"`
+
+	// Resumed marks a trial Plan re-opened rather than created. It is
+	// process-local (never serialized) and it exists for exactly one
+	// consumer: --dry-run, which closes the journal it opened. Closing a
+	// journal it did NOT open is a full rollback of somebody's in-flight
+	// trial performed by a flag whose name says nothing happens.
+	Resumed bool `json:"-"`
 }
 
 // LogEntry is one thing that happened, with its time.
@@ -450,10 +458,17 @@ func (r *Runner) resume(t *Trial, req PlanRequest) (*Trial, *profile.BackendDef,
 	if name == "" {
 		name = derivedName(req.Repo, req.File)
 	}
-	if t.Def != name || t.Repo != req.Repo || t.File != req.File || t.Incumbent != req.Like {
-		return nil, nil, fmt.Errorf("a trial of %s (%s/%s, modelled on %s) is already in flight on %s at state %s — one trial at a time per cell. "+
+	// Revision and --dest are part of the trial's IDENTITY, not decoration.
+	// A resume that ignored them would silently serve the revision the
+	// operator replaced and write the def for weights at the old path,
+	// while echoing back the arguments they just typed.
+	same := t.Def == name && t.Repo == req.Repo && t.File == req.File &&
+		t.Incumbent == req.Like && t.Revision == req.Revision &&
+		(req.Dest == "" || t.WeightsPath == filepath.Join(req.Dest, filepath.Base(req.File)))
+	if !same {
+		return nil, nil, fmt.Errorf("a trial of %s (%s/%s%s, modelled on %s, weights %s) is already in flight on %s at state %s — one trial at a time per cell. "+
 			"Finish it (`vibe model try status`) or roll it back (`vibe model try end`) before starting another",
-			t.Def, t.Repo, t.File, t.Incumbent, t.Cell, t.State)
+			t.Def, t.Repo, t.File, revisionSuffix(t.Revision), t.Incumbent, t.WeightsPath, t.Cell, t.State)
 	}
 	if err := r.agreesWithJournal(t); err != nil {
 		return nil, nil, err
@@ -469,12 +484,37 @@ func (r *Runner) resume(t *Trial, req PlanRequest) (*Trial, *profile.BackendDef,
 	if err := r.checkIncumbent(inc); err != nil {
 		return nil, nil, err
 	}
+	t.Resumed = true
 	t.note(r.opt.Now(), "resumed at state %s", t.State)
 	if err := r.save(t); err != nil {
 		return nil, nil, err
 	}
 	return t, deriveDef(inc, t.Def, t.WeightsPath, r.opt.Cell), nil
 }
+
+// DiscardIfFresh closes a journal THIS invocation opened, and refuses to
+// close one it merely re-opened. It is --dry-run's only rollback: `End`
+// works from any state, so calling it on a resumed trial removes the def,
+// re-renders the cell's llama-swap config and evicts every resident model
+// — a full rollback performed by a flag whose entire promise is that
+// nothing happens. Reports whether it closed anything so the caller can
+// tell the operator which of the two it did.
+func (r *Runner) DiscardIfFresh(ctx context.Context, t *Trial) (bool, error) {
+	if t.Resumed {
+		return false, nil
+	}
+	if _, err := r.End(ctx, t, false); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// Save persists the journal. Exported because the two control-plane
+// declarations a trial makes are taken by the CLI, and a declaration that
+// is not on disk before the next step can fail is one `end` will never
+// release: the lease and the hold outlive the process by four hours, and
+// the next run deadlocks on its own hold under --unleased.
+func (r *Runner) Save(t *Trial) error { return r.save(t) }
 
 // agreesWithJournal refuses to act on a journal written against a
 // different cell or a different llama-swap config. Both are reachable by
@@ -622,10 +662,10 @@ func (r *Runner) Fetch(ctx context.Context, t *Trial, progress hfdownload.Progre
 // render and every announce on this box, including the ones that end the
 // trial.
 func (r *Runner) Stage(t *Trial, def *profile.BackendDef) error {
-	if t.State == StateStaged || t.State == StateApplied || t.State == StateMeasured {
+	if t.State == StateApplied || t.State == StateMeasured {
 		return nil
 	}
-	if t.State != StateFetched {
+	if t.State != StateFetched && t.State != StateStaged {
 		return fmt.Errorf("cannot stage a trial in state %q (the weights are not on disk yet)", t.State)
 	}
 	preview, err := PreviewDef(t, def)
@@ -633,6 +673,29 @@ func (r *Runner) Stage(t *Trial, def *profile.BackendDef) error {
 		return fmt.Errorf("marshal trial def: %w", err)
 	}
 	staged := []byte(preview)
+	// Resuming at `staged`: Plan re-derived the def from the CURRENT
+	// incumbent, and returning early here would discard that and keep
+	// serving the derivation from before the operator's edit — the exact
+	// staleness the re-derivation exists to prevent. Identical bytes are
+	// the common case and cost one comparison.
+	if t.State == StateStaged {
+		prev, rerr := os.ReadFile(t.DefPath)
+		if rerr == nil && string(prev) == preview {
+			return nil
+		}
+		if rerr == nil {
+			if err := r.restageChangedDef(t, staged, prev); err != nil {
+				return err
+			}
+			t.note(r.opt.Now(), "re-derived the trial def from the current %s", t.Incumbent)
+			return r.save(t)
+		}
+		if !errors.Is(rerr, os.ErrNotExist) {
+			return fmt.Errorf("read the staged trial def %s: %w", t.DefPath, rerr)
+		}
+		// The def is gone (someone deleted it under us). Fall through and
+		// write it again, which is what `staged` claims is true on disk.
+	}
 
 	// Round-trip through the real loader in a scratch dir: the def that
 	// reaches the backends dir is one that profile.LoadBackendFrom has
@@ -666,6 +729,25 @@ func (r *Runner) Stage(t *Trial, def *profile.BackendDef) error {
 	t.State = StateStaged
 	t.note(r.opt.Now(), "staged def %s", t.DefPath)
 	return r.save(t)
+}
+
+// restageChangedDef swaps a re-derived trial def in and proves the render
+// still succeeds, restoring the PREVIOUS bytes if it does not. The
+// restore is the whole point: at `staged` there is already a def the box
+// renders, so failing the way the first stage fails (remove it, report
+// "nothing changed") would leave the trial in a state its own journal
+// says is impossible.
+func (r *Runner) restageChangedDef(t *Trial, staged, prev []byte) error {
+	if err := writeFileAtomic(t.DefPath, staged, 0o644); err != nil {
+		return fmt.Errorf("write trial def %s: %w", t.DefPath, err)
+	}
+	if _, err := r.render(false); err != nil {
+		if rerr := writeFileAtomic(t.DefPath, prev, 0o644); rerr != nil {
+			return fmt.Errorf("the re-derived def does not render (%w) AND restoring the previous one failed (%w) — %s is now unrenderable, fix or remove it by hand", err, rerr, t.DefPath)
+		}
+		return fmt.Errorf("the trial def re-derived from the current %s does not render (%w) — the previously staged def has been put back and nothing on this box changed", t.Incumbent, err)
+	}
+	return nil
 }
 
 // render runs the cell's own render. write=false is the proof pass.
@@ -852,6 +934,13 @@ func (r *Runner) Measure(ctx context.Context, t *Trial) (*Comparison, error) {
 	prober, err := modelprobe.New(modelprobe.Config{
 		LlamaSwapURL: r.opt.LlamaSwapURL,
 		StatePath:    r.opt.ProbeStatePath,
+		// READ-ONLY. The cell daemon's own prober owns this file and
+		// rewrites it whole from memory; a trial that wrote it back would
+		// delete every baseline sample and every budget entry the daemon
+		// recorded during the twenty minutes a trial takes. The incumbent's
+		// rolling window is the only multi-sample number on the report, so
+		// it is read — and left exactly as it was found.
+		ReadOnly: true,
 		Specs: func(model string) modelprobe.Spec {
 			if s, ok := specs[model]; ok {
 				return s
@@ -949,7 +1038,11 @@ func (r *Runner) warm(ctx context.Context, model, kind string) error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("POST %s: HTTP %d: %s", path, resp.StatusCode, strings.TrimSpace(string(snippet)))
+		// Scrubbed: this body reaches the operator's terminal AND the
+		// journal `status` re-renders, and it is written by a process on
+		// the other end of a socket. Same rule as cli.termSafe, held here
+		// because the string is stored before any renderer sees it.
+		return fmt.Errorf("POST %s: HTTP %d: %s", path, resp.StatusCode, printableSnippet(string(snippet)))
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	return nil
@@ -996,7 +1089,15 @@ func (r *Runner) End(ctx context.Context, t *Trial, purge bool) (EndReport, erro
 			rep.Steps = append(rep.Steps, "removed the trial def "+t.DefPath)
 		}
 	}
-	if t.State == StateApplied || t.State == StateMeasured {
+	// The re-render runs from `staged` too, and only when the config on
+	// disk still names the trial. `staged` promises the config was never
+	// written by the TRIAL — it does not promise nobody else ran
+	// `vibe router render` in between, and after that the config serves a
+	// def this function just deleted. Gating on the name is what keeps
+	// this from creating or rewriting a config on the ordinary path, where
+	// the trial genuinely never touched it.
+	if t.State == StateApplied || t.State == StateMeasured ||
+		(t.State == StateStaged && r.configNamesTrial(t)) {
 		out, err := r.render(true)
 		switch {
 		case err == nil:
@@ -1050,20 +1151,67 @@ func (r *Runner) End(ctx context.Context, t *Trial, purge bool) (EndReport, erro
 	return rep, nil
 }
 
-// stillListed answers whether the cell's llama-swap has really let go of
-// the trial id. An unreadable catalog is reported as unknown, never as
-// gone.
-func (r *Runner) stillListed(ctx context.Context, id string) (bool, string) {
-	ids, err := r.catalog(ctx)
+// configNamesTrial reports whether the llama-swap config on disk still
+// declares the trial id as a models: key. Read from the file rather than
+// re-derived, because the question is about the bytes llama-swap is
+// serving, not about what a render would produce now.
+func (r *Runner) configNamesTrial(t *Trial) bool {
+	data, err := os.ReadFile(r.opt.ConfigPath)
 	if err != nil {
-		return false, "could not read this cell's /v1/models (" + err.Error() + "), so whether llama-swap has dropped " + id + " is unverified"
+		return false
 	}
-	for _, got := range ids {
-		if got == id {
-			return true, id + " is still in this cell's catalog: the config no longer declares it, so llama-swap has not reloaded — restart it to finish the rollback"
+	// A models: key is its own line, at whatever indent yaml.v3 chose.
+	// Matching the whole trimmed line rather than a substring keeps the
+	// id's other appearances — it is also the --alias inside the rendered
+	// cmd block — from answering a question about the catalog.
+	key := t.Def + ":"
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == key {
+			return true
 		}
 	}
-	return false, ""
+	return false
+}
+
+// stillListed answers whether the cell's llama-swap has really let go of
+// the trial id. It POLLS, on the same budget Apply gives adoption, for
+// the same reason: `-watch-config` notices a write on its own 2 s cadence
+// (C0's measured gate), so a single read taken microseconds after the
+// re-render finds the trial still listed on EVERY healthy rollback and
+// tells the operator to restart llama-swap. A warning that fires on the
+// success path is a warning nobody reads on the failure path.
+//
+// An unreadable catalog is reported as unknown, never as gone.
+func (r *Runner) stillListed(ctx context.Context, id string) (bool, string) {
+	// time.Now, not r.opt.Now: this loop sleeps on the wall clock, and a
+	// deadline from a frozen injectable clock never expires (awaitCatalog's
+	// REV-7 rule, held here too).
+	deadline := time.Now().Add(r.opt.CatalogWait)
+	for {
+		ids, err := r.catalog(ctx)
+		listed, known := false, err == nil
+		for _, got := range ids {
+			if got == id {
+				listed = true
+				break
+			}
+		}
+		if known && !listed {
+			return false, ""
+		}
+		if !time.Now().Before(deadline) {
+			if !known {
+				return false, "could not read this cell's /v1/models (" + err.Error() + "), so whether llama-swap has dropped " + id + " is unverified"
+			}
+			return true, id + " is still in this cell's catalog " + r.opt.CatalogWait.String() +
+				" after the re-render: llama-swap has not reloaded — restart it to finish the rollback"
+		}
+		select {
+		case <-ctx.Done():
+			return false, "cancelled while waiting for the cell's llama-swap to drop " + id
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 // ── derivation ──────────────────────────────────────────────────────────
@@ -1096,11 +1244,18 @@ func deriveDef(inc *profile.BackendDef, name, weights, cell string) *profile.Bac
 	ls.ChatTemplateFile = ""
 
 	def := &profile.BackendDef{
-		Name:            name,
-		Backend:         profile.Backend{External: true, LlamaServer: &ls},
-		EstimatedVRAMGB: inc.EstimatedVRAMGB,
-		Cell:            cell,
-		Trial:           true,
+		Name:    name,
+		Backend: profile.Backend{External: true, LlamaServer: &ls},
+		// estimated_vram_gb is deliberately NOT inherited. It is a
+		// hand-measured claim about the INCUMBENT's weights, and the
+		// report puts it in a column headed by the candidate's name —
+		// "a model that is 15% faster and 40% larger has not obviously
+		// won" is the sentence that column exists for, and copying the
+		// number makes the two sides equal by construction, every time.
+		// An external def is never VRAM-preflighted (vibe launches
+		// nothing for it), so the field costs nothing but the lie.
+		Cell:  cell,
+		Trial: true,
 	}
 	if lc := inc.Lifecycle; lc != nil {
 		// TTL and start_timeout describe how this BOX behaves; preload
@@ -1182,6 +1337,13 @@ func validDefName(name string) error {
 	return nil
 }
 
+func revisionSuffix(rev string) string {
+	if rev == "" {
+		return ""
+	}
+	return " @ " + rev
+}
+
 func findDef(defs []*profile.BackendDef, name string) *profile.BackendDef {
 	for _, d := range defs {
 		if d != nil && d.Name == name {
@@ -1204,6 +1366,23 @@ func defServingPath(defs []*profile.BackendDef, path string) string {
 		}
 	}
 	return ""
+}
+
+// printableSnippet strips control characters from text this package did
+// not write. Everything llama-swap says ends up in a `Note` that is saved
+// to the journal and printed to a tty; an escape sequence there is an
+// injection into the operator's terminal, replayed by every later
+// `vibe model try status`.
+func printableSnippet(s string) string {
+	return strings.TrimSpace(strings.Map(func(r rune) rune {
+		switch {
+		case r == '\t' || r == '\n' || r == '\r':
+			return ' '
+		case !unicode.IsPrint(r):
+			return -1
+		}
+		return r
+	}, s))
 }
 
 func fileSize(path string) int64 {

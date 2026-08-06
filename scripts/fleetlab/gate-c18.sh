@@ -6,83 +6,134 @@
 #   L1  applying a trial def is adopted by a real `-watch-config` llama-swap
 #       within two poll intervals, so the `Live` bit is an observation.
 #   L2  that adoption costs what C0 measured — the old upstream drains and a
-#       generation still running at 30s is force-closed — so the sentence
+#       request still running at 30s is force-closed — so the sentence
 #       `--now` prints is describing the real thing.
 #   L3  the trial id appears in fleet_status for its cell and NEVER in the
 #       rendered FRONT config, and both facts reverse on `end`.
 #   L4  `end` restores the cell's llama-swap config byte-for-byte.
 #
-# It uses the lab's `bravo` cell: opportunistic, its own llama-swap, its own
-# announcer. The incumbent is whatever def bravo already serves.
+# It uses the lab's `bravo` cell, which is the only lab cell with a full vibe
+# cell daemon — and therefore the only one with a `fleet.cell:` for
+# `vibe model try` to place a trial on. Everything below is derived from what
+# `lab.sh` actually writes; the first cut of this rig named a `lab-chat-b` def
+# and a `$LAB/models/` directory that the lab has never created, so it exited
+# at its own precondition check.
+#
+#   bravo's XDG_CONFIG_HOME is $LAB/etc-bravo (fleet.cell: bravo, proxy_port
+#   9642). Running under gl.sh's $LAB/etc instead makes this box the FRONT
+#   cell, and `try` refuses the front structurally — correctly, and long
+#   before it gets anywhere near L1.
+#
+#   bravo's only def is lab-embed-b (BGE_M3, an EMBEDDING server). So the
+#   trial is an embed trial: C18 reads the probe kind off the def's rendered
+#   argv, `--embeddings` makes it KindEmbed, and both the warm and the probe
+#   use /v1/embeddings. A chat completion against this cell measures a 400.
 #
 # PORT CONTENTION: scripts/fleetlab binds fixed ports and `down`'s sweep is
 # anchored partly on a shared upstream range, so a second lab instance on one
 # box is entitled to kill the first's processes (futures item 15). Set
 # FLEETLAB_DIR and run this only when you own the lab.
+#
+# startPort HAZARD: `vibe router render` — which is what `try`'s apply calls —
+# hardcodes `startPort: 5800`, production's upstream range on this box. lab.sh
+# and gl.sh's render_cell rewrite it after every render for exactly that
+# reason, and so does this rig, fatally if the rewrite does not apply.
 set -uo pipefail
 source "$(dirname "$0")/gl.sh"
 
 CELL=${CELL:-bravo}
-PORT=${PORT:-9642}
-SPORT=${SPORT:-6000}
-INCUMBENT=${INCUMBENT:-lab-chat-b}
+# Derived, not hardcoded: lab.sh has moved bravo's proxy_port before, and a
+# rig that keeps its own copy points at whichever llama-swap used to be
+# there. Same for the upstream startPort, which is read off the config this
+# rig is about to bank — restoring to anything else fails L4 for a reason
+# that has nothing to do with C18.
+PORT=${PORT:-$(sed -n 's/^proxy_port: *\([0-9]*\)$/\1/p' "$LAB/etc-bravo/vibe/config.yaml" 2>/dev/null)}
+SPORT=${SPORT:-$(sed -n 's/^startPort: *\([0-9]*\)$/\1/p' "$LAB/cells/${CELL}/config.yaml" 2>/dev/null)}
+INCUMBENT=${INCUMBENT:-lab-embed-b}
 TRIAL=trial-c18
 CFG=$LAB/cells/$CELL/config.yaml
 
-# The candidate is a LOCAL copy of a model the lab already has: this rig is
-# gating the sequence and the rollback, not HuggingFace's CDN. `try` is
-# driven step by step through the same journal a real run writes.
-CANDIDATE=${CANDIDATE:-$LAB/models/lab-chat-b.gguf}
+# The candidate is a LOCAL copy of a GGUF the lab already has, under a name
+# no def serves: this rig gates the sequence and the rollback, not
+# HuggingFace's CDN, and `try` refuses outright to download over a path
+# another def already serves. `hfdownload.Download` returns immediately for a
+# present file whose size it cannot check, which is what makes the fetch step
+# a no-op here.
+CAND_DIR=${CAND_DIR:-$LAB/trial-models}
+CANDIDATE=${CANDIDATE:-$CAND_DIR/c18-candidate.gguf}
+SOURCE_GGUF=${SOURCE_GGUF:-${BGE_LARGE:-$HOME/models/bge-large-en-v1.5-gguf/bge-large-en-v1.5-q8_0.gguf}}
 
-export XDG_CONFIG_HOME=$LAB/etc
-export XDG_STATE_HOME=$LAB/state/ann-$CELL
-export XDG_RUNTIME_DIR=$LAB/run/rt-$CELL
+# bravo's OWN config + state. gl.sh points these at fleetd; `vibe model try`
+# resolves fleet.cell, the backends dir and the journal from them, so running
+# under fleetd's would try (and refuse) to place a trial on the front.
+export XDG_CONFIG_HOME=$LAB/etc-bravo
+export XDG_STATE_HOME=$LAB/state/bravo
+export XDG_RUNTIME_DIR=$LAB/run/rt-bravo
+# VIBE_API/VIBE_TOKEN were captured by gl.sh before this and still point at
+# fleetd, which is where the lease and the hold go.
 
 catalog() { curl -fsS -m 10 "http://127.0.0.1:$PORT/v1/models" | jq -r '.data[].id' | sort; }
 running() { curl -fsS -m 10 "http://127.0.0.1:$PORT/running" | jq -c '[.running[]|{model,state}]'; }
-frontcfg() { cat "$LAB/cells/front/config.yaml" 2>/dev/null || cat "$LAB/front/config.yaml" 2>/dev/null; }
+frontcfg() { cat "$LAB/cells/front/config.yaml" 2>/dev/null; }
 cellmodels() { state | jq -c ".cells[]|select(.name==\"$CELL\")|[.models[].id]"; }
 
+# fix_startport CFG — the render inside `try` writes production's 5800. Every
+# failure here is fatal to the rig: everything after it would be measuring
+# the wrong process, and on this box those ports belong to production.
+fix_startport() {
+  grep -q "^startPort: $SPORT\$" "$1" && return 0
+  sed -i "s/^startPort: 5800\$/startPort: $SPORT/" "$1"
+  grep -q "^startPort: $SPORT\$" "$1" || {
+    echo "startPort rewrite did not apply to $1 — REFUSING to continue (5800 is production's range)" >&2
+    exit 2
+  }
+}
+
 hr "0. preconditions"
-[[ -f $CANDIDATE ]] || { echo "no candidate weights at $CANDIDATE — set CANDIDATE=<a .gguf the lab has>"; exit 2; }
+[[ -f $LAB/etc-bravo/vibe/config.yaml ]] || { echo "no bravo cell daemon config — run \`lab.sh up\` first"; exit 2; }
+[[ -n ${PORT:-} && -n ${SPORT:-} ]] || { echo "could not derive PORT/SPORT from the lab — is it up? (PORT='${PORT:-}' SPORT='${SPORT:-}')"; exit 2; }
 [[ -f $LAB/etc/vibe/backends/$INCUMBENT.yaml ]] || { echo "no incumbent def $INCUMBENT"; exit 2; }
+[[ -f $SOURCE_GGUF ]] || { echo "no source GGUF at $SOURCE_GGUF — set SOURCE_GGUF"; exit 2; }
+mkdir -p "$CAND_DIR"
+[[ -f $CANDIDATE ]] || cp "$SOURCE_GGUF" "$CANDIDATE"
 echo "# incumbent def:"; cat "$LAB/etc/vibe/backends/$INCUMBENT.yaml"
-cp "$CFG" /tmp/c18-pretrial-config.yaml
-echo "# banked the pre-trial config at /tmp/c18-pretrial-config.yaml (L4's reference)"
+echo "# candidate: $CANDIDATE ($(stat -c%s "$CANDIDATE") bytes)"
+cp "$CFG" "$LAB/c18-pretrial-config.yaml"
+echo "# banked the pre-trial config at $LAB/c18-pretrial-config.yaml (L4's reference)"
 echo "# catalog before: $(catalog | tr '\n' ' ')"
 
 hr "1. plan + fetch + stage (--dry-run first: nothing must change)"
-"$BIN" model try file://local --file "$(basename "$CANDIDATE")" --like "$INCUMBENT" --as "$TRIAL" \
-  --dest "$(dirname "$CANDIDATE")" --dry-run --skip-disk-check
-echo "# config unchanged after --dry-run: $(cmp -s "$CFG" /tmp/c18-pretrial-config.yaml && echo yes || echo NO)"
-echo
-echo "# NOTE: the fetch is a real HuggingFace pull. To gate the sequence without one,"
-echo "#       point --dest at a directory that ALREADY holds the file under the same"
-echo "#       basename: hfdownload returns immediately for a present, correctly-sized file."
+"$BIN" model try local/c18 --file "$(basename "$CANDIDATE")" --like "$INCUMBENT" --as "$TRIAL" \
+  --dest "$CAND_DIR" --dry-run --skip-disk-check
+echo "# config unchanged after --dry-run: $(cmp -s "$CFG" "$LAB/c18-pretrial-config.yaml" && echo yes || echo NO)"
+echo "# journal after --dry-run (must be 'no trial'): $("$BIN" model try status)"
 
 hr "2. L1 — apply, and watch a real -watch-config adopt it"
 BEFORE=$(date +%s)
-"$BIN" model try file://local --file "$(basename "$CANDIDATE")" --like "$INCUMBENT" --as "$TRIAL" \
-  --dest "$(dirname "$CANDIDATE")" --skip-disk-check --now
+"$BIN" model try local/c18 --file "$(basename "$CANDIDATE")" --like "$INCUMBENT" --as "$TRIAL" \
+  --dest "$CAND_DIR" --skip-disk-check --now
+fix_startport "$CFG"
 echo "# elapsed to adoption: $(( $(date +%s) - BEFORE ))s  (C0 measured the -watch-config poll at 2s)"
 echo "# catalog after:  $(catalog | tr '\n' ' ')"
 echo "# journal:"; "$BIN" model try status
 
 hr "3. L3 — visible on the CELL, absent from the FRONT"
 echo "# fleet_status models for $CELL: $(cellmodels)"
+echo "# fleet_status leases for $CELL:  $(state | jq -c ".cells[]|select(.name==\"$CELL\")|.leases")"
 echo "# does the rendered front config mention $TRIAL? $(frontcfg | grep -c "$TRIAL") occurrence(s)  <- MUST be 0"
 echo "# front render warnings (the exclusion must be LOUD):"
-"$BIN" router render --cell front --stdout 2>&1 >/dev/null | grep -i trial || echo "  (none — if a trial def is in fleetd's checkout this is a FAILURE)"
+"$BIN" router render --cell front --stdout 2>&1 >/dev/null | grep -i trial ||
+  echo "  (none — the lab shares one backends dir between fleetd and bravo, so this IS reachable and its absence is a FAILURE)"
 
 hr "4. L2 — the cost of a reload, watched"
-echo "# start a long generation against the incumbent, then re-render mid-stream."
+echo "# start a batch embedding request against the incumbent, then touch the config."
 echo "# C0's measured behaviour: the new config is live immediately, the OLD upstream"
-echo "# drains in-flight streams under a hardcoded 30s, then force-closes (clean EOF)."
-( curl -sS -m 120 -N "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
-    -d "{\"model\":\"$INCUMBENT\",\"stream\":true,\"max_tokens\":2000,\"messages\":[{\"role\":\"user\",\"content\":\"Count slowly to two hundred, one number per line.\"}]}" \
-    | tail -c 400; echo "  <- stream ended at $(date -Is)" ) &
+echo "# drains in-flight work under a hardcoded 30s, then force-closes."
+( curl -sS -m 120 "http://127.0.0.1:$PORT/v1/embeddings" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$INCUMBENT\",\"input\":[$(printf '"chunk %s",' $(seq 1 200))\"tail\"]}" \
+    | head -c 200; echo "  <- request ended at $(date -Is)" ) &
 STREAM=$!
-sleep 5
+sleep 3
 echo "# touching the config at $(date -Is)"
 touch "$CFG"
 wait $STREAM
@@ -90,11 +141,13 @@ echo "# running after the reload: $(running)"
 
 hr "5. L4 — end, and compare the config byte-for-byte"
 "$BIN" model try end
-echo "# config restored byte-for-byte: $(cmp -s "$CFG" /tmp/c18-pretrial-config.yaml && echo YES || echo NO)"
-cmp -s "$CFG" /tmp/c18-pretrial-config.yaml || diff -u /tmp/c18-pretrial-config.yaml "$CFG"
+fix_startport "$CFG"
+echo "# config restored byte-for-byte: $(cmp -s "$CFG" "$LAB/c18-pretrial-config.yaml" && echo YES || echo NO)"
+cmp -s "$CFG" "$LAB/c18-pretrial-config.yaml" || diff -u "$LAB/c18-pretrial-config.yaml" "$CFG"
 echo "# catalog after end: $(catalog | tr '\n' ' ')"
 echo "# fleet_status models for $CELL: $(cellmodels)"
-echo "# weights kept (no --purge): $(ls -la "$(dirname "$CANDIDATE")" | grep -c "$(basename "$CANDIDATE")")"
+echo "# fleet_status leases for $CELL:  $(state | jq -c ".cells[]|select(.name==\"$CELL\")|.leases")  <- MUST be empty"
+echo "# weights kept (no --purge): $(ls -l "$CANDIDATE" 2>/dev/null | wc -l)"
 "$BIN" model try status
 
 hr "done — every line above is an observation; nothing here asserts"
