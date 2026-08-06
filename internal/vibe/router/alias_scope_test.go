@@ -161,6 +161,38 @@ func TestResolveAliases_CollisionStaysAnErrorWithOneClaimantMissing(t *testing.T
 	}
 }
 
+// TestResolveAliases_ReturnsANonNilMapWithNothingToResolve: Render treats
+// a nil AliasWinners as "compute it yourself", which is the pre-C21
+// behaviour. fleetd relies on the map being non-nil to keep that fallback
+// unreachable, so a fleet that declares no aliases at all must still
+// produce a map — otherwise the defect silently re-enables itself on
+// exactly the fleets where nobody would look.
+func TestResolveAliases_ReturnsANonNilMapWithNothingToResolve(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		defs []*profile.BackendDef
+	}{
+		{"no defs", nil},
+		{"defs with no aliases", []*profile.BackendDef{claimDef("gpu-coder", "gpu", false)}},
+		{"only a cloud peer", []*profile.BackendDef{{
+			Name: "anthropic",
+			Backend: profile.Backend{External: true, CloudPeer: &profile.CloudPeerBackend{
+				BaseURL: "https://api.anthropic.com", APIKeyEnv: "K", Models: []string{"claude-sonnet-5"},
+			}},
+		}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			winners, err := ResolveAliases(tc.defs)
+			if err != nil {
+				t.Fatalf("ResolveAliases: %v", err)
+			}
+			if winners == nil {
+				t.Fatal("ResolveAliases returned a nil map; Render would fall back to resolving over the survivors")
+			}
+		})
+	}
+}
+
 // TestResolveAliases_IgnoresCloudPeerDefs: cloud ids come from
 // cloud_peer.models, so a cloud def neither claims aliases nor reserves
 // its name against one.

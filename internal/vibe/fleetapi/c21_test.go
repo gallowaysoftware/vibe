@@ -140,6 +140,54 @@ func c21Fleet(t *testing.T, defs []*profile.BackendDef) (*Server, *c21Writes) {
 	return s, w
 }
 
+// TestRenderLoop_AlwaysPassesAliasWinnersEvenWithNoAliasesDeclared:
+// router.Options treats a nil AliasWinners as "resolve from the defs you
+// were handed", which for this caller is the defect — it hands over the
+// SURVIVORS. So the loop must pass a non-nil map on every pass, including
+// on a fleet that declares no aliases at all, or the fallback re-enables
+// itself the day someone adds the first alias.
+func TestRenderLoop_AlwaysPassesAliasWinnersEvenWithNoAliasesDeclared(t *testing.T) {
+	seen := make(chan router.Options, 8)
+	defs := []*profile.BackendDef{
+		{Name: "plain", Cell: "gpu", Backend: profile.Backend{
+			External: true, LlamaServer: &profile.LlamaServerBackend{Path: "/models/plain.gguf"},
+		}},
+	}
+	cells := []Cell{
+		{Name: "front", URL: "http://127.0.0.1:1", Class: "always_on"},
+		{Name: "gpu", URL: "http://127.0.0.1:3", Class: "always_on"},
+	}
+	hosts := &fleetcfg.File{Cells: map[string]fleetcfg.Cell{
+		"front": {URL: "http://127.0.0.1:1", Class: fleetcfg.ClassAlwaysOn},
+		"gpu":   {URL: "http://127.0.0.1:3", Class: fleetcfg.ClassAlwaysOn},
+	}}
+	s := New(cells, filepath.Join(t.TempDir(), "hist.json"), testDaemonInfo, Options{})
+	t.Cleanup(s.Close)
+	s.StartRenderLoop(RenderLoopConfig{
+		Hosts:             hosts,
+		FrontConfigPath:   filepath.Join(t.TempDir(), "front.yaml"),
+		FullWaveTimeout:   30 * time.Second,
+		RenderMinInterval: time.Millisecond,
+		LoadDefs:          func(string) ([]*profile.BackendDef, error) { return defs, nil },
+		Render: func(d []*profile.BackendDef, o router.Options) (string, error) {
+			seen <- o
+			return router.Render(d, o)
+		},
+		WriteFile: func(path string, data []byte) error { return os.WriteFile(path, data, 0o644) },
+	})
+	rlAnnounce(t, s, "front", rlServing(), nil)
+	rlAnnounce(t, s, "gpu", rlServing(), nil)
+
+	select {
+	case o := <-seen:
+		if o.AliasWinners == nil {
+			t.Fatal("renderPass passed a nil AliasWinners; Render falls back to resolving over the pruned def set")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for a render pass")
+	}
+}
+
 func TestRenderLoop_PrunedRoamingOwnerTakesItsAliasOutOfTheCatalog(t *testing.T) {
 	s, w := c21Fleet(t, []*profile.BackendDef{
 		c21Def("laptop-coder", "laptop", true, "best-coder"),

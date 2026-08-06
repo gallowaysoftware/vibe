@@ -17,6 +17,15 @@
 #
 # Run against a lab already up:
 #   FLEETLAB_DIR=... ./lab.sh up && FLEETLAB_DIR=... ./gate-c21-alias.sh
+#
+# Side effects on the lab (idempotent, not undone — take the lab down after):
+# appends a router: block to three defs, re-renders alpha's and charlie's
+# cell configs, and stops+restarts charlie's announcer.
+#
+# FLEETLAB_DIR must be SHORT. Every daemon binds
+# $FLEETLAB_DIR/run/rt-*/vibe/vibe.sock, and a path over the 108-byte
+# sun_path limit fails with `bind: invalid argument` whose only visible
+# symptom is `lab.sh up` reporting "fleetd did not come up".
 set -uo pipefail
 source "$(dirname "$0")/gl.sh"
 
@@ -32,12 +41,15 @@ check() { # $1 label, $2 = 0/1 from the caller
 
 # peer_of ID — which peer stanza in the front's rendered config serves ID,
 # or "" when the catalog does not carry it at all. yq is not assumed.
+# Two peers claiming one id prints "a+b" rather than picking one: a rig
+# that silently returns the last match would report the expected cell
+# while the catalog carried a duplicate.
 peer_of() {
   python3 - "$FRONT_CFG" "$1" <<'PY'
 import sys, re
 path, want = sys.argv[1], sys.argv[2]
 peer, inmodels = "", False
-out = ""
+hits = []
 for line in open(path):
     m = re.match(r"^    (\S+):\s*$", line)
     if m:
@@ -50,10 +62,10 @@ for line in open(path):
         m = re.match(r"^            - (\S+)\s*$", line)
         if m:
             if m.group(1) == want:
-                out = peer
+                hits.append(peer)
         else:
             inmodels = False
-print(out)
+print("+".join(hits))
 PY
 }
 

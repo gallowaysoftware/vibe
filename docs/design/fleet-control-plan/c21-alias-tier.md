@@ -1,7 +1,9 @@
 # C21 — the visible-repoint alias tier: REJECTED, and the invisible one that already shipped
 
 Status: **PR OPEN**, off `feat/c21-alias-tier` branched from `main` at
-`e144f8b`. Backlog item 10
+`e144f8b`. Two commits: the decision + the fix, and ground rule 9's
+adversarial self-review (§8b — five findings, two fixed, one a silent
+disarming of the fix itself). Backlog item 10
 ([fleet-control-futures.md](../fleet-control-futures.md) §2), whose entry
 asks for a decision rather than a feature:
 
@@ -295,8 +297,8 @@ the loud direction. No reference-fleet or `scripts/fleetlab` def hits it.
 |---|---|
 | `internal/vibe/router/render.go` | `Options.AliasWinners`; exported `ResolveAliases`; `aliasClaimants`; `Render` resolves over the declared set |
 | `internal/vibe/fleetapi/render_loop.go` | `renderPass` resolves before the overlays and passes `AliasWinners`; the collision error fails the pass |
-| `internal/vibe/router/alias_scope_test.go` | 6 tests: the unassigned / trial / cross-cell transfers, the `AliasWinners` seam, the collision that must not heal, the cloud-peer exclusion |
-| `internal/vibe/fleetapi/c21_test.go` | 3 tests through the **real** `router.Render` in the loop's seam: prune-does-not-repoint, collision-does-not-heal, alias-returns-with-its-owner |
+| `internal/vibe/router/alias_scope_test.go` | 7 tests: the unassigned / trial / cross-cell transfers, the `AliasWinners` seam, the collision that must not heal, the cloud-peer exclusion, the non-nil-map guard |
+| `internal/vibe/fleetapi/c21_test.go` | 4 tests through the **real** `router.Render` in the loop's seam: prune-does-not-repoint, collision-does-not-heal, alias-returns-with-its-owner, and the `AliasWinners` non-nil guard |
 | `scripts/fleetlab/gate-c21-alias.sh` | the L1 rig (§8) |
 
 No new HTTP route, no MCP tool, no proto change, no state file, no config
@@ -318,15 +320,19 @@ surface.
 | U7 | Through the real renderer in the loop: pruning the roaming **owner** removes the alias from the catalog and does not repoint it at the co-claimant's cell | PASS |
 | U8 | Through the real renderer: an unresolvable collision renders **nothing**, before and after the prune (`RenderCount == 0`) | PASS |
 | U9 | Through the real renderer: the alias returns with its declared owner after C3's re-add hysteresis, and the co-claimant never holds it | PASS |
+| U10 | `ResolveAliases` returns a NON-NIL map with nothing to resolve (no defs / no aliases / only a cloud peer) — a nil map re-enables `Render`'s fallback | PASS |
+| U11 | The render loop passes a non-nil `AliasWinners` on every pass, including on a fleet that declares no aliases at all | PASS |
 
-**Mutation-verified**, three production predicates, each reverted,
+**Mutation-verified**, five production predicates, each reverted,
 confirmed red on a named test, restored:
 
 | mutation | red |
 |---|---|
 | `Render` resolves over `modelDefs` (the survivors) again | U1, U2, U3 |
-| `renderPass` stops passing `AliasWinners` | U7 — failure output prints the repointed config with `best-coder` under `gpu` |
+| `renderPass` stops passing `AliasWinners` | U7 — failure output prints the repointed config with `best-embed` under `alpha` |
 | `renderPass` swallows the `ResolveAliases` error | U8 |
+| `renderPass` omits `AliasWinners` entirely | U11 |
+| `ResolveAliases` returns nil when there is nothing to resolve | U10 |
 
 Inner loop, all on this branch's tree: `go build ./...` clean,
 `go vet ./...` clean, `gofmt -l .` silent, `go mod tidy` leaves
@@ -464,6 +470,66 @@ path — a scratchpad under
 did not come up". `/tmp/fleetlab-c21` works. This is a second reason
 futures item 15 (a `FLEETLAB_PORT_BASE` knob) should also take a
 path-length check.
+
+## 8b. Adversarial self-review addendum (ground rule 9)
+
+Five things the review pass went looking for. Two became commits, three
+are recorded as checked-and-clean or checked-and-pre-existing, because
+"I looked and it was fine" is worth as much to the next agent as a fix.
+
+**REV-1 (fixed, blocker-shaped).** `Options.AliasWinners` uses `nil` to
+mean "resolve it yourself", which is correct for the three callers holding
+a whole checkout and is a **silent disarming** for the one caller that
+does not. If `ResolveAliases` ever returned a nil map — or a future
+refactor dropped the field from `renderPass`'s `Options` literal — fleetd
+reverts to resolving over the survivors with no error, no log line and no
+test failure, and the defect this phase exists to close comes back on
+exactly the fleets nobody is watching. This is C15's `front_extras`
+lesson: a declared-but-absent input must not degrade quietly. Pinned from
+both ends (U10, U11), both mutation-verified. Considered and rejected:
+removing the fallback entirely, because the CLI, `RenderToFile` and
+`fleetmcp` all legitimately hold the full checkout and forcing them to
+pre-compute would spread the invariant across four call sites instead of
+concentrating it in one.
+
+**REV-2 (fixed, rig honesty).** `peer_of` in the gate rig returned the
+LAST peer claiming an id. A duplicate — one id under two peer stanzas —
+would have printed the expected cell and passed the check. It now prints
+`a+b`, which fails every equality. A rig that can only report the answer
+it expects is C5's `TestWarmTarget_SkipsAbsentAndDrainedCells` again.
+
+**REV-3 (checked, clean): every other `Render` caller.** Audited all four:
+`cli.runRouterRender`, `router.RenderToFile`, `fleetmcp`'s `render_front`
+dry-run and `modeltry`. Each passes an unfiltered `router.LoadDefs`
+result, so each is correct with `AliasWinners` nil. `fleetapi.renderPass`
+is the only pre-filtering caller in the module.
+
+**REV-4 (checked, clean): does C18's trial scaffolder create the
+collision?** It would be the common case if it did — `vibe model try
+--like <def>` derives a candidate from the incumbent, and a copied
+`router.aliases` would collide with the incumbent's on every trial.
+`modeltry.deriveDef` already drops aliases and its comment names the same
+hazard ("a render error at best, a silent re-point at worst"). C18 guarded
+its own path before this phase found the general case. So U2's trial
+scenario needs a hand-written `alias_owner: true` on a trial def — a
+declaration, and after C21 it yields a missing id rather than a
+substitution.
+
+**REV-5 (checked, pre-existing, NOT fixed here): an alias colliding with a
+cloud peer's MODEL id.** `resolveAliases` reserves def *names*, and a
+`cloud_peer` def's name is a peer stanza key rather than a catalog id — so
+`aliasClaimants` correctly excludes it (U6). But the ids a cloud peer
+actually serves come from `cloud_peer.models`, and nothing checks an alias
+against those. A def aliased `claude-sonnet-5` would render that id under
+two peers. Unchanged by this phase in either direction, out of its scope,
+and named here so it is not rediscovered as a C21 regression. The rig
+change in REV-2 is what would catch it in a gate.
+
+Also unchanged and worth stating: `fleetmcp`'s `render_front` dry-run
+renders the FULL def set while fleetd renders the pruned one, so its diff
+shows a pruned roaming cell as drift. That predates C21 (the peer stanzas
+already differed); the alias is now one more line in a diff that was
+already there.
 
 ## 9. What this phase deliberately does not do
 
