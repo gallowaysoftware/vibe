@@ -255,6 +255,19 @@ type FleetConfig struct {
 	// render_front tool can diff a fresh render against it. Empty means
 	// render-only, no diff.
 	FrontConfig string `yaml:"front_config,omitempty"`
+	// FrontExtras is a YAML file whose top-level sections are merged into
+	// every render of the front's config (`vibe router render --extras`,
+	// same merge). It exists because the front's config is a DERIVED
+	// artifact — fleetd rewrites it on every membership transition — so
+	// anything the operator needs there that the renderer does not emit is
+	// erased on the next presence change.
+	//
+	// `apiKeys:` is exactly that (fleet-control C15), and it is why this
+	// key landed with the credential rather than after it: a front
+	// credential fleetd deletes at the next render is not a credential.
+	// Same for `store:` (C7a's activity log). Empty is the reference
+	// posture — a rendered front with nothing but derived content.
+	FrontExtras string `yaml:"front_extras,omitempty"`
 	// Notify is the alarm-to-webhook bridge (fleet-control C9). Empty
 	// means no notifications — the design's "alarm? yes" column then
 	// terminates in an SSE stream nobody watches, which is the status
@@ -645,6 +658,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 			CellAuth:   d.cellAuthProbe,
 		}
 		d.hosts = hosts
+		// C15: resolve every declared llama-swap credential now, so a
+		// missing key file is an ERROR line at startup rather than a warm
+		// target that quietly stops firing.
+		checkSwapKeys(hosts)
 	}
 	fleet := fleetapi.New(
 		fleetCells,
@@ -661,6 +678,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			FrontConfig: d.cfg.Fleet.FrontConfig,
 			BackendsDir: paths.BackendsDir(),
 			LlamaBinary: d.cfg.LlamaBinary,
+			FrontExtras: d.cfg.Fleet.FrontExtras,
 		}).Register(mux)
 		// C3: the front config is a derived artifact once fleetd can see
 		// its path (same-host mount). Without front_config the registry
@@ -670,6 +688,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 				BackendsDir:       paths.BackendsDir(),
 				LlamaServerBinary: d.cfg.LlamaBinary,
 				FrontConfigPath:   d.cfg.Fleet.FrontConfig,
+				FrontExtras:       d.cfg.Fleet.FrontExtras,
 				Hosts:             d.hosts,
 			})
 		}

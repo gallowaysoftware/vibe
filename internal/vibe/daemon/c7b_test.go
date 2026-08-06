@@ -71,7 +71,7 @@ func TestCloudSpendPoller_SkipsWhenDefsCannotBeRead(t *testing.T) {
 
 	dir := t.TempDir()
 	writeDef(t, dir, "broken.yaml", "this: is: not: yaml:\n")
-	poll := cloudSpendPoller(front.URL, filepath.Join(t.TempDir(), "state.json"), dir)
+	poll := cloudSpendPoller(front.URL, "", filepath.Join(t.TempDir(), "state.json"), dir)
 	if poll == nil {
 		t.Fatal("poller not built")
 	}
@@ -105,7 +105,7 @@ backend:
     base_url: "https://api.example.invalid"
     models: ["vendor-chat-1"]
 `)
-	poll := cloudSpendPoller(front.URL, filepath.Join(t.TempDir(), "state.json"), dir)
+	poll := cloudSpendPoller(front.URL, "", filepath.Join(t.TempDir(), "state.json"), dir)
 	u := poll(context.Background())
 	if u == nil {
 		t.Fatal("no usage returned")

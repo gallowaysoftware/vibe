@@ -77,6 +77,7 @@ type Server struct {
 	// from this daemon (a same-host mount) — render_front diffs against
 	// it. Empty means render-only, no diff.
 	frontConfig string
+	frontExtras string
 	// backendsDir and llamaBinary feed the renderer the same inputs the
 	// CLI gives it.
 	backendsDir string
@@ -90,6 +91,13 @@ type Server struct {
 // own config values).
 type Options struct {
 	FrontConfig string
+	// FrontExtras is fleet.front_extras — the operator-owned YAML the
+	// render LOOP merges into the front's config (C15). render_front
+	// answers "what would the render write", so it must merge the same
+	// file: with the CLI's default instead, the dry run reports the
+	// front's `apiKeys:` as drift to be deleted on a fleet whose render
+	// loop preserves them.
+	FrontExtras string
 	BackendsDir string
 	LlamaBinary string
 }
@@ -103,6 +111,7 @@ func New(fleet *fleetapi.Server, hosts *fleetcfg.File, opts Options) *Server {
 		http:        &http.Client{Timeout: toolTimeout},
 		warmHTTP:    &http.Client{},
 		frontConfig: opts.FrontConfig,
+		frontExtras: opts.FrontExtras,
 		backendsDir: opts.BackendsDir,
 		llamaBinary: opts.LlamaBinary,
 	}
@@ -698,8 +707,18 @@ func (s *Server) toolWarmModel(ctx context.Context, model string) (string, error
 	if !ok {
 		return "", fmt.Errorf("no %q cell in hosts.yaml", fleetcfg.FrontCell)
 	}
+	// The catalog read is the operator-facing surface for a broken front
+	// credential (C15): it is the one part of this verb that runs
+	// synchronously, so a 401 here is the answer the agent gets back
+	// instead of a warm that vanishes into a goroutine. Deliberately NOT
+	// gated by SwapAuthRefusal — an operator asking is not fleetd
+	// guessing, and the operator is the one person who can read the
+	// diagnosis and go fix the file.
 	known, err := s.modelInCatalog(ctx, front.URL, model)
 	if err != nil {
+		if why, blocked := s.fleet.SwapAuthRefusal(fleetcfg.FrontCell); blocked {
+			return "", fmt.Errorf("check front catalog: %v — %s", err, why)
+		}
 		return "", fmt.Errorf("check front catalog: %v", err)
 	}
 	if !known {
@@ -730,11 +749,16 @@ func (s *Server) toolWarmModel(ctx context.Context, model string) (string, error
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
+		if err := s.fleet.AuthorizeSwap(req, fleetcfg.FrontCell); err != nil {
+			slog.Error("warm_model not sent: the front's llama-swap credential will not resolve", "model", model, "err", credentialDetail(err))
+			return
+		}
 		resp, err := s.warmHTTP.Do(req)
 		if err != nil {
 			slog.Warn("warm_model request failed", "model", model, "err", err)
 			return
 		}
+		s.fleet.NoteSwapStatus(fleetcfg.FrontCell, resp.StatusCode)
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
 	}()
@@ -755,7 +779,7 @@ func (s *Server) modelInCatalog(ctx context.Context, frontURL, model string) (bo
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	if err := s.getJSON(ctx, strings.TrimRight(frontURL, "/")+"/v1/models", &wrap); err != nil {
+	if err := s.getJSON(ctx, fleetcfg.FrontCell, strings.TrimRight(frontURL, "/")+"/v1/models", &wrap); err != nil {
 		return false, err
 	}
 	for _, m := range wrap.Data {
@@ -782,11 +806,21 @@ func (s *Server) toolUnloadModel(ctx context.Context, cell, model string) (strin
 	if err != nil {
 		return "", err
 	}
+	// The admin port is gated by the cell's own apiKeys, not the front's
+	// (C15): /api/models/unload/* answers 401 without a key on v239.
+	// A credential that will not resolve is a local failure and is NOT
+	// queued — the cell would execute the verb happily, so hiding a broken
+	// key file behind "queued for the next announce" would let the
+	// misconfiguration survive indefinitely.
+	if err := s.fleet.AuthorizeSwap(req, cell); err != nil {
+		return "", fmt.Errorf("unload %s on %s: %v", model, cell, credentialDetail(err))
+	}
 	resp, err := s.http.Do(req)
 	if err != nil {
 		return s.queueUnload(cell, model, fmt.Sprintf("POST %s: %v", url, err))
 	}
 	defer resp.Body.Close()
+	s.fleet.NoteSwapStatus(cell, resp.StatusCode)
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode >= 500 {
 		return s.queueUnload(cell, model, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
@@ -796,7 +830,13 @@ func (s *Server) toolUnloadModel(ctx context.Context, cell, model string) (strin
 		// Queueing it would tell the agent "done on its next heartbeat"
 		// about a verb the cell will refuse identically — the piggyback
 		// fallback is for delivery failures, not for definitive answers.
-		return "", fmt.Errorf("unload %s on %s: HTTP %d: %s", model, cell, resp.StatusCode, strings.TrimSpace(string(body)))
+		msg := fmt.Sprintf("unload %s on %s: HTTP %d: %s", model, cell, resp.StatusCode, strings.TrimSpace(string(body)))
+		if why, blocked := s.fleet.SwapAuthRefusal(cell); blocked {
+			// llama-swap's 401 body says "invalid or missing API key" and
+			// names no config; this names the one to fix.
+			msg += " — " + why
+		}
+		return "", errors.New(msg)
 	}
 	return fmt.Sprintf("Unloaded %s on %s. The next request naming it JIT-loads again.", model, cell), nil
 }
@@ -813,9 +853,29 @@ func (s *Server) queueUnload(cell, model, why string) (string, error) {
 	return fmt.Sprintf("%s's admin port did not answer (%s), so the unload of %s is queued for its next announce (≤ one heartbeat).", cell, why, model), nil
 }
 
-func (s *Server) getJSON(ctx context.Context, url string, out any) error {
+// getJSON reads one llama-swap JSON endpoint on a named cell, carrying
+// that cell's llama-swap credential (C15). The cell name is a parameter
+// for the same reason fleetapi's is: it selects the key, and every
+// fleetd→llama-swap call in this repo goes through one authorizer.
+// credentialDetail is the token-only rendering of a swap-credential
+// failure. fleetapi's error deliberately names only the hosts.yaml key,
+// because it propagates into `/api/fleet/state`, which C12 grants to the
+// guest bearer; /mcp and this daemon's log are token-only, so they get
+// the wrapped cause and with it the PATH an operator has to go fix.
+func credentialDetail(err error) error {
+	var ske *fleetcfg.SwapKeyError
+	if errors.As(err, &ske) {
+		return ske
+	}
+	return err
+}
+
+func (s *Server) getJSON(ctx context.Context, cell, url string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
+		return err
+	}
+	if err := s.fleet.AuthorizeSwap(req, cell); err != nil {
 		return err
 	}
 	resp, err := s.http.Do(req)
@@ -823,6 +883,7 @@ func (s *Server) getJSON(ctx context.Context, url string, out any) error {
 		return err
 	}
 	defer resp.Body.Close()
+	s.fleet.NoteSwapStatus(cell, resp.StatusCode)
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("GET %s: status %d", url, resp.StatusCode)

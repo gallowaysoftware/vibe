@@ -152,6 +152,11 @@ type DoctorHost struct {
 	// render mount contract) — which is the only reason doctor may report
 	// anything about the front's disk.
 	FrontConfig string
+	// FrontExtras is fleet.front_extras: the operator-owned YAML merged
+	// into every front render. Its ABSENCE beside a front that declares a
+	// llama-swap API key is a finding, because the render then deletes the
+	// key from the config it rewrites (C15).
+	FrontExtras string
 	// TokenMinted reports that this start CREATED the control-plane token
 	// rather than loading one. On fleetd that is the signature of a
 	// container recreate over an unmounted state dir.
@@ -342,9 +347,12 @@ const (
 // ─── credentials, both directions ───────────────────────────────────────────
 
 func (s *Server) checkAuth(ctx context.Context, rep *DoctorReport, snap StateSnapshot, pres map[string]Presence, host DoctorHost) {
+	expl := explainedCells(snap)
 	for _, c := range snap.Cells {
 		s.checkInbound(rep, c, pres[c.Name], snap.Daemon.AuthRejected)
+		s.checkSwapCredential(rep, c, expl)
 	}
+	s.checkFrontExtras(rep, host)
 	// Probed in PARALLEL, like Snapshot's own cell round: each call is
 	// bounded at 5s, and run serially a fleet with three boxes off would
 	// spend the whole report deadline dialling them — leaving the cells
@@ -440,6 +448,131 @@ func (s *Server) checkInbound(rep *DoctorReport, c CellSnapshot, p Presence, rej
 		}
 		rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelUnknown,
 			Summary: "never announced", Detail: det})
+	}
+}
+
+// checkSwapCredential is the THIRD credential in the fleet, and the one
+// nothing checked before C15: the API key a cell's llama-swap demands
+// (`apiKeys:`), as opposed to the cell daemon's bearer token
+// (auth.outbound) or fleetd's own (auth.inbound).
+//
+// The ID names what it proves. It is `swap.credential` — "fleetd can
+// present what this cell's llama-swap asks for" — not `swap.reachable`:
+// llama-swap exempts /health from apiKeys, so a cell can answer a health
+// check perfectly while refusing every route fleetd actually uses.
+func (s *Server) checkSwapCredential(rep *DoctorReport, c CellSnapshot, expl map[string]string) {
+	id := "swap.credential"
+	cred, resolveErr := s.hostsFile().SwapCredentialFor(c.Name)
+	if resolveErr != nil {
+		rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelFail,
+			Summary: "the declared llama-swap API key will not resolve",
+			Detail:  resolveErr.Error() + " — fleetd sends no request to this cell's llama-swap at all rather than sending one unauthenticated.",
+			Fix:     "restore the key file, or drop cells." + c.Name + ".swap_key_file if that llama-swap has no apiKeys."})
+		return
+	}
+	if f, bad := s.swapAuthState(c.Name); bad {
+		fix := "add cells." + c.Name + ".swap_key_file to hosts.yaml, holding one of that llama-swap's apiKeys values."
+		if f.Kind == SwapAuthRejected {
+			fix = "the key file and that llama-swap's apiKeys list have diverged; re-sync them (the value never lives in this repo)."
+		}
+		rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelFail,
+			Summary: "this cell's llama-swap is refusing fleetd's credential (" + f.Kind + ", since " + ago(f.Since) + " ago)",
+			Detail:  f.Detail,
+			Fix:     fix})
+		return
+	}
+	switch {
+	case cred.Configured && c.Reachable:
+		rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelOK,
+			Summary: "llama-swap API key declared and accepted",
+			Detail:  "source: " + cred.Source + " — this cell's /running and /v1/models answered fleetd with it."})
+	case cred.Configured:
+		// Not UNKNOWN: what this check proves is that fleetd can PRESENT
+		// the credential, and it can. Whether the far side likes it is
+		// unknowable while the box is off, and scoring an off
+		// opportunistic cell UNKNOWN forever is how an operator learns to
+		// ignore the level (C13).
+		rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelOK,
+			Summary: "llama-swap API key declared and resolvable",
+			Detail:  "source: " + cred.Source + ". Nothing has exercised it: this cell's llama-swap is not answering right now."})
+	case c.Reachable:
+		rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelOK,
+			Summary: "no llama-swap API key declared, and none demanded",
+			Detail:  "this cell's llama-swap is answering fleetd's probes unauthenticated, which is the reference posture (LAN-only, no apiKeys)."})
+	case expl[c.Name] != "":
+		rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelOK,
+			Summary: "no llama-swap API key declared; nothing to check while the cell is away",
+			Detail:  expl[c.Name] + "."})
+	default:
+		rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelUnknown,
+			Summary: "no llama-swap API key declared and this cell's llama-swap is not answering",
+			Detail: "whether it demands a key is unknowable from here — an unreachable llama-swap and one that is refusing every " +
+				"route except /health look identical to a probe that got no answer.",
+			Fix: "if it does run with apiKeys, set cells." + c.Name + ".swap_key_file."})
+	}
+}
+
+// checkFrontExtras answers the one way a correctly-configured C15
+// credential still stops working: the front's config is a DERIVED
+// artifact, rewritten by fleetd on every membership transition, and the
+// renderer emits only what it derives. A front with `apiKeys:` and no
+// `fleet.front_extras` therefore loses its keys at the next presence
+// change — hours after someone configured them, with nothing in between
+// to connect cause and effect.
+//
+// It is named for what it proves: whether the operator-owned half of the
+// front's config is declared, not whether the file's contents are right.
+func (s *Server) checkFrontExtras(rep *DoctorReport, host DoctorHost) {
+	id := "front.extras"
+	if host.FrontConfig == "" {
+		// No render mount: the front's config is hand-maintained and
+		// nothing here can overwrite anything. OK with the reason, never a
+		// permanent UNKNOWN on a fleet that is fine (C13).
+		rep.Add(DoctorCheck{ID: id, Cell: fleetcfg.FrontCell, Level: LevelOK,
+			Summary: "fleetd does not render the front's config, so nothing overwrites it",
+			Detail:  "fleet.front_config is unset: the registry is observe-only for the front (C1/C2 behaviour)."})
+		return
+	}
+	cred, err := s.hostsFile().SwapCredentialFor(fleetcfg.FrontCell)
+	keyed := err != nil || cred.Configured
+	// DECLARED is not MERGED. router.mergeExtras treats a missing file as
+	// "no extras", so a typo'd or unmounted front_extras is exactly as
+	// destructive as no front_extras at all — and reporting it OK would
+	// make this check name something it does not prove (C13).
+	extrasErr := error(nil)
+	if host.FrontExtras != "" {
+		_, extrasErr = os.Stat(host.FrontExtras)
+	}
+	switch {
+	case extrasErr != nil && keyed:
+		rep.Add(DoctorCheck{ID: id, Cell: fleetcfg.FrontCell, Level: LevelFail,
+			Summary: "fleet.front_extras is declared but cannot be read, so the render merges nothing",
+			Detail: "fleet.front_extras: " + host.FrontExtras + " (" + extrasErr.Error() + "). A missing extras file is not an error to the " +
+				"renderer — it merges nothing and writes on — so " + host.FrontConfig + " loses its apiKeys at the next membership transition, " +
+				"exactly as if front_extras were unset. fleetd's render loop refuses the write while this holds.",
+			Fix: "fix the path (or the container mount) so fleet.front_extras resolves on the box running fleetd."})
+	case extrasErr != nil:
+		rep.Add(DoctorCheck{ID: id, Cell: fleetcfg.FrontCell, Level: LevelWarn,
+			Summary: "fleet.front_extras is declared but cannot be read",
+			Detail: "fleet.front_extras: " + host.FrontExtras + " (" + extrasErr.Error() + "). Nothing is being erased today — the front declares " +
+				"no llama-swap API key — but the render merges nothing, so any section put in that file would not reach the front.",
+			Fix: "fix the path (or the container mount), or drop fleet.front_extras."})
+	case host.FrontExtras != "":
+		rep.Add(DoctorCheck{ID: id, Cell: fleetcfg.FrontCell, Level: LevelOK,
+			Summary: "the front's non-derived config is declared and merged into every render",
+			Detail:  "fleet.front_extras: " + host.FrontExtras})
+	case keyed:
+		rep.Add(DoctorCheck{ID: id, Cell: fleetcfg.FrontCell, Level: LevelFail,
+			Summary: "the front declares a llama-swap API key and fleetd renders its config with no front_extras",
+			Detail: "every membership transition rewrites " + host.FrontConfig + " from the backend defs alone, which emits no " +
+				"apiKeys: the front will stop demanding a key (or, on restart, stop accepting the one it had) and the fleet's " +
+				"warms will fail with no configuration having changed.",
+			Fix: "put the front's apiKeys (and any other hand-written section, e.g. store:) in a YAML file and name it in " +
+				"fleet.front_extras."})
+	default:
+		rep.Add(DoctorCheck{ID: id, Cell: fleetcfg.FrontCell, Level: LevelOK,
+			Summary: "the front's config is fully derived; nothing hand-written to preserve",
+			Detail:  "no llama-swap API key is declared for the front, which is the reference posture (LAN-only, no apiKeys)."})
 	}
 }
 

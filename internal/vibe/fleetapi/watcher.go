@@ -64,11 +64,20 @@ func (s *Server) streamCell(c Cell) (connected bool) {
 	if err != nil {
 		return false
 	}
+	// /api/events is gated by llama-swap's apiKeys like everything except
+	// /health (C15, verified on v239). Without the credential the stream
+	// 401s forever and the cell silently loses in-flight evidence,
+	// per-model activity and every idle window built on them — the inputs
+	// the warm policy, `await --idle` and the sleep guard all read.
+	if err := s.AuthorizeSwap(req, c.Name); err != nil {
+		return false
+	}
 	resp, err := s.streamClient.Do(req)
 	if err != nil {
 		return false
 	}
 	defer resp.Body.Close()
+	s.NoteSwapStatus(c.Name, resp.StatusCode)
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return false

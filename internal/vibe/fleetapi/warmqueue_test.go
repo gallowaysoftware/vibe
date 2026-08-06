@@ -307,7 +307,7 @@ func TestWarmViaFrontTypesItsStatus(t *testing.T) {
 				http.Error(w, "nope", tc.status)
 			}))
 			defer srv.Close()
-			err := warmViaFront(t.Context(), srv.URL, "default-model")
+			err := newWarmServer(t, nil).warmViaFront(t.Context(), srv.URL, "default-model")
 			if err == nil {
 				t.Fatal("a non-200 warm reported success")
 			}
@@ -318,7 +318,7 @@ func TestWarmViaFrontTypesItsStatus(t *testing.T) {
 	}
 
 	// A transport failure carries no status and is never definitive.
-	if definitiveWarmRefusal(warmViaFront(t.Context(), "http://127.0.0.1:1", "default-model")) {
+	if definitiveWarmRefusal(newWarmServer(t, nil).warmViaFront(t.Context(), "http://127.0.0.1:1", "default-model")) {
 		t.Error("a transport failure was read as the front answering")
 	}
 }

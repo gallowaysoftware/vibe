@@ -150,7 +150,7 @@ func (s *Server) startSleepLoopWithConfig(cfg sleepLoopConfig) {
 		cfg.poll = 15 * time.Second
 	}
 	if cfg.warmFn == nil {
-		cfg.warmFn = warmViaFront
+		cfg.warmFn = s.warmViaFront
 	}
 	if cfg.wakeFn == nil {
 		cfg.wakeFn = func(ctx context.Context, cell string) (string, error) {
@@ -516,6 +516,13 @@ func (s *Server) wakeWarm(ctx context.Context, cell, model string, cfg sleepLoop
 	// fires at 07:15 with nobody watching.
 	if refused := s.warmClassRefusal(model); refused != "" {
 		return "warm " + model + " refused: " + refused
+	}
+	// The third producer takes C15's front-credential rung too, and it is
+	// the one that fires at 07:15 with nobody watching: a wake whose warms
+	// all 401 must say which config is wrong in the wake's own note, not
+	// leave "warm failed: HTTP 401" for whoever reads fleet_status next.
+	if why, blocked := s.SwapAuthRefusal(fleetcfg.FrontCell); blocked {
+		return "warm " + model + " skipped: " + why
 	}
 	var err error
 	if s.frontCanRoute(cell) {

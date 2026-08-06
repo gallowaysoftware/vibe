@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 )
 
 // Warm schedules (fleet-control C4 §2): cron-firing model warming,
@@ -199,7 +201,7 @@ func (s *Server) startScheduleLoopWithConfig(entries []WarmScheduleEntry, cellOf
 		loc = time.Local
 	}
 	if warmFn == nil {
-		warmFn = warmViaFront
+		warmFn = s.warmViaFront
 	}
 	now := time.Now()
 	for _, e := range entries {
@@ -288,6 +290,7 @@ func (s *Server) evalScheduleEntry(e WarmScheduleEntry, spec cronSpec, st *warmS
 
 	note, unguarded := "", ""
 	refused := s.warmClassRefusal(e.Model)
+	frontAuth, frontBlocked := s.SwapAuthRefusal(fleetcfg.FrontCell)
 	cell, err := cellOfModel(e.Model)
 	switch {
 	case refused != "":
@@ -296,6 +299,12 @@ func (s *Server) evalScheduleEntry(e WarmScheduleEntry, spec cronSpec, st *warmS
 		// condition of this minute, so no rung below it can overwrite it
 		// with a reason that reads as temporary.
 		note = "refused: " + refused
+	case frontBlocked:
+		// Second, ahead of the per-cell rungs: the schedule's channel is
+		// the front, so a front that will not accept fleetd's credential
+		// makes every rung below irrelevant. Naming the busy cell instead
+		// would send the operator to the wrong box (C15).
+		note = "skipped (" + frontAuth + ")"
 	case err != nil:
 		note = fmt.Sprintf("skipped (cannot resolve cell for %s: %v)", e.Model, err)
 		slog.Warn("warm schedule cell resolve failed — not firing unguarded", "model", e.Model, "err", err)

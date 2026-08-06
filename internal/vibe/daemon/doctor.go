@@ -31,6 +31,7 @@ func (d *Daemon) doctorHost() fleetapi.DoctorHost {
 	h := fleetapi.DoctorHost{
 		StateDir:      filepath.Dir(paths.IntentFile()),
 		FrontConfig:   d.cfg.Fleet.FrontConfig,
+		FrontExtras:   d.cfg.Fleet.FrontExtras,
 		TokenMinted:   d.tokenMinted.Load(),
 		EnvTokenSet:   strings.TrimSpace(os.Getenv("VIBE_TOKEN")) != "",
 		Version:       buildinfo.String(),

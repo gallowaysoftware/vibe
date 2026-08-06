@@ -267,7 +267,7 @@ func renderDegraded(out io.Writer, fleetdErr error) error {
 	sort.Strings(names)
 	for _, n := range names {
 		c := hosts.Cells[n]
-		cellUp, models := probeCellDirect(c.URL)
+		cellUp, models, authNote := probeCellDirect(hosts, n)
 		host := "-"
 		if c.HostProbe != "" {
 			if probeTCPDirect(c.HostProbe) {
@@ -277,38 +277,73 @@ func renderDegraded(out io.Writer, fleetdErr error) error {
 			}
 		}
 		cell := "down"
-		if cellUp {
+		switch {
+		case cellUp:
 			cell = "up"
+		case authNote != "":
+			// A cell whose llama-swap refused the credential is not a cell
+			// that is DOWN — it answered. Printing "down" here is the same
+			// absent-evidence-as-fact mistake the warm policy spent two
+			// phases removing, and this is the screen someone reads while
+			// fleetd is already broken (C15).
+			cell = "auth?"
+			models = authNote
 		}
 		fmt.Fprintf(out, "%-14s %-10s %-10s %s\n", termSafe(n), cell, host, termSafe(models))
 	}
 	return nil
 }
 
-func probeCellDirect(url string) (bool, string) {
+// probeCellDirect reads one cell's llama-swap catalog from THIS box,
+// carrying the cell's declared API key (C15). The third return names a
+// CREDENTIAL problem, which callers must not render as "the cell is
+// down": llama-swap answered, it just refused us, and the two have
+// completely different fixes.
+func probeCellDirect(hosts *fleetcfg.File, name string) (up bool, models, authNote string) {
+	c := hosts.Cells[name]
 	hc := &http.Client{Timeout: 3 * time.Second}
 	var wrap struct {
 		Data []struct {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	resp, err := hc.Get(strings.TrimRight(url, "/") + "/v1/models")
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(c.URL, "/")+"/v1/models", nil)
 	if err != nil {
-		return false, "-"
+		return false, "-", ""
+	}
+	cred, err := hosts.SwapCredentialFor(name)
+	if err != nil {
+		// Fail closed, exactly as fleetd does: a declared key that will not
+		// read must not become an unauthenticated probe reported as a dead
+		// cell.
+		return false, "-", "swap_key_file unreadable: " + err.Error()
+	}
+	if cred.Configured {
+		req.Header.Set("Authorization", "Bearer "+cred.Key)
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return false, "-", ""
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		if cred.Configured {
+			return false, "-", "llama-swap refused cells." + name + ".swap_key_file"
+		}
+		return false, "-", "llama-swap wants an API key; no cells." + name + ".swap_key_file declared"
+	}
 	if resp.StatusCode != http.StatusOK {
-		return false, "-"
+		return false, "-", ""
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&wrap); err != nil {
-		return true, "(catalog unreadable)"
+		return true, "(catalog unreadable)", ""
 	}
 	ids := make([]string, 0, len(wrap.Data))
 	for _, m := range wrap.Data {
 		ids = append(ids, m.ID)
 	}
 	sort.Strings(ids)
-	return true, strings.Join(ids, " ")
+	return true, strings.Join(ids, " "), ""
 }
 
 func probeTCPDirect(addr string) bool {
