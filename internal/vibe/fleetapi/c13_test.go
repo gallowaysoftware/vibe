@@ -260,6 +260,9 @@ func TestDoctor_ReachesNoMutatingVerb(t *testing.T) {
 		// contributes checks to the report is on the doctor path whatever
 		// it is called.
 		"upgrade.go",
+		// C19's two checks live beside the rest of the mirror for the same
+		// reason, and the file reads a receipt off the state dir.
+		"mirror.go",
 		"../daemon/doctor.go",
 		"../fleetmcp/doctor.go",
 		"../cli/cmd_fleet_doctor.go",

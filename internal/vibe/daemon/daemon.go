@@ -276,6 +276,20 @@ type FleetConfig struct {
 	// llama-swap whose in-flight wire every busy guard misread.
 	// fleetapi.UnmanagedFrontImage declares a front that runs no image.
 	FrontImage string `yaml:"front_image,omitempty"`
+	// MirrorMaxAge is how fresh the off-host state mirror is expected to
+	// be (fleet-control C19), as a Go duration — "36h" for a nightly
+	// timer with a night of slack. It configures nothing: fleetd never
+	// mirrors anything and must not, because the mirror has to keep
+	// running when fleetd is the thing that broke. The one consumer is
+	// `vibe fleet doctor`'s mirror.age check, and the value is what turns
+	// "a mirror ran at some point" into a verdict.
+	//
+	// fleetapi.UnmanagedMirror is the closed-vocabulary declaration that
+	// this fleet's state is backed up by something else (a snapshotting
+	// filesystem, borg, the whole host being a VM). Unset is UNKNOWN, not
+	// OK: "the operator decided" and "nobody told fleetd" must not be
+	// spelled the same way (C16's front_image rule).
+	MirrorMaxAge string `yaml:"mirror_max_age,omitempty"`
 	// Notify is the alarm-to-webhook bridge (fleet-control C9). Empty
 	// means no notifications — the design's "alarm? yes" column then
 	// terminates in an SSE stream nobody watches, which is the status
@@ -344,9 +358,16 @@ func (c Config) FleetLocation() *time.Location {
 }
 
 // LoadConfig reads the global vibe config; missing file is not an error.
-func LoadConfig() (Config, error) {
+func LoadConfig() (Config, error) { return LoadConfigFrom(paths.ConfigFile()) }
+
+// LoadConfigFrom reads a config from an explicit path. It exists for
+// `vibe fleet mirror` (C19), which runs on the front HOST against
+// fleetd's bind-mounted config dir rather than against its own XDG
+// locations — and a second parser for the same file is how two readers
+// drift apart.
+func LoadConfigFrom(path string) (Config, error) {
 	c := Config{ProxyPort: defaultProxyPort, HTTPAddr: defaultHTTPAddr}
-	data, err := os.ReadFile(paths.ConfigFile())
+	data, err := os.ReadFile(path) //nolint:gosec // an explicit config path
 	if errors.Is(err, os.ErrNotExist) {
 		return c.resolveHTTPAddr(), nil
 	}
