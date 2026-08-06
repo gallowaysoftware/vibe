@@ -53,7 +53,7 @@ func (d *Daemon) CellSuspend(ctx context.Context, req *connect.Request[vibev1.Ce
 	var inFlight int
 	reported := false
 	if d.fleet != nil {
-		if n, ok := d.fleet.InFlight(d.localCellKey()); ok {
+		if n, ok := d.fleet.InFlight(d.localCellKey()).Observed(); ok {
 			n64 := int64(n)
 			report.InFlightRequests = &n64
 			inFlight, reported = n, true

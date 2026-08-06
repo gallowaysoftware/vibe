@@ -55,7 +55,7 @@ have jq
 [[ -x $LLAMA_SWAP ]] || die "no llama-swap at $LLAMA_SWAP"
 state >/dev/null 2>&1 || die "fleetd is not answering at $VIBE_API — run ./lab.sh up first"
 
-rm -rf "$DRILL"
+rm -rf "${DRILL:?}"
 mkdir -p "$MIRROR" "$SB_STATE" "$SB_ETC" "$(dirname "$SB_FRONT")"
 
 # ─────────────────────────────────────────────────────────── 0. seed state

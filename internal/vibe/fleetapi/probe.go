@@ -167,7 +167,7 @@ func (s *Server) probeGuard(cell, model string) (string, bool) {
 	if !resident {
 		return fmt.Sprintf("%s is not resident on %s — a probe must not load it; warm it first", model, cell), false
 	}
-	n, reported := s.InFlight(cell)
+	n, reported := s.InFlight(cell).Observed()
 	switch {
 	case !reported:
 		return fmt.Sprintf("cell %s in-flight unknown — not spending GPU time blind", cell), false

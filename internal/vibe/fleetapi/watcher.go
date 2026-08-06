@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/observed"
 )
 
 // scannerBufMax sizes the SSE line scanner. llama-swap's initial logData
@@ -162,9 +164,10 @@ type inflightEntry struct {
 // disarm on it silently.
 //
 // So an operation this code does not recognise DISARMS the cell —
-// s.inFlightSeen goes false, which every one of those guards already
-// renders as a refusal. Fail toward "no evidence", never toward
-// "confirmed idle": the drift nobody noticed is the normal case.
+// s.inFlight[cell] returns to its unknown zero value, which every one of
+// those guards already renders as a refusal. Fail toward "no evidence",
+// never toward "confirmed idle": the drift nobody noticed is the normal
+// case.
 //
 // Entries also feed per-model activity timestamps (fleetd-side clock), the
 // idle windows C4's warm targets restore on. Holding the model per id is
@@ -241,8 +244,7 @@ func (s *Server) trackInFlight(cell string, data json.RawMessage) {
 	}
 
 	s.inFlightReqs[cell] = set
-	s.inFlight[cell] = len(set)
-	s.inFlightSeen[cell] = true
+	s.inFlight[cell] = observed.Known(len(set))
 	delete(s.inFlightUnknownOp, cell)
 
 	seen := map[string]bool{}
@@ -277,7 +279,6 @@ func (s *Server) trackInFlight(cell string, data json.RawMessage) {
 func (s *Server) disarmInFlightLocked(cell, op string) {
 	delete(s.inFlightReqs, cell)
 	delete(s.inFlight, cell)
-	s.inFlightSeen[cell] = false
 	s.lastInFlightModels[cell] = nil
 	if s.inFlightUnknownOp[cell] != op {
 		s.inFlightUnknownOp[cell] = op
@@ -298,20 +299,24 @@ func (s *Server) clearInFlight(cell string) {
 	defer s.mu.Unlock()
 	delete(s.inFlightReqs, cell)
 	delete(s.inFlight, cell)
-	delete(s.inFlightSeen, cell)
 	delete(s.inFlightUnknownOp, cell)
 	s.lastInFlightModels[cell] = nil
 }
 
 // modelLastActivity returns when the model last served a request on
-// the cell (fleetd-side clock). The bool is false when no inflight
-// frame has ever mentioned it — callers treat that as "idle since
-// process start", never as "active now".
-func (s *Server) modelLastActivity(cell, model string) (time.Time, bool) {
+// the cell (fleetd-side clock). It is UNKNOWN when no inflight frame has
+// ever mentioned the model — callers treat that as "idle since process
+// start", never as "active now", and the observed.Value is what keeps
+// the second half of that sentence from being one dropped bool away
+// (C20).
+func (s *Server) modelLastActivity(cell, model string) observed.Value[time.Time] {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.modelActivity[cell+"\x00"+model]
-	return t, ok
+	if !ok {
+		return observed.Value[time.Time]{}
+	}
+	return observed.Known(t)
 }
 
 // trackModelStatus measures starting→ready wall time per model. modelStatus

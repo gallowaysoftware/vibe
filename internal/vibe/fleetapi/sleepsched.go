@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
+	"github.com/gallowaysoftware/vibe/internal/vibe/observed"
 )
 
 // Sleep schedules (fleet-control C14): warm_schedule's dual. A cron
@@ -671,7 +672,7 @@ func (s *Server) suspendGuard(cell string, quietFor time.Duration) (SuspendBlock
 			Absent: true,
 		}, false
 	}
-	n, reported := s.InFlight(cell)
+	n, reported := s.InFlight(cell).Observed()
 	switch {
 	case !reported:
 		return policy("cell %s in-flight unknown — unknown is not zero", cell)
@@ -699,7 +700,7 @@ func (s *Server) suspendGuard(cell string, quietFor time.Duration) (SuspendBlock
 	// the floor a fleetd restarted at 23:29 reads "quiet forever" and
 	// suspends the box its operator was using at 23:28, which is exactly
 	// the human this window exists for.
-	if last, ok := s.cellLastActivity(cell); ok {
+	if last, ok := s.cellLastActivity(cell).Observed(); ok {
 		if idle := time.Since(last); idle < quietFor {
 			return policy("cell %s served a request %s ago (quiet window %s)", cell, idle.Round(time.Second), quietFor)
 		}
@@ -729,11 +730,11 @@ func classOrUnset(class string) string {
 
 // cellLastActivity is the most recent request stamp across every model
 // of a cell — C4's per-model activity map, read cell-wide, because the
-// contended resource is the box. The bool is false when no frame has
-// ever mentioned any of the cell's models; combined with
+// contended resource is the box. It is UNKNOWN when no frame has ever
+// mentioned any of the cell's models; combined with
 // observesActivity that means "watched, saw nothing", which is the only
 // reading under which the quiet window may pass.
-func (s *Server) cellLastActivity(cell string) (time.Time, bool) {
+func (s *Server) cellLastActivity(cell string) observed.Value[time.Time] {
 	prefix := cell + "\x00"
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -747,7 +748,10 @@ func (s *Server) cellLastActivity(cell string) (time.Time, bool) {
 			last, found = t, true
 		}
 	}
-	return last, found
+	if !found {
+		return observed.Value[time.Time]{}
+	}
+	return observed.Known(last)
 }
 
 // pendingProbes lists probe verbs queued for or handed to a cell. A

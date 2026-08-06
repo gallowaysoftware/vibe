@@ -435,9 +435,18 @@ func TestPrintDrainReport_WaitStatus(t *testing.T) {
 		absent string
 	}{
 		{name: "skipped", status: strPtr(fleetapi.DrainWaitSkippedNoInflight), want: "--wait was SKIPPED"},
+		// The status has TWO producers — never reported, and reported then
+		// stopped mid-wait (C20) — so the sentence may not assert either
+		// one. "never reported in-flight counts" sends the operator to
+		// debug an events stream when what happened is that they cancelled
+		// a running generation.
+		{name: "skipped says no evidence, not `never`", status: strPtr(fleetapi.DrainWaitSkippedNoInflight), want: "no in-flight evidence", absent: "never reported in-flight counts"},
 		{name: "waited", status: strPtr(fleetapi.DrainWaitWaited), want: "waited for in-flight requests"},
 		{name: "not requested", status: strPtr(fleetapi.DrainWaitNotRequested), absent: "wait"},
 		{name: "absent field (old daemon)", status: nil, absent: "wait"},
+		// A newer daemon's vocabulary must not render as silence, which an
+		// operator reads as "the wait happened".
+		{name: "unknown status from a newer daemon", status: strPtr("skipped_evidence_lost"), want: "unrecognised status"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer

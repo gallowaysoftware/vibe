@@ -228,7 +228,7 @@ esac
 command -v jq >/dev/null || die "jq required"
 
 sweep
-rm -rf "$LAB"; mkdir -p "$LAB/bin"
+rm -rf "${LAB:?}"; mkdir -p "$LAB/bin"
 say "building vibe into $LAB/bin"
 ( cd "$REPO" && go build -o "$BIN" ./cmd/vibe ) || die "build failed"
 

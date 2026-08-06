@@ -91,7 +91,7 @@ func i1(t *testing.T, tgt target) {
 	srv, cell := watchTarget(t, tgt)
 	defer srv.Close()
 	waitFor(t, 10*time.Second, "connect snapshot", func() bool {
-		_, reported := srv.InFlight(cell)
+		_, reported := srv.InFlight(cell).Observed()
 		return reported
 	})
 
@@ -109,7 +109,7 @@ func i1(t *testing.T, tgt target) {
 				return
 			default:
 			}
-			n, reported := srv.InFlight(cell)
+			n, reported := srv.InFlight(cell).Observed()
 			mu.Lock()
 			if n > maxSeen {
 				maxSeen = n

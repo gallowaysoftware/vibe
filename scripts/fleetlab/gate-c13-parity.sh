@@ -37,7 +37,7 @@ hr "1. every reporting cell at one clean SHA"
 doctor
 
 hr "2. give charlie its OWN checkout, one commit ahead"
-rm -rf "$CHARLIE_ETC"; mkdir -p "$CHARLIE_ETC/vibe"
+rm -rf "${CHARLIE_ETC:?}"; mkdir -p "$CHARLIE_ETC/vibe"
 git clone -q "$DEFS" "$CHARLIE_ETC/vibe/backends" || exit 1
 ln -sfn "$LAB/etc/vibe/hosts.yaml" "$CHARLIE_ETC/vibe/hosts.yaml"
 CDEFS=$CHARLIE_ETC/vibe/backends

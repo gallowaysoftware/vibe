@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
+	"github.com/gallowaysoftware/vibe/internal/vibe/observed"
 	"github.com/gallowaysoftware/vibe/internal/vibe/prices"
 )
 
@@ -272,11 +273,16 @@ type Server struct {
 	renderWrites atomic.Int64
 
 	// inFlight tracks each cell's current in-flight request count as
-	// reported by llama-swap's inflight SSE frames. The bool in the
-	// accessor distinguishes "reported zero" from "no frame seen yet" —
-	// callers must not invent a count for a cell that never reported.
-	inFlight     map[string]int
-	inFlightSeen map[string]bool
+	// reported by llama-swap's inflight SSE frames.
+	//
+	// It is an observed.Value, not an int, and it used to be an int beside
+	// an inFlightSeen bool (fleet-control C20). Two maps that must agree
+	// is the shape this fleet has shipped the same defect in six times:
+	// "reported zero" and "no frame seen yet" are different facts, the
+	// second one disarms eight busy guards, and every way of losing the
+	// distinction — a map miss, a dropped second return, a delete — used
+	// to produce a confident 0. Here the map miss IS the unknown.
+	inFlight map[string]observed.Value[int]
 	// inFlightReqs is the live request SET per cell (request id -> model).
 	// A set rather than a count because v240+ sends DELTAS: an upsert
 	// names one request and a remove names only an id, so folding them
@@ -438,8 +444,7 @@ func New(cells []Cell, historyPath string, daemonInfo func() DaemonInfo, opts Op
 		cellUpSince:        map[string]time.Time{},
 		lastState:          map[string]string{},
 		startedAt:          map[string]time.Time{},
-		inFlight:           map[string]int{},
-		inFlightSeen:       map[string]bool{},
+		inFlight:           map[string]observed.Value[int]{},
 		inFlightReqs:       map[string]map[string]string{},
 		inFlightUnknownOp:  map[string]string{},
 		modelActivity:      map[string]time.Time{},
@@ -584,17 +589,17 @@ func (s *Server) StartStats(model string) (StartStats, bool) {
 }
 
 // InFlight returns the cell's last reported in-flight request count.
-// The bool is false until llama-swap's events stream has sent one
-// inflight frame — an unreported count must stay distinguishable from a
-// reported zero (the pre-drain report omits the field rather than
-// inventing it).
-func (s *Server) InFlight(cell string) (int, bool) {
+//
+// It is UNKNOWN until llama-swap's events stream has sent one inflight
+// frame this build could fold, and it returns to unknown when the stream
+// drops or a frame arrives in a shape this build does not recognise. The
+// caller cannot reach the number without answering that question, which
+// is the point: the pre-drain report omits the field rather than
+// inventing it, and eight busy guards refuse rather than assume idle.
+func (s *Server) InFlight(cell string) observed.Value[int] {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.inFlightSeen[cell] {
-		return 0, false
-	}
-	return s.inFlight[cell], true
+	return s.inFlight[cell]
 }
 
 // snapshotCell merges the cell's /running (live processes: state/ttl) into

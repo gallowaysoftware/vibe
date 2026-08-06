@@ -16,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/observed"
 )
 
 // holdWarmTarget is warmTarget's sibling with the lease store enabled —
@@ -213,8 +215,7 @@ func TestHold_SuppressesScheduledWarm(t *testing.T) {
 	cellOf := func(string) (string, error) { return "heavy", nil }
 	now := time.Now()
 	s.mu.Lock()
-	s.inFlight["heavy"] = 0
-	s.inFlightSeen["heavy"] = true
+	s.inFlight["heavy"] = observed.Known(0)
 	s.schedStates = []*warmScheduleState{{Cron: entry.Cron, Model: entry.Model, NextFire: &now}}
 	st := s.schedStates[0]
 	s.mu.Unlock()

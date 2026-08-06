@@ -2,9 +2,6 @@ package fleetmcp
 
 import (
 	"context"
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gallowaysoftware/vibe/internal/astscan"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 )
@@ -157,54 +155,25 @@ func TestUnloadModelUnresolvableKeyIsNotQueued(t *testing.T) {
 
 // TestEveryLlamaSwapRequestIsAuthorized is the twin of fleetapi's: every
 // HTTP request this package builds goes to a cell's llama-swap, so every
-// builder must call the one authorizer.
+// builder must call the one authorizer. Both twins now express the same
+// rule through internal/astscan (C20), which is also where the inertness
+// floor came from: "found == 0" passed with three of the three producers
+// deleted.
 func TestEveryLlamaSwapRequestIsAuthorized(t *testing.T) {
-	// ParseFile per source file rather than the deprecated parser.ParseDir.
-	entries, err := os.ReadDir(".")
+	r := astscan.Rule{
+		Name:    "every fleetd\u2192llama-swap request carries the cell's credential (C15)",
+		Dir:     ".",
+		Trigger: []string{"NewRequestWithContext", "NewRequest"},
+		Require: []string{"AuthorizeSwap"},
+		// toolWarmModel, toolUnloadModel, getJSON.
+		MinProducers: 3,
+		Because:      "every fleetd\u2192llama-swap call carries the cell's credential (C15).",
+	}
+	res, err := r.Check()
 	if err != nil {
-		t.Fatalf("read dir: %v", err)
+		t.Fatal(err)
 	}
-	fset := token.NewFileSet()
-	found := 0
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		file, err := parser.ParseFile(fset, name, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		ast.Inspect(file, func(n ast.Node) bool {
-			fn, ok := n.(*ast.FuncDecl)
-			if !ok || fn.Body == nil {
-				return true
-			}
-			builds, authorizes := false, false
-			ast.Inspect(fn.Body, func(m ast.Node) bool {
-				sel, ok := m.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				switch sel.Sel.Name {
-				case "NewRequestWithContext", "NewRequest":
-					builds = true
-				case "AuthorizeSwap":
-					authorizes = true
-				}
-				return true
-			})
-			if builds {
-				found++
-				if !authorizes {
-					t.Errorf("%s: %s builds an HTTP request to a llama-swap without calling AuthorizeSwap (C15)",
-						name, fn.Name.Name)
-				}
-			}
-			return true
-		})
-	}
-	if found == 0 {
-		t.Fatal("no request builders found — the scan is inert")
+	if err := r.Err(res); err != nil {
+		t.Error(err)
 	}
 }

@@ -364,4 +364,33 @@ func TestMCPDrainCellReportsSkippedWait(t *testing.T) {
 	if !strings.Contains(text, "wait was SKIPPED") {
 		t.Errorf("report does not say the wait was skipped:\n%s", text)
 	}
+	// The status has two producers (C20): the cell never reported a count,
+	// or the report stopped while the wait was parked on a running
+	// request. Asserting either one as fact tells the agent — and through
+	// it the operator — the wrong thing to go and look at.
+	if !strings.Contains(text, "no in-flight evidence") || strings.Contains(text, "never reported in-flight counts") {
+		t.Errorf("the skipped-wait line asserts one of the two producers as fact:\n%s", text)
+	}
+}
+
+// TestMCPDrainCellUnknownWaitStatusIsNotSilence: a wait_status this build
+// does not know comes from a NEWER daemon, and rendering nothing reads to
+// an agent as "the wait happened".
+func TestMCPDrainCellUnknownWaitStatusIsNotSilence(t *testing.T) {
+	cellDaemon := newFakeCellDaemon(t)
+	cellDaemon.waitStatus = "skipped_evidence_lost"
+	front := newFakeLlamaSwap(t)
+	_, ts := newTestFacade(t, map[string]fleetcfg.Cell{
+		"front":    {URL: front.srv.URL, Class: fleetcfg.ClassAlwaysOn},
+		"gpu-cell": {URL: "http://127.0.0.1:1", Class: fleetcfg.ClassOpportunistic, DaemonURL: cellDaemon.srv.URL},
+	}, nil)
+
+	resp := rpc(t, ts, `{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"drain_cell","arguments":{"cell":"gpu-cell","wait_seconds":30}}}`)
+	text, isErr := toolText(t, resp)
+	if isErr {
+		t.Fatalf("drain error: %s", text)
+	}
+	if !strings.Contains(text, "unrecognised status") {
+		t.Errorf("an unknown wait_status rendered as silence, which reads as a successful wait:\n%s", text)
+	}
 }

@@ -129,9 +129,13 @@ func (s *Server) toolDrainCell(ctx context.Context, cell, reason, eta string, wa
 	switch {
 	case report.WaitStatus == nil || *report.WaitStatus == fleetapi.DrainWaitNotRequested:
 	case *report.WaitStatus == fleetapi.DrainWaitSkippedNoInflight:
-		b.WriteString("\n- WARNING: the requested wait was SKIPPED (the cell never reported in-flight counts); the drain ran immediately and cancelled any streams")
+		// True of BOTH producers: never reported, or reported and then
+		// stopped mid-wait (C20). See cli.printDrainReport.
+		b.WriteString("\n- WARNING: the requested wait was SKIPPED (no in-flight evidence: the cell never reported a count, or its report stopped mid-wait); the drain ran without proof of quiescence and cancelled any streams")
 	case *report.WaitStatus == fleetapi.DrainWaitWaited:
 		b.WriteString("\n- waited for in-flight requests to reach zero before draining")
+	default:
+		fmt.Fprintf(&b, "\n- WARNING: the wait returned an unrecognised status %q; treat quiescence as unproven", *report.WaitStatus)
 	}
 	if report.LeasesUnavailable {
 		b.WriteString("\n- WARNING: lease list was unavailable — stranded-work check could not run")
