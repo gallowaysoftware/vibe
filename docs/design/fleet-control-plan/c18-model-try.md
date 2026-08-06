@@ -5,12 +5,15 @@ Status: **PR OPEN**, off `feat/c18-model-try` branched from `main` at
 [fleet-control-futures.md](../fleet-control-futures.md) §2) — the weekly
 loop the futures doc calls "the year's dominant toil".
 
-Two commits: the feature, and ground rule 9's adversarial self-review.
-Unit gates U1–U12 green on a full local inner loop (`go build`,
+Two commits: the feature, and ground rule 9's adversarial self-review
+(**seven findings, one of them a blocker** — see the
+[addendum](#adversarial-self-review-addendum-ground-rule-9)).
+Unit gates U1–U13 green on a full local inner loop (`go build`,
 `go vet`, `go test -race ./...` repeated, `gofmt -l .` silent,
-`go mod tidy` byte-clean, `golangci-lint run` 0 issues). Nine production
-predicates are **mutation-verified**: reverted one at a time, each
-confirmed to turn a NAMED test red, then restored.
+`go mod tidy` byte-clean, `golangci-lint run` 0 issues). Twelve
+production predicates are **mutation-verified**: reverted one at a time,
+each confirmed to turn a NAMED test red, then restored. One fix
+(atomic def write) is deliberately NOT mutation-verified and says so.
 
 **Live gates: see [Acceptance gates](#acceptance-gates).** The rig is
 committed (`scripts/fleetlab/gate-c18.sh`); whether it ran is recorded
@@ -390,14 +393,22 @@ fleetd, no new dependency, and an **empty diff for `internal/vibe/proxy`**.
 | U9 | applied-but-not-live is its own answer, names `-watch-config`, and refuses the measurement | `TestAppliedButNotLiveIsItsOwnAnswer` |
 | U10 | both sides are probed against a real llama-swap double and the report prints its caveats; a ratio only when the metrics match | `TestMeasureProbesBothSidesAndSaysWhatItIsNot`, `TestDeltaOnlyWhenTheMetricsMatch` |
 | U11 | a corrupt journal is an ERROR, never "no trial"; the journal survives a process death; the staged def round-trips through the real loader and equals `--dry-run`'s preview | `TestCorruptJournalIsNeverReadAsNoTrial`, `TestJournalSurvivesAProcessDeath`, `TestStagedDefRoundTripsThroughTheRealLoader` |
+| U13 | re-running RESUMES the same trial and refuses a different one; a journal from another cell or another config path is refused by both `Plan` and `end`; a FAILED rollback keeps the journal and the banked config | `TestReRunningResumesTheSameTrial`, `TestJournalFromAnotherCellOrConfigIsRefused`, `TestFailedRollbackKeepsTheJournalAndTheBackup` |
 | U12 | the trial takes a lease and a hold-on-the-incumbent, leaves an existing hold alone in both directions, refuses to apply undeclared, skips re-declaring on resume, and rolls back with fleetd gone | `TestTrialNowDeclaresTheLeaseAndTheHold`, `TestTrialLeavesAnExistingHoldAloneInBothDirections`, `TestEndReleasesOnlyWhatTheTrialTook`, `TestTrialRefusesToApplyUndeclared`, `TestTrialDeclarationsAreSkippedOnResume`, `TestEndStillRollsBackWhenFleetdIsGone` |
 
-**Mutation-verified predicates (9).** Each production line reverted,
+**Mutation-verified predicates (12).** Each production line reverted,
 the named test confirmed red, the line restored:
 the front-render trial exclusion; staging's def removal on a failed
 render; the fetch size check; the corrupt-journal error; the not-live
 measurement refusal; the alias reset in the derivation; `bankConfig`;
-the unknown-size disk refusal; the existing-hold check.
+the unknown-size disk refusal; the existing-hold check; the resume
+branch; the journal/runner agreement check; the failed-rollback
+retention.
+
+**Not** mutation-verified, and named rather than counted: the atomic
+def write (REV-2). No unit test distinguishes `os.WriteFile` from
+tmp+rename, because the failure is a process death between the two
+syscalls. It is here on the argument, not on a red test.
 
 ### Live (`scripts/fleetlab/gate-c18.sh`)
 
@@ -422,6 +433,75 @@ call. **A gate claim is a claim about a mechanical run** (ground rule
 with a free lab runs them rather than re-derives them.
 
 L5 is a different kind of unrun: it needs metal, not a time budget.
+
+
+## Adversarial self-review addendum (ground rule 9)
+
+Seven findings against the feature commit, all fixed in the review
+commit. Ranked by what they would have cost.
+
+**REV-1 (blocker) — re-running could not resume.** `Plan` is the only
+entry point and it REFUSED when a journal existed, so the phase's
+central promise ("every step is journalled; re-run resumes") was
+unreachable code. The exact case: the download finishes, the idle wait
+times out at `--wait 2h`, the operator re-runs in the morning — and gets
+"a trial is already in flight", with no way forward except `end`, which
+throws the 20 GB pull away. `Plan` now resumes when the request names
+the SAME trial and refuses when it names a different one, saying which
+is open. Resuming re-derives the def from the CURRENT incumbent, so a
+def edit made between the fetch and the apply is picked up rather than
+silently serving a stale derivation.
+
+**REV-2 — the trial def was written non-atomically.** `router.LoadDefs`
+treats ONE unparseable def as a hard error for the whole directory, so a
+torn write breaks every render and every announce on the box until
+somebody finds the file — including the render `end` needs. The staging
+step already went to great lengths to avoid exactly this (it proves the
+render and removes the def if it fails); writing the file with a plain
+`os.WriteFile` left the same hole open one syscall earlier. Now
+tmp+rename, like every other file this repo writes.
+
+**REV-3 — a comment described the opposite of the code, and the
+behaviour it described was destructive.** `measureOne`'s comment claimed
+`rebaseline=true`; the call passed `false`. `false` is correct — `true`
+would WIPE the incumbent's C8 rolling window on this box, which is the
+only multi-sample number the report prints and the one thing that makes
+a single sample interpretable. A future agent "fixing the code to match
+the comment" would have deleted it. This is the comment-rot failure
+AGENTS.md warns about, in its most expensive form.
+
+**REV-4 — `end` deleted the journal and the banked config even when the
+rollback had FAILED.** Both were removed unconditionally on the way out,
+including on the path that had just reported "the config may still
+contain the trial". That turns a recoverable half-rollback into a
+permanent one and makes `status` report no trial on a box still serving
+it. A failed rollback now KEEPS both and says so; only a clean one
+closes.
+
+**REV-5 — an unverified rollback read as a clean one.** `stillListed`
+correctly reports an unreadable catalog as "not listed, and here is why
+I could not check", but the CLI printed the note only when the model WAS
+still listed. So the one case where the rollback is unproven printed
+nothing at all — absent evidence rendering as a healthy value, this
+repo's most-repeated defect class, shipped again. The note now prints
+whenever there is one.
+
+**REV-6 — the journal was trusted to describe this box.** `end` renders
+with `r.opt.ConfigPath` but restores to `t.ConfigPath`, and nothing
+compared them. Editing `fleet.cell` or the proxy port mid-trial (both
+one line in `config.yaml`) would make the rollback re-render for the
+wrong cell and drop banked bytes onto a file they never came from.
+`agreesWithJournal` now refuses on either mismatch, naming both values
+and how to recover, and it guards `Plan` and `end` alike.
+
+**REV-7 — two smaller ones.** `--dry-run` left the journal open, so the
+very next real invocation resumed a trial the operator never started —
+and if they had changed a flag between the two, it would have been
+refused as a different one; the dry run now closes the journal through
+the real rollback path. And `awaitCatalog` built its deadline from the
+injectable clock while sleeping on the wall clock, which spins forever
+under a frozen `Now`; both are `time.Now` now, with the reason written
+down.
 
 ## For the reconciliation pass
 
@@ -516,7 +596,7 @@ Everything below belongs in a shared doc this branch may not touch
 Table row:
 
 ```
-| [C18](c18-model-try.md) | `vibe model try`: the churn loop as one command | ~1400 lines | C0, C2, C4, C8, C10, C11, C14 (composition) | PR open; unit gates U1-U12 green, 9 predicates mutation-verified; **live gates L1-L4 UNRUN (lab port contention — futures item 15), L5 needs metal** |
+| [C18](c18-model-try.md) | `vibe model try`: the churn loop as one command | ~1400 lines | C0, C2, C4, C8, C10, C11, C14 (composition) | PR open; unit gates U1-U13 green, 12 predicates mutation-verified; **live gates L1-L4 UNRUN (lab port contention — futures item 15), L5 needs metal** |
 ```
 
 And a paragraph in the phase-notes prose:

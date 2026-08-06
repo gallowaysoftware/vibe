@@ -353,12 +353,17 @@ type PlanRequest struct {
 // Plan validates everything that can be decided before anything is
 // written, derives the trial def, and opens the journal. It is the whole
 // refusal surface: after Plan returns, every later step is mechanical.
+//
+// When a journal already exists it RESUMES it, provided the request
+// names the same trial. Resuming is the point: the fetch is the long
+// step, the apply is the disruptive one, and a command that could only
+// ever start from scratch would make "re-run to continue" a promise the
+// code does not keep. A request naming a DIFFERENT trial is refused —
+// one trial at a time per cell — and says which one is open.
 func (r *Runner) Plan(ctx context.Context, req PlanRequest) (*Trial, *profile.BackendDef, error) {
-	if existing, err := r.Load(); err != nil {
+	existing, err := r.Load()
+	if err != nil {
 		return nil, nil, err
-	} else if existing != nil {
-		return nil, nil, fmt.Errorf("a trial of %s is already in flight on %s (state %s) — one trial at a time per cell; `vibe model try status`, then `vibe model try end`",
-			existing.Def, existing.Cell, existing.State)
 	}
 	if err := r.refuseStructural(); err != nil {
 		return nil, nil, err
@@ -368,6 +373,9 @@ func (r *Runner) Plan(ctx context.Context, req PlanRequest) (*Trial, *profile.Ba
 	}
 	if req.Like == "" {
 		return nil, nil, errors.New("--like <def> is required: it names the def whose serving flags the trial copies AND the model the trial is measured against")
+	}
+	if existing != nil {
+		return r.resume(existing, req)
 	}
 
 	defs, err := router.LoadDefs(r.opt.BackendsDir)
@@ -431,6 +439,57 @@ func (r *Runner) Plan(ctx context.Context, req PlanRequest) (*Trial, *profile.Ba
 		return nil, nil, err
 	}
 	return t, trialDef, nil
+}
+
+// resume re-opens an existing journal for a request that names the same
+// trial, re-deriving the def from the CURRENT incumbent — so a def edit
+// made between the fetch and the apply is picked up rather than
+// silently serving a stale derivation.
+func (r *Runner) resume(t *Trial, req PlanRequest) (*Trial, *profile.BackendDef, error) {
+	name := req.As
+	if name == "" {
+		name = derivedName(req.Repo, req.File)
+	}
+	if t.Def != name || t.Repo != req.Repo || t.File != req.File || t.Incumbent != req.Like {
+		return nil, nil, fmt.Errorf("a trial of %s (%s/%s, modelled on %s) is already in flight on %s at state %s — one trial at a time per cell. "+
+			"Finish it (`vibe model try status`) or roll it back (`vibe model try end`) before starting another",
+			t.Def, t.Repo, t.File, t.Incumbent, t.Cell, t.State)
+	}
+	if err := r.agreesWithJournal(t); err != nil {
+		return nil, nil, err
+	}
+	defs, err := router.LoadDefs(r.opt.BackendsDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load backend defs: %w", err)
+	}
+	inc := findDef(defs, t.Incumbent)
+	if inc == nil {
+		return nil, nil, fmt.Errorf("the incumbent def %q has disappeared from %s since this trial started; `vibe model try end` rolls it back", t.Incumbent, r.opt.BackendsDir)
+	}
+	if err := r.checkIncumbent(inc); err != nil {
+		return nil, nil, err
+	}
+	t.note(r.opt.Now(), "resumed at state %s", t.State)
+	if err := r.save(t); err != nil {
+		return nil, nil, err
+	}
+	return t, deriveDef(inc, t.Def, t.WeightsPath, r.opt.Cell), nil
+}
+
+// agreesWithJournal refuses to act on a journal written against a
+// different cell or a different llama-swap config. Both are reachable by
+// editing the daemon config mid-trial, and both would make `end` restore
+// a banked config over a file it never banked.
+func (r *Runner) agreesWithJournal(t *Trial) error {
+	if t.Cell != r.opt.Cell {
+		return fmt.Errorf("the open trial was placed on cell %q and this box now declares fleet.cell %q; refusing to act on it — put fleet.cell back and roll it back there, or remove %s by hand",
+			t.Cell, r.opt.Cell, r.opt.StatePath)
+	}
+	if t.ConfigPath != "" && t.ConfigPath != r.opt.ConfigPath {
+		return fmt.Errorf("the open trial applied to %s and this box now renders to %s; refusing to act on it — the rollback would restore a config it never banked",
+			t.ConfigPath, r.opt.ConfigPath)
+	}
+	return nil
 }
 
 // refuseStructural holds the refusals `force` never bypasses, C14's rule
@@ -518,8 +577,12 @@ func (r *Runner) checkDisk(dest string, size int64, sizeErr error, skip bool) er
 			dest, why, humanBytes(free), dest)
 	}
 	if free-size < r.opt.MinFreeBytes {
+		left := "nothing (the file is larger than the free space)"
+		if free-size >= 0 {
+			left = humanBytes(free - size)
+		}
 		return fmt.Errorf("refusing to pull: %s free at %s, the file is %s, and that would leave %s — under the %s this box keeps for llama-swap, the activity store and the next pull (--min-free changes the floor, --skip-disk-check removes it)",
-			humanBytes(free), dest, humanBytes(size), humanBytes(free-size), humanBytes(r.opt.MinFreeBytes))
+			humanBytes(free), dest, humanBytes(size), left, humanBytes(r.opt.MinFreeBytes))
 	}
 	return nil
 }
@@ -587,7 +650,10 @@ func (r *Runner) Stage(t *Trial, def *profile.BackendDef) error {
 		return fmt.Errorf("the scaffolded def does not load (%w) — nothing was written; this is a bug in the derivation, not in your input", err)
 	}
 
-	if err := os.WriteFile(t.DefPath, staged, 0o644); err != nil {
+	// Atomically: router.LoadDefs treats ONE unparseable def as a hard
+	// error for the whole directory, so a torn write here breaks every
+	// render and every announce on this box until someone finds the file.
+	if err := writeFileAtomic(t.DefPath, staged, 0o644); err != nil {
 		return fmt.Errorf("write trial def %s: %w", t.DefPath, err)
 	}
 	// Prove the full render with the def in place. On failure the def is
@@ -693,7 +759,10 @@ func (r *Runner) bankConfig(t *Trial) error {
 // up in its catalog. Running out of the budget is EVIDENCE, not a
 // timeout to retry: llama-swap either watches its config or it does not.
 func (r *Runner) awaitCatalog(ctx context.Context, id string) (bool, string) {
-	deadline := r.opt.Now().Add(r.opt.CatalogWait)
+	// time.Now, not r.opt.Now: the loop sleeps on the wall clock, and a
+	// deadline from an injectable clock that does not advance would spin
+	// here forever. The two must be the same clock.
+	deadline := time.Now().Add(r.opt.CatalogWait)
 	var last string
 	for {
 		ids, err := r.catalog(ctx)
@@ -707,7 +776,7 @@ func (r *Runner) awaitCatalog(ctx context.Context, id string) (bool, string) {
 				}
 			}
 		}
-		if !r.opt.Now().Before(deadline) {
+		if !time.Now().Before(deadline) {
 			why := fmt.Sprintf("%s is not in this cell's /v1/models after %s", id, r.opt.CatalogWait)
 			if last != "" {
 				why += " (last read: " + last + ")"
@@ -827,12 +896,12 @@ func (r *Runner) measureOne(ctx context.Context, prober *modelprobe.Prober, spec
 		m.Note = "warm failed: " + err.Error()
 		return m
 	}
-	// rebaseline=true: this run's numbers must not be scored against — or
-	// folded into — a window built under other conditions. A trial
-	// deliberately restarts llama-swap's whole model set, so every
-	// sample either side of it belongs to a different situation, and
-	// C8's degraded verdict on the incumbent here would be an artefact of
-	// the trial rather than a fact about the box.
+	// rebaseline is FALSE, deliberately. Passing true would wipe the
+	// incumbent's C8 rolling window on this box — the only multi-sample
+	// number the report prints, and the one thing that makes a single
+	// sample interpretable. The trial's own key is new, so it starts
+	// empty either way and reports `unknown` under C8's five-sample
+	// minimum, which is the honest verdict for one measurement.
 	res := prober.Run(ctx, model, false)
 	if res == nil {
 		m.Note = "the prober returned nothing"
@@ -911,6 +980,13 @@ type EndReport struct {
 // which is the case it exists for.
 func (r *Runner) End(ctx context.Context, t *Trial, purge bool) (EndReport, error) {
 	rep := EndReport{ConfigPath: t.ConfigPath}
+	// A journal written against another cell or another config path
+	// cannot be rolled back here: the re-render would target the wrong
+	// cell and the banked bytes would land on a file they never came
+	// from. Refusing names both values and how to recover.
+	if err := r.agreesWithJournal(t); err != nil {
+		return rep, err
+	}
 	var problems []error
 
 	if t.State == StateApplied || t.State == StateMeasured || t.State == StateStaged {
@@ -942,8 +1018,7 @@ func (r *Runner) End(ctx context.Context, t *Trial, purge bool) (EndReport, erro
 		default:
 			problems = append(problems, fmt.Errorf("re-render failed (%w) and there was no banked config to restore — %s may still contain the trial", err, t.ConfigPath))
 		}
-		still, note := r.stillListed(ctx, t.Def)
-		rep.StillInCatalog, rep.Note = still, note
+		rep.StillInCatalog, rep.Note = r.stillListed(ctx, t.Def)
 	}
 	if purge {
 		for _, p := range []string{t.WeightsPath, t.WeightsPath + ".partial"} {
@@ -956,15 +1031,23 @@ func (r *Runner) End(ctx context.Context, t *Trial, purge bool) (EndReport, erro
 	} else if t.State != StatePlanned {
 		rep.Steps = append(rep.Steps, "kept the weights at "+t.WeightsPath+" (--purge deletes them)")
 	}
+	// A FAILED rollback keeps both the banked config and the journal.
+	// They are the only two things a retry has: deleting them because
+	// the function is returning would turn a recoverable half-rollback
+	// into a permanent one, and `status` would then report no trial on a
+	// box still serving it.
+	if len(problems) > 0 {
+		rep.Steps = append(rep.Steps, "KEPT the journal and the banked config — the rollback did not complete, and they are what a retry needs")
+		return rep, errors.Join(problems...)
+	}
 	if t.BackupPath != "" {
 		_ = os.Remove(t.BackupPath)
 	}
 	if err := os.Remove(r.opt.StatePath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		problems = append(problems, fmt.Errorf("remove trial journal: %w", err))
-	} else {
-		rep.Steps = append(rep.Steps, "closed the trial journal")
+		return rep, fmt.Errorf("remove trial journal: %w", err)
 	}
-	return rep, errors.Join(problems...)
+	rep.Steps = append(rep.Steps, "closed the trial journal")
+	return rep, nil
 }
 
 // stillListed answers whether the cell's llama-swap has really let go of

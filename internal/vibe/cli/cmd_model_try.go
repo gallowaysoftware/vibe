@@ -272,8 +272,16 @@ func runModelTry(ctx context.Context, out io.Writer, runner *modeltry.Runner, ap
 		fmt.Fprintln(out, "--dry-run: the def that would be written:")
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, yamlDef)
-		fmt.Fprintln(out, "nothing was downloaded and nothing on this box changed; the journal is open —")
-		fmt.Fprintln(out, "re-run without --dry-run to continue, or `vibe model try end` to close it.")
+		// Close the journal Plan opened. A --dry-run that leaves one
+		// behind makes the very next real invocation resume a trial the
+		// operator never started — and if they changed a flag between
+		// the two, it would be refused as a DIFFERENT trial. From
+		// `planned` this is the real rollback path with nothing to undo.
+		if _, err := runner.End(ctx, t, false); err != nil {
+			return err
+		}
+		fmt.Fprintln(out, "nothing was downloaded, nothing on this box changed, and no trial is open.")
+		fmt.Fprintln(out, "re-run without --dry-run to perform it.")
 		return nil
 	}
 
@@ -446,7 +454,11 @@ func runModelTryEnd(ctx context.Context, out io.Writer, runner *modeltry.Runner,
 	if rep.RestoredFromBackup {
 		fmt.Fprintln(out, "  (the re-render failed for a reason unrelated to the trial; check `vibe router render --check`)")
 	}
-	if rep.StillInCatalog {
+	// Printed whenever there is one: `stillListed` reports an UNREADABLE
+	// catalog as not-listed with a note, and swallowing the note there
+	// would let "I could not check" read as "it is gone" — the reading
+	// this repo has shipped six times.
+	if rep.Note != "" {
 		fmt.Fprintf(out, "  %s\n", rep.Note)
 	}
 	if err != nil {

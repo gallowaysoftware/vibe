@@ -385,13 +385,15 @@ backend:
 			t.Fatalf("want a weights-path refusal, got %v", err)
 		}
 	})
-	t.Run("a second trial while one is in flight", func(t *testing.T) {
+	t.Run("a DIFFERENT trial while one is in flight", func(t *testing.T) {
 		r := smallRig(t)
 		run := r.runner()
 		if _, _, err := run.Plan(context.Background(), planReq()); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := run.Plan(context.Background(), planReq()); err == nil || !strings.Contains(err.Error(), "already in flight") {
+		other := planReq()
+		other.Repo = "someone/Other-Model-GGUF"
+		if _, _, err := run.Plan(context.Background(), other); err == nil || !strings.Contains(err.Error(), "already in flight") {
 			t.Fatalf("want a one-trial-at-a-time refusal, got %v", err)
 		}
 	})
@@ -935,4 +937,123 @@ func TestStepsRefuseOutOfOrder(t *testing.T) {
 	if _, err := run.Measure(ctx, tr); err == nil || !strings.Contains(err.Error(), "apply it first") {
 		t.Fatalf("measuring before applying must be refused, got %v", err)
 	}
+}
+
+// ── U13: the review pass's findings ─────────────────────────────────────
+
+// TestReRunningResumesTheSameTrial. The phase promises "re-run to
+// continue" and Plan is the only entry point, so a Plan that refused on
+// an open journal made that promise unreachable — the fetch is the long
+// step and the apply is the disruptive one.
+func TestReRunningResumesTheSameTrial(t *testing.T) {
+	r := smallRig(t)
+	ctx := context.Background()
+	tr, def, err := r.runner().Plan(ctx, planReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.runner().Fetch(ctx, tr, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.runner().Stage(tr, def); err != nil {
+		t.Fatal(err)
+	}
+	// A fresh process, same command line.
+	again, def2, err := r.runner().Plan(ctx, planReq())
+	if err != nil {
+		t.Fatalf("re-running must resume, not refuse: %v", err)
+	}
+	if again.State != StateStaged || again.Def != tr.Def || again.WeightsPath != tr.WeightsPath {
+		t.Fatalf("the resume lost the journal: %+v", again)
+	}
+	if def2 == nil || def2.Name != tr.Def || !def2.Trial {
+		t.Fatalf("the resume did not re-derive the def: %+v", def2)
+	}
+	if !anyLogContains(again.Log, "resumed at state staged") {
+		t.Fatalf("a resume must be visible in the journal: %v", again.Log)
+	}
+	// And it is idempotent: staging again must not fail or rewrite.
+	if err := r.runner().Stage(again, def2); err != nil {
+		t.Fatalf("re-staging a staged trial must be a no-op: %v", err)
+	}
+}
+
+// TestJournalFromAnotherCellOrConfigIsRefused. Both are reachable by
+// editing the daemon config mid-trial, and both would make `end` restore
+// a banked config over a file it never banked.
+func TestJournalFromAnotherCellOrConfigIsRefused(t *testing.T) {
+	r := smallRig(t)
+	ctx := context.Background()
+	tr, _, err := r.runner().Plan(ctx, planReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved := r.runner(func(o *Options) { o.ConfigPath = filepath.Join(r.dir, "elsewhere.yaml") })
+	if _, _, err := moved.Plan(ctx, planReq()); err == nil || !strings.Contains(err.Error(), "never banked") {
+		t.Fatalf("want a config-path refusal, got %v", err)
+	}
+	if _, err := moved.End(ctx, tr, false); err == nil || !strings.Contains(err.Error(), "never banked") {
+		t.Fatalf("end must refuse too, got %v", err)
+	}
+	other := r.runner(func(o *Options) { o.Cell = "other-cell" })
+	if _, err := other.End(ctx, tr, false); err == nil || !strings.Contains(err.Error(), "fleet.cell") {
+		t.Fatalf("want a cell refusal on end, got %v", err)
+	}
+}
+
+// TestFailedRollbackKeepsTheJournalAndTheBackup. Deleting them because
+// the function is returning turns a recoverable half-rollback into a
+// permanent one, and `status` would then report no trial on a box still
+// serving it.
+func TestFailedRollbackKeepsTheJournalAndTheBackup(t *testing.T) {
+	r := smallRig(t)
+	run := r.runner()
+	ctx := context.Background()
+	if _, err := run.render(true); err != nil {
+		t.Fatal(err)
+	}
+	tr, def, err := run.Plan(ctx, planReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Fetch(ctx, tr, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Stage(tr, def); err != nil {
+		t.Fatal(err)
+	}
+	r.swap.SetModelState(tr.Def, "stopped")
+	if _, err := run.Apply(ctx, tr); err != nil {
+		t.Fatal(err)
+	}
+	// Break the re-render AND the restore: a broken def plus an
+	// unwritable config directory.
+	r.writeDef("broken", "this: is: not: yaml:\n  - [\n")
+	if err := os.Chmod(filepath.Dir(r.configPath), 0o500); err != nil {
+		t.Skipf("cannot make the config dir read-only here: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Dir(r.configPath), 0o755) })
+
+	rep, err := run.End(ctx, tr, false)
+	if err == nil {
+		t.Fatalf("a rollback that could not run must be an error; steps were %v", rep.Steps)
+	}
+	if _, statErr := os.Stat(r.statePath); statErr != nil {
+		t.Fatal("the journal was deleted after a FAILED rollback — the retry has nothing to work from")
+	}
+	if _, statErr := os.Stat(tr.BackupPath); statErr != nil {
+		t.Fatal("the banked config was deleted after a FAILED rollback — the only copy of the pre-trial config is gone")
+	}
+	if !anyContains(rep.Steps, "KEPT the journal") {
+		t.Fatalf("the report must say what it kept: %v", rep.Steps)
+	}
+}
+
+func anyLogContains(entries []LogEntry, sub string) bool {
+	for _, e := range entries {
+		if strings.Contains(e.Note, sub) {
+			return true
+		}
+	}
+	return false
 }
