@@ -213,6 +213,23 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 				}
 			}
 			switch {
+			case front && def.Trial:
+				// fleet-control C18. A trial def is a candidate under
+				// evaluation on ONE cell; putting it in the front's peer
+				// map would make it routable fleet-wide — the "no silent
+				// catalog change" invariant, spent on a model nobody
+				// decided to run.
+				//
+				// The exclusion lives HERE rather than in the writer
+				// because there are three renderers (the CLI, fleetd's
+				// presence loop, RenderToFile) and only one Render. On the
+				// reference fleet the trial def is in the cell's checkout
+				// and fleetd's is a different one, so this is unreachable;
+				// it is exactly reachable on a single box where fleetd and
+				// the cell share $XDG_CONFIG_HOME/vibe/backends, which is
+				// the shape `scripts/fleetlab` and every new adopter has.
+				warn("backend %s is a trial def (trial: true); excluded from the front render — a trial is evaluated on its own cell and never becomes fleet catalog (promote it by deleting the trial: line and committing the def)", def.Name)
+				continue
 			case front && def.Cell == fleetcfg.FrontCell:
 				// A model def pinned to the front would self-peer: the
 				// front proxying to itself is a loop, and the front owns

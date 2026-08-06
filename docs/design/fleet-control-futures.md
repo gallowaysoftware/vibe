@@ -245,11 +245,31 @@ Medium:
 
 Large:
 
-14. **`vibe model try <hf-id> --cell <name>`** — download to the
-    library, scaffold a def from a family template, render, apply at
-    cell-idle, warm, report tok/s vs the incumbent. Compresses the
-    weekly membership-churn loop (the year's dominant toil) into one
-    sentence to an agent.
+14. **`vibe model try <hf-id> --cell <name>`** — **SHIPPED as
+    [C18](fleet-control-plan/c18-model-try.md) (2026-08-05).** Download,
+    scaffold, render, apply at cell-idle, warm, report tok/s vs the
+    incumbent, with a journal that makes every step reversible. Three
+    corrections to this entry's framing, all found while building it.
+    **"A family template" is the wrong template**: it encodes what a
+    model FAMILY wants, while the def already serving on the box encodes
+    what THIS GPU, THIS llama.cpp build and THIS context budget want —
+    and the second list is what decides whether the candidate loads. So
+    one flag (`--like <def>`) supplies both the template and the
+    comparison. **"Apply at cell-idle" is an invariant question, not a
+    scheduling one**: observed idleness INITIATING a config change is
+    the rejected direction, so the apply is C14's declared-action-
+    deferred-by-observation and the deferral reuses C10's
+    `awaitCell --idle` rather than a second notion of idle. And
+    **`--cell <name>` ships as "the cell you are on"**: every step
+    writes a file on the box that will serve the model, fleetd is
+    read-and-request-only, and a verb that makes another box download
+    20 GB and rewrite its router config is a phase rather than a flag.
+    Two things it deliberately cannot do: promote a trial into the
+    fleet catalog (that is a commit to a shared git repo with a human
+    on it — the trial def carries `trial: true` and `router.Render`
+    excludes those from the FRONT render), and price the comparison
+    (C7b's arithmetic needs a window of real traffic a trial does not
+    have; the resource half is weights-on-disk and `estimated_vram_gb`).
 
 ## 3. The adoption story (if this is ever for others)
 

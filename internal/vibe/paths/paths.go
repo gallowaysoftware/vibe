@@ -122,6 +122,13 @@ func LeasesFile() string { return filepath.Join(StateHome(), "fleet", "leases.js
 // not about a cell.
 func NotifyScopeFile() string { return filepath.Join(StateHome(), "fleet", "notify-scope.json") }
 
+// ModelTrialFile is the CELL-side journal of an in-flight `vibe model try`
+// (fleet-control C18). Cell-side because every step it records happened on
+// this box — the weights, the def, the rendered llama-swap config — and
+// because the rollback has to be reachable from the box that can perform
+// it, in a later process, after a reboot, without fleetd.
+func ModelTrialFile() string { return filepath.Join(StateHome(), "fleet", "model-trial.json") }
+
 // TokenFile is the path to the daemon's bearer-token file. The token lives in
 // $XDG_STATE_HOME/vibe rather than $XDG_CONFIG_HOME because it's a generated
 // runtime secret, not user-authored configuration — same reasoning that puts
