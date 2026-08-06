@@ -127,6 +127,14 @@ type Config struct {
 	LlamaSwapURL string
 	// StatePath backs the rolling baselines and the budget counters.
 	StatePath string
+	// ReadOnly loads StatePath and never writes it back. It exists because
+	// the file is a whole-file rewrite from in-memory state (history.go's
+	// shape), so a SECOND process holding it discards every record the
+	// first one made after the second one started. The cell daemon's
+	// prober is the owner and the only writer; a short-lived prober beside
+	// it (`vibe model try`) reads the incumbent's window to print it and
+	// must not spend the daemon's samples or its 96/day budget to do so.
+	ReadOnly bool
 	// Specs resolves a model id to its probe spec. Nil means every model
 	// probes as chat with no fingerprint binding.
 	Specs func(model string) Spec
@@ -261,7 +269,7 @@ func (p *Prober) load() {
 // are warned, not fatal: the in-memory baseline stays authoritative for
 // this process, and losing a baseline costs samples, not correctness.
 func (p *Prober) saveLocked() {
-	if p.cfg.StatePath == "" {
+	if p.cfg.StatePath == "" || p.cfg.ReadOnly {
 		return
 	}
 	st := state{Results: p.results, Attempts: p.attempts, LastAttempt: p.lastAttempt}

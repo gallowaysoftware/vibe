@@ -47,6 +47,39 @@ type BackendDef struct {
 	// here: defs also load standalone for daemon activation, where an
 	// unknown cell is meaningless.
 	Cell string `yaml:"cell,omitempty"`
+	// Trial marks a def written by `vibe model try` (fleet-control C18):
+	// a candidate under evaluation on ONE cell, not part of the fleet's
+	// model set. It is excluded from the FRONT render, which is the
+	// structural reason a trial can never become fleet catalog no matter
+	// whose def checkout it lands in — see router.Render.
+	//
+	// Promotion is deleting this one line and committing the def. That is
+	// deliberate: nothing in vibe can promote a trial, because entering
+	// the fleet catalog is a change to the shared def set and the shared
+	// def set is a git repo with a human on it.
+	Trial bool `yaml:"trial,omitempty"`
+}
+
+// validateTrial holds the two things a trial def must be for its
+// exclusion to mean anything. Both are structural, not stylistic: an
+// unassigned trial would render onto whatever box ran a render (its
+// weights are on ONE box), and a non-external trial is not served by the
+// router at all, so nothing about the front-render exclusion applies to
+// it and the flag would be decoration.
+func (d *BackendDef) validateTrial() error {
+	if !d.Trial {
+		return nil
+	}
+	if d.Cell == "" {
+		return errors.New("trial: true requires cell: — a trial's weights live on one box, and an unassigned def renders wherever a render runs")
+	}
+	if !d.Backend.External {
+		return errors.New("trial: true requires backend.external: true — a trial is evaluated through the router, and the front-render exclusion that keeps it out of the fleet catalog only applies to rendered defs")
+	}
+	if d.Backend.CloudPeer != nil {
+		return errors.New("trial: true is not valid for cloud_peer (there are no weights to try and no cell to try them on)")
+	}
+	return nil
 }
 
 // Lifecycle is the router-lifecycle block on a backend def. All fields feed
@@ -332,6 +365,9 @@ func LoadBackendFrom(dir, name string) (*BackendDef, error) {
 		return nil, fmt.Errorf("backend %s: %w", name, err)
 	}
 	if err := def.Router.validate(); err != nil {
+		return nil, fmt.Errorf("backend %s: %w", name, err)
+	}
+	if err := def.validateTrial(); err != nil {
 		return nil, fmt.Errorf("backend %s: %w", name, err)
 	}
 	switch def.Fingerprint {

@@ -59,6 +59,7 @@ func rootCmd() *cobra.Command {
 		tokenCmd(),
 		cellCmd(),
 		fleetCmd(),
+		modelCmd(),
 	)
 	return root
 }

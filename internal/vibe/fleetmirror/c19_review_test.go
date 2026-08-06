@@ -3,7 +3,6 @@ package fleetmirror
 import (
 	"encoding/json"
 	"errors"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -332,11 +331,17 @@ func TestArchiveOrder_TheSecondRunOfASecondIsTheNewer(t *testing.T) {
 // deadAddr returns a loopback address nothing listens on.
 func deadAddr(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	ln.Close()
-	return addr
+	// A RESERVED address, not a recycled ephemeral one. The old shape
+	// (listen on :0, read the port, close) hands the port straight back
+	// to the kernel, and a test binary that stands up dozens of
+	// httptest servers can be given that exact port a few microseconds
+	// later — at which point the "dead" cell answers 404 and the test
+	// fails for a reason that has nothing to do with what it asserts.
+	// Seen once in ~25 package runs of `go test -race ./...`, which is
+	// precisely the failure rate that makes a green CI meaningless.
+	// Port 1 is privileged: nothing in this binary can bind it, and a
+	// loopback connect gets an immediate ECONNREFUSED. It is already the
+	// idiom these tests use for an unreachable front.
+	_ = t
+	return "127.0.0.1:1"
 }

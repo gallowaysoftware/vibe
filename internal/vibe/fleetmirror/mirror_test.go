@@ -37,6 +37,15 @@ var notFleetState = map[string]string{
 	"FrontendStateRoot": "per-profile frontend state (Open WebUI data, harness configs): not fleet state, and a fleetd deployment has no profiles",
 	"FrontendStateDir":  "same, per profile",
 	"TokenFile":         "carried, but under its own secret rules — see knownState",
+	// fleet-control C18. The trial journal is CELL-side: `vibe model try`
+	// refuses to run on the front cell at all (Runner.refuseStructural),
+	// and every path it records — the weights, the trial def, the cell's
+	// rendered llama-swap config — is on the box that will serve the
+	// model. It does not die with the front, and restoring it onto a
+	// standby would be worse than losing it: `status` would report a
+	// trial whose files are on the box that died, and `end` would
+	// re-render the standby's config on the strength of it.
+	"ModelTrialFile": "cell-side, like cell-intent/cell-usage and C8's baselines: `vibe model try` refuses the front cell, and the journal names files on the cell that serves the trial — a standby that restored it would report a trial it cannot roll back",
 }
 
 // TestMirrorCoversEveryFleetStateFile is the "find every producer" rule

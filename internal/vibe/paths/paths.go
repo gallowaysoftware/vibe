@@ -122,6 +122,15 @@ func LeasesFile() string { return filepath.Join(StateHome(), "fleet", "leases.js
 // not about a cell.
 func NotifyScopeFile() string { return filepath.Join(StateHome(), "fleet", "notify-scope.json") }
 
+// ModelTrialFile is the CELL-side journal of an in-flight `vibe model try`
+// (fleet-control C18). Cell-side because every step it records happened on
+// this box — the weights, the def, the rendered llama-swap config — and
+// because the rollback has to be reachable from the box that can perform
+// it, in a later process, after a reboot, without fleetd. It is therefore
+// deliberately NOT in C19's mirror (see notFleetState): a journal restored
+// onto a standby would describe files on the box that died.
+func ModelTrialFile() string { return filepath.Join(StateHome(), "fleet", "model-trial.json") }
+
 // MirrorReceiptFile records the last `vibe fleet mirror` run
 // (fleet-control C19). It lives in the state dir fleetd already reads so
 // `vibe fleet doctor` can answer "is the off-host mirror fresh" with no
