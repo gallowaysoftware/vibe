@@ -337,6 +337,13 @@ var ErrPartialState = errors.New("this box already holds part of a fleet's state
 // mirror time, `fleetd_url` unset (it is `omitempty`), no `front` cell
 // declared. That leaves all three slices empty, and Restore answers it
 // with ErrNoProbeTargets.
+//
+// Addresses are dialed in sequence, so the whole scan is bounded by
+// N × 2 × DialTimeout — 8s for the two recorded addresses at the 2s
+// default, and N × 4s when an operator repeats --probe-addr. Sequential
+// on purpose: this is the guard everything else rests on, two addresses
+// is the normal case, and doctor's parallel fan-out buys seconds at the
+// cost of being harder to reason about here.
 func ScanTakeover(opts RestoreOptions, id Identity) TakeoverScan {
 	timeout := opts.DialTimeout
 	if timeout <= 0 {
@@ -380,12 +387,22 @@ func ScanTakeover(opts RestoreOptions, id Identity) TakeoverScan {
 //
 // Deprecated: it cannot express "I could not find out", so use
 // ScanTakeover. What it does NOT do is hand that state back as a healthy
-// value: an address it could not settle appears in neither return, so a
-// caller holding the old `len(probed) == 0` guard refuses rather than
-// proceeds. The degradation is fail-closed on purpose — this is the
-// function whose empty second return means "stop".
+// value: if ANY address went unsettled it returns an empty second slice,
+// so a caller holding the old `len(probed) == 0` guard refuses rather
+// than proceeds. This is the function whose empty second return means
+// "stop".
+//
+// Dropping the unsettled addresses and returning the settled ones was
+// not enough, and the mixed scan is exactly why: fleetd refused (host
+// rebooted) and the front timed out (alive, behind a DROP rule) left one
+// address in `probed` and no hits — the all-clear, for the one scan that
+// most needs a refusal. A caller that cannot see the third state must be
+// told nothing rather than a subset.
 func TakeoverProbe(opts RestoreOptions, id Identity) ([]TakeoverHit, []string) {
 	scan := ScanTakeover(opts, id)
+	if len(scan.Unknown) > 0 {
+		return scan.Hits, nil
+	}
 	return scan.Hits, scan.Settled
 }
 
@@ -427,19 +444,26 @@ func probeOne(dial func(network, addr string, timeout time.Duration) (net.Conn, 
 	}()
 	select {
 	case out := <-ch:
+		// The CONNECTION is checked first, and before the error. A dialer
+		// that returns both — a proxy, a happy-eyeballs wrapper, a future
+		// TLS seam reporting a non-fatal condition — established a session
+		// with something, which is the strongest evidence there is that the
+		// old front is up. Reading its error and discarding the conn scored
+		// that as "nothing is there" AND leaked the socket into the process
+		// about to write a state dir.
+		if out.conn != nil {
+			out.conn.Close()
+			return verdictAnswered, ""
+		}
 		if out.err != nil {
 			return classifyDialErr(out.err)
 		}
-		if out.conn == nil {
-			// Neither a connection nor an error. Nothing in the stdlib does
-			// this; a fake or a wrapper can, and reading it as "nothing
-			// answered" would be a guess made by the code that exists to
-			// stop guessing. (It also used to panic on the Close below,
-			// mid-recovery, with a live front possibly still up.)
-			return verdictUnsettled, "the dialer returned neither a connection nor an error"
-		}
-		out.conn.Close()
-		return verdictAnswered, ""
+		// Neither a connection nor an error. Nothing in the stdlib does
+		// this; a fake or a wrapper can, and reading it as "nothing
+		// answered" would be a guess made by the code that exists to stop
+		// guessing. (It also used to panic on the Close above, mid-recovery,
+		// with a live front possibly still up.)
+		return verdictUnsettled, "the dialer returned neither a connection nor an error"
 	case <-time.After(watchdog):
 		// The dial may still land. Take the connection off the buffered
 		// channel and close it rather than leaking a socket into a process
@@ -466,18 +490,30 @@ func probeOne(dial func(network, addr string, timeout time.Duration) (net.Conn, 
 // the same cumulative totals into two ledgers that can never afterwards
 // be reconciled.
 func classifyDialErr(err error) (probeVerdict, string) {
-	// A RST: something on the other side is up enough to say "nothing is
-	// listening on this port". This is the ordinary shape of a front host
-	// that has been rebooted or whose llama-swap is stopped.
-	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) {
+	// The host's own stack answered the SYN with a RST: it is up enough to
+	// say "nothing is listening on this port". That is the ordinary shape
+	// of a front host that has been rebooted or whose llama-swap is
+	// stopped, and it is the only network answer that means absence.
+	//
+	// ECONNRESET is deliberately NOT here. It means something accepted or
+	// answered and then tore the connection down — a reverse proxy that is
+	// up and shedding load, a middlebox — which is evidence of a LIVE
+	// peer, nearer a hit than a miss. It falls through to doubt below.
+	if errors.Is(err, syscall.ECONNREFUSED) {
 		return verdictNothingThere, ""
 	}
-	// The recorded name does not exist. Judged a definite negative
-	// because the identity a standby would assume IS that name: if it
-	// resolves nowhere, no client is reaching the old front by it.
-	// The residual is split-horizon DNS — a name that resolves on the
-	// old front's network and not on this one — which --probe-addr
-	// answers by naming the address directly.
+	// The recorded name does not resolve FROM HERE.
+	//
+	// KNOWN FAIL-OPEN, kept only because this package's fixtures rest on
+	// it (see the U2 addendum in docs/design/fleet-control-plan/
+	// c19-front-failover.md). Resolution happens on the CLIENT, not on the
+	// standby: a resolver with no internal zone, or a /etc/resolv.conf
+	// pointing at the front host that just died, NXDOMAINs every recorded
+	// name while the old front is alive and serving every client by IP —
+	// and this branch calls that a dead front. Closing it is two lines
+	// (classify as unsettled, and give standby.opts() a refusing Dial so
+	// no restore test touches the network), in a test file this change
+	// does not own.
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
 		return verdictNothingThere, ""

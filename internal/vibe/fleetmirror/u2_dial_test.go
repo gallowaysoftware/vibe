@@ -161,6 +161,24 @@ func TestTakeoverProbe_ADialerThatIgnoresItsBudgetIsStillBounded(t *testing.T) {
 	}
 }
 
+// TestTakeoverProbe_ADialerReturningBothIsAHit is the asymmetric twin of
+// the (nil, nil) case, and it went the dangerous way: the error was
+// classified and the CONNECTION — a session established with something,
+// the strongest evidence the old front is up — was dropped on the floor
+// unread and unclosed. A refusing error beside a live conn scored as
+// "nothing is there", which is the green light.
+func TestTakeoverProbe_ADialerReturningBothIsAHit(t *testing.T) {
+	live := answeringConn(t)
+	f := &fakeDialer{answer: func(string) (net.Conn, error) {
+		return live, &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}
+	}}
+	scan := ScanTakeover(RestoreOptions{Dial: f.dial, DialTimeout: 40 * time.Millisecond},
+		Identity{FleetdURL: "http://" + fleetdAddr})
+	require.Len(t, scan.Hits, 1, "a dialer that handed back a live connection was scored as nothing being there")
+	require.Equal(t, fleetdAddr, scan.Hits[0].Addr)
+	require.Empty(t, scan.Unknown)
+}
+
 // TestTakeoverProbe_ADialerReturningNeitherIsUnsettled: nothing in the
 // stdlib returns (nil, nil), a wrapper can, and the old code called
 // Close on it — a nil dereference in the middle of a recovery, with a
@@ -203,8 +221,11 @@ func TestTakeoverProbe_TheDefaultDialerStillSettlesARealRefusal(t *testing.T) {
 func TestClassifyDialErr_OnlyADefiniteNegativeMeansNothingIsThere(t *testing.T) {
 	definite := map[string]error{
 		"connection refused (RST)": &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED},
-		"connection reset":         &net.OpError{Op: "dial", Err: syscall.ECONNRESET},
-		"the name does not exist":  &net.OpError{Op: "dial", Err: &net.DNSError{Err: "no such host", IsNotFound: true}},
+		// NXDOMAIN is here under protest and with a written reason: it is a
+		// KNOWN FAIL-OPEN this change did not close, because every restore
+		// fixture in this package rests on it. See classifyDialErr and the
+		// U2 addendum. When it is closed, this line moves down.
+		"the name does not resolve from here": &net.OpError{Op: "dial", Err: &net.DNSError{Err: "no such host", IsNotFound: true}},
 	}
 	for name, err := range definite {
 		t.Run("definite/"+name, func(t *testing.T) {
@@ -217,14 +238,19 @@ func TestClassifyDialErr_OnlyADefiniteNegativeMeansNothingIsThere(t *testing.T) 
 		// The headline: a firewall that DROPs rather than REJECTs, which
 		// is how an old front that is very much alive presents to a
 		// standby on another network.
-		"net timeout":              &net.OpError{Op: "dial", Err: timedOut{}},
-		"os deadline exceeded":     os.ErrDeadlineExceeded,
-		"context deadline":         context.DeadlineExceeded,
-		"host unreachable":         &net.OpError{Op: "dial", Err: syscall.EHOSTUNREACH},
-		"network unreachable":      &net.OpError{Op: "dial", Err: syscall.ENETUNREACH},
-		"blocked by local policy":  &net.OpError{Op: "dial", Err: syscall.EACCES},
-		"resolver is unwell":       &net.OpError{Op: "dial", Err: &net.DNSError{Err: "server misbehaving", IsTemporary: true}},
-		"something nobody planned": errors.New("a brand new failure mode"),
+		"net timeout": &net.OpError{Op: "dial", Err: timedOut{}},
+		// ECONNRESET is not absence. Something accepted and then tore the
+		// connection down — a proxy shedding load, a middlebox — which is
+		// evidence of a LIVE peer, and reading it as "nothing is there"
+		// would be fail-open inside the list that must be fail-closed.
+		"connection reset by a live peer": &net.OpError{Op: "dial", Err: syscall.ECONNRESET},
+		"os deadline exceeded":            os.ErrDeadlineExceeded,
+		"context deadline":                context.DeadlineExceeded,
+		"host unreachable":                &net.OpError{Op: "dial", Err: syscall.EHOSTUNREACH},
+		"network unreachable":             &net.OpError{Op: "dial", Err: syscall.ENETUNREACH},
+		"blocked by local policy":         &net.OpError{Op: "dial", Err: syscall.EACCES},
+		"resolver is unwell":              &net.OpError{Op: "dial", Err: &net.DNSError{Err: "server misbehaving", IsTemporary: true}},
+		"something nobody planned":        errors.New("a brand new failure mode"),
 	}
 	for name, err := range doubt {
 		t.Run("doubt/"+name, func(t *testing.T) {
@@ -383,38 +409,89 @@ func TestTakeoverProbe_TheTwoReturnShapeDegradesToARefusal(t *testing.T) {
 	require.Empty(t, probed, "the two-return shape reported an unsettled address as probed, which reads as 'nothing answered'")
 }
 
+// TestTakeoverProbe_TheTwoReturnShapeRefusesOnAMIXEDScan is the case the
+// test above cannot reach, and it is the one that matters.
+//
+// Dropping the unsettled addresses and returning the settled ones is not
+// enough: fleetd refused (the host rebooted) and the front timed out
+// (alive, behind a DROP rule) left ONE address in `probed` and no hits —
+// which is the all-clear, handed to a caller that cannot see the third
+// state, for the exact scan that most needs a refusal. Returning a
+// SUBSET of the evidence is the dropped bit wearing a different coat.
+func TestTakeoverProbe_TheTwoReturnShapeRefusesOnAMIXEDScan(t *testing.T) {
+	f := &fakeDialer{answer: func(addr string) (net.Conn, error) {
+		if addr == fleetdAddr {
+			return nil, &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}
+		}
+		return nil, &net.OpError{Op: "dial", Err: timedOut{}}
+	}}
+	opts := RestoreOptions{Dial: f.dial, DialTimeout: 40 * time.Millisecond}
+	id := Identity{FleetdURL: "http://" + fleetdAddr, FrontURL: "http://" + frontAddr}
+
+	// The full scan sees all three states.
+	scan := ScanTakeover(opts, id)
+	require.Equal(t, []string{fleetdAddr}, scan.Settled)
+	require.Len(t, scan.Unknown, 1)
+	require.Equal(t, frontAddr, scan.Unknown[0].Addr)
+
+	// The two-return shape must hand back nothing rather than the half it
+	// can express.
+	hits, probed := TakeoverProbe(opts, id)
+	require.Empty(t, hits)
+	require.Empty(t, probed,
+		"a mixed scan handed the legacy caller a settled address and no hits — the all-clear, with a live front unaccounted for")
+}
+
 // TestTakeoverProbe_HasNoProductionCallers keeps the paragraph above
 // true. Restore is the only thing that decides whether a standby comes
 // up, and it must decide on the full scan; a future caller reaching for
 // the shorter signature is exactly how the dropped bit gets back in.
 func TestTakeoverProbe_HasNoProductionCallers(t *testing.T) {
-	callers, err := nonTestCallersOf("../../..", "TakeoverProbe(", "restore.go")
+	callers, err := nonTestCallersOf("../../..", "TakeoverProbe", probeDefinedIn)
 	require.NoError(t, err)
 	require.Empty(t, callers, "use ScanTakeover: the two-return probe cannot say 'I could not find out'")
 }
+
+// probeDefinedIn is a PATH, not a basename. Excluding by basename made
+// every restore.go in the repo invisible to the scan — including a
+// future internal/vibe/fleetapi/restore.go calling straight into the
+// deprecated probe, which is the one regression this guard exists to
+// catch.
+var probeDefinedIn = filepath.Join("internal", "vibe", "fleetmirror", "restore.go")
 
 // TestNonTestCallersOf_FindsAPlantedCaller is the scan's own proof. A
 // source guard that can only pass is not a guard.
 func TestNonTestCallersOf_FindsAPlantedCaller(t *testing.T) {
 	root := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(root, "pkg", ".git"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(root, "pkg", "caller.go"),
-		[]byte("package pkg\n\nfunc x() { TakeoverProbe(nil, nil) }\n"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(root, "pkg", "caller_test.go"),
-		[]byte("package pkg\n\nfunc y() { TakeoverProbe(nil, nil) }\n"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(root, "pkg", "restore.go"),
-		[]byte("package pkg\n\nfunc z() { TakeoverProbe(nil, nil) }\n"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(root, "pkg", ".git", "hook.go"),
-		[]byte("package pkg\n\nfunc w() { TakeoverProbe(nil, nil) }\n"), 0o644))
+	plant := func(rel, body string) {
+		t.Helper()
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755))
+		require.NoError(t, os.WriteFile(p, []byte(body), 0o644))
+	}
+	plant("pkg/caller.go", "package pkg\n\nfunc x() { TakeoverProbe(nil, nil) }\n")
+	plant("pkg/caller_test.go", "package pkg\n\nfunc y() { TakeoverProbe(nil, nil) }\n")
+	plant("pkg/restore.go", "package pkg\n\nfunc z() { TakeoverProbe(nil, nil) }\n")
+	plant("pkg/.git/hook.go", "package pkg\n\nfunc w() { TakeoverProbe(nil, nil) }\n")
+	// A caller taking the function VALUE rather than calling it — the
+	// reason the scan matches the bare identifier and not "TakeoverProbe(".
+	plant("pkg/indirect.go", "package pkg\n\nvar f = TakeoverProbe\n")
 
-	callers, err := nonTestCallersOf(root, "TakeoverProbe(", "restore.go")
+	callers, err := nonTestCallersOf(root, "TakeoverProbe", filepath.Join("pkg", "restore.go"))
 	require.NoError(t, err)
-	require.Equal(t, []string{filepath.Join("pkg", "caller.go")}, callers,
+	require.Equal(t, []string{filepath.Join("pkg", "caller.go"), filepath.Join("pkg", "indirect.go")}, callers,
 		"the scan must see production callers and only production callers")
+
+	// ...and the exclusion is the DEFINING PATH, not any file that happens
+	// to share its name.
+	elsewhere, err := nonTestCallersOf(root, "TakeoverProbe", filepath.Join("other", "restore.go"))
+	require.NoError(t, err)
+	require.Contains(t, elsewhere, filepath.Join("pkg", "restore.go"),
+		"a same-named file in another package was excluded by its basename")
 }
 
 // nonTestCallersOf lists the non-test .go files under root that mention
-// symbol, excluding the file that defines it.
+// symbol, excluding the file at definedIn (a root-relative PATH).
 func nonTestCallersOf(root, symbol, definedIn string) ([]string, error) {
 	var found []string
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
@@ -431,7 +508,14 @@ func nonTestCallersOf(root, symbol, definedIn string) ([]string, error) {
 			return nil
 		}
 		name := d.Name()
-		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") || name == definedIn {
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			return nil
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return err
+		}
+		if rel == definedIn {
 			return nil
 		}
 		b, err := os.ReadFile(p) //nolint:gosec // a repo-relative source file this test just walked to
@@ -439,10 +523,6 @@ func nonTestCallersOf(root, symbol, definedIn string) ([]string, error) {
 			return err
 		}
 		if strings.Contains(string(b), symbol) {
-			rel, err := filepath.Rel(root, p)
-			if err != nil {
-				return err
-			}
 			found = append(found, rel)
 		}
 		return nil
