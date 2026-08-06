@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1321,6 +1322,431 @@ func TestWarmErrorsAreStrippedOfControlCharacters(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "cleared your scrollback") {
 		t.Fatalf("the readable half of the message must survive: %q", err.Error())
+	}
+}
+
+// ── the independent adversarial pass's findings ─────────────────────────
+
+// TestEndRemovesTheConfigTheTrialCreated is REV3-2. `bankConfig` records
+// the absence of a config explicitly, and its own comment says End
+// "removes the file it created rather than restoring bytes that never
+// existed" — End re-rendered instead, so a box that had no llama-swap
+// config at this path was left with one after `end` reported "trial
+// closed". Observed on a real fleetlab cell, whose llama-swap is started
+// with a different `-config`: the leftover named every model on the cell
+// and llama-swap's default upstream range (5800, production's on this
+// box), at a path nothing reads and nobody knows to delete.
+func TestEndRemovesTheConfigTheTrialCreated(t *testing.T) {
+	r := smallRig(t)
+	run := r.runner()
+	ctx := context.Background()
+	// Deliberately NO seed render: this box has no config at r.configPath.
+	if _, err := os.Stat(r.configPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the fixture already has a config: %v", err)
+	}
+	tr, def, err := run.Plan(ctx, planReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Fetch(ctx, tr, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Stage(tr, def); err != nil {
+		t.Fatal(err)
+	}
+	r.swap.SetModelState(tr.Def, "stopped")
+	if _, err := run.Apply(ctx, tr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(r.configPath); err != nil {
+		t.Fatalf("the apply did not write a config at all: %v", err)
+	}
+	if !tr.ConfigCreated {
+		t.Fatal("the journal did not record that this trial created the config; a later process cannot know to remove it")
+	}
+	// It survives a process death: the rollback is usually a later one.
+	reloaded, err := r.runner().Load()
+	if err != nil || reloaded == nil || !reloaded.ConfigCreated {
+		t.Fatalf("config_created did not reach the journal: %+v (%v)", reloaded, err)
+	}
+	rep, err := r.runner().End(ctx, reloaded, false)
+	if err != nil {
+		t.Fatalf("end: %v (%v)", err, rep.Steps)
+	}
+	if _, err := os.Stat(r.configPath); !errors.Is(err, os.ErrNotExist) {
+		body := readOrEmpty(t, r.configPath)
+		t.Fatalf("`end` left behind a llama-swap config on a box that had none — the box is not in its prior state:\n%s", body)
+	}
+	if !anyContains(rep.Steps, "had no llama-swap config there before") {
+		t.Fatalf("the report must say what it removed and why: %v", rep.Steps)
+	}
+}
+
+// TestEndStillRestoresAConfigThatAlreadyExisted is the fail-closed half:
+// the removal fires ONLY when the trial created the file. A cell with a
+// real config must get it back, not lose it.
+func TestEndStillRestoresAConfigThatAlreadyExisted(t *testing.T) {
+	r := smallRig(t)
+	run := r.runner()
+	ctx := context.Background()
+	if _, err := run.render(true); err != nil {
+		t.Fatal(err)
+	}
+	before := readOrEmpty(t, r.configPath)
+	tr, def, err := run.Plan(ctx, planReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Fetch(ctx, tr, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Stage(tr, def); err != nil {
+		t.Fatal(err)
+	}
+	r.swap.SetModelState(tr.Def, "stopped")
+	if _, err := run.Apply(ctx, tr); err != nil {
+		t.Fatal(err)
+	}
+	if tr.ConfigCreated {
+		t.Fatal("the trial claims it created a config that was already there; `end` would delete the cell's real one")
+	}
+	if _, err := run.End(ctx, tr, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := readOrEmpty(t, r.configPath); got != before {
+		t.Fatalf("the pre-existing config was not restored:\nwant:\n%s\ngot:\n%s", before, got)
+	}
+}
+
+// TestApplyRefusesToDeleteAHandWrittenSection is REV3-6, and it is the
+// finding the corrected live rig surfaced the moment L4 could run at all.
+//
+// `router.Render` merges hand-written sections from an extras file, and
+// `mergeExtras` treats a MISSING extras file as "no extras, no error".
+// C18 rendered with the XDG default path and no flag to say otherwise, so
+// on a cell whose renders are driven by `--extras <file>` — which is what
+// scripts/fleetlab writes and what the reference deploy does — the apply
+// silently deleted whatever that file contributes:
+//
+//   - `apiKeys:`, C15's llama-swap credential. The cell stops demanding a
+//     key at all, which is strictly worse than the 401 C15 exists to fix,
+//     and is what C19's renderPass refuses on by name for the front.
+//   - `store:`, the SQLite activity log C7a's ledger and C7b's savings
+//     screen are computed from.
+//
+// Neither appeared anywhere in the trial's output, and `end`'s re-render
+// reproduced the loss, so the rollback did not put them back either.
+// Observed on a real lab cell: after `end` reported "trial closed", the
+// config had lost its `store:` block permanently.
+func TestApplyRefusesToDeleteAHandWrittenSection(t *testing.T) {
+	r := smallRig(t)
+	extras := filepath.Join(r.dir, "router-extras.yaml")
+	if err := os.WriteFile(extras, []byte("apiKeys:\n  - the-cells-key\nstore:\n  path: "+
+		filepath.Join(r.dir, "activity.db")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	// The cell's real config, rendered WITH its extras — the state a
+	// llama-swap started with `-config` is actually serving.
+	withExtras := r.runner(func(o *Options) { o.ExtrasPath = extras })
+	if _, err := withExtras.render(true); err != nil {
+		t.Fatal(err)
+	}
+	before := readOrEmpty(t, r.configPath)
+	for _, want := range []string{"apiKeys", "store"} {
+		if !strings.Contains(before, want) {
+			t.Fatalf("the fixture's config has no %s: section:\n%s", want, before)
+		}
+	}
+
+	// The trial renders with the DEFAULT extras path, which does not exist.
+	run := r.runner()
+	tr, def, err := run.Plan(ctx, planReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Fetch(ctx, tr, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Stage(tr, def); err != nil {
+		t.Fatal(err)
+	}
+	_, err = run.Apply(ctx, tr)
+	if err == nil {
+		t.Fatalf("the apply deleted the cell's hand-written sections and said nothing:\n%s", readOrEmpty(t, r.configPath))
+	}
+	for _, want := range []string{"apiKeys:", "store:", "--extras"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the refusal must name what it would have deleted and the flag that fixes it (%q): %v", want, err)
+		}
+	}
+	if got := readOrEmpty(t, r.configPath); got != before {
+		t.Fatalf("the refusal still wrote:\n%s", got)
+	}
+	if tr.State != StateStaged {
+		t.Fatalf("state advanced past a refused apply: %q", tr.State)
+	}
+
+	// With the right extras the same apply proceeds, and both sections
+	// survive the trial AND the rollback.
+	ok := r.runner(func(o *Options) { o.ExtrasPath = extras })
+	r.swap.SetModelState(tr.Def, "stopped")
+	if _, err := ok.Apply(ctx, tr); err != nil {
+		t.Fatalf("the apply must proceed once it renders the cell's own extras: %v", err)
+	}
+	applied := readOrEmpty(t, r.configPath)
+	if !strings.Contains(applied, "apiKeys") || !strings.Contains(applied, tr.Def) {
+		t.Fatalf("the applied config lost a section or the trial:\n%s", applied)
+	}
+	if _, err := ok.End(ctx, tr, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := readOrEmpty(t, r.configPath); got != before {
+		t.Fatalf("the rollback did not restore the cell's config:\nwant:\n%s\ngot:\n%s", before, got)
+	}
+}
+
+// TestUnparseableConfigIsARefusalNotNothingToLose. The dropped-section
+// check answers "what would this write delete", and a config it cannot
+// parse is the one state where it has no answer. Reading that as "nothing
+// to lose" is the absent-evidence-as-a-healthy-value class this repo has
+// shipped six times, on the guard that stands in front of the cell's
+// credential.
+func TestUnparseableConfigIsARefusalNotNothingToLose(t *testing.T) {
+	r := smallRig(t)
+	ctx := context.Background()
+	if err := os.WriteFile(r.configPath, []byte("models:\n  a: [\n   unterminated\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := readOrEmpty(t, r.configPath)
+	run := r.runner()
+	tr, def, err := run.Plan(ctx, planReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Fetch(ctx, tr, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Stage(tr, def); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run.Apply(ctx, tr); err == nil || !strings.Contains(err.Error(), "refusing rather than guessing") {
+		t.Fatalf("want a refusal on an unreadable config, got %v", err)
+	}
+	if got := readOrEmpty(t, r.configPath); got != before {
+		t.Fatalf("the refusal still wrote:\n%s", got)
+	}
+}
+
+// TestEndFallsBackToTheBankWhenTheRerenderWouldDropASection is the same
+// rule on the way out. `end` is the surface that tells an operator the box
+// is back where it started, so a re-render that would lose a hand-written
+// section must lose to the byte-exact bank instead — and say which path
+// ran.
+func TestEndFallsBackToTheBankWhenTheRerenderWouldDropASection(t *testing.T) {
+	r := smallRig(t)
+	extras := filepath.Join(r.dir, "router-extras.yaml")
+	if err := os.WriteFile(extras, []byte("apiKeys:\n  - the-cells-key\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	run := r.runner(func(o *Options) { o.ExtrasPath = extras })
+	if _, err := run.render(true); err != nil {
+		t.Fatal(err)
+	}
+	before := readOrEmpty(t, r.configPath)
+	tr, def, err := run.Plan(ctx, planReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Fetch(ctx, tr, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Stage(tr, def); err != nil {
+		t.Fatal(err)
+	}
+	r.swap.SetModelState(tr.Def, "stopped")
+	if _, err := run.Apply(ctx, tr); err != nil {
+		t.Fatal(err)
+	}
+	// The extras file goes away between the apply and the rollback (an
+	// unmounted volume, a moved checkout). The re-render would succeed and
+	// silently strip apiKeys:.
+	if err := os.Remove(extras); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := run.End(ctx, tr, false)
+	if err != nil {
+		t.Fatalf("end: %v (%v)", err, rep.Steps)
+	}
+	if !rep.RestoredFromBackup {
+		t.Fatalf("the rollback re-rendered without the extras and reported success; steps were %v", rep.Steps)
+	}
+	if got := readOrEmpty(t, r.configPath); got != before {
+		t.Fatalf("the cell lost apiKeys: across a rollback that said it was done:\n%s", got)
+	}
+}
+
+// TestResumeReChecksTheDisk is REV3-3. §7's refusals lived only in Plan's
+// FRESH branch, and `resume` returns before them — so the commonest resume
+// of all (a killed twenty-minute pull, journal at `planned`, a .partial on
+// disk) re-entered Fetch with no headroom check and no unknown-size
+// refusal. Observed live: a re-run with --min-free 100000 and no
+// --skip-disk-check went straight to the download.
+func TestResumeReChecksTheDisk(t *testing.T) {
+	r := smallRig(t)
+	ctx := context.Background()
+	tr, _, err := r.runner().Plan(ctx, planReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.State != StatePlanned {
+		t.Fatalf("state %q", tr.State)
+	}
+	// The library filesystem filled while the operator was asleep.
+	full := r.runner(func(o *Options) {
+		o.DiskFree = func(string) (int64, error) { return 1 << 30, nil }
+	})
+	if _, _, err := full.Plan(ctx, planReq()); err == nil || !strings.Contains(err.Error(), "would leave") {
+		t.Fatalf("a resume must re-check the headroom, got %v", err)
+	}
+	// And the unreadable-filesystem refusal, which is the same rule.
+	blind := r.runner(func(o *Options) {
+		o.DiskFree = func(string) (int64, error) { return 0, errors.New("statfs: permission denied") }
+	})
+	if _, _, err := blind.Plan(ctx, planReq()); err == nil || !strings.Contains(err.Error(), "cannot read free space") {
+		t.Fatalf("a resume must re-check that the filesystem is readable, got %v", err)
+	}
+	// --skip-disk-check is still the override, and a resume past `planned`
+	// has nothing left to download.
+	skip := planReq()
+	skip.SkipDiskCheck = true
+	if _, _, err := full.Plan(ctx, skip); err != nil {
+		t.Fatalf("the override must still work on a resume: %v", err)
+	}
+	if err := r.runner().Fetch(ctx, tr, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := full.Plan(ctx, planReq()); err != nil {
+		t.Fatalf("a resume at `fetched` has nothing left to pull and must not be refused for disk: %v", err)
+	}
+}
+
+// TestNotLiveNamesTheConfigItWroteAndBothCauses is REV3-4's display half.
+// The note named exactly one cause — a llama-swap started without
+// -watch-config — and prescribed a restart. On a cell started with a
+// DIFFERENT `-config` (every deploy that does not use the XDG default,
+// including scripts/fleetlab and the reference fleet's containerised
+// front) the restart comes back reading the same file it always read, and
+// the operator has been sent to evict every resident model for nothing.
+func TestNotLiveNamesTheConfigItWroteAndBothCauses(t *testing.T) {
+	r := smallRig(t)
+	run := r.runner()
+	ctx := context.Background()
+	tr, def, err := run.Plan(ctx, planReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Fetch(ctx, tr, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Stage(tr, def); err != nil {
+		t.Fatal(err)
+	}
+	res, err := run.Apply(ctx, tr) // the double never learns the id
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Live {
+		t.Fatal("live with a catalog that never listed the trial")
+	}
+	for _, want := range []string{r.configPath, "-watch-config", "different `-config`", "--config"} {
+		if !strings.Contains(res.Note, want) {
+			t.Fatalf("the not-live note does not say %q — it is the only diagnosis the operator gets:\n%s", want, res.Note)
+		}
+	}
+}
+
+// TestProbeNotesAreStrippedOfControlCharacters is REV3-5. REV2-11 scrubbed
+// `warm`'s 512-byte snippet at the point of capture and stopped there.
+// `measureOne` also stores modelprobe's note, and modelprobe's postJSON
+// embeds up to 4096 RAW bytes of llama-swap's body — the same untrusted
+// socket, eight times the budget — into a Measurement that is saved to the
+// journal and re-printed by `Comparison.Render` and by every later
+// `vibe model try status`.
+func TestProbeNotesAreStrippedOfControlCharacters(t *testing.T) {
+	hostile := "\x1b[2Jcleared your scrollback\x07"
+	var posts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/running" {
+			// Resident, so C8's cardinal rule lets the probe through and the
+			// hostile body is reached.
+			_, _ = w.Write([]byte(`{"running":[{"model":"` + incName + `","state":"ready"}]}`))
+			return
+		}
+		// The WARM succeeds and the PROBE fails: `warm`'s snippet is
+		// already scrubbed (REV2-11), so a server that failed both would
+		// return on the warm and never exercise the path under test.
+		if posts.Add(1) == 1 {
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+			return
+		}
+		http.Error(w, hostile, http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	r := smallRig(t)
+	run := r.runner(func(o *Options) { o.LlamaSwapURL = srv.URL })
+	defs, err := router.LoadDefs(r.backends)
+	if err != nil {
+		t.Fatal(err)
+	}
+	specs := modelprobe.SpecsFromDefs(defs, "/usr/bin/llama-server")
+	prober, err := modelprobe.New(modelprobe.Config{
+		LlamaSwapURL: srv.URL, ReadOnly: true,
+		Specs: func(m string) modelprobe.Spec { return specs[m] },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := run.measureOne(context.Background(), prober, specs, defs, incName)
+	if m.Note == "" {
+		t.Fatal("the hostile side produced no note at all; the test is not reaching the path")
+	}
+	if strings.ContainsAny(m.Note, "\x1b\x07") {
+		t.Fatalf("a control character from llama-swap was stored in the journal and re-printed by `status`: %q", m.Note)
+	}
+	if !strings.Contains(m.Note, "cleared your scrollback") {
+		t.Fatalf("the readable half of the diagnosis must survive: %q", m.Note)
+	}
+}
+
+// TestPlanRefusesControlCharactersInTheCoordinate is REV3-8. The
+// coordinate is interpolated verbatim into the scaffolded def's header —
+// a COMMENT block, where a newline ends the comment and the rest is YAML —
+// and into the journal, which `status` re-prints to a terminal forever.
+func TestPlanRefusesControlCharactersInTheCoordinate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mut  func(*PlanRequest)
+	}{
+		{"repo", func(q *PlanRequest) { q.Repo = "owner/repo\ntrial: false" }},
+		{"file", func(q *PlanRequest) { q.File = "x.gguf\x1b[2J" }},
+		{"revision", func(q *PlanRequest) { q.Revision = "main\nname: qwen3.6-27b" }},
+		{"dest", func(q *PlanRequest) { q.Dest = "/models\n" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := smallRig(t)
+			req := planReq()
+			tc.mut(&req)
+			_, _, err := r.runner().Plan(context.Background(), req)
+			if err == nil || !strings.Contains(err.Error(), "control character") {
+				t.Fatalf("want a field-hygiene refusal, got %v", err)
+			}
+			if _, serr := os.Stat(r.statePath); !errors.Is(serr, os.ErrNotExist) {
+				t.Fatal("a refused plan opened a journal")
+			}
+		})
 	}
 }
 

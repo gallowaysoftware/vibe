@@ -49,6 +49,20 @@ type awaitConds struct {
 	idle     time.Duration
 	unleased bool
 	lease    leaseClaim
+	// holdExempt names ONE model whose C11 hold does not count against
+	// --unleased. It has no flag and its zero value changes nothing:
+	// `vibe cell await --unleased` still refuses to unblock while any
+	// hold stands, which is what C11 promises an operator.
+	//
+	// It exists because --unleased already skips the waiter's own LEASE
+	// holder and cannot skip its own HOLD — a hold is keyed on the
+	// reserved holder, so every hold looks like somebody else's. C18's
+	// trial takes a hold on the incumbent right after this wait, which
+	// makes the wait unsatisfiable on every resume of a trial that got
+	// that far, and unsatisfiable from the start when the operator
+	// already holds the incumbent — the case `trialTakeHold` prints "left
+	// alone" for, on a branch that could only be reached with --now.
+	holdExempt string
 }
 
 // extras reports whether anything beyond reachability was requested.
@@ -336,6 +350,13 @@ func (c awaitConds) evalLeases(cs *fleetapi.CellSnapshot) condResult {
 		// holder, and "leased by hold" reads as a consumer with an odd
 		// name rather than the operator's do-not-touch declaration.
 		if l.Holder == fleetapi.HoldHolder {
+			// One named exemption (holdExempt): a hold on THIS model is
+			// the caller's own declaration about the warm policy, not a
+			// consumer claiming the cell. Without it the waiter that is
+			// about to place that hold can never get past its own.
+			if c.holdExempt != "" && l.Model == c.holdExempt {
+				continue
+			}
 			holders = append(holders, "held: "+termSafe(l.Model))
 			continue
 		}

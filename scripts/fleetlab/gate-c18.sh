@@ -34,10 +34,23 @@
 # box is entitled to kill the first's processes (futures item 15). Set
 # FLEETLAB_DIR and run this only when you own the lab.
 #
+# CONFIG PATH: `vibe model try` writes the llama-swap config the same way
+# `vibe router render` does, and llama-swap reads whatever its `-config` names.
+# In this lab those are two DIFFERENT files: the cells run
+# `-config $LAB/cells/<cell>/config.yaml`, while the XDG default under
+# bravo's own XDG_CONFIG_HOME is $LAB/etc-bravo/llama-swap/config.yaml. The
+# first cut of this rig let `try` write the default, so L1 timed out at 60s
+# reporting NOT LIVE and L4 compared a file the command had never touched —
+# both gates green-looking and both vacuous. `--config "$CFG"` is what makes
+# L1 and L4 observations of anything.
+#
 # startPort HAZARD: `vibe router render` — which is what `try`'s apply calls —
-# hardcodes `startPort: 5800`, production's upstream range on this box. lab.sh
-# and gl.sh's render_cell rewrite it after every render for exactly that
-# reason, and so does this rig, fatally if the rewrite does not apply.
+# hardcodes `startPort: 5800`, production's upstream range on this box. Fixing
+# it AFTER the command returns is too late once the config path is right: the
+# apply waits for llama-swap to adopt the file and then warms a model through
+# it, so the upstream binds 5800 while the rig is still blocked. sport_guard
+# rewrites it continuously in the background instead, inside llama-swap's own
+# 2s poll, and fix_startport is kept as the fatal backstop.
 set -uo pipefail
 source "$(dirname "$0")/gl.sh"
 
@@ -89,6 +102,23 @@ fix_startport() {
   }
 }
 
+# sport_guard CFG — the same rewrite, continuously, for the duration of a
+# command that renders WHILE we are blocked on it. `try`'s apply writes the
+# config, waits for llama-swap to adopt it and then warms a model through it,
+# so a rewrite that only runs afterwards has already let an upstream bind
+# production's range. 100ms is well inside llama-swap's 2s -watch-config poll.
+GUARD_PID=
+sport_guard() {
+  ( while :; do
+      if grep -q '^startPort: 5800$' "$1" 2>/dev/null; then
+        sed -i "s/^startPort: 5800\$/startPort: $SPORT/" "$1"
+      fi
+      sleep 0.1
+    done ) & GUARD_PID=$!
+}
+sport_unguard() { [[ -n $GUARD_PID ]] && kill "$GUARD_PID" 2>/dev/null; GUARD_PID=; }
+trap sport_unguard EXIT
+
 hr "0. preconditions"
 [[ -f $LAB/etc-bravo/vibe/config.yaml ]] || { echo "no bravo cell daemon config — run \`lab.sh up\` first"; exit 2; }
 [[ -n ${PORT:-} && -n ${SPORT:-} ]] || { echo "could not derive PORT/SPORT from the lab — is it up? (PORT='${PORT:-}' SPORT='${SPORT:-}')"; exit 2; }
@@ -104,14 +134,16 @@ echo "# catalog before: $(catalog | tr '\n' ' ')"
 
 hr "1. plan + fetch + stage (--dry-run first: nothing must change)"
 "$BIN" model try local/c18 --file "$(basename "$CANDIDATE")" --like "$INCUMBENT" --as "$TRIAL" \
-  --dest "$CAND_DIR" --dry-run --skip-disk-check
+  --dest "$CAND_DIR" --config "$CFG" --dry-run --skip-disk-check
 echo "# config unchanged after --dry-run: $(cmp -s "$CFG" "$LAB/c18-pretrial-config.yaml" && echo yes || echo NO)"
 echo "# journal after --dry-run (must be 'no trial'): $("$BIN" model try status)"
 
 hr "2. L1 — apply, and watch a real -watch-config adopt it"
 BEFORE=$(date +%s)
+sport_guard "$CFG"
 "$BIN" model try local/c18 --file "$(basename "$CANDIDATE")" --like "$INCUMBENT" --as "$TRIAL" \
-  --dest "$CAND_DIR" --skip-disk-check --now
+  --dest "$CAND_DIR" --config "$CFG" --skip-disk-check --now
+sport_unguard
 fix_startport "$CFG"
 echo "# elapsed to adoption: $(( $(date +%s) - BEFORE ))s  (C0 measured the -watch-config poll at 2s)"
 echo "# catalog after:  $(catalog | tr '\n' ' ')"
@@ -129,9 +161,15 @@ hr "4. L2 — the cost of a reload, watched"
 echo "# start a batch embedding request against the incumbent, then touch the config."
 echo "# C0's measured behaviour: the new config is live immediately, the OLD upstream"
 echo "# drains in-flight work under a hardcoded 30s, then force-closes."
-( curl -sS -m 120 "http://127.0.0.1:$PORT/v1/embeddings" -H 'Content-Type: application/json' \
-    -d "{\"model\":\"$INCUMBENT\",\"input\":[$(printf '"chunk %s",' $(seq 1 200))\"tail\"]}" \
-    | head -c 200; echo "  <- request ended at $(date -Is)" ) &
+# 3000 chunks, not 200: after the measurement the incumbent is WARM, and a
+# batch that finishes in under a second measures nothing about a reload. The
+# body goes to /dev/null — piping it into `head` closes the socket and curl
+# reports (23) at whatever moment head had enough, which reads exactly like a
+# force-close and is not one.
+( curl -sS -m 120 -o /dev/null -w "  <- HTTP %{http_code} after %{time_total}s (want a 30s force-close if it was still running)\n" \
+    "http://127.0.0.1:$PORT/v1/embeddings" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$INCUMBENT\",\"input\":[$(printf '"chunk %s",' $(seq 1 3000))\"tail\"]}"
+  echo "  <- request ended at $(date -Is)" ) &
 STREAM=$!
 sleep 3
 echo "# touching the config at $(date -Is)"
@@ -140,7 +178,9 @@ wait $STREAM
 echo "# running after the reload: $(running)"
 
 hr "5. L4 — end, and compare the config byte-for-byte"
-"$BIN" model try end
+sport_guard "$CFG"
+"$BIN" model try end --config "$CFG"
+sport_unguard
 fix_startport "$CFG"
 echo "# config restored byte-for-byte: $(cmp -s "$CFG" "$LAB/c18-pretrial-config.yaml" && echo YES || echo NO)"
 cmp -s "$CFG" "$LAB/c18-pretrial-config.yaml" || diff -u "$LAB/c18-pretrial-config.yaml" "$CFG"

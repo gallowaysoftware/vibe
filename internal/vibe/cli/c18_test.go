@@ -28,6 +28,11 @@ type trialFleetd struct {
 	posts   []map[string]any
 	deletes []map[string]any
 	leases  []fleetapi.Lease
+	// idle, when set, gives the cell an activity block fleetd would vouch
+	// for, so a wait that is NOT --now can be satisfied. Without it every
+	// test here can only exercise the --now path, which is how the
+	// deferral shipped untested.
+	idle *fleetapi.CellActivity
 }
 
 func (f *trialFleetd) start(t *testing.T) *httptest.Server {
@@ -49,12 +54,19 @@ func (f *trialFleetd) start(t *testing.T) *httptest.Server {
 	})
 	mux.HandleFunc("GET /api/fleet/state", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(fleetapi.StateSnapshot{
-			Cells: []fleetapi.CellSnapshot{{Name: "gpu-cell", Reachable: true, Leases: f.leases}},
+			Cells: []fleetapi.CellSnapshot{{Name: "gpu-cell", Reachable: true, Leases: f.leases, Activity: f.idle}},
 		})
 	})
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	return ts
+}
+
+// observedIdle is an activity block fleetd would publish for a cell it
+// has watched go quiet: evidence, not an assumption (C10's rule).
+func observedIdle(seconds float64) *fleetapi.CellActivity {
+	zero := 0
+	return &fleetapi.CellActivity{Observed: true, IdleSeconds: &seconds, InFlight: &zero}
 }
 
 func trialFor(state string) *modeltry.Trial {
@@ -321,6 +333,121 @@ func TestTrialDeclarationsAreOnDiskBeforeTheApply(t *testing.T) {
 	}
 	if !got.Held {
 		t.Fatalf("the hold is not in the journal, so `end` leaves the warm policy suspended:\n%s", raw)
+	}
+}
+
+// ── the independent adversarial pass's findings ─────────────────────────
+
+// TestTrialDeferralIsNotBlockedByAHoldOnItsOwnIncumbent is REV3-1, and it
+// is the first test in this file to exercise the deferral AT ALL — every
+// other one passes --now, which is why this shipped.
+//
+// The wait carries `unleased: true`, and `awaitConds.evalLeases` counts a
+// C11 hold as a blocking lease. It skips the waiter's own LEASE holder
+// and cannot skip its own HOLD, because a hold is keyed on the reserved
+// holder and every hold therefore looks like somebody else's. So the wait
+// standing immediately in front of "take a C11 hold on the incumbent" can
+// never be satisfied once that hold exists:
+//
+//   - a trial that took the hold and then failed to apply is journalled at
+//     `staged` with held: true, and every resume parks against its own
+//     declaration until the 4 h TTL expires;
+//   - an operator's own hold on the incumbent — the case `trialTakeHold`
+//     honours by name, printing "left alone" — makes the trial unstartable
+//     from the beginning.
+//
+// The only escapes were --now (which truncates streams past 30 s and
+// evicts every resident model) and `end` (which throws the pull away).
+func TestTrialDeferralIsNotBlockedByAHoldOnItsOwnIncumbent(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		lease fleetapi.Lease
+	}{
+		{"its own hold, on a resumed trial", fleetapi.Lease{
+			Cell: "gpu-cell", Model: "qwen3.6-27b", Holder: fleetapi.HoldHolder, Hold: true,
+			Note: "vibe model try: comparison in progress against this model", ExpiresAt: time.Now().Add(4 * time.Hour),
+		}},
+		{"the operator's hold, which the trial honours", fleetapi.Lease{
+			Cell: "gpu-cell", Model: "qwen3.6-27b", Holder: fleetapi.HoldHolder, Hold: true,
+			Note: "the operator's own afternoon", ExpiresAt: time.Now().Add(6 * time.Hour),
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fd := &trialFleetd{leases: []fleetapi.Lease{tc.lease}, idle: observedIdle(3600)}
+			ts := fd.start(t)
+			target, err := resolveFleetd(ts.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			run, _ := trialRunner(t)
+			var out bytes.Buffer
+			// A real wait, not --now, with a budget short enough that a
+			// deadlock fails fast instead of hanging the suite.
+			err = trialDeclareAndWait(context.Background(), &out, run, target, trialFor(modeltry.StateStaged),
+				trialGateOpts{quiet: time.Minute, wait: 3 * time.Second})
+			if err != nil {
+				t.Fatalf("the deferral parked on a hold on the trial's own incumbent — the only way past it was --now, "+
+					"which truncates streams and evicts every resident model: %v\n%s", err, out.String())
+			}
+			if len(fd.posts) == 0 {
+				t.Fatalf("the wait never reached the declarations:\n%s", out.String())
+			}
+		})
+	}
+}
+
+// TestTrialDeferralStillWaitsForEverythingElse is the fail-closed half:
+// the exemption is ONE model's hold, not "holds do not count". Another
+// consumer's lease and a hold on a DIFFERENT model both still block, or
+// the trial would rewrite the cell's config out from under somebody.
+func TestTrialDeferralStillWaitsForEverythingElse(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		lease fleetapi.Lease
+	}{
+		{"another consumer's lease", fleetapi.Lease{
+			Cell: "gpu-cell", Model: "qwen3.6-27b", Holder: "batch-ingest", ExpiresAt: time.Now().Add(time.Hour)}},
+		{"a hold on a different model", fleetapi.Lease{
+			Cell: "gpu-cell", Model: "embed-large", Holder: fleetapi.HoldHolder, Hold: true, ExpiresAt: time.Now().Add(time.Hour)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fd := &trialFleetd{leases: []fleetapi.Lease{tc.lease}, idle: observedIdle(3600)}
+			ts := fd.start(t)
+			target, err := resolveFleetd(ts.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			run, _ := trialRunner(t)
+			var out bytes.Buffer
+			err = trialDeclareAndWait(context.Background(), &out, run, target, trialFor(modeltry.StateStaged),
+				trialGateOpts{quiet: time.Minute, wait: 2 * time.Second})
+			if err == nil {
+				t.Fatalf("the trial rewrote the cell's config while %s stood:\n%s", tc.name, out.String())
+			}
+			if len(fd.posts) != 0 {
+				t.Fatalf("it declared anyway: %v", fd.posts)
+			}
+		})
+	}
+}
+
+// TestAwaitUnleasedStillRefusesEveryHoldByDefault. holdExempt has no flag
+// and its zero value must change nothing: `vibe cell await --unleased`
+// is C11's promise to an operator that a hold is respected.
+func TestAwaitUnleasedStillRefusesEveryHoldByDefault(t *testing.T) {
+	cs := &fleetapi.CellSnapshot{Name: "gpu-cell", Reachable: true, Leases: []fleetapi.Lease{
+		{Cell: "gpu-cell", Model: "qwen3.6-27b", Holder: fleetapi.HoldHolder, Hold: true},
+	}}
+	if r := (awaitConds{unleased: true}).evalLeases(cs); r.met {
+		t.Fatalf("a bare --unleased stepped over a hold: %+v", r)
+	}
+	exempt := awaitConds{unleased: true, holdExempt: "qwen3.6-27b"}
+	if r := exempt.evalLeases(cs); !r.met {
+		t.Fatalf("the named exemption did not apply: %+v", r)
+	}
+	other := awaitConds{unleased: true, holdExempt: "something-else"}
+	if r := other.evalLeases(cs); r.met {
+		t.Fatalf("the exemption is per-MODEL and matched the wrong one: %+v", r)
 	}
 }
 

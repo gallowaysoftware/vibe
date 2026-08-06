@@ -52,6 +52,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -139,6 +140,14 @@ type Trial struct {
 	DefPath     string `json:"def_path"`
 	ConfigPath  string `json:"config_path"`
 	BackupPath  string `json:"backup_path,omitempty"`
+	// ConfigCreated records that ConfigPath did not exist when the trial
+	// banked it. "Restore the previous config" then means REMOVING the
+	// file, not rendering a second one: a box whose llama-swap is started
+	// with some other -config had no file here, and a re-render leaves it
+	// one that names every model on the cell and llama-swap's default
+	// upstream range. It is journalled rather than derived, because the
+	// process that has to undo it is usually a later one.
+	ConfigCreated bool `json:"config_created,omitempty"`
 	// SizeBytes is what HuggingFace advertised for the file, or -1 when
 	// it would not say. -1 is never treated as small.
 	SizeBytes int64 `json:"size_bytes"`
@@ -379,6 +388,9 @@ func (r *Runner) Plan(ctx context.Context, req PlanRequest) (*Trial, *profile.Ba
 	if req.Repo == "" || req.File == "" {
 		return nil, nil, errors.New("a HuggingFace repo and a file are required (vibe model try <owner>/<repo> --file <name>.gguf)")
 	}
+	if err := checkPrintable(req); err != nil {
+		return nil, nil, err
+	}
 	if req.Like == "" {
 		return nil, nil, errors.New("--like <def> is required: it names the def whose serving flags the trial copies AND the model the trial is measured against")
 	}
@@ -472,6 +484,19 @@ func (r *Runner) resume(t *Trial, req PlanRequest) (*Trial, *profile.BackendDef,
 	}
 	if err := r.agreesWithJournal(t); err != nil {
 		return nil, nil, err
+	}
+	// §7's refusals are not a one-time toll paid at Plan. The commonest
+	// resume is a killed twenty-minute pull — journal at `planned`, a
+	// `.partial` on disk, hours elapsed — and the library filesystem is
+	// exactly the thing that may have filled in between. The failure this
+	// guards is not "the download fails", it is "the download succeeds and
+	// llama-swap, the activity store and the next pull all stop", and a
+	// resume that skipped the check would walk straight into it with the
+	// operator believing they were re-running a checked command.
+	if t.State == StatePlanned {
+		if err := r.checkDisk(filepath.Dir(t.WeightsPath), t.SizeBytes, nil, req.SkipDiskCheck); err != nil {
+			return nil, nil, err
+		}
 	}
 	defs, err := router.LoadDefs(r.opt.BackendsDir)
 	if err != nil {
@@ -791,6 +816,17 @@ func (r *Runner) Apply(ctx context.Context, t *Trial) (ApplyResult, error) {
 		if err := r.bankConfig(t); err != nil {
 			return ApplyResult{}, err
 		}
+		// Prove the write BEFORE it happens, against the bytes llama-swap
+		// is serving now. A trial adds one models: entry and must change
+		// nothing else; a render that would also DELETE a hand-written
+		// section is not an apply, it is a config edit nobody asked for.
+		proof, err := r.render(false)
+		if err != nil {
+			return ApplyResult{}, fmt.Errorf("render %s: %w", r.opt.ConfigPath, err)
+		}
+		if err := r.refuseDroppedSections(proof.Rendered); err != nil {
+			return ApplyResult{}, err
+		}
 		out, err := r.render(true)
 		if err != nil {
 			return ApplyResult{}, fmt.Errorf("render %s: %w", r.opt.ConfigPath, err)
@@ -822,10 +858,12 @@ func (r *Runner) bankConfig(t *Trial) error {
 	data, err := os.ReadFile(r.opt.ConfigPath)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		// No config yet is a real state (a fresh cell). Record the
-		// absence explicitly so End removes the file it created rather
-		// than restoring bytes that never existed.
+		// No config yet is a real state (a fresh cell, or — far more
+		// commonly — a llama-swap started with a different -config).
+		// Record the absence explicitly so End removes the file it
+		// created rather than restoring bytes that never existed.
 		t.BackupPath = ""
+		t.ConfigCreated = true
 		return nil
 	case err != nil:
 		return fmt.Errorf("read %s before applying: %w", r.opt.ConfigPath, err)
@@ -861,9 +899,17 @@ func (r *Runner) awaitCatalog(ctx context.Context, id string) (bool, string) {
 		if !time.Now().Before(deadline) {
 			why := fmt.Sprintf("%s is not in this cell's /v1/models after %s", id, r.opt.CatalogWait)
 			if last != "" {
-				why += " (last read: " + last + ")"
+				why += " (last read: " + printableSnippet(last) + ")"
 			}
-			return false, why + " — the config is written; a llama-swap started without -watch-config needs `systemctl --user restart llama-swap`, which evicts whatever is resident"
+			// TWO causes, named, because prescribing only the first one
+			// sends an operator to restart a llama-swap that will come back
+			// reading the same file it was already reading. The restart
+			// fixes a cell started without -watch-config; nothing fixes a
+			// cell started with a DIFFERENT -config except writing the file
+			// it actually reads.
+			return false, why + " — " + r.opt.ConfigPath + " is written, so either this llama-swap was started without -watch-config " +
+				"(`systemctl --user restart llama-swap`, which evicts whatever is resident), or it was started with a different `-config` " +
+				"and that file is the one to write (`vibe model try --config <path>`; check the unit's ExecStart)"
 		}
 		select {
 		case <-ctx.Done():
@@ -982,7 +1028,7 @@ func (r *Runner) measureOne(ctx context.Context, prober *modelprobe.Prober, spec
 		m.VRAMEstimateGB = def.EstimatedVRAMGB
 	}
 	if err := r.warm(ctx, model, m.Kind); err != nil {
-		m.Note = "warm failed: " + err.Error()
+		m.Note = printableSnippet("warm failed: " + err.Error())
 		return m
 	}
 	// rebaseline is FALSE, deliberately. Passing true would wipe the
@@ -999,7 +1045,15 @@ func (r *Runner) measureOne(ctx context.Context, prober *modelprobe.Prober, spec
 	m.Metric, m.Value, m.TTFTMS = res.Metric, res.Value, res.TTFTMS
 	m.BaselineP50, m.Samples = res.BaselineP50, res.Samples
 	if res.Note != "" {
-		m.Note = res.Note
+		// Scrubbed for the same reason `warm` scrubs, and it is the
+		// LARGER exposure of the two: modelprobe's postJSON embeds up to
+		// 4096 raw bytes of llama-swap's body in the error it returns,
+		// and that error becomes this Note — which is SAVED to the journal
+		// and re-printed by `Comparison.Render` and by every later
+		// `vibe model try status`. C8 renders its notes through fleetd's
+		// own hygiene; C18 stores them, so the rule has to be held here,
+		// at the point of capture.
+		m.Note = printableSnippet(res.Note)
 	}
 	if m.Value <= 0 && m.Note == "" {
 		m.Note = "the probe produced no rate"
@@ -1098,26 +1152,58 @@ func (r *Runner) End(ctx context.Context, t *Trial, purge bool) (EndReport, erro
 	// the trial genuinely never touched it.
 	if t.State == StateApplied || t.State == StateMeasured ||
 		(t.State == StateStaged && r.configNamesTrial(t)) {
-		out, err := r.render(true)
-		switch {
-		case err == nil:
-			rep.Steps = append(rep.Steps, fmt.Sprintf("re-rendered %s without the trial (changed=%v)", t.ConfigPath, out.Changed))
-		case t.BackupPath != "":
-			// A render can fail for reasons unrelated to the trial (a def
-			// edited by someone else, a broken extras file). The operator
-			// still gets their router back.
-			data, rerr := os.ReadFile(t.BackupPath)
-			if rerr == nil {
-				rerr = writeFileAtomic(t.ConfigPath, data, 0o644)
-			}
-			if rerr != nil {
-				problems = append(problems, fmt.Errorf("re-render failed (%w) AND restoring the banked config failed (%w) — %s still contains the trial", err, rerr, t.ConfigPath))
+		// The trial CREATED this file: the box had none before, so
+		// "restore the previous config" means REMOVING it. Re-rendering
+		// instead leaves behind a config the operator never had, naming
+		// every model on the cell and llama-swap's default upstream range
+		// — and on the shape this is reachable on (a llama-swap started
+		// with a different -config, which is every deploy that does not
+		// use the XDG default) it is a file nothing reads and nobody
+		// knows to delete. `bankConfig` recorded the absence for exactly
+		// this. Never on the `staged` branch: there the file is somebody
+		// ELSE's render, and removing it would take the cell's real
+		// config with it.
+		if t.ConfigCreated && t.State != StateStaged {
+			if err := os.Remove(t.ConfigPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				problems = append(problems, fmt.Errorf("remove the config this trial created (%s): %w", t.ConfigPath, err))
 			} else {
-				rep.RestoredFromBackup = true
-				rep.Steps = append(rep.Steps, fmt.Sprintf("re-render failed (%v); restored the banked config byte-for-byte from %s", err, t.BackupPath))
+				rep.Steps = append(rep.Steps, "removed "+t.ConfigPath+" — this trial created it; the box had no llama-swap config there before")
 			}
-		default:
-			problems = append(problems, fmt.Errorf("re-render failed (%w) and there was no banked config to restore — %s may still contain the trial", err, t.ConfigPath))
+		} else {
+			// PROVE, then write. The re-render loses the same hand-written
+			// sections the apply refuses to lose, and here it is worse:
+			// `end` is the surface that tells the operator the box is back
+			// where it started. When the render would drop one, the
+			// byte-exact bank IS the prior state — so fall through to it,
+			// which the report already names.
+			out, err := r.render(false)
+			if err == nil {
+				if derr := r.refuseDroppedSections(out.Rendered); derr != nil {
+					err = derr
+				} else if _, werr := r.render(true); werr != nil {
+					err = werr
+				}
+			}
+			switch {
+			case err == nil:
+				rep.Steps = append(rep.Steps, fmt.Sprintf("re-rendered %s without the trial (changed=%v)", t.ConfigPath, out.Changed))
+			case t.BackupPath != "":
+				// A render can fail for reasons unrelated to the trial (a def
+				// edited by someone else, a broken extras file). The operator
+				// still gets their router back.
+				data, rerr := os.ReadFile(t.BackupPath)
+				if rerr == nil {
+					rerr = writeFileAtomic(t.ConfigPath, data, 0o644)
+				}
+				if rerr != nil {
+					problems = append(problems, fmt.Errorf("re-render failed (%w) AND restoring the banked config failed (%w) — %s still contains the trial", err, rerr, t.ConfigPath))
+				} else {
+					rep.RestoredFromBackup = true
+					rep.Steps = append(rep.Steps, fmt.Sprintf("re-render failed (%v); restored the banked config byte-for-byte from %s", err, t.BackupPath))
+				}
+			default:
+				problems = append(problems, fmt.Errorf("re-render failed (%w) and there was no banked config to restore — %s may still contain the trial", err, t.ConfigPath))
+			}
 		}
 		rep.StillInCatalog, rep.Note = r.stillListed(ctx, t.Def)
 	}
@@ -1149,6 +1235,73 @@ func (r *Runner) End(ctx context.Context, t *Trial, purge bool) (EndReport, erro
 	}
 	rep.Steps = append(rep.Steps, "closed the trial journal")
 	return rep, nil
+}
+
+// refuseDroppedSections refuses a write that would DELETE a top-level
+// section the cell's llama-swap config has today.
+//
+// `router.Render` merges hand-written sections from an extras file, and
+// `mergeExtras` maps a missing file to "no extras, no error" — a sane
+// default for `vibe router render --extras`, and a silent disarming here.
+// A trial rendered with the WRONG extras path (the XDG default, on a cell
+// whose render is driven by `--extras <file>`) still succeeds, and quietly
+// strips whatever that file contributes:
+//
+//   - `apiKeys:` — C15's llama-swap credential. The cell stops demanding a
+//     key at all for the trial's duration, which is strictly worse than
+//     the 401 C15 exists to prevent, and is the exact reasoning C19's
+//     renderPass already refuses on for the front.
+//   - `store: {path: …}` — the SQLite activity log C7a's usage ledger and
+//     C7b's savings screen are computed from. Without it llama-swap keeps
+//     a 1000-row in-memory ring and the meter reads ~nothing.
+//
+// Neither loss is visible in the trial's own output, and `end`'s
+// re-render reproduces it, so the rollback does not put them back either.
+// A trial adds one `models:` entry; anything it would REMOVE is a config
+// edit nobody asked for, and it is refused before the write rather than
+// diagnosed afterwards.
+func (r *Runner) refuseDroppedSections(rendered string) error {
+	current, err := os.ReadFile(r.opt.ConfigPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil // nothing to lose
+	}
+	if err != nil {
+		return fmt.Errorf("read %s before applying: %w", r.opt.ConfigPath, err)
+	}
+	dropped, err := droppedSections(current, []byte(rendered))
+	if err != nil {
+		// Unparseable is not "nothing to lose". It is the one state where
+		// this check cannot answer, and absent evidence is not a healthy
+		// value: refuse and say which file to look at.
+		return fmt.Errorf("cannot tell whether applying would drop a hand-written section of %s (%w) — refusing rather than guessing; fix the file, or roll the trial back with `vibe model try end`", r.opt.ConfigPath, err)
+	}
+	if len(dropped) == 0 {
+		return nil
+	}
+	return fmt.Errorf("applying would DELETE %s from %s — a trial adds one model and must remove nothing. "+
+		"Those sections come from a router extras file (`vibe router render --extras <file>`), and this trial rendered with %q. "+
+		"Re-run with `--extras <the file your renders use>`; nothing has been written and the trial is still staged",
+		strings.Join(dropped, ", "), r.opt.ConfigPath, r.opt.ExtrasPath)
+}
+
+// droppedSections lists the top-level YAML keys `current` has and
+// `rendered` does not.
+func droppedSections(current, rendered []byte) ([]string, error) {
+	var cur, next map[string]any
+	if err := yaml.Unmarshal(current, &cur); err != nil {
+		return nil, err
+	}
+	if err := yaml.Unmarshal(rendered, &next); err != nil {
+		return nil, err
+	}
+	var out []string
+	for k := range cur {
+		if _, ok := next[k]; !ok {
+			out = append(out, k+":")
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // configNamesTrial reports whether the llama-swap config on disk still
@@ -1366,6 +1519,26 @@ func defServingPath(defs []*profile.BackendDef, path string) string {
 		}
 	}
 	return ""
+}
+
+// checkPrintable refuses control characters in the strings that leave
+// this process as something other than an argv word. The coordinate is
+// interpolated verbatim into the scaffolded def's HEADER — a comment
+// block, where a newline ends the comment and the rest becomes YAML — and
+// into the journal, which `vibe model try status` re-prints to a terminal
+// on every later invocation. `validateAwaitFlags` already holds this rule
+// for the fields it forwards to fleetd; C18 held it only for the def NAME,
+// which is the one string it derives rather than carries.
+func checkPrintable(req PlanRequest) error {
+	for _, f := range []struct{ flag, value string }{
+		{"<hf-repo>", req.Repo}, {"--file", req.File}, {"--revision", req.Revision},
+		{"--as", req.As}, {"--dest", req.Dest},
+	} {
+		if f.value != printableSnippet(f.value) {
+			return fmt.Errorf("%s contains a control character or leading/trailing space: it is written into the trial def's header, saved to the journal and re-printed by every later `vibe model try status`", f.flag)
+		}
+	}
+	return nil
 }
 
 // printableSnippet strips control characters from text this package did

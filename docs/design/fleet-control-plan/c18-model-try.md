@@ -1,16 +1,20 @@
 # C18 — `vibe model try`: the membership-churn loop as one command
 
 Status: **PR OPEN**, off `feat/c18-model-try` branched from `main` at
-`c2127f3`. Backlog item 14 (the only Large-tier entry in
+`c2127f3` and merged up to `cfb3d40` (C19). Backlog item 14 (the only
+Large-tier entry in
 [fleet-control-futures.md](../fleet-control-futures.md) §2) — the weekly
 loop the futures doc calls "the year's dominant toil".
 
-Three commits: the feature, ground rule 9's adversarial self-review
+Four commits: the feature, ground rule 9's adversarial self-review
 (**seven findings, one blocker** — see the
-[addendum](#adversarial-self-review-addendum-ground-rule-9)), and an
-independent adversarial-review pass over both (**eleven findings, one
-blocker** — see the
-[second addendum](#adversarial-review-addendum-ground-rule-9-second-pass)).
+[addendum](#adversarial-self-review-addendum-ground-rule-9)), a second
+pass over both (**eleven findings, one blocker** — see the
+[second addendum](#adversarial-review-addendum-ground-rule-9-second-pass)),
+and the INDEPENDENT pass this phase never got because its build agent died
+on an API error before it ran (**nine findings, two blockers**, and four
+of the five live gates moved from UNRUN to PASS — see the
+[third addendum](#adversarial-review-addendum-independent-pass)).
 Unit gates U1–U14 green on a full local inner loop (`go build`,
 `go vet`, `go test -race ./...` ×5 on the touched packages plus
 `-race ./...` whole-module, `gofmt -l .` silent, `go mod tidy`
@@ -402,6 +406,7 @@ fleetd, no new dependency, and an **empty diff for `internal/vibe/proxy`**.
 | U11 | a corrupt journal is an ERROR, never "no trial"; the journal survives a process death; the staged def round-trips through the real loader and equals `--dry-run`'s preview | `TestCorruptJournalIsNeverReadAsNoTrial`, `TestJournalSurvivesAProcessDeath`, `TestStagedDefRoundTripsThroughTheRealLoader` |
 | U13 | re-running RESUMES the same trial and refuses a different one; a journal from another cell or another config path is refused by both `Plan` and `end`; a FAILED rollback keeps the journal and the banked config | `TestReRunningResumesTheSameTrial`, `TestJournalFromAnotherCellOrConfigIsRefused`, `TestFailedRollbackKeepsTheJournalAndTheBackup` |
 | U12 | the trial takes a lease and a hold-on-the-incumbent, leaves an existing hold alone in both directions, refuses to apply undeclared, skips re-declaring on resume, and rolls back with fleetd gone | `TestTrialNowDeclaresTheLeaseAndTheHold`, `TestTrialLeavesAnExistingHoldAloneInBothDirections`, `TestEndReleasesOnlyWhatTheTrialTook`, `TestTrialRefusesToApplyUndeclared`, `TestTrialDeclarationsAreSkippedOnResume`, `TestEndStillRollsBackWhenFleetdIsGone` |
+| U15 | the independent pass's nine findings: the deferral is not blocked by a hold on its OWN incumbent (its own or the operator's) and still waits for everything else; a bare `--unleased` still refuses every hold; the apply and `end` refuse to delete a hand-written section and an unparseable config is a refusal; the disk refusals are re-evaluated on resume; the not-live note names the config it wrote and both causes; the probe's body is scrubbed at the point of capture; `end` removes a config the trial created and restores one it did not; a control character in the coordinate is refused | `TestTrialDeferralIsNotBlockedByAHoldOnItsOwnIncumbent`, `TestTrialDeferralStillWaitsForEverythingElse`, `TestAwaitUnleasedStillRefusesEveryHoldByDefault`, `TestApplyRefusesToDeleteAHandWrittenSection`, `TestUnparseableConfigIsARefusalNotNothingToLose`, `TestEndFallsBackToTheBankWhenTheRerenderWouldDropASection`, `TestResumeReChecksTheDisk`, `TestNotLiveNamesTheConfigItWroteAndBothCauses`, `TestProbeNotesAreStrippedOfControlCharacters`, `TestEndRemovesTheConfigTheTrialCreated`, `TestEndStillRestoresAConfigThatAlreadyExisted`, `TestPlanRefusesControlCharactersInTheCoordinate` |
 | U14 | the adversarial-review pass's eleven findings: `--dry-run` never rolls back a resumed trial and still closes its own journal; both declarations are on disk before the apply; the candidate's VRAM estimate is not the incumbent's; `end` waits for llama-swap to drop the id and still reports one that never went; `end` re-renders a staged trial the config still names and writes nothing when it does not; `--idle 0` and `--min-free 0` are refused; a different `--revision`/`--dest` does not resume; a re-derived def is restaged; llama-swap's body is scrubbed; the cell's shared probe state is never rewritten | `TestDryRunNeverRollsBackAnInFlightTrial`, `TestTrialDeclarationsAreOnDiskBeforeTheApply`, `TestTrialVRAMEstimateIsNotTheIncumbentsNumber`, `TestEndWaitsForLlamaSwapToDropTheTrial`, `TestEndStillReportsACatalogThatNeverLetGo`, `TestEndRerendersAStagedTrialTheConfigStillNames`, `TestEndDoesNotWriteAConfigTheTrialNeverTouched`, `TestTrialGateRefusesAZeroIdleWindow`, `TestTrialGateRefusesAZeroMinFree`, `TestResumeRefusesADifferentRevisionOrDest`, `TestResumeRestagesADefTheIncumbentChanged`, `TestWarmErrorsAreStrippedOfControlCharacters`, `TestMeasureNeverWritesTheCellsSharedProbeState` |
 
 **Mutation-verified predicates (12).** Each production line reverted,
@@ -427,6 +432,40 @@ syscalls. It is here on the argument, not on a red test.
 | L3 | a real fleetd + announcer: confirm the trial id appears in `fleet_status` for the cell and does NOT appear in the rendered front config; `end`, and confirm it disappears from both | **UNRUN** |
 | L4 | `end` from each of the five journal states, with the config compared byte-for-byte against a pre-trial copy | **UNRUN** |
 | L5 | the magnitude gate: a real GPU, a real 20 GB pull, a real cold start on both sides, and a report a human agrees with | **UNRUN — needs metal.** CPU models are not GPU models (the plan README's standing qualification): nothing in a lab exercises a 6–10 minute cold start or VRAM pressure, and this phase's whole output is a magnitude. |
+
+**L1–L4 now PASS**, on a real four-cell `scripts/fleetlab` (2026-08-06,
+independent review pass, `FLEETLAB_DIR=/tmp/fleetlab-c18rev`). They were
+run against the committed rig FIRST, which is how REV3-4 and REV3-6 were
+found; the transcript below is the run after those fixes. See the
+[third addendum](#adversarial-review-addendum-independent-pass) for what
+the first run actually showed.
+
+- **L1 PASS.** `elapsed to adoption: 8s`; the journal records
+  `catalog: live=true the cell's llama-swap adopted the config`; the
+  cell's `/v1/models` goes from `lab-embed-b` to
+  `lab-embed-b trial-c18`. The `Live` bit is an observation.
+- **L2 PASS.** A 3000-input embedding batch in flight, config touched 3 s
+  in: `HTTP 502 after 34.7s`, i.e. force-closed ~32 s after the reload,
+  with `/running` empty afterwards. C0's hardcoded 30 s drain-then-
+  force-close, watched — so the sentence `--now` prints is describing the
+  real cost, and so is the eviction half.
+- **L3 PASS.** `fleet_status models for bravo: ["lab-embed-b","trial-c18"]`
+  while `does the rendered front config mention trial-c18? 0
+  occurrence(s)`, and the exclusion is LOUD (`vibe router render --cell
+  front` prints the `trial: true` warning by name). After `end`, both
+  reverse: the cell is back to `["lab-embed-b"]` and the leases are
+  `null`.
+- **L4 PASS.** `config restored byte-for-byte: YES` against a copy taken
+  before the trial, plus `no trial in flight on bravo` and the weights
+  kept (no `--purge`).
+
+The two rig hazards the second pass named are handled rather than
+tolerated: the apply now writes the config llama-swap is actually
+started with (`--config`), and `startPort: 5800` is rewritten
+CONTINUOUSLY in the background for the duration of the command rather
+than after it returns — once the config path is right, `try` warms a
+model through the file before it hands control back, so an after-the-fact
+rewrite has already let an upstream bind production's range.
 
 **L1–L4 were NOT RUN, in either session** — and the review pass found
 that the rig as first committed could not have been: it named an
@@ -700,6 +739,181 @@ is true and it is what dirty means; a future phase that wants doctor to
 say "dirty, and it is a trial" needs `defs_dirty` to carry a reason,
 which is a wire change this branch is not making.
 
+## Adversarial-review addendum (independent pass)
+
+The independent pass every other phase in this plan received and C18
+never did — its build agent died on an API error before it ran. **Nine
+findings, two blockers.** All fixed in a fourth commit; every production
+predicate below was mutation-verified (the line reverted, the NAMED test
+confirmed red by reading `go test`'s own exit status, the line restored).
+Four of the five live gates moved from UNRUN to PASS in the process, and
+two of the nine were found by running the rig rather than by reading it.
+
+**REV3-1 (BLOCKER) — the deferral deadlocked against a C11 hold,
+including the trial's own.** `trialDeclareAndWait` waits with
+`unleased: true`, and `awaitConds.evalLeases` counts a hold as a blocking
+lease. `--unleased` skips the waiter's own LEASE holder and cannot skip
+its own HOLD, because a hold is keyed on the reserved holder and every
+hold therefore looks like somebody else's. So the wait standing
+immediately in front of "take a C11 hold on the incumbent" could never be
+satisfied once that hold existed. Two reachable shapes, both reproduced
+on a live lab:
+
+- a trial that took its hold and then failed to apply is journalled at
+  `staged` with `held: true`, and **every resume parks against its own
+  declaration** until the 4 h TTL runs out. That is REV2-2's own
+  sentence — "the re-run parks forever… the trial deadlocks against its
+  own declaration" — still true after REV2-2 fixed the journal half of
+  it;
+- an operator's own hold on the incumbent makes the trial unstartable
+  from the beginning, which means `trialTakeHold`'s "a hold already
+  exists — left alone" branch, and the U12 test named
+  `…InBothDirections`, were reachable only under `--now`.
+
+The only escapes were `--now` (which truncates streams past 30 s and
+evicts every resident model) and `end` (which throws the pull away).
+`awaitConds.holdExempt` names ONE model whose hold does not count; the
+trial sets it to the incumbent. Zero value changes nothing, so
+`vibe cell await --unleased` still respects every hold, and another
+consumer's lease or a hold on a different model still block.
+
+**REV3-2 (BLOCKER) — the apply silently deleted the cell's
+hand-written llama-swap sections, and the rollback did not put them
+back.** `router.Render` merges an extras file and `mergeExtras` maps a
+missing one to "no extras, no error" — a sane default for
+`vibe router render --extras`, and a silent disarming here, because C18
+rendered with the XDG default path and had no flag to say otherwise. On
+any cell whose renders are driven by `--extras <file>` (what
+`scripts/fleetlab` writes, what the reference deploy does) the apply
+dropped whatever that file contributes:
+
+- **`apiKeys:` — C15's llama-swap credential.** The cell stops demanding
+  a key at all for the trial's duration, which is strictly worse than the
+  401 C15 exists to prevent. C19's `renderPass` refuses on exactly this
+  reasoning for the front; C18's apply had no equivalent.
+- **`store: {path: …}`** — the SQLite activity log C7a's ledger and C7b's
+  savings screen are computed from. Without it llama-swap keeps a
+  1000-row in-memory ring and the meter reads ~nothing.
+
+Neither loss appeared anywhere in the trial's output, and `end`'s
+re-render reproduced it, so "the config was restored" was false. Found by
+running the rig: L4's byte-for-byte comparison, once it compared the
+right file, came back NO with `store:` missing. Now `--extras` exists,
+and — the actual guard — both the apply and the rollback PROVE the render
+first and refuse a write that would remove a top-level section the config
+has today, naming the sections and the flag. An unparseable config is a
+refusal too, not "nothing to lose".
+
+**REV3-3 (major) — `Plan`'s resume path performed no disk check at
+all.** §7's refusals ("an unknown size is not a small one", the
+headroom) live in `Plan`'s FRESH branch, and `resume` returns before
+them. The commonest resume there is — a killed twenty-minute pull,
+journal at `planned`, a `.partial` on disk, hours elapsed — re-entered
+`Fetch` unchecked, and the library filesystem is exactly the thing that
+may have filled in between. That is the failure §7 names: not "the
+download fails" but "the download succeeds and llama-swap, the activity
+store and the next pull all stop". Reproduced live: a re-run with
+`--min-free 100000` and no `--skip-disk-check` went straight to the
+download, where a fresh `Plan` would have refused twice over.
+
+**REV3-4 (major) — the apply could not name the config llama-swap
+reads, and misdiagnosed when it guessed wrong.** `newTrialRunner`
+hardcoded `llamaSwapConfigPath()`; `vibe router render` has had `--out`
+since C0 and llama-swap takes its file from `-config`. On every deploy
+that does not use the XDG default the apply wrote a file nothing serves —
+and then reported NOT LIVE naming exactly one cause, "a llama-swap
+started without `-watch-config`", and prescribed a restart that comes
+back reading the same file it always read. Proven by the phase's own
+rig: `gate-c18.sh` ran end to end and **L1 timed out at 60 s while L4
+compared a file the command had never touched**, both looking like
+results. `--config` on `try` and `end`, and the not-live note now names
+the path it wrote and both causes.
+
+**REV3-5 (major) — the probe's response body reached the journal and
+the terminal unscrubbed.** REV2-11 scrubbed `warm`'s 512-byte snippet at
+the point of capture and stopped there. `measureOne` also stores
+`modelprobe`'s note, and `modelprobe.postJSON` embeds up to **4096 raw
+bytes** of llama-swap's body in the error it returns — the same untrusted
+socket, eight times the budget — into a `Measurement` that is SAVED to
+the journal and re-printed by `Comparison.Render` and by every later
+`vibe model try status`. C8 renders its notes through fleetd's own
+hygiene; C18 stores them, so the rule has to be held here.
+
+**REV3-6 (major, rig) — `gate-c18.sh`'s premises were wrong for the
+second time, and its startPort mitigation could not work.** Beyond
+REV3-4's config path: the `--dry-run` comparison was vacuous, the
+`fix_startport` backstop rewrote a file `try` never touched, and — once
+the config path is corrected — fixing `startPort` AFTER the command
+returns is too late, because the apply waits for llama-swap to adopt the
+file and then warms a model through it, so the upstream binds
+production's 5800 range while the rig is still blocked. `sport_guard`
+rewrites continuously in the background, inside llama-swap's own 2 s
+poll, with `fix_startport` kept as the fatal backstop. L2's batch also
+went from 200 inputs to 3000: after the measurement the incumbent is
+warm, and a batch that finishes in under a second measures nothing about
+a reload (the first corrected run reported `curl: (23)` from `head`
+closing the pipe, which reads exactly like a force-close and is not one).
+
+**REV3-7 (minor) — `end` left behind a llama-swap config on a box that
+had none.** `bankConfig` records the absence explicitly and its own
+comment says End "removes the file it created rather than restoring bytes
+that never existed" — End re-rendered instead. The comment described the
+opposite of the code, which is REV-3's class again. Observed on a real
+lab cell: after `end` reported "trial closed", a 573-byte config existed
+at a path that had none before, naming every model on the cell and
+`startPort: 5800`. `Trial.ConfigCreated` is journalled (the process that
+undoes it is usually a later one) and `End` removes the file, never on
+the `staged` branch where the file is somebody else's render.
+
+**REV3-8 (minor) — operator strings reached the scaffolded def
+unescaped.** The coordinate is interpolated verbatim into the def's
+HEADER — a comment block, where a newline ends the comment and the rest
+becomes YAML — and into the journal, which `status` re-prints to a
+terminal forever. `validateAwaitFlags` already holds this rule for the
+fields it forwards to fleetd; C18 held it only for the def NAME, the one
+string it derives rather than carries. `checkPrintable` refuses control
+characters in the repo, `--file`, `--revision`, `--as` and `--dest`
+before the journal is opened.
+
+**REV3-9 (minor, pre-existing) — a flaky `deadAddr` reddened this PR's
+CI.** `go test -race ./...` failed once in ~25 runs on
+`TestMCPUnloadUnreachableCellQueues` with `HTTP 404` from an address the
+helper had declared dead: `deadAddr` listens on `:0`, reads the port and
+closes, handing it straight back to the kernel, and a binary that stands
+up dozens of `httptest` servers can be given that exact port microseconds
+later. Not C18's code (C6, `cc98389`) and not C18's to own — but a green
+CI on this PR is, and a test that fails 4% of the time is the class this
+plan already paid a phase for. All three copies now return `127.0.0.1:1`,
+which nothing in the binary can bind and which is already the idiom these
+tests use for an unreachable front.
+
+**Mutation-verified predicates (11).** `holdExempt`'s call site and its
+guard in `evalLeases` (two mutations); `refuseDroppedSections` in `Apply`
+and in `End` (two), plus the unparseable-config refusal;
+`bankConfig`'s `ConfigCreated` and `End`'s removal branch, in both
+directions (three); the resume disk check; the two-cause not-live note;
+`printableSnippet` on the probe note; `checkPrintable`.
+
+**Also looked at and found sound**, so a later pass need not re-derive
+it: the C15 AST scans really are directory-scoped to `fleetapi` and
+`fleetmcp`, and `modeltry`'s unauthenticated loopback requests match C8's
+cell-side prober and C16's `ReadOwnSwapVersion` exactly; `resolveAliases`
+skips a self-alias so the trial's `alias: <own name>` is inert and the
+front-render exclusion happens before `resolveAliases` runs at all;
+`modelprobe.ReadOnly` covers every write path (`saveLocked` is the only
+one) and the daemon's budget is respected read-side; every response body
+is drained and closed and no goroutine outlives the command; `vibe fleet
+doctor` runs clean with a trial open (45 checks, 0 FAIL).
+
+**Named rather than fixed.** `end --purge` removes the weights and a
+`.partial` sibling but not the `.incomplete` file or `.cache/` directory
+the `hf` CLI can leave in the destination dir — on a 20 GB abandoned pull
+that is 20 GB of residue `--purge` claims to have removed.
+`hfdownload.HeadSize` uses `http.DefaultClient` with no timeout rather
+than the injected client, so `Plan` can hang on a HEAD. And
+`resolveFleetd` still runs AFTER the twenty-minute pull, which is a
+partial application of C10's issue-the-refusal-first rule.
+
 ## For the reconciliation pass
 
 Everything below belongs in a shared doc this branch may not touch
@@ -833,14 +1047,56 @@ Everything below belongs in a shared doc this branch may not touch
 >     `Authorization` header — C15 §8's cell-side posture, same as C8's
 >     prober and `ReadOwnSwapVersion`. Do not invent a credential
 >     resolver here; C15's futures item owns it.
+>   - **An apply must never REMOVE a section of the cell's config.**
+>     `router.Render` merges hand-written sections from an extras file
+>     and `mergeExtras` treats a missing extras file as "no extras, no
+>     error", so a trial rendered with the wrong `--extras` silently
+>     deleted `apiKeys:` (C15's llama-swap credential — the cell then
+>     demands no key at all) and `store:` (C7a's activity log), and the
+>     rollback's re-render re-created the loss. Both the apply and `end`
+>     now prove the render first and refuse a write that drops a
+>     top-level key the config has today; an unparseable config is a
+>     refusal, not "nothing to lose". This is C19's `renderPass` gate,
+>     which had the same reasoning for the front.
+>   - **`--config` and `--extras` are flags, not assumptions.**
+>     llama-swap reads whatever its `-config` names and `vibe router
+>     render` has had `--out` since C0; an apply that guessed the XDG
+>     default wrote a file nothing served and then blamed
+>     `-watch-config`. The not-live note names the path it wrote and both
+>     causes.
+>   - **`--unleased` cannot skip a C11 HOLD.** It skips the waiter's own
+>     LEASE holder, and a hold is keyed on the reserved holder, so every
+>     hold looks like somebody else's. C18's deferral waits with
+>     `unleased` immediately before placing a hold on the incumbent, so
+>     it deadlocked against its own declaration on every resume and
+>     against an operator's hold from the start.
+>     `awaitConds.holdExempt` names one model; zero value changes
+>     nothing, so `vibe cell await --unleased` still respects every hold.
+>   - **§7's disk refusals are re-evaluated on RESUME.** They lived only
+>     in the fresh-plan branch, and the commonest resume of all is a
+>     killed twenty-minute pull — the library filesystem is exactly what
+>     may have filled in between.
 
 ### For `docs/design/fleet-control-plan/README.md`
 
 Table row:
 
 ```
-| [C18](c18-model-try.md) | `vibe model try`: the churn loop as one command | ~1400 lines | C0, C2, C4, C8, C10, C11, C14 (composition) | PR open; feature + self-review + adversarial-review commits (7 + 11 findings, one blocker each); unit gates U1-U14 green, 23 predicates mutation-verified; **live gates L1-L4 UNRUN — the rig as first committed could not run and has been corrected but not executed; L5 needs metal** |
+| [C18](c18-model-try.md) | `vibe model try`: the churn loop as one command | ~1400 lines | C0, C2, C4, C8, C10, C11, C14 (composition) | PR open; feature + self-review + 2nd-pass + independent-review commits (7 + 11 + 9 findings, 4 blockers); unit gates U1-U14 green, 34 predicates mutation-verified; **L1-L4 PASS** (harness, 2026-08-06), L5 needs metal |
 ```
+
+The independent pass's two blockers are the ones worth carrying into the
+prose: `--unleased` cannot skip a C11 HOLD (it only skips its own lease
+holder), so C18's deferral stood in front of a hold C18 was itself about
+to place and deadlocked on every resume; and `router.Render`'s extras
+merge treats a missing extras file as "no extras, no error", so an apply
+rendered with the wrong extras path silently DELETED the cell's
+`apiKeys:` and `store:` sections and the rollback re-created the loss. It
+also earned the plan's standing sentence one more time: **running the rig
+is not the same as reading it.** Two of the nine — including the
+`apiKeys:` blocker — were invisible until `gate-c18.sh` was executed, and
+executing the rig as committed is what showed that L1 and L4 had been
+measuring a file the command never wrote.
 
 And a paragraph in the phase-notes prose:
 
@@ -897,6 +1153,21 @@ protocol.
 > production's upstream range on this box — so the rig re-applies
 > lab.sh's rewrite after every render and exits rather than continue if
 > it does not take.
+
+### For `internal/vibe/fleetmirror/mirror_test.go` — resolved on this branch
+
+C19's phase doc left a note for whoever merged C18: `paths.ModelTrialFile()`
+would fail `TestMirrorCoversEveryFleetStateFile` until classified, and the
+right answer looked like a `notFleetState` entry. **Verified against C18's
+code rather than taken on faith, and C19's note is right.** `vibe model try`
+refuses the front cell structurally (`Runner.refuseStructural`), so the
+journal is never written on the front host at all; and every path it
+records — the weights, the trial def, the cell's rendered llama-swap
+config — is on the box that will serve the model. Restoring it onto a
+standby would be worse than losing it: `status` would report a trial whose
+files are on the box that died, and `end` would re-render the standby's
+config on the strength of it. The entry is in `notFleetState` with that
+sentence, and its absence was confirmed to turn the test red.
 
 ### Cross-branch note
 

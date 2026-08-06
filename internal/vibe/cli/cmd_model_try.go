@@ -69,7 +69,7 @@ func modelCmd() *cobra.Command {
 func modelTryCmd() *cobra.Command {
 	var (
 		file, revision, like, as, dest, apiFlag string
-		cellFlag                                string
+		cellFlag, configFlag, extrasFlag        string
 		quiet, waitFor                          time.Duration
 		now, dryRun, skipDisk                   bool
 		minFreeGB                               float64
@@ -96,7 +96,7 @@ func modelTryCmd() *cobra.Command {
 			if err := validateTrialGate(quiet, minFreeGB, now); err != nil {
 				return err
 			}
-			runner, err := newTrialRunner(minFreeGB)
+			runner, err := newTrialRunner(minFreeGB, configFlag, extrasFlag)
 			if err != nil {
 				return err
 			}
@@ -115,6 +115,8 @@ func modelTryCmd() *cobra.Command {
 	cmd.Flags().StringVar(&as, "as", "", "trial def name (default: trial-<repo>)")
 	cmd.Flags().StringVar(&dest, "dest", "", "directory for the weights (default: beside the --like def's weights)")
 	cmd.Flags().StringVar(&cellFlag, "cell", "", "the cell to try on; must be this box's own cell (cross-cell try is not implemented)")
+	cmd.Flags().StringVar(&configFlag, "config", "", "this cell's llama-swap config — the file its `-config` names (default: the path `vibe router render` writes)")
+	cmd.Flags().StringVar(&extrasFlag, "extras", "", "the router extras file this cell's renders use (apiKeys:, store:); a trial that renders without it would delete those sections")
 	cmd.Flags().StringVar(&apiFlag, "api", "", "fleetd base URL (default: $VIBE_API, hosts.yaml fleetd_url, or the local daemon)")
 	cmd.Flags().DurationVar(&quiet, "idle", modeltry.DefaultQuiet, "how long this cell must be observed idle before the config is applied")
 	cmd.Flags().DurationVar(&waitFor, "wait", 2*time.Hour, "how long to wait for that idle window (0 waits forever)")
@@ -133,7 +135,7 @@ func modelTryStatusCmd() *cobra.Command {
 		Short: "Show the in-flight trial on this cell and how to end it.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			runner, err := newTrialRunner(0)
+			runner, err := newTrialRunner(0, "", "")
 			if err != nil {
 				return err
 			}
@@ -154,8 +156,10 @@ func modelTryStatusCmd() *cobra.Command {
 
 func modelTryEndCmd() *cobra.Command {
 	var (
-		purge   bool
-		apiFlag string
+		purge      bool
+		apiFlag    string
+		configFlag string
+		extrasFlag string
 	)
 	cmd := &cobra.Command{
 		Use:   "end",
@@ -169,7 +173,7 @@ func modelTryEndCmd() *cobra.Command {
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmdContext(cmd)
-			runner, err := newTrialRunner(0)
+			runner, err := newTrialRunner(0, configFlag, extrasFlag)
 			if err != nil {
 				return err
 			}
@@ -186,6 +190,12 @@ func modelTryEndCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&purge, "purge", false, "also delete the downloaded weights")
 	cmd.Flags().StringVar(&apiFlag, "api", "", "fleetd base URL (default: $VIBE_API, hosts.yaml fleetd_url, or the local daemon)")
+	// The same flag `try` takes, because `agreesWithJournal` refuses a
+	// rollback whose config path is not the one the trial applied to: a
+	// trial started with --config must be ended with it, and the refusal
+	// names both values so the operator can see which.
+	cmd.Flags().StringVar(&configFlag, "config", "", "this cell's llama-swap config — must match the trial's (default: the path `vibe router render` writes)")
+	cmd.Flags().StringVar(&extrasFlag, "extras", "", "the router extras file this cell's renders use; the rollback falls back to the banked bytes rather than re-rendering without it")
 	return cmd
 }
 
@@ -217,7 +227,16 @@ func validateTrialGate(quiet time.Duration, minFreeGB float64, now bool) error {
 // newTrialRunner resolves everything from the same sources the render
 // path uses, so a trial's config write and `vibe router render` can never
 // disagree about which cell this box is or which binary it renders.
-func newTrialRunner(minFreeGB float64) (*modeltry.Runner, error) {
+//
+// configPath overrides the llama-swap config the apply writes. It is a
+// flag rather than an assumption because `vibe router render` has had
+// `--out` since C0 and llama-swap takes its file from `-config`: on every
+// deploy that does not use the XDG default — the reference fleet's
+// containerised front, `scripts/fleetlab`, anything with a systemd unit
+// naming a path — an apply that guessed the default writes a file nothing
+// reads, and then reports NOT LIVE and prescribes a restart that comes
+// back reading the same file it always read.
+func newTrialRunner(minFreeGB float64, configPath, extrasPath string) (*modeltry.Runner, error) {
 	cfg, err := daemon.LoadConfig()
 	if err != nil {
 		return nil, err
@@ -233,12 +252,23 @@ func newTrialRunner(minFreeGB float64) (*modeltry.Runner, error) {
 	if minFreeGB > 0 {
 		minFree = int64(minFreeGB * (1 << 30))
 	}
+	if extrasPath == "" {
+		extrasPath = routerExtrasPath()
+	}
+	if configPath == "" {
+		configPath = llamaSwapConfigPath()
+	} else if abs, aerr := filepath.Abs(configPath); aerr == nil {
+		// Absolute, because the journal is read by a later process with a
+		// different working directory and `agreesWithJournal` compares the
+		// two strings.
+		configPath = abs
+	}
 	return modeltry.New(modeltry.Options{
 		Cell:              cfg.Fleet.Cell,
 		Hosts:             hosts,
 		BackendsDir:       paths.BackendsDir(),
-		ConfigPath:        llamaSwapConfigPath(),
-		ExtrasPath:        routerExtrasPath(),
+		ConfigPath:        configPath,
+		ExtrasPath:        extrasPath,
 		LlamaServerBinary: resolveLlamaServerBinary(""),
 		LlamaSwapURL:      fmt.Sprintf("http://127.0.0.1:%d", cfg.ProxyPort),
 		StatePath:         paths.ModelTrialFile(),
@@ -389,6 +419,18 @@ func trialDeclareAndWait(ctx context.Context, out io.Writer, runner *modeltry.Ru
 		idle:     gate.quiet,
 		unleased: true,
 		lease:    leaseClaim{holder: modeltry.TrialLeaseHolder},
+		// --unleased skips the waiter's own LEASE holder and cannot skip
+		// its own HOLD, because a hold is keyed on the reserved holder and
+		// every hold therefore looks like somebody else's. The hold this
+		// wait is standing in front of is the one on the INCUMBENT, and it
+		// is either this trial's (a resumed trial that took it and then
+		// failed to apply parks against its own declaration, forever) or
+		// the operator's (which `trialTakeHold` honours by name three
+		// lines below — a branch that was reachable only under --now).
+		// Exempting exactly that model leaves every other consumer's lease
+		// and every other model's hold blocking, which is what the wait is
+		// for.
+		holdExempt: t.Incumbent,
 	}
 	if gate.now {
 		// C14's force: about tonight's conditions, never about
