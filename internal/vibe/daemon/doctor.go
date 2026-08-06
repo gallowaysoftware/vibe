@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +16,7 @@ import (
 	"github.com/gallowaysoftware/vibe/internal/buildinfo"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetmirror"
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"github.com/gallowaysoftware/vibe/internal/vibeclient"
 )
@@ -33,6 +36,8 @@ func (d *Daemon) doctorHost() fleetapi.DoctorHost {
 		FrontConfig:   d.cfg.Fleet.FrontConfig,
 		FrontExtras:   d.cfg.Fleet.FrontExtras,
 		FrontImage:    d.cfg.Fleet.FrontImage,
+		MirrorMaxAge:  d.cfg.Fleet.MirrorMaxAge,
+		Mirror:        mirrorFacts(),
 		TokenMinted:   d.tokenMinted.Load(),
 		EnvTokenSet:   strings.TrimSpace(os.Getenv("VIBE_TOKEN")) != "",
 		Version:       buildinfo.String(),
@@ -44,6 +49,26 @@ func (d *Daemon) doctorHost() fleetapi.DoctorHost {
 		h.DefsSHA, h.DefsDirty = v.DefsSHA, v.DefsDirty
 	}
 	return h
+}
+
+// mirrorFacts reads the receipt `vibe fleet mirror` leaves in this
+// daemon's own state dir (fleet-control C19). A READ, on the doctor
+// path: nothing here writes, and a missing receipt is nil rather than a
+// zero-valued run — beside a declared fleet.mirror_max_age the
+// difference is a FAIL versus an OK.
+func mirrorFacts() *fleetapi.MirrorFacts {
+	rc, err := fleetmirror.ReadReceipt(paths.StateHome())
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return &fleetapi.MirrorFacts{ReadErr: err.Error()}
+	}
+	return &fleetapi.MirrorFacts{
+		At: rc.At, Archive: rc.Archive, Dest: rc.Dest, Files: rc.Files, Bytes: rc.Bytes,
+		Missing: rc.Missing, Errors: rc.Errors, Gaps: rc.Gaps, Warnings: rc.Warnings,
+		Credentials: rc.Credentials,
+	}
 }
 
 // diskFreeBytes reports free bytes on the filesystem holding path.

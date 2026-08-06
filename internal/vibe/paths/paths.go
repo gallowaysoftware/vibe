@@ -126,8 +126,18 @@ func NotifyScopeFile() string { return filepath.Join(StateHome(), "fleet", "noti
 // (fleet-control C18). Cell-side because every step it records happened on
 // this box — the weights, the def, the rendered llama-swap config — and
 // because the rollback has to be reachable from the box that can perform
-// it, in a later process, after a reboot, without fleetd.
+// it, in a later process, after a reboot, without fleetd. It is therefore
+// deliberately NOT in C19's mirror (see notFleetState): a journal restored
+// onto a standby would describe files on the box that died.
 func ModelTrialFile() string { return filepath.Join(StateHome(), "fleet", "model-trial.json") }
+
+// MirrorReceiptFile records the last `vibe fleet mirror` run
+// (fleet-control C19). It lives in the state dir fleetd already reads so
+// `vibe fleet doctor` can answer "is the off-host mirror fresh" with no
+// new mount, no new route and no network call — a stale backup being the
+// classic failure of the whole idea. Written by the mirror command,
+// never by the daemon.
+func MirrorReceiptFile() string { return filepath.Join(StateHome(), "fleet", "mirror-receipt.json") }
 
 // TokenFile is the path to the daemon's bearer-token file. The token lives in
 // $XDG_STATE_HOME/vibe rather than $XDG_CONFIG_HOME because it's a generated

@@ -164,6 +164,14 @@ type DoctorHost struct {
 	// how the fleet's llama-swap changes without anybody deciding to.
 	// UnmanagedFrontImage is the declaration that there is no image.
 	FrontImage string
+	// MirrorMaxAge is fleet.mirror_max_age: how fresh the off-host state
+	// mirror is declared to be (C19). UnmanagedMirror declares that
+	// something else backs this host up; empty is UNKNOWN.
+	MirrorMaxAge string
+	// Mirror is the last recorded `vibe fleet mirror` run, read from the
+	// state dir by the daemon half. nil means no receipt exists — which
+	// beside a declared max age is a FAIL, not an absence.
+	Mirror *MirrorFacts
 	// TokenMinted reports that this start CREATED the control-plane token
 	// rather than loading one. On fleetd that is the signature of a
 	// container recreate over an unmounted state dir.
@@ -226,6 +234,7 @@ func (s *Server) Doctor(ctx context.Context) DoctorReport {
 
 	s.checkFleetd(&rep, snap, host)
 	s.checkFrontImage(&rep, host)
+	s.checkMirror(&rep, host, rep.GeneratedAt)
 	s.checkAuth(ctx, &rep, snap, pres, host)
 	s.checkVersions(ctx, &rep, snap, pres, host)
 	s.checkDisk(&rep, pres, host)

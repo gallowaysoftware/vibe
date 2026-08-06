@@ -201,12 +201,27 @@ Medium:
     bench corpus). Makes "new release dropped" answerable against
     *your* workload. The invariant-violating version — live shadow
     routing at the front — stays dead.
-12. **Front failover identity** — a DNS name for :9000 (so a spare
-    box can assume it), rendered config + compose + nightly
-    fleetd-state tarball mirrored off the front host, and a half-page
-    cold-standby runbook (the gpu-cell can run `llama-swap:cpu` with
-    the same peers file in ~10 minutes). The front host dying is the
-    one total-fleet outage; don't build HA, write down the path.
+12. **Front failover identity** — **SHIPPED as
+    [C19](fleet-control-plan/c19-front-failover.md) (2026-08-05).**
+    `vibe fleet mirror` (create / verify / restore, stdlib tar+gzip),
+    two doctor checks, `docs/runbooks/front-failover.md`, and a fire
+    drill that kills a real fleetd and times the recovery
+    (`scripts/fleetlab/gate-c19-drill.sh`: 10.1 s to a standby with the
+    same token, the same declared intent and a byte-identical ledger).
+    Three notes worth carrying. **"Don't build HA" is an invariant, not
+    a budget decision**: an automatic promotion is the silent rerouting
+    the design forbids, so the mechanism's whole contribution to the
+    two-boxes-answering problem is a REFUSAL — `restore` dials the
+    fleet's own addresses and stops. **The mirror cannot live in
+    fleetd**, because it has to keep running when fleetd is what broke,
+    and fleetd cannot see the host paths its own state is mounted from;
+    it is a host command on a timer, and the only thing fleetd does is
+    read the receipt it leaves. And **enumerating the state was most of
+    the work and produced a correction**: C8's probe baselines and the
+    C7a cursor are CELL-side and do not die with the front, while the
+    ledger, the intent store, the leases and the rendered front config
+    do — `TestMirrorCoversEveryFleetStateFile` scans `paths.go` so the
+    next phase's state file cannot quietly fall outside the archive.
 13. **The upgrade ritual** — **SHIPPED as
     [C16](fleet-control-plan/c16-upgrade-ritual.md) (2026-08-05).**
     Digest-pinned front image as the shipped default,
