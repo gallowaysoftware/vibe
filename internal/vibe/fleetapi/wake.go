@@ -34,8 +34,14 @@ type WakeSpec struct {
 // defaultWakeBroadcast is the canonical magic-packet destination.
 const defaultWakeBroadcast = "255.255.255.255:9"
 
-// wakeCmdTimeout bounds the fallback command.
-const wakeCmdTimeout = 30 * time.Second
+// wakeCmdTimeout bounds the fallback command. A var, not a const, for
+// the reason warmLoopConfig.tick is a field: SendWake takes no config
+// struct (it is the shared delivery path for the HTTP endpoint, the MCP
+// facade and the sleep schedule's wake half), so this is the only seam a
+// test can dial down — and a 30-second deadline no test can shorten is a
+// deadline no test ever reaches. Production never assigns it; the wake
+// verbs read it and nothing else does.
+var wakeCmdTimeout = 30 * time.Second
 
 // wakeRequest is the POST /api/fleet/wake body.
 type wakeRequest struct {

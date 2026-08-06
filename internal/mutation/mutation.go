@@ -341,6 +341,111 @@ var Registry = []Mutation{
 		Why: "an ntfy topic URL is bearer-equivalent. The sink unwraps *url.Error AND scrubs, and " +
 			"both guards are pinned individually — neither may be deleted because 'the other one covers it'.",
 	},
+
+	// ── class 4: a deadline that is present but never reached ─────────
+	//
+	// Every entry below was verified by hand in the U5 pass and is here
+	// because the class is invisible to ordinary tests: this repo's whole
+	// vocabulary for "unreachable" is an immediate ECONNREFUSED or a DNS
+	// failure, both of which return in microseconds. A bound that was
+	// deleted outright would not have failed a single test in the suite
+	// before these — the far side always answered too fast to need it.
+	{
+		Name:     "u5/a zero warmTimeout seam becomes an already-expired context",
+		File:     "internal/vibe/fleetapi/warmtarget.go",
+		Find:     "func warmBound(d time.Duration) time.Duration {\n\tif d <= 0 {\n\t\treturn warmTimeout\n\t}\n\treturn d\n}",
+		Replace:  "func warmBound(d time.Duration) time.Duration {\n\treturn d\n}",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestU5_WarmRestoreDefaultsToTheProductionWarmTimeout"},
+		Why: "the seam that lets a test dial the warm bound down is also the way to break every " +
+			"production warm at once: context.WithTimeout(bg, 0) is already expired, so an unset " +
+			"field would turn a 10-minute cold-start allowance into an instant deadline-exceeded " +
+			"on every restore — and the piggyback queue would then carry the failure to the cell.",
+	},
+	{
+		Name:     "u5/a zero suspendTimeout seam becomes an already-expired context",
+		File:     "internal/vibe/fleetapi/sleepsched.go",
+		Find:     "func suspendBound(d time.Duration) time.Duration {\n\tif d <= 0 {\n\t\treturn suspendTimeout\n\t}\n\treturn d\n}",
+		Replace:  "func suspendBound(d time.Duration) time.Duration {\n\treturn d\n}",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestU5_ScheduledSuspendDefaultsToTheProductionSuspendTimeout"},
+		Why: "same shape as the warm seam, on the verb that takes a box off the fleet. An expired " +
+			"context makes every scheduled suspend report `failed` in microseconds, every night, " +
+			"while the box keeps drawing its idle watts and the audit stays green.",
+	},
+	{
+		Name:     "u5/a wedged suspend RPC stops dying with the server",
+		File:     "internal/vibe/fleetapi/sleepsched.go",
+		Find:     "ctx, cancel := s.warmCtx(suspendBound(cfg.suspendTimeout))",
+		Replace:  "ctx, cancel := context.WithCancel(context.Background())",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestU5_AWedgedSuspendDoesNotHoldClose"},
+		Why: "warmCtx is what links a bound to s.done. Unlinked, a fleetd asked to shut down while " +
+			"a suspend RPC is wedged waits the full 90s on wg.Wait() — on the one goroutine holding " +
+			"a box's power state open. CC-2 fixed exactly this for the warm and the suspend was built later.",
+	},
+	{
+		Name:     "u5/the sleep return grace shrinks inside the stale window",
+		File:     "internal/vibe/fleetapi/sleepsched.go",
+		Find:     "const sleepReturnGrace = 2 * time.Minute",
+		Replace:  "const sleepReturnGrace = 30 * time.Second",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestU5_TheReturnGraceOutlastsTheWindowWhereADeadBoxStillReadsFresh"},
+		Why: "cellPresent reads an announce as present until staleAfter(interval) — 50s at the " +
+			"default cadence — so a box suspended at T still reads PRESENT for the next fifty " +
+			"seconds. A grace inside that window makes the entry forget it suspended the box, on " +
+			"the evidence of a heartbeat that predates the suspend. The relation to staleAfter is " +
+			"what makes this a guard rather than a literal: the two other grace tests name the " +
+			"constant and would stay green at two seconds.",
+	},
+	{
+		Name:     "u5/an absent cell is reconciled to awake",
+		File:     "internal/vibe/fleetapi/sleepsched.go",
+		Find:     "if st.asleep && present && !hasSleep && time.Since(st.asleepSince) > sleepReturnGrace {",
+		Replace:  "if st.asleep && !hasSleep && time.Since(st.asleepSince) > sleepReturnGrace {",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestU5_TheReturnGraceNeedsBothHalvesOfTheEvidence"},
+		Why: "class 1 again, in the sleep half: the grace expiring is necessary, never sufficient. " +
+			"Without the presence conjunct a box that is still asleep — which is the whole point — " +
+			"has its record cleared two minutes in, and fleet_status then reports a sleeping box as " +
+			"watching. Absence of evidence became evidence of return.",
+	},
+	{
+		Name:     "u5/the warm schedule's warm loses its deadline",
+		File:     "internal/vibe/fleetapi/warmsched.go",
+		Find:     "ctx, cancel := s.warmCtx(warmTimeout)",
+		Replace:  "ctx, cancel := context.WithCancel(context.Background())",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestU5_WarmScheduleCarriesTheSameWarmTimeout"},
+		Why: "class 3: warmTimeout has THREE consumers (the warm target, the warm schedule, the " +
+			"post-wake warms) and the seam added in U5 only reaches the first. The other two are " +
+			"pinned by reading the deadline back out of the context they hand their warm, which is " +
+			"the only assertion available without waiting ten minutes.",
+	},
+	{
+		Name:     "u5/the post-wake warms lose the warm half of their bound",
+		File:     "internal/vibe/fleetapi/sleepsched.go",
+		Find:     "ctx, cancel := s.warmCtx(e.WakeGrace + warmTimeout)",
+		Replace:  "ctx, cancel := s.warmCtx(e.WakeGrace)",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestU5_PostWakeWarmsCarryTheGraceAndTheWarmTimeout"},
+		Why: "the wake sequence builds ONE context for the whole run, and the warms sit at the far " +
+			"end of it. Bounded by the grace alone, every 07:15 warm starts with a context that the " +
+			"return wait has already consumed — the warms fail instantly and get queued to the cell " +
+			"as if the front had refused them.",
+	},
+	{
+		Name:     "u5/the wake fallback command stops honouring its caller's context",
+		File:     "internal/vibe/fleetapi/wake.go",
+		Find:     "ctx, cancel := context.WithTimeout(ctx, wakeCmdTimeout)",
+		Replace:  "ctx, cancel := context.WithTimeout(context.Background(), wakeCmdTimeout)",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestU5_TheWakeFallbackCommandDiesWithItsCallersContext"},
+		Why: "the sleep schedule calls SendWake with a warmCtx, so the fallback command is how a " +
+			"wake reaches Close(). Rooted at Background it is bounded only by its own 30s timeout, " +
+			"and a shutdown during the morning wake waits half a minute per wedged cell. The " +
+			"one-character version of this bug is invisible to every other test in the package.",
+	},
 }
 
 // ── tree copying and patching ────────────────────────────────────────
