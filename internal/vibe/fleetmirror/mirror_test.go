@@ -243,8 +243,15 @@ func TestCreate_NoSecretsDropsTheTokensAndTheRenderedFront(t *testing.T) {
 	if bytes.Contains(decompress(t, read(t, rc.Archive)), []byte("TOKEN-VALUE-fleet-root")) {
 		t.Error("--no-secrets archive contains the token anyway")
 	}
-	if len(m.Warnings) == 0 {
-		t.Error("dropping the token silently is worse than not dropping it: no warning was recorded")
+	// A dropped credential is a GAP, not a warning: it is the difference
+	// between an archive that restores the fleet and one that leaves the
+	// recovery a re-key, and `vibe fleet doctor` scores gaps (review
+	// REV-4). Warnings are advisory and stay green.
+	if !containsSubstr(m.Gaps, "state/token") {
+		t.Errorf("dropping the token silently is worse than not dropping it: gaps were %v", m.Gaps)
+	}
+	if containsSubstr(m.Warnings, "--no-secrets") {
+		t.Errorf("a capture gap was filed as an advisory warning: %v", m.Warnings)
 	}
 }
 
@@ -611,9 +618,27 @@ func TestRestore_DoesNotOverwriteWithoutBeingAsked(t *testing.T) {
 	mkdirs(t, sb.state)
 	write(t, filepath.Join(sb.state, "token"), "A-LIVE-FLEETS-TOKEN", 0o600)
 
-	rep, err := Restore(sb.opts(rc.Archive))
+	// The whole state slot already present: nothing to write, nothing to
+	// mix, so this is a report and not a refusal.
+	all := newStandby(t)
+	for _, rel := range []string{"token", "fleet/intent.json", "fleet/usage.jsonl"} {
+		write(t, filepath.Join(all.state, filepath.FromSlash(rel)), "ALREADY-HERE", 0o600)
+	}
+	allOpts := RestoreOptions{Archive: rc.Archive, StateDir: all.state}
+	repAll, err := Restore(allOpts)
 	if err != nil {
-		t.Fatalf("restore: %v", err)
+		t.Fatalf("a fully-present state slot is a report, not a refusal: %v", err)
+	}
+	if repAll.Wrote != 0 {
+		t.Errorf("wrote %d files over an existing state dir", repAll.Wrote)
+	}
+	if !hasAction(repAll, "state/token", "exists") {
+		t.Error("the skip was not reported")
+	}
+
+	rep, err := Restore(sb.opts(rc.Archive))
+	if !errors.Is(err, ErrPartialState) {
+		t.Fatalf("a partial restore over an existing token was allowed: %v", err)
 	}
 	if got := string(read(t, filepath.Join(sb.state, "token"))); got != "A-LIVE-FLEETS-TOKEN" {
 		t.Fatalf("an existing file was replaced without --overwrite: %q", got)
@@ -696,10 +721,16 @@ func TestTakeoverProbe_QuietWhenNothingAnswers(t *testing.T) {
 	}
 	addr := ln.Addr().String()
 	ln.Close()
-	hits := TakeoverProbe(RestoreOptions{DialTimeout: 500 * time.Millisecond},
+	hits, probed := TakeoverProbe(RestoreOptions{DialTimeout: 500 * time.Millisecond},
 		Identity{FleetdURL: "http://" + addr, FrontURL: "http://" + addr})
 	if len(hits) != 0 {
 		t.Errorf("probe reported %v against a dead address", hits)
+	}
+	// ...and it must say it actually LOOKED. "Nothing answered" and
+	// "there was nothing to dial" are the same empty hit list and
+	// completely different evidence (review REV-3).
+	if len(probed) != 2 {
+		t.Errorf("probed = %v, want both recorded addresses", probed)
 	}
 }
 
@@ -923,8 +954,8 @@ func TestCreate_AnEmptyDefsDirIsAWarning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !containsSubstr(m.Warnings, "cannot RENDER") {
-		t.Fatalf("an empty defs dir is the one shape that looks like a good capture and is not; warnings were %v", m.Warnings)
+	if !containsSubstr(m.Gaps, "cannot RENDER") {
+		t.Fatalf("an empty defs dir is the one shape that looks like a good capture and is not; gaps were %v", m.Gaps)
 	}
 	// And a populated one must not warn: a permanent warning on a correct
 	// configuration is one an operator learns to ignore.
@@ -938,8 +969,8 @@ func TestCreate_AnEmptyDefsDirIsAWarning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if containsSubstr(m3.Warnings, "cannot RENDER") {
-		t.Errorf("a defs dir with defs warned anyway: %v", m3.Warnings)
+	if containsSubstr(m3.Gaps, "cannot RENDER") {
+		t.Errorf("a defs dir with defs warned anyway: %v", m3.Gaps)
 	}
 }
 
@@ -951,8 +982,8 @@ func TestCreate_NoConfigDirSaysWhatIsNotInTheArchive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !containsSubstr(m.Warnings, "NOT in this archive") {
-		t.Fatalf("a mirror with no config dir captured nothing and said nothing: %v", m.Warnings)
+	if !containsSubstr(m.Gaps, "NOT in this archive") {
+		t.Fatalf("a mirror with no config dir captured nothing and said nothing: %v", m.Gaps)
 	}
 }
 

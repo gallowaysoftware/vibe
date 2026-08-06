@@ -66,7 +66,8 @@ func mirrorFacts() *fleetapi.MirrorFacts {
 	}
 	return &fleetapi.MirrorFacts{
 		At: rc.At, Archive: rc.Archive, Dest: rc.Dest, Files: rc.Files, Bytes: rc.Bytes,
-		Missing: rc.Missing, Errors: rc.Errors, Warnings: rc.Warnings, Credentials: rc.Credentials,
+		Missing: rc.Missing, Errors: rc.Errors, Gaps: rc.Gaps, Warnings: rc.Warnings,
+		Credentials: rc.Credentials,
 	}
 }
 

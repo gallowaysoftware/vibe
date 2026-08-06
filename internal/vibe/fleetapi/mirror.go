@@ -32,13 +32,19 @@ const mirrorStaleFactor = 3
 // half exactly as the rest of DoctorHost is — fleetapi has never read a
 // file and this phase does not change that.
 type MirrorFacts struct {
-	At          time.Time
-	Archive     string
-	Dest        string
-	Files       int
-	Bytes       int64
-	Missing     []string
-	Errors      []string
+	At      time.Time
+	Archive string
+	Dest    string
+	Files   int
+	Bytes   int64
+	Missing []string
+	Errors  []string
+	// Gaps are things the archive was supposed to carry and does not
+	// (--no-secrets, no config dir, no backend defs, a guest token outside
+	// the mirrored state dir). Distinct from Warnings because a gap is the
+	// difference between an archive that restores the fleet and one that
+	// does not, and it must not render green.
+	Gaps        []string
 	Warnings    []string
 	Credentials bool
 	// ReadErr is set when a receipt EXISTS and could not be understood.
@@ -168,6 +174,32 @@ func (s *Server) checkMirror(rep *DoctorReport, host DoctorHost, now time.Time) 
 			Detail:  strings.Join(f.Errors, "; ") + ifNotEmpty(". ", det),
 			Fix: "the archive is partial: whatever it could not read is not backed up. Usually a permission " +
 				"(fleetd's container writes its state as root; the mirror must run as a user that can read it)."})
+		return
+	}
+	// A GAP is not an absence: it is something the mirror set out to carry
+	// and did not — --no-secrets dropping the control-plane token, no
+	// config dir so hosts.yaml never entered the archive, no backend defs
+	// so the standby cannot render. Each leaves an archive that cannot do
+	// the one thing this phase exists for, and each was previously folded
+	// into a green OK with the reason in the detail nobody reads. Absent
+	// evidence must never render as a healthy value.
+	if len(f.Gaps) > 0 {
+		rep.Add(DoctorCheck{ID: "mirror.contents", Level: LevelWarn,
+			Summary: fmt.Sprintf("the last mirror captured %d files and left %d gap(s)", f.Files, len(f.Gaps)),
+			Detail:  strings.Join(f.Gaps, "; ") + ifNotEmpty(". ", det),
+			Fix: "each gap is something a recovery from this archive would have to do by hand. Drop --no-secrets, " +
+				"pass --config-dir, or point --state-dir at the dir fleetd actually uses. " + mirrorFix})
+		return
+	}
+	// Zero entries is the wrong-directory signature: every path looked for
+	// was somewhere else. It cannot restore anything and must not read as
+	// a successful run.
+	if f.Files == 0 {
+		rep.Add(DoctorCheck{ID: "mirror.contents", Level: LevelWarn,
+			Summary: "the last mirror captured NO files",
+			Detail:  ifNotEmpty("", det),
+			Fix: "an empty archive restores nothing. Check --state-dir and --config-dir point at the directories " +
+				"fleetd actually uses (the container's bind-mount source, not the XDG defaults). " + mirrorFix})
 		return
 	}
 	sum := fmt.Sprintf("last mirror captured %d files (%s)", f.Files, humanBytes(f.Bytes))

@@ -2,6 +2,7 @@ package fleetmirror
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
@@ -80,6 +81,14 @@ func Verify(archive string) (*Manifest, error) {
 
 	var problems []error
 	for _, e := range m.Entries {
+		if err := safeName(e.Archive); err != nil {
+			problems = append(problems, err)
+			continue
+		}
+		if err := safeRel(e); err != nil {
+			problems = append(problems, err)
+			continue
+		}
 		got, ok := seen[e.Archive]
 		if !ok {
 			problems = append(problems, errors.New(e.Archive+": in the manifest, missing from the archive"))
@@ -126,6 +135,31 @@ func safeName(name string) error {
 		}
 	}
 	return nil
+}
+
+// safeRel applies the same rule to the manifest's Rel, which is the
+// field a restore actually JOINS onto --state-dir. safeName guarding
+// only Entry.Archive was a guard in one of two paths: a manifest with a
+// harmless `archive` and a `rel` of "../../.." wrote wherever it liked,
+// with the mode the manifest asked for. The archive is untrusted input —
+// it comes off a backup target, which is the one machine in this design
+// that is neither the front nor a cell.
+func safeRel(e Entry) error {
+	if err := safeName(e.Rel); err != nil {
+		return errors.New(e.Archive + ": rel " + err.Error())
+	}
+	return nil
+}
+
+// inside reports whether p lands within root once both are cleaned.
+// (mirror.go's `under` answers the same question with its arguments the
+// other way round; this one reads in the direction the plan loop asks
+// it.) It is the belt to safeRel's braces: the check that actually
+// matters is where the path is JOINED, and it costs nothing to make it
+// there too.
+func inside(root, p string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(p))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // RestoreOptions places an archive's slots on the standby box. Every
@@ -176,13 +210,35 @@ type RestoreReport struct {
 	Manifest *Manifest     `json:"manifest"`
 	Actions  []Action      `json:"actions"`
 	Takeover []TakeoverHit `json:"takeover,omitempty"`
-	Wrote    int           `json:"wrote"`
-	DryRun   bool          `json:"dry_run"`
+	// Probed is every address the takeover probe was able to DIAL. It is
+	// reported rather than counted silently because an empty probe and a
+	// quiet one are the same absence of hits and completely different
+	// evidence.
+	Probed []string `json:"probed,omitempty"`
+	// Preserved names append-only files that were moved aside instead of
+	// being replaced.
+	Preserved []string `json:"preserved,omitempty"`
+	Wrote     int      `json:"wrote"`
+	DryRun    bool     `json:"dry_run"`
 }
 
 // ErrTakeover is returned when something still answers on the fleet's
 // own addresses.
 var ErrTakeover = errors.New("the fleet's address still answers")
+
+// ErrNoProbeTargets is returned when the manifest recorded no address
+// the probe could dial. The takeover refusal is this phase's whole
+// contribution to the two-boxes-answering problem, and a probe with
+// nothing to aim at returns the same empty hit list as a probe that
+// found the old front dead. Reporting the second when it means the first
+// is absent evidence wearing a healthy value — this repo's oldest
+// mistake, six occurrences before this one.
+var ErrNoProbeTargets = errors.New("nothing to probe: the mirror recorded no fleetd or front address")
+
+// ErrPartialState is returned when a restore would leave a state or
+// config dir holding SOME of this archive's files beside files that were
+// already there. See Restore.
+var ErrPartialState = errors.New("this box already holds part of a fleet's state")
 
 // TakeoverProbe dials the addresses the manifest recorded as the
 // fleet's identity and reports which of them answer.
@@ -200,7 +256,13 @@ var ErrTakeover = errors.New("the fleet's address still answers")
 // ALREADY moved the address to this box and started something on it, the
 // probe reaches itself and refuses. That is why the runbook's order is
 // restore first, address second, and why --force exists.
-func TakeoverProbe(opts RestoreOptions, id Identity) []TakeoverHit {
+// It returns the hits AND every address it was able to dial. The second
+// return is not decoration: a manifest whose identity records no URL —
+// hosts.yaml absent at mirror time, `fleetd_url` unset (it is
+// `omitempty`), no `front` cell declared — yields an empty hit list that
+// is indistinguishable from "the old box is dead", and the caller must
+// be able to tell those apart.
+func TakeoverProbe(opts RestoreOptions, id Identity) ([]TakeoverHit, []string) {
 	timeout := opts.DialTimeout
 	if timeout <= 0 {
 		timeout = 2 * time.Second
@@ -220,11 +282,13 @@ func TakeoverProbe(opts RestoreOptions, id Identity) []TakeoverHit {
 		}
 	}
 	var hits []TakeoverHit
+	var probed []string
 	for _, t := range targets {
 		addr := dialAddr(t.raw)
 		if addr == "" {
 			continue
 		}
+		probed = append(probed, addr)
 		conn, err := dial("tcp", addr, timeout)
 		if err != nil {
 			continue
@@ -232,7 +296,7 @@ func TakeoverProbe(opts RestoreOptions, id Identity) []TakeoverHit {
 		conn.Close()
 		hits = append(hits, TakeoverHit{What: t.what, Addr: addr})
 	}
-	return hits
+	return hits, probed
 }
 
 // dialAddr turns a recorded URL (or a bare host:port) into something
@@ -271,7 +335,9 @@ func Restore(opts RestoreOptions) (*RestoreReport, error) {
 	rep := &RestoreReport{Manifest: m, DryRun: opts.DryRun}
 
 	if !opts.Force {
-		if hits := TakeoverProbe(opts, m.Identity); len(hits) > 0 {
+		hits, probed := TakeoverProbe(opts, m.Identity)
+		rep.Probed = probed
+		if len(hits) > 0 {
 			rep.Takeover = hits
 			var names []string
 			for _, h := range hits {
@@ -283,20 +349,30 @@ func Restore(opts RestoreOptions) (*RestoreReport, error) {
 				"If this is the standby answering on an address you already moved, re-run with --force",
 				ErrTakeover, strings.Join(names, ", "))
 		}
+		if len(probed) == 0 {
+			return rep, fmt.Errorf("%w (fleetd_url and the front cell's url are both absent or unparseable). "+
+				"The probe found nothing to dial, which is NOT the same as finding the old front dead — and this "+
+				"refusal is the only mechanical thing standing between you and two fleetds folding the same "+
+				"cumulative totals into two ledgers. Pass --probe-addr host:port for the old front, or --force "+
+				"once you have confirmed it is down by hand",
+				ErrNoProbeTargets)
+		}
 	}
 
+	// dest answers where an entry goes, or why it does not go anywhere.
 	dest := func(e Entry) (string, string) {
+		root := ""
 		switch e.Slot {
 		case SlotState:
 			if opts.StateDir == "" {
 				return "", "no --state-dir given"
 			}
-			return filepath.Join(opts.StateDir, filepath.FromSlash(e.Rel)), ""
+			root = opts.StateDir
 		case SlotConfig:
 			if opts.ConfigDir == "" {
 				return "", "no --config-dir given"
 			}
-			return filepath.Join(opts.ConfigDir, filepath.FromSlash(e.Rel)), ""
+			root = opts.ConfigDir
 		case SlotFront:
 			if e.Rel == "config.yaml" {
 				if opts.FrontConfig == "" {
@@ -311,19 +387,35 @@ func Restore(opts RestoreOptions) (*RestoreReport, error) {
 		default:
 			return "", "extras are restored by hand: they came from absolute paths on the old host"
 		}
+		return filepath.Join(root, filepath.FromSlash(e.Rel)), ""
+	}
+	// root is the directory a slot's entries must land inside. Empty for
+	// the front slot, whose two destinations are named files.
+	root := func(s Slot) string {
+		switch s {
+		case SlotState:
+			return opts.StateDir
+		case SlotConfig:
+			return opts.ConfigDir
+		default:
+			return ""
+		}
 	}
 
 	// Plan first, write second. Every refusal an operator could hit is
 	// decided before the first byte lands, so a restore either happens or
 	// does not — it never stops halfway with a state dir holding one
 	// fleet's token and another fleet's intent.
-	type job struct {
-		e    Entry
-		dest string
-	}
-	var jobs []job
+	var jobs []restoreJob
+	kept := map[Slot][]string{}
 	for _, e := range m.Entries {
 		if err := safeName(e.Archive); err != nil {
+			return rep, err
+		}
+		// Verify already ran safeRel over every entry; repeating it here is
+		// the "find every producer" habit applied to one function — Restore
+		// is the only caller today, and the join is two lines below.
+		if err := safeRel(e); err != nil {
 			return rep, err
 		}
 		d, why := dest(e)
@@ -335,7 +427,11 @@ func Restore(opts RestoreOptions) (*RestoreReport, error) {
 			rep.Actions = append(rep.Actions, Action{Archive: e.Archive, Slot: e.Slot, Mode: e.Mode, Status: status, Note: why})
 			continue
 		}
+		if r := root(e.Slot); r != "" && !inside(r, d) {
+			return rep, fmt.Errorf("%s: rel %q lands outside %s — refusing", e.Archive, e.Rel, r)
+		}
 		if _, err := os.Stat(d); err == nil && !opts.Overwrite {
+			kept[e.Slot] = append(kept[e.Slot], d)
 			rep.Actions = append(rep.Actions, Action{Archive: e.Archive, Dest: d, Slot: e.Slot, Mode: e.Mode,
 				Status: "exists", Note: "already present; --overwrite to replace"})
 			continue
@@ -345,8 +441,28 @@ func Restore(opts RestoreOptions) (*RestoreReport, error) {
 			status = "would-write"
 		}
 		rep.Actions = append(rep.Actions, Action{Archive: e.Archive, Dest: d, Slot: e.Slot, Mode: e.Mode, Status: status})
-		jobs = append(jobs, job{e: e, dest: d})
+		jobs = append(jobs, restoreJob{e: e, dest: d})
 	}
+
+	// A slot is all or nothing. Skipping the files that already exist and
+	// writing the ones that do not produces exactly the hybrid this
+	// function's own comment says it never produces: this box's token
+	// beside the archive's intent.json, a fleetd that authenticates as one
+	// fleet and holds another's declarations. Nothing downstream would
+	// ever notice — every file parses. So the mix is refused BEFORE the
+	// first byte, and the two clean answers stay available: --overwrite
+	// (replace it all) or an empty destination.
+	for _, s := range []Slot{SlotState, SlotConfig} {
+		if len(kept[s]) == 0 || !slotHasJob(jobs, s) {
+			continue
+		}
+		return rep, fmt.Errorf("%w: %s/ already holds %s, and this archive would add others beside them. "+
+			"A state dir with this box's token and another fleet's intent is a fleetd that authenticates as one "+
+			"fleet and acts on another's declarations, and nothing downstream notices. Restore into an empty "+
+			"directory, or pass --overwrite to replace what is there",
+			ErrPartialState, s, strings.Join(kept[s], ", "))
+	}
+
 	if opts.DryRun {
 		return rep, nil
 	}
@@ -355,24 +471,48 @@ func Restore(opts RestoreOptions) (*RestoreReport, error) {
 	if err != nil {
 		return rep, err
 	}
+	// Verify read the archive; this read it again. Between the two the
+	// file could have been replaced — by another mirror run finishing,
+	// by a half-copied file on a network mount, by anything — and then
+	// what lands on the standby is not what was checked. Every payload is
+	// re-hashed HERE, before the first write: doing it inside the write
+	// loop meant a tampered last entry aborted a restore that had already
+	// placed six files, which is the half-restored state dir the plan
+	// step exists to prevent.
 	for _, j := range jobs {
 		data, ok := payload[j.e.Archive]
 		if !ok {
-			return rep, errors.New(j.e.Archive + ": vanished between verify and restore")
+			return rep, errors.New(j.e.Archive + ": vanished between verify and restore — nothing written")
 		}
-		// Verify read the archive; this read it again. Between the two the
-		// file could have been replaced — by another mirror run finishing,
-		// by a half-copied file on a network mount, by anything — and then
-		// what lands on the standby is not what was checked. Cheap to
-		// close, and "verified" is a claim this command makes to somebody
-		// mid-incident.
 		sum := sha256.Sum256(data)
 		if got := hex.EncodeToString(sum[:]); got != j.e.SHA256 {
-			return rep, fmt.Errorf("%s: content changed after verification (manifest %s, now %s) — nothing further written",
+			return rep, fmt.Errorf("%s: content changed after verification (manifest %s, now %s) — nothing written",
 				j.e.Archive, short(j.e.SHA256), short(got))
 		}
+	}
+
+	appendOnly := appendOnlyDests()
+	for _, j := range jobs {
+		data := payload[j.e.Archive]
 		if err := os.MkdirAll(filepath.Dir(j.dest), 0o755); err != nil {
 			return rep, err
+		}
+		// C7a's ledger is append-only and irreplaceable: cells announce
+		// CUMULATIVE totals, so rows that go do not come back. --overwrite
+		// replacing it with an older copy is a silent, permanent data loss,
+		// so anything the archive does not already contain is moved aside
+		// first and named in the report. When the on-disk file is a prefix
+		// of the archived one the archive is a strict superset and nothing
+		// is at risk, so no sidecar is made.
+		if appendOnly[j.e.Archive] {
+			side, err := preserveAppendOnly(j.dest, data)
+			if err != nil {
+				return rep, err
+			}
+			if side != "" {
+				rep.Preserved = append(rep.Preserved, side)
+				markPreserved(rep, j.e.Archive, side)
+			}
 		}
 		mode := j.e.Mode.Perm()
 		if mode == 0 {
@@ -387,6 +527,61 @@ func Restore(opts RestoreOptions) (*RestoreReport, error) {
 		rep.Wrote++
 	}
 	return rep, nil
+}
+
+// restoreJob is one planned write, decided before any byte lands.
+type restoreJob struct {
+	e    Entry
+	dest string
+}
+
+func slotHasJob(jobs []restoreJob, s Slot) bool {
+	for _, j := range jobs {
+		if j.e.Slot == s {
+			return true
+		}
+	}
+	return false
+}
+
+// preserveAppendOnly moves an existing append-only file aside when the
+// bytes about to replace it would lose rows. Returns the sidecar path,
+// or "" when nothing needed preserving.
+func preserveAppendOnly(dest string, incoming []byte) (string, error) {
+	existing, err := os.ReadFile(dest) //nolint:gosec // the destination this restore was asked to write
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("%s: cannot read the append-only file this restore would replace: %w", dest, err)
+	}
+	if bytes.HasPrefix(incoming, existing) {
+		// The archive contains everything on disk and then some: replacing
+		// it loses nothing.
+		return "", nil
+	}
+	side := dest + ".pre-restore-" + time.Now().UTC().Format("20060102T150405Z")
+	for i := 1; ; i++ {
+		if _, err := os.Stat(side); errors.Is(err, fs.ErrNotExist) {
+			break
+		}
+		if i > 99 {
+			return "", errors.New(dest + ": cannot find an unused name to preserve the append-only file under")
+		}
+		side = fmt.Sprintf("%s.pre-restore-%s-%d", dest, time.Now().UTC().Format("20060102T150405Z"), i)
+	}
+	if err := os.Rename(dest, side); err != nil {
+		return "", err
+	}
+	return side, nil
+}
+
+func markPreserved(rep *RestoreReport, archive, side string) {
+	for i := range rep.Actions {
+		if rep.Actions[i].Archive == archive {
+			rep.Actions[i].Note = "append-only: the file that was here is preserved at " + side
+		}
+	}
 }
 
 func writeFileMode(dest string, data []byte, mode fs.FileMode) error {

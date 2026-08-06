@@ -309,14 +309,23 @@ Unit (mechanical, in-repo):
 | U21 | *(review)* two runs inside one second produce two archives, both verifiable | PASS (mutation-verified) |
 | U22 | *(review)* the undeclared branch never renders a zero or future timestamp as an age, and still reports a usable one | PASS (mutation-verified) |
 | U23 | *(review)* the manifest is the FIRST entry in the archive | PASS |
+| U24 | *(review 2)* a manifest `rel` that escapes its slot is refused by `verify` AND by `restore`, and nothing is written outside the slot root | PASS (mutation-verified) |
+| U25 | *(review 2)* `--overwrite` never destroys the append-only ledger: a divergent copy is preserved and named; a strict prefix makes no sidecar | PASS (mutation-verified) |
+| U26 | *(review 2)* a manifest with no dialable address makes `restore` refuse rather than proceed; `--probe-addr` and `--force` are the two escapes, and a recorded address is still probed | PASS (mutation-verified) |
+| U27 | *(review 2)* `--probe-addr` reaches `RestoreOptions` (a registered-but-unwired flag fails) | PASS (mutation-verified) |
+| U28 | *(review 2)* a capture GAP is not a green `mirror.contents`, an advisory warning still is, and zero captured files is not a successful run | PASS (mutation-verified) |
+| U29 | *(review 2)* a restore that would mix this box's state with the archive's is refused before the first byte; a fully-present slot is still a report | PASS (mutation-verified) |
+| U30 | *(review 2)* a payload that changed after verification writes NOTHING, not "nothing further" | PASS (mutation-verified) |
+| U31 | *(review 2)* the second archive of a second is the newest one: `--keep` does not delete it and `Newest` returns it | PASS (mutation-verified) |
 
 Live (a real fleet, or the harness):
 
 | # | gate | result |
 |---|---|---|
-| L1 | the fire drill end to end against a real four-cell fleetlab: mirror → refusal → SIGKILL → restore → standby → timings → survival | **PASS** — see Execution |
+| L1 | the fire drill end to end against a real four-cell fleetlab: mirror → refusal → SIGKILL → restore → standby → timings → survival | **PASS** — see Execution (feature commit; the second review pass could not re-run it, see its addendum) |
 | L2 | the same drill on real hardware: the gpu-cell box as the standby, the pinned image pulled, DNS repointed, cells re-announcing across a LAN | **UNRUN** — needs the fleet (SSH blocked, the LAN does not route from here) |
 | L3 | a real off-host destination (NFS/CIFS mount) over a week of nightly timer runs, with `mirror.age` moving OK → WARN when the timer is stopped | **UNRUN** — wall clock, not hardware |
+| L4 | *(review 2)* the five refusals driven through the real `vibe fleet mirror` binary against a synthetic front-host state dir | **PASS** — see Execution |
 
 ## Execution
 
@@ -553,6 +562,225 @@ Gates re-run after the fixes: `go build ./...`, `go vet ./...`,
 `gofmt -l .` silent, `go mod tidy` byte-identical, `golangci-lint run`
 **0 issues**, `go test -race ./...` green across the module, `-count=5`
 green on `fleetmirror`, `fleetapi`, `daemon` and `cli`.
+
+### Adversarial-review addendum (independent pass)
+
+Ground rule 9's second reviewer, run against `cc77d0a`. Seven findings,
+one of them a data-loss blocker and one an arbitrary-write blocker.
+Every fix below is mutation-verified: the production line reverted, the
+NAMED test observed red, the line restored.
+
+**REV-1 (blocker) — `restore` wrote wherever the manifest's `rel` said.**
+`safeName` guarded `Entry.Archive`. The field a restore actually JOINS
+onto `--state-dir` is `Entry.Rel`, and nothing looked at it — so an
+archive with a harmless `archive` of `state/token` and a `rel` of
+`../../../../…` placed the file anywhere the restoring user could write,
+with the mode the manifest asked for. A guard in one of two paths is not
+a guard, and the path it was missing from is the one that writes.
+
+The archive is untrusted input. It is not a cell and it is not the
+front: it comes off a backup target, the machine in this design with the
+weakest claim to being trusted, and the runbook has an operator restore
+whichever archive `verify` liked. `Verify` now rejects a traversing
+`rel` (so the read-only command catches it first), `Restore` re-checks
+it, and the join is additionally asserted to land inside its slot root.
+
+*Mutation:* remove both `safeRel` calls →
+`TestRestore_RefusesAManifestRelThatEscapesItsSlot` fails at the
+`verify` assertion. Restored.
+
+**REV-2 (blocker) — `--overwrite` destroyed the append-only ledger.**
+`usage.jsonl` is the one file in the state dir that cannot be rebuilt:
+cells announce CUMULATIVE totals, so a row that goes does not come back
+and C7b's payback bars are computed from what is left. `restore
+--overwrite` replaced it with the archive's copy like any other file, so
+a second restore from an older archive — the natural move when the
+newest one has errors, which is what the runbook's step 2 tells you to
+do — silently truncated the fleet's whole accounting history.
+
+The receiving side now knows which files are append-only, from the same
+`knownState()` table `Create` captures from rather than from the
+manifest (an archive written by an older build gets the same
+protection). If what is on disk is a prefix of the archive's copy the
+archive is a strict superset and nothing is at risk; otherwise the
+existing file is moved to `usage.jsonl.pre-restore-<stamp>`, named in
+the report, and printed by the command. Nothing is destroyed and the
+restore is still coherent.
+
+*Mutation:* disable the append-only branch →
+`TestRestore_PreservesTheAppendOnlyLedgerItWouldReplace` fails. A second
+test, `TestRestore_ExtendingTheLedgerNeedsNoSidecar`, keeps the fix from
+leaving a file behind on every correct restore. Restored.
+
+**REV-3 (blocker) — the takeover refusal was disarmed by an absent
+address.** `TakeoverProbe` dials `fleetd_url` and the `front` cell's
+`url` out of the manifest. `fleetd_url` is `omitempty` and a fleet need
+not declare a `front` cell, so a manifest can record nothing dialable at
+all — and the probe then returns the same empty hit list it returns when
+the old front is genuinely dead. `Restore` read that as "safe to
+proceed".
+
+This is the phase's ENTIRE contribution to the two-boxes-answering
+problem, and it is this repo's oldest defect class (absent evidence
+wearing a healthy value, now seven occurrences) sitting on the one guard
+whose failure the design says nothing else would ever notice. The probe
+now reports what it was able to dial, `Restore` refuses when that is
+empty, and `--probe-addr host:port` is the escape that is still a probe.
+`--force` is unchanged.
+
+*Mutations:* remove the empty-probe refusal →
+`TestRestore_RefusesWhenThereWasNothingToProbe` fails; and separately,
+drop `ProbeAddrs` from the CLI's `RestoreOptions` (it was registered as a
+flag before it was wired — a switch an operator flips mid-incident with
+no effect) →
+`TestFleetMirrorRestore_ProbeAddrFlagReachesTheProbe` fails.
+`TestRestore_ARecordedAddressIsStillProbed` proves the fix did not turn
+the probe off for fleets that do declare an address. Restored.
+
+**REV-4 (major) — a capture GAP rendered as a green `mirror.contents`.**
+The mirror's `Warnings` list mixed two different things: advisory notes
+that are true of a correct fleet (the front is on a literal IP — this
+house's is), and gaps, meaning something the mirror set out to carry and
+did not. `--no-secrets` dropping the control-plane token, no config dir
+so `hosts.yaml` never entered the archive, no backend defs so the
+standby cannot render — each leaves an archive that cannot do the one
+thing this phase exists for, and all of them scored OK with the reason
+in a detail line. A doctor whose reward is a screen of green is exactly
+where that mistake is cheapest to make (C13).
+
+`Gaps` is now its own field on the manifest, the receipt and
+`MirrorFacts`; `mirror.contents` WARNs on gaps and stays OK for
+advisory warnings. Zero captured files — the wrong-`--state-dir`
+signature — is also no longer a successful run.
+
+*Mutation:* disable both branches →
+`TestMirrorContents_ACaptureGapIsNotOK` and
+`TestMirrorContents_AnEmptyArchiveIsNotOK` fail. Restored.
+
+**REV-5 (major) — a partial restore blended two fleets into one state
+dir.** `Restore`'s own comment claimed it "never stops halfway with a
+state dir holding one fleet's token and another fleet's intent". The
+exists-skip produced precisely that: a standby that already had its own
+`token` kept it and took the archive's `intent.json`, `leases.json` and
+ledger beside it. Every file parses, so nothing downstream ever notices;
+the result is a fleetd that authenticates as one fleet and acts on
+another's declarations. A slot is now all or nothing — the mix is
+refused before the first byte, and both clean answers stay available
+(`--overwrite`, or an empty destination). A slot whose files are ALL
+already present is still a report, not a refusal.
+
+*Mutation:* disable the rule →
+`TestRestore_RefusesToMixTwoFleetsInOneStateDir` fails. Restored.
+
+**REV-6 (major) — the "nothing written" claim was written half a
+restore late.** The feature pass's own REV-1 added a re-hash of each
+payload against the manifest, and put it INSIDE the write loop. Entries
+are sorted, `state/token` sorts last, so a tampered token aborted a
+restore that had already placed six files — the half-restored state dir
+the plan step exists to prevent, and the error text says "nothing
+further written" while the previous reviewer's test only checked that
+the *token* had not landed. A test asserting less than its name claims,
+guarding a fix that was correct in substance and misplaced by one scope.
+Every payload is now verified before the first write.
+
+*Mutation:* move the re-hash back inside the write loop →
+`TestRestore_WritesNothingWhenAPayloadChangedAfterVerification` fails
+with "wrote 6 files before noticing". Restored.
+
+**REV-7 (major) — `--keep` deleted the archive it had just written.**
+`…Z-1.tar.gz` compares LOWER than `…Z.tar.gz` (`-` is 0x2D, `.` is
+0x2E), so the plain lexical sort called the second run of a second the
+OLDEST archive in the directory. With `--keep 1` prune therefore deleted
+the archive whose path had gone into the receipt one line earlier —
+leaving `mirror.age` reporting a fresh mirror that is not on disk — and
+`Newest` handed `restore <dir>` the older of the two. The feature pass
+added the collision suffix and its test (`TwoRunsInOneSecondDoNotCollide`)
+proved both files exist; neither it nor the ordering knew about the
+other. Sorting is now by (stamp, collision counter).
+
+*Mutation:* revert `newerFirst` to a string compare →
+`TestArchiveOrder_TheSecondRunOfASecondIsTheNewer` fails on both halves.
+Restored.
+
+**REV-8 (minor, rig) — the drill's cleanup trap was installed after the
+damage.** `gate-c19-drill.sh` rewrites the lab's `config.yaml` in step 0
+and SIGKILLs fleetd and the front in step 3, but installed
+`trap cleanup EXIT` in step 4. Any `die` in between — a mirror that
+failed, a takeover guard that did not fire, a fleetd that survived the
+kill — left the lab's config rewritten with nothing queued to put it
+back, and the backup is only taken when the file does not already
+mention `mirror_max_age`, so the next run would not re-take it. The trap
+now goes in before the first mutation. Step 2 also grew a `2b` that
+asserts REV-5's refusal against the real lab.
+
+Two things this pass looked at and left alone:
+
+- **The takeover probe still dials only fleetd and the front, not the
+  cells.** Correct: the cells are supposed to be up, and probing them
+  would turn every healthy fleet into a refusal.
+- **`vibe fleet mirror` writes its receipt into the live state dir.**
+  It is a write from a host command into a directory fleetd owns, which
+  looks like a layering violation and is the only way `mirror.age` can
+  exist without a new mount or route. It is one atomic rename of one
+  file fleetd only ever reads.
+
+Gates re-run after these fixes: `go build ./...`, `go vet ./...`,
+`gofmt -l .` silent, `go mod tidy` byte-identical, `golangci-lint run`
+**0 issues**, `go test -race -count=5 ./...` green across the module
+(exit status read directly, not through a pipe).
+
+**The fire drill was NOT re-run for this pass** — see L4 below for what
+was run instead, and why it is not the same thing.
+
+#### L4 PASS — the five refusals against the real binary, 2026-08-06
+
+No fleetlab was standing (`lab.sh` was down and its fixed ports free,
+but the drill is DISRUPTIVE and a sibling wave-2 agent shares this box),
+so this pass drove `vibe fleet mirror` from a built binary against a
+synthetic front-host state dir in a scratch directory. Nothing here
+touched production's llama-swap `:9000` or the vibe daemon `:9001`.
+
+```
+=== mirror ===
+wrote .../fleet-mirror-20260806T022236Z.tar.gz (7 files, 2868 bytes)
+  contains the control-plane token: this archive is as sensitive as the front host.
+  warnings:
+    - the front is addressed by literal IP (http://127.0.0.1:19000) …
+=== verify ===
+OK: 7 entries, every sha256 matches.
+
+A. restore onto a fresh standby
+   takeover probe: 127.0.0.1:19001, 127.0.0.1:19000 answered nothing   <- REV-3: it says it LOOKED
+   restored 7 files.
+
+B. something answers on the front's address
+   STILL ANSWERING: the front at 127.0.0.1:19000
+   vibe: the fleet's address still answers … (nothing written)
+
+C. --overwrite over a LONGER append-only ledger                        <- REV-2
+   PRESERVED: … usage.jsonl.pre-restore-20260806T022250Z (it was not a prefix of the archive's copy)
+   live ledger:      2 rows (the archive's)
+   preserved sidecar: 4 rows (the box's own) — nothing destroyed
+
+D. a state dir that already holds this box's token                     <- REV-5
+   vibe: this box already holds part of a fleet's state: state/ already holds …/token
+   token after: THIS-BOXES-OWN-TOKEN     (and no intent.json beside it)
+
+E. a mirror whose hosts.yaml declared no address                       <- REV-3
+   vibe: nothing to probe: the mirror recorded no fleetd or front address …
+   wrote: 0 entries
+   with --probe-addr 127.0.0.1:19099:
+   takeover probe: 127.0.0.1:19099 answered nothing
+   written  state/fleet/intent.json …
+```
+
+**What this is not.** No cells, no announces, no SIGKILL, no timing, no
+second process assuming an identity. It exercises the five decisions this
+review changed, through the real CLI, on real files — and nothing about
+whether a fleet comes back. L1's drill remains the only evidence for
+that, and it ran against the feature commit, not this one. Step 2b of
+`gate-c19-drill.sh` (REV-5's refusal against a live lab) is written and
+**unwatched**.
 
 ## For the reconciliation pass
 

@@ -167,6 +167,7 @@ func fleetMirrorRestoreCmd() *cobra.Command {
 		overwrite   bool
 		dryRun      bool
 		force       bool
+		probeAddrs  []string
 	)
 	cmd := &cobra.Command{
 		Use:   "restore <archive|dir>",
@@ -188,6 +189,7 @@ func fleetMirrorRestoreCmd() *cobra.Command {
 				Archive: archive, StateDir: stateDir, ConfigDir: configDir,
 				FrontConfig: frontConfig, FrontExtras: frontExtras,
 				Overwrite: overwrite, DryRun: dryRun, Force: force,
+				ProbeAddrs: probeAddrs,
 			})
 			if rep != nil {
 				printRestore(cmd.OutOrStdout(), rep)
@@ -202,6 +204,8 @@ func fleetMirrorRestoreCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&overwrite, "overwrite", false, "replace files that already exist on this box")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the plan and write nothing")
 	cmd.Flags().BoolVar(&force, "force", false, "skip the takeover probe (only when you have confirmed the old front is down)")
+	cmd.Flags().StringArrayVar(&probeAddrs, "probe-addr", nil,
+		"host:port the old front answers on, when the mirror recorded no address to probe; repeatable")
 	return cmd
 }
 
@@ -232,6 +236,7 @@ func printMirror(w io.Writer, m *fleetmirror.Manifest, rc *fleetmirror.Receipt) 
 	}
 	printList(w, "missing (not present on this host)", m.Missing)
 	printList(w, "ERRORS (these files are NOT backed up)", m.Errors)
+	printList(w, "GAPS (this archive cannot restore these)", m.Gaps)
 	printList(w, "warnings", m.Warnings)
 	if len(m.References) > 0 {
 		fmt.Fprintln(w, "  credentials referenced and deliberately NOT carried:")
@@ -266,6 +271,7 @@ func printManifest(w io.Writer, archive string, m *fleetmirror.Manifest) {
 	}
 	printList(w, "missing", m.Missing)
 	printList(w, "ERRORS", m.Errors)
+	printList(w, "GAPS (this archive cannot restore these)", m.Gaps)
 	printList(w, "warnings", m.Warnings)
 	if len(m.References) > 0 {
 		fmt.Fprintln(w, "\nfetch these from the private fleet repo (paths recorded, values never carried):")
@@ -282,6 +288,9 @@ func printManifest(w io.Writer, archive string, m *fleetmirror.Manifest) {
 func printRestore(w io.Writer, rep *fleetmirror.RestoreReport) {
 	for _, h := range rep.Takeover {
 		fmt.Fprintf(w, "STILL ANSWERING: %s at %s\n", h.What, h.Addr)
+	}
+	if len(rep.Takeover) == 0 && len(rep.Probed) > 0 {
+		fmt.Fprintf(w, "takeover probe: %s answered nothing\n", strings.Join(rep.Probed, ", "))
 	}
 	for _, a := range rep.Actions {
 		dest := a.Dest
@@ -300,6 +309,9 @@ func printRestore(w io.Writer, rep *fleetmirror.RestoreReport) {
 	}
 	if rep.Wrote == 0 {
 		return
+	}
+	for _, p := range rep.Preserved {
+		fmt.Fprintf(w, "PRESERVED: the append-only file that was here is at %s (it was not a prefix of the archive's copy)\n", p)
 	}
 	fmt.Fprintf(w, "\nrestored %d files. Still yours to do:\n", rep.Wrote)
 	fmt.Fprintln(w, "  1. fetch the credential files the manifest lists as references (private fleet repo)")

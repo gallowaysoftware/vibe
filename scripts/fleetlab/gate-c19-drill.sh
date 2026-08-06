@@ -93,6 +93,26 @@ echo "token sha:    $(printf %s "$BEFORE_TOKEN" | sha256sum | cut -c1-12)"
 # fleet.front_image is what the standby has to RUN, and a recovery that
 # pulls a different llama-swap is how it becomes the v247 incident (C16).
 PIN=ghcr.io/mostlygeek/llama-swap:v239-cpu-b9994@sha256:6bae869ec0908538e421172fd576288e87c1bc330acde24517992507218d2c7c
+
+# The trap goes in BEFORE the first mutation, not after step 4. Every
+# `die` between here and the standby coming up used to leave the lab's
+# config.yaml rewritten — and, after step 3, its fleetd dead with nothing
+# queued to put the file back. A rig that can only clean up on the happy
+# path is a rig that leaves the next agent a broken lab.
+KILLED=0
+cleanup() {
+  hr "cleanup"
+  for n in standby-fleetd standby-front; do
+    p=$(cat "$DRILL/run/$n.pid" 2>/dev/null)
+    [[ -n ${p:-} ]] && kill "$p" 2>/dev/null && echo "stopped $n"
+  done
+  [[ -f $DRILL/config.yaml.c19bak ]] && cp "$DRILL/config.yaml.c19bak" "$LAB_ETC_DIR/config.yaml" &&
+    echo "restored the lab's config.yaml"
+  [[ $KILLED == 1 ]] &&
+    echo "the lab's own fleetd and front are still dead: ./lab.sh down && ./lab.sh up"
+  return 0
+}
+trap cleanup EXIT
 if ! grep -q mirror_max_age "$LAB_ETC_DIR/config.yaml"; then
   cp "$LAB_ETC_DIR/config.yaml" "$DRILL/config.yaml.c19bak"
   sed -i "s|^fleet:$|fleet:\n  mirror_max_age: 36h\n  front_image: $PIN|" "$LAB_ETC_DIR/config.yaml"
@@ -120,6 +140,18 @@ fi
 [[ -e $SB_STATE/vibe/token ]] && die "the refusal still wrote files"
 echo "(refused, wrote nothing — correct)"
 
+hr "2b. restore REFUSES to mix this box's state with another fleet's (review REV-5)"
+mkdir -p "$SB_STATE/vibe"
+printf 'THIS-BOXES-OWN-TOKEN' >"$SB_STATE/vibe/token"
+if "$BIN" fleet mirror restore "$MIRROR" --state-dir "$SB_STATE/vibe" --config-dir "$SB_ETC/vibe" \
+     --front-config "$SB_FRONT" --force; then
+  die "a state dir holding one fleet's token took another fleet's intent"
+fi
+[[ -e $SB_STATE/vibe/fleet/intent.json ]] && die "the mixed restore wrote intent.json anyway"
+[[ $(cat "$SB_STATE/vibe/token") == THIS-BOXES-OWN-TOKEN ]] || die "the refusal replaced the token"
+rm -rf "${SB_STATE:?}/vibe"
+echo "(refused, kept this box's token — correct)"
+
 # ────────────────────────────────────────────── 3. the front host dies
 hr "3. SIGKILL fleetd and the front llama-swap (the front host dying)"
 T0=$(date +%s.%N)
@@ -128,6 +160,7 @@ for name in fleetd swap-front; do
   [[ -n ${pid:-} ]] && kill -9 "$pid" 2>/dev/null
   echo "killed $name (pid ${pid:-none})"
 done
+KILLED=1
 sleep 1
 curl -fsS -m 3 "http://127.0.0.1:$FLEETD_PORT/ui/fleet" >/dev/null 2>&1 && die "fleetd survived the kill"
 curl -fsS -m 3 "http://127.0.0.1:$FRONT_PORT/v1/models" >/dev/null 2>&1 && die "the front survived the kill"
@@ -152,25 +185,12 @@ hr "4. restore onto the standby box"
 sed -i "s|front_config: .*|front_config: $SB_FRONT|" "$SB_ETC/vibe/config.yaml"
 
 hr "4b. start the standby front and fleetd on the SAME addresses"
-mkdir -p "$DRILL/run" "$DRILL/logs"
 env CUDA_VISIBLE_DEVICES= "$LLAMA_SWAP" -config "$SB_FRONT" \
   -listen "127.0.0.1:$FRONT_PORT" -watch-config >"$DRILL/logs/standby-front.log" 2>&1 &
 echo $! >"$DRILL/run/standby-front.pid"
 env XDG_CONFIG_HOME="$SB_ETC" XDG_STATE_HOME="$SB_STATE" XDG_RUNTIME_DIR="$DRILL/run/rt" \
   "$BIN" daemon >"$DRILL/logs/standby-fleetd.log" 2>&1 &
 echo $! >"$DRILL/run/standby-fleetd.pid"
-
-cleanup() {
-  hr "cleanup"
-  for n in standby-fleetd standby-front; do
-    p=$(cat "$DRILL/run/$n.pid" 2>/dev/null)
-    [[ -n ${p:-} ]] && kill "$p" 2>/dev/null && echo "stopped $n"
-  done
-  [[ -f $DRILL/config.yaml.c19bak ]] && cp "$DRILL/config.yaml.c19bak" "$LAB_ETC_DIR/config.yaml" &&
-    echo "restored the lab's config.yaml"
-  echo "the lab's own fleetd and front are still dead: ./lab.sh down && ./lab.sh up"
-}
-trap cleanup EXIT
 
 # ─────────────────────────────────────────────────────────── 5. the clock
 hr "5. recovery timings (from the SIGKILL)"

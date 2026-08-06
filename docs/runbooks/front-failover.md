@@ -34,9 +34,26 @@ F=/srv/front-config/config.yaml
    carry, and recomputes every sha256. If it reports errors, take the
    previous archive.
 3. **Restore.** `vibe fleet mirror restore $M --state-dir $S --config-dir $C --front-config $F`
-   It re-runs the verification and **refuses** while anything answers on
-   the fleet's own addresses (step 1, mechanically). `--force` is for the
-   one honest false positive: you already moved the address to this box.
+   It re-runs the verification and **refuses** in three cases, all before
+   it writes a byte:
+   - anything answers on the fleet's own addresses (step 1,
+     mechanically). `--force` is for the one honest false positive: you
+     already moved the address to this box.
+   - the mirror recorded **no address to probe** (`hosts.yaml` had no
+     `fleetd_url` and no `front` cell). Nothing to dial is not the same
+     as finding the old box dead. Name the old front with
+     `--probe-addr host:port`, or `--force` once you have confirmed it by
+     hand.
+   - the destination **already holds part of a fleet's state**. A state
+     dir with this box's token beside another fleet's `intent.json` is a
+     fleetd that authenticates as one fleet and acts on another's
+     declarations, and every file parses so nothing downstream notices.
+     Restore into an empty directory, or `--overwrite`.
+
+   `--overwrite` never destroys the append-only ledger: if what is on
+   disk is not already contained in the archive's copy, the existing file
+   is moved to `usage.jsonl.pre-restore-<stamp>` and named in the output.
+   Concatenate by hand if you need both halves.
 4. **Fetch the credential files** the manifest lists as references
    (`cell_token`, `swap_key`, `notify_url`) from the private fleet repo,
    to the paths it names, mode `0600`. Without them fleetd still
@@ -54,7 +71,10 @@ F=/srv/front-config/config.yaml
    to this box. Cells re-announce within one heartbeat.
 8. **Check.** `vibe fleet doctor` — `fleetd.token` must say *loaded*,
    not *minted*; every cell should be announcing within ~30 s;
-   `mirror.age` will WARN until a mirror runs here.
+   `mirror.age` will WARN until a mirror runs here. `mirror.contents`
+   WARNs on a **gap** — something the mirror set out to carry and did
+   not (`--no-secrets`, no `--config-dir`, no backend defs) — because an
+   archive that cannot restore the fleet must not render green.
 9. **Before the old box comes back:** disable its front and fleetd units
    (`systemctl disable --now`, or `docker compose down` + remove
    `restart: unless-stopped`). It will otherwise answer on an address
@@ -73,6 +93,10 @@ vibe fleet mirror --out /mnt/backup/fleet \
   --include /srv/front --include /srv/fleetd/compose
 ```
 
+- Prefer a **DNS name or at least a declared address**: `restore`'s
+  takeover probe dials `fleetd_url` and the `front` cell's `url` from
+  `hosts.yaml`. If neither is set the probe has nothing to aim at and
+  says so instead of proceeding.
 - `--out` must not be on this host's own disk; the command refuses a
   destination inside the state or config dir, and cannot tell whether a
   path is a remote mount. **A mirror stored on the box it mirrors is not

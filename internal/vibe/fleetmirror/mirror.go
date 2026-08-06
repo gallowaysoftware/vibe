@@ -43,6 +43,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -171,7 +172,18 @@ type Manifest struct {
 	// NotCovered is the fixed list of things no mirror of the front host
 	// can contain.
 	NotCovered []string `json:"not_covered"`
-	Warnings   []string `json:"warnings,omitempty"`
+	// Gaps are the things this archive was SUPPOSED to carry and does
+	// not: --no-secrets drops, a missing config dir, no backend defs, a
+	// guest token outside the mirrored state dir. Separate from Warnings
+	// because they are the difference between an archive that can restore
+	// the fleet and one that cannot, and `vibe fleet doctor` scores them —
+	// a capture gap rendering as a green mirror.contents is this repo's
+	// oldest defect class (absent evidence wearing a healthy value).
+	Gaps []string `json:"gaps,omitempty"`
+	// Warnings are advisory: true of a correct configuration, worth
+	// knowing, not a reason to score the mirror. A permanent WARN on a
+	// healthy fleet is one an operator learns to ignore (C13).
+	Warnings []string `json:"warnings,omitempty"`
 	// Credentials reports that the archive carries at least one secret
 	// file, which makes the archive itself as sensitive as the front
 	// host.
@@ -191,6 +203,7 @@ type Receipt struct {
 	Files       int       `json:"files"`
 	Missing     []string  `json:"missing,omitempty"`
 	Errors      []string  `json:"errors,omitempty"`
+	Gaps        []string  `json:"gaps,omitempty"`
 	Warnings    []string  `json:"warnings,omitempty"`
 	Credentials bool      `json:"credentials"`
 	Host        string    `json:"host,omitempty"`
@@ -254,7 +267,12 @@ type stateFile struct {
 	producer string
 	rel      string
 	secret   bool
-	why      string
+	// appendOnly marks a file whose history is the file: replacing it
+	// with an older copy DESTROYS rows that exist nowhere else. The
+	// restore side reads this table rather than the manifest, so an
+	// archive written by an older build gets the same protection.
+	appendOnly bool
+	why        string
 }
 
 // knownState is derived from paths.go rather than spelled out, so
@@ -268,35 +286,50 @@ func knownState() []stateFile {
 		return filepath.ToSlash(r)
 	}
 	return []stateFile{
-		{"TokenFile", rel(paths.TokenFile()), true,
-			"the control-plane bearer. A standby that mints a fresh one 401s every cell, every client and every MCP registration at once."},
-		{"IntentFile", rel(paths.IntentFile()), false,
-			"declared cell intent (axis 2). Losing it turns every deliberate drain into a DRAINED? mystery and re-arms C9's absence alarms."},
-		{"LastSeenFile", rel(paths.LastSeenFile()), false,
-			"last sightings of absent cells. Losing it makes every away box look newly absent."},
-		{"LeasesFile", rel(paths.LeasesFile()), false,
-			"advisory leases and C11 holds. Losing a hold re-arms the warm policy against a model somebody is evaluating."},
-		{"StartHistoryFile", rel(paths.StartHistoryFile()), false,
-			"cold-start ETAs. Losing it costs accuracy, not correctness."},
-		{"UsageLedgerFile", rel(paths.UsageLedgerFile()), false,
-			"the append-only token ledger. IRREPLACEABLE: cells announce CUMULATIVE totals, so a fresh ledger restarts the running total rather than back-filling, and C7b's payback bars are computed from it."},
-		{"FrontCloudUsageFile", rel(paths.FrontCloudUsageFile()), false,
-			"the cursor for the front's cloud_peer spend. Losing it re-ingests whatever the front's activity log still holds, double-counting that window."},
-		{"NotifyScopeFile", rel(paths.NotifyScopeFile()), false,
-			"the declared away/home notification scope. Losing it delivers holiday alarms."},
-		{"MirrorReceiptFile", rel(paths.MirrorReceiptFile()), false,
-			"the previous mirror's receipt, so a restored fleetd knows how old its own state was."},
+		{producer: "TokenFile", rel: rel(paths.TokenFile()), secret: true,
+			why: "the control-plane bearer. A standby that mints a fresh one 401s every cell, every client and every MCP registration at once."},
+		{producer: "IntentFile", rel: rel(paths.IntentFile()),
+			why: "declared cell intent (axis 2). Losing it turns every deliberate drain into a DRAINED? mystery and re-arms C9's absence alarms."},
+		{producer: "LastSeenFile", rel: rel(paths.LastSeenFile()),
+			why: "last sightings of absent cells. Losing it makes every away box look newly absent."},
+		{producer: "LeasesFile", rel: rel(paths.LeasesFile()),
+			why: "advisory leases and C11 holds. Losing a hold re-arms the warm policy against a model somebody is evaluating."},
+		{producer: "StartHistoryFile", rel: rel(paths.StartHistoryFile()),
+			why: "cold-start ETAs. Losing it costs accuracy, not correctness."},
+		{producer: "UsageLedgerFile", rel: rel(paths.UsageLedgerFile()), appendOnly: true,
+			why: "the append-only token ledger. IRREPLACEABLE: cells announce CUMULATIVE totals, so a fresh ledger restarts the running total rather than back-filling, and C7b's payback bars are computed from it."},
+		{producer: "FrontCloudUsageFile", rel: rel(paths.FrontCloudUsageFile()),
+			why: "the cursor for the front's cloud_peer spend. Losing it re-ingests whatever the front's activity log still holds, double-counting that window."},
+		{producer: "NotifyScopeFile", rel: rel(paths.NotifyScopeFile()),
+			why: "the declared away/home notification scope. Losing it delivers holiday alarms."},
+		{producer: "MirrorReceiptFile", rel: rel(paths.MirrorReceiptFile()),
+			why: "the previous mirror's receipt, so a restored fleetd knows how old its own state was."},
 		// Cell-side files. A fleetd host is usually not a cell, so these
 		// are normally absent — and their absence here is the point: C8's
 		// probe baselines and the C7a cell cursor live on the CELLS and do
 		// NOT die with the front.
-		{"CellIntentFile", rel(paths.CellIntentFile()), false,
-			"this box's own cell intent, if it is also a cell. Cells keep their own copy; the front's death does not lose another box's."},
-		{"CellUsageFile", rel(paths.CellUsageFile()), false,
-			"this box's own usage cursor, if it is also a cell."},
-		{"CellProbeFile", rel(paths.CellProbeFile()), false,
-			"this box's own C8 probe baselines, if it is also a cell. Every other cell's baselines live on that cell and survive the front."},
+		{producer: "CellIntentFile", rel: rel(paths.CellIntentFile()),
+			why: "this box's own cell intent, if it is also a cell. Cells keep their own copy; the front's death does not lose another box's."},
+		{producer: "CellUsageFile", rel: rel(paths.CellUsageFile()),
+			why: "this box's own usage cursor, if it is also a cell."},
+		{producer: "CellProbeFile", rel: rel(paths.CellProbeFile()),
+			why: "this box's own C8 probe baselines, if it is also a cell. Every other cell's baselines live on that cell and survive the front."},
 	}
+}
+
+// appendOnlyDests is the RECEIVING side's copy of which restored files
+// are append-only. It is derived from the same table Create captures
+// from, and it is consulted on the standby rather than trusted from the
+// archive's manifest, because "the sending side guards and the receiving
+// side does not" is this repo's most recurring defect.
+func appendOnlyDests() map[string]bool {
+	out := map[string]bool{}
+	for _, sf := range knownState() {
+		if sf.appendOnly {
+			out[path.Join(string(SlotState), sf.rel)] = true
+		}
+	}
+	return out
 }
 
 // NotCovered is the fixed, deliberate list of what a mirror of the front
@@ -354,7 +387,7 @@ func Create(opts Options) (*Manifest, *Receipt, error) {
 	files := map[string][]byte{}
 	add := func(e Entry, data []byte) {
 		if opts.NoSecrets && e.Secret {
-			m.Warnings = append(m.Warnings, "--no-secrets: "+e.Archive+" was not captured ("+e.Why+")")
+			m.Gaps = append(m.Gaps, "--no-secrets: "+e.Archive+" was not captured ("+e.Why+")")
 			return
 		}
 		if e.Secret {
@@ -426,13 +459,13 @@ func Create(opts Options) (*Manifest, *Receipt, error) {
 				}
 			}
 		} else {
-			m.Warnings = append(m.Warnings, "fleet.guest_token_file ("+gt+") is outside the mirrored state dir and was NOT captured")
+			m.Gaps = append(m.Gaps, "fleet.guest_token_file ("+gt+") is outside the mirrored state dir and was NOT captured")
 		}
 	}
 
 	// ── config ──────────────────────────────────────────────────────────
 	if opts.ConfigDir == "" {
-		m.Warnings = append(m.Warnings, "no config dir given: hosts.yaml, config.yaml and the backend defs are NOT in this archive")
+		m.Gaps = append(m.Gaps, "no config dir given: hosts.yaml, config.yaml and the backend defs are NOT in this archive")
 	}
 	if opts.ConfigDir != "" {
 		for _, rel := range []string{
@@ -481,7 +514,7 @@ func Create(opts Options) (*Manifest, *Receipt, error) {
 		// front config over a good one (C3). Say it here, where it is
 		// still cheap to fix.
 		if defsCaptured(m) == 0 {
-			m.Warnings = append(m.Warnings, "no backend defs captured: a standby restored from this archive cannot RENDER the front's config (it can still serve the rendered one)")
+			m.Gaps = append(m.Gaps, "no backend defs captured: a standby restored from this archive cannot RENDER the front's config (it can still serve the rendered one)")
 		}
 	}
 
@@ -580,7 +613,7 @@ func Create(opts Options) (*Manifest, *Receipt, error) {
 	rc := &Receipt{
 		Version: ManifestVersion, At: m.CreatedAt, Archive: archive, Dest: opts.Out,
 		Bytes: n, Files: len(m.Entries), Missing: m.Missing, Errors: m.Errors,
-		Warnings: m.Warnings, Credentials: m.Credentials, Host: m.Host,
+		Gaps: m.Gaps, Warnings: m.Warnings, Credentials: m.Credentials, Host: m.Host,
 	}
 	if err := WriteReceipt(opts.StateDir, rc); err != nil {
 		// The archive is written and good; only doctor's freshness answer
@@ -907,6 +940,37 @@ func under(p, dir string) bool {
 	return err1 == nil && err2 == nil && ad == ap
 }
 
+// archiveKey splits an archive name into the stamp it was written at and
+// its collision counter. It exists because the two do NOT sort together
+// as one string: `…Z-1.tar.gz` compares LOWER than `…Z.tar.gz` ('-' <
+// '.'), so a plain lexical sort calls the second run of a second the
+// oldest archive in the directory — which made `--keep 1` delete the
+// archive whose path had just gone into the receipt, and made `Newest`
+// hand a recovery the older of the two.
+func archiveKey(name string) (string, int) {
+	mid := strings.TrimSuffix(strings.TrimPrefix(name, ArchivePrefix), ArchiveSuffix)
+	if i := strings.LastIndex(mid, "-"); i >= 0 {
+		if seq, err := strconv.Atoi(mid[i+1:]); err == nil {
+			return mid[:i], seq
+		}
+	}
+	return mid, 0
+}
+
+// newerFirst orders archives newest-first by (stamp, collision counter).
+func newerFirst(a, b string) bool {
+	as, an := archiveKey(a)
+	bs, bn := archiveKey(b)
+	if as != bs {
+		return as > bs
+	}
+	return an > bn
+}
+
+func isArchiveName(name string, isDir bool) bool {
+	return !isDir && strings.HasPrefix(name, ArchivePrefix) && strings.HasSuffix(name, ArchiveSuffix)
+}
+
 // prune deletes all but the newest keep archives, matching only this
 // package's own naming so a shared backup directory is never at risk.
 func prune(dir string, keep int) error {
@@ -919,16 +983,15 @@ func prune(dir string, keep int) error {
 	}
 	var names []string
 	for _, e := range entries {
-		n := e.Name()
-		if e.IsDir() || !strings.HasPrefix(n, ArchivePrefix) || !strings.HasSuffix(n, ArchiveSuffix) {
+		if !isArchiveName(e.Name(), e.IsDir()) {
 			continue
 		}
-		names = append(names, n)
+		names = append(names, e.Name())
 	}
 	if len(names) <= keep {
 		return nil
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	sort.Slice(names, func(i, j int) bool { return newerFirst(names[i], names[j]) })
 	var errs []error
 	for _, n := range names[keep:] {
 		if err := os.Remove(filepath.Join(dir, n)); err != nil {
@@ -952,10 +1015,10 @@ func Newest(dir string) (string, error) {
 	best := ""
 	for _, e := range entries {
 		n := e.Name()
-		if e.IsDir() || !strings.HasPrefix(n, ArchivePrefix) || !strings.HasSuffix(n, ArchiveSuffix) {
+		if !isArchiveName(n, e.IsDir()) {
 			continue
 		}
-		if n > best {
+		if best == "" || newerFirst(n, best) {
 			best = n
 		}
 	}
