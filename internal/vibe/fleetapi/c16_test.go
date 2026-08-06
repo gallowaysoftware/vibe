@@ -295,14 +295,32 @@ func TestFrontSwapVersion_401FeedsTheCredentialMachinery(t *testing.T) {
 		t.Fatalf("SwapAuthRefusal = (%q, %v), want the no-retry-loop rule armed and naming the config", why, blocked)
 	}
 
-	// And a later accepted call retires it, so a fixed key file is not
+	// And a later accepted call RETIRES it, so a fixed key file is not
 	// reported as broken forever.
-	s2 := newC15Server(t, front, hostsWithKey(t, front.srv.URL, labSwapKey))
+	//
+	// On the same Server, and by repairing the file the operator actually
+	// repairs — a second Server starts with an empty record, so "nothing
+	// is recorded" would hold there whether or not anything ever cleared,
+	// which is a green test for a deleted clearSwapAuth.
+	keyPath := filepath.Join(t.TempDir(), "front-swap.key")
+	if err := os.WriteFile(keyPath, []byte("not-the-front-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s2 := newC15Server(t, front, hostsWithKeyPath(t, front.srv.URL, keyPath))
+	if got := s2.frontSwapVersion(t.Context()); got != "" {
+		t.Fatalf("frontSwapVersion with a key the front rejects = %q, want absence", got)
+	}
+	if f, bad := s2.swapAuthState(fleetcfg.FrontCell); !bad || f.Kind != SwapAuthRejected {
+		t.Fatalf("swap auth state = %+v (recorded=%v), want %s", f, bad, SwapAuthRejected)
+	}
+	if err := os.WriteFile(keyPath, []byte(labSwapKey+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if got := s2.frontSwapVersion(t.Context()); got != "v239" {
 		t.Fatalf("frontSwapVersion after the key was fixed = %q, want v239", got)
 	}
-	if _, bad := s2.swapAuthState(fleetcfg.FrontCell); bad {
-		t.Fatal("an accepted read left a credential failure recorded")
+	if f, bad := s2.swapAuthState(fleetcfg.FrontCell); bad {
+		t.Fatalf("an accepted read left %s recorded; a repaired key file stays broken until fleetd restarts", f.Kind)
 	}
 }
 

@@ -308,9 +308,10 @@ Unit (mechanical, in-repo):
 | U17 | *(merge)* the fleetd→front version read carries the front's declared key, and an UNRESOLVABLE declaration sends no request at all | PASS |
 | U18 | *(merge)* the reference fleet (no key declared anywhere) reads the version with no `Authorization` header and records no failure | PASS |
 | U19 | *(merge)* a 401 on the version read lands in `NoteSwapStatus`/`SwapAuthRefusal` exactly as the other producers' do, and an accepted read retires it | PASS |
-| U20 | *(merge)* the cell-side reader (`ReadOwnSwapVersion`) sends no credential, and is the ONLY function allowed to skip the authorizer | PASS |
+| U20 | *(merge)* the cell-side reader (`ReadOwnSwapVersion`) sends no credential, is the ONLY function allowed to skip the authorizer, and has NO caller inside `fleetapi` — the exported wrapper is not a second way to drop the credential | PASS |
 | U21 | *(merge)* C15's `TestEveryLlamaSwapRequestIsAuthorized` still fails for a genuinely unauthorized builder (scratch-file mutation) | PASS |
 | U22 | *(merge)* C13's read-only scan still fails for the same verbs in a neighbouring function, for a different verb inside the exempt one, and for an exemption that stopped firing | PASS |
+| U23 | *(review)* a repaired key file retires the recorded failure on the SAME fleetd, proven by stubbing `clearSwapAuth` out | PASS |
 
 Live (a real llama-swap binary, a real fleet, or real clients):
 
@@ -781,6 +782,60 @@ Gates re-run after the fix: `go build ./...`, `go vet ./...`,
 `fleetapi`, `fleetmcp` and `daemon`, and `go test -race ./...` green
 across the module (`swaptest` included, so I6 still reads the endpoint
 through the real reader).
+
+#### Adversarial review of the fix: two findings
+
+Both found by mutation — the fix was re-verified by breaking it, not by
+reading it.
+
+**1. The exemption is EXPORTED, and that is a second door onto the same
+room.** `TestOnlyTheCellSideReaderSkipsSwapAuth` guarded the nil
+*argument*, so it watched the door marked `readSwapVersion(ctx, nil, …)`.
+But `ReadOwnSwapVersion` has to be exported for the cell-side callers,
+and a fleetd producer inside `fleetapi` could simply call it: no `nil`
+written anywhere, and no `http.NewRequest` in the calling function for
+C15's scan to see. Demonstrated — a six-line `(*Server)` method reading a
+cell's version through it left the whole suite green, including both
+scans and C13's.
+
+That is the hole the previous paragraph claimed was closed, in a wider
+form. Closed now by the same test: this package must contain **no call**
+to `ReadOwnSwapVersion` at all. Its callers are the cell-side ones, which
+live in other packages; fleetd's path is `frontSwapVersion`. The scan is
+scoped to `fleetapi` — where the reader lives and where the next version
+producer would naturally be written — and `fleetmcp`'s twin still covers
+that package's three producers by the request-builder rule.
+
+**2. "A later accepted call retires it" was asserting nothing.** The
+retire half of `TestFrontSwapVersion_401FeedsTheCredentialMachinery`
+built a SECOND `Server` and asserted no failure was recorded on it — but
+a fresh `Server` starts with an empty `swapAuth` map, so the assertion
+held whether or not anything ever cleared. Demonstrated: with
+`clearSwapAuth` stubbed out to do nothing, the test stayed green.
+
+Rewritten to repair the thing an operator repairs, on ONE `Server`: the
+key file starts holding a value the front rejects (which also gives this
+path its first `SwapAuthRejected` coverage — `SwapCredentialFor` reads
+the file per call, so no restart is involved), then is rewritten with the
+right value and re-read. The stubbed `clearSwapAuth` is now red.
+
+| mutation | red |
+|---|---|
+| a fleetd producer in `fleetapi` reads a cell's version via the exported `ReadOwnSwapVersion` (scratch file, since removed) | `TestOnlyTheCellSideReaderSkipsSwapAuth` — after the fix; **green before it** |
+| `clearSwapAuth` stubbed to a no-op | `TestFrontSwapVersion_401FeedsTheCredentialMachinery` — after the fix; **green before it** (C15's own `TestSwapAuth_ClearsOnTheFirstAcceptedCall` was the only thing covering it) |
+
+Re-verified unchanged by the review: the whole mutation table above still
+reproduces; C15's scan still fails for a genuinely unauthorized request
+builder dropped into the package; the unresolvable-credential path still
+sends **zero** requests to a hit-recording front; the unkeyed reference
+fleet still reads its version with no `Authorization` header at all; and
+`frontSwapVersion` is reached only from `Doctor` (via `checkVersions`),
+which is an operator verb — never a ticker — so declining to gate it on
+`SwapAuthRefusal` is the rule C15 wrote, not an omission.
+
+Gates re-run after the review fixes: `go build ./...`, `go vet ./...`,
+`gofmt -l .` silent, `go mod tidy` byte-identical, `golangci-lint run`
+**0 issues**, `go test -race ./...` green across the module.
 
 ## For the reconciliation pass
 

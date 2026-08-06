@@ -558,6 +558,14 @@ func TestEveryLlamaSwapRequestIsAuthorized(t *testing.T) {
 // could satisfy the scan above by taking the same parameter and always
 // receiving nil. So the nil is allowed in exactly one function, by name,
 // and any other caller that passes it fails here.
+//
+// And the exemption is EXPORTED, which is a second door onto the same
+// room: a fleetd producer in this package could reach the unauthenticated
+// posture without writing `nil` at all, just by calling ReadOwnSwapVersion
+// — invisible to the scan above (it builds no request of its own) and to
+// the nil check (it names a different identifier). So this package must
+// contain NO call to it: its callers are the cell-side ones, in other
+// packages, and fleetd's path is frontSwapVersion.
 func TestOnlyTheCellSideReaderSkipsSwapAuth(t *testing.T) {
 	const reader, exempt = "readSwapVersion", "ReadOwnSwapVersion"
 	entries, err := os.ReadDir(".")
@@ -586,7 +594,16 @@ func TestOnlyTheCellSideReaderSkipsSwapAuth(t *testing.T) {
 					return true
 				}
 				id, ok := call.Fun.(*ast.Ident)
-				if !ok || id.Name != reader {
+				if !ok {
+					return true
+				}
+				if id.Name == exempt {
+					t.Errorf("%s: %s calls %s. Nothing in this package may — it is the UNAUTHENTICATED posture, and a "+
+						"fleetd producer reaching it drops the cell's credential without ever writing nil or building a "+
+						"request the C15 scan can see. Read a cell's version through the authorizing path.", name, fn.Name.Name, exempt)
+					return true
+				}
+				if id.Name != reader {
 					return true
 				}
 				calls++
