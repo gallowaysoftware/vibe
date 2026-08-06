@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
+	"github.com/gallowaysoftware/vibe/internal/vibe/modelcat"
 	"github.com/gallowaysoftware/vibe/internal/vibe/observed"
 	"github.com/gallowaysoftware/vibe/internal/vibe/prices"
 )
@@ -623,19 +624,14 @@ func (s *Server) snapshotCell(ctx context.Context, c Cell) CellSnapshot {
 			Name  string `json:"name"`
 		} `json:"running"`
 	}
-	var modWrap struct {
-		Data []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		} `json:"data"`
-		// A vibe-daemon-proxy cell (the roaming class before C3) answers
-		// /v1/models with the Ollama passthrough shape instead — llama.cpp
-		// only advertises what it has loaded, so entries here mean ready.
-		Ollama []struct {
-			Name  string `json:"name"`
-			Model string `json:"model"`
-		} `json:"models"`
-	}
+	// modelcat.Wire keeps the two catalog shapes apart on purpose: which
+	// one a cell answered with is residency evidence HERE, where a
+	// client-facing catalog has to fold them together. It is the same
+	// declaration vibe's own proxy normalises with, so a shape that
+	// reaches one of them reaches both — a llama.cpp-family cell (vibe
+	// daemon proxy, bare llama-server) advertises only what it has
+	// LOADED, so entries under models[] mean ready.
+	var modWrap modelcat.Wire
 	runErr := s.getJSON(ctx, c.Name, c.URL+"/running", &runWrap)
 	modErr := s.getJSON(ctx, c.Name, c.URL+"/v1/models", &modWrap)
 	running, models := runWrap.Running, modWrap.Data
@@ -661,10 +657,7 @@ func (s *Server) snapshotCell(ctx context.Context, c Cell) CellSnapshot {
 	// data[] entries honestly stay "stopped".)
 	if runErr != nil {
 		for _, m := range modWrap.Ollama {
-			id := m.Model
-			if id == "" {
-				id = m.Name
-			}
+			id := m.OllamaID()
 			if id == "" {
 				continue
 			}

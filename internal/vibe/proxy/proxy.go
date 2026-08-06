@@ -8,6 +8,19 @@
 // instead of the default. This lets concurrently-running service-mode
 // backends share the one proxy port and be selected by model id — see
 // Daemon.startService.
+//
+// Two contracts govern this package, and they pull in opposite directions:
+//
+//   - /v1/chat/completions is the data plane. Bytes, flush timing and
+//     latency are inviolable; a stream that stalls turns a slow model into
+//     a broken one. Nothing here buffers it or inspects it beyond the one
+//     body pass routing and the rewrite already cost.
+//   - /v1/models is discovery, and the proxy ANSWERS it rather than
+//     forwarding it (internal/vibe/modelcat). The catalog is a promise
+//     that every id in it is servable — consumers pin ids from it and send
+//     them back — so it is normalised to the OpenAI shape on every path,
+//     and a shape that cannot be read is an error rather than a quietly
+//     empty list. See serveModels.
 package proxy
 
 import (
@@ -25,6 +38,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/modelcat"
 )
 
 // maxPeekBody caps how much of a request body we buffer to read the
@@ -243,6 +258,26 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rw := p.rewrite
 	p.mu.RUnlock()
 
+	// /v1/models is answered here, in full, for every configuration: with
+	// routes, with a rewrite, and with neither. It is a discovery GET and
+	// never part of the streaming data path — nothing below this branch is
+	// reachable for it, and nothing inside it is reachable for a
+	// completion, which still takes the same two lines to its backend as
+	// before.
+	//
+	// Answering it on EVERY path is the fix. The no-routes-no-rewrite case
+	// used to forward the upstream's catalog verbatim, so an upstream that
+	// answers in the Ollama shape made vibe an Ollama-shaped peer: every
+	// consumer that reads data[] — vamp's ResolveModelID, `vibe cell`,
+	// fleetannounce, the daemon's external-backend check — then saw a cell
+	// serving NOTHING while its /v1/chat/completions worked fine. A
+	// catalog that cannot be read is worse than an absent one, because
+	// consumers pin ids from it.
+	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/v1/models") {
+		p.serveModels(w, r, def, rw)
+		return
+	}
+
 	// Fast path: no model routes registered → behave exactly like the
 	// original single-upstream proxy (no body inspection, zero overhead).
 	// A rewrite still costs a body pass, but only when one is configured.
@@ -252,24 +287,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if rw != nil {
-			if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/v1/models") {
-				if p.serveRewrittenModels(w, r, def, rw) {
-					return
-				}
-			}
 			rewriteRequestModel(r, rw)
 		}
 		def.rp.ServeHTTP(w, r)
 		return
-	}
-
-	// With routes present, aggregate /v1/models so clients see the active
-	// model AND every routed service model. Best-effort: any failure
-	// falls through to the default upstream's own /v1/models.
-	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/v1/models") {
-		if p.serveAggregatedModels(w, r, def, rw) {
-			return
-		}
 	}
 
 	be := p.pick(r, def)
@@ -330,52 +351,6 @@ func rewriteRequestModel(r *http.Request, rw *modelRewrite) {
 	r.Header.Set("Content-Length", strconv.Itoa(len(out)))
 }
 
-// rewriteModelIDs swaps id == from for to in an OpenAI /v1/models payload,
-// leaving every other field of each entry untouched. Returns nil when the
-// body isn't the expected shape so callers can fall back to passthrough.
-func rewriteModelIDs(body []byte, from, to string) []byte {
-	var ml struct {
-		Object string                       `json:"object"`
-		Data   []map[string]json.RawMessage `json:"data"`
-	}
-	if json.Unmarshal(body, &ml) != nil {
-		return nil
-	}
-	repl, err := json.Marshal(to)
-	if err != nil {
-		return nil
-	}
-	for _, entry := range ml.Data {
-		var id string
-		if json.Unmarshal(entry["id"], &id) == nil && id == from {
-			entry["id"] = repl
-		}
-	}
-	out, err := json.Marshal(ml)
-	if err != nil {
-		return nil
-	}
-	return out
-}
-
-// serveRewrittenModels answers /v1/models from the single default upstream
-// with the upstream's id swapped for the client-facing alias, so discovery
-// returns the same name the client is expected to send back.
-func (p *Proxy) serveRewrittenModels(w http.ResponseWriter, r *http.Request, def *backend, rw *modelRewrite) bool {
-	body, err := fetchModels(r.Context(), def.url)
-	if err != nil {
-		return false
-	}
-	out := rewriteModelIDs(body, rw.upstream, rw.alias)
-	if out == nil {
-		return false
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(out)
-	return true
-}
-
 // pick selects the upstream for r. A POST carrying a JSON "model" that
 // matches a registered route goes to that route; everything else
 // (including the active model) goes to the default backend.
@@ -418,11 +393,17 @@ func peekModel(r *http.Request) string {
 	return probe.Model
 }
 
-// serveAggregatedModels merges /v1/models from the default upstream (if
-// any) and every routed upstream into one list, deduped by model id.
-// Returns false (writing nothing) on failure so the caller can fall back
-// to the default-upstream path (which 503s when there is no default).
-func (p *Proxy) serveAggregatedModels(w http.ResponseWriter, r *http.Request, def *backend, rw *modelRewrite) bool {
+// serveModels answers /v1/models: the default upstream's catalog merged
+// with every routed upstream's, normalised to the OpenAI shape and deduped
+// by model id.
+//
+// No failure here produces an empty catalog, and none falls back to
+// forwarding a body we could not read. The default upstream is the source
+// of truth, so its failure is the response's failure; a routed service
+// that is mid-restart is skipped, because its models come back when it
+// does; and with no upstream answering at all the reply is the same 503
+// the completion path gives, never a 200 listing nothing.
+func (p *Proxy) serveModels(w http.ResponseWriter, r *http.Request, def *backend, rw *modelRewrite) {
 	p.mu.RLock()
 	routes := make([]*backend, 0, len(p.routes))
 	for _, be := range p.routes {
@@ -430,91 +411,124 @@ func (p *Proxy) serveAggregatedModels(w http.ResponseWriter, r *http.Request, de
 	}
 	p.mu.RUnlock()
 
-	type modelList struct {
-		Object string            `json:"object"`
-		Data   []json.RawMessage `json:"data"`
-	}
-	merged := modelList{Object: "list"}
-	seen := map[string]bool{}
-	add := func(be *backend) error {
-		body, err := fetchModels(r.Context(), be.url)
+	var merged *modelcat.Catalog
+	if def != nil {
+		cat, status, err := fetchCatalog(r.Context(), def.url, callerCreds(r))
 		if err != nil {
-			return err
+			writeCatalogError(w, def.url, status, err)
+			return
 		}
 		// The rewrite describes the default upstream only, so the swap is
 		// scoped to it: a routed service that happens to serve the same id
 		// keeps its own name.
-		if rw != nil && be == def {
-			if swapped := rewriteModelIDs(body, rw.upstream, rw.alias); swapped != nil {
-				body = swapped
-			}
+		if rw != nil {
+			cat.Rename(rw.upstream, rw.alias)
 		}
-		var ml modelList
-		if err := json.Unmarshal(body, &ml); err != nil {
-			return err
-		}
-		for _, raw := range ml.Data {
-			var idObj struct {
-				ID string `json:"id"`
-			}
-			_ = json.Unmarshal(raw, &idObj)
-			if idObj.ID != "" {
-				if seen[idObj.ID] {
-					continue
-				}
-				seen[idObj.ID] = true
-			}
-			merged.Data = append(merged.Data, raw)
-		}
-		return nil
+		merged = cat
 	}
-
-	// When a default upstream exists it must succeed (it's the source of
-	// truth); a routed service that's mid-restart is skipped rather than
-	// fatal. With no default (service-mode backends only, no active
-	// profile), at least one routed upstream must answer — never serve an
-	// empty list that would hide models a restarted service will re-offer.
-	if def != nil {
-		if err := add(def); err != nil {
-			return false
-		}
-	}
-	ok := def != nil
 	for _, be := range routes {
-		if add(be) == nil {
-			ok = true
+		// No credentials to a routed sidecar. The default upstream is the
+		// one the caller was addressing, and the aggregation path has never
+		// carried the caller's headers to the service backends; a fix for
+		// discovery is not the place to start handing a llama-swap key to
+		// every co-resident process.
+		cat, _, err := fetchCatalog(r.Context(), be.url, nil)
+		if err != nil {
+			// Logged, not swallowed: a routed service whose catalog cannot
+			// be READ looks identical, in the response, to one that is
+			// simply down, and the two have different fixes.
+			slog.Warn("proxy: routed upstream catalog omitted from /v1/models",
+				"upstream", be.url.Redacted(), "err", err)
+			continue
 		}
+		if merged == nil {
+			merged = cat
+			continue
+		}
+		merged.Merge(cat)
 	}
-	if !ok {
-		return false
+	if merged == nil {
+		http.Error(w, "vibe: no profile active", http.StatusServiceUnavailable)
+		return
 	}
-
-	out, err := json.Marshal(merged)
+	out, err := merged.JSON()
 	if err != nil {
-		return false
+		http.Error(w, "vibe: /v1/models: "+err.Error(), http.StatusBadGateway)
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
-	return true
 }
 
-func fetchModels(ctx context.Context, u *url.URL) ([]byte, error) {
+// writeCatalogError answers a request whose default upstream could not
+// supply a readable catalog. An upstream that replied with a status of its
+// own said something specific — /v1/models unimplemented, credentials
+// refused — and that status is more use to an operator than a blanket 502,
+// so it is preserved; a 200 whose body is not a catalog in any shape vibe
+// knows becomes a 502 naming the upstream.
+func writeCatalogError(w http.ResponseWriter, u *url.URL, status int, err error) {
+	code := http.StatusBadGateway
+	if status >= 400 {
+		code = status
+	}
+	http.Error(w, fmt.Sprintf("vibe: /v1/models from %s: %v", u.Redacted(), err), code)
+}
+
+// callerCreds copies the inbound credential headers so a fetched catalog
+// carries what a forwarded request would have carried. llama-swap exempts
+// only /health from its API key, and the no-routes path used to FORWARD
+// this request, which took these headers along for free — dropping them
+// would make every keyed upstream answer discovery 401 and read as down.
+func callerCreds(r *http.Request) http.Header {
+	var out http.Header
+	for _, h := range []string{"Authorization", "X-Api-Key"} {
+		if v := r.Header.Get(h); v != "" {
+			if out == nil {
+				out = http.Header{}
+			}
+			out.Set(h, v)
+		}
+	}
+	return out
+}
+
+// fetchCatalog reads and parses one upstream's /v1/models. The upstream's
+// status is returned alongside any error so the caller can tell "the
+// upstream refused" from "the upstream answered 200 with a shape we could
+// not read"; it is 0 when the request never got a reply.
+func fetchCatalog(ctx context.Context, u *url.URL, creds http.Header) (*modelcat.Catalog, int, error) {
+	body, status, err := fetchModels(ctx, u, creds)
+	if err != nil {
+		return nil, status, err
+	}
+	cat, err := modelcat.Parse(body)
+	if err != nil {
+		return nil, status, err
+	}
+	return cat, status, nil
+}
+
+func fetchModels(ctx context.Context, u *url.URL, creds http.Header) ([]byte, int, error) {
 	endpoint := *u
 	endpoint.Path = "/v1/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
+	}
+	for h, v := range creds {
+		req.Header[h] = v
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("models: upstream status %d", resp.StatusCode)
+		return nil, resp.StatusCode, fmt.Errorf("upstream status %d", resp.StatusCode)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return body, resp.StatusCode, err
 }
 
 // Start binds the listener and serves in the background.

@@ -19,6 +19,12 @@ func TestProxy_NoBackend_Returns503(t *testing.T) {
 	}
 }
 
+// TestProxy_ForwardsToBackend pins the passthrough contract on every path
+// that is not the catalog. It used to use /v1/models, which is exactly the
+// behaviour that shipped the novodoo defect: the proxy forwarded whatever
+// the upstream said there, in whatever shape, and "hi" is not a catalog.
+// Discovery is answered by the proxy now (see TestProxy_Ollama*), so this
+// asserts the same passthrough on a path that still has it.
 func TestProxy_ForwardsToBackend(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Echo-Path", r.URL.Path)
@@ -31,18 +37,20 @@ func TestProxy_ForwardsToBackend(t *testing.T) {
 	p := New("127.0.0.1:0")
 	p.SetBackend(bu)
 
-	w := httptest.NewRecorder()
-	r := httptest.NewRequest("GET", "/v1/models", nil)
-	p.ServeHTTP(w, r)
+	for _, path := range []string{"/health", "/v1/completions", "/v1/models/qwen"} {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest("GET", path, nil)
+		p.ServeHTTP(w, r)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("status = %d", w.Code)
-	}
-	if got := w.Header().Get("X-Echo-Path"); got != "/v1/models" {
-		t.Errorf("X-Echo-Path = %q", got)
-	}
-	if w.Body.String() != "hi" {
-		t.Errorf("body = %q", w.Body.String())
+		if w.Code != http.StatusOK {
+			t.Errorf("%s: status = %d", path, w.Code)
+		}
+		if got := w.Header().Get("X-Echo-Path"); got != path {
+			t.Errorf("%s: X-Echo-Path = %q", path, got)
+		}
+		if w.Body.String() != "hi" {
+			t.Errorf("%s: body = %q", path, w.Body.String())
+		}
 	}
 }
 
