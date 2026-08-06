@@ -122,6 +122,14 @@ func LeasesFile() string { return filepath.Join(StateHome(), "fleet", "leases.js
 // not about a cell.
 func NotifyScopeFile() string { return filepath.Join(StateHome(), "fleet", "notify-scope.json") }
 
+// MirrorReceiptFile records the last `vibe fleet mirror` run
+// (fleet-control C19). It lives in the state dir fleetd already reads so
+// `vibe fleet doctor` can answer "is the off-host mirror fresh" with no
+// new mount, no new route and no network call — a stale backup being the
+// classic failure of the whole idea. Written by the mirror command,
+// never by the daemon.
+func MirrorReceiptFile() string { return filepath.Join(StateHome(), "fleet", "mirror-receipt.json") }
+
 // TokenFile is the path to the daemon's bearer-token file. The token lives in
 // $XDG_STATE_HOME/vibe rather than $XDG_CONFIG_HOME because it's a generated
 // runtime secret, not user-authored configuration — same reasoning that puts

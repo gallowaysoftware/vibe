@@ -64,6 +64,15 @@ fleet:
   # versions.llama_swap matrix is for.
   front_image: ghcr.io/mostlygeek/llama-swap:v239-cpu-b9994@sha256:6bae869ec0908538e421172fd576288e87c1bc330acde24517992507218d2c7c
 
+  # C19: how fresh the OFF-HOST state mirror is expected to be. fleetd
+  # mirrors nothing — `vibe fleet mirror` runs on the HOST from a timer,
+  # because the mirror has to keep working when fleetd is what broke.
+  # This value is what turns "a mirror ran at some point" into the
+  # mirror.age verdict in `vibe fleet doctor`; unset is UNKNOWN, and the
+  # literal `unmanaged` declares that something else backs this host up.
+  # See docs/runbooks/front-failover.md.
+  mirror_max_age: 36h
+
   # C12: the guest READ-ONLY bearer. Honored on GET /api/fleet/state and
   # GET /api/fleet/events and refused on everything else — /mcp, the
   # RPCs, intent, wake, announce, leases, and both /api/fleet/usage and
@@ -278,6 +287,18 @@ the state dir, which the compose marks required:
 | `leases.json` (C2) | Advisory consumer leases. |
 | `usage.jsonl` (C7a) | The token ledger, append-only. Losing it loses the fleet's whole accounting history — cells announce CUMULATIVE totals, so a fresh ledger starts the running total over rather than back-filling. C7b's payback bars are computed from this file. |
 | `front-cloud-usage.json` (C7b) | fleetd's cursor for the front's `cloud_peer` traffic. Losing it re-ingests whatever the front's activity log still holds, which double-counts that window's actual cloud spend. |
+| `mirror-receipt.json` (C19) | what the last `vibe fleet mirror` run captured, and when. Written by that command, read by `vibe fleet doctor`'s `mirror.age`. |
+
+**And this whole table is why C19 exists.** The mount keeps these files
+across a container recreate; it does nothing about the HOST dying, which
+is the fleet's one total outage. `vibe fleet mirror --out <off-host dir>`
+archives the state dir, the config dir and the front's rendered config
+somewhere else, `vibe fleet mirror restore` puts them on a spare box, and
+`docs/runbooks/front-failover.md` is the half-page path from one to the
+other — rehearsed by `scripts/fleetlab/gate-c19-drill.sh`, which kills a
+real fleetd and times the recovery. There is deliberately no automatic
+failover: two boxes answering on one address is worse than an outage, so
+`restore` refuses while the fleet's own address still answers.
 
 The **backends defs mount** (`/config/vibe/backends`) is not state, but
 it is load-bearing the same way: fleetd renders the front config from
@@ -317,6 +338,10 @@ wrong.
     doctor` again → one real `wake_cell`. That last step is the test
     `wake.configured` cannot be: the control plane can see a MAC is
     declared and cannot see whether the NIC is armed.
+  - **The other quarterly drill** is C19's: `vibe fleet mirror verify`
+    the newest archive, and `restore --dry-run` it onto the standby box.
+    Both are read-only. The full path is
+    `docs/runbooks/front-failover.md`.
 - MCP: `POST http://<FLEETD_IPV4>:9001/mcp` (bearer) speaks
   initialize / tools-list / tools-call. Tools: `fleet_status`,
   `fleet_doctor`, `warm_model`, `unload_model`, `drain_cell`,

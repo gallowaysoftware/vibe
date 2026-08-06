@@ -132,10 +132,12 @@ first (`FLEETLAB_DIR=/tmp/fleetlab ./lab.sh up`) and pass the same
 | `gate-c13-parity.sh` | C13's `defs.parity` — the dirty-and-diverged level, after #36 | ~3 min |
 | `gate-c14-l3.sh` | C14 L3 — a real request defers the declared suspend, then it fires | ~12 min |
 | `gate-c14-l4.sh` | C14 L4 — a lease defers the suspend until `max_defer` abandons it | ~10 min |
+| `gate-c19-drill.sh` | C19's fire drill — mirror, kill the front host, restore onto a standby, time it. **DISRUPTIVE**: it SIGKILLs the lab's fleetd and front and leaves a standby in their place; `./lab.sh down && ./lab.sh up` afterwards | ~3 min |
 | `marionette.py` | C12 L1's DOM half — drives headless Firefox over Marionette | ~1 min |
 
 `marionette.py` needs `firefox` on `$PATH`; nothing else here does.
-**Five** of these change fleetd config and restart it (`gate-c9-14a.sh`,
+`gate-c19-drill.sh` is the one rig that deliberately KILLS lab processes;
+everything else leaves the fleet as it found it. **Five** of these change fleetd config and restart it (`gate-c9-14a.sh`,
 `gate-c9-14d.sh`, `gate-c11-l3.sh`, `gate-c14-l3.sh`, `gate-c14-l4.sh`) —
 they back the file up to the same `config.yaml.c17bak` and restore it, so
 do not run two of them at once against the same lab, and do not start one
