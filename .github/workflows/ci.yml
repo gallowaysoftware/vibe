@@ -74,7 +74,20 @@ jobs:
       - name: mutation harness
         env:
           VIBE_MUTATION_TEST: "1"
-        run: go test -count=1 -timeout 900s -v ./internal/mutation/
+        # The env gate is the whole job. Unset it — a rename, a typo, a
+        # merge that drops the `env:` block — and every expensive test in
+        # the package SKIPS, `go test` exits 0, and the job is green while
+        # nothing was verified. This repo has already shipped one green
+        # t.Skip standing in for a conformance invariant, which is why the
+        # run has to prove it happened rather than merely not fail.
+        # pipefail so tee cannot mask go test's own exit status.
+        run: |
+          set -euo pipefail
+          go test -count=1 -timeout 900s -v ./internal/mutation/ | tee /tmp/mutation.log
+          grep -q 'guards mutation-verified' /tmp/mutation.log || {
+            echo "the mutation harness SKIPPED: VIBE_MUTATION_TEST did not reach the test binary, so this job verified nothing" >&2
+            exit 1
+          }
 
   # internal/swaptest's conformance list, run against a REAL llama-swap.
   #

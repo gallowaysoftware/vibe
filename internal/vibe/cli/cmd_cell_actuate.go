@@ -302,9 +302,18 @@ func printDrainReport(out io.Writer, name string, r *vibev1.CellDrainResponse) {
 	switch {
 	case r.WaitStatus == nil || *r.WaitStatus == fleetapi.DrainWaitNotRequested:
 	case *r.WaitStatus == fleetapi.DrainWaitSkippedNoInflight:
-		fmt.Fprintln(out, "  warning: --wait was SKIPPED (the cell never reported in-flight counts) — the drain ran immediately and cancelled any streams")
+		// Two ways to reach this status and the sentence has to be true of
+		// both: the cell never reported a count, OR the report stopped
+		// while the wait was parked on a running request (C20). "never
+		// reported" sent the operator to debug an events stream when what
+		// they had just done was cancel a generation.
+		fmt.Fprintln(out, "  warning: --wait was SKIPPED (no in-flight evidence: the cell never reported a count, or its report stopped mid-wait) — the drain ran without proof of quiescence and cancelled any streams")
 	case *r.WaitStatus == fleetapi.DrainWaitWaited:
 		fmt.Fprintln(out, "  waited for in-flight requests to reach zero before draining")
+	default:
+		// A status this build does not know is a newer daemon's word, and
+		// silence would render it as "the wait happened". Say what arrived.
+		fmt.Fprintf(out, "  warning: --wait returned an unrecognised status %q — this vibe is older than the daemon; treat quiescence as unproven\n", termSafe(*r.WaitStatus))
 	}
 	if r.LeasesUnavailable {
 		fmt.Fprintln(out, "  warning: lease list unavailable — stranded-work check could not run")

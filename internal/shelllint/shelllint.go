@@ -134,7 +134,12 @@ func lintFile(name string, r interface{ Read([]byte) (int, error) }) []Finding {
 			}
 		}
 		if m := killLine.FindStringSubmatch(line); m != nil {
-			if !strings.Contains(m[2], "$") {
+			// Only the kill's OWN arguments count. `pkill -f llama-swap ||
+			// echo "$?"` used to satisfy the rule, because a `$` anywhere
+			// to the right of the verb read as if it had scoped the
+			// pattern — as did a `$` in a trailing comment, before
+			// stripComment learned to remove one.
+			if !strings.Contains(killArgs(m[2]), "$") {
 				out = append(out, Finding{name, n, RuleBroadKill, raw,
 					"a kill pattern with no variable in it cannot be scoped to this rig: it matches a " +
 						"sibling lab's processes, and on this box a production llama-swap and vibe daemon. " +
@@ -164,26 +169,44 @@ func hasErrExit(setCmd string) bool {
 // cdHandled reports whether the line already deals with a failing cd:
 // an explicit `|| …`, or a subshell that chains with `&&` (the
 // `( cd "$X" && cmd )` idiom, where a failed cd stops the chain).
+//
+// Both halves of the `;` matter, and the review pass found the second one
+// after the self-review had fixed the first. `cd "$X"; git init && git
+// add -A` chains off `git init`, not off the cd — that is the C17 blocker
+// verbatim. But so is `cd "$X" && git init; git add -A`: the `&&` stops
+// `git init`, and then the `;` starts a fresh command that runs in the
+// operator's directory anyway. So an `&&` guards only what is left of the
+// next `;` — if anything follows the cd's own command on the line, the
+// cd's failure is still unhandled. `|| …` is different: it handles the
+// failure (typically by exiting) rather than merely skipping one command.
 func cdHandled(line string) bool {
 	i := strings.Index(line, "cd ")
 	if i < 0 {
 		return false
 	}
-	// The operator has to be in the cd's OWN command. `cd "$X"; git init
-	// && git add -A` contains a `&&` after the cd and chains off `git
-	// init` — which is the C17 blocker with one more statement on the
-	// line, and the reading a whole-line Contains() gets wrong.
 	seg := line[i:]
-	if j := strings.IndexAny(seg, ";\n"); j >= 0 {
+	j := strings.IndexAny(seg, ";\n")
+	if j >= 0 {
 		seg = seg[:j]
 	}
-	return strings.Contains(seg, "||") || strings.Contains(seg, "&&")
+	if strings.Contains(seg, "||") {
+		return true
+	}
+	// An && chain that is the last thing on the line: nothing runs after
+	// the short-circuit, so the wrong directory reaches nothing.
+	return j < 0 && strings.Contains(seg, "&&")
 }
 
 // rmTarget walks rm's arguments: every leading -flag is consumed (the
 // recursive bit may live in any of them, and `rm -r -f X` is as dangerous
 // as `rm -rf X`), and the first non-flag word is the target. Quotes are
 // kept — "$LAB" and $LAB are the same hazard, "${LAB:?}" is not.
+//
+// `--` is CONSUMED rather than returned as the target. It used to be
+// returned, which made `rm -rf -- "$LAB"` scan clean — the end-of-options
+// marker is the more careful spelling and this repo already uses it
+// (`cd -- "$(dirname …)"`), so the rule was silent on exactly the line an
+// author who was being careful would write.
 func rmTarget(rest string) (target string, recursive bool) {
 	for {
 		rest = strings.TrimLeft(rest, " \t")
@@ -195,8 +218,8 @@ func rmTarget(rest string) (target string, recursive bool) {
 		if end >= 0 {
 			word = rest[:end]
 		}
-		if strings.HasPrefix(word, "-") && word != "--" {
-			if strings.ContainsAny(word, "rR") {
+		if strings.HasPrefix(word, "-") {
+			if word != "--" && strings.ContainsAny(word, "rR") {
 				recursive = true
 			}
 			if end < 0 {
@@ -222,10 +245,52 @@ func needsEmptyGuard(arg string) bool {
 	return bareExpansion.MatchString(trimmed)
 }
 
+// killArgs narrows a kill line to the verb's own command, so a variable
+// in a NEIGHBOURING command cannot be read as having scoped the pattern.
+// `|` alone is deliberately not a separator: it is legal inside a pkill
+// -f regex, and cutting there would over-report on a real alternation.
+func killArgs(rest string) string {
+	for _, sep := range []string{";", "&&", "||"} {
+		if i := strings.Index(rest, sep); i >= 0 {
+			rest = rest[:i]
+		}
+	}
+	return rest
+}
+
+// stripComment removes a whole-line comment and a TRAILING one.
+//
+// The trailing half is not cosmetic. The kill rule asks whether the
+// pattern carries a variable, and a comment sits to the right of
+// everything — so `pkill -f llama-swap  # scoped to $LAB` scanned clean,
+// which on this box is the production llama-swap on :9000. A `#` opens a
+// comment only at line start or after whitespace, and only outside
+// quotes: `${LAB#prefix}`, `$#` and `"a # b"` are not comments.
 func stripComment(line string) string {
 	trimmed := strings.TrimSpace(line)
 	if strings.HasPrefix(trimmed, "#") {
 		return ""
+	}
+	var sq, dq bool
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '\\':
+			if !sq {
+				i++
+			}
+		case '\'':
+			if !dq {
+				sq = !sq
+			}
+		case '"':
+			if !sq {
+				dq = !dq
+			}
+		case '#':
+			if !sq && !dq && (i == 0 || line[i-1] == ' ' || line[i-1] == '\t') {
+				return line[:i]
+			}
+		}
 	}
 	return line
 }

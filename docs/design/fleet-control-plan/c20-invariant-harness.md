@@ -1,11 +1,13 @@
 # C20 — The invariant harness: the review step, made mechanical
 
 Status: **PR OPEN** (2026-08-06), off `feat/c20-invariant-harness`
-branched from `main` at `e144f8b`. Unit gates U1–U14 green on a full
-local inner loop (`go test -race -count=3` over every touched package).
-The **mutation harness runs green at 16/16** — 21 s with a warm build
-cache, 58 s from cold, in its own CI job. See
-[Acceptance gates](#acceptance-gates).
+branched from `main` at `e144f8b`. Feature + self-review +
+**independent adversarial-review** commits (4 + 10 findings). Unit gates
+U1–U15 green on a full local inner loop (`go test -race -count=5` over
+every touched package). The **mutation harness runs green at 17/17** —
+~21 s with a warm build cache, in its own CI job. See
+[Acceptance gates](#acceptance-gates) and the
+[adversarial-review addendum](#adversarial-review-addendum-independent-pass).
 
 The mandate, in the repo owner's words:
 
@@ -127,13 +129,25 @@ llama-swap upgrade all produce it — and `drain --wait` exists precisely
 because the stop that follows force-closes in-flight streams at
 llama-swap's hardcoded 30 s.
 
-Fixed: an unreported count mid-wait returns `skipped_no_inflight_data`,
-the `wait_status` that already means "no data", rather than a claim about
-the box. Pinned by
-`TestCellDrainWait_DoesNotClaimQuiescenceWhenTheEvidenceStops`, which
-drives the real watcher against a real events stream and drops the
-connection mid-wait — and mutation-verified, both by hand and as a
-registry entry.
+Fixed: an unreported count mid-wait never returns `waited`. A gap shorter
+than `inflightEvidenceGrace` (5 s) is ridden out — llama-swap re-seeds a
+fresh `/api/events` connection with a current-state snapshot inside
+~200 ms and the watcher's backoff starts at 500 ms, so giving up on the
+first missing tick would turn a reconnect into the force-closed
+generation `--wait` exists to prevent; that half was the independent
+review's R-7, and it is the reason this section's fix is two paragraphs
+rather than one. A gap that outlasts the grace answers
+`skipped_no_inflight_data`, the `wait_status` that already means "no
+data", rather than a claim about the box.
+
+Pinned by two tests that drive the real watcher against a real events
+stream and drop the connection mid-wait:
+`TestCellDrainWait_DoesNotClaimQuiescenceWhenTheEvidenceStops` (evidence
+never returns ⇒ `skipped_no_inflight_data`, never `waited`) and
+`TestCellDrainWait_RidesOutAReconnectWithTheRequestStillRunning`
+(evidence returns busy ⇒ the wait continues, and `waited` only once the
+cell really goes quiet). Both are named by the one registry entry, so
+neither can quietly stop covering the other.
 
 This is the argument for the type in one paragraph: the defect had been
 there since C2, three review passes had read that function, and it became
@@ -275,9 +289,15 @@ for gets deleted):
 | `c20/a new (value, known-bit) field pair` | scan 2 above |
 | `c20/a new (measurement, bool) return` | scan 3 above |
 | `c20/an unguarded cd in a shell rig` | §4's shell lint |
+| `c15/fleetmcp's unload builder drops the credential` | the credential rule's TWIN, in the package holding the operator's verbs |
 
-The last four are this phase proving its own checks CATCH: each plants a
+Four of them are this phase proving its own checks CATCH: each plants a
 real violation in a real file and asserts the named scan goes red.
+
+Two properties of the runner are load-bearing and were both wrong in the
+first cut (see the addendum): **every** named test must go red, not any
+of them, and only TOP-LEVEL verdict lines count — a subtest's verdict
+folded onto its parent's name reported a fired guard as unprotected.
 
 ### Cost, honestly
 
@@ -403,7 +423,8 @@ fails when the scan's own target is empty.
 | `TestNoNewValueAndKnownBitFieldPair` | registry entry `c20/a new (value, known-bit) field pair` | floor: ≥100 struct types examined; unused exemptions are errors |
 | `TestNoNewMeasurementAndBoolReturn` | registry entry `c20/a new (measurement, bool) return` | floor: ≥500 functions with results; unused exemptions are errors |
 | `astscan` (engine) | `TestRuleFindsTheUnguardedProducer` against a testdata fixture | `TestInertScanIsAnError`, `TestStaleExemptionIsAnError`, `TestUnreadableDirIsAnError` |
-| `TestEveryLlamaSwapRequestIsAuthorized` (×2) | registry entry `c15/streamCell drops…` | `MinProducers` 4 and 3, actual counts |
+| `TestEveryLlamaSwapRequestIsAuthorized` (fleetapi) | registry entry `c15/streamCell drops…` | `MinProducers` 4, the actual count |
+| `TestEveryLlamaSwapRequestIsAuthorized` (fleetmcp) | registry entry `c15/fleetmcp's unload builder drops…` | `MinProducers` 3, the actual count |
 | `TestEveryWarmProducerConsultsTheClassGuard` | registry entry `c4/the warm class guard…` | `MinProducers` 3 |
 | `TestScriptsAreSafe` | registry entry `c20/an unguarded cd…` (un-guards `gate-c19-drill.sh`'s `cd`) | floor: ≥15 `.sh` files; unused exemptions are errors; each rule has its own catch + false-positive table |
 | the mutation runner | `TestRunnerReportsAnUnprotectedGuard`, `TestRunnerRejectsANonCompilingMutation`, `TestRunnerRejectsAStaleFind` | baseline round; registry floor of 10 entries |
@@ -502,7 +523,8 @@ code is one the next agent turns off.
 | U11 | `scripts/` is clean under all three shell rules (≥15 files); each rule catches its hazard and does not fire on the guarded idioms; two exemptions, both written | PASS |
 | U12 | The mutation registry is current: ≥10 entries, each `Find` matching exactly once, each `MustFail` test actually declared, no duplicate names, every entry carrying a `Why` | PASS |
 | U13 | The runner refuses a stale/ambiguous `Find` without writing, reports an inert mutation as UNPROTECTED, and reports a non-compiling mutation as a registry error | PASS |
-| U14 | **16/16 registry mutations caught**, on a clean baseline, in 21 s warm / 58 s cold | PASS |
+| U14 | **17/17 registry mutations caught**, on a clean baseline, in ~21 s warm | PASS |
+| U15 | `drain --wait` rides out an evidence gap shorter than the grace and still reports `waited` once the cell really goes quiet; the two renderers assert neither producer of `skipped_no_inflight_data` as fact and never render an unknown status as silence | PASS |
 
 ### Inner loop
 
@@ -611,6 +633,208 @@ matching is on a call's final identifier (`s.AuthorizeSwap` and
 `other.AuthorizeSwap` are the same string). `MinProducers` is what makes
 the first visible if a producer ever moves there.
 
+## Adversarial-review addendum (independent pass)
+
+Ground rule 9's independent review, run against this branch's full diff.
+**Ten findings, one of them the phase's own headline half-fixed.** The
+theme is the one the phase named and then had to live up to: *a check that
+does not catch is worse than no check*, and five of the ten are checks
+this phase added that scanned a real violation clean.
+
+Every finding below was reproduced by planting the violation, and every
+fix carries a regression test that was run against the pre-fix code and
+observed RED.
+
+**R-1 (major). `internal/mutation`'s runner reported a mutation "caught"
+when only ONE of its `MustFail` tests went red.** The judgement was
+`len(passed) == len(m.MustFail)` — UNPROTECTED only if they ALL still
+passed — while `MustFail`'s own doc comment says "Each one is checked
+individually". It is not academic: `c4/the warm class guard leaves the
+restore` names its structural scan *and* its behavioural fire-time test
+precisely because §3 claims both, and under the loose rule the scan alone
+carried a green result. Proven with a probe entry whose second named test
+stayed green and which the runner still reported caught. Fixed: any named
+test that stays green is an UNPROTECTED finding, named. All 17 entries
+still catch under the strict rule (verified: both of the `c4` entry's
+tests genuinely go red). `TestRunnerRequiresEVERYNamedTestToFail`.
+
+**R-2 (major). The runner recorded SUBTEST verdicts under the parent
+test's name, last line wins.** `go test -v` prints the parent's verdict
+first and its subtests indented underneath, and `^\s*--- (PASS|FAIL|SKIP):
+(Test[A-Za-z0-9_]*)` matched both — stopping at the `/`. So a parent that
+FAILED with a passing subtest last read as a PASS, which this runner
+reports as an UNPROTECTED guard. `TestWarmTarget_NoActivityEvidence` is a
+`MustFail` target with three subtests and only the third fails under its
+mutation; reordering them would turn a real catch into a false accusation.
+A harness that calls a working guard broken is the same category of lie as
+one that calls a broken guard fine. Fixed: both patterns anchored at
+column 0, subtest lines ignored. The parse is split out as
+`parseVerdicts` so it can be tested without shelling out —
+`TestVerdictsIgnoreSubtestLines`.
+
+**R-3 (major). `unguarded-cd` missed `cd "$LAB" && git init; git add -A`.**
+The self-review's REV-4 fixed the mirror image (`cd "$X"; git init && git
+add -A`) and left this one, which is the C17 blocker with the `&&` on the
+other side of the `;`: the `&&` short-circuits `git init`, and then the
+`;` starts a fresh command that runs in the operator's repository anyway.
+Fixed: an `&&` guards a `cd` only when nothing follows the cd's own
+command on the line; `||` still guards unconditionally, because it handles
+the failure rather than skipping one command. The repo's own
+`( cd "$REPO" && go build … ) || die` idiom is asserted still clean, so
+the rule stays satisfiable by the spelling it recommends.
+
+**R-4 (major). `rm-rf-bare-var` missed `rm -rf -- "$LAB"`.** `rmTarget`
+returned the `--` end-of-options marker as rm's target, which does not
+start with `$`, so the rule was silent. `--` is the *more* careful
+spelling and this repo already uses it (`cd -- "$(dirname …)"`) — the rule
+was blind to exactly the line an author being careful would write. Fixed:
+`--` is consumed and the next word is the target.
+
+**R-5 (major). `unscoped-kill` was suppressed by any `$` to the right of
+the verb** — including one in a trailing comment. `pkill -f llama-swap  #
+scoped to $LAB` scanned clean, and on this box that is the production
+llama-swap on `:9000`. So did `pkill -f llama-swap || echo "$?"`. Fixed
+twice over: `stripComment` now removes a TRAILING comment (a `#` at line
+start or after whitespace, outside quotes — `${LAB#p}` and `$#` are not
+comments), and the rule reads only the kill's own command
+(`killArgs` cuts at `;`, `&&`, `||`; a bare `|` is left alone because it
+is legal inside a `pkill -f` regex).
+
+**R-6 (major). The two `wait_status` renderers told the operator something
+false on the path this phase added.** Both say the wait was skipped
+because "the cell **never** reported in-flight counts" and that "the drain
+ran **immediately**". On the new mid-wait branch both halves are wrong:
+the cell *did* report (that is what started the wait) and the drain
+*did* wait. An operator reading it goes and debugs an events-stream
+configuration instead of the generation they just cancelled. Fixed in
+`cli.printDrainReport` and `fleetmcp`'s drain report: one sentence true of
+both producers ("no in-flight evidence: the cell never reported a count,
+or its report stopped mid-wait — the drain ran without proof of
+quiescence"). Both switches also grew a `default:` arm: `wait_status` is a
+free string, so a newer daemon's vocabulary used to render as *silence*,
+which reads as "the wait happened".
+
+**R-7 (major). The fix relabelled the lie and left the harm.**
+`awaitQuiescence` gave up on the FIRST tick where the count was missing.
+But the count going missing is overwhelmingly a BLIP: AGENTS.md's own
+measurement is that llama-swap re-seeds a fresh `/api/events` connection
+with a current-state inflight snapshot inside ~200 ms, and the watcher's
+reconnect backoff starts at 500 ms. So a reconnect became an immediate
+unit stop that force-closes a generation fleetd had POSITIVE evidence was
+running one second earlier — the exact outcome `--wait` exists to prevent,
+and the "change that is a no-op exactly where the bug lives". Fixed: a gap
+shorter than `inflightEvidenceGrace` (5 s ≈ three reconnect attempts) is
+ridden out. **Neither terminal answer moves** — evidence that never
+returns is still `skipped_no_inflight_data`, evidence that returns still
+has to reach zero before this reports `waited` — and the operator's own
+`--wait` deadline still bounds everything. A deadline that expires while
+the evidence is missing now answers `skipped_no_inflight_data` rather than
+`DeadlineExceeded`, because refusing the drain there would be reporting
+in-flight work nothing has observed since the stream dropped.
+`TestCellDrainWait_RidesOutAReconnectWithTheRequestStillRunning` holds the
+gap open for longer than one turn of the wait's ticker, so the gap is
+genuinely observed rather than closed before anyone looked.
+
+**R-8 (major). The `mutation` CI job was green when its gate env was
+unset.** Every expensive test in the package is `t.Skipf`-gated on
+`VIBE_MUTATION_TEST=1`; drop, rename or typo that `env:` block and all of
+them skip, `go test` exits 0, and the job reports success having verified
+nothing. That is the green-`t.Skip`-standing-in-for-an-invariant failure
+AGENTS.md already names as one of the two ways a suite lies. Fixed: the
+step runs under `set -euo pipefail` and greps its own output for
+`guards mutation-verified`, so the job proves the run happened.
+
+**R-9 (minor). `fleetmcp`'s half of C15's credential rule had no registry
+entry**, while §5's table credits "TestEveryLlamaSwapRequestIsAuthorized
+(×2)" to a single entry that only mutates `fleetapi`. `fleetmcp` is the
+half holding the operator's verbs (`warm_model`, `unload_model`), where a
+401 is an agent's verb failing quietly. Verified by hand that the twin
+does catch, then added `c15/fleetmcp's unload builder drops the
+credential` so it cannot rot; the table is corrected. Registry: 17 entries.
+
+**R-10 (minor). An exemption's written reason was wrong, in the phase that
+made written reasons the mechanism.**
+`evidencePairExempt["…savings.go:Power"]` claimed "every read is gated on
+the bool in the same function". `dayNet.net()` is `Gross - Power` with no
+reference to `PowerKnown`, from the payback series in a different
+function. The BEHAVIOUR is correct — it is C7b's declared "the power term
+is the one place this screen errs LARGE", disclosed on the page by
+`powerGapNote` — but the reason is the only thing that tells the next
+agent whether to re-examine. Corrected to say what is actually true, and
+to name the disclosure the exemption depends on.
+
+### The stale meta-guard fired on this pass, for real
+
+Rewriting `awaitQuiescence` (R-7) moved the line
+`drain-wait/evidence-loss-reported-as-quiescence` guards, and
+`TestMutationRegistryIsCurrent` went red naming the entry and telling the
+agent to re-point it rather than delete it. That is the mechanism working
+against an unplanned refactor rather than against a planted break. The
+entry is re-pointed at the new switch and now names **both** drain-wait
+tests, which R-1's strict rule makes meaningful.
+
+### Every fix, proven RED against the pre-fix code
+
+| fix | regression | observed |
+|---|---|---|
+| R-1 strict `MustFail` | `TestRunnerRequiresEVERYNamedTestToFail` | red with the `== len(MustFail)` judgement restored |
+| R-2 top-level verdicts only | `TestVerdictsIgnoreSubtestLines` | red with the `\s*`-prefixed patterns restored |
+| R-3 `&&` guards only its own command | `TestUnguardedCd`'s `cd … && git init; git add -A` | red (0 findings) pre-fix |
+| R-3 comments do not guard | `TestUnguardedCd`'s `cd "$LAB"  # \|\| exit 1` | red pre-fix |
+| R-4 `--` consumed | `TestRmRfBareVar` ×3 (`--`, flags apart, braced) | red (0 findings) pre-fix |
+| R-5 kill scoping + trailing comments | `TestUnscopedKill` ×3 | red (0 findings) pre-fix |
+| R-6 renderers + `default:` | `TestPrintDrainReport_WaitStatus` ×2, `TestMCPDrainCellReportsSkippedWait`, `TestMCPDrainCellUnknownWaitStatusIsNotSilence` | red pre-fix |
+| R-7 evidence grace | `TestCellDrainWait_RidesOutAReconnectWithTheRequestStillRunning` | red pre-fix ("the drain ran during the evidence gap") |
+| R-8 CI proves the run | shell step asserted by hand (`bash -n`, gate env removed ⇒ grep fails) | n/a |
+| R-9 fleetmcp registry entry | the entry itself | caught, 17/17 |
+
+### Independently re-verified, unchanged
+
+Each of these was planted and watched, not read:
+
+- **Every C20 check catches.** `fleetmcp`'s credential twin (unauthorized
+  builder planted ⇒ names `toolUnloadModel`); `rm-rf-bare-var` and
+  `unscoped-kill` against REAL rig files (`gate-c19-drill.sh`,
+  `gate-c15-warm-auth.sh`), which the registry only covered for
+  `unguarded-cd`; the registry's STALE meta-guard (a guarded production
+  line reworded) and its missing-test meta-guard (a `MustFail` renamed).
+- **Every check is non-inert.** All three `observed` scans and
+  `TestScriptsAreSafe` fail with `t.Fatal` when pointed at an empty tree
+  ("the scan is inert"), not pass over nothing. `astscan`'s floors are the
+  EXACT producer counts, verified by dumping them: `fleetapi` C15 = 4
+  (`getJSON`, `readSwapVersion`, `warmViaFront`, `streamCell`), `fleetmcp`
+  C15 = 3, warm class = 3 (`wakeWarm`, `evalScheduleEntry`, `restore`).
+  Production `.Observed()` reads = 10 against a floor of 8.
+- **No entry passes trivially.** The runner's non-compiling verdict is
+  itself tested, and every `Replace` in the registry was checked to
+  produce test verdicts rather than a build error.
+- **Cost, re-measured on the workstation:** 10 s fully warm, 18–25 s after
+  a source edit — the doc's 21 s warm figure is honest and errs high. The
+  new packages add ~0.6 s to the blocking job.
+- **Inner loop:** `go build`, `go vet`, `gofmt -l` silent, `go mod tidy`
+  byte-identical, `golangci-lint run` **0 issues**, `go test -race ./...`
+  green, `-race -count=5` green over the touched packages.
+- `internal/vibe/proxy`: **empty diff**. `go.mod`/`go.sum`:
+  **byte-identical**. `AGENTS.md`, the plan README and
+  `docs/design/fleet-control.md`: **untouched**.
+
+### Not changed, and why
+
+- **`astscan`'s `MinProducers` counts EXEMPT producers.** A rule that
+  exempted every producer would still clear its floor. No production rule
+  uses `Exempt` today, and the floor's job is to prove the scan REACHED
+  the code, which an exempt producer does. Recorded rather than changed.
+- **A distinct `wait_status` for "evidence lost mid-wait".** It would name
+  what it proves (C13's rule), and `WaitStatus` is a free string so no
+  proto change is needed — but it is new vocabulary for four consumers,
+  and R-6's `default:` arm now makes an unknown value loud in both
+  renderers, which is the property that mattered. Left for a phase that
+  wants the distinction on the wire.
+- **The `(value, bool)` LOCALS in `daemon/cell_suspend.go`.** The three
+  scans see struct fields and returns, not locals. This pair is declared,
+  written and read inside one function within twenty lines, which is the
+  case the type is not needed for.
+
 ## For the reconciliation pass
 
 This branch does not touch `AGENTS.md`,
@@ -649,10 +873,18 @@ A new section, "The invariant harness (fleet-control C20)":
   unset, not empty), and `pkill` patterns with no variable in them. Two
   exemptions, both in `gate-c15-warm-auth.sh`, both written down.
 - Under the drain notes: **`drain --wait` refuses to claim quiescence
-  from the LOSS of the in-flight report.** An unreported count mid-wait
-  returns `skipped_no_inflight_data`, not `waited` — the stream can drop
-  (`clearInFlight`) or send an unfoldable frame (`disarmInFlightLocked`)
-  while the request is still running.
+  from the LOSS of the in-flight report, and refuses to ACT on it
+  either.** An unreported count mid-wait never returns `waited`; a gap
+  shorter than `inflightEvidenceGrace` (5 s, ~3 reconnect attempts) is
+  ridden out, because llama-swap re-seeds a fresh `/api/events`
+  connection with a current-state snapshot inside ~200 ms and giving up
+  on the first missing tick turns a blip into the force-closed generation
+  `--wait` exists to prevent. Only a gap that outlasts the grace — or the
+  operator's own deadline expiring while the evidence is missing —
+  answers `skipped_no_inflight_data`. Both renderers say "no in-flight
+  evidence", never "the cell never reported": the status has two
+  producers and asserting either as fact sends the operator to debug the
+  wrong thing.
 
 ### docs/design/fleet-control-plan/README.md
 

@@ -51,6 +51,24 @@ func isRemoteInvocation(ctx context.Context) bool {
 // surface as Unavailable, not a stuck RPC.
 const cellCmdTimeout = 60 * time.Second
 
+// inflightEvidenceGrace bounds how long the quiescence wait tolerates the
+// in-flight report going missing before it gives up on proving anything.
+//
+// The report going missing is overwhelmingly a BLIP: llama-swap re-seeds
+// a fresh /api/events connection with a current-state inflight snapshot
+// inside ~200 ms (AGENTS.md, measured), and the watcher's reconnect
+// backoff starts at 500 ms. Giving up on the first missing tick turns a
+// reconnect into the one outcome `--wait` exists to prevent — a unit stop
+// that force-closes a generation fleetd had POSITIVE evidence was
+// running one second earlier.
+//
+// It changes neither terminal answer: the evidence really being gone
+// still yields skipped_no_inflight_data, and it returning still yields
+// waited. Long enough for three reconnect attempts (0.5 + 1 + 2 s),
+// short enough that a cell whose events stream is genuinely dead does not
+// hold the verb.
+const inflightEvidenceGrace = 5 * time.Second
+
 // CellDrain runs the configured drain command and returns the pre-drain
 // report gathered just before it. The report is best-effort by design:
 // resident models come from the local llama-swap's /running when it
@@ -158,26 +176,48 @@ func (d *Daemon) awaitQuiescence(ctx context.Context) (string, error) {
 	}
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
+	// lostAt is when the in-flight report went missing, zero while it is
+	// arriving. The wait rides out a gap shorter than the grace rather
+	// than treating a reconnect as an answer.
+	var lostAt time.Time
 	for {
 		// The count can go UNREPORTED mid-wait: the cell's events stream
 		// drops (clearInFlight) or sends a frame this build cannot fold
 		// (disarmInFlightLocked). This loop used to spell that
 		// `n, _ := InFlight(cell)`, read the zero, and return "waited" —
 		// telling an operator who asked for quiescence that the cell went
-		// quiet, when what actually went quiet was fleetd's evidence. The
-		// answer is the one wait_status that already means "no data",
-		// not a claim about the box (fleet-control C20).
+		// quiet, when what actually went quiet was fleetd's evidence
+		// (fleet-control C20).
 		n, reported := d.fleet.InFlight(cell).Observed()
-		if !reported {
-			slog.Info("the local cell's in-flight report stopped mid-wait; not claiming quiescence", "cell", cell)
+		switch {
+		case reported:
+			lostAt = time.Time{}
+			if n == 0 {
+				return fleetapi.DrainWaitWaited, nil
+			}
+			slog.Info("drain waiting for in-flight requests", "in_flight", n)
+		case lostAt.IsZero():
+			lostAt = time.Now()
+			slog.Info("the local cell's in-flight report stopped mid-wait; holding for the stream to re-seed",
+				"cell", cell, "grace", inflightEvidenceGrace)
+		case time.Since(lostAt) >= inflightEvidenceGrace:
+			// The evidence is gone, not blinking. Answer with the one
+			// wait_status that already means "no data" — never a claim
+			// about the box, and never `waited`.
+			slog.Info("the local cell's in-flight report did not return; not claiming quiescence",
+				"cell", cell, "missing_for", time.Since(lostAt).Round(time.Second))
 			return fleetapi.DrainWaitSkippedNoInflight, nil
 		}
-		if n == 0 {
-			return fleetapi.DrainWaitWaited, nil
-		}
-		slog.Info("drain waiting for in-flight requests", "in_flight", n)
 		select {
 		case <-ctx.Done():
+			if !lostAt.IsZero() {
+				// The operator's wait ran out while the evidence was
+				// missing. That is the same "no data" answer, not
+				// DeadlineExceeded — refusing the drain here would report
+				// in-flight work that nothing has observed since the
+				// stream dropped.
+				return fleetapi.DrainWaitSkippedNoInflight, nil
+			}
 			return "", ctx.Err()
 		case <-tick.C:
 		}

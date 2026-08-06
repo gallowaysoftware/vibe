@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
-
 	"github.com/gallowaysoftware/vibe/internal/vibe/observed"
 )
 

@@ -160,14 +160,21 @@ var pairSuffixes = []string{"Seen", "Known", "Reported", "OK", "Ok", "Valid", "S
 var evidencePairExempt = map[string]string{
 	// C7b's power term is an ACCUMULATOR plus "did anything contribute",
 	// not a measurement plus "was it measured": every write is
-	// `power += cost; powerKnown = true` at one site, and every read is
-	// gated on the bool in the same function. observed.Value would spell
-	// each += as Known(OrElse(0)+cost), which is strictly worse code for
-	// no change in what is representable. Listed rather than migrated on
-	// purpose, and re-examine it if the accumulation ever moves away from
-	// its guard.
-	"internal/vibe/fleetapi/savings.go:Power": "accumulator + did-anything-contribute, written and read at the same site",
-	"internal/vibe/fleetapi/savings.go:power": "same pair, the unexported window aggregate",
+	// `power += cost; powerKnown = true` at one site. observed.Value would
+	// spell each += as Known(OrElse(0)+cost), which is strictly worse code
+	// for no change in what is representable.
+	//
+	// The reads are NOT uniformly gated on the bool, and the first draft
+	// of this table said they were — `dayNet.net()` is `Gross - Power`
+	// with no reference to PowerKnown, so the payback series bills an
+	// undeclared cell's electricity as zero. That is C7b's deliberate
+	// "the power term is the one place this screen errs LARGE", stated on
+	// the page by `powerGapNote`, not a dropped bit. Written down here
+	// because an exemption's REASON is the only thing that tells the next
+	// agent whether to re-examine it: re-examine if the accumulation ever
+	// moves away from its guard, or if the err-large disclosure goes away.
+	"internal/vibe/fleetapi/savings.go:Power": "accumulator + did-anything-contribute; the one ungated read (dayNet.net) is C7b's declared err-large payback term, disclosed by powerGapNote",
+	"internal/vibe/fleetapi/savings.go:power": "same pair, the unexported window aggregate; every read of this one IS gated on powerKnown",
 }
 
 func TestNoNewValueAndKnownBitFieldPair(t *testing.T) {

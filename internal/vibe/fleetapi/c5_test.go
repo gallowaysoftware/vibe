@@ -18,9 +18,8 @@ import (
 	"time"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
-	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
-
 	"github.com/gallowaysoftware/vibe/internal/vibe/observed"
+	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 )
 
 // ─── §2 crash and config integrity ──────────────────────────────────────────

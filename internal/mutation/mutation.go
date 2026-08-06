@@ -118,15 +118,20 @@ var Registry = []Mutation{
 	{
 		Name: "drain-wait/evidence-loss-reported-as-quiescence",
 		File: "internal/vibe/daemon/cell_drain.go",
-		Find: "\t\tn, reported := d.fleet.InFlight(cell).Observed()\n\t\tif !reported {",
-		// The pre-C20 spelling, verbatim: read the count, drop the bit.
-		Replace:  "\t\tn, reported := d.fleet.InFlight(cell).Observed()\n\t\tif false && !reported {",
+		Find: "\t\tn, reported := d.fleet.InFlight(cell).Observed()\n\t\tswitch {\n\t\tcase reported:",
+		// The pre-C20 spelling, in effect: read the count, drop the bit,
+		// let an unreported read take the reported branch as a zero. The
+		// `_ = reported` keeps it compiling — a mutation that fails to
+		// build proves nothing about the guard.
+		Replace:  "\t\tn, reported := d.fleet.InFlight(cell).Observed()\n\t\t_ = reported\n\t\tswitch {\n\t\tcase true:",
 		Pkg:      "./internal/vibe/daemon/",
-		MustFail: []string{"TestCellDrainWait_DoesNotClaimQuiescenceWhenTheEvidenceStops"},
+		MustFail: []string{"TestCellDrainWait_DoesNotClaimQuiescenceWhenTheEvidenceStops", "TestCellDrainWait_RidesOutAReconnectWithTheRequestStillRunning"},
 		Why: "the in-flight count can go UNREPORTED mid-wait when the cell's events stream drops. " +
 			"Reading that as zero tells an operator who asked for quiescence that the cell went " +
 			"quiet, when what went quiet was fleetd's evidence — and the stop that follows cancels " +
-			"whatever was running.",
+			"whatever was running. Both halves are pinned: the report must not read as quiescence, " +
+			"and a gap shorter than the grace must not end the wait at all (llama-swap re-seeds a " +
+			"fresh events connection inside ~200 ms).",
 	},
 
 	// ── class 3: a guard that lives in one of N call paths ────────────
@@ -140,6 +145,18 @@ var Registry = []Mutation{
 		Why: "the AST scan is the only thing that sees a NEW producer built without the credential " +
 			"— it caught C16's /api/version reader at merge time. If it stops failing for a " +
 			"genuinely unauthorized builder it is decoration.",
+	},
+	{
+		Name:     "c15/fleetmcp's unload builder drops the credential",
+		File:     "internal/vibe/fleetmcp/fleetmcp.go",
+		Find:     "\tif err := s.fleet.AuthorizeSwap(req, cell); err != nil {\n\t\treturn \"\", fmt.Errorf(\"unload %s on %s: %v\", model, cell, credentialDetail(err))\n\t}",
+		Replace:  "\tif req == nil {\n\t\treturn \"\", nil\n\t}",
+		Pkg:      "./internal/vibe/fleetmcp/",
+		MustFail: []string{"TestEveryLlamaSwapRequestIsAuthorized"},
+		Why: "the credential rule has a TWIN, and fleetmcp is the half that holds the operator's verbs " +
+			"(warm_model, unload_model). The registry covered only fleetapi's copy, so the phase doc's " +
+			"claim that one entry proves both was one rename away from being false in the package where " +
+			"a 401 is an agent's verb failing silently.",
 	},
 	{
 		Name:     "c4/the warm class guard leaves the restore",

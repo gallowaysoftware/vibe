@@ -361,7 +361,8 @@ func TestSuspendGuard_EveryRungDefersAndNamesItself(t *testing.T) {
 // IN-FLIGHT message — ground rule 10's exact failure, a name claiming
 // more than the body proves. The observesActivity rung cannot in fact
 // fire: it is reached only after the in-flight rung passed, and passing
-// that rung requires an in-flight count reported for the cell, which is one of the two things
+// that rung requires an in-flight count REPORTED for the cell, which is
+// one of the two things
 // observesActivity is an OR over. So the ladder is sound and the rung is
 // belt-and-braces; the test now says which rung answers, and pins the
 // subsumption that makes the other one unreachable.

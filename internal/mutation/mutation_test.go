@@ -290,6 +290,69 @@ func TestRunnerRejectsANonCompilingMutation(t *testing.T) {
 	}
 }
 
+// TestVerdictsIgnoreSubtestLines: a SUBTEST verdict must never be
+// recorded under its parent's name. `go test -v` prints the parent's
+// verdict first and its subtests indented underneath, so a `\s*`-prefixed
+// pattern let the LAST subtest decide the parent's result — and a parent
+// that FAILED with a passing subtest last read as a pass, which this
+// runner reports as an UNPROTECTED guard. Not hypothetical:
+// TestWarmTarget_NoActivityEvidence is a MustFail target with three
+// subtests, and only the third fails under its mutation.
+func TestVerdictsIgnoreSubtestLines(t *testing.T) {
+	const out = `=== RUN   TestWarmTarget_NoActivityEvidence
+=== RUN   TestWarmTarget_NoActivityEvidence/unwatched_cell_is_never_evicted
+=== RUN   TestWarmTarget_NoActivityEvidence/watched_cell_still_restores
+--- FAIL: TestWarmTarget_NoActivityEvidence (0.02s)
+    --- FAIL: TestWarmTarget_NoActivityEvidence/unwatched_cell_is_never_evicted (0.00s)
+    --- PASS: TestWarmTarget_NoActivityEvidence/watched_cell_still_restores (0.01s)
+--- PASS: TestSomethingElse (0.00s)
+FAIL
+`
+	res := parseVerdicts(out)
+	if got, ok := res["TestWarmTarget_NoActivityEvidence"]; !ok || got {
+		t.Fatalf("verdict = (%v, ok=%v), want a FAIL: a passing SUBTEST overwrote the failing parent, so a "+
+			"guard that fired would be reported as UNPROTECTED", got, ok)
+	}
+	if got, ok := res["TestSomethingElse"]; !ok || !got {
+		t.Fatalf("TestSomethingElse = (%v, ok=%v), want a PASS — the parser now misses ordinary top-level lines", got, ok)
+	}
+	if len(res) != 2 {
+		t.Fatalf("res = %v, want exactly the two top-level tests", res)
+	}
+}
+
+// TestRunnerRequiresEVERYNamedTestToFail: an entry naming two guards
+// pins two guards. The first cut asked whether they ALL still passed, so
+// either one going red satisfied the entry — and `c4/the warm class guard
+// leaves the restore` names its structural scan and its behavioural
+// fire-time test precisely because the phase doc claims both.
+func TestRunnerRequiresEVERYNamedTestToFail(t *testing.T) {
+	if os.Getenv(gateEnv) != "1" {
+		t.Skipf("set %s=1 (this one compiles a package)", gateEnv)
+	}
+	tree := workTree(t)
+	m := Mutation{
+		Name:    "half-covered",
+		File:    "internal/vibe/fleetapi/warmtarget.go",
+		Find:    "\tif refused := s.warmClassRefusal(t.Model); refused != \"\" {",
+		Replace: "\tif refused := \"\"; refused != \"\" {",
+		Pkg:     "./internal/vibe/fleetapi/",
+		// The first goes red under this mutation. The second is a real
+		// test in the same package that this mutation cannot touch, so it
+		// stays green — exactly what an entry looks like once one of its
+		// named guards has stopped covering the line.
+		MustFail: []string{"TestEveryWarmProducerConsultsTheClassGuard", "TestRoutes_EveryRouteDeclaresAnAccessLevel"},
+		Why:      "the runner's own negative control for a partially-covering entry",
+	}
+	err := runOne(t, tree, m)
+	if err == nil {
+		t.Fatal("an entry whose second named test stayed GREEN was reported as caught: a registry entry can claim two guards and pin one")
+	}
+	if !strings.Contains(err.Error(), "UNPROTECTED") || !strings.Contains(err.Error(), "TestRoutes_EveryRouteDeclaresAnAccessLevel") {
+		t.Fatalf("err = %v, want an UNPROTECTED finding naming the test that stayed green", err)
+	}
+}
+
 func workTree(t *testing.T) string {
 	t.Helper()
 	tree := filepath.Join(t.TempDir(), "tree")
@@ -332,16 +395,34 @@ func runOne(t *testing.T, tree string, m Mutation) error {
 			passed = append(passed, name)
 		}
 	}
-	if len(passed) == len(m.MustFail) {
-		return fmt.Errorf("mutation applied and every named test still PASSED (%s). This guard is "+
-			"UNPROTECTED: %s", strings.Join(passed, ", "), m.Why)
+	// EVERY named test, not any of them. The field is called MustFail and
+	// its doc says each one is checked individually; the first cut asked
+	// only whether they ALL passed, so an entry naming two tests was
+	// satisfied by either one. That is not academic here: `c4/the warm
+	// class guard leaves the restore` names the structural scan AND the
+	// behavioural fire-time test precisely because the phase doc claims
+	// both, and under the loose rule the scan alone would have carried a
+	// green result while the behavioural half quietly stopped covering
+	// anything.
+	if len(passed) > 0 {
+		return fmt.Errorf("mutation applied and %d of %d named test(s) still PASSED (%s). Those guards are "+
+			"UNPROTECTED: %s", len(passed), len(m.MustFail), strings.Join(passed, ", "), m.Why)
 	}
 	return nil
 }
 
 var (
-	runLine    = regexp.MustCompile(`^=== RUN\s+(Test[A-Za-z0-9_]*)`)
-	verdictRe  = regexp.MustCompile(`^\s*--- (PASS|FAIL|SKIP): (Test[A-Za-z0-9_]*)`)
+	// Both anchored at column 0, which is where `go test -v` prints the
+	// TOP-LEVEL lines. Subtest verdicts are INDENTED and their names carry
+	// a `/`, and a `\s*` prefix used to fold them onto the parent's name —
+	// last line wins, so a parent that failed with a passing subtest last
+	// was recorded as a PASS. `TestWarmTarget_NoActivityEvidence` (a
+	// MustFail target) has three subtests and only the third fails under
+	// its mutation; reorder them and a real catch becomes a spurious
+	// UNPROTECTED report. A harness that calls a working guard broken is
+	// the same category of lie as one that calls a broken guard fine.
+	runLine    = regexp.MustCompile(`^=== RUN\s+(Test[A-Za-z0-9_]*)$`)
+	verdictRe  = regexp.MustCompile(`^--- (PASS|FAIL|SKIP): (Test[A-Za-z0-9_]*) `)
 	testBinary = "go"
 )
 
@@ -362,7 +443,15 @@ func runTests(t *testing.T, tree, pkg string, names []string) (map[string]bool, 
 	cmd.Dir = tree
 	raw, err := cmd.CombinedOutput()
 	out := string(raw)
+	return parseVerdicts(out), out, err
+}
 
+// parseVerdicts turns `go test -v` output into a per-TOP-LEVEL-test
+// pass/fail map. Split out from runTests so the parsing can be tested
+// without shelling out — it is the one place this harness converts
+// evidence into a verdict, and getting it wrong makes every entry's
+// result meaningless in a way nothing else would notice.
+func parseVerdicts(out string) map[string]bool {
 	res := map[string]bool{}
 	ran := map[string]bool{}
 	sc := bufio.NewScanner(strings.NewReader(out))
@@ -390,7 +479,7 @@ func runTests(t *testing.T, tree, pkg string, names []string) (map[string]bool, 
 			res[name] = false
 		}
 	}
-	return res, out, err
+	return res
 }
 
 func repoRoot(t *testing.T) string {

@@ -91,6 +91,22 @@ func TestUnguardedCd(t *testing.T) {
 	if got := lintText(t, "set -uo pipefail\ncd \"$LAB\"; git init && git add -A\n"); len(got) != 1 {
 		t.Errorf("an && to the RIGHT of the cd was read as guarding it: %v", got)
 	}
+	// The MIRROR image, which the self-review's REV-4 left open: the &&
+	// short-circuits `git init`, and then the `;` starts a fresh command
+	// that runs in the operator's directory regardless. An && guards only
+	// what is left of the next `;`.
+	if got := lintText(t, "set -uo pipefail\ncd \"$LAB\" && git init; git add -A\n"); len(got) != 1 {
+		t.Errorf("an && chain followed by `; more` was read as guarding the whole line: %v", got)
+	}
+	// …and the same shape with the trailing statement removed is still
+	// guarded, or the rule is unsatisfiable by the idiom it recommends.
+	if got := lintText(t, "set -uo pipefail\n( cd \"$REPO\" && go build ./... ) || die \"build failed\"\n"); len(got) != 0 {
+		t.Errorf("the repo's own guarded-subshell idiom now over-fires: %v", got)
+	}
+	// A trailing comment neither guards a cd nor hides one.
+	if got := lintText(t, "set -uo pipefail\ncd \"$LAB\"  # || exit 1 would be nice\n"); len(got) != 1 {
+		t.Errorf("a `||` inside a COMMENT was read as guarding the cd: %v", got)
+	}
 }
 
 func TestRmRfBareVar(t *testing.T) {
@@ -99,6 +115,13 @@ func TestRmRfBareVar(t *testing.T) {
 		"unquoted":      "set -uo pipefail\nrm -rf $LAB\n",
 		"braced":        "set -uo pipefail\nrm -rf \"${LAB}/state\"\n",
 		"flags apart":   "set -uo pipefail\nrm -r -f \"$LAB\"\n",
+		// `--` is the CAREFUL spelling and this repo already uses it
+		// (`cd -- "$(dirname …)"`), so it must not be the one the rule is
+		// silent on. rmTarget used to return the marker itself as rm's
+		// target, which starts with `-` rather than `$`.
+		"end-of-options marker":         "set -uo pipefail\nrm -rf -- \"$LAB\"\n",
+		"end-of-options, flags apart":   "set -uo pipefail\nrm -r -f -- $LAB\n",
+		"end-of-options, braced target": "set -uo pipefail\nrm -rf -- \"${LAB}/state\"\n",
 	} {
 		got := lintText(t, body)
 		if len(got) != 1 || got[0].Rule != RuleRmRfVar {
@@ -106,11 +129,13 @@ func TestRmRfBareVar(t *testing.T) {
 		}
 	}
 	for name, body := range map[string]string{
-		"colon-question guard": "set -uo pipefail\nrm -rf \"${SB_STATE:?}/vibe\"\n",
-		"colon-dash default":   "set -uo pipefail\nrm -rf \"${LAB:-/tmp/none}\"\n",
-		"a literal path":       "set -uo pipefail\nrm -rf /tmp/fixed/path\n",
-		"literal then var":     "set -uo pipefail\nrm -rf /tmp/lab-\"$ID\"\n",
-		"not recursive":        "set -uo pipefail\nrm -f \"$LAB\"\n",
+		"colon-question guard":   "set -uo pipefail\nrm -rf \"${SB_STATE:?}/vibe\"\n",
+		"colon-dash default":     "set -uo pipefail\nrm -rf \"${LAB:-/tmp/none}\"\n",
+		"a literal path":         "set -uo pipefail\nrm -rf /tmp/fixed/path\n",
+		"literal then var":       "set -uo pipefail\nrm -rf /tmp/lab-\"$ID\"\n",
+		"not recursive":          "set -uo pipefail\nrm -f \"$LAB\"\n",
+		"guarded after --":       "set -uo pipefail\nrm -rf -- \"${LAB:?}\"\n",
+		"not recursive after --": "set -uo pipefail\nrm -f -- \"$LAB\"\n",
 	} {
 		if got := lintText(t, body); len(got) != 0 {
 			t.Errorf("%s: false positive %v", name, got)
@@ -119,9 +144,21 @@ func TestRmRfBareVar(t *testing.T) {
 }
 
 func TestUnscopedKill(t *testing.T) {
-	got := lintText(t, "set -uo pipefail\npkill -f llama-swap\n")
-	if len(got) != 1 || got[0].Rule != RuleBroadKill {
-		t.Fatalf("findings = %v, want one unscoped-kill", got)
+	for name, body := range map[string]string{
+		"bare": "set -uo pipefail\npkill -f llama-swap\n",
+		// The `$` has to be in the KILL's own arguments. Both of these
+		// scanned clean: the rule searched everything to the right of the
+		// verb, so a variable in a neighbouring command — or in a comment
+		// claiming the pattern is scoped — read as scoping it. On this box
+		// that is the production llama-swap on :9000.
+		"a $ in a trailing comment": "set -uo pipefail\npkill -f llama-swap  # scoped to $LAB, honest\n",
+		"a $ in the next command":   "set -uo pipefail\npkill -f llama-swap || echo \"$?\"\n",
+		"a $ after a semicolon":     "set -uo pipefail\npkill -f llama-swap; rm -rf \"${WORK:?}\"\n",
+	} {
+		got := lintText(t, body)
+		if len(got) != 1 || got[0].Rule != RuleBroadKill {
+			t.Errorf("%s: findings = %v, want one unscoped-kill", name, got)
+		}
 	}
 	for name, body := range map[string]string{
 		"anchored on the lab path": "set -uo pipefail\npkill -f \"llama-swap -config $LAB/\"\n",
