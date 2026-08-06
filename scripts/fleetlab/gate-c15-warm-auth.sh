@@ -268,6 +268,36 @@ state | jq -r '"    front_renders after the transition: \(.front_renders)"'
 grep -c apiKeys "$CELLS/front/config.yaml" | sed 's/^/    apiKeys lines in the re-rendered front config: /'
 grep -o '"msg":"front config[^"]*"' "$STATE/fleetd/vibe/daemon.log" | sort | uniq -c
 
+# ── HALF 4: the adversarial-review pass's three findings, live ─────────
+say "HALF 4a: a key file deleted at 03:00 — does the GUEST-readable state document leak its path?"
+rm -f "$KEY_FILE"
+sleep 20
+state | jq -c '.swap_auth.cells[]? | {cell, kind, detail}'
+if state | jq -e --arg p "$KEY_FILE" '(.|tostring) | contains($p)' >/dev/null; then
+  note "LEAK: /api/fleet/state carries $KEY_FILE (C12 grants this document to the guest bearer)"
+else
+  note "no path in the state document (the sentence names cells.front.swap_key_file only)"
+fi
+note "queued commands for heavy (an unresolvable FRONT credential must not be routed around):"
+state | jq -r '"    " + ((.cells[] | select(.name == "heavy") | .queued_commands // 0) | tostring) + " queued"' 2>/dev/null \
+  || note "    (no queued_commands field on this snapshot)"
+grep -o '"msg":"warm-target restore piggybacked on the announce"' "$STATE/fleetd/vibe/daemon.log" | wc -l \
+  | sed 's/^/    warm-target restores piggybacked to the cell: /'
+
+say "HALF 4b: fleet.front_extras declared but NOT readable — does the render still delete apiKeys?"
+mv "$LAB/front-extras.yaml" "$LAB/front-extras.yaml.moved"
+grep -c apiKeys "$CELLS/front/config.yaml" | sed 's/^/    apiKeys lines before the transition: /'
+pkill -f "llama-swap -config $CELLS/heavy/" 2>/dev/null
+sleep 20
+( cd "$LAB" && CUDA_VISIBLE_DEVICES="" "$LLAMA_SWAP" -config "$CELLS/heavy/config.yaml" \
+    -listen 127.0.0.1:9661 -watch-config >>"$LOGS/swap-heavy.log" 2>&1 & )
+sleep 45
+grep -c apiKeys "$CELLS/front/config.yaml" | sed 's/^/    apiKeys lines after the transition: /'
+grep -o '"msg":"presence-derived render failed"' "$STATE/fleetd/vibe/daemon.log" | sort | uniq -c
+grep -o 'front_extras[^"]*cannot be read' "$STATE/fleetd/vibe/daemon.log" | head -1 | sed 's/^/    refusal: /' 
+doctor | jq -c '.checks[] | select(.id == "front.extras") | {id, level, summary}'
+mv "$LAB/front-extras.yaml.moved" "$LAB/front-extras.yaml"
+
 say "fleetd log lines about the credential (the daemon logs to its state dir, not stdout)"
 grep -o '"msg":"[^"]*\(credential\|API key\)[^"]*"' "$STATE/fleetd/vibe/daemon.log" | sort | uniq -c
 

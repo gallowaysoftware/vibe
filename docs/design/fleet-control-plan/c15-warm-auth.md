@@ -2,11 +2,17 @@
 
 Status: **PR OPEN** ([#38](https://github.com/gallowaysoftware/vibe/pull/38),
 2026-08-05), off `feat/c15-warm-auth` branched from `main` at `0c275fd`.
-Four commits: the feature, `fleet.front_extras` (the render half — see
+Five commits: the feature, `fleet.front_extras` (the render half — see
 §6, it is not optional scope), ground rule 9's adversarial self-review
 commit (two findings, one of them an eighth producer living outside
-fleetd), and a post-CI fix (the page's credential line, and the AST
-scans off the deprecated `parser.ParseDir`). Every production predicate
+fleetd), a post-CI fix (the page's credential line, and the AST
+scans off the deprecated `parser.ParseDir`), and ground rule 9's second
+pass — an ADVERSARIAL REVIEW by a different agent, which found six more
+(one blocker: a declared-but-unreadable `front_extras` deletes the
+front's `apiKeys`; a guest-visible path leak; a piggyback that routed
+around the credential). See the
+[adversarial-review addendum](#adversarial-review-addendum-ground-rule-9s-second-pass).
+Every production predicate
 in the phase is **mutation-verified**: 24 reverts, each confirmed to turn
 a named test red and then restored. Unit gates U1–U12 green on a full
 local inner loop (`go build`, `go vet`,
@@ -571,6 +577,139 @@ Ground rule 9's separate pass, over the two feature commits.
   reason was buried every other tick. Both halves are now present and
   separately pinned.
 
+### Adversarial-review addendum (ground rule 9's second pass)
+
+A separate pass over the four feature/self-review commits, by a reviewer
+who did not write them. Six findings, all fixed in
+`review: adversarial-review pass` — five of them in code the phase added,
+one in a claim the phase doc made about that code. Every fix is
+mutation-verified (9 reverts, each confirmed to turn a NAMED test red,
+then restored) and the two that change fleet behaviour were re-run on the
+real two-swap rig as **HALF 4** of `gate-c15-warm-auth.sh`.
+
+- **REV-A (blocker): a declared `fleet.front_extras` that will not read
+  deletes the front's `apiKeys` — and the doctor calls it OK.**
+  `router.mergeExtras` maps `os.ErrNotExist` to "no extras, no error" (a
+  sane default for `vibe router render --extras`, where a missing file
+  genuinely means none). Under the render LOOP it means a typo in the
+  path — or, on fleetd, an extras file whose container mount is missing —
+  renders a front config with no `apiKeys:` over one that had them. The
+  outcome is strictly worse than the 401 this phase exists to fix: the
+  LAN-facing box stops demanding a credential at all. `front.extras`
+  reported **OK** throughout, because it tested only that the config key
+  was set — DECLARED is not MERGED, which is exactly the "a check is
+  named for what it PROVES" rule C13 carries. Fixed at both ends:
+  `renderPass` refuses the write while the declared extras cannot be
+  read (input-side, and only when there IS a non-empty front config to
+  protect — the same shape and the same first-boot exemption as the
+  zero-defs gate right above it), and `front.extras` is a FAIL on a keyed
+  front / WARN otherwise, naming the path.
+- **REV-B (major): the key file's PATH reached the guest.**
+  `swap_auth[].detail` formatted the resolver's error, which embeds the
+  declared path, and the same string propagated into the warm rows —
+  both on `GET /api/fleet/state`, which C12 grants to the guest bearer.
+  The phase doc claimed the opposite in §4 ("the config key, not the
+  path, because that document is guest-readable") while the code did it
+  in two producers. `TestSwapKeyNeverAppearsInAnySurface` did not catch
+  it because it greps for the KEY and only ever exercises the *rejected*
+  path, where no path is printed. Fixed by splitting the disclosure
+  levels at the source: `fleetcfg.SwapKeyError` carries `Error()` (with
+  the path — for the daemon log, the doctor, and an operator's own
+  terminal) and `Public()` (the hosts.yaml key and the reason, nothing
+  else), `fleetapi` renders only `Public()`, and `/mcp` unwraps for the
+  path because it is token-only. An error the resolver did not classify
+  contributes nothing but its existence — substituting `err.Error()`
+  there is how an unreviewed string reaches a guest.
+- **REV-C (major): an unresolvable credential was piggybacked to the
+  cell.** §5 rejects "the front refused us, so send the warm to the
+  cell's own llama-swap" by name — and the rejection held only for the
+  401, because that is a typed `*warmHTTPError`. A declared key file that
+  will not read returned an UNTYPED error, which `queueWarm` reads as a
+  DELIVERY failure, so the first tick after a key file went missing
+  queued a `warm` to the cell and executed it there. The rung above it
+  does not help: `SwapAuthRefusal` suppresses only once a failure is
+  already recorded, and this is the tick that records it. Fixed by
+  typing it (`swapAuthError`) and teaching `definitiveWarmRefusal` that
+  fleetd refusing to SEND is a refusal, not a failure to deliver.
+- **REV-D (major): `render_front` merged a different extras file than
+  the render loop.** The MCP tool read the CLI default
+  (`~/.config/vibe/router-extras.yaml`) while the loop merges
+  `fleet.front_extras`, so on the very fleet this phase supports the
+  dry-run diff reported the front's own `apiKeys:` as a deletion — and
+  on fleetd, where the CLI default does not exist, it reported every
+  hand-written section that way. A tool whose entire job is "what would
+  the render write" must merge what the writer merges. `Options` gained
+  `FrontExtras`; the CLI default now applies only when fleetd does NOT
+  own the write path, there being no loop to agree with. (Writing the
+  test also caught the old code reading the DEVELOPER's real
+  `router-extras.yaml` into a unit test.)
+- **REV-E (minor): `usagemeter.authorize` skipped the control-character
+  check** `fleetcfg.SwapCredentialFor` performs. A key file with a
+  wrapped line fails in net/http as "invalid header field value", naming
+  no configuration — the exact failure the resolver's check exists to
+  prevent, on the one producer that does not use the resolver.
+- **REV-F (minor): keying a NON-front cell is accepted and silently
+  breaks that cell's announce catalog.** §8 records the hazard
+  (`announceOnce` maps a `gatherModels` failure to an EMPTY model list,
+  which C4's warm policy reads as "nothing resident") and correctly
+  scopes the cell-side dialers out. But `swap_key_file` is a per-CELL
+  field, so the phase makes that configuration one an operator can now
+  reach by typing it, with nothing said at the moment of typing.
+  `checkSwapKeys` now logs one WARN naming the affected cells and what
+  breaks. Deliberately a startup log and not a status row: a permanent
+  yellow on a fleet that is fine is how an operator learns to ignore a
+  level (C13).
+
+Two things looked wrong and are not, recorded so the next pass does not
+re-litigate them:
+
+- The credential rung in `restore`/`wakeWarm` sits above the
+  `frontCanRoute` branch, so a warm target on a cell absent from the
+  registry is blocked by the FRONT's credential even though its warm
+  would never have gone through the front. Left alone: that path exists
+  only for a target naming a cell `hosts.yaml` has never heard of, and
+  the safe direction here is refusing.
+- `TestDaemon_PullForLocalFile` flaked once under `-race -count=5` across
+  every package in parallel and passed 18/18 afterwards (8 in isolation,
+  10 in two full package runs). Its 5-second socket-reachability budget
+  is pre-existing and unrelated to this phase.
+
+#### Review gates
+
+| # | gate | result |
+|---|---|---|
+| R1 | The guest-readable state document (and the warm rows on it) carry no filesystem path, on BOTH producers of the unresolvable sentence, while still naming `cells.<name>.swap_key_file` | PASS |
+| R2 | An unresolvable credential is a definitive refusal: no request, no piggyback, through `warmViaFront`, `queueWarm` and the real `restore` | PASS |
+| R3 | A declared-but-unreadable `front_extras` refuses the render (and does not refuse a first-boot render with nothing to erase); `front.extras` is FAIL / WARN accordingly | PASS |
+| R4 | `render_front`'s dry run merges the render loop's extras, so it does not report the front's `apiKeys` as drift | PASS |
+| R5 | The usage collector refuses a key holding a control character, names the file, leaks no bytes, sends nothing | PASS |
+| R6 | A keyed non-front cell produces the cell-side-gap warning; a front-only keyed fleet (the reference posture) produces none | PASS |
+| R7 | Mutation: 9 reverts, each turns a named test red | PASS |
+| R8 | Full inner loop, `-race -count=5 ./...`, `gofmt` silent, `go mod tidy` byte-identical, `golangci-lint` v2.12.2 0 issues, `internal/vibe/proxy` diff empty | PASS |
+
+**Live (HALF 4 of `gate-c15-warm-auth.sh`, 2026-08-05, same two-swap rig):**
+
+```
+HALF 4a: the key file deleted under a running fleetd
+{"cell":"front","kind":"unresolvable",
+ "detail":"fleetd cannot read the llama-swap API key declared for front, so no request is
+           sent to its llama-swap at all: cells.front.swap_key_file names a file that does not exist"}
+    no path in the state document (the sentence names cells.front.swap_key_file only)
+    0 queued
+    warm-target restores piggybacked to the cell: 0
+
+HALF 4b: fleet.front_extras declared but moved away, then a membership transition
+    apiKeys lines before the transition: 1
+    apiKeys lines after the transition:  1
+      1 "msg":"presence-derived render failed"
+    refusal: front_extras /tmp/fleetlab-c15rev/front-extras.yaml cannot be read
+{"id":"front.extras","level":"fail","summary":"fleet.front_extras is declared but cannot be read, so the render merges nothing"}
+```
+
+Halves 1-3 were re-run unchanged on the fixed code and reproduce the
+transcript above. The two README qualifications still apply (CPU models
+are not GPU models; one box is not a fleet).
+
 ## For the reconciliation pass
 
 This branch does not touch `AGENTS.md`,
@@ -624,6 +763,29 @@ A new bullet in the fleet-control section, after C14's:
 >     status strip): the detail names `cells.<name>.swap_key_file` and the
 >     state document is guest-readable, so the sentence stays on
 >     `fleet_status` and doctor. No new route — C7b's rule.
+>   - **`fleet.front_extras` must RESOLVE, not merely be declared.**
+>     `router.mergeExtras` maps a missing file to "no extras, no error",
+>     so a typo'd path erases the front's `apiKeys` exactly as an unset
+>     `front_extras` would — and the front then stops demanding a
+>     credential at all, which is worse than the 401. `renderPass`
+>     refuses the write while the declared file cannot be read (input-side,
+>     and only when there is a non-empty front config to protect — the
+>     zero-defs gate's shape), and `front.extras` is a FAIL. `render_front`
+>     merges the LOOP's extras, not the CLI default, or its dry run
+>     reports the operator's `apiKeys` as a deletion.
+>   - **Two disclosure levels, and the split is at the source.**
+>     `fleetcfg.SwapKeyError.Error()` names the PATH and belongs on the
+>     token-only surfaces (the daemon log, the doctor, `/mcp`, an
+>     operator's terminal); `.Public()` names only
+>     `cells.<name>.swap_key_file` and the reason, and is the ONLY thing
+>     that may reach `/api/fleet/state` — C12 grants that document to the
+>     guest bearer, and the warm rows ride it too. An unclassified error
+>     contributes nothing but its existence.
+>   - **fleetd refusing to SEND is a refusal, not a failure to deliver.**
+>     `definitiveWarmRefusal` covers `*swapAuthError` as well as a 4xx:
+>     an unresolvable key file was untyped, so `queueWarm` piggybacked the
+>     warm to the cell and executed it there — routing around the broken
+>     credential on the one tick before the sticky refusal arms.
 >   - **The cell-side dialers are NOT covered** (fleetannounce,
 >     modelprobe, the cell's own usagemeter): different config surface.
 >     The hazard to know: `announceOnce` maps a `gatherModels` failure to

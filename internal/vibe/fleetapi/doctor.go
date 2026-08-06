@@ -535,7 +535,28 @@ func (s *Server) checkFrontExtras(rep *DoctorReport, host DoctorHost) {
 	}
 	cred, err := s.hostsFile().SwapCredentialFor(fleetcfg.FrontCell)
 	keyed := err != nil || cred.Configured
+	// DECLARED is not MERGED. router.mergeExtras treats a missing file as
+	// "no extras", so a typo'd or unmounted front_extras is exactly as
+	// destructive as no front_extras at all — and reporting it OK would
+	// make this check name something it does not prove (C13).
+	extrasErr := error(nil)
+	if host.FrontExtras != "" {
+		_, extrasErr = os.Stat(host.FrontExtras)
+	}
 	switch {
+	case extrasErr != nil && keyed:
+		rep.Add(DoctorCheck{ID: id, Cell: fleetcfg.FrontCell, Level: LevelFail,
+			Summary: "fleet.front_extras is declared but cannot be read, so the render merges nothing",
+			Detail: "fleet.front_extras: " + host.FrontExtras + " (" + extrasErr.Error() + "). A missing extras file is not an error to the " +
+				"renderer — it merges nothing and writes on — so " + host.FrontConfig + " loses its apiKeys at the next membership transition, " +
+				"exactly as if front_extras were unset. fleetd's render loop refuses the write while this holds.",
+			Fix: "fix the path (or the container mount) so fleet.front_extras resolves on the box running fleetd."})
+	case extrasErr != nil:
+		rep.Add(DoctorCheck{ID: id, Cell: fleetcfg.FrontCell, Level: LevelWarn,
+			Summary: "fleet.front_extras is declared but cannot be read",
+			Detail: "fleet.front_extras: " + host.FrontExtras + " (" + extrasErr.Error() + "). Nothing is being erased today — the front declares " +
+				"no llama-swap API key — but the render merges nothing, so any section put in that file would not reach the front.",
+			Fix: "fix the path (or the container mount), or drop fleet.front_extras."})
 	case host.FrontExtras != "":
 		rep.Add(DoctorCheck{ID: id, Cell: fleetcfg.FrontCell, Level: LevelOK,
 			Summary: "the front's non-derived config is declared and merged into every render",

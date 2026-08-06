@@ -223,6 +223,25 @@ func (rl *renderLoop) renderPass() error {
 			return fmt.Errorf("refusing to render an empty front config: no backend defs under %s (fix the defs mount)", rl.cfg.BackendsDir)
 		}
 	}
+	// The same input-side gate for the OTHER half of the front's config.
+	// router.mergeExtras maps ErrNotExist to "no extras, no error" — a
+	// sane default for `vibe router render --extras`, and a silent
+	// disarming here: a declared front_extras whose path is wrong (or
+	// whose mount is missing inside fleetd's container) renders a config
+	// with no `apiKeys:` over one that had them. The front then stops
+	// demanding a key at all, which is a worse outcome than the 401 this
+	// phase exists to fix. Declared-and-unreadable is a config error, so
+	// refuse and keep the last good file — but only when there IS a file
+	// to protect, exactly as the zero-defs gate above does, or a
+	// first-boot fleet could never render.
+	if rl.cfg.FrontExtras != "" {
+		if _, statErr := os.Stat(rl.cfg.FrontExtras); statErr != nil {
+			if fi, cfgErr := os.Stat(rl.cfg.FrontConfigPath); cfgErr == nil && fi.Size() > 0 {
+				return fmt.Errorf("refusing to render over %s: fleet.front_extras %s cannot be read (%v), so the render would drop every hand-written section (apiKeys:, store:) from the front's config",
+					rl.cfg.FrontConfigPath, rl.cfg.FrontExtras, statErr)
+			}
+		}
+	}
 	pres := rl.srv.presenceSnapshot()
 
 	defs = rl.applyClassPolicy(defs, pres)

@@ -97,15 +97,59 @@ type swapAuthCell struct {
 // unresolvable declaration as a failure, so a key file deleted at 03:00
 // shows up in fleet_status and the doctor rather than only in whichever
 // caller happened to try first.
+//
+// The returned error is a *swapAuthError whose Error() is the PATH-FREE
+// sentence, because it propagates into the warm status rows that ride
+// `/api/fleet/state`. The path stays on the token-only surfaces (the
+// doctor resolves the credential itself; `daemon.checkSwapKeys` logs it).
 func (s *Server) swapCredential(cell string) (fleetcfg.SwapCredential, error) {
 	cred, err := s.hostsFile().SwapCredentialFor(cell)
 	if err != nil {
-		s.recordSwapAuth(cell, SwapAuthUnresolvable, fmt.Sprintf(
-			"fleetd cannot read the llama-swap API key declared for %s, so no request is sent to its llama-swap at all: %v", cell, err))
-		return cred, err
+		detail := swapUnresolvableDetail(cell, err)
+		s.recordSwapAuth(cell, SwapAuthUnresolvable, detail)
+		return cred, &swapAuthError{public: detail, cause: err}
 	}
 	return cred, nil
 }
+
+// swapUnresolvableDetail is the ONE renderer for an unresolvable
+// declaration, shared by both producers so the two cannot disclose
+// different things. It never carries the key file's PATH: this string
+// lands in `fleet_status.swap_auth[].detail` and in the warm rows, and
+// `GET /api/fleet/state` is C12's one guest-readable document.
+//
+// An error the resolver did not classify contributes NOTHING but its
+// existence — substituting err.Error() there is how an unreviewed string
+// reaches a guest.
+func swapUnresolvableDetail(cell string, err error) string {
+	why := fleetcfg.PublicSwapKeyReason(err)
+	if why == "" {
+		why = "cells." + cell + ".swap_key_file will not resolve"
+	}
+	return "fleetd cannot read the llama-swap API key declared for " + cell +
+		", so no request is sent to its llama-swap at all: " + why
+}
+
+// swapAuthError is fleetd REFUSING to send: a declared credential would
+// not resolve, so nothing left this box. It is a type for two reasons.
+//
+// Its Error() is the path-free sentence, so every surface that formats
+// it — including the guest-readable warm rows — discloses only the
+// config key; Unwrap keeps the path-bearing cause reachable for a log or
+// an errors.Is.
+//
+// And it is DEFINITIVE (see definitiveWarmRefusal): the piggyback queue
+// must not route around it. A warm queued to the cell would execute
+// against the cell's own llama-swap, hiding a broken front credential
+// behind a promise — the case §5 rejects by name, which held only for
+// the 401 (a typed *warmHTTPError) until this pass.
+type swapAuthError struct {
+	public string
+	cause  error
+}
+
+func (e *swapAuthError) Error() string { return e.public }
+func (e *swapAuthError) Unwrap() error { return e.cause }
 
 // hostsFile is nil-safe access to the parsed hosts.yaml. A single-box
 // daemon has none, and every cell there resolves to "no key declared".
@@ -151,8 +195,12 @@ func (s *Server) NoteSwapStatus(cell string, status int) {
 	cred, err := s.hostsFile().SwapCredentialFor(cell)
 	switch {
 	case err != nil:
+		why := fleetcfg.PublicSwapKeyReason(err)
+		if why == "" {
+			why = "cells." + cell + ".swap_key_file will not resolve"
+		}
 		s.recordSwapAuth(cell, SwapAuthUnresolvable, fmt.Sprintf(
-			"%s's llama-swap refused fleetd (HTTP %d) and the key declared for it cannot be read: %v", cell, status, err))
+			"%s's llama-swap refused fleetd (HTTP %d) and the key declared for it cannot be read: %s", cell, status, why))
 	case cred.Configured:
 		s.recordSwapAuth(cell, SwapAuthRejected, fmt.Sprintf(
 			"%s's llama-swap REJECTED the key from cells.%s.swap_key_file (HTTP %d): that value is not in its apiKeys list "+

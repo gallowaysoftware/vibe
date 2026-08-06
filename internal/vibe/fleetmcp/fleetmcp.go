@@ -77,6 +77,7 @@ type Server struct {
 	// from this daemon (a same-host mount) — render_front diffs against
 	// it. Empty means render-only, no diff.
 	frontConfig string
+	frontExtras string
 	// backendsDir and llamaBinary feed the renderer the same inputs the
 	// CLI gives it.
 	backendsDir string
@@ -90,6 +91,13 @@ type Server struct {
 // own config values).
 type Options struct {
 	FrontConfig string
+	// FrontExtras is fleet.front_extras — the operator-owned YAML the
+	// render LOOP merges into the front's config (C15). render_front
+	// answers "what would the render write", so it must merge the same
+	// file: with the CLI's default instead, the dry run reports the
+	// front's `apiKeys:` as drift to be deleted on a fleet whose render
+	// loop preserves them.
+	FrontExtras string
 	BackendsDir string
 	LlamaBinary string
 }
@@ -103,6 +111,7 @@ func New(fleet *fleetapi.Server, hosts *fleetcfg.File, opts Options) *Server {
 		http:        &http.Client{Timeout: toolTimeout},
 		warmHTTP:    &http.Client{},
 		frontConfig: opts.FrontConfig,
+		frontExtras: opts.FrontExtras,
 		backendsDir: opts.BackendsDir,
 		llamaBinary: opts.LlamaBinary,
 	}
@@ -741,7 +750,7 @@ func (s *Server) toolWarmModel(ctx context.Context, model string) (string, error
 		}
 		req.Header.Set("Content-Type", "application/json")
 		if err := s.fleet.AuthorizeSwap(req, fleetcfg.FrontCell); err != nil {
-			slog.Error("warm_model not sent: the front's llama-swap credential will not resolve", "model", model, "err", err)
+			slog.Error("warm_model not sent: the front's llama-swap credential will not resolve", "model", model, "err", credentialDetail(err))
 			return
 		}
 		resp, err := s.warmHTTP.Do(req)
@@ -804,7 +813,7 @@ func (s *Server) toolUnloadModel(ctx context.Context, cell, model string) (strin
 	// key file behind "queued for the next announce" would let the
 	// misconfiguration survive indefinitely.
 	if err := s.fleet.AuthorizeSwap(req, cell); err != nil {
-		return "", fmt.Errorf("unload %s on %s: %v", model, cell, err)
+		return "", fmt.Errorf("unload %s on %s: %v", model, cell, credentialDetail(err))
 	}
 	resp, err := s.http.Do(req)
 	if err != nil {
@@ -848,6 +857,19 @@ func (s *Server) queueUnload(cell, model, why string) (string, error) {
 // that cell's llama-swap credential (C15). The cell name is a parameter
 // for the same reason fleetapi's is: it selects the key, and every
 // fleetd→llama-swap call in this repo goes through one authorizer.
+// credentialDetail is the token-only rendering of a swap-credential
+// failure. fleetapi's error deliberately names only the hosts.yaml key,
+// because it propagates into `/api/fleet/state`, which C12 grants to the
+// guest bearer; /mcp and this daemon's log are token-only, so they get
+// the wrapped cause and with it the PATH an operator has to go fix.
+func credentialDetail(err error) error {
+	var ske *fleetcfg.SwapKeyError
+	if errors.As(err, &ske) {
+		return ske
+	}
+	return err
+}
+
 func (s *Server) getJSON(ctx context.Context, cell, url string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

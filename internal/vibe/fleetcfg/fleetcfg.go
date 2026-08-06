@@ -20,6 +20,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"syscall"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"gopkg.in/yaml.v3"
@@ -336,6 +337,49 @@ type SwapCredential struct {
 	Source string
 }
 
+// SwapKeyError is a declared swap_key_file that will not resolve.
+//
+// It carries the same fact twice, at two disclosure levels, because the
+// surfaces that report it are not equally private. Error() names the
+// PATH and belongs on the token-only surfaces (fleetd's log, the doctor
+// report, an operator's own terminal). Public() names only the
+// hosts.yaml KEY and the reason, for anything that reaches
+// `/api/fleet/state` — which C12 grants to the guest bearer, and a
+// route grant is not a field grant. Neither ever carries the key value.
+type SwapKeyError struct {
+	// Key is "cells.<name>.swap_key_file".
+	Key string
+	// Path is the declared file. Absent from Public().
+	Path string
+	// Reason is the path-free failure clause ("does not exist", "is
+	// empty", …). It never quotes file CONTENT.
+	Reason string
+	// Err is the underlying os error, if any, for errors.Is.
+	Err error
+}
+
+func (e *SwapKeyError) Error() string {
+	return e.Key + " (" + e.Path + ") " + e.Reason
+}
+
+// Public is the sentence a guest may read: the config key to fix and
+// why, with no filesystem path.
+func (e *SwapKeyError) Public() string { return e.Key + " " + e.Reason }
+
+func (e *SwapKeyError) Unwrap() error { return e.Err }
+
+// PublicSwapKeyReason renders err for a guest-readable surface: the
+// SwapKeyError's path-free sentence, or "" for anything else. Callers
+// that get "" must not substitute err.Error() — an unrecognised error
+// has not been reviewed for what it discloses.
+func PublicSwapKeyReason(err error) string {
+	var ske *SwapKeyError
+	if errors.As(err, &ske) {
+		return ske.Public()
+	}
+	return ""
+}
+
 // SwapCredentialFor resolves the API key a caller must present to one
 // cell's llama-swap.
 //
@@ -346,10 +390,10 @@ type SwapCredential struct {
 // way — membership is s.cells' business (fleetapi) and hosts.yaml's
 // validate(), not this resolver's.
 //
-// A DECLARED key that cannot be resolved is a typed error and the caller
-// must fail CLOSED: sending the request unauthenticated turns an operator
-// typo into an opaque 401 from a box across the house, which is the exact
-// failure C6's MIN-P fixed for the daemon token.
+// A DECLARED key that cannot be resolved is a *SwapKeyError and the
+// caller must fail CLOSED: sending the request unauthenticated turns an
+// operator typo into an opaque 401 from a box across the house, which is
+// the exact failure C6's MIN-P fixed for the daemon token.
 func (f *File) SwapCredentialFor(name string) (SwapCredential, error) {
 	if f == nil {
 		return SwapCredential{}, nil
@@ -358,25 +402,46 @@ func (f *File) SwapCredentialFor(name string) (SwapCredential, error) {
 	if !ok || c.SwapKeyFile == "" {
 		return SwapCredential{}, nil
 	}
-	src := "cells." + name + ".swap_key_file (" + c.SwapKeyFile + ")"
+	key := "cells." + name + ".swap_key_file"
+	src := key + " (" + c.SwapKeyFile + ")"
+	fail := func(reason string, cause error) (SwapCredential, error) {
+		return SwapCredential{Configured: true, Source: src},
+			&SwapKeyError{Key: key, Path: c.SwapKeyFile, Reason: reason, Err: cause}
+	}
 	data, err := os.ReadFile(c.SwapKeyFile)
 	if err != nil {
-		return SwapCredential{Configured: true, Source: src}, fmt.Errorf("read %s: %w", src, err)
+		reason := "cannot be read: " + readReason(err)
+		if errors.Is(err, os.ErrNotExist) {
+			reason = "names a file that does not exist"
+		}
+		return fail(reason, err)
 	}
-	key := strings.TrimSpace(string(data))
-	if key == "" {
-		return SwapCredential{Configured: true, Source: src}, fmt.Errorf("%s is empty", src)
+	val := strings.TrimSpace(string(data))
+	if val == "" {
+		return fail("names an empty file", nil)
 	}
 	// Checked here rather than left to net/http: a key with an embedded
 	// newline or tab is rejected by the transport with "invalid header
 	// field value" naming no config at all, and the operator then hunts a
 	// Go error instead of a stray byte in a key file. The offending byte
 	// is reported by POSITION — printing it would print part of the key.
-	if i := strings.IndexFunc(key, func(r rune) bool { return r < 0x20 || r == 0x7f }); i >= 0 {
-		return SwapCredential{Configured: true, Source: src},
-			fmt.Errorf("%s holds a control character at byte %d: an API key must be one line of printable text", src, i)
+	if i := strings.IndexFunc(val, func(r rune) bool { return r < 0x20 || r == 0x7f }); i >= 0 {
+		return fail(fmt.Sprintf("holds a control character at byte %d: an API key must be one line of printable text", i), nil)
 	}
-	return SwapCredential{Key: key, Configured: true, Source: src}, nil
+	return SwapCredential{Key: val, Configured: true, Source: src}, nil
+}
+
+// readReason classifies an os.ReadFile failure without echoing the
+// message, which embeds the path net/os put in it.
+func readReason(err error) string {
+	switch {
+	case errors.Is(err, os.ErrPermission):
+		return "permission denied"
+	case errors.Is(err, syscall.EISDIR):
+		return "it is a directory"
+	default:
+		return "unreadable"
+	}
 }
 
 // ModelPricingFor returns the pricing claim for a local model id.

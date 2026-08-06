@@ -745,6 +745,15 @@ func (c *Collector) authorize(req *http.Request) error {
 	if key == "" {
 		return fmt.Errorf("api_key_file %s is empty", c.cfg.APIKeyFile)
 	}
+	// Same check fleetcfg's resolver makes, for the same reason: net/http
+	// refuses a header value with an embedded newline or tab, and its
+	// "invalid header field value" names no configuration at all. The
+	// offending byte is reported by POSITION — printing it would print
+	// part of the key. Without this the collector's failure mode is a Go
+	// error the operator cannot map back to a file.
+	if i := strings.IndexFunc(key, func(r rune) bool { return r < 0x20 || r == 0x7f }); i >= 0 {
+		return fmt.Errorf("api_key_file %s holds a control character at byte %d: an API key must be one line of printable text", c.cfg.APIKeyFile, i)
+	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	return nil
 }

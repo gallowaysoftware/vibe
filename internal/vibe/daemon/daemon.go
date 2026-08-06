@@ -678,6 +678,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			FrontConfig: d.cfg.Fleet.FrontConfig,
 			BackendsDir: paths.BackendsDir(),
 			LlamaBinary: d.cfg.LlamaBinary,
+			FrontExtras: d.cfg.Fleet.FrontExtras,
 		}).Register(mux)
 		// C3: the front config is a derived artifact once fleetd can see
 		// its path (same-host mount). Without front_config the registry

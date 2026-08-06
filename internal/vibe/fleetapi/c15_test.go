@@ -3,6 +3,7 @@ package fleetapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -207,8 +208,19 @@ func TestSwapKey_UnresolvableDeclarationSendsNothing(t *testing.T) {
 	if err == nil {
 		t.Fatal("warm succeeded with an unreadable key file")
 	}
-	if !strings.Contains(err.Error(), missing) {
-		t.Errorf("error does not name the file: %v", err)
+	// The sentence names the CONFIG KEY, and deliberately not the path:
+	// this error propagates into the warm status rows, which ride
+	// `/api/fleet/state` — C12's one guest-readable document. The path is
+	// reachable through Unwrap for the token-only surfaces.
+	if !strings.Contains(err.Error(), "cells.front.swap_key_file") {
+		t.Errorf("error does not name the config to fix: %v", err)
+	}
+	if strings.Contains(err.Error(), missing) {
+		t.Errorf("the credential error carries the key file's PATH, and this string reaches a guest: %v", err)
+	}
+	var ske *fleetcfg.SwapKeyError
+	if !errors.As(err, &ske) || ske.Path != missing {
+		t.Errorf("the path is not recoverable for the token-only surfaces: %v", err)
 	}
 	if front.requests() != 0 {
 		t.Fatalf("%d request(s) reached the front; a declared-but-unreadable key must fail CLOSED", front.requests())
@@ -221,7 +233,7 @@ func TestSwapKey_UnresolvableDeclarationSendsNothing(t *testing.T) {
 func TestSwapCredentialFor_RejectsUnusableKeys(t *testing.T) {
 	dir := t.TempDir()
 	for name, tc := range map[string]struct{ body, want string }{
-		"empty":            {"   \n", "is empty"},
+		"empty":            {"   \n", "empty file"},
 		"embedded-newline": {"abc\ndef\n", "control character"},
 		"tab":              {"abc\tdef", "control character"},
 	} {
@@ -243,6 +255,15 @@ func TestSwapCredentialFor_RejectsUnusableKeys(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), "abc") {
 				t.Errorf("the error string leaked key bytes: %v", err)
+			}
+			// Public() is what a guest-readable surface may render: the
+			// hosts.yaml key and the reason, never the path.
+			var ske *fleetcfg.SwapKeyError
+			if !errors.As(err, &ske) {
+				t.Fatalf("not a *SwapKeyError, so no surface can tell what it may disclose: %v", err)
+			}
+			if strings.Contains(ske.Public(), p) || !strings.Contains(ske.Public(), "cells.front.swap_key_file") {
+				t.Errorf("Public() = %q, want the config key and no path", ske.Public())
 			}
 		})
 	}
@@ -675,15 +696,27 @@ func TestDoctorFrontExtras(t *testing.T) {
 	keyed := hostsWithKey(t, front.srv.URL, labSwapKey)
 	unkeyed := hostsWithKeyPath(t, front.srv.URL, "")
 
+	realExtras := filepath.Join(t.TempDir(), "front-extras.yaml")
+	if err := os.WriteFile(realExtras, []byte("apiKeys:\n  - k\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ghost := filepath.Join(t.TempDir(), "not-mounted.yaml")
+
 	for name, tc := range map[string]struct {
 		hosts *fleetcfg.File
 		host  DoctorHost
 		want  Level
 	}{
 		"keyed front, rendered config, no extras": {keyed, DoctorHost{FrontConfig: "/front/config.yaml"}, LevelFail},
-		"keyed front, rendered config, extras":    {keyed, DoctorHost{FrontConfig: "/front/config.yaml", FrontExtras: "/front/extras.yaml"}, LevelOK},
+		"keyed front, rendered config, extras":    {keyed, DoctorHost{FrontConfig: "/front/config.yaml", FrontExtras: realExtras}, LevelOK},
 		"keyed front, no render mount":            {keyed, DoctorHost{}, LevelOK},
 		"unkeyed front, rendered config":          {unkeyed, DoctorHost{FrontConfig: "/front/config.yaml"}, LevelOK},
+		// DECLARED is not MERGED: router.mergeExtras maps a missing file
+		// to "no extras, no error", so a typo'd path erases the front's
+		// apiKeys exactly as an unset front_extras would. Scoring it OK
+		// made the check name something it did not prove.
+		"keyed front, extras path that does not exist":   {keyed, DoctorHost{FrontConfig: "/front/config.yaml", FrontExtras: ghost}, LevelFail},
+		"unkeyed front, extras path that does not exist": {unkeyed, DoctorHost{FrontConfig: "/front/config.yaml", FrontExtras: ghost}, LevelWarn},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := newC15Server(t, front, tc.hosts)

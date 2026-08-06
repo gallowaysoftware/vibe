@@ -514,16 +514,26 @@ func (e *warmHTTPError) Error() string {
 	return fmt.Sprintf("warm through front: HTTP %d: %s", e.Status, e.Body)
 }
 
-// definitiveWarmRefusal reports whether the front ANSWERED the warm
-// with a 4xx. Anything else — a transport error, a 5xx, an injected
-// test error — is a failure to DELIVER, which is what the piggyback
+// definitiveWarmRefusal reports whether the warm was REFUSED rather
+// than merely undelivered — the two cases the piggyback queue must not
+// be allowed to blur. Anything else — a transport error, a 5xx, an
+// injected test error — is a failure to DELIVER, which is what the
 // queue exists for.
+//
+// Two shapes qualify. The front ANSWERING with a 4xx (a *warmHTTPError)
+// is C6's rule. A *swapAuthError is C15's: fleetd could not resolve the
+// credential, so nothing left this box, and the cell cannot fix the
+// front's key file — queueing the warm there would execute it against
+// the cell's own llama-swap and hide a broken credential behind a
+// promise. Until this was typed, the 401 was refused and the
+// unresolvable declaration right beside it was piggybacked.
 func definitiveWarmRefusal(err error) bool {
 	var he *warmHTTPError
 	if errors.As(err, &he) {
 		return he.Status >= 400 && he.Status < 500
 	}
-	return false
+	var sae *swapAuthError
+	return errors.As(err, &sae)
 }
 
 // queueWarm is the warm loops' half of the piggyback producer (C6's

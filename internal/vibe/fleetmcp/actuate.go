@@ -199,6 +199,18 @@ func (s *Server) toolWakeCell(ctx context.Context, cell string) (string, error) 
 // presence-driven render loop OWNS the write path, and two writers to
 // one -watch-config file is exactly what its atomic-write contract
 // forbids. This tool is the "what would change" question, not a lever.
+// renderExtrasPath picks the extras file whose merge this dry run must
+// reproduce: fleetd's own `fleet.front_extras` when fleetd owns the
+// write path, and the CLI's default only when it does not — there being
+// no render loop to agree with, the output is then a render a human
+// applies with `vibe router render`, which merges exactly that file.
+func (s *Server) renderExtrasPath() string {
+	if s.frontConfig != "" {
+		return s.frontExtras
+	}
+	return filepath.Join(paths.ConfigHome(), "router-extras.yaml")
+}
+
 func (s *Server) toolRenderFront(ctx context.Context, dryRun *bool) (string, error) {
 	_ = ctx // the dry-run path has no cancellation semantics of its own
 	if dryRun != nil && !*dryRun {
@@ -209,9 +221,12 @@ func (s *Server) toolRenderFront(ctx context.Context, dryRun *bool) (string, err
 		Cell:              fleetcfg.FrontCell,
 		Hosts:             s.hosts,
 		LlamaServerBinary: s.llamaBinary,
-		// Same extras default as the CLI (missing file = none), so the
-		// dry-run diff can't disagree with a CLI render that merged them.
-		ExtrasPath: filepath.Join(paths.ConfigHome(), "router-extras.yaml"),
+		// The render LOOP's extras, not the CLI's default: this tool
+		// answers "what would fleetd write", and fleetd merges
+		// fleet.front_extras. Reading ~/.config/vibe/router-extras.yaml
+		// here made the dry run report the front's own `apiKeys:` as a
+		// deletion — on the one file C15 exists to keep them in.
+		ExtrasPath: s.renderExtrasPath(),
 		Warnf: func(format string, args ...any) {
 			warnings = append(warnings, fmt.Sprintf(format, args...))
 		},

@@ -34,7 +34,7 @@ func checkSwapKeys(hosts *fleetcfg.File) {
 	if hosts == nil {
 		return
 	}
-	var declared []string
+	var declared, peers []string
 	for _, name := range slices.Sorted(maps.Keys(hosts.Cells)) {
 		cred, err := hosts.SwapCredentialFor(name)
 		if err != nil {
@@ -45,6 +45,9 @@ func checkSwapKeys(hosts *fleetcfg.File) {
 		}
 		if cred.Configured {
 			declared = append(declared, name)
+			if name != fleetcfg.FrontCell {
+				peers = append(peers, name)
+			}
 		}
 	}
 	if len(declared) > 0 {
@@ -52,5 +55,21 @@ func checkSwapKeys(hosts *fleetcfg.File) {
 		// "which cells are keyed" is exactly the question an operator has
 		// when half the fleet 401s.
 		slog.Info("llama-swap API keys resolved", "cells", declared)
+	}
+	if len(peers) > 0 {
+		// The cell-side dialers are out of this phase's scope, and the
+		// gap is not symmetric: keying a NON-front cell also keys it
+		// against its OWN announcer, C8's prober and its usage collector,
+		// none of which present a credential. `announceOnce` maps a
+		// gatherModels failure to an EMPTY model list, which is precisely
+		// what C4's warm policy reads as "nothing resident" — so the box
+		// invites a warm on every grace window while reporting a catalog
+		// it cannot read. Said once, at the moment the config is loaded,
+		// to the person who just wrote it; deliberately NOT a status row,
+		// because a permanent nag on a fleet that is fine is how an
+		// operator learns to ignore a level.
+		slog.Warn("llama-swap API keys declared on non-front cells; the CELL-side dialers do not present one",
+			"cells", peers,
+			"affects", "that cell's announcer catalog (announces as EMPTY, which the warm policy reads as nothing resident), its C8 prober, and its usage ledger rows")
 	}
 }
