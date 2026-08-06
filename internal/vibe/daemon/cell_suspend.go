@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"connectrpc.com/connect"
@@ -49,7 +50,17 @@ func (d *Daemon) CellSuspend(ctx context.Context, req *connect.Request[vibev1.Ce
 	}
 
 	report := &vibev1.CellSuspendResponse{IdleStatus: fleetapi.SuspendIdleNotRequired}
-	report.ResidentModels = d.probeResidentModels(ctx)
+	if models, ok := d.probeResidentModels(ctx).Observed(); ok {
+		report.ResidentModels = models
+	} else {
+		// Same rule as the drain's: an unanswered /running leaves the field
+		// empty, and the log is where "nobody looked" is written down. The
+		// idle PROOF below is untouched by it — that one refuses on absent
+		// evidence rather than logging it, because a suspend acts on the
+		// whole box.
+		slog.Warn("the local llama-swap did not answer /running; the pre-suspend report names no resident models because none were OBSERVED, not because none are loaded",
+			"cell", d.localCellKey())
+	}
 	var inFlight int
 	reported := false
 	if d.fleet != nil {
@@ -73,7 +84,7 @@ func (d *Daemon) CellSuspend(ctx context.Context, req *connect.Request[vibev1.Ce
 		report.IdleStatus = fleetapi.SuspendIdleVerified
 	}
 
-	vctx, cancelVerb := verbCtx(ctx)
+	vctx, cancelVerb := d.verbCtx(ctx)
 	defer cancelVerb()
 	if stderr, err := d.cellCmdRunner(vctx, d.cfg.CellCmds.Suspend); err != nil {
 		return nil, connect.NewError(connect.CodeUnavailable,

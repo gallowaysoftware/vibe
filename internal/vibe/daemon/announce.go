@@ -94,6 +94,18 @@ func (d *Daemon) startAnnounce(ctx context.Context) error {
 // flight — an unreachable registry must not hold shutdown open.
 const announceStopTimeout = 3 * time.Second
 
+// announceWithdrawTimeout bounds the goodbye itself, and it is built from
+// context.Background deliberately: the shutdown path's own ctx is
+// typically already cancelled by the time this runs, and a goodbye that
+// cancels itself never leaves the box.
+//
+// Which makes this the ONLY end of that call. The last time this
+// construction went unbounded, a registry that accepted the connection
+// and stopped talking held Close() for ten minutes; withdraw is
+// best-effort by design (fleetd's staleness prunes the cell anyway), so
+// spending more than this on it buys nothing and costs a shutdown.
+const announceWithdrawTimeout = 5 * time.Second
+
 // withdrawAnnounce stops the announce loop and sends the goodbye
 // heartbeat, in that order: a heartbeat racing the withdraw would land
 // after it and re-announce the cell as serving. Best-effort throughout —
@@ -112,7 +124,7 @@ func (d *Daemon) withdrawAnnounce() {
 			slog.Info("announce loop still running at shutdown; withdrawing anyway")
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), announceWithdrawTimeout)
 	defer cancel()
 	if err := d.announce.Withdraw(ctx); err != nil {
 		slog.Info("withdraw announce failed; fleetd will prune on staleness", "err", err)
@@ -199,10 +211,17 @@ func (d *Daemon) localLlamaSwapURL() string {
 	return "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(d.cfg.ProxyPort))
 }
 
+// fleetCapacityTimeout bounds the VRAM probes behind one heartbeat's
+// capacity block. Same rule as the version read: the heartbeat is the
+// cell's only evidence of life, and an nvidia-smi that has gone
+// uninterruptible must cost the announce a field rather than the
+// announce.
+const fleetCapacityTimeout = 3 * time.Second
+
 // fleetCapacity fills the announce capacity block: VRAM total/free from
 // the daemon's own probes, disk free for the state dir.
 func (d *Daemon) fleetCapacity() *fleetapi.AnnounceCapacity {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), fleetCapacityTimeout)
 	defer cancel()
 	cap := FleetDiskCapacity(filepath.Dir(paths.StartHistoryFile()))
 	if free, err := d.nvidiaSMI(ctx); err == nil {

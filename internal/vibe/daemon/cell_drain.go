@@ -21,6 +21,7 @@ import (
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
+	"github.com/gallowaysoftware/vibe/internal/vibe/observed"
 	vibev1 "github.com/gallowaysoftware/vibe/proto/vibe/v1"
 )
 
@@ -49,7 +50,34 @@ func isRemoteInvocation(ctx context.Context) bool {
 
 // cellCmdTimeout bounds drain/resume commands: a hung unit stop must
 // surface as Unavailable, not a stuck RPC.
+//
+// It is the DEFAULT, not the only value: a box whose process regime is
+// genuinely slower (a compose stack that pulls, an NFS-backed unit)
+// raises it with cell_cmds.cmd_timeout rather than by patching this
+// constant — which is also what lets a test prove the bound is armed
+// without spending a minute to watch it fire.
 const cellCmdTimeout = 60 * time.Second
+
+// cellCmdBudget resolves the bound one cell verb runs under. Absent
+// config is the default above; so is an unparseable or non-positive
+// setting, LOUDLY. A typo'd duration that fell through as zero would
+// hand every verb an already-expired context, and the whole box would
+// report "drain command failed" with nothing anywhere naming the config
+// line that did it — the failure mode this repo keeps meeting, in which
+// a missing measurement is spent as if it were a real one.
+func (d *Daemon) cellCmdBudget() time.Duration {
+	raw := strings.TrimSpace(d.cfg.CellCmds.CmdTimeout)
+	if raw == "" {
+		return cellCmdTimeout
+	}
+	v, err := time.ParseDuration(raw)
+	if err != nil || v <= 0 {
+		slog.Warn("cell_cmds.cmd_timeout is not a positive Go duration; using the default",
+			"value", raw, "default", cellCmdTimeout)
+		return cellCmdTimeout
+	}
+	return v
+}
 
 // inflightEvidenceGrace bounds how long the quiescence wait tolerates the
 // in-flight report going missing before it gives up on proving anything.
@@ -82,7 +110,17 @@ func (d *Daemon) CellDrain(ctx context.Context, req *connect.Request[vibev1.Cell
 	}
 
 	report := &vibev1.CellDrainResponse{ActiveLeases: []*vibev1.LeaseView{}}
-	report.ResidentModels = d.probeResidentModels(ctx)
+	if models, ok := d.probeResidentModels(ctx).Observed(); ok {
+		report.ResidentModels = models
+	} else {
+		// Written down rather than left to the empty list: the wire has one
+		// spelling for "nothing loaded" and "nobody answered", and the
+		// operator reading a pre-drain report deserves to know which one
+		// this is. See probeResidentModels for why the wire cannot say it
+		// yet.
+		slog.Warn("the local llama-swap did not answer /running; the pre-drain report names no resident models because none were OBSERVED, not because none are loaded",
+			"cell", d.localCellKey())
+	}
 	if d.fleet != nil {
 		if n, ok := d.fleet.InFlight(d.localCellKey()).Observed(); ok {
 			n64 := int64(n)
@@ -118,7 +156,7 @@ func (d *Daemon) CellDrain(ctx context.Context, req *connect.Request[vibev1.Cell
 	}
 	report.WaitStatus = &waitStatus
 
-	vctx, cancelVerb := verbCtx(ctx)
+	vctx, cancelVerb := d.verbCtx(ctx)
 	defer cancelVerb()
 	if stderr, err := d.cellCmdRunner(vctx, d.cfg.CellCmds.Drain); err != nil {
 		return nil, connect.NewError(connect.CodeUnavailable,
@@ -143,7 +181,7 @@ func (d *Daemon) CellResume(ctx context.Context, _ *connect.Request[vibev1.CellR
 		return nil, connect.NewError(connect.CodeFailedPrecondition,
 			fmt.Errorf("this daemon has no cell verbs configured (cell_cmds.resume is unset)"))
 	}
-	vctx, cancelVerb := verbCtx(ctx)
+	vctx, cancelVerb := d.verbCtx(ctx)
 	defer cancelVerb()
 	if stderr, err := d.cellCmdRunner(vctx, d.cfg.CellCmds.Resume); err != nil {
 		return nil, connect.NewError(connect.CodeUnavailable,
@@ -241,9 +279,13 @@ func (d *Daemon) localCellKey() string {
 // the RPC's cancellation (a client disconnecting mid-verb must not
 // SIGKILL a unit stop in flight — the verb is exactly as atomic as the
 // process regime makes it, and the caller's presence changes nothing
-// about that), bounded by cellCmdTimeout.
-func verbCtx(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(ctx), cellCmdTimeout)
+// about that), bounded by the cell-command budget.
+//
+// The detachment is why the bound is load-bearing rather than a belt: a
+// WithoutCancel context has no other end. Without the timeout a hung
+// `systemctl stop` holds this RPC for as long as the daemon lives.
+func (d *Daemon) verbCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), d.cellCmdBudget())
 }
 
 // runCellCmd executes a cell verb via sh -c, returning captured stderr for
@@ -257,11 +299,28 @@ func runCellCmd(ctx context.Context, cmd string) (string, error) {
 	return stderr.String(), err
 }
 
+// residentProbeTimeout bounds the pre-drain /running read. It is a
+// 127.0.0.1 read of the router this box runs, and it is on the path of a
+// verb an operator is waiting on: a wedged llama-swap costs the report a
+// field, never the drain.
+const residentProbeTimeout = 3 * time.Second
+
 // probeResidentModels lists models the local llama-swap currently has
-// loaded (any non-stopped state). An absent or non-llama-swap router
-// degrades to an empty list — /running is llama-swap's endpoint.
-func (d *Daemon) probeResidentModels(ctx context.Context) []string {
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+// loaded (any non-stopped state).
+//
+// observed.Value, not a plain slice: an absent or non-llama-swap router,
+// a wedged one and a router with genuinely nothing loaded all produce
+// the same empty list, and "nothing is loaded" is a claim about the box
+// while "nobody answered" is a claim about the evidence. Only the
+// unknown case is UNKNOWN here; a /running that answers with an empty
+// set is Known and empty.
+//
+// The wire still spells both as an absent repeated field — closing that
+// needs a resident_models_unavailable on CellDrainResponse, the shape
+// leases_unavailable already has one field over. Until then the callers
+// log the difference rather than silently spending it.
+func (d *Daemon) probeResidentModels(ctx context.Context) observed.Value[[]string] {
+	ctx, cancel := context.WithTimeout(ctx, residentProbeTimeout)
 	defer cancel()
 	var wrap struct {
 		Running []struct {
@@ -272,19 +331,19 @@ func (d *Daemon) probeResidentModels(ctx context.Context) []string {
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(d.cfg.ProxyPort))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/running", nil)
 	if err != nil {
-		return nil
+		return observed.Value[[]string]{}
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil
+		return observed.Value[[]string]{}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return nil
+		return observed.Value[[]string]{}
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&wrap); err != nil {
-		return nil
+		return observed.Value[[]string]{}
 	}
 	var out []string
 	for _, m := range wrap.Running {
@@ -292,15 +351,22 @@ func (d *Daemon) probeResidentModels(ctx context.Context) []string {
 			out = append(out, m.Model)
 		}
 	}
-	return out
+	return observed.Known(out)
 }
+
+// leaseFetchTimeout bounds the lease read below. Same rule as the
+// resident probe, one hop further out: this one leaves the box, so it is
+// the pre-drain probe most likely to meet a fleetd that accepted the
+// connection and then stopped talking — the failure an ECONNREFUSED test
+// never sees.
+const leaseFetchTimeout = 3 * time.Second
 
 // fetchCellLeases pulls this cell's active advisory leases from fleetd —
 // the "would I strand a batch job?" half of the pre-drain report. Bounded
 // like the other pre-drain probes: a wedged fleetd must degrade the
 // report (leases_unavailable), never block the verb.
 func (d *Daemon) fetchCellLeases(ctx context.Context) ([]*vibev1.LeaseView, error) {
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, leaseFetchTimeout)
 	defer cancel()
 	base := strings.TrimRight(d.cfg.Fleet.RegistryURL, "/")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
@@ -339,6 +405,14 @@ func (d *Daemon) fetchCellLeases(ctx context.Context) ([]*vibev1.LeaseView, erro
 	return out, nil
 }
 
+// intentPostTimeout bounds the best-effort intent POST. context.
+// Background is deliberate — the verb has already succeeded and the RPC's
+// ctx may be gone — which makes this timeout the ONLY thing that ends the
+// call: a fleetd that accepts the connection and never answers would
+// otherwise hold the verb's reply behind a record that is, by design,
+// allowed to fail.
+const intentPostTimeout = 5 * time.Second
+
 // postIntentBestEffort records intent at fleetd after a successful
 // locally-invoked drain/resume. Best-effort by design (the C2 rule):
 // fleetd being down must not fail the verb itself, so failures log and
@@ -367,7 +441,7 @@ func (d *Daemon) postIntentBestEffort(intent fleetapi.Intent) {
 	if err != nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), intentPostTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		strings.TrimRight(d.cfg.Fleet.RegistryURL, "/")+"/api/fleet/intent",

@@ -203,8 +203,9 @@ type ProbeTarget struct {
 }
 
 // CellCmds maps the unified verbs to this box's process regime. Commands
-// run via sh -c with a 60s timeout; a failing drain must surface stderr
-// (a stopped-but-reporting unit is the classic silent failure).
+// run via sh -c with a 60s default timeout (cmd_timeout); a failing drain
+// must surface stderr (a stopped-but-reporting unit is the classic silent
+// failure).
 type CellCmds struct {
 	// Drain reclaims the box (e.g. "systemctl --user stop llama-swap") —
 	// a unit stop, never a kill, and never unload-all (an unloaded model
@@ -227,6 +228,13 @@ type CellCmds struct {
 	// blocks until the machine freezes turns the RPC into a transport
 	// error and the outcome into a guess.
 	Suspend string `yaml:"suspend,omitempty"`
+	// CmdTimeout bounds every verb above (Go duration string, e.g. "90s").
+	// Empty is cellCmdTimeout's 60s, which fits a systemd unit stop; a box
+	// whose regime is genuinely slower declares the longer budget here
+	// rather than losing the bound. An unparseable or non-positive value
+	// logs and falls back to the default: a zero budget would expire every
+	// verb before it started.
+	CmdTimeout string `yaml:"cmd_timeout,omitempty"`
 }
 
 // FleetConfig is the daemon's cell identity and registry pointer. C3's
