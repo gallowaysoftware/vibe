@@ -70,7 +70,11 @@ func (s *Server) checkMirror(rep *DoctorReport, host DoctorHost, now time.Time) 
 		det := "the front host dying is the fleet's one total outage, and the state that dies with it " +
 			"(intent.json, leases.json, the append-only usage ledger, the rendered front config) is not " +
 			"reconstructible from the cells."
-		if f != nil && f.ReadErr == "" {
+		// Only when the receipt carries a stamp this check can subtract:
+		// a zero time renders as "20599d ago" and a future one as "less
+		// than a minute", and both are absent evidence wearing a value —
+		// the mistake the declared branch has its own two rungs for.
+		if f != nil && f.ReadErr == "" && usableStamp(f.At, now) {
 			sum = "a mirror ran " + humanAge(now.Sub(f.At)) + " ago; nothing declares how fresh it must be"
 			det = "no threshold, so no verdict: this check can report the age and cannot say whether it is late."
 		}
@@ -100,12 +104,14 @@ func (s *Server) checkMirror(rep *DoctorReport, host DoctorHost, now time.Time) 
 				Summary: "the mirror receipt could not be read",
 				Detail:  f.ReadErr,
 				Fix:     "re-run the mirror; the receipt is rewritten every run. " + mirrorFix})
-		case f.At.IsZero():
-			rep.Add(DoctorCheck{ID: "mirror.age", Level: LevelUnknown,
-				Summary: "the mirror receipt carries no timestamp",
-				Detail:  "a receipt with no time cannot answer the only question this check asks.",
-				Fix:     mirrorFix})
-		case f.At.After(now.Add(time.Minute)):
+		case !usableStamp(f.At, now):
+			if f.At.IsZero() {
+				rep.Add(DoctorCheck{ID: "mirror.age", Level: LevelUnknown,
+					Summary: "the mirror receipt carries no timestamp",
+					Detail:  "a receipt with no time cannot answer the only question this check asks.",
+					Fix:     mirrorFix})
+				break
+			}
 			// A future stamp would read as freshly-mirrored forever, which
 			// is this repo's oldest mistake: absent evidence rendering as a
 			// healthy value.
@@ -169,6 +175,13 @@ func (s *Server) checkMirror(rep *DoctorReport, host DoctorHost, now time.Time) 
 		det = ifNotEmpty("", det) + ifNotEmpty(". ", strings.Join(f.Warnings, "; "))
 	}
 	rep.Add(DoctorCheck{ID: "mirror.contents", Level: LevelOK, Summary: sum, Detail: strings.TrimPrefix(det, ". ")})
+}
+
+// usableStamp reports whether a receipt time is one this check can
+// subtract from now. A minute of tolerance is NTP jitter; more is a
+// clock step, and zero is a receipt that never carried a time.
+func usableStamp(at, now time.Time) bool {
+	return !at.IsZero() && !at.After(now.Add(time.Minute))
 }
 
 func ifNotEmpty(sep, s string) string {

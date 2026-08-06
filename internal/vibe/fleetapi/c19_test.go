@@ -62,6 +62,33 @@ func TestMirrorAge_LevelsAndReasons(t *testing.T) {
 	}
 }
 
+// TestMirrorAge_UndeclaredNeverRendersAnUnusableStampAsAnAge is the
+// review pass's REV-2. The undeclared branch reports the age when it has
+// one — and a zero timestamp subtracted from now reads as "20599d ago",
+// a future one as "less than a minute". Both are absent evidence wearing
+// a value, which the declared branch already has two rungs for.
+func TestMirrorAge_UndeclaredNeverRendersAnUnusableStampAsAnAge(t *testing.T) {
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	for name, f := range map[string]*MirrorFacts{
+		"zero stamp":   {Archive: "/mnt/backup/x.tar.gz"},
+		"future stamp": {At: now.Add(72 * time.Hour)},
+	} {
+		c := doctorCheck(t, mirrorReport(t, DoctorHost{Mirror: f}, now), "mirror.age")
+		if strings.Contains(c.Summary, " ago") {
+			t.Errorf("%s: reported an age anyway: %q", name, c.Summary)
+		}
+		if c.Level == LevelOK {
+			t.Errorf("%s: scored OK", name)
+		}
+	}
+	// With a usable stamp it must still report the age, or the fix above
+	// would have been "print less".
+	c := doctorCheck(t, mirrorReport(t, DoctorHost{Mirror: &MirrorFacts{At: now.Add(-3 * time.Hour)}}, now), "mirror.age")
+	if !strings.Contains(c.Summary, "3h0m ago") {
+		t.Errorf("a usable stamp stopped reporting its age: %q", c.Summary)
+	}
+}
+
 // TestMirrorAge_UndeclaredIsNotOK is separate from the table above for
 // C16's reason: a table can drift into asserting the opposite of the
 // rule it was written for. Nothing declaring a mirror must never read as

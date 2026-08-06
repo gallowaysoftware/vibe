@@ -8,9 +8,10 @@ request *goes*, and a promotion nobody asked for is exactly the silent
 rerouting that rule forbids.
 
 **Rehearsed** on the local harness, 2026-08-05: the mechanical half took
-10 seconds. Budget **10–15 minutes** for the real thing — the time goes
-on confirming the old box is dead, fetching credentials, pulling the
-pinned image, and DNS TTL.
+10-14 seconds (two runs; the spread is one announce interval). Budget
+**10–15 minutes** for the real thing — the time goes on confirming the
+old box is dead, fetching credentials, pulling the pinned image, and DNS
+TTL.
 
 ## Recover
 

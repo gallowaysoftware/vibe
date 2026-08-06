@@ -879,3 +879,130 @@ func handRolledOrdered(t *testing.T, archive string, files map[string][]byte, or
 		t.Fatal(err)
 	}
 }
+
+// ─── review pass ────────────────────────────────────────────────────────
+
+// TestRestore_RefusesContentThatChangedAfterVerification closes the gap
+// between the two reads. Verify checks the archive; the write reads it
+// again, and between the two the file can be replaced — by a mirror run
+// finishing onto the same name, by a half-copied file on a network
+// mount. Without this, "verified" is a claim about bytes that are not
+// the bytes that land on the standby.
+func TestRestore_RefusesContentThatChangedAfterVerification(t *testing.T) {
+	f := newFixture(t)
+	_, rc, err := Create(f.opts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := readArchiveFn
+	readArchiveFn = func(archive string) (map[string][]byte, error) {
+		files, err := orig(archive)
+		if err != nil {
+			return nil, err
+		}
+		files["state/token"] = []byte("A-TOKEN-NOBODY-VERIFIED")
+		return files, nil
+	}
+	t.Cleanup(func() { readArchiveFn = orig })
+
+	sb := newStandby(t)
+	if _, err := Restore(sb.opts(rc.Archive)); err == nil || !strings.Contains(err.Error(), "changed after verification") {
+		t.Fatalf("tampered payload was accepted: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(sb.state, "token")); err == nil && string(b) == "A-TOKEN-NOBODY-VERIFIED" {
+		t.Fatal("the unverified bytes were written to the standby")
+	}
+}
+
+func TestCreate_AnEmptyDefsDirIsAWarning(t *testing.T) {
+	f := newFixture(t)
+	if err := os.Remove(filepath.Join(f.config, "backends", "chat.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	m, _, err := Create(f.opts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsSubstr(m.Warnings, "cannot RENDER") {
+		t.Fatalf("an empty defs dir is the one shape that looks like a good capture and is not; warnings were %v", m.Warnings)
+	}
+	// And a populated one must not warn: a permanent warning on a correct
+	// configuration is one an operator learns to ignore.
+	m2, _, err := Create(f.opts())
+	_ = m2
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(f.config, "backends", "chat.yaml"), "backend: {}\n", 0o644)
+	m3, _, err := Create(f.opts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsSubstr(m3.Warnings, "cannot RENDER") {
+		t.Errorf("a defs dir with defs warned anyway: %v", m3.Warnings)
+	}
+}
+
+func TestCreate_NoConfigDirSaysWhatIsNotInTheArchive(t *testing.T) {
+	f := newFixture(t)
+	o := f.opts()
+	o.ConfigDir = ""
+	m, _, err := Create(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsSubstr(m.Warnings, "NOT in this archive") {
+		t.Fatalf("a mirror with no config dir captured nothing and said nothing: %v", m.Warnings)
+	}
+}
+
+func TestCreate_TwoRunsInOneSecondDoNotCollide(t *testing.T) {
+	f := newFixture(t)
+	o := f.opts()
+	fixed := time.Date(2026, 8, 5, 3, 0, 0, 0, time.UTC)
+	o.Now = func() time.Time { return fixed }
+	_, first, err := Create(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, second, err := Create(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Archive == second.Archive {
+		t.Fatal("the second run overwrote the first: one archive, two receipts, the older describing a file that is gone")
+	}
+	for _, a := range []string{first.Archive, second.Archive} {
+		if _, err := Verify(a); err != nil {
+			t.Errorf("verify %s: %v", a, err)
+		}
+	}
+}
+
+// TestArchive_ManifestIsTheFirstEntry pins what the writer does (so
+// `tar tzf` shows a human what they are holding first). Verify itself
+// deliberately tolerates any order.
+func TestArchive_ManifestIsTheFirstEntry(t *testing.T) {
+	f := newFixture(t)
+	_, rc, err := Create(f.opts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := os.Open(rc.Archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	gz, err := gzip.NewReader(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+	h, err := tar.NewReader(gz).Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Name != ManifestName {
+		t.Errorf("first archive entry is %q, want %q", h.Name, ManifestName)
+	}
+}

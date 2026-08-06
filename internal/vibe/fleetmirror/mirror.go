@@ -54,9 +54,10 @@ const (
 	// ManifestVersion is the archive format's version. A restore refuses
 	// a version it does not know rather than guessing at the layout.
 	ManifestVersion = 1
-	// ManifestName is the manifest's path inside the archive. It is
-	// written FIRST so a reader knows what it is holding before it has
-	// spent the bytes.
+	// ManifestName is the manifest's path inside the archive. Written
+	// FIRST, so `tar tzf` shows a human what they are holding before
+	// anything else — Verify itself tolerates any order, because an
+	// archive is not the place to enforce a convenience.
 	ManifestName = "manifest.json"
 	// ArchivePrefix/ArchiveSuffix bound what `--keep` is allowed to
 	// delete: pruning matches this package's own naming and nothing else.
@@ -430,6 +431,9 @@ func Create(opts Options) (*Manifest, *Receipt, error) {
 	}
 
 	// ── config ──────────────────────────────────────────────────────────
+	if opts.ConfigDir == "" {
+		m.Warnings = append(m.Warnings, "no config dir given: hosts.yaml, config.yaml and the backend defs are NOT in this archive")
+	}
 	if opts.ConfigDir != "" {
 		for _, rel := range []string{
 			filepath.Base(paths.HostsFile()),
@@ -470,6 +474,14 @@ func Create(opts Options) (*Manifest, *Receipt, error) {
 			m.Errors = append(m.Errors, defs+": "+err.Error())
 		} else if errors.Is(err, fs.ErrNotExist) {
 			m.Missing = append(m.Missing, filepath.Base(paths.BackendsDir())+"/ (no defs dir)")
+		}
+		// A defs dir that exists and holds nothing is the one shape that
+		// looks like a successful capture and is not: the standby's render
+		// has no input, and fleetd correctly refuses to write a peerless
+		// front config over a good one (C3). Say it here, where it is
+		// still cheap to fix.
+		if defsCaptured(m) == 0 {
+			m.Warnings = append(m.Warnings, "no backend defs captured: a standby restored from this archive cannot RENDER the front's config (it can still serve the rendered one)")
 		}
 	}
 
@@ -544,8 +556,19 @@ func Create(opts Options) (*Manifest, *Receipt, error) {
 	if err := os.MkdirAll(opts.Out, 0o700); err != nil {
 		return nil, nil, err
 	}
-	name := ArchivePrefix + m.CreatedAt.Format(ArchiveTimeFormat) + ArchiveSuffix
-	archive := filepath.Join(opts.Out, name)
+	archive := filepath.Join(opts.Out, ArchivePrefix+m.CreatedAt.Format(ArchiveTimeFormat)+ArchiveSuffix)
+	// The name is second-resolution; two runs inside one second would
+	// otherwise leave one archive and two receipts, the older of which
+	// describes a file that no longer exists.
+	for i := 1; ; i++ {
+		if _, err := os.Stat(archive); errors.Is(err, fs.ErrNotExist) {
+			break
+		}
+		if i > 99 {
+			return nil, nil, errors.New("cannot find an unused archive name in " + opts.Out)
+		}
+		archive = filepath.Join(opts.Out, fmt.Sprintf("%s%s-%d%s", ArchivePrefix, m.CreatedAt.Format(ArchiveTimeFormat), i, ArchiveSuffix))
+	}
 	n, err := writeArchive(archive, m, files)
 	if err != nil {
 		return nil, nil, err
@@ -572,6 +595,18 @@ func Create(opts Options) (*Manifest, *Receipt, error) {
 		rc.Warnings = m.Warnings
 	}
 	return m, rc, nil
+}
+
+// defsCaptured counts backend defs in the archive so far.
+func defsCaptured(m *Manifest) int {
+	n := 0
+	prefix := filepath.Base(paths.BackendsDir()) + "/"
+	for _, e := range m.Entries {
+		if e.Slot == SlotConfig && strings.HasPrefix(e.Rel, prefix) {
+			n++
+		}
+	}
+	return n
 }
 
 // references records the credential files the fleet uses and this

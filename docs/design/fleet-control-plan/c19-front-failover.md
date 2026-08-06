@@ -2,12 +2,14 @@
 
 Status: **PR OPEN** (2026-08-05), off `feat/c19-front-failover` branched
 from `main` at `c2127f3`. Feature commit plus ground rule 9's adversarial
-self-review commit; every fix mutation-verified. Unit gates U1–U17 green
+self-review commit (seven findings, two of them major — see the
+[addendum](#adversarial-self-review-addendum)); every fix
+mutation-verified. Unit gates U1–U23 green
 on a full local inner loop. **Live gate L1 PASS** — the fire drill ran
 against a real four-cell fleetlab: mirror, refusal, `SIGKILL` of a real
-fleetd and a real llama-swap front, restore onto a standby, **10.1 s** to
-three cells announcing again with the same token, the same declared
-intent and a byte-identical usage ledger. L2 (the same drill on real
+fleetd and a real llama-swap front, restore onto a standby, **10.1 s and
+14.1 s** (two runs) to three cells announcing again with the same token,
+the same declared intent and a byte-identical usage ledger. L2 (the same drill on real
 hardware) is **UNRUN** — it needs the fleet. See
 [Acceptance gates](#acceptance-gates).
 
@@ -301,6 +303,12 @@ Unit (mechanical, in-repo):
 | U15 | `mirror.contents` is not emitted when no readable receipt exists (one UNKNOWN, not two) | PASS |
 | U16 | C13's read-only source scan covers `fleetapi/mirror.go`, and passes | PASS |
 | U17 | full inner loop: build, vet, `test -race -count=5`, gofmt, `go mod tidy` byte-identical, golangci-lint | PASS |
+| U18 | *(review)* `restore` refuses payload bytes that changed between the verification and the write, and writes nothing | PASS (mutation-verified) |
+| U19 | *(review)* an EMPTY backend-defs dir is a warning, and a populated one is not | PASS (mutation-verified) |
+| U20 | *(review)* a mirror with no config dir says what is not in the archive | PASS (mutation-verified) |
+| U21 | *(review)* two runs inside one second produce two archives, both verifiable | PASS (mutation-verified) |
+| U22 | *(review)* the undeclared branch never renders a zero or future timestamp as an age, and still reports a usable one | PASS (mutation-verified) |
+| U23 | *(review)* the manifest is the FIRST entry in the archive | PASS |
 
 Live (a real fleet, or the harness):
 
@@ -402,7 +410,16 @@ The one edit the lab needs and a real deployment does not:
 mount (`/front-config/config.yaml`) in the reference stack, so the drill
 rewrites it after the restore and says why at the line that does it.
 
-**Qualifications, per the plan README's rule.** 10.1 s is the *mechanism*
+**Run twice.** The transcript above is the run against the feature
+commit; the whole drill was re-run against the reviewed code and
+measured **14.1 s** to the same three assertions, with every survival
+check identical (`token identical: yes`, the same `since` on bravo's
+intent, ledger sha `f1221ff2a381` unchanged, all four doctor checks OK).
+The spread is one announce interval — a cell that heartbeated just before
+the kill waits its full 15 s — so the honest figure is *inside one
+heartbeat of the control plane coming back*, not a stopwatch number.
+
+**Qualifications, per the plan README's rule.** ~10-14 s is the *mechanism*
 on one box with no network, no image pull, no DNS and no human. It is
 evidence that the state survives and the identity is assumable; it is not
 a prediction of a real recovery, which the runbook puts at 10–15 minutes
@@ -437,6 +454,105 @@ issues, `go test -race ./...` green, `-count=5` green on `fleetmirror`,
   `fleetmirror.ReadReceipt` — a read, on a path that already reads
   `intent.json`'s directory — and the scan's banned list (`Create`,
   `WriteFile`, …) still passes.
+
+### Adversarial self-review addendum
+
+Ground rule 9, run against the feature commit. Seven findings; every fix
+is mutation-verified below (the mutation applied, the named test observed
+red, the mutation restored).
+
+**REV-1 (major) — `restore` verified one set of bytes and wrote another.**
+`Restore` called `Verify`, which reads the archive and checks every
+sha256, and then called `readArchive`, which reads it *again*. Between
+the two reads the file can change: a mirror run finishing onto the same
+name, a half-copied file on a network mount, a `cp` from a second
+backup. The window is small and the claim is not — this command tells
+somebody mid-incident that what it is placing on the standby has been
+checked, and it had not been. Each payload is now re-hashed against the
+manifest at write time and a mismatch stops the whole restore.
+
+The guard cannot be provoked from outside the process, so it is tested
+through a seam (`readArchiveFn`) rather than left unexercised: a guard
+nothing exercises is a guard nobody trusts.
+
+*Mutation:* remove the re-hash →
+`TestRestore_RefusesContentThatChangedAfterVerification` fails with
+"tampered payload was accepted". Restored.
+
+**REV-2 (major) — the undeclared branch rendered an unusable timestamp
+as an age.** `mirror.age` with no `fleet.mirror_max_age` reports the age
+when it has one. It did that unconditionally, so a receipt with a zero
+time read as *"a mirror ran 20599d ago"* and one stamped in the future as
+*"a mirror ran less than a minute ago"* — the second being exactly the
+sentence the declared branch grew a whole rung to prevent. Absent
+evidence wearing a value, in the one branch that had not been given the
+rule. `usableStamp` is now the single predicate both branches use.
+
+*Mutation:* drop `usableStamp` from the undeclared branch →
+`TestMirrorAge_UndeclaredNeverRendersAnUnusableStampAsAnAge` fails
+naming the sentence. Restored.
+
+**REV-3 (minor) — an EMPTY defs dir was captured silently.** It is the
+one shape that looks like a successful capture and is not: a standby
+restored from that archive cannot RENDER the front's config at all, and
+fleetd correctly refuses to write the peerless result over a good one
+(C3). Absent files were already reported as `missing`; a directory that
+exists and holds nothing produced no row of any kind. Now a warning, at
+mirror time, where it is still cheap to fix — and no warning when defs
+are present, because a permanent warning on a correct configuration is
+one an operator learns to ignore.
+
+*Mutation:* disable the branch → `TestCreate_AnEmptyDefsDirIsAWarning`
+fails. Restored.
+
+**REV-4 (minor) — a mirror with no config dir said nothing about it.**
+The CLI always passes one, so this is a library-API hole rather than a
+live bug; it still means an archive could exist with no `hosts.yaml`, no
+`config.yaml` and no defs, and nothing anywhere saying so.
+
+*Mutation:* disable the warning →
+`TestCreate_NoConfigDirSaysWhatIsNotInTheArchive` fails. Restored.
+
+**REV-5 (minor) — `readArchive` bounded each entry and not the total.**
+`Create` refuses to build an archive over 512 MiB; the reader enforced
+only the 256 MiB per-file limit, so a hostile or corrupt archive could
+be read into memory unbounded. Same limit, both directions.
+
+**REV-6 (nit) — a claim the code did not make.** The package comment said
+the manifest is written first "so a reader knows what it is holding
+before it has spent the bytes". `Verify` reads the whole archive
+regardless and tolerates any order. The comment now says what the order
+actually buys (`tar tzf` shows a human the manifest first) and
+`TestArchive_ManifestIsTheFirstEntry` pins the writer's behaviour rather
+than an unenforced convention. Ground rule 10 applied to a comment.
+
+**REV-7 (nit) — two runs inside one second silently overwrote.** The
+archive name is second-resolution, so a double-fire left one archive and
+two receipts, the older of which describes a file that no longer exists.
+Now suffixed.
+
+*Mutation:* remove the collision loop →
+`TestCreate_TwoRunsInOneSecondDoNotCollide` fails. Restored.
+
+Two things this pass looked at and left alone:
+
+- **`--out` cannot verify that its destination is off-host.** It refuses
+  a path inside the state or config dir and stops there: telling a mount
+  from a local directory portably is not something this can do honestly,
+  and a check that is right most of the time would be read as a
+  guarantee. The manifest records the destination, `mirror.age` prints
+  it, and the runbook says the sentence instead.
+- **The takeover probe's false positive is not "fixed" by probing
+  harder** (asking whether the answering fleetd is *this* one, say). Every
+  version of that reasons about whether the operator has already moved
+  the address — which is the thing the operator knows and the code does
+  not. It stays a refusal with `--force` beside it, and the runbook
+  orders the steps so the case does not arise.
+
+Gates re-run after the fixes: `go build ./...`, `go vet ./...`,
+`gofmt -l .` silent, `go mod tidy` byte-identical, `golangci-lint run`
+**0 issues**, `go test -race ./...` green across the module, `-count=5`
+green on `fleetmirror`, `fleetapi`, `daemon` and `cli`.
 
 ## For the reconciliation pass
 

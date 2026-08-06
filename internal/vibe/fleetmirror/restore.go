@@ -351,7 +351,7 @@ func Restore(opts RestoreOptions) (*RestoreReport, error) {
 		return rep, nil
 	}
 
-	payload, err := readArchive(opts.Archive)
+	payload, err := readArchiveFn(opts.Archive)
 	if err != nil {
 		return rep, err
 	}
@@ -359,6 +359,17 @@ func Restore(opts RestoreOptions) (*RestoreReport, error) {
 		data, ok := payload[j.e.Archive]
 		if !ok {
 			return rep, errors.New(j.e.Archive + ": vanished between verify and restore")
+		}
+		// Verify read the archive; this read it again. Between the two the
+		// file could have been replaced — by another mirror run finishing,
+		// by a half-copied file on a network mount, by anything — and then
+		// what lands on the standby is not what was checked. Cheap to
+		// close, and "verified" is a claim this command makes to somebody
+		// mid-incident.
+		sum := sha256.Sum256(data)
+		if got := hex.EncodeToString(sum[:]); got != j.e.SHA256 {
+			return rep, fmt.Errorf("%s: content changed after verification (manifest %s, now %s) — nothing further written",
+				j.e.Archive, short(j.e.SHA256), short(got))
 		}
 		if err := os.MkdirAll(filepath.Dir(j.dest), 0o755); err != nil {
 			return rep, err
@@ -399,6 +410,11 @@ func writeFileMode(dest string, data []byte, mode fs.FileMode) error {
 	return os.Rename(tmpName, dest)
 }
 
+// readArchiveFn is the seam the "changed after verification" guard is
+// tested through: the race it closes cannot be produced from outside the
+// process, and a guard nothing exercises is a guard nobody trusts.
+var readArchiveFn = readArchive
+
 func readArchive(archive string) (map[string][]byte, error) {
 	f, err := os.Open(archive) //nolint:gosec // an operator-named archive path
 	if err != nil {
@@ -411,6 +427,7 @@ func readArchive(archive string) (map[string][]byte, error) {
 	}
 	defer gz.Close()
 	out := map[string][]byte{}
+	total := int64(0)
 	tr := tar.NewReader(gz)
 	for {
 		h, err := tr.Next()
@@ -429,6 +446,10 @@ func readArchive(archive string) (map[string][]byte, error) {
 		data, err := io.ReadAll(io.LimitReader(tr, maxFileBytes+1))
 		if err != nil {
 			return nil, err
+		}
+		total += int64(len(data))
+		if int64(len(data)) > maxFileBytes || total > maxTotalBytes {
+			return nil, fmt.Errorf("%s: archive exceeds this build's size limits", archive)
 		}
 		out[h.Name] = data
 	}
