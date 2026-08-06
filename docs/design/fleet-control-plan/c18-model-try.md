@@ -887,12 +887,14 @@ plan already paid a phase for. All three copies now return `127.0.0.1:1`,
 which nothing in the binary can bind and which is already the idiom these
 tests use for an unreachable front.
 
-**Mutation-verified predicates (11).** `holdExempt`'s call site and its
+**Mutation-verified predicates (12).** `holdExempt`'s call site and its
 guard in `evalLeases` (two mutations); `refuseDroppedSections` in `Apply`
 and in `End` (two), plus the unparseable-config refusal;
 `bankConfig`'s `ConfigCreated` and `End`'s removal branch, in both
 directions (three); the resume disk check; the two-cause not-live note;
-`printableSnippet` on the probe note; `checkPrintable`.
+`printableSnippet` on the probe note; `checkPrintable`. The C19 collision's `notFleetState` entry makes 13
+mutations in this pass; 35 production predicates across the three review
+commits.
 
 **Also looked at and found sound**, so a later pass need not re-derive
 it: the C15 AST scans really are directory-scoped to `fleetapi` and
@@ -1082,7 +1084,7 @@ Everything below belongs in a shared doc this branch may not touch
 Table row:
 
 ```
-| [C18](c18-model-try.md) | `vibe model try`: the churn loop as one command | ~1400 lines | C0, C2, C4, C8, C10, C11, C14 (composition) | PR open; feature + self-review + 2nd-pass + independent-review commits (7 + 11 + 9 findings, 4 blockers); unit gates U1-U14 green, 34 predicates mutation-verified; **L1-L4 PASS** (harness, 2026-08-06), L5 needs metal |
+| [C18](c18-model-try.md) | `vibe model try`: the churn loop as one command | ~1400 lines | C0, C2, C4, C8, C10, C11, C14 (composition) | PR open; feature + self-review + 2nd-pass + independent-review commits (7 + 11 + 9 findings, 4 blockers); unit gates U1-U15 green, 35 predicates mutation-verified; **L1-L4 PASS** (harness, 2026-08-06), L5 needs metal |
 ```
 
 The independent pass's two blockers are the ones worth carrying into the
