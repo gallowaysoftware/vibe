@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
+	"github.com/gallowaysoftware/vibe/internal/vibe/observed"
 )
 
 // Tokens mirrors llama-swap v239's store.TokenMetrics. Two sentinels
@@ -392,12 +393,23 @@ type Config struct {
 	// which is indistinguishable from a fleet nobody used.
 	APIKeyFile string
 	// HTTPClient is the transport seam (tests inject a stub server's
-	// client); nil gets a 10s-timeout client.
+	// client); nil gets a defaultHTTPTimeout client.
 	HTTPClient *http.Client
 	// Logger; nil → slog.Default.
 	Logger *slog.Logger
 	// NewEpoch mints an epoch id; nil uses crypto/rand. Test seam.
 	NewEpoch func() string
+	// PollTimeout overrides the deadline PollAndSnapshot puts on one whole
+	// poll (0 → pollTimeout). A seam rather than a knob: 20 seconds is not
+	// something an operator should be tuning, but a test that never makes
+	// the deadline ELAPSE is not testing it at all, and the whole class of
+	// "unreachable" this repo had covered was the microsecond kind —
+	// ECONNREFUSED and DNS failure — neither of which reaches a timer.
+	PollTimeout time.Duration
+	// Now is the clock. Test seam for the freshness bookkeeping below,
+	// which is measured in minutes and cannot be waited out. nil →
+	// time.Now.
+	Now func() time.Time
 	// MaxPages bounds one poll's walk back through the activity log
 	// (0 → defaultMaxPages). Each page is up to activityLimit rows.
 	MaxPages int
@@ -428,6 +440,34 @@ const defaultMaxPages = 10
 // so the next heartbeat resumes from the same place.
 const pollTimeout = 20 * time.Second
 
+// defaultHTTPTimeout bounds ONE page request when the caller injects no
+// client. It is deliberately shorter than pollTimeout: the poll budget is
+// the outer bound over up to defaultMaxPages requests, so a per-request
+// bound at or above it would let a single stalled page consume the whole
+// poll and leave the walk-back with nothing. A llama-swap answering
+// /api/metrics/activity is reading its own SQLite over localhost; ten
+// seconds is already an enormous allowance.
+const defaultHTTPTimeout = 10 * time.Second
+
+// frozenAfter is how long the announced totals may stay frozen by failing
+// polls before the failure stops being a blip and starts being a lie.
+//
+// It is the hazard this collector owns. PollAndSnapshot returns the
+// PREVIOUS cumulative totals whether the poll refused, timed out or
+// succeeded — correct about the VALUE, since those totals are still true
+// — but fleetd derives per-interval deltas from them, and a cumulative
+// total that stops moving produces a delta of zero. On fleetd's side "this
+// cell is idle" and "this cell's usage collector has been timing out for
+// six hours" are then the SAME picture, and the announce block carries no
+// field that separates them. Absent evidence read as a healthy value is
+// this repo's most recurring defect class; see internal/vibe/observed.
+//
+// Twenty announce intervals at the DefaultAnnounceIntervalS cadence — long
+// enough that a llama-swap restart or a slow page does not page anybody,
+// short enough that the log says so long before a human reads a flat usage
+// row as a quiet week.
+const frozenAfter = 5 * time.Minute
+
 // Collector tails one cell's llama-swap activity log.
 type Collector struct {
 	cfg    Config
@@ -447,6 +487,113 @@ type Collector struct {
 	anchor *rowAnchor
 	lost   int64
 	totals map[entryKey]Counters
+
+	// The freshness bookkeeping behind Health. `started` is the floor a
+	// collector that has NEVER completed a poll is measured from: without
+	// it, "no poll has ever finished" would compute a staleness of zero,
+	// which is the exact confusion frozenAfter exists to name.
+	started  time.Time
+	lastPoll observed.Value[time.Time]
+	fails    int
+	lastErr  string
+	lastWarn time.Time
+}
+
+// PollHealth is the collector's report on ITSELF: are the counters it
+// announces still being refreshed?
+//
+// It exists because Snapshot cannot answer that. Snapshot returns
+// cumulative totals, and totals that stopped moving because every poll
+// times out are byte-identical to totals that stopped moving because
+// nobody used the cell. This is the pair that separates them.
+//
+// The announce block (fleetapi.AnnounceUsage) carries no field for it
+// yet, so today this reaches a human through the WARN line
+// PollAndSnapshot emits once the totals have been frozen for frozenAfter,
+// and through this accessor for any surface that wants to render it.
+type PollHealth struct {
+	// LastPoll is when a poll last completed cleanly. UNKNOWN — not the
+	// zero time, and not "now" — when none ever has: a collector that has
+	// been refused since boot has no last poll, and spelling that as an
+	// instant would hand every reader a measurement nobody took.
+	LastPoll observed.Value[time.Time]
+	// Failures counts polls that have failed CONSECUTIVELY since the last
+	// clean one. Zero with a known LastPoll is the healthy state.
+	Failures int
+	// LastErr is the most recent poll error, verbatim. A poll error names
+	// the local llama-swap and, at worst, the path of an API key file;
+	// this package never puts key bytes in an error (see authorize).
+	LastErr string
+	// StaleFor is how long the announced totals have been frozen: since the
+	// last clean poll, or since the collector was built when there has
+	// never been one. Zero means the last poll succeeded.
+	//
+	// A durability failure counts as staleness too. Poll returns an error
+	// when the fold succeeded but the state file would not write, and that
+	// is not "the totals are old" — it is worse, because the next restart
+	// re-ingests rows already counted into an APPEND-ONLY ledger. Both
+	// failures break the same claim (the totals this cell announces can be
+	// trusted), so both are reported.
+	StaleFor time.Duration
+}
+
+// String renders the pair for a status line. An unknown LastPoll renders
+// as "never", never as a date and never as an implied "just now".
+func (h PollHealth) String() string {
+	last := "never"
+	if t, ok := h.LastPoll.Observed(); ok {
+		last = t.Format(time.RFC3339)
+	}
+	switch {
+	case h.Failures == 0 && h.LastPoll.IsKnown():
+		return "ok (last poll " + last + ")"
+	case h.Failures == 0:
+		return "no poll has completed yet (last poll never)"
+	}
+	msg := fmt.Sprintf("stale for %s after %d consecutive failures (last clean poll %s)",
+		h.StaleFor.Round(time.Second), h.Failures, last)
+	if h.LastErr != "" {
+		msg += ": " + h.LastErr
+	}
+	return msg
+}
+
+// Health reports whether the totals this collector announces are fresh.
+func (c *Collector) Health() PollHealth {
+	now := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.healthLocked(now)
+}
+
+func (c *Collector) healthLocked(now time.Time) PollHealth {
+	h := PollHealth{LastPoll: c.lastPoll, Failures: c.fails, LastErr: c.lastErr}
+	if c.fails == 0 && c.lastPoll.IsKnown() {
+		return h
+	}
+	// The fallback is NAMED here rather than defaulted: absence of a clean
+	// poll means the totals are as old as this collector, not as old as the
+	// epoch.
+	from := c.lastPoll.OrElse(c.started)
+	if d := now.Sub(from); d > 0 {
+		h.StaleFor = d
+	}
+	return h
+}
+
+func (c *Collector) now() time.Time {
+	if c.cfg.Now != nil {
+		return c.cfg.Now()
+	}
+	return time.Now()
+}
+
+// pollBudget is the deadline PollAndSnapshot puts on one whole poll.
+func (c *Collector) pollBudget() time.Duration {
+	if c.cfg.PollTimeout > 0 {
+		return c.cfg.PollTimeout
+	}
+	return pollTimeout
 }
 
 // New builds a Collector and loads (or mints) its state. A missing state
@@ -465,11 +612,12 @@ func New(cfg Config) (*Collector, error) {
 		totals: map[entryKey]Counters{},
 	}
 	if c.http == nil {
-		c.http = &http.Client{Timeout: 10 * time.Second}
+		c.http = &http.Client{Timeout: defaultHTTPTimeout}
 	}
 	if c.logger == nil {
 		c.logger = slog.Default()
 	}
+	c.started = c.now()
 	c.load()
 	return c, nil
 }
@@ -565,7 +713,40 @@ func (c *Collector) save() error {
 func (c *Collector) Poll(ctx context.Context) error {
 	c.pollMu.Lock()
 	defer c.pollMu.Unlock()
+	err := c.poll(ctx)
+	c.recordPoll(err, c.now())
+	return err
+}
 
+// recordPoll updates the freshness pair. Every exit from a poll passes
+// through it — a poll that fails silently is the whole hazard.
+func (c *Collector) recordPoll(err error, now time.Time) {
+	c.mu.Lock()
+	if err != nil {
+		c.fails++
+		c.lastErr = err.Error()
+		c.mu.Unlock()
+		return
+	}
+	frozen := c.healthLocked(now).StaleFor
+	warned := !c.lastWarn.IsZero()
+	c.lastPoll = observed.Known(now)
+	c.fails = 0
+	c.lastErr = ""
+	c.lastWarn = time.Time{}
+	c.mu.Unlock()
+	if warned {
+		// Only if the freeze was ever announced. A recovery line for an
+		// outage nobody was told about is noise, and an outage a human WAS
+		// told about needs its all-clear or the log leaves them believing
+		// the numbers are still frozen.
+		c.logger.Info("usage collector recovered; the totals this cell announces are moving again",
+			"frozen_for", frozen.Round(time.Second))
+	}
+}
+
+// poll is Poll's body. Called with pollMu held.
+func (c *Collector) poll(ctx context.Context) error {
 	// Probe the head of the log first. It resolves the id-reset question
 	// BEFORE any walk-back, which matters: resetting the cursor after a
 	// walk would leave the shortfall arithmetic comparing rows read
@@ -819,13 +1000,44 @@ func (c *Collector) Snapshot() *fleetapi.AnnounceUsage {
 // back cumulative totals. A poll failure is NOT fatal — the previous
 // cumulative totals are still true and still worth announcing, and an
 // unreachable local llama-swap must never cost the cell its heartbeat.
+//
+// What it must not do is fail QUIETLY forever. Returning the last known
+// totals is right, and it is also exactly what an idle cell returns, so
+// the failure is reported at Debug while it is plausibly a blip and at
+// WARN once the totals have been frozen for frozenAfter. See PollHealth.
 func (c *Collector) PollAndSnapshot(ctx context.Context) *fleetapi.AnnounceUsage {
-	pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
+	pollCtx, cancel := context.WithTimeout(ctx, c.pollBudget())
 	defer cancel()
 	if err := c.Poll(pollCtx); err != nil {
-		c.logger.Debug("usage poll failed; announcing the last known totals", "err", err)
+		c.reportPollFailure(err)
 	}
 	return c.Snapshot()
+}
+
+// reportPollFailure logs one failed poll at the level its AGE earns.
+// Rate-limited to one warning per frozenAfter: the announce loop calls
+// this every heartbeat, and a line every 15 seconds for six hours is a
+// log nobody reads, which fails the same way silence does.
+func (c *Collector) reportPollFailure(err error) {
+	now := c.now()
+	c.mu.Lock()
+	h := c.healthLocked(now)
+	loud := h.StaleFor >= frozenAfter && (c.lastWarn.IsZero() || now.Sub(c.lastWarn) >= frozenAfter)
+	if loud {
+		c.lastWarn = now
+	}
+	c.mu.Unlock()
+	if !loud {
+		c.logger.Debug("usage poll failed; announcing the last known totals",
+			"err", err, "consecutive_failures", h.Failures)
+		return
+	}
+	c.logger.Warn("usage collector has not completed a poll; the token counts this cell announces are FROZEN, not idle",
+		"stale_for", h.StaleFor.Round(time.Second),
+		"consecutive_failures", h.Failures,
+		"last_poll", h.LastPoll.String(),
+		"llama_swap_url", c.cfg.LlamaSwapURL,
+		"err", err)
 }
 
 // Deterministic (model, basis) order keeps the state file and the wire
@@ -836,6 +1048,11 @@ func (c *Collector) PollAndSnapshot(ctx context.Context) *fleetapi.AnnounceUsage
 // collector that cannot even be constructed degrades to "no usage
 // block" — fleetd then renders the cell as unmeasured, which is the
 // truth, instead of costing it its heartbeat.
+//
+// The Collector is not returned, so a caller wired this way reads its
+// freshness from the WARN line PollAndSnapshot emits rather than from
+// PollHealth. Take the collector directly (New + PollAndSnapshot) if you
+// want to render Health somewhere.
 func Snapshotter(llamaSwapURL, statePath string) func(context.Context) *fleetapi.AnnounceUsage {
 	c, err := New(Config{LlamaSwapURL: llamaSwapURL, StatePath: statePath})
 	if err != nil {
