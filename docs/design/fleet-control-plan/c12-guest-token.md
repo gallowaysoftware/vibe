@@ -6,10 +6,11 @@ loop (`go build`, `go vet`, `go test -race -count=5`, `golangci-lint
 run` 0 issues, `gofmt -l .` silent, `go mod tidy` clean). Live gate L2
 **PASSED on 2026-08-05** against the local multi-cell harness
 ([`scripts/fleetlab`](../../../scripts/fleetlab/README.md)) — a 52-case
-route sweep run twice on two independent fleets; L1 is **PARTIAL** (the
-`X-Vibe-Auth` contract is verified at the HTTP layer, the page's DOM
-behaviour is not — that needs a browser, not a phone); L3 (rotation) is
-unrun. The author's self-review pass found 5 items; the
+route sweep run twice on two independent fleets. **L1 and L3 PASSED the
+same day under [C17](c17-gate-closure.md)** — L1's DOM half in a real
+headless-Firefox session (guest: no buttons, no savings tab, no warm row,
+live SSE updates; operator: all fifteen buttons), L3 across a real token
+rotation and fleetd restart. The author's self-review pass found 5 items; the
 separate adversarial pass (ground rule 9) found **7 more — one of them a
 BLOCKER that rotated the control-plane token** — 5 fixed with
 mutation-verified regression tests, 2 documented. See the two addenda at
@@ -654,16 +655,43 @@ Live gates, re-run 2026-08-05 against the local multi-cell harness
 ([`scripts/fleetlab`](../../../scripts/fleetlab/README.md)) — a real
 fleetd with a real `guest_token_file`, on two independent lab fleets:
 
-- **L1 — the hallway test: PARTIAL.** The HTTP half is verified and the
-  DOM half is not. `GET /api/fleet/state` with the guest token carries
-  `X-Vibe-Auth: guest`; with the operator token it carries no such
-  header — which is the entire signal the page's read-only rendering
-  rides. The guest token was minted `0600` and logged
-  `guest read-only token CREATED (new) — share this value, not the
-  control-plane token` on first start and `loaded` on every restart.
-  **Not run:** driving a browser to confirm the buttons, the warm row
-  and the savings tab are actually absent. That needs a browser session;
-  a phone is convenient, not required.
+- **L1 — the hallway test: PASS** (HTTP half 2026-08-05; **DOM half
+  2026-08-05, C17, `scripts/fleetlab/marionette.py`**). The HTTP half:
+  `GET /api/fleet/state` with the guest token carries `X-Vibe-Auth:
+  guest`; with the operator token it carries no such header — the entire
+  signal the page's read-only rendering rides. The guest token was minted
+  `0600` and logged `guest read-only token CREATED (new) — share this
+  value, not the control-plane token` on first start and `loaded` on
+  every restart. The DOM half now runs in a **real browser engine**:
+  headless Firefox driven over Marionette by a ~90-line stdlib Python
+  client (no Go dependency, nothing in the module), which seeds
+  `localStorage`'s `vibeFleetToken` and reloads. Under the **guest**
+  token: the `read-only` chip is visible, `#token-gate` is not, there are
+  **zero** visible buttons, `#nav-savings` and `#warmrow` both compute to
+  `display: none` with `offsetParent === null`, and all four cells render
+  with live status. Under the **operator** token in the same browser: the
+  chip is `display:none`, `#warmrow` computes to `display: flex`, and the
+  action buttons appear (`drain`/`resume`/`wake` ×4 cells, plus `warm`,
+  `away`, `test`, and `unload <model>` per resident model), with the
+  `savings` tab. **Corrected by C17's own review pass** (2026-08-05): the
+  first cut of this row said the guest sees "no warm row" on the strength
+  of a page-wide `/warm/i` regex over `document.body.innerText`, which is
+  not a control check — the footer's `warm targets: …` summary matches it
+  for a guest too, and a re-run says `true` where the row said no. The
+  claim now rests on `#warmrow`'s own computed visibility, which is what
+  `body.guest #warmrow { display: none }` actually controls, and the
+  distinction it hides is worth stating: the row is **hidden by CSS, not
+  absent from the DOM** — the boundary is the middleware, exactly as §1
+  says, and the page is a courtesy. The
+  "updates live" half ran too — with the guest page open and **no
+  reload**, an operator's `vibe cell drain bravo` moved the row
+  `SERVING → INCONSISTENT (requested, awaiting ack) → DRAINED`, and
+  `resume` moved it back through `INCONSISTENT` to `SERVING`. One
+  consequence worth naming: the guest view renders the notify strip,
+  including the endpoint's REDACTED form (`http://…/... (id 4a75d5da)`).
+  That is §1's route-grant rule working as designed, and it had never
+  been looked at. **Still owed:** a phone, which was always convenience
+  — the remaining delta is screen size.
 - **L2 — the boundary in the field: PASS.** With the guest token in
   `$VIBE_TOKEN`: `vibe cell status` **works** and renders the full
   table plus `(guest read-only token: on; 39 request(s) refused past its
@@ -684,8 +712,24 @@ fleetd with a real `guest_token_file`, on two independent lab fleets:
   `guest_rejected` +33, matching exactly the 8 no-token and 33
   guest-token refusals the run issued (reproduced +14/+39 on the second
   fleet).
-- **L3 — rotation: NOT RUN.** `vibe token --guest --regenerate` plus a
-  fleetd restart. No physical blocker; dropped for session time.
+- **L3 — rotation: PASS** (2026-08-05, C17,
+  `scripts/fleetlab/gate-c12-l3.sh`). Before: the old token 200s on
+  `/api/fleet/state` and `/api/fleet/events`, 401s on `/api/fleet/usage`
+  and `/mcp`. `vibe token --guest --regenerate --yes` wrote a new `0600`
+  value and printed *"# Restart the daemon for the new guest token to
+  take effect."* — and that is exactly what the running fleetd did:
+  BEFORE the restart the old value still answered 200 and the new one
+  401'd. After the restart the old value 401s on **both** guest routes
+  and the new one answers 200 on state, 401 on usage and `/mcp`, and
+  carries `X-Vibe-Auth: guest`. The counters kept their meanings across
+  the rotation, which is the part worth pinning: the rotated-out token's
+  refusals landed in **`auth_rejected`** (+2) and NOT in
+  `guest_rejected`, because `guest_rejected` counts 401s from a *valid*
+  guest token on a route it does not cover
+  (`internal/vibe/daemon/auth.go:149`) while a rotated-out value is
+  precisely the stale token `auth_rejected` exists to signal; the new
+  token's two refusals past its two routes landed in `guest_rejected`
+  (+2).
 
 **One finding, no escalation.** `daemon/auth.go:189` evaluates the
 allowlist on `r.URL.Path`, which Go has already percent-decoded — not on
