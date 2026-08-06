@@ -782,6 +782,208 @@ that, and it ran against the feature commit, not this one. Step 2b of
 `gate-c19-drill.sh` (REV-5's refusal against a live lab) is written and
 **unwatched**.
 
+## U2 addendum — the third state the takeover probe could not express (2026-08-06)
+
+An integration-test pass over the fleet control plane, on the observation
+that this repo's entire vocabulary for "unreachable" is an immediate
+ECONNREFUSED or an NXDOMAIN. Both fail in microseconds, so no timeout
+path anywhere had ever executed. In `fleetmirror` that was not a coverage
+gap; it was a live hazard in the one guard C19 rests on.
+
+**The dormant seam.** `RestoreOptions.Dial` has been injectable since the
+feature commit and **no test anywhere set it**. The only test of the
+probe (`TestTakeoverProbe_QuietWhenNothingAnswers`) passes
+`DialTimeout: 500ms` against a closed loopback port, which refuses
+instantly — so `DialTimeout` never elapsed and nothing had ever checked
+that it bounds anything.
+
+**What that hid.** `TakeoverProbe` treated every dial error as
+`continue`. A 2-second timeout and an instant RST produced the SAME empty
+hit list with the address present in `probed`. So an old front sitting
+behind a firewall that DROPs packets — the ordinary way a half-dead host
+presents to a standby on another network — read as a dead one, and
+`Restore` **proceeded**. That is two fronts under one identity: the exact
+disaster the refusal exists to prevent, reached through the guard rather
+than around it. A refusal means "nothing is there, go ahead"; a timeout
+means "I could not find out"; collapsing them resolved the ambiguity in
+the one direction that cannot be undone afterwards.
+
+It is the same class as REV-3 one layer in. REV-3 separated *nothing to
+dial* from *nothing answered* (`ErrNoProbeTargets`). This separates
+*nothing answered* from *no answer either way*.
+
+**The change** (`internal/vibe/fleetmirror/restore.go`, and nothing else
+in production):
+
+- `ScanTakeover` replaces `TakeoverProbe` as the real entry point and
+  returns three slices — `Hits`, `Settled`, `Unknown`. Only "no hits AND
+  a non-empty `Settled` AND an empty `Unknown`" is a green light.
+- `classifyDialErr` names the DEFINITE negatives — `ECONNREFUSED`,
+  `ECONNRESET`, `*net.DNSError{IsNotFound}` — and everything else is
+  doubt. The list is closed by construction: a failure mode nobody
+  anticipated lands in doubt and costs an operator one `--force`, where
+  the other default costs two ledgers that can never be reconciled.
+- `probeOne` holds the dialer to `DialTimeout` rather than trusting it,
+  and a dial that overruns is unsettled — never a miss.
+- `Restore` fails closed with `ErrProbeInconclusive`, checked AFTER the
+  hits (an answered address is the more specific finding) and BEFORE the
+  empty-probe branch (telling an operator "your mirror recorded no
+  address" is a lie when one was recorded, dialed, and never answered).
+- `RestoreReport.Unresolved` carries it out to `--json`. `Probed` now
+  means SETTLED: an address the probe could not settle is deliberately
+  absent from it, which is also why the deprecated two-return
+  `TakeoverProbe` degrades to a REFUSAL — a caller holding the old
+  `len(probed) == 0` guard stops rather than proceeds.
+
+The shape is copied from `certNotAfter`
+(`internal/vibe/fleetapi/doctor.go`), which branches on `ctx.Err()` so
+that "the budget ran out" is never reported as "the host is off", and is
+honest in its summary about the residual.
+
+**`--force` stays the only escape, deliberately.** C19's whole design is
+that a HUMAN confirming the old front is DOWN is the step everything
+rests on, and `--force` is the only thing in the system that asserts a
+human did. A second, gentler flag for "the probe timed out, proceed
+anyway" would be an easier lever reaching the same irreversible place, so
+there is not one. `--probe-addr` remains the escape that is still a
+probe: name the old front by IP and the refusal becomes an answer.
+`TestRestore_ForceRemainsTheOnlyEscapeFromAnUnsettledProbe` pins it.
+
+**`internal/vibe/observed` is NOT the carrier for this state**, and it is
+worth writing down why, since C20 built it for exactly this defect class.
+`observed.Value[T]` says *nobody looked*. This state is *somebody looked
+and the network did not answer* — a different proposition, and the one
+the operator has to act on. Three concrete reasons: (1) the load-bearing
+part is the REASON string ("the dial timed out …"), which a
+`Value[bool]` has nowhere to put, and without it the refusal cannot tell
+an operator what to do next; (2) `Restore` never wants a boolean — it
+wants to ENUMERATE the addresses it could not settle and name them, which
+is a slice, not a scalar; (3) the JSON surface is read by a human
+mid-incident, and `"unresolved": [{"addr": …, "why": …}]` says what
+`{"answered": null}` cannot. What `observed` supplies here is the
+DISCIPLINE — a zero value that means "no evidence" — and `TakeoverScan`
+takes it structurally: an address contributes to exactly one of the three
+slices, and the empty scan is the one that refuses. If a machine-readable
+per-address tri-state is ever wanted on the wire, `observed.Value[bool]`
+is the right thing to add BESIDE the reasons, not instead of them.
+
+**Mutation table.** Each applied to the production line, the named test
+observed RED, the mutation restored.
+
+| # | mutation | red |
+|---|---|---|
+| 1 | timeout classified as `verdictNothingThere` | `TestClassifyDialErr_OnlyADefiniteNegativeMeansNothingIsThere` (3 subtests), `TestRestore_RefusesWhenTheProbeCouldNotFindOut` |
+| 2 | `Restore`'s inconclusive branch disabled | `TestRestore_RefusesWhenTheProbeCouldNotFindOut`, `TestRestore_ATimedOutProbeIsNotReportedAsNothingToDial`, `TestRestore_ForceRemainsTheOnlyEscapeFromAnUnsettledProbe` |
+| 3 | unsettled address also appended to `Settled` | `TestTakeoverProbe_TheTwoReturnShapeDegradesToARefusal`, `TestRestore_RefusesWhenTheProbeCouldNotFindOut`, `TestTakeoverProbe_ADialerThatIgnoresItsBudgetIsStillBounded` |
+| 4 | `probeOne`'s watchdog disarmed | `TestTakeoverProbe_ADialerThatIgnoresItsBudgetIsStillBounded` ("the probe hung on a dialer that ignored its timeout") |
+| 5 | nil-conn/nil-err guard removed | `TestTakeoverProbe_ADialerReturningNeitherIsUnsettled` (nil dereference in `probeOne`) |
+| 6 | inconclusive checked AFTER the empty-probe branch | `TestRestore_ATimedOutProbeIsNotReportedAsNothingToDial` |
+| 7 | unknown made to outrank a hit | `TestRestore_AnAnsweredAddressOutranksAnUnsettledOne` |
+| 8 | a constant passed to `dial` in place of `timeout` | `TestTakeoverProbe_TheDialSeamIsHandedTheConfiguredTimeout` |
+| 9 | `ECONNREFUSED`/`ECONNRESET` dropped from the definite negatives | `TestRestore_ASettledProbeStillProceeds`, `TestTakeoverProbe_TheDefaultDialerStillSettlesARealRefusal` — the guard must not have swallowed the ordinary recovery |
+
+`TestNonTestCallersOf_FindsAPlantedCaller` is the same idea applied to
+the source scan that keeps the deprecated two-return probe out of
+production code: a guard that can only pass is not a guard.
+
+**L5 PASS — `gate-c19-drill.sh` after the change, 2026-08-06.** A real
+fleetlab (4 llama-swap processes, a real fleetd, 3 announcing cells) on a
+shifted port range so a parallel wave could not collide: copies of
+`lab.sh`/`gl.sh`/`gate-c19-drill.sh` under `/tmp/fleetlab-u2-scripts`
+with 9640-9643→9820-9823, 9651-9653→9831-9833, 9720-9724→9826-9829,
+upstreams 5980-6019→6080-6119. The rigs take every one of those as a
+LITERAL — `FLEETLAB_DIR` is the only knob, there is no port base — so
+running two of them at once is not possible without this, and nothing in
+`scripts/` was edited to do it.
+
+The teardown is the part that matters for a parallel wave, and it needed
+a second edit: `sweep()`'s four pgrep patterns are anchored on `$LAB`
+(safe under a private `FLEETLAB_DIR`), but its fifth kills
+`llama-server .*--port (59[89][0-9]|60[01][0-9])` — the SHARED upstream
+range, i.e. another agent's llama-servers. Re-anchored to this copy's own
+`(60[89][0-9]|61[01][0-9])` before the lab was ever started. Production's
+llama-swap `:9000` and daemon `:9001` were never touched: both were still
+the same pids afterwards.
+
+```
+=== 2. restore REFUSES while the fleet's own address still answers ===
+STILL ANSWERING: fleetd at 127.0.0.1:9827
+STILL ANSWERING: the front at 127.0.0.1:9820
+vibe: the fleet's address still answers: fleetd (127.0.0.1:9827), the front (127.0.0.1:9820). …
+(refused, wrote nothing — correct)
+
+=== 2b. restore REFUSES to mix this box's state with another fleet's (review REV-5) ===
+vibe: this box already holds part of a fleet's state: state/ already holds …/token …
+(refused, kept this box's token — correct)
+
+=== 3. SIGKILL fleetd and the front llama-swap (the front host dying) ===
+killed fleetd (pid 1788878)
+killed swap-front (pid 1788788)
+=== 3b. invariant 4: the CELLS keep serving with the control plane gone ===
+  alpha    /v1/models -> 2 model(s)
+  charlie  /v1/models -> 1 model(s)
+
+=== 4. restore onto the standby box ===
+takeover probe: 127.0.0.1:9827, 127.0.0.1:9820 answered nothing
+  …
+restored 14 files.
+
+=== 5. recovery timings (from the SIGKILL) ===
+  fleetd answering                   1.0s
+  the front serving the catalog      1.0s
+  all 3 cells announcing again       6.1s
+
+=== 6. what survived ===
+  token identical:   yes
+  bravo before:      {"display":"DRAINED","intent":{"state":"drained","reason":"c19 fire drill",…}}
+  bravo after:       {"display":"DRAINED","intent":{"state":"drained","reason":"c19 fire drill",…}}
+  ledger lines:      3 -> 3   (sha e485a3c04cdc -> e485a3c04cdc)
+
+=== 6b. fleet doctor on the standby ===
+OK      fleetd.token         control-plane token loaded from the state dir (not minted at this start)
+OK      front.image_pin      front image is digest-pinned
+OK      mirror.age           state mirrored less than a minute ago (declared limit 36h)
+
+=== 7. the restored control plane can actuate ===
+Resumed bravo. Models return by JIT on next request; intent cleared.
+```
+
+Both directions on real sockets: the refusal fires against a live fleet,
+and after the SIGKILL the same two addresses settle as definite negatives
+and the restore proceeds — the third state did not make the ordinary
+recovery any harder, and 6.1s to a standby holding the same token,
+the same declared drain and the same ledger is the same shape L1
+measured at ~10s.
+
+**Two residuals and a rig defect, all named rather than fixed here.**
+
+1. **A DNS `IsNotFound` is still judged a definite negative.** The
+   identity a standby assumes IS that name, so if it resolves nowhere, no
+   client is reaching the old front by it. The residual is split-horizon
+   DNS — a name that resolves on the old front's network and not on this
+   one — and `--probe-addr` answers it. Closing it would also require the
+   `fleetmirror` fixtures to stop leaning on `front.example.lan` being
+   NXDOMAIN, which is a change in files this unit does not own.
+2. **`printRestore` in `internal/vibe/cli/cmd_fleet_mirror.go` does not
+   know about `Unresolved`.** Its `len(Takeover) == 0 && len(Probed) > 0`
+   line still reads "N answered nothing" — TRUE, because `Probed` is now
+   only the settled ones, but it says nothing about the addresses that
+   answered neither way. The error text carries them and the command
+   exits non-zero; the human-readable line should still grow a row, and
+   there is no `--probe-timeout` flag for the operator whose network is
+   merely slow. Both are one-line CLI changes in a file this unit does
+   not own.
+3. **`gate-c19-drill.sh` never creates `$DRILL/run` or `$DRILL/logs`**
+   (it `rm -rf`s `$DRILL` and then makes only four dirs), so step 4b's
+   two redirections and two pidfile writes fail, and steps 5-7 — the
+   standby coming up, and the RECOVERY TIMING the drill exists to
+   measure — report `NOT REACHED in 60s`. Pre-existing since the feature
+   commit; C20 touched only the `rm -rf` line. The first run here hit it
+   exactly that way; the transcript above is the second, with
+   `"$DRILL/run/rt" "$DRILL/logs"` added to line 59's `mkdir -p` in the
+   /tmp copy. The one-word fix belongs in `scripts/`, which this unit
+   does not own.
+
 ## For the reconciliation pass
 
 This branch does not touch `AGENTS.md`,
