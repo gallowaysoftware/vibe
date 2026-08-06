@@ -187,13 +187,38 @@ Medium:
    observation of absence, which for an opportunistic cell is normal
    forever, but a declared action of the control plane's own that did
    not complete.
-10. **Visible-repoint alias tier** — a catalog id (`best-coder`)
-    whose resolution to a concrete cell model is *shown* in the
-    catalog, re-resolves only on membership transitions, with a loud
-    event. This is the named answer to the roaming-best-node problem;
-    explicitly not per-request fallback (invariant 3 stands). Decide
-    it deliberately in fleet-control.md §9 — adopt or reject with the
-    two-id workaround documented — before the good laptop arrives.
+10. **Visible-repoint alias tier** — **REJECTED as
+    [C21](fleet-control-plan/c21-alias-tier.md) (2026-08-06)**, which is
+    what this entry asked for. The proposal: a catalog id (`best-coder`)
+    whose resolution to a concrete cell model is *shown* in the catalog,
+    re-resolves only on membership transitions, with a loud event. Four
+    notes for whoever reads this next. **Enumerate the states first**:
+    candidate-present and no-candidate-at-all are byte-identical to a
+    declared alias plus §4's class policy (and the entry's own open
+    question, 404-or-hold, is one C3 already answered), so the entire
+    delta is the third state — a `200 OK` from a model the caller did not
+    name. Prune and hold are both fail-LOUD; this would have been the
+    first mechanism here that is not. **Visibility is a property of who
+    reads it, not of the mechanism**: the event, `fleet_status` and the
+    page are all read by the OPERATOR, who already knows the laptop left,
+    while the consumer's only channels are `/v1/models` — which attributes
+    an id to a **peer**, never to a model — and the completion response,
+    whose `model` field is endpoint-dependent (measured on v239: a chat
+    response named the concrete model, an embeddings response echoed the
+    alias straight back). Making it honest to the consumer means rewriting
+    responses at the front, which is invariant 1, so the one mechanism
+    that would rescue it is structurally unavailable. **The workaround is
+    one line, not two ids**: `router.aliases` + `router.alias_owner: true`
+    on the def, repointed by moving the owner line — a commit, a diff, an
+    author, a render; membership through git, as §4 says. And **the
+    feature had already shipped invisibly since C3** — alias ownership was
+    resolved over the defs that SURVIVED the roaming prune, so a departing
+    owner handed its alias to a co-claimant on another cell, proven end to
+    end against merged `main` on real llama-swap processes. That is also
+    the answer to "is a loud event enough": the prune logs a loud line at
+    exactly the right instant, and nobody noticed for five phases. C21
+    closes it (resolution runs over the DECLARED def set at both render
+    layers) and the revisit conditions are named in the phase doc §10.
 11. **`vibe bench replay`** — offline replay of a cell's
     `/api/captures` through a candidate model: tok/s, tool-call rate,
     divergence vs recorded prod responses. Replay in place, emit only
@@ -329,6 +354,10 @@ tip a stranger from stealing the architecture to running the tool:
   hop + contradicts "wake is always explicit").
 - A public read-only status page (intent leaks presence-of-a-person;
   there is no consumer the C4-page-behind-VPN doesn't serve).
+- Automatic alias re-resolution — a catalog id whose target fleetd
+  chooses from presence (C21, item 10 above). The DECLARED form stays:
+  `router.aliases` + `router.alias_owner`, repointed by a human moving one
+  line. An exclusion removes a catalog id; it never re-points one.
 - Router-enforced silent cloud spillover (the reserved `on_cold`
   namespace is the only future home; agent-side declared policy +
   provider spend caps + a `cloud_budget_status` tool cover the real

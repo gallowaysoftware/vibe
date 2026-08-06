@@ -242,6 +242,20 @@ func (rl *renderLoop) renderPass() error {
 			}
 		}
 	}
+	// Alias ownership is decided over the DECLARED def set, before either
+	// overlay removes anything. Both overlays below drop defs, and the
+	// renderer resolves aliases from what it is handed — so without this,
+	// pruning a roaming cell (or excluding a strict fingerprint mismatch)
+	// hands that def's aliases to a co-claimant on another cell, and an id
+	// a consumer pinned keeps answering while naming a different model.
+	// That is the repoint C21 rejected, arrived at by accident; the
+	// declared owner keeps its aliases even when it is not rendered, so an
+	// exclusion makes the alias disappear (invariant 3's fail-loud
+	// direction) instead of moving it.
+	aliasWinners, err := router.ResolveAliases(defs)
+	if err != nil {
+		return fmt.Errorf("resolve aliases: %w", err)
+	}
 	pres := rl.srv.presenceSnapshot()
 
 	defs = rl.applyClassPolicy(defs, pres)
@@ -252,6 +266,7 @@ func (rl *renderLoop) renderPass() error {
 		Hosts:             rl.cfg.Hosts,
 		LlamaServerBinary: rl.cfg.LlamaServerBinary,
 		ExtrasPath:        rl.cfg.FrontExtras,
+		AliasWinners:      aliasWinners,
 		Warnf: func(format string, args ...any) {
 			slog.Warn(fmt.Sprintf("front render: "+format, args...))
 		},

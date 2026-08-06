@@ -56,6 +56,17 @@ type Options struct {
 	// warning, never validated.
 	Hosts *fleetcfg.File
 
+	// AliasWinners overrides alias ownership with a map computed by the
+	// caller (ResolveAliases) over the DECLARED def set. It exists for the
+	// one caller that filters defs BEFORE calling Render — fleetd's
+	// presence-derived render loop, which prunes roaming cells and
+	// excludes strict fingerprint mismatches. Without it, resolution runs
+	// over the surviving defs and an owner's departure hands its alias to
+	// a co-claimant on another cell: the id keeps answering and names a
+	// different model. Nil means resolve from the defs passed in, which is
+	// correct for every caller that hands Render the whole checkout.
+	AliasWinners map[string][]string
+
 	// Warnf receives one message per def the cell selection excludes.
 	// Nil discards; the CLI wires it to stderr so an excluded def is
 	// always visible to whoever ran the render.
@@ -282,9 +293,19 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 		}
 	}
 
-	aliases, err := resolveAliases(modelDefs)
-	if err != nil {
-		return "", err
+	// Resolution runs over every DECLARED claimant, not the survivors of
+	// the cell/trial selection above: a def excluded from this render is
+	// still the fleet's declared owner of its aliases, and resolving over
+	// the survivors would transfer the alias to whoever is left instead of
+	// dropping it. An exclusion must remove an alias from the catalog,
+	// never repoint it at a different model.
+	aliases := opts.AliasWinners
+	if aliases == nil {
+		var err error
+		aliases, err = resolveAliases(aliasClaimants(defs))
+		if err != nil {
+			return "", err
+		}
 	}
 
 	cfg := swapConfig{
@@ -448,6 +469,35 @@ func mergeExtras(rendered []byte, path string) ([]byte, error) {
 		return nil, fmt.Errorf("marshal merged config: %w", err)
 	}
 	return out, nil
+}
+
+// ResolveAliases computes alias ownership over a whole backend-def
+// checkout, for a caller that filters defs before rendering and would
+// otherwise let an excluded def's alias fall to a co-claimant. The result
+// goes back in as Options.AliasWinners. An unresolvable collision is an
+// error here exactly as it is inside Render: a fleet whose alias has two
+// claimants and no declared owner must be fixed, and letting it resolve
+// itself the moment one claimant leaves is the repoint this returns an
+// error to prevent.
+func ResolveAliases(defs []*profile.BackendDef) (map[string][]string, error) {
+	return resolveAliases(aliasClaimants(defs))
+}
+
+// aliasClaimants selects the defs whose ids the router serves directly —
+// the same set Render turns into models:/peers: entries. cloud_peer defs
+// are excluded: their catalog ids come from cloud_peer.models, so they
+// neither claim aliases nor reserve names.
+func aliasClaimants(defs []*profile.BackendDef) []*profile.BackendDef {
+	out := make([]*profile.BackendDef, 0, len(defs))
+	for _, d := range defs {
+		if !d.Backend.External {
+			continue
+		}
+		if d.Backend.LlamaServer != nil || d.Backend.ComfyUI != nil || d.Backend.MLXServer != nil {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // resolveAliases computes each rendered model's alias list and enforces the
