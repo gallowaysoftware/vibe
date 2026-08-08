@@ -12,54 +12,57 @@ package fleetmcp
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gallowaysoftware/vibe/internal/swaptest"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 )
 
-// probeFixture wires a facade over a fleetapi server watching one fake
-// cell whose /api/events reports an idle in-flight count.
+// probeFixture wires a facade over a fleetapi server watching one
+// llama-swap double.
+//
+// The cell is internal/swaptest, not a hand-rolled /api/events handler.
+// The hand-rolled one this replaced emitted exactly one frame —
+// `{"requests":[]}` — which is v239's wire and only v239's: it could
+// never produce a v240+ delta, so the busy guard below could not be
+// tested on the wire that broke it, and it could never produce a NON-zero
+// count at all, so the guard's whole point (a busy cell is a skip) was
+// pinned nowhere in this package.
 type probeFixture struct {
 	s     *Server
 	fleet *fleetapi.Server
 	api   *httptest.Server
+	cell  *swaptest.Cell
 	seq   uint64
 }
 
 func newProbeFixture(t *testing.T) *probeFixture {
 	t.Helper()
-	cellMux := http.NewServeMux()
-	cellMux.HandleFunc("GET /api/events", func(w http.ResponseWriter, r *http.Request) {
-		fl, ok := w.(http.Flusher)
-		if !ok {
-			return
-		}
-		// llama-swap's inflight frame: a JSON envelope whose data is a
-		// JSON STRING. Reporting zero requests is what makes the guard
-		// EVALUABLE — "unknown in-flight is not zero in-flight".
-		fmt.Fprintf(w, "data:%s\n\n", `{"type":"inflight","data":"{\"requests\":[]}"}`)
-		fl.Flush()
-		<-r.Context().Done()
-	})
-	cellMux.HandleFunc("GET /running", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"running":[]}`))
-	})
-	cell := httptest.NewServer(cellMux)
-	t.Cleanup(cell.Close)
+	return newProbeFixtureOn(t, swaptest.Default)
+}
+
+func newProbeFixtureOn(t *testing.T, wire swaptest.Wire) *probeFixture {
+	t.Helper()
+	// The catalog agrees with what these tests announce. The old fixture
+	// served `{"running":[]}` while its announces said qwen was ready —
+	// a cell that contradicted itself, which is a state no real fleet is
+	// ever in and therefore not one worth pinning behaviour against.
+	cell := swaptest.NewCell(t,
+		swaptest.WithWire(wire),
+		swaptest.WithModels(swaptest.Model{ID: "qwen", State: "ready", TTL: 1800}))
 
 	dir := t.TempDir()
 	cells := map[string]fleetcfg.Cell{
 		"front":    {URL: "http://front.invalid"},
-		"gpu-cell": {URL: cell.URL, Class: fleetcfg.ClassOpportunistic},
+		"gpu-cell": {URL: cell.URL(), Class: fleetcfg.ClassOpportunistic},
 	}
 	fleet := fleetapi.New(
-		[]fleetapi.Cell{{Name: "front", URL: "http://front.invalid"}, {Name: "gpu-cell", URL: cell.URL, Class: string(fleetcfg.ClassOpportunistic)}},
+		[]fleetapi.Cell{{Name: "front", URL: "http://front.invalid"}, {Name: "gpu-cell", URL: cell.URL(), Class: string(fleetcfg.ClassOpportunistic)}},
 		dir+"/history.json",
 		func() fleetapi.DaemonInfo { return fleetapi.DaemonInfo{} },
 		fleetapi.Options{IntentPath: dir + "/intent.json", LastSeenPath: dir + "/last-seen.json"},
@@ -73,7 +76,7 @@ func newProbeFixture(t *testing.T) *probeFixture {
 		fleet.Close()
 	})
 
-	f := &probeFixture{s: New(fleet, &fleetcfg.File{Cells: cells}, Options{}), fleet: fleet, api: api}
+	f := &probeFixture{s: New(fleet, &fleetcfg.File{Cells: cells}, Options{}), fleet: fleet, api: api, cell: cell}
 	f.waitForInFlight(t)
 	return f
 }
@@ -89,6 +92,25 @@ func (f *probeFixture) waitForInFlight(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("the cell's in-flight count was never reported; the fixture's guard state is not what the test assumes")
+}
+
+// waitForInFlightCount blocks until the watcher's folded count is want.
+// It asserts on REPORTED-ness too: an unreported count is not zero, and a
+// test that accepted either would pass through the exact confusion the
+// fold exists to prevent.
+func (f *probeFixture) waitForInFlightCount(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var last int
+	var reported bool
+	for time.Now().Before(deadline) {
+		last, reported = f.fleet.InFlight("gpu-cell").Observed()
+		if reported && last == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("in-flight settled at (%d, reported=%v), want (%d, reported=true)", last, reported, want)
 }
 
 // announce posts one heartbeat and returns the response, which is where
@@ -182,9 +204,10 @@ func TestProbeModelTool_RefusesAColdModelAndPointsAtWarm(t *testing.T) {
 // force flag, by design — a busy box is an answer.
 func TestProbeModelTool_ReportsAGuardSkipWithoutAnOverride(t *testing.T) {
 	f := newProbeFixture(t)
-	// A cell that never announced is the guard state reachable without
-	// racing the watcher; the busy and leased variants are pinned against
-	// the scheduler in fleetapi's c8_test.go, which shares this guard.
+	// A cell that never announced is the cheapest guard state to reach;
+	// the BUSY variant is now driven through this same tool against a real
+	// in-flight edge below, and the leased variant is pinned against the
+	// scheduler in fleetapi's c8_test.go, which shares this guard.
 	text, err := f.s.toolProbeModel("gpu-cell", "qwen", false)
 	if err != nil {
 		t.Fatalf("probe_model: %v", err)
@@ -204,6 +227,59 @@ func TestProbeModelTool_ReportsAGuardSkipWithoutAnOverride(t *testing.T) {
 				t.Fatalf("probe_model exposes a %q argument", banned)
 			}
 		}
+	}
+}
+
+// TestProbeModelTool_RefusesABusyCellOnEveryWire is the case the
+// hand-rolled fake could not produce, and it is the case the guard exists
+// for: a probe spends real GPU time, so a cell with live requests on it is
+// a SKIP.
+//
+// Run over both recorded wires because the in-flight fold is the one place
+// llama-swap's protocol changed under vibe. On v239 the edge is a full
+// {"requests":[…]} list; on v247 it is {"operation":"upsert","request":{…}}
+// with `requests` absent. A reader that counts len(requests) sees ZERO on
+// v247 and reports that zero as KNOWN — at which point this tool queues a
+// probe onto a box that is mid-generation. That is the live break C21
+// found, expressed at the verb an agent actually calls.
+func TestProbeModelTool_RefusesABusyCellOnEveryWire(t *testing.T) {
+	for _, wire := range swaptest.Wires() {
+		t.Run(wire.String(), func(t *testing.T) {
+			f := newProbeFixtureOn(t, wire)
+			f.announce(t, fleetapi.AnnounceModel{ID: "qwen", State: "ready"})
+
+			// A real request, opened and left open: the start edge goes out,
+			// the completion edge does not.
+			_, done := f.cell.StartRequest("qwen", "/v1/chat/completions")
+			f.waitForInFlightCount(t, 1)
+
+			text, err := f.s.toolProbeModel("gpu-cell", "qwen", false)
+			if err != nil {
+				t.Fatalf("a guard skip must be an ANSWER, not a tool error: %v", err)
+			}
+			got := decodeProbeResult(t, text)
+			if !strings.Contains(got.Note, "in-flight") {
+				t.Fatalf("want a busy refusal naming the in-flight count, got %q", got.Note)
+			}
+			if resp := f.announce(t, fleetapi.AnnounceModel{ID: "qwen", State: "ready"}); len(resp.Commands) != 0 {
+				t.Fatalf("queued a probe onto a cell with live requests: %+v", resp.Commands)
+			}
+
+			// And the refusal is not permanent: once the request retires,
+			// the same call goes through. Without this half the test would
+			// also pass against a guard that refuses everything forever.
+			done(swaptest.Tokens{Input: 12, Output: 8, Cache: 0,
+				Draft: swaptest.NotReported, DraftAcc: swaptest.NotReported}, 200*time.Millisecond)
+			f.waitForInFlightCount(t, 0)
+
+			if _, err := f.s.toolProbeModel("gpu-cell", "qwen", false); err != nil {
+				t.Fatalf("probe_model on the now-idle cell: %v", err)
+			}
+			resp := f.announce(t, fleetapi.AnnounceModel{ID: "qwen", State: "ready"})
+			if len(resp.Commands) != 1 || resp.Commands[0].Verb != "probe" {
+				t.Fatalf("the retired request did not re-arm the guard: %+v", resp.Commands)
+			}
+		})
 	}
 }
 

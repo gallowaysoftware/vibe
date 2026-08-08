@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gallowaysoftware/vibe/internal/swaptest"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
 )
 
@@ -89,11 +90,16 @@ func TestCellStatusRendersDerivedTable(t *testing.T) {
 func TestCellStatusDegradedFallback(t *testing.T) {
 	// fleetd is dead; hosts.yaml has cells. One cell answers a direct
 	// /v1/models probe, the other doesn't.
-	liveCell := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"qwen3.6-27b","object":"model"}]}`))
-	}))
-	t.Cleanup(liveCell.Close)
+	//
+	// The live cell is internal/swaptest's double rather than a handler
+	// that answers the same canned catalog to every path. Two differences
+	// are load-bearing here: its rows carry `created` and `owned_by` (the
+	// real catalog's full field set, so a decoder that grew a dependency on
+	// either fails here rather than in production), and it answers only the
+	// routes llama-swap actually serves — a probe that drifted onto the
+	// wrong path used to get a 200 and a catalog back regardless.
+	liveCell := swaptest.NewCell(t, swaptest.WithModels(
+		swaptest.Model{ID: "qwen3.6-27b", State: "ready", TTL: 1800}))
 	deadLn, _ := net.Listen("tcp", "127.0.0.1:0")
 	deadURL := "http://" + deadLn.Addr().String()
 	deadLn.Close()
@@ -108,7 +114,7 @@ fleetd_url: "%s"
 cells:
   front:  { url: "%s", class: always_on }
   gpu-cell: { url: "%s", class: opportunistic }
-`, deadURL, liveCell.URL, deadURL)
+`, deadURL, liveCell.URL(), deadURL)
 	if err := os.WriteFile(filepath.Join(xdg, "vibe", "hosts.yaml"), []byte(hostsYAML), 0o600); err != nil {
 		t.Fatal(err)
 	}
