@@ -1,6 +1,6 @@
 # C15 — the warm credential
 
-Status: **PR OPEN** ([#38](https://github.com/gallowaysoftware/vibe/pull/38),
+Status: **merged** ([#38](https://github.com/gallowaysoftware/vibe/pull/38),
 2026-08-05), off `feat/c15-warm-auth` branched from `main` at `0c275fd`.
 Five commits: the feature, `fleet.front_extras` (the render half — see
 §6, it is not optional scope), ground rule 9's adversarial self-review

@@ -1,6 +1,6 @@
 # C20 — The invariant harness: the review step, made mechanical
 
-Status: **PR OPEN** (2026-08-06), off `feat/c20-invariant-harness`
+Status: **merged** (#43) (2026-08-06), off `feat/c20-invariant-harness`
 branched from `main` at `e144f8b`. Feature + self-review +
 **independent adversarial-review** commits (4 + 10 findings). Unit gates
 U1–U15 green on a full local inner loop (`go test -race -count=5` over

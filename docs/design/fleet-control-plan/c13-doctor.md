@@ -1,6 +1,6 @@
 # C13 — `vibe fleet doctor`: the sit-down-after-two-weeks command
 
-Status: **PR OPEN** (2026-08-05), off `feat/c13-doctor` branched from
+Status: **merged** (#32) (2026-08-05), off `feat/c13-doctor` branched from
 `feat/c12-guest-token` at `96f793c` (**C12 merges first**). Feature
 commit, ground rule 9's adversarial self-review commit (five findings,
 three of them ways this command could have MISREPORTED — see the

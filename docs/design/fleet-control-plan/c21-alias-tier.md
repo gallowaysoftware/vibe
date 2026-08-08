@@ -1,6 +1,6 @@
 # C21 — the visible-repoint alias tier: REJECTED, and the invisible one that already shipped
 
-Status: **PR OPEN**, off `feat/c21-alias-tier` branched from `main` at
+Status: **merged** (#44), off `feat/c21-alias-tier` branched from `main` at
 `e144f8b`. Three commits: the decision + the fix, ground rule 9's
 adversarial self-review (§8b — five findings, two fixed, one a silent
 disarming of the fix itself), and the independent adversarial review pass

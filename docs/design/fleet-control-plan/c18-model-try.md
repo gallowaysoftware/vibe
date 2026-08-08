@@ -1,6 +1,6 @@
 # C18 — `vibe model try`: the membership-churn loop as one command
 
-Status: **PR OPEN**, off `feat/c18-model-try` branched from `main` at
+Status: **merged** (#41), off `feat/c18-model-try` branched from `main` at
 `c2127f3` and merged up to `cfb3d40` (C19). Backlog item 14 (the only
 Large-tier entry in
 [fleet-control-futures.md](../fleet-control-futures.md) §2) — the weekly

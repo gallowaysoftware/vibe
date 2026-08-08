@@ -1,6 +1,6 @@
 # C16 — The upgrade ritual: digest-pin the front, make the bump a sequence
 
-Status: **PR OPEN** (2026-08-05), off `feat/c16-upgrade-ritual` branched
+Status: **merged** (#39) (2026-08-05), off `feat/c16-upgrade-ritual` branched
 from `main` at `0c275fd`. Feature commit plus ground rule 9's adversarial
 self-review commit (five findings, one of them a test that would have
 reported two contradictory failures about one event — see the
