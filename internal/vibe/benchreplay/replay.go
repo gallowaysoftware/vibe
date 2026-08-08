@@ -95,7 +95,22 @@ func (s *Set) replay(ctx context.Context, side Side) (replayResult, error) {
 
 	res := replayResult{model: side.Model}
 	var sawDecode, sawE2E bool
-	for _, item := range s.items {
+	// The wall bound on a whole side. Per-request timeouts alone are not a
+	// bound: 40 samples at ReplayTimeout is nearly four hours PER SIDE, and
+	// a captured agentic request carries its own max_tokens, so the worst
+	// case is a real one rather than an arithmetic one.
+	//
+	// Running out of it is a REFUSAL, not a truncation. A side that
+	// replayed 31 of 40 while the other replayed all 40 is not a paired
+	// comparison, and reporting one would be the "silently short n" failure
+	// C25 §2 rejects live shadow routing for.
+	deadline := s.opt.Now().Add(s.opt.SideBudget)
+	for i, item := range s.items {
+		if s.opt.Now().After(deadline) {
+			return replayResult{}, fmt.Errorf(
+				"replaying %s ran past its %s budget after %d of %d request(s); a side that replayed part of the sample is not a paired comparison, so no score is produced. Re-run with fewer samples or a longer budget",
+				side.Model, s.opt.SideBudget, i, len(s.items))
+		}
 		sh, rate, metric := s.one(ctx, side.Model, item)
 		res.shapes = append(res.shapes, sh)
 		res.tokS = append(res.tokS, rate)
@@ -146,7 +161,11 @@ func (s *Set) one(ctx context.Context, model string, item sample) (shape, float6
 		return shape{toolOutcome: ToolNone, finish: FinishNone}, 0, ""
 	}
 	req.Header.Set("Content-Type", "application/json")
-	start := s.opt.Now()
+	// time.Now, not s.opt.Now. This is a MEASUREMENT of a real request, not
+	// a schedule; reading it off an injectable clock is how a frozen fake
+	// reports every request as infinitely fast. Same distinction C18's
+	// REV-7 had to make between a deadline and a sleep.
+	start := time.Now()
 	resp, err := s.opt.HTTP.Do(req)
 	if err != nil {
 		// A transport failure, a timeout: no shape, no rate. An abandoned
@@ -155,7 +174,7 @@ func (s *Set) one(ctx context.Context, model string, item sample) (shape, float6
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxCaptureBytes))
-	elapsed := s.opt.Now().Sub(start)
+	elapsed := time.Since(start)
 	if err != nil {
 		return shape{status: resp.StatusCode, toolOutcome: ToolNone, finish: FinishNone}, 0, ""
 	}

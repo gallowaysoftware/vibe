@@ -1017,8 +1017,55 @@ func TestOptionsDefaultsAreTheDocumentedConstants(t *testing.T) {
 	require.Equal(t, DefaultMaxPages, o.MaxPages)
 	require.Equal(t, DefaultRateFloor, o.RateFloor)
 	require.Equal(t, DefaultReplayTimeout, o.ReplayTimeout)
+	require.Equal(t, DefaultSideBudget, o.SideBudget)
 	require.NotNil(t, o.HTTP)
 	require.NotNil(t, o.Now)
+}
+
+// TestASideThatOutrunsItsBudgetRefusesRatherThanTruncating pins the one
+// bound a per-request timeout does not give: 40 samples at a 5-minute
+// per-request timeout is nearly four hours PER SIDE, and the sample is
+// real agentic traffic with its own max_tokens.
+//
+// The refusal, rather than a short n, is the point. A side that replayed
+// part of the sample while the other replayed all of it is not a paired
+// comparison, and printing one would be a metric lying about its own n.
+func TestASideThatOutrunsItsBudgetRefusesRatherThanTruncating(t *testing.T) {
+	f := newFakeCell(t)
+	f.warm("incumbent", "candidate")
+	for id := int64(1); id <= 5; id++ {
+		f.row(id, "incumbent", "/v1/chat/completions", 200, plainRequest("p"), "")
+	}
+
+	// A clock that jumps a minute per read, so the budget ELAPSES rather
+	// than being asserted against a value nothing reaches — the shape three
+	// tests in this repo got wrong by borrowing their deadline from the
+	// caller.
+	now := time.Unix(1_700_000_000, 0)
+	tick := func() time.Time {
+		now = now.Add(time.Minute)
+		return now
+	}
+	set, err := Harvest(t.Context(), Options{LlamaSwapURL: f.url}, "incumbent", false)
+	require.NoError(t, err)
+	set.opt.Now = tick
+	set.opt.SideBudget = 2 * time.Minute
+
+	_, err = set.Run(t.Context(), "c", Side{Model: "incumbent"}, Side{Model: "candidate"})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "budget")
+	require.Contains(t, err.Error(), "not a paired comparison")
+	require.Less(t, len(f.sentBodies("incumbent")), 5,
+		"the budget must stop the run; if every request went out, the deadline never elapsed and this test proves nothing")
+
+	// And a budget it fits inside produces a full score, so the assertion
+	// above is the budget firing rather than the fixture being broken.
+	set2, err := Harvest(t.Context(), Options{LlamaSwapURL: f.url}, "incumbent", false)
+	require.NoError(t, err)
+	rep, err := set2.Run(t.Context(), "c", Side{Model: "incumbent"}, Side{Model: "candidate"})
+	require.NoError(t, err)
+	require.Equal(t, 5, rep.Incumbent.Requests)
+	require.Equal(t, 5, rep.Candidate.Requests)
 }
 
 // TestNothingCrossesABox is mechanism 5, as a scan. This package must

@@ -117,6 +117,21 @@ const DefaultMaxPages = 6
 // nobody measured.
 const DefaultReplayTimeout = 5 * time.Minute
 
+// DefaultSideBudget bounds one whole side of the replay.
+//
+// A per-request timeout is not a bound on the command: DefaultMaxSample at
+// DefaultReplayTimeout is nearly four hours per side, and the sample is
+// real agentic traffic with its own max_tokens, so that is a reachable
+// number rather than an arithmetic one. `vibe model try` already holds a
+// four-hour lease and a four-hour C11 hold on the incumbent; a replay that
+// outlived them would be measuring a cell the fleet had resumed using.
+//
+// Exhausting it is a REFUSAL. A side that replayed 31 of 40 samples while
+// the other replayed 40 is not a paired comparison, and reporting one
+// would be the silently-short-n failure §2 rejects live shadow routing
+// for.
+const DefaultSideBudget = 90 * time.Minute
+
 // activityLimit is llama-swap's own cap on the activity endpoint's `limit`
 // parameter; asking for more is answered with fewer, silently.
 const activityLimit = 999
@@ -167,14 +182,21 @@ type Options struct {
 	ConfigPath string
 
 	HTTP *http.Client
-	Now  func() time.Time
+	// Now is the clock for BUDGETS — deadlines this package decides — and
+	// never for timing a request. Measuring a real request's elapsed time
+	// against an injectable clock is C18's REV-7 shape (a deadline from the
+	// fake clock, a sleep on the wall clock) pointed at a metric instead of
+	// a loop: a frozen Now would report every request as infinitely fast.
+	// The elapsed measurement in `one` uses time.Now and says so.
+	Now func() time.Time
 
-	// MaxSample, MaxPages, RateFloor and ReplayTimeout default to the
-	// constants above.
+	// MaxSample, MaxPages, RateFloor, ReplayTimeout and SideBudget default
+	// to the constants above.
 	MaxSample     int
 	MaxPages      int
 	RateFloor     int
 	ReplayTimeout time.Duration
+	SideBudget    time.Duration
 }
 
 func (o Options) withDefaults() Options {
@@ -195,6 +217,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.ReplayTimeout <= 0 {
 		o.ReplayTimeout = DefaultReplayTimeout
+	}
+	if o.SideBudget <= 0 {
+		o.SideBudget = DefaultSideBudget
 	}
 	return o
 }

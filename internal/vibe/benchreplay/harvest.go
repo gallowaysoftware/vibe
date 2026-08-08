@@ -218,19 +218,19 @@ func fetchSample(ctx context.Context, opt Options, row activityRow) (sample, fet
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return sample{}, fetchMalformed
 	}
-	var cap capturePayload
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxCaptureBytes)).Decode(&cap); err != nil {
+	var payload capturePayload
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxCaptureBytes)).Decode(&payload); err != nil {
 		return sample{}, fetchMalformed
 	}
-	facts, ok := extractRequest(cap.ReqBody)
+	facts, ok := extractRequest(payload.ReqBody)
 	if !ok {
 		return sample{}, fetchMalformed
 	}
 	return sample{
 		activityID: row.ID,
-		reqBody:    cap.ReqBody,
+		reqBody:    payload.ReqBody,
 		facts:      facts,
-		recorded:   shapeOfRecorded(row.Status, cap.RespBody, facts),
+		recorded:   shapeOfRecorded(row.Status, payload.RespBody, facts),
 	}, fetchOK
 }
 

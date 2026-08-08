@@ -857,6 +857,23 @@ var Registry = []Mutation{
 			"become an actuator, and the thing it actuated is eviction.",
 	},
 	{
+		Name: "c25/a replay side loses its wall bound",
+		File: "internal/vibe/benchreplay/replay.go",
+		Find: "\t\tif s.opt.Now().After(deadline) {",
+		// `_ = deadline` keeps it compiling: a mutation that fails to build
+		// proves nothing about the guard.
+		Replace:  "\t\t_ = deadline\n\t\tif false {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestASideThatOutrunsItsBudgetRefusesRatherThanTruncating"},
+		Why: "a per-request timeout is not a bound on the command: 40 samples at the 5-minute " +
+			"per-request timeout is nearly four hours PER SIDE, and the sample is real agentic " +
+			"traffic carrying its own max_tokens. `vibe model try` holds a four-hour lease and a " +
+			"four-hour C11 hold on the incumbent while this runs, so a replay that outlived them " +
+			"would be measuring a cell the fleet had resumed using. The refusal rather than a short " +
+			"n is the other half: a side that replayed 31 of 40 while the other replayed 40 is a " +
+			"metric lying about its own n.",
+	},
+	{
 		Name:     "c25/the replay edits the client's own sampling",
 		File:     "internal/vibe/benchreplay/replay.go",
 		Find:     "\tobj[\"stream\"] = json.RawMessage(\"false\")",

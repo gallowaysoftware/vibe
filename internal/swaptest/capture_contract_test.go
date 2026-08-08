@@ -72,7 +72,7 @@ func i7(t *testing.T, tgt target) {
 
 	// The payload. Field names and base64 bodies, exactly as
 	// internal/vibe/benchreplay decodes them.
-	var cap struct {
+	var payload struct {
 		ID          int               `json:"id"`
 		ReqPath     string            `json:"req_path"`
 		ReqHeaders  map[string]string `json:"req_headers"`
@@ -80,28 +80,28 @@ func i7(t *testing.T, tgt target) {
 		RespHeaders map[string]string `json:"resp_headers"`
 		RespBody    []byte            `json:"resp_body"`
 	}
-	if err := json.Unmarshal(body, &cap); err != nil {
+	if err := json.Unmarshal(body, &payload); err != nil {
 		t.Fatalf("decode the capture: %v", err)
 	}
-	if int64(cap.ID) != row.ID {
-		t.Errorf("capture id %d for activity row %d: the key is the ACTIVITY row id, and a harvest that walked the activity log would fetch the wrong object", cap.ID, row.ID)
+	if int64(payload.ID) != row.ID {
+		t.Errorf("capture id %d for activity row %d: the key is the ACTIVITY row id, and a harvest that walked the activity log would fetch the wrong object", payload.ID, row.ID)
 	}
-	if !strings.Contains(cap.ReqPath, "chat") {
-		t.Errorf("req_path %q does not match the row's %q", cap.ReqPath, row.ReqPath)
+	if !strings.Contains(payload.ReqPath, "chat") {
+		t.Errorf("req_path %q does not match the row's %q", payload.ReqPath, row.ReqPath)
 	}
-	if len(cap.ReqBody) == 0 {
+	if len(payload.ReqBody) == 0 {
 		t.Fatal("req_body is empty. The whole phase replays that body; a capture without one is not a sample")
 	}
 	// The request body is the one this test just sent, so asserting on it
 	// asserts nothing about anyone's traffic.
-	if !json.Valid(cap.ReqBody) {
-		t.Errorf("req_body did not decode to valid JSON (%d bytes); encoding/json + encoding/base64 is the whole decoder C25 uses", len(cap.ReqBody))
+	if !json.Valid(payload.ReqBody) {
+		t.Errorf("req_body did not decode to valid JSON (%d bytes); encoding/json + encoding/base64 is the whole decoder C25 uses", len(payload.ReqBody))
 	}
 	var sent struct {
 		Model    string `json:"model"`
 		Messages []any  `json:"messages"`
 	}
-	if err := json.Unmarshal(cap.ReqBody, &sent); err != nil {
+	if err := json.Unmarshal(payload.ReqBody, &sent); err != nil {
 		t.Errorf("req_body is not the request that was sent: %v", err)
 	} else if len(sent.Messages) == 0 {
 		t.Error("req_body carries no messages; C25 rewrites `model` and `stream` in exactly this object and leaves the rest alone")
@@ -111,7 +111,7 @@ func i7(t *testing.T, tgt target) {
 	// are stripped and NOTHING in the bodies is — which is the entire
 	// reason this phase treats a capture as the most private object in the
 	// fleet.
-	for h := range cap.ReqHeaders {
+	for h := range payload.ReqHeaders {
 		switch strings.ToLower(h) {
 		case "authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key":
 			t.Errorf("req_headers carried %q; upstream redacts these five by name", h)

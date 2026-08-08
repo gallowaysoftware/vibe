@@ -325,13 +325,11 @@ func shapeOfStream(status int, body []byte, f requestFacts) shape {
 		}
 		s.argsValid, s.argsRequired = checkArgs(argsB.String(), f.requiredArgs[toolName])
 	}
-	if f.wantsSchema {
-		s.schemaWanted = true
-		// A streamed schema response would need the text reassembled, and
-		// §5 refuses to do that. Wanted, not claimed.
-		s.schemaOK = false
-		s.schemaWanted = false
-	}
+	// Schema conformance is deliberately NOT answered for a streamed
+	// recorded response. Judging it needs the text reassembled and §5
+	// refuses to reassemble streamed text, so the question is DROPPED
+	// rather than answered "did not conform" — an unanswerable question
+	// must not become a failure nobody measured.
 	return s
 }
 
