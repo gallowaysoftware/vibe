@@ -187,6 +187,7 @@ it changed. Bring the lab up first
 | `gate-c14-l3.sh` | C14 L3 — a real request defers the declared suspend, then it fires | ~12 min |
 | `gate-c14-l4.sh` | C14 L4 — a lease defers the suspend until `max_defer` abandons it | ~10 min |
 | `gate-c19-drill.sh` | C19's fire drill — mirror, kill the front host, restore onto a standby, time it. **DISRUPTIVE**: it SIGKILLs the lab's fleetd and front and leaves a standby in their place; `./lab.sh down && ./lab.sh up` afterwards | ~3 min |
+| `gate-c24-stop-record.sh` | C24 — the shipped `ExecStopPost` hook against a real fleetd: the record is not handed back as a command, with a human's declared drain as the positive control. Wants a clean intent axis (a fresh `lab.sh up`); drains and resumes bravo and puts it back | ~2 min |
 | `marionette.py` | C12 L1's DOM half — drives headless Firefox over Marionette | ~1 min |
 
 `marionette.py` needs `firefox` on `$PATH`; nothing else here does.

@@ -513,6 +513,10 @@ anything and about the honesty of what it wrote.
 
 ## For the reconciliation pass
 
+> **APPLIED by C22 (PR #46, 2026-08-06)** — verified against the tree by
+> C26b. Ground rule 10's amendment carries the attribution in the plan
+> README itself.
+
 Three shared files are off-limits to this branch (they are wave 1's
 conflict axis). Here is exactly what belongs in each.
 

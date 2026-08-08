@@ -1,7 +1,7 @@
 # C23 — a port base for `scripts/fleetlab`: one lab's teardown cannot reach another's
 
-Status: **PR OPEN**, off `c23-fleetlab-port-base` branched from `main` at
-`499d4e8`. Backlog item 15
+Status: **MERGED (#57, 2026-08-08)**, off `c23-fleetlab-port-base`
+branched from `main` at `499d4e8`. Backlog item 15
 ([fleet-control-futures.md](../fleet-control-futures.md) §2):
 
 > **A port offset for `scripts/fleetlab`.** It binds fixed ports
@@ -308,6 +308,12 @@ discipline — the base that would have made this dangerous now does not
 start.
 
 ## For the reconciliation pass
+
+> **APPLIED by C26b (2026-08-08).** All three items landed: the
+> collision rule and `internal/fleetlab` are in `AGENTS.md` under the
+> local-rigs bullets, the README gained a C23 row and the carried-rule
+> paragraph, C16's row now reads "L1–L4 and L7 PASS", and C16 L4 is out
+> of the owed table with the distinction spelled out under it.
 
 Nothing in this phase touches the three shared docs, so the following are
 recorded here for whoever runs the reconciliation:

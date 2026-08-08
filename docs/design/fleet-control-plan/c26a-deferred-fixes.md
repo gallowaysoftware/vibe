@@ -1,7 +1,7 @@
 # C26a — the four fixes that were recorded instead of made
 
-Status: **PR OPEN**, off `c26a-deferred-fixes` branched from `main` at
-`e590b05`.
+Status: **MERGED (#60, 2026-08-08)**, off `c26a-deferred-fixes` branched
+from `main` at `e590b05`.
 
 This phase has no subject of its own. It is the week's *deferral ledger*
 paid off: four findings that were deliberately written down rather than
@@ -334,6 +334,14 @@ and each asserted dead (or deliberately detached and then reaped) before
 the test returns.
 
 ## For the reconciliation pass
+
+> **APPLIED by C26b (2026-08-08).** All of it, with one resolution worth
+> naming: the doctor rule proposed below ("a check that cannot apply must
+> return not-applicable, never pass and never fail") is the opposite of
+> the rule `AGENTS.md` already carried for `vibe fleet doctor` ("never
+> add a fifth level for not-applicable"). They are about two different
+> commands with two different report shapes, so both are in the file, each
+> with a sentence saying which is which and pointing at the other.
 
 Nothing in this phase edits the three shared docs. Recorded here for
 whoever runs the reconciliation:

@@ -1,7 +1,9 @@
 # C19 — Front failover identity: the state that dies with the front host, and the path back
 
-Status: **PR OPEN** (2026-08-05), off `feat/c19-front-failover` branched
-from `main` at `c2127f3`. Feature commit plus ground rule 9's adversarial
+Status: **MERGED (#42, 2026-08-05)**, off `feat/c19-front-failover`
+branched from `main` at `c2127f3`; two cross-unit fixes landed later as
+[U3](#u3--the-two-cross-unit-fixes-2026-08-08) (#55) and L7 ran on
+2026-08-08 (C26b). Feature commit plus ground rule 9's adversarial
 self-review commit (seven findings, two of them major — see the
 [addendum](#adversarial-self-review-addendum)); every fix
 mutation-verified. Unit gates U1–U23 green
@@ -9,11 +11,13 @@ on a full local inner loop. **Live gate L1 PASS** — the fire drill ran
 against a real four-cell fleetlab: mirror, refusal, `SIGKILL` of a real
 fleetd and a real llama-swap front, restore onto a standby, **10.1 s and
 14.1 s** (two runs) to three cells announcing again with the same token,
-the same declared intent and a byte-identical usage ledger. **Those
-timings are UNVERIFIED against the committed rig** — the script in
+the same declared intent and a byte-identical usage ledger. Those
+timings were UNVERIFIED against the committed rig — the script in
 `scripts/` could not have produced them, and what it was patched to on
-the night is not recorded; see
-[U3](#u3--the-two-cross-unit-fixes-2026-08-08). L2 (the same drill on real
+the night is not recorded (see
+[U3](#u3--the-two-cross-unit-fixes-2026-08-08)) — and are now superseded
+by **L7 PASS (2026-08-08)**, which ran the committed rig on a private
+port base and measured **9.6 s and 10.1 s**. L2 (the same drill on real
 hardware) is **UNRUN** — it needs the fleet. See
 [Acceptance gates](#acceptance-gates).
 
@@ -250,12 +254,14 @@ restores the documented shape.
 
 ## 6. What is still manual, and how long the real thing takes
 
-The drill's mechanical half is **10 seconds** (measured, but on a
-locally-patched rig — see the qualification under L1 and
-[U3](#u3--the-two-cross-unit-fixes-2026-08-08); the order of magnitude is
-what this section rests on and that is not in doubt). The runbook budgets
-**10–15 minutes** for the real recovery, and the difference is entirely
-human or physical:
+The drill's mechanical half is **about 10 seconds** — 9.6 s and 10.1 s
+over two runs of the committed rig on 2026-08-08
+([L7](#l7-pass--the-drill-on-the-committed-rig-2026-08-08)). That
+sentence stood for three days on a locally-patched rig nobody wrote down
+(see the qualification under L1 and
+[U3](#u3--the-two-cross-unit-fixes-2026-08-08)); it is now measured.
+The runbook budgets **10–15 minutes** for the real recovery, and the
+difference is entirely human or physical:
 
 - **confirming the old front is DOWN** — the one step that must not be
   automated, and the step the whole design rests on;
@@ -329,10 +335,11 @@ Live (a real fleet, or the harness):
 
 | # | gate | result |
 |---|---|---|
-| L1 | the fire drill end to end against a real four-cell fleetlab: mirror → refusal → SIGKILL → restore → standby → timings → survival | **PASS, with its timings UNVERIFIED** — the drill ran and the survival evidence stands, but steps 5–7 cannot execute under the committed script (U3 fix 2), so the recovery numbers came from a locally-patched copy nobody wrote down. See Execution and [U3](#u3--the-two-cross-unit-fixes-2026-08-08) |
+| L1 | the fire drill end to end against a real four-cell fleetlab: mirror → refusal → SIGKILL → restore → standby → timings → survival | **PASS, with its own timings still UNVERIFIED** — the drill ran and the survival evidence stands, but steps 5–7 could not execute under the committed script (U3 fix 2), so *these* recovery numbers came from a locally-patched copy nobody wrote down. Superseded rather than rescued: **L7** re-ran the fixed rig and measured the same thing. See Execution and [U3](#u3--the-two-cross-unit-fixes-2026-08-08) |
 | L2 | the same drill on real hardware: the gpu-cell box as the standby, the pinned image pulled, DNS repointed, cells re-announcing across a LAN | **UNRUN** — needs the fleet (SSH blocked, the LAN does not route from here) |
 | L3 | a real off-host destination (NFS/CIFS mount) over a week of nightly timer runs, with `mirror.age` moving OK → WARN when the timer is stopped | **UNRUN** — wall clock, not hardware |
 | L4 | *(review 2)* the five refusals driven through the real `vibe fleet mirror` binary against a synthetic front-host state dir | **PASS** — see Execution |
+| L7 | *(U3)* the whole drill on the **committed** rig, so the "5. recovery timings" block is read off the script that is in the repository | **PASS (2026-08-08, C26b)** — two runs on port base 10200: **9.6 s** and **10.1 s** to three cells announcing again. See [Execution](#l7-pass--the-drill-on-the-committed-rig-2026-08-08) |
 
 ## Execution
 
@@ -460,11 +467,57 @@ there is, and because the *survival* half of this transcript (token
 identical, the same `since` on bravo's intent, the ledger sha unchanged,
 `fleetd.token` reporting *loaded*) does not depend on the timing block at
 all and is unaffected. What is unverified is narrow and specific: the
-seconds. **What would verify them:** re-run
-`FLEETLAB_DIR=… ./gate-c19-drill.sh` against a four-cell fleetlab on the
-fixed script and read the block off a run whose rig is byte-identical to
-the one in the repository. U3 fixed the script and could not re-run it —
-see [U3](#u3--the-two-cross-unit-fixes-2026-08-08) for why.
+seconds — and only *these* seconds, from *these* two runs. They are not
+rescued below; they are superseded by a measurement of the same quantity
+on the rig that is actually in the repository.
+
+### L7 PASS — the drill on the committed rig, 2026-08-08
+
+Run by the C26b reconciliation pass, on
+`FLEETLAB_DIR=/tmp/fleetlab-c26b FLEETLAB_PORT_BASE=10200` — a
+non-default port base, which is the only thing that was ever missing.
+C23 shipped the knob; nothing else about the drill changed. The script
+is the one in the repository, byte for byte, and no `/tmp` copy was
+made. Two runs, each against a four-cell lab stood up immediately
+beforehand (`./lab.sh down && ./lab.sh up`, as the rig's header
+requires):
+
+```
+run 1                                       run 2
+=== 5. recovery timings (from the SIGKILL) ===
+  fleetd answering                   2.0s     2.0s
+  the front serving the catalog      2.0s     2.0s
+  all 3 cells announcing again       9.6s    10.1s
+
+=== 6. what survived ===
+  token identical:   yes                      yes
+  bravo before/after: byte-identical intent, same `since`
+  ledger lines:      3 -> 3 (sha d056d62c9699 -> d056d62c9699)   both runs
+```
+
+So U3's fix works — the block prints three durations rather than three
+`NOT REACHED` lines — and the number it prints is the number the
+unrecorded rig printed. **9.6 s and 10.1 s against the earlier 10.1 s and
+14.1 s.** That is a corroboration and it is worth being precise about
+what it does and does not settle: it settles that the committed script
+can produce a timing block and that the drill's mechanical half is ~10 s
+on this box; it does not retroactively make the earlier transcripts
+reproducible, because their rig is still unrecorded. The qualification on
+L1 therefore stays where it is. What is gone is the *standing* unverified
+number: §6 now leans on a run anyone can repeat.
+
+Two smaller things the re-run establishes. The 15 s announce interval is
+still the whole spread — 9.6 s and 10.1 s differ by less than one
+heartbeat, so "inside one heartbeat of the control plane coming back"
+survives as the honest phrasing rather than a stopwatch figure. And run
+1's step 6 shows bravo as `INCONSISTENT` rather than `DRAINED` (its
+cell-side echo had not caught up with the declared drain when the front
+was killed) while every survival assertion held identically — which is
+the display doing its job on a genuinely ambiguous instant, not a
+regression.
+
+**Still not run on metal.** L7 is the *harness* drill; L2 remains what it
+was.
 
 ### L2, L3 UNRUN
 
@@ -1310,7 +1363,26 @@ in beside L1's. If the fix is right the block prints three durations; if
 it is wrong it now aborts with a named directory instead of three
 `NOT REACHED` lines.
 
+**CLOSED 2026-08-08 by C26b — and the reason it was open is the point.**
+The blocker above is a *scheduling* one ("four other agents were working
+this box"), and by the time it was written [C23](c23-fleetlab-port-base.md)
+had shipped `FLEETLAB_PORT_BASE`, which is exactly the knob that turns a
+shared rig into a private one. The drill then ran unchanged on base
+10200, twice, and printed the block: **9.6 s and 10.1 s**
+([L7 in Execution](#l7-pass--the-drill-on-the-committed-rig-2026-08-08)).
+It needed no lab it could not have, no hardware and no wall clock — only
+a base nobody else held. A gate parked under a heading that says "cannot"
+when it means "did not" is invisible forever, which is ground rule 10's
+amendment; this is the second worked example after C16's L4, and the two
+of them are why the sweep in C26b went looking for a third.
+
 ## For the reconciliation pass
+
+> **APPLIED by C22 (PR #46, 2026-08-06)** for the original three bullets;
+> the "Added by U3" amendments below were APPLIED by **C26b
+> (2026-08-08)**, which also replaced the second of them: L7 ran, so
+> C19's README row now carries a MEASURED 9.6 s / 10.1 s rather than the
+> UNVERIFIED qualification U3 asked for.
 
 This branch does not touch `AGENTS.md`,
 `docs/design/fleet-control-plan/README.md` or
