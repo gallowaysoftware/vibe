@@ -124,6 +124,26 @@ stand-in.
   sentinel, the wire shape — are required of `fake/` targets and merely
   noted on live ones: llama.cpp may legitimately not report a counter, but
   the double has no excuse.
+- **Two upstream BEHAVIOURS are gated, not just the wire**
+  (`internal/swaptest/behaviour_test.go`, C16). The loading-state
+  keepalive (a streaming completion at a still-loading model must be
+  delivering parseable delta frames within 2 s, and the same stream must
+  go on to carry the model's own tokens) and SIGTERM's stream handling
+  (`/api/events` closes at once; in-flight *inference* streams are NOT
+  cancelled; anything still running at the 30 s grace is force-closed).
+  Both are env-gated on `LLAMA_SWAP_BIN` because a signal is not a wire,
+  and both use an in-test HTTP upstream so the question stays about
+  llama-swap rather than about llama.cpp. The grace window is bounded on
+  both sides on purpose — either direction changes what `TimeoutStopSec`
+  has to be.
+- **`GET /api/version` is an upstream contract like any other** (C16).
+  `fleetapi.readSwapVersion` is the ONE reader, verified against real
+  v239 and v247 binaries and replayed by `TestSwapContract` I6 on both
+  fake wires. It **rejects rather than truncates**: a truncated version
+  is a guess that becomes its own matrix key, and an unprintable one
+  makes fleetd's `clean` refuse the cell's WHOLE announce — presence,
+  intent echo, usage and probes with it. An upstream dependency the
+  conformance suite does not replay is the hole C16 exists to close.
 - **The local rigs stay.** `scripts/fleetlab` and
   `scripts/smoke/llama-swap/` are not made redundant by any of this — CI has
   no GPU, no real models, no SSH, no wattmeter, and its numbers would be
@@ -135,6 +155,24 @@ stand-in.
   armed; before a release; and when adding a new cell CLASS. **A green CI
   suite is never evidence that a phase doc's gate passed** — those
   transcripts are real hardware runs.
+  - `scripts/fleetlab/gate-*.sh` are the per-gate rigs (one per phase
+    gate, sourcing `gl.sh`); `marionette.py` drives a headless Firefox
+    for the one gate that needs a DOM. They print raw evidence, never a
+    verdict — **a rig that prints PASS is a rig that can print PASS
+    while wrong.** C17's own review found six evidence lines that were
+    structurally constant (`null`, `0`, `"none"` regardless of what the
+    fleet was doing) under headings promising a measurement, with three
+    flipped gate rows citing one of them. So: every column in a rig must
+    be watched to MOVE when the fleet moves, no rig may act outside
+    `$FLEETLAB_DIR` (`git -C`, never a bare `cd`), and no rig may print
+    a credential. **Running the rig is not the same as reading it** —
+    C18 found two defects, one a blocker, only by executing the rig it
+    had already committed.
+  - `vibe router render` hardcodes `startPort: 5800`, which is
+    **production's** upstream range on this box. Every rig that
+    re-renders a cell config goes through `gl.sh`'s `render_cell`, which
+    FAILS if the port rewrite did not apply. Do not open-code a render
+    in a rig.
 
 ## Conventions agents tend to violate
 
@@ -201,7 +239,7 @@ stand-in.
   fails to activate with a message naming `search_url`, instead of
   rendering an empty URL into a harness config.
 - **Fleet control plane (fleet-control C1+).** `docs/design/fleet-control.md`
-  is the design; the phase plan (C0–C4) is
+  is the design; the phase plan (C0–C21, all merged) is
   `docs/design/fleet-control-plan/`. The pieces an agent must not break:
   - `internal/vibe/fleetcfg` parses `$XDG_CONFIG_HOME/vibe/hosts.yaml`
     (cells registry + `fleetd_url` + optional `model_classes`) — the
@@ -236,13 +274,21 @@ stand-in.
     remote daemon, never routing. Errors: `FailedPrecondition` (no
     cell_cmds), `Unavailable`+stderr (command failed),
     `DeadlineExceeded` (quiescence wait expired, drain NOT run).
-  - **llama-swap's SIGTERM path cancels in-flight streams
-    immediately** (v239 verified: `CloseStreams()` precedes the
-    graceful drain). `vibe cell drain --wait <dur>` /
-    `CellDrainRequest.wait_seconds` is the quiescence wait that lets
-    generations finish BEFORE the unit stops — driven by fleetapi's
-    inflight SSE tracking. Unit `TimeoutStopSec` must exceed
-    llama-swap's 30s internal cap.
+  - **llama-swap's SIGTERM path does NOT cancel in-flight INFERENCE
+    streams** — corrected by C16, and this bullet asserted the opposite
+    until 2026-08-05. Measured on real v239 and v247:
+    `CloseStreams()` closes the EVENT streams (`/api/events` drops in
+    ~1 ms) while inference streams keep flowing and are force-closed at
+    a hardcoded **30 s** — the same grace a `-watch-config` reload gets,
+    not a contrast with it. Gated in
+    `internal/swaptest/behaviour_test.go` (B2), bounded on BOTH sides on
+    purpose: either direction changes what `TimeoutStopSec` has to be.
+    `vibe cell drain --wait <dur>` / `CellDrainRequest.wait_seconds` is
+    unaffected and still required — a generation longer than the grace
+    is truncated either way, which is what C2's ~39 s live gate actually
+    observed. It is the quiescence wait that lets generations finish
+    BEFORE the unit stops, driven by fleetapi's inflight SSE tracking.
+    Unit `TimeoutStopSec` must exceed llama-swap's 30 s internal cap.
   - **One intent writer per invocation path, transport-distinguished**:
     TCP-arriving RPCs are fleetd-driven (fleetd writes intent after
     success, `fleetapi.SetIntent`); unix-socket ones are local (the
@@ -736,6 +782,22 @@ stand-in.
     hatch. It reuses `history.go`'s SHAPE (small window, rewrite on
     record) and deliberately not C7a's JSONL — records here are
     minutes-to-hours apart.
+  - **A cell's probe specs and announced fingerprints are FROZEN at
+    announcer start** (`modelprobe.Hooks` gets a defs slice loaded once,
+    in `daemon/announce.go` and `cli/cmd_fleet.go`). fleetd re-reads defs
+    every render pass; a cell never does. Under C0's `-watch-config` hot
+    reload a def edit therefore takes effect in llama-swap while the
+    baseline key and the announced `flags_sha256` still describe the old
+    argv — so the new configuration's samples are scored against, and
+    folded into, the OLD configuration's baseline, and a hot-applied edit
+    at the cell raises a spurious fingerprint mismatch (and, for a strict
+    def, a front-render exclusion). Restarting the announcer is the only
+    thing that rebinds either. Watched end to end on the harness
+    2026-08-05 (`scripts/fleetlab/gate-c8-l5-staleflags.sh`, C17 finding
+    1): 100 s and six announces after the edit the cell still announced
+    the old hash while fleetd logged the mismatch and dropped the def
+    from the front. **This is an open defect, not a documented
+    behaviour** — C8's L5 flag-change half FAILS.
   - `Prober.Start` returns immediately and probes on its own goroutine:
     the heartbeat is the cell's only evidence of life, and a synchronous
     probe would mark a cell stale for being slow to prove it was slow.
@@ -788,9 +850,10 @@ stand-in.
     `fleetmcp.leaseLine`) use it. `DELETE /api/fleet/lease` returns
     `existed` beside `status` so a release never claims work it did not
     do; `fleetapi.HoldLeft` is the ONE remaining-time string.
-  - **Ladder: drained > held > stale > unreachable > policy.** Every
-    rung skips, so the order decides only the reason an operator reads —
-    which is why it is written down here and in the phase doc.
+  - **Ladder: drained > held > swap-credential > stale > unreachable >
+    policy** (the credential rung added by C15). Every rung skips, so the
+    order decides only the reason an operator reads — which is why it is
+    written down here and in the phase doc.
   - **Bounded and self-expiring**: default 4h, max 24h (tighter than the
     lease store's 168h, because a hold disables a configured policy). A
     re-issue refreshes the same key. There is no unbounded hold.
@@ -1217,6 +1280,353 @@ stand-in.
   - The wake's declared warms skip a declared drain AND a C11 hold, and
     doctor's `sleep.suspend` is a WARN when the last suspend ERRORED (a
     deferred or abandoned night stays OK — that is the policy working).
+- **The llama-swap credential (fleet-control C15).** `hosts.yaml`'s
+  per-cell `swap_key_file` is the API key a cell's llama-swap demands
+  (`apiKeys:`), presented as `Authorization: Bearer`.
+  `fleetapi/swapauth.go` is the ONE authorizer and `AuthorizeSwap` is the
+  only way a request reaches a llama-swap — an AST test in `fleetapi` and
+  `fleetmcp` fails any `http.NewRequest*` in a function that does not
+  call it.
+  - **It is not `token_file`.** That authenticates the cell's vibe
+    DAEMON (drain/resume/suspend); this authenticates llama-swap's own
+    OpenAI + admin surface. The front settles it: in the reference
+    deployment it runs llama-swap and no daemon at all, so it has no
+    `token_file` to reuse — and it is the cell every warm goes through.
+  - **`apiKeys` gates everything except `/health`** (measured on v239):
+    `/v1/models`, `/running`, `/api/events`, `/api/metrics/activity`,
+    `/api/models/unload/*` and `/v1/chat/completions` all 401, and a
+    WRONG key gets 401 too (never 403). So a keyed fleet without this
+    lost not just its warms but every probe, the whole in-flight evidence
+    stream and every idle window built on it. `/health` answering is not
+    evidence that anything else will.
+  - **Three failure kinds, three fixes**: `unauthorized` (demanded, not
+    declared), `rejected` (declared, refused), `unresolvable` (declared,
+    unreadable — loud at config load, and no request is sent). They
+    surface in `fleet_status.swap_auth` and doctor's `swap.credential`.
+    The key VALUE appears nowhere: not a log, not an error, not a status
+    document, not the page (C9's webhook-URL rule).
+  - **A 401 suppresses the AUTOMATED warm producers for 5 minutes and
+    re-arms**; the warm loops are tickers, so an unguarded 401 is a
+    5,760-a-day retry loop. An operator's `warm_model` is never
+    suppressed. A 401 is still a definitive 4xx and is never queued to
+    the piggyback — routing around a broken credential hides it.
+  - **The rung is drained > held > swap-credential > evidence**, and it
+    is checked BOTH in `evalWarmTarget` and at fire time in `restore`
+    (C11's clear-`emptySince`-on-skip makes a fire-time-only check flap
+    the status row).
+  - **`fleet.front_extras` is part of the credential**: the front's
+    config is derived and rewritten on every membership transition, and
+    the renderer emits no `apiKeys`, so without the extras merge fleetd
+    deletes the key it was just given. Doctor's `front.extras` FAILs on
+    exactly that combination.
+  - **`fleet.front_extras` must RESOLVE, not merely be declared.**
+    `router.mergeExtras` maps a missing file to "no extras, no error", so
+    a typo'd path erases the front's `apiKeys` exactly as an unset
+    `front_extras` would — and the front then stops demanding a
+    credential at all, which is worse than the 401. `renderPass` refuses
+    the write while the declared file cannot be read (input-side, and
+    only when there is a non-empty front config to protect — the
+    zero-defs gate's shape), and `front.extras` is a FAIL. `render_front`
+    merges the LOOP's extras, not the CLI default, or its dry run reports
+    the operator's `apiKeys` as a deletion.
+  - **The page carries the KIND, not the sentence** (`fleet.html`'s
+    status strip): the detail names `cells.<name>.swap_key_file` and the
+    state document is guest-readable, so the sentence stays on
+    `fleet_status` and doctor. No new route — C7b's rule.
+  - **Two disclosure levels, and the split is at the source.**
+    `fleetcfg.SwapKeyError.Error()` names the PATH and belongs on the
+    token-only surfaces (the daemon log, the doctor, `/mcp`, an
+    operator's terminal); `.Public()` names only
+    `cells.<name>.swap_key_file` and the reason, and is the ONLY thing
+    that may reach `/api/fleet/state` — C12 grants that document to the
+    guest bearer, and the warm rows ride it too.
+  - **fleetd refusing to SEND is a refusal, not a failure to deliver.**
+    `definitiveWarmRefusal` covers `*swapAuthError` as well as a 4xx: an
+    unresolvable key file was untyped, so `queueWarm` piggybacked the
+    warm to the cell and executed it there — routing around the broken
+    credential on the one tick before the sticky refusal arms.
+  - **The cell-side dialers are NOT covered** (fleetannounce, modelprobe,
+    the cell's own usagemeter, C18's trial prober, `ReadOwnSwapVersion`):
+    different config surface, and a deliberate scope boundary rather than
+    an oversight. Do not invent a second credential resolver for them.
+    The hazard to know: `announceOnce` maps a `gatherModels` failure to
+    an EMPTY model list, so a keyed cell without a cell-side credential
+    announces "nothing resident" — which is what C4's warm policy reads
+    as "restore".
+- **The upgrade ritual (fleet-control C16).** The front image is
+  **digest-pinned by default**, and moving the pin is
+  `scripts/upgrade/ritual.sh` (preflight → record → canary → gate →
+  pin), never an edit. `TestReferenceFrontStackShipsADigestPin` fails if
+  the reference compose default or `.env.example` goes back to a
+  floating tag.
+  - **`front.image_pin` is declared, `versions.llama_swap` is observed,
+    and the pair is the point.** fleetd has no docker socket and must not
+    grow one, so whether the deployment is pinned can only be declared
+    (`fleet.front_image`, with `unmanaged` as the closed-vocabulary
+    declaration that the front runs no container). What catches a
+    declaration nobody applied is the observed version matrix.
+  - **`versions.llama_swap` has a producer** (C13 reported it UNKNOWN
+    naming the gap): `fleetapi.readSwapVersion` is the ONE reader —
+    `GET /api/version` — used by both producers, each cell for its own
+    llama-swap and fleetd directly for the FRONT's (the front runs no
+    announcer and is the box the incident happened to). ONE reader, TWO
+    postures: the fleetd path (`frontSwapVersion`) carries the front's
+    C15 credential and folds the status back through `NoteSwapStatus`,
+    and `ReadOwnSwapVersion` is the cell-side entry point that presents
+    none, because C15 scopes the cell-side dialers out.
+    `TestOnlyTheCellSideReaderSkipsSwapAuth` is what keeps the second
+    from becoming a way around C15's scan; the exemption fails if it
+    outlives its caller.
+  - **Absence in the matrix is NAMED, on every branch.** A front that did
+    not answer and a cell whose vibe build predates the producer are both
+    silent in a way no other check reports, so `versions.llama_swap`
+    carries them the way `defs.parity` carries `absentNote` — and the
+    front's silence goes in the Summary, because it is in no other
+    absence list.
+  - **A version with no recording is a WARN ahead of plain divergence.**
+    `fleetapi.GatedSwapVersions()`, `internal/swaptest/fixtures/` and
+    `ci.yml`'s matrix are three copies of one fact, pinned to each other
+    by two tests. Adding a recording without adding it to the other two
+    is red.
+- **`vibe model try` (fleet-control C18).** `internal/vibe/modeltry` (the
+  journal, the steps, the refusals, the derivation),
+  `internal/vibe/cli/cmd_model_try.go` (the deferral and the two
+  declarations), `profile.BackendDef.Trial`, and one exclusion in
+  `router.Render`. It adds no HTTP route, no MCP tool, no proto change,
+  no fleetd state and no dependency.
+  - **A trial def never reaches the FRONT render**, and the guard is
+    `case front && def.Trial` in `router.Render` — the one function every
+    renderer goes through (the CLI, `RenderToFile`, fleetd's presence
+    loop). On the reference fleet it is unreachable (fleetd renders from
+    its OWN def checkout, and the trial def is in the cell's); it is
+    exactly reachable on a single box where fleetd and the cell share
+    `backends/`, which is what `scripts/fleetlab` and every adopter have.
+    The exclusion is LOUD: a def that vanishes from the catalog without a
+    sentence is the bug, not the fix. `trial: true` requires `cell:` and
+    `backend.external: true` and refuses `cloud_peer`. **Promotion is
+    deleting one line** — nothing in vibe can do it, because entering the
+    fleet catalog is a change to a shared git repo with a human on it.
+  - **Applying is C14's sentence again**: a declared action deferred by
+    observation. The write is DISRUPTIVE (C0 measured it: `-watch-config`
+    reloads, the old upstream drains under a hardcoded 30 s, then
+    force-closes), so the wait is C10's `awaitCell` with `--idle` — the
+    SAME idleness notion, not a second one — and C10's "missing evidence
+    is never idleness" comes with it. `--now` is C14's `force`: about
+    tonight's conditions, never about configuration.
+  - **The derivation drops every claim on the fleet** and keeps only the
+    serving flags: `router.aliases`/`alias_owner`, the
+    `llama_server.alias` (reset to the trial's own name), `huggingface:`,
+    `mmproj`/`draft_model`/`spec_*`/`chat_template_file`,
+    `fingerprint: strict`, `lifecycle.preload`/`refresh` all go.
+    Inheriting an alias is a silent re-point of every client already
+    using it. **`estimated_vram_gb` is NOT inherited either**: it is a
+    hand-measured claim about the incumbent's weights, and copying it
+    made the resource half of the comparison equal by construction.
+  - **Two declarations, and the right one for each**: a plain C2 lease on
+    the cell (holder `model-try` — the trial is a CONSUMER) and a C11
+    HOLD on the INCUMBENT (so the warm-target restore does not reload it
+    the moment the cell looks idle and evict the candidate). The hold is
+    taken only when there is not one already; the journal records what it
+    TOOK and releases exactly that. **A declaration is journalled the
+    moment it is taken**, not when the sequence finishes — one that lived
+    only in process memory is one nothing ever releases.
+  - **`--unleased` cannot skip a C11 HOLD.** It skips the waiter's own
+    LEASE holder, and a hold is keyed on the reserved holder, so every
+    hold looks like somebody else's. C18's deferral waits with `unleased`
+    immediately before placing a hold on the incumbent, so it deadlocked
+    against its own declaration on every resume and against an operator's
+    hold from the start. `awaitConds.holdExempt` names ONE model; its
+    zero value changes nothing, so `vibe cell await --unleased` still
+    respects every hold.
+  - **The journal states name what is TRUE ON DISK** — `planned` /
+    `fetched` / `staged` / `applied` / `measured` — which is what makes a
+    killed run resumable and reversible from a later process. `Load`
+    treats a corrupt journal as an ERROR, never as "no trial". `end`
+    releases the declarations FIRST and independently of the file
+    rollback, then re-renders, falling back to a byte-exact banked copy
+    when the render fails for an unrelated reason. Weights survive unless
+    `--purge`.
+  - **An apply must never REMOVE a section of the cell's config.**
+    `mergeExtras` treats a missing extras file as "no extras, no error",
+    so a trial rendered with the wrong `--extras` silently deleted
+    `apiKeys:` (C15's credential — the cell then demands no key at all)
+    and `store:` (C7a's activity log), and the rollback's re-render
+    re-created the loss. Both the apply and `end` prove the render first
+    and refuse a write that drops a top-level key the config has today;
+    an unparseable config is a refusal, not "nothing to lose".
+  - **`--dry-run` closes only a journal IT opened.** `Plan` resumes an
+    open trial and `End` works from any state, so "close the journal Plan
+    opened" performed a full rollback of somebody's in-flight trial under
+    a flag whose whole promise is that nothing happens. The decision
+    cannot live in `End`; it is `Trial.Resumed` (never serialized) plus
+    `Runner.DiscardIfFresh`.
+  - **The trial's prober is READ-ONLY on the cell's probe state**
+    (`modelprobe.Config.ReadOnly`). That file is a whole-file rewrite
+    from memory and the cell daemon's prober owns it; a second process
+    holding it for the twenty minutes two cold loads take discards every
+    baseline sample recorded meanwhile.
+  - **Absent evidence is a refusal here too**: an unknown HuggingFace
+    size is not a small file and an unreadable filesystem is not an empty
+    one — both refuse the pull, `--skip-disk-check` is the only override,
+    and the refusals are re-evaluated on RESUME (the commonest resume of
+    all is a killed twenty-minute pull). `--idle 0` and `--min-free 0`
+    are refused rather than honoured: zero is how those flags spell
+    "unset", so honouring them silently skipped the guard.
+  - **Both sides of the catalog observation POLL.** `-watch-config`
+    notices a write on its own ~2 s cadence, so `Apply` waits for the id
+    to APPEAR and `end` waits for it to LEAVE, on the same budget.
+  - **The report states what it is not** (C7b's rule): one sample each
+    against C8's five-sample minimum, the trial measured SECOND with the
+    warmer page cache, defs-not-models, throughput-is-not-quality, and a
+    comparative ratio printed ONLY when both sides reported the same
+    metric. Cell-local by construction: `--cell` must be this box's own
+    cell, and cross-cell `try` is a phase, not a flag.
+- **Front failover (fleet-control C19).** `internal/vibe/fleetmirror`,
+  `vibe fleet mirror`, `docs/runbooks/front-failover.md`, and doctor's
+  `mirror.age` / `mirror.contents`.
+  - **There is no automatic failover and there must not be one.** An
+    automatic front promotion is the silent rerouting invariant 3
+    forbids, one layer down from a router that retries a dead cell
+    elsewhere. `fleetmirror` makes a MANUAL recovery fast; the only thing
+    it contributes to the two-boxes-answering problem is a REFUSAL
+    (`TakeoverProbe` — a TCP dial of the recorded `fleetd_url` and front
+    URL; `restore` stops if anything answers, `--force` is for the one
+    false positive where the operator already moved the address).
+  - **`vibe fleet mirror` is a HOST command on a timer, never a fleetd
+    loop.** It has to keep working when fleetd is what broke, and fleetd
+    cannot see the host paths its own state is bind-mounted from.
+    fleetd's only involvement is READING the receipt the command leaves
+    in the state dir (`paths.MirrorReceiptFile`) — no new mount, no new
+    route, no network call, and C13's injection shape unchanged.
+  - **The mirrored state table is bound to `paths.go`**
+    (`TestMirrorCoversEveryFleetStateFile`): a new `StateHome()`-rooted
+    path is either captured with a sentence saying what its loss costs,
+    or excused by name in `notFleetState`. A phase that adds a state file
+    and neither mirrors nor excuses it fails. The three cell-side files
+    (`cell-intent.json`, `cell-usage.json`, C8's `model-probe.json`) are
+    captured only as the front box's OWN copy if it happens to be a cell
+    — every other cell's live on that cell and do not die with the front.
+    C18's `ModelTrialFile` is excused by name for the same reason.
+  - **Credential values are never carried; paths are.** `hosts.yaml`'s
+    `token_file`/`swap_key_file` and `fleet.notify`'s files become
+    `references` (path, exists, mode, consequence) for the runbook to
+    fetch from the private repo. fleetd's OWN token and guest token ARE
+    carried, because they are the identity being assumed and excluding
+    them turns a recovery into a fleet-wide re-key — so the archive is
+    `0600`, the manifest sets `credentials: true`, and every surface says
+    so. `--no-secrets` is the opt-out, at the price of a re-key and a
+    re-render.
+  - **`verify` before every restore, and plan-then-write.** Modes are
+    restored rather than inherited (a `0600` token landing `0644`
+    publishes the fleet's root credential), archive paths are validated
+    against `..` and absolute forms, `extras/` is never placed
+    automatically, and an unset destination is a named skip rather than a
+    guess.
+  - **`fleet.mirror_max_age`**: unset is UNKNOWN, `unmanaged` is the
+    closed-vocabulary opt-out, over 3× is a FAIL, and a receipt stamped
+    in the FUTURE is UNKNOWN — a clock step forward would otherwise make
+    a stale mirror read as fresh forever.
+  - `scripts/fleetlab/gate-c19-drill.sh` is the one rig that deliberately
+    kills lab processes (`./lab.sh down && up` after it), and it is the
+    quarterly fire drill the runbook names. **The drill has never run on
+    metal**: a second physical box taking the front's address over a real
+    LAN is C19's L2 and is UNRUN.
+- **The invariant harness (fleet-control C20).**
+  - **`internal/vibe/observed` is where absent evidence lives.**
+    `observed.Value[T]`'s zero value is UNKNOWN; the value is unexported
+    so it cannot be read without the bit; `OrElse` is how a caller WRITES
+    DOWN what absence means. `Server.InFlight` returns one, and so do
+    `modelLastActivity` and `cellLastActivity`. Three module-wide scans
+    in that package's tests keep the old shape out — a discarded known
+    bit, a `(value, knownBit)` field pair, a `(numeric, bool)` return —
+    each with a written-reason exemption table and an inertness floor.
+    Add to the table with a reason; do not delete a scan, do not widen
+    `pairSuffixes`, do not narrow `numericResult`.
+  - **`internal/mutation` is the review step, encoded.** A registry of
+    `{name, file, find, replace, pkg, mustFail, why}`. A guard whose
+    mutation leaves every named test green is UNPROTECTED; an entry whose
+    `Find` stops matching is STALE and must be re-pointed, never deleted;
+    a mutation that does not compile proves nothing. The staleness audit
+    runs in the blocking test job (milliseconds); the runner is its own
+    CI job behind `VIBE_MUTATION_TEST=1` (~21 s warm, ~58 s cold).
+    **When a review pass mutation-verifies a guard by hand, add the
+    entry** — that is the whole point.
+  - **`internal/astscan` is the reusable "every function that does X must
+    call Y" scan.** C15's credential rule (both packages) and C4's warm
+    class rule are the instances. `MinProducers` is not optional: a rule
+    that matches nothing passes. An exemption is a function name mapped
+    to a reason, and an unused exemption is an error. A phase that adds
+    an HTTP request builder to `fleetapi`/`fleetmcp`, or a warm producer,
+    must RAISE the corresponding floor — lowering it to make a deletion
+    quiet is the failure this exists to prevent.
+  - **`internal/shelllint` covers `scripts/`**: unguarded `cd` under no
+    `set -e`, `rm -rf` on a bare `$VAR` (use `${VAR:?}` — `set -u`
+    catches unset, not empty), and `pkill` patterns with no variable in
+    them. Two exemptions, both in `gate-c15-warm-auth.sh`, both written
+    down.
+  - **`drain --wait` refuses to claim quiescence from the LOSS of the
+    in-flight report, and refuses to ACT on it either.** An unreported
+    count mid-wait never returns `waited`; a gap shorter than
+    `inflightEvidenceGrace` (5 s, ~3 reconnect attempts) is ridden out,
+    because llama-swap re-seeds a fresh `/api/events` connection with a
+    current-state snapshot inside ~200 ms and giving up on the first
+    missing tick turns a blip into the force-closed generation `--wait`
+    exists to prevent. Only a gap that outlasts the grace — or the
+    operator's own deadline expiring while the evidence is missing —
+    answers `skipped_no_inflight_data`. Both renderers say "no in-flight
+    evidence", never "the cell never reported": the status has two
+    producers and asserting either as fact sends the operator to debug
+    the wrong thing.
+- **Alias scope (fleet-control C21).** The visible-repoint alias tier is
+  **rejected** (design §9); `docs/design/fleet-control-plan/c21-alias-tier.md`
+  holds the argument, the workaround and the revisit conditions. The rule
+  the code now enforces:
+  - **Alias ownership is decided over the DECLARED def set, and an
+    exclusion removes an alias from the catalog rather than transferring
+    it.** `router.Render` resolves over `aliasClaimants(defs)` — every
+    external model def it was handed, before its own cell/trial/front
+    selection — and `fleetapi.renderPass` calls the exported
+    `router.ResolveAliases` on the full `LoadDefs` result (kept in
+    `declared` before `applyClassPolicy` and `applyFingerprints` drop
+    anything), passing the winners as `router.Options.AliasWinners`. The
+    CALL sits AFTER both overlays on purpose: its error aborts the pass,
+    and `applyFingerprints` is the only thing that evaluates C9's
+    persistent-drift set — resolving first froze that set on its last
+    value while the notify status still called the evaluator live. Both
+    sites are required: the second excludes defs the first can never see.
+    Resolving over the survivors is how a pruned roaming owner silently
+    handed `best-coder` to another cell's model — measured end to end
+    against merged `main` on real llama-swap processes, a `200 OK` from a
+    model nobody asked for, with nothing in `fleet_status` and nothing in
+    the log.
+  - **The collision error must not heal by attrition.** Two claimants and
+    no `router.alias_owner` is a render error; `renderPass` returns it
+    rather than swallowing it, so it survives one claimant leaving. The
+    error disappearing WAS the repoint. A fleet in that state has a
+    frozen front catalog until a human sets an owner — which is the loud
+    direction, and it already failed every render while both claimants
+    were present.
+  - **The declared alias IS the answer to the roaming-best-node
+    problem**: `router.aliases` + `router.alias_owner: true`, repointed
+    by moving one line in the defs repo. Do not add an automatic
+    re-resolution, a `best-*` namespace, or a per-request fallback.
+    `scripts/fleetlab/gate-c21-alias.sh` serves a real completion through
+    a declared alias and proves the departed one 404s.
+  - **An alias that leaves the catalog is named in the log**
+    (`warnOrphanedAliases`). The prune's own line names a CELL, and the
+    co-claimant's box is still up, so nothing connected "laptop pruned"
+    to "`best-coder` stopped resolving". It fires only for defs the
+    overlays dropped — the exclusions inside `Render` warn there — and
+    only when the dropped def actually WON an alias.
+  - **Carried gap, for whoever owns the next fleetd status surface: a
+    failing `renderPass` is invisible to every surface.** No field in
+    `/api/fleet/state`, nothing on the fleet page, no doctor check, no C9
+    condition — only `slog.Warn("presence-derived render failed")` inside
+    a container. Pre-existing, but C21 creates the first PERMANENT
+    instance: an unresolvable alias collision now correctly stays an
+    error instead of healing into a repoint, so the front catalog can
+    stop tracking the fleet indefinitely while `front_renders` sits still
+    and every display reads green.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.
@@ -1612,16 +2022,28 @@ planned. The short version an agent needs:
 
 ## Fleet control (node state / intent / presence, 2026-08-02+)
 
-`docs/design/fleet-control.md` is the design; the C0–C14 execution plan
+`docs/design/fleet-control.md` is the design; the C0–C21 execution plan
 lives in `docs/design/fleet-control-plan/` (one phase = one PR, each
 phase doc ends in acceptance gates that are the definition of done),
 and the ranked v2 backlog is `docs/design/fleet-control-futures.md`.
-The invariants an agent must not violate while implementing or
-touching adjacent code: the data plane (client → front → cell
-llama-swap) gains no new hop; availability is observed, intent is
-declared, model residency stays llama-swap-owned; the `DRAINED?`
-display state is never acted on; mutation goes through the daemon's
-bearer-authed control plane, never SSH-from-a-container.
+All twenty-two phases are merged. The invariants an agent must not
+violate while implementing or touching adjacent code: the data plane
+(client → front → cell llama-swap) gains no new hop; availability is
+observed, intent is declared, model residency stays llama-swap-owned;
+the `DRAINED?` display state is never acted on; mutation goes through
+the daemon's bearer-authed control plane, never SSH-from-a-container;
+and nothing re-points a catalog id that a human did not declare (C21),
+including the front's own identity (C19 — failover is manual).
+
+Two things about that plan's paperwork, because they are how it stays
+worth reading. **A gate claim is a claim about a mechanical run**, and
+the plan README's owed table names the specific physical fact each
+unrun gate lacks — "needs hardware" is not an answer, and neither is
+conflating "not attempted" with "not possible". And when a phase's
+prose and the code disagree, **the code wins, then fix the prose**: the
+SIGTERM bullet above, `noFrontRoute`'s "announce-only", and C21's alias
+resolution were each documented wrong for multiple phases before
+somebody measured.
 
 ## Things to never do
 

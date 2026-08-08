@@ -1,4 +1,4 @@
-# Fleet-control implementation plan (C0–C14)
+# Fleet-control implementation plan (C0–C21)
 
 Execution plan for [../fleet-control.md](../fleet-control.md). Each
 phase is one PR, independently shippable, and pays for itself before
@@ -14,15 +14,22 @@ to be implementable on its own after that.
 | [C4](c4-comfort.md) | Comfort: warm targets, warm schedules, the fleet page | ~300 lines | C3 (a read-only page could ship after C1; its action buttons need C2, fingerprint badges C3) | merged (#22); its 3 live gates ran, gate 4 superseded by C5 |
 | [C5](c5-land-c4.md) | Land C4: the adversarial review pass C4 never got | ~400 lines | C4 | merged (#22); unit gates green; **live gates 4 + 6 PASS** (harness, 2026-08-05) |
 | [C6](c6-substrate-repair.md) | Substrate repair: the C1–C3 findings against merged code | ~500 lines | independent of C5 | merged (#23); unit gates green; **live gates 1, 2 + 5's live half PASS** (harness) |
-| [C7a](c7a-usage-ledger.md) | The usage ledger: tokens per cell, per model, per day | ~710 lines | C4 | merged (#24); unit gates green; live halves of 3, 6, 8 **PASS**, 1, 2, 4, 5 **PARTIAL** (harness) |
+| [C7a](c7a-usage-ledger.md) | The usage ledger: tokens per cell, per model, per day | ~710 lines | C4 | merged (#24); unit gates green; live halves of 2, 3, 5, 6, 8 **PASS**, 1 and 4 PARTIAL (harness) |
 | [C7b](c7b-savings-screen.md) | The savings screen: what the fleet didn't spend | ~690 lines + ~100 KB data | C7a, C5 | merged (#25); unit gates green; live plausibility gate still UNRUN (needs a real week of priced traffic) |
-| [C8](c8-probe-model.md) | probe_model: throughput health against the model's own baseline | ~900 lines | C3, C4 | merged (#27); unit gates 1-10 green; **L1-L3 PASS** (harness, CPU models), L4-L5 unrun (wall clock) |
-| [C9](c9-fleet-notify.md) | `vibe fleet notify`: the alarm column, delivered | ~1100 lines | C2, C3, C4 | merged (#28); unit gates 1-13 green; **14b, 14c PASS** + 3 bonus gates (harness), 14a PARTIAL, 14d unrun |
-| [C10](c10-await-extensions.md) | await extensions: `--model --ready`, `--idle`, the lease handshake | ~450 lines | C1, C2, C3, C4, C6, C9, C11 | merged (#29); unit gates 1-12 green; **13b PASS**, 13a PARTIAL, 13c **VOID**, 13d unrun |
-| [C11](c11-hold-model.md) | hold_model: the pause button on the warm policy | ~450 lines | C2, C4, C5 | merged (#30); unit gates 1-11 green; **L1 + L4 PASS**, L3 PARTIAL (harness), L2 unrun |
-| [C12](c12-guest-token.md) | Guest read-only token: sharing status without sharing drain | ~250 lines | C1, C5 | PR open; feature + self-review + adversarial-review commits; unit gates 1-14 (+11b) green; **L2 PASS** (52-case sweep ×2 fleets), L1 PARTIAL (needs a browser), L3 unrun |
-| [C13](c13-doctor.md) | `vibe fleet doctor`: the sit-down-after-two-weeks audit | ~1500 lines | C1-C12 (composition) | PR open, branched off C12; unit gates U1-U16 green; **L1-L3 PASS** (harness), L4 PARTIAL (WoL needs metal) |
-| [C14](c14-sleep-schedule.md) | `sleep_schedule`: the declared night, deferred by observation | ~1100 lines | C2, C3, C4, C11 | PR open, branched off C13; feature + self-review + adversarial-review commits (4 + 7 findings); unit gates U1-U18 green; **6 live gates UNRUN — 4 of them genuinely need metal** |
+| [C8](c8-probe-model.md) | probe_model: throughput health against the model's own baseline | ~900 lines | C3, C4 | merged (#27); unit gates 1-10 green; **L1-L4 PASS** and L5's baseline half PASS (harness); **L5's flag-change half FAIL** — see C17 finding 1 |
+| [C9](c9-fleet-notify.md) | `vibe fleet notify`: the alarm column, delivered | ~1100 lines | C2, C3, C4 | merged (#28); unit gates 1-13 green; **14b-14d PASS** + 3 bonus gates (harness); 14a PASS bar the phone |
+| [C10](c10-await-extensions.md) | await extensions: `--model --ready`, `--idle`, the lease handshake | ~450 lines | C1, C2, C3, C4, C6, C9, C11 | merged (#29); unit gates 1-12 green; **13b, 13d PASS**, 13a PARTIAL, 13c **VOID** |
+| [C11](c11-hold-model.md) | hold_model: the pause button on the warm policy | ~450 lines | C2, C4, C5 | merged (#30); unit gates 1-11 green; **L1-L4 PASS** (harness) |
+| [C12](c12-guest-token.md) | Guest read-only token: sharing status without sharing drain | ~250 lines | C1, C5 | merged (#31); feature + self-review + adversarial-review commits; unit gates 1-14 (+11b) green; **L1-L3 PASS** (L1's DOM half via headless Firefox) |
+| [C13](c13-doctor.md) | `vibe fleet doctor`: the sit-down-after-two-weeks audit | ~1500 lines | C1-C12 (composition) | merged (#32); unit gates U1-U16 green; **L1-L3 + defs-parity PASS** (harness), L4 PARTIAL (WoL needs metal) |
+| [C14](c14-sleep-schedule.md) | `sleep_schedule`: the declared night, deferred by observation | ~1100 lines | C2, C3, C4, C11 | merged (#33); feature + self-review + adversarial-review commits (4 + 7 findings); unit gates U1-U18 green; **L3, L4 PASS** (harness); L1, L2, L5, L6 need metal |
+| [C15](c15-warm-auth.md) | The warm credential: a llama-swap API key fleetd can present | ~750 lines | C4, C5, C13 | merged (#38); feature + `front_extras` + adversarial-review commits; unit gates U1-U12 green (24 mutation checks); **L1 PASS** (purpose-built two-swap rig with real `apiKeys`) |
+| [C16](c16-upgrade-ritual.md) | The upgrade ritual: digest-pin the front, make the bump a sequence | ~700 lines | #37's conformance work | merged (#39); unit gates U1-U23 green; **L1-L3 PASS**, L4-L6 unrun |
+| [C17](c17-gate-closure.md) | Gate closure: run the gates that were never attempted | 0 lines (14 gate rigs) | C7a-C14 | merged (#40); 14 gate rows moved; 2 findings; 9 review findings against its own rigs |
+| [C18](c18-model-try.md) | `vibe model try`: the churn loop as one command | ~1400 lines | C0, C2, C4, C8, C10, C11, C14 (composition) | merged (#41); feature + self-review + 2nd-pass + independent-review commits (7 + 11 + 9 findings, 4 blockers); unit gates U1-U15 green, 35 predicates mutation-verified; **L1-L4 PASS** (harness, 2026-08-06), L5 needs metal |
+| [C19](c19-front-failover.md) | Front failover identity: the state that dies with the front host, and the path back | ~1400 lines | C1-C16 (composition) | merged (#42); unit gates U1-U31 green; **L1 PASS** (harness fire drill, 10.1 s recovery) and **L4 PASS**; L2 needs the fleet, L3 is wall clock |
+| [C20](c20-invariant-harness.md) | The invariant harness: the recurring defect classes, made mechanical | ~1600 lines | C1-C19 (composition) | merged (#43); unit gates U1-U15 green; **mutation harness 17/17**; no live gates by construction |
+| [C21](c21-alias-tier.md) | The visible-repoint alias tier: **rejected**, and the invisible one that already shipped | ~55 lines + 15 tests | C2, C3 | merged (#44); feature + self-review + adversarial-review commits (5 + 9 findings); unit gates U1-U15 green, 11 predicates mutation-verified; **L1 + L2 PASS** (harness, 2026-08-06, build pass — not re-run after the review commit) |
 
 C10 (await extensions) is the last of the three branches cut from
 `c9e8bcf` in parallel; C11 and then C9 landed ahead of it. None of the
@@ -57,15 +64,38 @@ it:
 - **One box is not a fleet.** No SSH, no TLS, no WoL, no suspend/resume,
   no laptop that leaves the building, no clock skew between hosts.
 
-What still genuinely needs metal, in full: a real suspend/resume cycle
-and a wattmeter (C14 L1); a magic packet on a real NIC plus the BIOS
-switch that arms it (C14 L2, L5; C13 L4's wake half); a laptop that
-physically leaves the LAN (C3 gate 1 against a real roaming box); a GPU
-under real VRAM pressure (C8 L2's spill, C10 13a's cold-start
-magnitude); a browser (C12 L1); and wall-clock duration — 24 h for
-C8 L4, a week of priced traffic for C7b's plausibility gate. Everything
-else that is still unrun is a time budget, and each phase doc says which
-of the two it is.
+What is still owed, and the physical fact each row needs. C17 rebuilt
+this list by running every gate #34 called runnable; C16, C18 and C19
+added their own. "Needs hardware" is not an answer — each row names the
+specific fact, and nothing here is a scheduling problem dressed up as a
+physical one.
+
+| gate | the physical fact it needs |
+|---|---|
+| C3 gate 1 — the roaming withdraw | A laptop that physically leaves the LAN. The lab's roaming cell is a process on the same box. |
+| C7a 1 — 24 h store soak | 24 h of wall clock, nothing else. The compressed run (1200 rows, nothing pruned, survived a restart) already proved the mechanism, and the harness can run it unattended. |
+| C7a 4 — the cancelled-stream branch | A model server that omits `timings` on an aborted stream. This llama-server build reports them anyway, so the branch needs an mlx cell — a second machine of a different architecture. |
+| C7b 9 — is the savings number believable | A week of real traffic on cells whose watts are **measured** rather than declared, priced against a real open-weight twin. The lab serves CPU bge embeddings; a synthetic `watts_idle` prices a fiction. |
+| C8 L2 — spill-induced degradation | A GPU under real VRAM pressure. #34 substituted a `SIGSTOP` duty-cycle throttle, which proves the scorer, not the cause an operator hits. |
+| C8 L4 — 24 h of scheduling | 24 h of wall clock at a 15-minute interval on two cells. The cap BOUNDARY is proven; a day of the scheduler asking is not. |
+| C8 L5 — the flag-change half | **Nothing physical. It FAILS on the harness today** — C17 finding 1, a real product defect, not an unrun gate. |
+| C9 14a — the phone half | A device with the ntfy app subscribed to the topic. The topic itself demonstrably accepts the payload. |
+| C10 13a — cold-start magnitude | A model whose ready transition takes 6–10 minutes: a 30B+ on a GPU with cold page cache. The harness model is ready in ~25 s, so the semantics are proven and the magnitude is not. |
+| C13 L4 — the fire drill | A physical box to reboot and a real NIC to receive a magic packet. `wake.configured` is a configuration check precisely because arming is not observable from here. |
+| C14 L1 — one real night | A box that actually enters S3 and returns, and a wattmeter on its cord. The schedule half is closed (L3). |
+| C14 L2 — the wake | A magic packet on a real NIC reaching a powered-off machine, and firmware that honours it. Loopback has nothing to wake. |
+| C14 L5 — the wake that fails | A BIOS switch to disarm WoL, and a night to fail across. |
+| C14 L6 — the quarterly drill | A real box to suspend and wake, end to end, from a phone. |
+| C16 L4 — the fleetlab half of `canary` | **Not hardware.** `scripts/fleetlab` binds fixed ports, so two lab instances cannot coexist on one box — which the parallel-agent workflow now hits routinely. Futures item 15. |
+| C16 L5 — `ritual.sh gate` | A time budget (~15 min at `DELAY_S=90`, ~45 at 420) plus two manual clients. |
+| C16 L6 — the pin on the real front | The fleet: the pinned image pulled onto the front host, doctor reporting one version across it. |
+| C18 L5 — the magnitude gate | A real GPU, a real 20 GB pull, a real cold start on both sides, and a report a human agrees with. This phase's whole output is a magnitude. |
+| C19 L2 — the failover drill on metal | A second physical box taking the front's address, over a real LAN, with a real DNS change and cells re-announcing across it. |
+| C19 L3 — the nightly mirror | A real off-host destination (NFS/CIFS) over a week of timer runs, watching `mirror.age` move OK → WARN when the timer stops. Wall clock, not hardware. |
+
+Everything else that is still unrun is a time budget, and each phase doc
+says which of the two it is. Two rows are neither: **C8 L5 fails**, and
+**C16 L4 is blocked by this repo's own harness**.
 
 Line counts are order-of-magnitude scoping signals, not budgets. Actual
 C0–C4 spend ran 3.6–4.5× the estimate in every phase; price that in.
@@ -198,6 +228,150 @@ structural refusals, so it could take the front down), and an alarm that
 paged about an opportunistic cell being switched off — the same
 class-table violation C9 shipped, here on a nightly cadence.
 
+C15 (2026-08-05) closes the defect C5 recorded and could not fix: the
+warm path sent no credential, so a front configured with llama-swap's
+`apiKeys` failed every warm with a 401. Measuring a real v239 first
+showed the note understated it — `/health` is the only exempt route, so
+such a fleet also lost every probe, the whole `/api/events` stream and
+every idle window built on it, the catalog check, `unload_model` and the
+cloud-spend tail; only the announce path survived, because cells dial
+out. Two rules it carries forward. **A 401 stops the automated
+producers, it does not feed them** — the warm loops are tickers, so an
+unguarded credential failure is 5,760 identical 401s a day, and the
+suppression is sticky, self-clearing and re-arming rather than a
+restart-to-recover flag. And **a credential the control plane erases is
+not a credential**: the front's config is a derived artifact fleetd
+rewrites on every membership transition, so `fleet.front_extras` (the
+operator-owned half of that file) shipped with the key rather than after
+it. Its self-review found this plan's most repeated defect inside the
+phase written to fix it — an eighth producer, in `cli` rather than
+fleetd, where the enforcing AST scan could not see it.
+
+C16 (2026-08-05) is backlog item 13, and it is the first phase whose
+subject is the repo's own discipline rather than the fleet's state. Its
+one carried rule is that **a defence that lives in upstream behaviour is
+only as durable as the pin under it**: the SSE keepalive and SIGTERM's
+stream grace are things llama-swap *does*, not things this repo owns,
+and a floating tag on the front turned "we verified this" into "we
+verified this once". Two corollaries worth keeping. **The declared and
+the observed halves are both required** — fleetd cannot see the front's
+image and a config value cannot see the running version, so
+`front.image_pin` and `versions.llama_swap` are a pair, and either alone
+reads as an answer. And **the mid-state is the normal state**: old
+recordings are kept rather than replaced and CI replays every one,
+because a fleet spends most of an upgrade with two llama-swap versions
+in it. The motivating incident is worth remembering by name — a floating
+`:cpu` tag had moved the fleet onto v247, whose in-flight wire change
+silently disarmed eight busy guards.
+
+C17 (2026-08-05) ships no Go code. It committed fourteen gate rigs and
+ran them, closing the "never attempted" gates the eleven phase docs
+above had left as prose, and it produced two findings a green suite
+never would: a cell's probe specs and announced fingerprints are frozen
+at announcer start (C8 L5's flag-change half, which now **fails** rather
+than being unrun), and the probe-traffic envelope is off by 3x. Its
+adversarial pass then found the joke telling itself — **six of C17's own
+evidence lines could not produce evidence**, printing `null`, `0` or
+`"none"` under a heading promising a measurement, with three flipped
+gate rows citing one of them. That is why G7 ("every evidence line in
+every rig can produce evidence") exists as a standing gate, and why the
+plan's standing sentence is now **running the rig is not the same as
+reading it**.
+
+C18 (2026-08-05) is backlog item 14, the only Large-tier entry, and it
+is the second phase after C14 to be built entirely around one sentence:
+**a declared action deferred by observation is clean; observed idleness
+initiating action is rejected.** Applying a def edit rewrites a cell's
+llama-swap config, which `-watch-config` reloads — evicting every
+resident model and truncating any generation still running at 30 s — so
+the apply had to be deferred, and the deferral reuses C10's
+`awaitCell --idle` rather than inventing a second notion of idle. Three
+rules it carries forward. **Promotion is deleting one line**: a trial
+def is marked `trial: true`, `router.Render` excludes those from the
+FRONT render, and nothing in vibe can promote one, because entering the
+fleet catalog is a change to a shared git repo with a human on it. **The
+incumbent def is the better family template** — a family template
+encodes what a model family wants, the incumbent encodes what THIS GPU
+and THIS build want, and the second list is what decides whether the
+candidate loads, which is why one flag (`--like`) supplies both the
+template and the comparison. And **the journal states name what is true
+on disk**, which is what makes a killed run resumable and, more
+importantly, reversible from a later process. Its honest boundary is
+that `--cell` must name the box you are on: every step writes a file
+where the model will run, fleetd is read-and-request-only, and
+cross-cell `try` is a phase rather than a flag. Its adversarial pass
+found the phase's own composition biting back twice: the self-review's
+two fixes met each other and turned `--dry-run` into a silent full
+rollback of an in-flight trial, and `Measure` made a short-lived second
+writer of C8's cell-side probe file, whose whole-file rewrite discards
+every baseline sample the cell daemon recorded while a trial runs. Both
+are the same shape — a component that was correct alone acquiring a
+second caller. The independent pass's two blockers are worth carrying:
+`--unleased` cannot skip a C11 HOLD (it only skips its own lease
+holder), so C18's deferral stood in front of a hold C18 was itself about
+to place and deadlocked on every resume; and `router.Render`'s extras
+merge treats a missing extras file as "no extras, no error", so an apply
+rendered with the wrong extras path silently DELETED the cell's
+`apiKeys:` and `store:` sections and the rollback re-created the loss.
+Two of the nine findings — including that one — were invisible until
+`gate-c18.sh` was executed, and executing the rig as committed is what
+showed that L1 and L4 had been measuring a file the command never wrote.
+
+C19 (2026-08-05) is backlog item 12, and it is the first phase whose
+subject is the fleet's own death. Its one carried rule is that **"don't
+build HA" is an invariant, not a budget decision** — an automatic front
+promotion is the silent rerouting invariant 3 forbids, so the code's
+entire contribution to two-boxes-answering is a refusal a human can
+override. Two corollaries. **The backup cannot live in the thing it
+backs up**: the mirror is a host command on a timer because it must
+survive fleetd, and fleetd's only role is reading the receipt. And
+**enumerating the state was the work** — the table is bound to
+`paths.go` by a test, and producing it corrected a standing assumption:
+C8's probe baselines and the C7a cursor are cell-side and survive the
+front, while the ledger, the intent store and the rendered front config
+do not.
+
+C20 (2026-08-06) is the first phase whose subject is the plan's own
+process. Its premise is that ground rule 9 works and does not scale —
+39+ real defects, four blockers, all in green code, and **the same
+classes every time**. Four rules it carries forward. **Removing a shape
+beats detecting it**: `observed.Value[T]`'s zero value is UNKNOWN and
+its value is unexported, so class 1 stops being writable on the
+in-flight path, and the migration immediately found a live defect three
+review passes had read past (`drain --wait` reporting the loss of its
+evidence as quiescence). **A mutation table is data, not prose**:
+`internal/mutation` runs the `| mutation | red |` tables the addenda
+already carry, with an UNPROTECTED verdict when nothing fails and a
+STALE verdict when the pattern stops matching, so a refactor cannot
+silently retire coverage. **A structural scan needs a floor**:
+`MinProducers` and the unused-exemption error are what stop the next
+rename turning a guard into decoration, and C15's hand-rolled
+`found == 0` was too weak. And **the checks are proven both ways** —
+each one has a planted violation observed red and an assertion that
+fails when its own target is empty, which is ground rule 10 applied to a
+phase whose entire deliverable is tests.
+
+C21 (2026-08-06) is backlog item 10, and it is the plan's first phase
+whose deliverable is a **decision**: the visible-repoint alias tier is
+REJECTED, with the workaround written down and the revisit conditions
+named. Two things it carries forward. **Visibility is not a property of
+a mechanism, it is a property of who reads it** — the alias tier's
+defence was that the resolution is shown and evented, and every one of
+those surfaces is read by the operator, who already knows the laptop
+left, while the consumer's only channels are `/v1/models` (which names
+the peer, not the model) and a completion response whose `model` field
+is endpoint-dependent; making it honest to the consumer means rewriting
+responses at the front, which is invariant 1. And **enumerate the
+feature's states before arguing about it**: two of the alias tier's
+three states are byte-identical to what ships, and the whole delta is
+the one state that answers `200 OK` from a model nobody asked for.
+Writing the test that pinned the rejection then found that the feature
+had **already shipped invisibly** since C3 — alias ownership resolved
+over the defs that survived the roaming prune, so a departing owner
+handed its alias to a co-claimant on another cell — which is also the
+phase's answer to "is a loud event enough": the prune logs a loud line
+at exactly the right instant, and this went unnoticed for five phases.
+
 A **post-merge reconciliation PR** (#26, 2026-08-03) closed the three
 items no single phase branch could reach, because each needed code from
 two branches at once: C6's MIN-G producer finished for
@@ -205,6 +379,23 @@ two branches at once: C6's MIN-G producer finished for
 loops were C4 files absent from its branch), C6's NIT-D (a debug
 `t.Logf` in a C4 test C6 correctly refused to touch), and this table's
 own status truth. It adds no new phase scope.
+
+A **reconciliation pass** (C22, 2026-08-06) is the same idea applied to
+a different failure. This file, `AGENTS.md` and
+[../fleet-control.md](../fleet-control.md) are the plan's conflict axis:
+nearly every phase touches all three, and every merge conflict the plan
+has produced landed in one of them. So C15 through C21 were **forbidden
+from editing them** and each wrote a "For the reconciliation pass"
+section into its own phase doc instead, stating exactly what belonged in
+each shared file; C22 applies all seven in one pass. It changes no code,
+and its own
+gate is ground rule 8: every claim it carried over was checked against
+the tree before it was written down, and four phases' drafted text
+understated their own gate counts (C15 U11→U12, C16 U10→U23, C19
+U17→U31 plus an unmentioned L4 PASS, C20's mutation harness 16→17). The
+pattern is worth naming, because it will recur: **a reconciliation
+section written mid-phase describes the phase as it stood at the time of
+writing, not as it merged.** Read it as a draft, not as a record.
 
 ## Ground rules for the implementing agent
 
@@ -272,3 +463,14 @@ own status truth. It adds no new phase scope.
     body only exercised `Stale` let a missing drained-skip pass a gate
     reported PASS, then propagated the same false claim into three
     other documents. Name tests for what the body proves.
+
+    *Amended 2026-08-06 (C17, applied by C22).* **"Not attempted" and
+    "not possible" are different statuses and must never share a
+    heading.** This plan has written the conflated version twice — #34,
+    and the eleven phase docs #34 itself corrected — each time turning a
+    gate nobody had tried into a gate nobody could try. The owed table
+    above is the corrected shape: a row names the specific physical fact
+    it lacks, or it says the work is a time budget, or it admits the
+    gate FAILS. A gate rig is itself a test, so the naming half of this
+    rule binds it too: an evidence line that cannot move is a column
+    asserting less than its heading claims (C17's G7).
