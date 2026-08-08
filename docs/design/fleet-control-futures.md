@@ -110,7 +110,12 @@ Small (days):
    makes the record structurally incapable of producing a command, in
    both directions: the start half retires a stop record and **only** a
    stop record, so it can neither clear a human's declared reclaim nor
-   store a serving request. **A recorded stop explains nothing**: a crash
+   store a serving request. **The hook's wire verbs are STATES**
+   (`unit_stopped` / `unit_started`) rather than that reason on
+   `drained`/`serving`, because a pre-C24 front does not know the reason
+   and would record — and then hand back — an ordinary drain request;
+   an unknown state is a 400 on every build, so skew degrades to doing
+   nothing. **A recorded stop explains nothing**: a crash
    fires the same `ExecStopPost` as `systemctl stop`, so an `always_on`
    cell still alarms and `vibe fleet doctor` still calls the stop
    undeclared — the record adds the *when*, never the *why*, and every

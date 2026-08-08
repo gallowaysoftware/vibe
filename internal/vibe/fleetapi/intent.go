@@ -68,6 +68,32 @@ func IsStopRecord(in *Intent) bool {
 	return in != nil && in.State == "drained" && in.Reason == StopIntentReason
 }
 
+// The two request-only states a cell unit's hook posts (C24). They are
+// spelled as STATES rather than as the reserved reason on `drained` /
+// `serving` for one reason: version skew.
+//
+// A pre-C24 fleetd does not know the reserved reason. Handed
+// `{"state":"drained","reason":"stopped out of band"}` it records an
+// ordinary drained REQUEST — which it then hands to the announcing cell
+// as desired_intent, where reconcile runs cell_cmds.drain. The hook
+// would stop the serving stack of a box that had just come back, and
+// nothing about the deployment would look wrong. The same skew turns the
+// start half into a cell_cmds.resume.
+//
+// An unknown STATE, by contrast, is a 400 on every build this endpoint
+// has ever had ("state must be drained or serving"), and the hook treats
+// a 400 the way it treats every other failure: record nothing, say why,
+// leave the axis UNKNOWN. So the drop-in installed against an old front
+// degrades to doing nothing instead of to actuating.
+//
+// The same property covers a typo in the hook: a misspelled state is
+// refused, where a misspelled reason would have recorded a
+// human-looking drain that all four rules below let through.
+const (
+	IntentStateUnitStopped = "unit_stopped"
+	IntentStateUnitStarted = "unit_started"
+)
+
 // handleIntent sets or clears one cell's declared intent. Unknown cells
 // and unknown states are 400s — a typo'd cell name must fail loudly, not
 // record intent for a cell that doesn't exist.
@@ -77,8 +103,18 @@ func (s *Server) handleIntent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
-	if req.State != "drained" && req.State != "serving" {
-		http.Error(w, `state must be "drained" or "serving"`, http.StatusBadRequest)
+	switch req.State {
+	case IntentStateUnitStopped:
+		// The unit knows two things — that it stopped, and when. It is
+		// given no way to say anything else: reason and ETA from the wire
+		// are dropped rather than merged, so a hook cannot dress a stop up
+		// as a declaration.
+		req.State, req.Reason, req.ETA = "drained", StopIntentReason, ""
+	case IntentStateUnitStarted:
+		req.State, req.Reason, req.ETA = "serving", StopIntentReason, ""
+	case "drained", "serving":
+	default:
+		http.Error(w, `state must be "drained", "serving", "unit_stopped" or "unit_started"`, http.StatusBadRequest)
 		return
 	}
 	in, err := s.SetIntent(req.Cell, req.State, req.Reason, req.ETA)
@@ -199,6 +235,30 @@ func (s *Server) SetIntentAt(cell, state, reason, eta string, since time.Time) (
 			delete(next, cell)
 		}
 	case "drained":
+		if reason == StopIntentReason {
+			// C24: a stop record never overwrites an existing declaration.
+			// The unit knows the stack is down; whoever wrote the entry
+			// that is already there knew WHY, and that is strictly more.
+			//
+			// The case that forced this is C14's: a scheduled suspend
+			// records {drained, "asleep per sleep_schedule", eta 07:15}
+			// and THEN takes the box down — through the same unit stop,
+			// which fires this hook. Without the guard the fleet forgets
+			// it put the box to sleep, `vibe fleet doctor` calls the night
+			// undeclared, and the wake's clear-first ordering has a
+			// different record to clear than the one it wrote. A human's
+			// `--reason gaming` is the same shape.
+			//
+			// A stop record MAY replace a stop record: that is the unit
+			// updating its own note, which is the only entry it owns. It
+			// may also replace a pending SERVING request, which carries no
+			// why and is a resume the stopped box will never ack — the
+			// same judgement pruneStaleServingRequest already makes.
+			if cur, had := next[cell]; had && cur.State == "drained" && !IsStopRecord(&cur) {
+				c := cur
+				return &c, nil
+			}
+		}
 		in := Intent{State: "drained", Reason: reason, ETA: eta, Since: since}
 		next[cell] = in
 		stored = &in

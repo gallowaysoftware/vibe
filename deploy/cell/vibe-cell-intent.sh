@@ -26,15 +26,6 @@
 
 set -u
 
-# The reserved reason. It MUST match fleetapi.StopIntentReason byte for
-# byte: fleetd keys four behaviours on it — the record is never handed
-# back as a command, it loses to the cell's own drained echo, it is never
-# counted as an unacked request, and it never explains an absence to the
-# always_on alarm. A typo here does not fail loudly; it records an
-# ordinary human-looking drain that silences the alarm for a crash.
-# internal/vibe/cli's C24 gate pins the two strings together.
-VIBE_STOP_REASON='stopped out of band'
-
 say() { echo "vibe-cell-intent: $*" >&2; }
 
 # give_up is the only failure path there is. The axis keeps whatever it
@@ -46,9 +37,16 @@ give_up() {
 	exit 0
 }
 
+# The two verbs are STATES, not a reason on drained/serving, and that is
+# the version-skew guard: a pre-C24 fleetd answers an unknown state with
+# HTTP 400, which lands in give_up — record nothing, say why. Spelled as
+# a reason instead, an old fleetd would record an ordinary drained
+# REQUEST and hand it back to this cell as a command to drain itself.
+# fleetapi.IntentStateUnitStopped / IntentStateUnitStarted; the C24 gate
+# pins these strings to those constants.
 case "${1:-}" in
 stopped)
-	state=drained
+	state=unit_stopped
 	# systemd hands the stop's outcome to ExecStopPost. It is worth a
 	# journal line and it is NOT worth recording: "exit-code" and
 	# "success" are the same fact on this axis — the stack is down —
@@ -61,7 +59,7 @@ started)
 	# nothing else: fleetd leaves a human's declared drain exactly where
 	# it is, so starting the unit inside a declared reclaim does not
 	# quietly cancel the reclaim.
-	state=serving
+	state=unit_started
 	;;
 *)
 	give_up "usage: ${0##*/} stopped|started"
@@ -89,6 +87,9 @@ esac
 [ "$timeout" -le 30 ] || give_up "VIBE_INTENT_TIMEOUT=$timeout exceeds the 30s ceiling: this runs inside the unit's stop, and a hook that outlives TimeoutStopSec is a shutdown that hangs"
 
 command -v curl >/dev/null 2>&1 || give_up "curl is not installed"
+# -f as well as -r: `read` from a FIFO or a character device is an
+# unbounded wait, and this runs inside the unit's stop sequence.
+[ -f "$token_file" ] || give_up "token file $token_file is not a regular file"
 [ -r "$token_file" ] || give_up "token file $token_file is unreadable"
 
 token=''
@@ -104,17 +105,26 @@ code=$(
 		--connect-timeout 1 --max-time "$timeout" \
 		--header 'Content-Type: application/json' \
 		--header "Authorization: Bearer $token" \
-		--data "{\"cell\":\"$cell\",\"state\":\"$state\",\"reason\":\"$VIBE_STOP_REASON\"}" \
+		--data "{\"cell\":\"$cell\",\"state\":\"$state\"}" \
 		"${url%/}/api/fleet/intent"
 ) || give_up "fleetd at ${url%/} is unreachable or slower than the ${timeout}s bound (curl said why, one line up)"
 
 case "$code" in
 200)
-	if [ "$state" = drained ]; then
-		say "recorded: $cell stopped out of band (fleetd shows DRAINED, with no declared reason)"
+	if [ "$state" = unit_stopped ]; then
+		# Deliberately hedged: fleetd keeps an existing declaration (a
+		# human's drain, C14's scheduled sleep) rather than letting the
+		# unit overwrite a reason with none.
+		say "recorded: $cell stopped; unless something had already declared why, the fleet now shows DRAINED with no reason"
 	else
-		say "recorded: $cell started; any stop record for it is retired"
+		say "recorded: $cell started; fleetd retired its stop record if it held one — a declared drain, if one is in force, is untouched"
 	fi
+	;;
+400)
+	# The two shapes: a cell name fleetd has never heard of, and a fleetd
+	# older than the unit_* verbs. Both are configuration, both are
+	# fixed by a human, and neither is worth a retry.
+	give_up "fleetd rejected the record (HTTP 400): either $cell is not a cell in its hosts.yaml, or the front predates the unit_stopped/unit_started verbs and this hook does nothing until it is upgraded"
 	;;
 *)
 	give_up "fleetd answered HTTP $code"

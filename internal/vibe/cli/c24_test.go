@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -426,18 +427,67 @@ func TestC24HookRefusesAnUnrecordableCell(t *testing.T) {
 	}
 }
 
-// TestC24ReservedReasonMatchesTheScript pins the one string that spans
-// two languages. A typo does not fail loudly: it records an ordinary
-// human-looking drain, which silences the always_on alarm for a crash
-// and hands the cell a drain command on its next heartbeat.
-func TestC24ReservedReasonMatchesTheScript(t *testing.T) {
+// TestC24VersionedVerbsMatchTheScript pins the two strings that span
+// two languages. They are the whole version-skew guard: an unknown state
+// is a 400 on every build of this endpoint, where an unknown REASON on a
+// known state is silently recorded as a human-looking drain — which an
+// old fleetd then hands back to the cell as a command to drain itself.
+func TestC24VersionedVerbsMatchTheScript(t *testing.T) {
 	b, err := os.ReadFile(c24Deploy(t, "vibe-cell-intent.sh"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "VIBE_STOP_REASON='" + fleetapi.StopIntentReason + "'"
-	if !strings.Contains(string(b), want) {
-		t.Errorf("deploy/cell/vibe-cell-intent.sh does not carry %s — fleetapi.StopIntentReason and the hook's reason must be byte-identical", want)
+	script := string(b)
+	for _, want := range []string{
+		"state=" + fleetapi.IntentStateUnitStopped,
+		"state=" + fleetapi.IntentStateUnitStarted,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("deploy/cell/vibe-cell-intent.sh does not carry `%s`; the hook and fleetapi must agree byte for byte", want)
+		}
+	}
+	// The reason is fleetd's to write. A hook that sends one is a hook
+	// that can dress a stop up as a declaration.
+	if strings.Contains(script, fleetapi.StopIntentReason) {
+		t.Errorf("the hook sends the reserved reason itself; it must send only the versioned state and let fleetd stamp the reason")
+	}
+}
+
+// TestC24HookAgainstAPreC24Fleetd is the skew gate. An old front does
+// not know the unit_* verbs and answers 400 — the hook must treat that
+// as every other failure (record nothing, exit 0) and must say what a
+// 400 means, because the fix is a human upgrading the front.
+func TestC24HookAgainstAPreC24Fleetd(t *testing.T) {
+	var bodies []string
+	var mu sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+		mu.Lock()
+		bodies = append(bodies, string(b))
+		mu.Unlock()
+		// Verbatim from the pre-C24 handler.
+		http.Error(w, `state must be "drained" or "serving"`, http.StatusBadRequest)
+	}))
+	t.Cleanup(ts.Close)
+
+	for _, arg := range []string{"stopped", "started"} {
+		stderr, code, _ := c24RunHook(t, c24HookEnv(t, ts.URL, "gpu-cell"), arg)
+		if code != 0 {
+			t.Errorf("%s: exit %d, want 0", arg, code)
+		}
+		if !strings.Contains(stderr, "NOT recorded") || !strings.Contains(stderr, "predates") {
+			t.Errorf("%s: stderr = %q, want a give-up that names the skew", arg, stderr)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("bodies = %v, want one request per verb", bodies)
+	}
+	for _, b := range bodies {
+		if !strings.Contains(b, `"state":"unit_`) {
+			t.Errorf("body %q does not use a versioned state, so an old fleetd would have ACCEPTED it", b)
+		}
 	}
 }
 

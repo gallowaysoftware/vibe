@@ -57,6 +57,14 @@ that gets removed from the launch options after one Friday night. What
 was stranded is still printed in the pre-drain report, which for Steam
 lands in the launcher log.
 
+**If the drain FAILS, the command does not run.** That is `vibe cell
+drain --until-exit`'s own semantic and the wrapper does not soften it: a
+wrapper that launched the game anyway would silently stop declaring, on
+exactly the box where nobody would notice for months. The failure is
+loud where a human can see it — run the same line in a terminal to read
+the error. The usual causes are `cell_cmds.drain` unset in this box's
+`config.yaml` (it is not a cell yet) and a drain command that fails.
+
 ## 2. The recorded path: `vibe-cell-intent.sh` + a unit drop-in
 
 ```sh
@@ -71,14 +79,28 @@ The drop-in belongs on **whatever unit `cell_cmds.drain` stops** — the
 serving stack, not the vibe daemon. `ExecStopPost` records the stop,
 `ExecStartPost` retires that record when the stack comes back.
 
-What it writes, exactly, on a stop:
+What it writes, exactly, on a stop — one POST to `/api/fleet/intent`:
 
 ```json
-{"cell":"gpu-cell","state":"drained","reason":"stopped out of band"}
+{"cell":"gpu-cell","state":"unit_stopped"}
 ```
 
-That reason is **reserved**. fleetd keys four behaviours on it, and each
-one is the difference between a record and a trigger:
+and `{"cell":"gpu-cell","state":"unit_started"}` when the stack comes
+back. The unit sends **no reason and no ETA**: it knows that it stopped
+and when, and a hook that could send a reason could dress a stop up as a
+declaration. fleetd stamps the reserved reason `stopped out of band`
+itself.
+
+**These two verbs need fleetd ≥ C24, and that is deliberate.** An older
+front answers an unknown state with `HTTP 400`, which the hook treats
+like every other failure: record nothing, say why, exit 0. Spelled as a
+*reason* on `drained` instead, an old front would have recorded an
+ordinary drain REQUEST — and handed it back to this cell on its next
+heartbeat as an instruction to drain itself. Version skew must degrade
+to doing nothing, never to actuating.
+
+The reason fleetd stamps is **reserved**, and it keys four behaviours,
+each of which is the difference between a record and a trigger:
 
 1. it is **never handed back to the cell** as `desired_intent`. Without
    this, the next heartbeat after the box comes back carries the record
@@ -95,6 +117,14 @@ one is the difference between a record and a trigger:
    and `vibe fleet doctor` still names the stop as undeclared. The record
    adds the *when*; the *why* is still missing, and every surface that
    cares about the why behaves as it did before.
+
+And one rule on the way in: **a stop record never overwrites an existing
+declaration.** If the cell is already drained for a reason — a human's
+`--reason gaming`, a `sleep_schedule` suspend that is about to take the
+box down through this very unit — that entry stays, because it knows the
+why and the unit does not. The hook's journal line is hedged for exactly
+this reason. A stop record may replace a stop record: that is the unit
+updating the one entry it owns.
 
 ### When it cannot reach fleetd
 

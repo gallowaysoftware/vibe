@@ -1,7 +1,10 @@
 # C24 — drain where reclaim happens
 
 Status: **PR OPEN**, off `c24-drain-where-reclaim-happens` branched from
-`main` at `cb8b336`. Backlog item 5
+`main` at `cb8b336`. Two commits: the packaging + the rules it needs to
+be safe, and ground rule 9's adversarial self-review (§8b — five
+findings, all fixed, two of them the phase's own headline defect reached
+by routes the feature commit had not looked at). Backlog item 5
 ([fleet-control-futures.md](../fleet-control-futures.md) §2):
 
 > **Drain where reclaim happens** — a documented Steam launch-option /
@@ -114,6 +117,7 @@ declaration must not get:
 | 2 | loses to the cell's own **drained echo** | `announce.go` | the wrapper's declared drain being restamped "stopped out of band" — a drained echo is only ever produced by a declared drain at the box, and the box outranks the record |
 | 3 | never counts as pending | `presence.go` | "requested, awaiting cell ack" for a stop nobody requested, and `intent.hygiene` yellow every night the box is off (C14's permanent-WARN shape) |
 | 4 | does not explain an absence | `notify.go`, `doctor.go` | a crash-stopped `always_on` cell silencing its own alarm — `systemctl stop` and a crash fire the same `ExecStopPost` |
+| 5 | never overwrites an existing declaration | `intent.go` | the C14 case: a scheduled suspend records `{drained, "asleep per sleep_schedule", eta 07:15}` and then takes the box down *through this unit stop*. Added by the self-review (§8b R-5) |
 
 Rule 4 is the one to argue with, so: the record adds the WHEN and the
 WHAT. The WHY is still missing, and a fleet whose heavy cell just died
@@ -147,10 +151,24 @@ directions or in neither.
 On a stop, one bounded POST to `/api/fleet/intent`:
 
 ```json
-{"cell":"gpu-cell","state":"drained","reason":"stopped out of band"}
+{"cell":"gpu-cell","state":"unit_stopped"}
 ```
 
-On a start, the same with `"state":"serving"`.
+On a start, `{"cell":"gpu-cell","state":"unit_started"}`. The unit sends
+no reason and no ETA — it knows that it stopped and when, and a hook
+that could send a reason could dress a stop up as a declaration. fleetd
+stamps `StopIntentReason` itself and drops anything else the wire
+carried.
+
+**The verbs are states, not a reason on `drained`/`serving`, and that is
+the version-skew guard** (found by the self-review, §8b R-1). A pre-C24
+fleetd handed `{"state":"drained","reason":"stopped out of band"}`
+records an ordinary drained REQUEST — §3, live, against a front that is
+one release behind. An unknown *state* is a 400 on every build this
+endpoint has ever had, and a 400 lands in the hook's give-up path. The
+same property makes a typo in the hook harmless: a misspelled state is
+refused, where a misspelled reason would have recorded a human-looking
+drain that all four rules let through.
 
 **When it cannot reach fleetd it writes nothing at all.** No file, no
 retry, no cached value, no "serving". The intent store keeps whatever it
@@ -232,7 +250,8 @@ record, which is the intended shape.
 - `deploy/cell/llama-swap.service.d/50-vibe-intent.conf` — the drop-in.
 - `deploy/cell/vibe-reclaim.desktop` — the shortcut form.
 - `internal/vibe/fleetapi/intent.go` — `StopIntentReason`,
-  `IsStopRecord`, the start half's conditional retire.
+  `IsStopRecord`, the `unit_stopped` / `unit_started` wire verbs, the
+  fill-if-absent rule and the start half's conditional retire.
 - `internal/vibe/fleetapi/announce.go` — rules 1 and 2.
 - `internal/vibe/fleetapi/presence.go` — rule 3.
 - `internal/vibe/fleetapi/notify.go`, `doctor.go` — rule 4.
@@ -259,7 +278,9 @@ record, which is the intended shape.
 | a crash still alarms | `TestC24StopRecordDoesNotSilenceTheAlwaysOnAlarm` | 6 cases incl. the declared-drain suppression that must survive |
 | the doctor still calls it undeclared | `TestC24DoctorStillCallsTheStopUndeclared` | the sit-down command does not get quieter |
 | the fragment stays installable | `TestC24UnitFragmentIsInstallable` | `-` prefixes, both halves, env, `TimeoutStopSec ≥ 33`, no `Restart=`/`OnFailure=` |
-| the cross-language constant | `TestC24ReservedReasonMatchesTheScript` | the script's reason is byte-identical to `fleetapi.StopIntentReason` |
+| the cross-language constants | `TestC24VersionedVerbsMatchTheScript` | the script's states are byte-identical to `fleetapi.IntentStateUnitStopped/Started`, and it sends no reason of its own |
+| version skew degrades to nothing | `TestC24HookAgainstAPreC24Fleetd`, `TestC24VersionedVerbsAreTheWireContract` | a pre-C24 400 records nothing and names the skew; an unknown state is still a 400 |
+| a stop record never overwrites a declaration | `TestC24StopRecordNeverOverwritesADeclaration` | C14's sleep record and a human's `gaming` both survive; the unit may refresh its own note |
 | the scripts pass the shell linter | `TestScriptsAreSafe` (C20/C21) | the walk covers `deploy/` |
 
 Mutation-checked rather than assumed:
@@ -290,6 +311,67 @@ with the specific fact it lacks. None of them is "not possible".
 (0 issues), plus `go test -race -count=5` on `internal/vibe/fleetapi`
 and `internal/vibe/cli`.
 
+## 8b. Adversarial self-review addendum (ground rule 9)
+
+Five findings, all fixed in the review commit. Two of them are the same
+class the phase was written to close — a record that can become a
+command — reached by routes the feature commit did not look at.
+
+**R-1 (blocker-shaped). Version skew turned the hook back into an
+actuator.** The feature commit's hook posted
+`{"state":"drained","reason":"stopped out of band"}`. A **pre-C24
+fleetd** does not know the reserved reason: it records an ordinary
+drained request, hands it to the announcing cell as `desired_intent`,
+and the cell runs `cell_cmds.drain` — §3, live, on any fleet where the
+drop-in reached a cell before the front was upgraded. The start half was
+the same defect with `cell_cmds.resume`. The whole rule set was
+inside-the-new-build reasoning about a wire two builds share.
+
+*Fix:* the hook posts a **state**, `unit_stopped` / `unit_started`, which
+every build of this endpoint that predates C24 answers with `400 state
+must be "drained" or "serving"`. The reserved reason stays as the
+internal marker; the wire carries a verb whose failure mode is refusal.
+Gated by `TestC24HookAgainstAPreC24Fleetd` (a server replying with the
+old handler's exact 400) and `TestC24VersionedVerbsAreTheWireContract`.
+A second, unlooked-for benefit: it demotes the cross-language string pin
+from silent-and-dangerous to loud — a typo in the state is a 400, a typo
+in the reason would have been an ordinary drain.
+
+**R-5 (blocker-shaped). A stop record clobbered C14's sleep record.** A
+scheduled suspend writes `{drained, "asleep per sleep_schedule", eta
+07:15}` and *then* takes the box down — through the same unit stop that
+fires this hook. The hook's write landed second, so every scheduled
+night ended with the fleet having forgotten it put the box to sleep:
+"asleep per sleep_schedule, eta 07:15" became "stopped out of band", the
+doctor called the night undeclared, and the wake's clear-first ordering
+had a different record to clear than the one it wrote. The same shape
+applied to a human's `--reason gaming` on a non-announcing cell.
+
+*Fix:* a stop record is a fill-if-absent write. It never overwrites an
+entry that carries a why; it may replace its own note (the timestamp is
+the point) and a pending serving request (which carries no why and is a
+resume the stopped box will never ack — `pruneStaleServingRequest`
+already makes that judgement). Gated by
+`TestC24StopRecordNeverOverwritesADeclaration`.
+
+**R-2. The hook's journal line claimed something it had not verified.**
+"recorded: gpu-cell started; any stop record for it is retired" is false
+in exactly the case R-5 is about — fleetd may have left a declaration
+alone. The hook does not read the response body, so it cannot know.
+Reworded to state what the request MEANS rather than what happened; the
+stop line is hedged the same way.
+
+**R-3. An unbounded read inside the stop sequence.** `IFS= read -r token
+<"$token_file"` on a FIFO or a character device blocks forever, and this
+runs where a hang is a hung shutdown. `[ -f ]` now precedes `[ -r ]`.
+
+**R-4. The wrapper's fail-closed behaviour was undocumented.** If the
+drain fails, `--until-exit` never runs the command — the game does not
+launch. That is the right default (a wrapper that launched anyway would
+silently stop declaring, on the one box where nobody would notice), but
+it was nowhere in the README, and the person it surprises is holding a
+controller. Documented with its usual causes.
+
 ## What this phase deliberately does not do
 
 - **No GPU-idle heuristic, no auto-resume.** Unchanged from C2 and worth
@@ -316,17 +398,19 @@ Axis 2 gains a second class of author. Suggested amendment:
 
 > *Amended C24.* Intent is declared, and a cell unit's own stop hook is
 > one of the declarers — the reserved reason `stopped out of band`
-> (`fleetapi.StopIntentReason`) marks a record whose author is the unit
-> rather than a human. It is still a declaration, not an inference:
-> nothing reads a probe and concludes intent. What separates it from
-> every other entry on this axis is that it carries **no why**, so the
-> control plane refuses it four things a human's declaration gets — it is
-> never handed back as `desired_intent`, it loses to the cell's own
-> drained echo, it never counts as a pending request, and **it does not
-> explain an absence** (an `always_on` cell whose stack crashed fires the
-> same `ExecStopPost` as one an operator stopped, and must alarm exactly
-> as before). The paired `ExecStartPost` retires the record and nothing
-> else. Packaging: `deploy/cell/`.
+> (`fleetapi.StopIntentReason`, written by fleetd when a hook posts
+> `state: unit_stopped`) marks a record whose author is the unit rather
+> than a human. It is still a declaration, not an inference: nothing
+> reads a probe and concludes intent. What separates it from every other
+> entry on this axis is that it carries **no why**, so the control plane
+> refuses it five things a human's declaration gets — it is never handed
+> back as `desired_intent`, it loses to the cell's own drained echo, it
+> never counts as a pending request, it never overwrites an entry that
+> does carry a why, and **it does not explain an absence** (an
+> `always_on` cell whose stack crashed fires the same `ExecStopPost` as
+> one an operator stopped, and must alarm exactly as before). The paired
+> `ExecStartPost` (`unit_started`) retires the record and nothing else.
+> Packaging: `deploy/cell/`.
 
 Open question for the design owner, deliberately left open: **should a
 stop record render `DRAINED` or keep the `DRAINED?` question?** This
@@ -347,19 +431,25 @@ stop, recorded and made incapable of commanding anything".
 
 Two additions, in the fleet section:
 
-> - **A recorded stop is not a request (fleet-control C24).**
->   `fleetapi.StopIntentReason` is the reserved intent reason a cell
->   unit's `ExecStopPost` hook writes. fleetd refuses it four things:
->   `handleAnnounce` never returns it as `desired_intent` (an announcing
->   cell answers a drained desired_intent by RUNNING `cell_cmds.drain` —
->   the record would stop the stack it only described), it is deleted the
->   moment the cell echoes a drain of its own, `resolveIntent` never
->   marks it pending, and `absentAlarm`/`explainedCells` never let it
->   explain an absence. `SetIntentAt` with that reason and `state:
->   serving` retires such a record and **only** such a record: it never
->   clears a human's declaration and never stores a serving request.
->   Adding a fifth surface that reads intent means deciding whether a
->   record with no why belongs in it.
+> - **A recorded stop is not a request (fleet-control C24).** A cell
+>   unit's own hooks post `state: unit_stopped` / `unit_started` to
+>   `/api/fleet/intent`; fleetd stamps `fleetapi.StopIntentReason` and
+>   refuses such a record five things: `handleAnnounce` never returns it
+>   as `desired_intent` (an announcing cell answers a drained
+>   desired_intent by RUNNING `cell_cmds.drain` — the record would stop
+>   the stack it only described), it is deleted the moment the cell
+>   echoes a drain of its own, `resolveIntent` never marks it pending,
+>   `absentAlarm`/`explainedCells` never let it explain an absence, and
+>   `SetIntentAt` never lets it overwrite an entry that carries a why
+>   (C14's sleep record is written *before* the suspend takes the box
+>   down through that same unit stop). `unit_started` retires a stop
+>   record and **only** a stop record: it never clears a human's
+>   declaration and never stores a serving request. **The verbs are
+>   states on purpose** — an unknown state is a 400 on every build of
+>   this endpoint, so a drop-in installed against an older front degrades
+>   to doing nothing instead of to actuating. Adding a sixth surface that
+>   reads intent means deciding whether a record with no why belongs in
+>   it.
 > - **`deploy/cell/` is host-installed packaging, and its scripts are
 >   under test.** `internal/vibe/cli/c24_test.go` executes the shipped
 >   files — the wrapper's argv and `exec`, the hook's bound, its exit-0

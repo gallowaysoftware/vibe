@@ -11,6 +11,8 @@ package fleetapi
 
 import (
 	"context"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -38,7 +40,13 @@ func TestC24StopRecordIsNeverHandedBackAsACommand(t *testing.T) {
 		t.Fatalf("a declared drain must still be handed back: desired = %+v", resp.DesiredIntent)
 	}
 
-	// The same shape, written by the unit's own stop hook.
+	// The same shape, written by the unit's own stop hook. The clear
+	// first is not incidental: a stop record does not overwrite a
+	// declaration (see TestC24StopRecordNeverOverwritesADeclaration), so
+	// the operator's drain has to be over before the unit's note applies.
+	if _, err := s.SetIntent("laptop", "serving", "", ""); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := s.SetIntent("laptop", "drained", StopIntentReason, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -257,5 +265,99 @@ func TestC24DoctorStillCallsTheStopUndeclared(t *testing.T) {
 	}
 	if !strings.Contains(got.Fix, "--until-exit") {
 		t.Errorf("fix = %q, want it to point at the declared path", got.Fix)
+	}
+}
+
+// TestC24VersionedVerbsAreTheWireContract: the hook posts a STATE the
+// endpoint either understands or refuses. fleetd stamps the reserved
+// reason; the hook never sends one, so it cannot dress a stop up as a
+// declaration.
+func TestC24VersionedVerbsAreTheWireContract(t *testing.T) {
+	s, ts, _ := newFleetdServer(t, []Cell{
+		{Name: "front", URL: "http://127.0.0.1:1", Class: "always_on"},
+		{Name: "gpu-cell", URL: "http://127.0.0.1:1", Class: "opportunistic"},
+	})
+	post := func(body string) int {
+		resp, err := http.Post(ts.URL+"/api/fleet/intent", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode
+	}
+
+	if code := post(`{"cell":"gpu-cell","state":"unit_stopped","reason":"nice try","eta":"23:00"}`); code != http.StatusOK {
+		t.Fatalf("unit_stopped: HTTP %d", code)
+	}
+	in, ok := s.effectiveIntent("gpu-cell")
+	if !ok || !IsStopRecord(&in) {
+		t.Fatalf("intent = %+v ok=%v, want the reserved reason stamped by fleetd", in, ok)
+	}
+	if in.ETA != "" {
+		t.Errorf("eta = %q: the unit knows that it stopped and when, and nothing else — a wire ETA must not survive", in.ETA)
+	}
+
+	if code := post(`{"cell":"gpu-cell","state":"unit_started"}`); code != http.StatusOK {
+		t.Fatalf("unit_started: HTTP %d", code)
+	}
+	if _, ok := s.effectiveIntent("gpu-cell"); ok {
+		t.Error("unit_started did not retire the stop record")
+	}
+
+	// The old vocabulary is untouched, and an unknown state is still a
+	// 400 — which is what makes an OLD fleetd safe against a NEW hook.
+	if code := post(`{"cell":"gpu-cell","state":"drained","reason":"gaming"}`); code != http.StatusOK {
+		t.Errorf("drained: HTTP %d", code)
+	}
+	if code := post(`{"cell":"gpu-cell","state":"unit_exploded"}`); code != http.StatusBadRequest {
+		t.Errorf("unknown state: HTTP %d, want 400", code)
+	}
+}
+
+// TestC24StopRecordNeverOverwritesADeclaration. The forcing case is
+// C14's: a scheduled suspend records {drained, "asleep per
+// sleep_schedule", eta 07:15} and THEN takes the box down through the
+// same unit stop that fires this hook. A stop record that overwrote it
+// would make the fleet forget it had put the box to sleep — and the
+// wake's clear-first ordering would have a different record to clear
+// than the one it wrote.
+func TestC24StopRecordNeverOverwritesADeclaration(t *testing.T) {
+	s, _, _ := newFleetdServer(t, []Cell{
+		{Name: "front", URL: "http://127.0.0.1:1", Class: "always_on"},
+		{Name: "gpu-cell", URL: "http://127.0.0.1:1", Class: "opportunistic"},
+	})
+	for _, declared := range []Intent{
+		{State: "drained", Reason: SleepIntentReason, ETA: "07:15"},
+		{State: "drained", Reason: "gaming", ETA: "23:00"},
+	} {
+		if _, err := s.SetIntent("gpu-cell", "drained", declared.Reason, declared.ETA); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.SetIntent("gpu-cell", "drained", StopIntentReason, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == nil || got.Reason != declared.Reason || got.ETA != declared.ETA {
+			t.Errorf("the stop record overwrote %q: now %+v", declared.Reason, got)
+		}
+		in, ok := s.effectiveIntent("gpu-cell")
+		if !ok || in.Reason != declared.Reason || in.ETA != declared.ETA {
+			t.Errorf("stored intent = %+v ok=%v, want %q kept", in, ok, declared.Reason)
+		}
+	}
+
+	// It may still replace its OWN note: that is the unit updating the
+	// one entry it owns, and the timestamp is the point of the record.
+	if _, err := s.SetIntent("gpu-cell", "serving", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.SetIntent("gpu-cell", "drained", StopIntentReason, "")
+	if err != nil || first == nil {
+		t.Fatalf("first stop: %+v %v", first, err)
+	}
+	later, err := s.SetIntentAt("gpu-cell", "drained", StopIntentReason, "", time.Now().UTC().Add(time.Hour))
+	if err != nil || later == nil || !later.Since.After(first.Since) {
+		t.Errorf("a later stop must refresh the unit's own record: %+v -> %+v (%v)", first, later, err)
 	}
 }
