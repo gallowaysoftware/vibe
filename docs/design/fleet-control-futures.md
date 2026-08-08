@@ -320,20 +320,41 @@ Medium:
     exactly the right instant, and nobody noticed for five phases. C21
     closes it (resolution runs over the DECLARED def set at both render
     layers) and the revisit conditions are named in the phase doc §10.
-11. **`vibe bench replay`** — offline replay of a cell's
-    `/api/captures` through a candidate model: tok/s, tool-call rate,
-    divergence vs recorded prod responses. Replay in place, emit only
-    scores (captures are private traffic; never sync them into a
-    bench corpus). Makes "new release dropped" answerable against
-    *your* workload. The invariant-violating version — live shadow
-    routing at the front — stays dead.
+11. **`vibe bench replay`** — **SHIPPED as
+    [C25](fleet-control-plan/c25-bench-replay.md) (2026-08-08)**, as
+    `vibe model try --replay`. Offline replay of a cell's own recent
+    captures through a candidate model: tok/s, tool-call rate, divergence
+    vs recorded prod responses. Replay in place, emit only scores. The
+    invariant-violating version — live shadow routing at the front —
+    stayed dead and now has a rejection row in the design doc's §9.
+    **This entry's central premise was wrong and checking it reshaped the
+    phase.** `/api/captures` — plural, listable, a pool you draw a bench
+    corpus from — does not exist and never did: the route is
+    `GET /api/captures/{id}`, by activity-row id, out of a size-bounded
+    **in-RAM FIFO** (`captureBuffer`, default 10 MB, `0` disables) that a
+    `-watch-config` reload empties. So there is no corpus to sync and
+    therefore no corpus rule to break; the privacy constraint becomes a
+    mechanism rather than a promise, because the sample can only live in
+    one process's memory. Two consequences the entry could not have
+    anticipated: the harvest must PRECEDE the apply (C18's apply *is* that
+    reload), and the deliverable is a flag on `vibe model try` rather than
+    a `vibe bench` verb, because it needs C18's lease, hold, journal,
+    rollback and its both-sides-warm controls. Divergence is
+    **structural** — tool-call vs prose, tool name, finish_reason, JSON
+    validity — never text similarity, and the recorded response is a
+    noise floor rather than a target, because the captured request
+    carries the client's own temperature and the incumbent disagrees with
+    itself.
 12. **Front failover identity** — **SHIPPED as
     [C19](fleet-control-plan/c19-front-failover.md) (2026-08-05).**
     `vibe fleet mirror` (create / verify / restore, stdlib tar+gzip),
     two doctor checks, `docs/runbooks/front-failover.md`, and a fire
     drill that kills a real fleetd and times the recovery
-    (`scripts/fleetlab/gate-c19-drill.sh`: 10.1 s to a standby with the
-    same token, the same declared intent and a byte-identical ledger).
+    (`scripts/fleetlab/gate-c19-drill.sh`: **9.6 s and 10.1 s** over two
+    runs of the committed rig, 2026-08-08, to a standby with the same
+    token, the same declared intent and a byte-identical ledger — the
+    figures first published here came from a patched copy of the rig and
+    were re-measured by C19's L7 once C23 made a private lab possible).
     Three notes worth carrying. **"Don't build HA" is an invariant, not
     a budget decision**: an automatic promotion is the silent rerouting
     the design forbids, so the mechanism's whole contribution to the
@@ -391,6 +412,19 @@ Medium:
     disjoint, and the script refuses one that is not. And **the guard is
     part of the feature**: a base whose windows would cover `:9000` or
     `:9001` is refused before `down` reaches the sweep at all.
+
+    *Added by C25, and it cuts the other way.* C25's L2 did **not** need
+    this knob, and that is worth recording beside the item: the gate is
+    one llama-swap on a private port with a private config, and reaching
+    for the shared four-cell rig is what made it look like a lab gate.
+    Three phases recorded a live gate UNRUN for a scheduling reason the
+    gate itself never had. So before the next phase writes
+    `scripts/fleetlab/gate-cNN.sh`, the question worth asking is whether
+    the invariant needs a **fleet** or **one process**. *Added by C26b:*
+    the knob is nevertheless what closed the two gates that genuinely did
+    need a fleet — C19's L7 and C24's live stop-record gate, both of them
+    parked behind "other agents are using the lab" and neither of them
+    needing anything else.
 
 Large:
 

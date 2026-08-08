@@ -730,6 +730,11 @@ working.
 
 ## For the reconciliation pass
 
+> **APPLIED by C22 (PR #46, 2026-08-06)** — verified against the tree by
+> C26b, which added the second half C26a owed this rule: a cloud peer's
+> model ids are canonical, so an alias equal to one is unresolvable and
+> `alias_owner` cannot arbitrate it.
+
 This branch does not touch `AGENTS.md`,
 `docs/design/fleet-control-plan/README.md` or
 `docs/design/fleet-control.md`. Everything meant for them is below.

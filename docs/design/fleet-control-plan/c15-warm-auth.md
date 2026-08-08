@@ -712,6 +712,10 @@ are not GPU models; one box is not a fleet).
 
 ## For the reconciliation pass
 
+> **APPLIED by C22 (PR #46, 2026-08-06)** — verified against the tree by
+> C26b. Kept as the record of what was asked for; the shared files are
+> the record of what landed.
+
 This branch does not touch `AGENTS.md`,
 `docs/design/fleet-control-plan/README.md` or
 `docs/design/fleet-control.md`. Here is what belongs in each.

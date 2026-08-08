@@ -873,6 +873,11 @@ Gates re-run after the review fixes: `go build ./...`, `go vet ./...`,
 
 ## For the reconciliation pass
 
+> **APPLIED by C22 (PR #46, 2026-08-06)** — verified against the tree by
+> C26b, which also corrected this phase's status row: L4 PASSED on
+> 2026-08-08 once C23 shipped `FLEETLAB_PORT_BASE`, so the row now reads
+> "L1–L4 and L7 PASS".
+
 This branch does not touch `AGENTS.md`,
 `docs/design/fleet-control-plan/README.md` or
 `docs/design/fleet-control.md`. What belongs in each:

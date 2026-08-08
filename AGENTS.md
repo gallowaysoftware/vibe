@@ -51,6 +51,15 @@ them before pushing. (2026-07-12: a push failed CI on golangci-lint
 findings that vet+gofmt missed — the linter is part of the gate, not
 optional.)
 
+**`golangci-lint`'s cache is per-USER, not per-checkout**, and this repo
+is worked in `.claude/worktrees/*` several at a time. A run can therefore
+report a finding whose path names a SIBLING worktree — code that is not
+in your tree and that your change cannot have caused. `golangci-lint
+cache clean` is the fix; a `.golangci.yml` exclude is not, because the
+path is real and it is the cache that is shared. Note the asymmetry:
+`go list ./...` does NOT cross worktrees (each has its own `go.mod`), so
+the `go` half of the loop never shows this and the linter half does.
+
 `go test -race ./...` is ~15s on a workstation. That number is an asset —
 it is why agents here run the whole gate before every push — so anything
 that pushes the blocking job past ~3 min is not worth whatever fidelity it
@@ -74,6 +83,17 @@ stand-in.
   is a positive claim of idleness that no guard can question. This is the
   only mechanism that protects against drift nobody noticed, and it is a
   property of the production code, not of a test.
+  - The same shape one layer up: `usagemeter.PollAndSnapshot` returns the
+    PREVIOUS cumulative totals whether the poll refused, timed out or
+    succeeded. It is right about the value — those totals are still true
+    — and it is also **exactly what an idle cell returns**, so "this cell
+    is idle" and "this cell's collector has been timing out for six
+    hours" are byte-identical on fleetd's side. `Collector.Health()` is
+    the separator (`LastPoll` UNKNOWN until a poll completes, staleness
+    measured from construction, WARN once the totals have been frozen
+    5 min, rate-limited, with an all-clear); a durability failure counts
+    as staleness too. A surface that renders usage and not freshness is
+    rendering a number it cannot date.
 - **The in-flight wire is version-dependent and the difference is not
   cosmetic.** v239 sends the full request list on every edge; v240+ sends
   operation-tagged DELTAS (`snapshot` / `upsert` / `remove`) with
@@ -144,6 +164,49 @@ stand-in.
   makes fleetd's `clean` refuse the cell's WHOLE announce — presence,
   intent echo, usage and probes with it. An upstream dependency the
   conformance suite does not replay is the hole C16 exists to close.
+- **A streaming guard must own its sockets.**
+  `TestProxy_StreamingCompletionIsUnbuffered` pins ground rule 1 (the SSE
+  keepalive) and went red once in CI on a diff touching **zero** lines of
+  `internal/vibe/proxy`. The chain is worth knowing for every
+  proxied-stream test here: a connection closed under
+  `httputil.ReverseProxy`'s body copy makes it log `read error during
+  body copy` and panic `ErrAbortHandler`, which truncates the chunked
+  response and reaches the client as `unexpected EOF` — **indistinguishable,
+  at the assertion, from the proxy having buffered the completion.** So a
+  test on this path must: dial BOTH hops from `*http.Transport`s it owns
+  (both default to `http.DefaultTransport`, and every
+  `httptest.Server.Close` in the binary calls `CloseIdleConnections` on it
+  as a documented courtesy); release a parked upstream handler on EVERY
+  exit path (`Close` waits for its handlers, so a `t.Fatal` above the
+  release cost a measured 10 s of teardown and printed a copy error
+  belonging to no assertion); close each transport's idle conns before its
+  server; and join any reader goroutine before closing the body. Related,
+  same package: **a closed `httptest` server is not a dead address, it is
+  a free one** — the port returns to the ephemeral pool and something else
+  can rebind it, so an "upstream is down" fixture uses `127.0.0.1:1`.
+  A guard that can go red for a reason other than its own trains everyone
+  to re-run it, which is worse than no guard.
+- **A shell command in a test is a shell-dependent test.** `/bin/sh` is
+  bash on the workstation and dash in CI, and the difference is not
+  cosmetic: bash exec-optimises `sh -c '<one word>'` while dash forks, so
+  a one-word command exercises a DIFFERENT NUMBER OF PROCESSES in the two
+  places. Any test whose subject is a process tree must fork explicitly
+  (`sleep 10 & echo $! >pid; wait`) rather than trusting the shell to do
+  it. This cost two CI rounds, once in `fleetapi` and once in `daemon`,
+  each time as a bound that passed locally and hung on the runner. Two
+  corollaries learned the same way:
+  - **`/dev/tty`-dependent shell features differ too.** `set -m` looks
+    like the portable way to give a background job its own process group
+    and is not: dash's `setjobctl` opens `/dev/tty` and declines
+    **silently** when there is no controlling terminal, which under
+    `go test` is always, while bash sets the group anyway. Use `setsid`.
+  - **A command with no pipe-backed output has no pipe to block on.**
+    With `Stdout`/`Stderr` left nil, `exec` wires the command to
+    `/dev/null`, `Wait` has no copy to wait for, the whole
+    kill-does-not-reach-the-grandchild defect disappears, and every test
+    passes for the wrong reason. Attach real pipes (`CombinedOutput`, or
+    set both), and assert a FLOOR as well as a ceiling — the floor is
+    what catches this.
 - **The local rigs stay.** `scripts/fleetlab` and
   `scripts/smoke/llama-swap/` are not made redundant by any of this — CI has
   no GPU, no real models, no SSH, no wattmeter, and its numbers would be
@@ -173,6 +236,25 @@ stand-in.
     re-renders a cell config goes through `gl.sh`'s `render_cell`, which
     FAILS if the port rewrite did not apply. Do not open-code a render
     in a rig.
+  - **A lab instance is `FLEETLAB_DIR` + `FLEETLAB_PORT_BASE`, both,
+    always** (C23). The dir separates the configs; the base separates the
+    ports; `down` sweeps on both. Bases are multiples of 200 (refused
+    otherwise — that is what makes two instances' listen AND upstream
+    windows disjoint), so take one nobody else holds, check it with
+    `ss -ltn` first, say which one you took, and never run `down` on the
+    default while another agent is working. Pass the same pair to the
+    gate rigs: they source `gl.sh`, which derives the same table, and a
+    rig run without the base drives whichever lab holds the default
+    block. `ports.sh` refuses outright a base whose listen or upstream
+    window would cover `:9000`, `:9001`, production's 5800-5809 or
+    `ritual.sh`'s ranges — base 12600 looks harmless and puts upstreams
+    on 8980-9019. Do not defeat that guard.
+  - **`internal/fleetlab` is a second Go package that runs real
+    subprocesses and binds real ports** — the regression that keeps one
+    lab's `down` out of another's. It skips itself when `bash`, `ps`,
+    `pgrep` or `awk` is missing, and its negative control (both instances
+    on one base, the sweep reaching across) is required: a sweep that
+    kills nothing reads exactly like a sweep that is correctly scoped.
 
 ## Conventions agents tend to violate
 
@@ -1129,7 +1211,11 @@ stand-in.
     announce-only cell's outbound credential, a fleet with no https
     endpoint, the front's absent announcer), the verdict is OK with the
     reason — a permanent UNKNOWN on a healthy fleet teaches the operator
-    to ignore the level.
+    to ignore the level. **This is `vibe fleet doctor`'s rule and not
+    `vibe doctor`'s**; the local box audit has a genuine
+    not-applicable and drops the check entirely (see *Profile authoring /
+    first-run guards*). Two commands, two report shapes — do not carry a
+    rule across.
   - **A check ID names what it PROVES**: `wake.configured` not
     `wake.armed` (a NIC's arming is not observable, and sending a packet
     to find out is a mutation), `tls.not_after` not `tls.valid` (the
@@ -1509,6 +1595,18 @@ stand-in.
     (`TakeoverProbe` — a TCP dial of the recorded `fleetd_url` and front
     URL; `restore` stops if anything answers, `--force` is for the one
     false positive where the operator already moved the address).
+  - **The refusal fails closed on DOUBT, not only on an answer.** A dial
+    that times out, a name that NXDOMAINs, and any error class nobody
+    enumerated all stop the restore (`ErrProbeInconclusive`); only an
+    answer (`ErrTakeover`) and a definite `ECONNREFUSED` are conclusions.
+    NXDOMAIN earns its own clause because it is the one that fires on
+    **every recorded name simultaneously** — resolution happens on the
+    box doing the asking, and that box is by construction the one that
+    was NOT the front, so a standby whose resolver lacks the internal
+    zone reads as unanimous evidence that the old front is gone. It used
+    to be classified as a definite negative, and the restore proceeded.
+    `--force` remains the single escape, and it is a claim that a human
+    checked.
   - **`vibe fleet mirror` is a HOST command on a timer, never a fleetd
     loop.** It has to keep working when fleetd is what broke, and fleetd
     cannot see the host paths its own state is bind-mounted from.
@@ -1559,6 +1657,21 @@ stand-in.
     each with a written-reason exemption table and an inertness floor.
     Add to the table with a reason; do not delete a scan, do not widen
     `pairSuffixes`, do not narrow `numericResult`.
+  - **Carried gap, verified rather than reasoned about (U6): the
+    `(bool, error)` evidence carriers are outside all three scans.** Scan
+    1 matches `.Observed()` calls, scan 2 matches struct field pairs,
+    scan 3 matches `(numeric, bool)` returns — and `bool` is deliberately
+    not in `numericResult`. So a function like
+    `modelprobe.isResident`, where **`false, err` means "no answer" and
+    `false, nil` means "asked and told no"**, is seen by none of them:
+    with the dropped-bit mutation applied, `./internal/vibe/observed/`
+    stays green. `ok, _ := …` is one keystroke, and the answered-no here
+    is not a neutral value — it is the note that says C8's cardinal rule
+    fired. Where such a function exists, pin it in its OWN package
+    (`TestIsResidentsErrorIsNeverDiscarded` is a package-local AST scan
+    carrying both meta-guards) and register the mutation. Whether the
+    module-wide scans should grow a fourth is undecided; do not assume
+    they cover this shape.
   - **`internal/mutation` is the review step, encoded.** A registry of
     `{name, file, find, replace, pkg, mustFail, why}`. A guard whose
     mutation leaves every named test green is UNPROTECTED; an entry whose
@@ -1644,6 +1757,85 @@ stand-in.
     error instead of healing into a repoint, so the front catalog can
     stop tracking the fleet indefinitely while `front_renders` sits still
     and every display reads green.
+- **Every operator-supplied shell string goes through
+  `internal/vibe/shellcmd`** (U3, completed by C26a). `exec.CommandContext`
+  kills the process it STARTED; with `sh -c` that is the shell, and the
+  shell is not where the work is for anything containing a `;`, an `&&`,
+  a subshell or a background job. The deadline then fires exactly on
+  time, the error reads `signal: killed`, and the call does not return
+  until the operator's `systemctl`/`ipmitool` finishes on its own — a
+  bound that is armed and has no reach, which on the wire is
+  indistinguishable from a bound that worked.
+  - `shellcmd.New(ctx, script, killGrace)` wires **both** halves and
+    neither subsumes the other: a process group of its own plus a
+    negative-pid `SIGKILL` ends the WORK (reaching what the shell
+    forked), and `WaitDelay` ends the WAIT for the descendant the kill
+    cannot reach. A non-positive `killGrace` is refused loudly — zero is
+    `WaitDelay`'s documented "block indefinitely", i.e. the defect.
+  - The four call sites are `fleetapi.wakeCommand` (5 s — a wake crosses
+    a network to a BMC), `daemon.runCellCmd` (2 s — drain/resume/suspend
+    talk to systemd on the same box), `daemon.runHooks` (5 s — and it has
+    no deadline of its own, so the missing reach was *worse* there) and
+    `fleetannounce`'s desired-intent verb. `internal/mutation` holds a
+    membership entry per site.
+  - **A call site behind a test seam is not on the shared builder until
+    something fails when the seam's DEFAULT drifts off it.** Every test
+    in `fleetannounce` replaces `execCmd`, so nothing there executes the
+    production value; `TestVerbSeam_ProductionDefaultIsTheBoundedRunner`
+    asserts the default by pointer identity, and the bound itself is
+    proved through the UNREPLACED seam. That pairing is the general
+    shape: assert the default, and drive at least one behavioural test
+    with nothing stubbed.
+- **A recorded stop is not a request (fleet-control C24).** A cell unit's
+  own hooks post `state: unit_stopped` / `unit_started` to
+  `/api/fleet/intent`; fleetd stamps `fleetapi.StopIntentReason` and
+  refuses such a record five things: `handleAnnounce` never returns it as
+  `desired_intent` (an announcing cell answers a drained desired_intent
+  by RUNNING `cell_cmds.drain` — the record would stop the stack it only
+  described), it is deleted the moment the cell echoes a drain of its
+  own, `resolveIntent` never marks it pending, `absentAlarm` /
+  `explainedCells` never let it explain an absence, and `SetIntentAt`
+  never lets it overwrite an entry that carries a why (C14's sleep record
+  is written *before* the suspend takes the box down through that same
+  unit stop). `unit_started` retires a stop record and **only** a stop
+  record: it never clears a human's declaration and never stores a
+  serving request. **The verbs are states on purpose** — an unknown state
+  is a 400 on every build of this endpoint, so a drop-in installed
+  against an older front degrades to doing nothing instead of to
+  actuating. Adding a sixth surface that reads intent means deciding
+  whether a record with no why belongs in it.
+- **`deploy/cell/` is host-installed packaging, and its scripts are under
+  test.** `internal/vibe/cli/c24_test.go` executes the shipped files —
+  the wrapper's argv and `exec`, the hook's bound, its exit-0 contract
+  and its tripwire-verified inertness — and parses the systemd drop-in.
+  Editing anything in `deploy/cell/` without running
+  `go test ./internal/vibe/cli/ -run TestC24` is how the example that
+  gets copied stops matching the code.
+  `scripts/fleetlab/gate-c24-stop-record.sh` is the live half: the
+  shipped hook against a real fleetd and a real announcing cell whose
+  drain verb really stops its llama-swap.
+- **`vibe model try --replay` (fleet-control C25).**
+  `internal/vibe/benchreplay` scores an incumbent and a candidate against
+  **n of the cell's own recent captures**, replayed in place, and emits
+  only scores. The bytes it reads are the most private objects in the
+  fleet and this repository is public, so the constraints are mechanical
+  rather than editorial: `internal/swaptest`'s recorder REFUSES the
+  capture route by name (`RefuseCaptureEndpoint`, plus an astscan rule, a
+  data-driven endpoint list and a walk of the embedded fixture tree);
+  `Report` cannot carry a body (a reflection walk against a field
+  allowlist and a closed set for every string field); the package cannot
+  write a file (an AST scan over `os.*`); bodies become shapes at the
+  boundary in `shape.go`, the only file that sees a `[]byte`; and nothing
+  crosses a box. **Harvest precedes apply by ORDERING, not by comment** —
+  C18's apply is a `-watch-config` reload, which builds a llama-swap with
+  a fresh empty capture buffer, so `Harvest` refuses at journal state
+  `applied`/`measured` and `Measure` takes the sample as a parameter.
+  Divergence is **structural** (tool-call vs prose, tool name,
+  finish_reason, JSON validity), never text similarity, and the recorded
+  response is a NOISE FLOOR rather than a target, because the captured
+  request carries the client's own temperature. Every rate is gated on
+  ITS OWN denominator (`ToolCallRate` divides by `ToolsOffered`, not by
+  `Requests`) and every floor is a refusal to answer, never a zero.
 - Frontends use an explicit `frontend.kind` enum
   (`external | docker-compose | managed`) because frontends share many
   fields; the sub-block-presence trick doesn't fit.
@@ -1991,6 +2183,22 @@ stand-in.
   profiles dir directly; `vibe ps` / `vibe env` ping the daemon and
   report "not running" rather than `ensureDaemon`. Only `start` / `run`
   / `pull` / `stop` / `logs` may auto-spawn.
+- **`vibe doctor`: a check that cannot apply returns NOT-APPLICABLE —
+  never a pass and never a fail.** Every check in `cli/cmd_doctor.go`
+  answers `(checkResult, bool)` where `ok=false` means "nothing on this
+  box needs this" and the runner appends nothing at all;
+  `checkRSVGForVision` and `checkDockerForProfiles` are the pattern.
+  `checkLlamaBinary` and `checkLlamaVersion` broke it and hard-failed a
+  `cloud_peer`-only laptop — and comfyui-only and mlx-only boxes — over a
+  `llama-server` nothing declared. **Applicability is computed from what
+  is DECLARED ON DISK, read without validation**: a def that pins its own
+  `binary:` is not a `$PATH` user, and validating the YAML first would
+  make the check not-applicable on a box whose GGUF is not pulled yet,
+  which is exactly the box that needs it. Validation failures are a
+  different check's business; using them as a gate silently disarms this
+  one. (`vibe fleet doctor` is a different command with a different
+  report shape and the opposite rule — it has four levels and no
+  not-applicable.)
 
 ## Router / model lifecycle (llama-swap era, 2026-07-12+)
 
@@ -2048,9 +2256,42 @@ planned. The short version an agent needs:
   reach for it (or copy its three lines) rather than assuming def name is
   an id. A fixture that names the def after its single model hides this
   bug; name them differently in tests.
+  - **Those ids are also CANONICAL** (C26a). An alias equal to one is an
+    unresolvable error exactly as an alias equal to a def name is, and
+    `router.alias_owner` does not arbitrate it — that key settles which of
+    two *alias claimants* wins, and has never had anything to say about an
+    alias colliding with a canonical id. Peer ids nevertheless do **not**
+    become alias claimants: `Render` emits no aliases for a peer stanza,
+    so a peer that won an alias would take it off the def that would have
+    served it and advertise nothing in its place. The resolver only sees
+    defs, so `checkCatalogIDsUnique` walks the RENDERED config as the
+    backstop — it catches a def named after a peer's model id and two
+    peers listing the same id, neither of which the resolver can see.
+    §3 of C26a is the second time the first half of this rule alone was
+    not enough to prevent the bug.
 - **Canonical model id = backend def name** (e.g. `qwen3.6-27b`); llama-server
   aliases exist for legacy client state. Alias collisions across defs are an
-  error resolved by explicit ownership, not magic.
+  error resolved by explicit ownership, not magic. **The router's catalog is
+  a namespace**: every client-facing id in it — a models key, an alias, a
+  peer's model — is unique by construction, and the render refuses a config
+  that says otherwise.
+- **llama-swap retains recent request and response BODIES in RAM, by
+  default, on every cell and the front.** `captureBuffer` defaults to
+  10 MB and vibe's renderer sets it nowhere, so each llama-swap holds a
+  rolling FIFO window of verbatim prompts, system prompts, tool
+  definitions and completions, readable at `GET /api/captures/{id}` by
+  anything holding that llama-swap's API key and discoverable via
+  `has_capture` on `/api/metrics/activity`. Redaction covers five HEADER
+  names and nothing in the bodies. Measured against real v239 (`dd81801`)
+  and v247 (`40027d6`): the route answers 401 with no key, 401 with a
+  wrong one (never 403), 404 for an evicted id and 400 for a non-integer
+  id, and the object is `{id, req_path, req_headers, req_body,
+  resp_headers, resp_body}` with base64 bodies. It is in-process memory,
+  not the store — a restart or a `-watch-config` reload empties it, and
+  C7a's `store: {path:}` does nothing for it. `captureBuffer: 0` through
+  `--extras` turns it off. This is true of the fleet **today**,
+  independent of C25: it is a deliberate declaration either way, and no
+  vibe verb may change it (C25 §4).
 - **Config flow**: `~/.config/vibe/backends/*.yaml` is the source of truth;
   the llama-swap config at `~/.config/llama-swap/config.yaml` is (post-A2)
   RENDERED — regenerate via `vibe router render`, don't hand-edit. The
@@ -2079,11 +2320,11 @@ planned. The short version an agent needs:
 
 ## Fleet control (node state / intent / presence, 2026-08-02+)
 
-`docs/design/fleet-control.md` is the design; the C0–C21 execution plan
+`docs/design/fleet-control.md` is the design; the C0–C26a execution plan
 lives in `docs/design/fleet-control-plan/` (one phase = one PR, each
 phase doc ends in acceptance gates that are the definition of done),
 and the ranked v2 backlog is `docs/design/fleet-control-futures.md`.
-All twenty-two phases are merged. The invariants an agent must not
+Every phase in that directory is merged. The invariants an agent must not
 violate while implementing or touching adjacent code: the data plane
 (client → front → cell llama-swap) gains no new hop; availability is
 observed, intent is declared, model residency stays llama-swap-owned;
@@ -2101,6 +2342,20 @@ prose and the code disagree, **the code wins, then fix the prose**: the
 SIGTERM bullet above, `noFrontRoute`'s "announce-only", and C21's alias
 resolution were each documented wrong for multiple phases before
 somebody measured.
+
+**This file, the plan README and `fleet-control.md` are the plan's
+conflict axis** — nearly every phase wants all three, and every merge
+conflict the plan has produced landed in one of them. So a phase branch
+does not edit them. It writes what it wants into a
+`## For the reconciliation pass` section of its OWN phase doc, and a
+later single-purpose PR applies them all at once (C22, C26b). Two things
+that pass keeps finding, so write the section as a draft rather than as a
+record: **a reconciliation section describes the phase as it stood when
+it was written, not as it merged** (C22 corrected four phases' own gate
+counts), and a rule proposed for a named command does not generalise to a
+command that merely shares its name (C26a's not-applicable doctor rule
+versus C13's four-level one — both are in this file, deliberately, with a
+sentence apiece saying which is which).
 
 ## Things to never do
 

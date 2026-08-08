@@ -1,7 +1,7 @@
 # C25 — `vibe bench replay`: your own traffic as the benchmark
 
-Status: **BUILT (2026-08-08)**, off `c25-bench-replay` branched from
-`main` at `899a414` (this doc's own merge). Delivered as
+Status: **MERGED (#59, 2026-08-08)**, off `c25-bench-replay` branched
+from `main` at `899a414` (this doc's own merge). Delivered as
 `vibe model try --replay` — a flag on [C18](c18-model-try.md)'s trial
 sequence, not a `vibe bench` verb, for the reason §4 gives. See
 [§11 Execution](#11-execution-2026-08-08) for what shipped, the gate
@@ -576,6 +576,12 @@ and the failure mode is a fixture commit that publishes a real prompt.
 ---
 
 ## 9. For the reconciliation pass
+
+> **APPLIED by C26b (2026-08-08)**, taking §12's corrections over §9's
+> drafts where they differ: the `AGENTS.md` capture-retention paragraph
+> landed with §12's MEASURED numbers, the README row landed as §12
+> rewrote it, and the `fleet-control.md` §9 rejection row landed verbatim
+> as drafted here.
 
 > **The build added to this section rather than editing it.** Everything
 > below is as the design branch wrote it and is still correct;

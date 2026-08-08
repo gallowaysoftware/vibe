@@ -918,6 +918,9 @@ partial application of C10's issue-the-refusal-first rule.
 
 ## For the reconciliation pass
 
+> **APPLIED by C22 (PR #46, 2026-08-06)** — verified against the tree by
+> C26b.
+
 Everything below belongs in a shared doc this branch may not touch
 (`AGENTS.md`, `docs/design/fleet-control-plan/README.md`,
 `docs/design/fleet-control.md`).

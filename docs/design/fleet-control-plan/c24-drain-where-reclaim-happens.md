@@ -1,8 +1,10 @@
 # C24 — drain where reclaim happens
 
-Status: **PR OPEN** (#58), off `c24-drain-where-reclaim-happens` branched
-from `main` at `cb8b336`. Four commits: the packaging + the rules it
-needs to be safe, ground rule 9's adversarial self-review (§8b — five
+Status: **MERGED (#58, 2026-08-08)**, off
+`c24-drain-where-reclaim-happens` branched from `main` at `cb8b336`. Its
+one live gate ran on 2026-08-08 (C26b,
+`scripts/fleetlab/gate-c24-stop-record.sh`). Four commits: the packaging
++ the rules it needs to be safe, ground rule 9's adversarial self-review (§8b — five
 findings, all fixed, two of them the phase's own headline defect reached
 by routes the feature commit had not looked at), a doc correction, and
 the two mutation-registry entries that keep the load-bearing pair honest
@@ -316,7 +318,74 @@ with the specific fact it lacks. None of them is "not possible".
 | the hook during a real **shutdown** (network already going away) | same, plus it needs a real reboot. This is the case the bound exists for; the hung-server test is its stand-in and is strictly weaker — it proves the timeout, not the teardown ordering. |
 | Steam actually substituting `%command%` | needs a Steam client and a game; the wrapper's argv handling is gated, the substitution is Valve's. |
 | `TimeoutStopSec` vs llama-swap's 30s stream grace, end to end | needs a real unit stop with a real in-flight stream. The 30s figure is C16's measurement, carried, not re-measured here. |
-| the fleetlab rig | `scripts/fleetlab/lab.sh` was **not run**: seven agents share this box and its `down` sweep is anchored partly on a shared upstream port range, so a teardown here surfaces as a phantom bug in someone else's phase. `internal/swaptest` covers the wire. |
+| ~~the fleetlab rig~~ | **CLOSED 2026-08-08 by C26b** — see below. The reason recorded here ("seven agents share this box and its `down` sweep is anchored partly on a shared upstream port range") was a scheduling one, and [C23](c23-fleetlab-port-base.md) had already shipped the knob that fixes it. |
+
+### The live half, run — `gate-c24-stop-record.sh` (2026-08-08, C26b)
+
+The row above was the only one in this table that was not about a
+physical fact, and per ground rule 10's amendment that makes it the one
+worth re-reading. `FLEETLAB_PORT_BASE=10200` gives this phase a private
+four-cell fleet, so the rig went in beside the others.
+
+It drives the **shipped** hook (`deploy/cell/vibe-cell-intent.sh`)
+against a real fleetd and a real announcing cell. Bravo is the lab's full
+cell daemon and its `cell_cmds.drain` really does stop its llama-swap,
+which is what makes §3's central claim observable: *the record is not
+handed back as a command*. A pid that does not change proves nothing on
+its own — it also does not change when nothing works — so step 1 is a
+**positive control**, a human's declared drain on the same cell in the
+same run:
+
+```
+=== 0. bravo before anything ===
+{"display":"SERVING","announcing":true,"echo":"serving","intent":null}
+swap-bravo pid 2283436: RUNNING          {"models":["lab-embed-b"]}
+
+=== 1. POSITIVE CONTROL: a human's declared drain DOES reach this cell's stack ===
+Drained bravo (reason: c24 gate: the control, eta 23:00). Intent recorded.
+swap-bravo pid <none>: GONE
+curl: (7) Failed to connect to 127.0.0.1:10242    (no answer)
+# and back:  Resumed bravo.  swap-bravo pid 2283436: RUNNING
+
+=== 2/3. the hook, and the record as fleetd holds it ===
+vibe-cell-intent: recorded: bravo stopped; unless something had already declared why …
+{"display":"INCONSISTENT",…,"intent":{"state":"drained","reason":"stopped out of band",…}}
+
+=== 4. two announce waves later (interval 15s) ===
+{"display":"INCONSISTENT","announcing":true,"echo":"serving","intent":{…"stopped out of band"…}}
+swap-bravo pid 2283436: RUNNING          {"models":["lab-embed-b"]}
+
+=== 5. the doctor does not get quieter about an undeclared stop ===
+WARN  intent.hygiene   undeclared state: bravo INCONSISTENT (recorded by its own unit
+                       stop at 2026-08-08T18:33:59Z; nothing declared why)
+                       (reported only — an inferred intent is never acted on, invariant 2)
+
+=== 6. the paired ExecStartPost retires the record ===
+{"display":"SERVING","announcing":true,"echo":"serving","intent":null}
+
+=== 7. a human's declaration outranks the unit's record ===
+after the human's drain:      reason "c24 gate: a human said why"
+after the unit's stop record: reason "c24 gate: a human said why"   (unchanged)
+```
+
+Same fleet, same verb path, two records: **one actuates and one does
+not.** That contrast is the gate; everything else here was already
+covered by `internal/vibe/fleetapi`'s unit tests.
+
+Two honest deviations to read the transcript with. The hook fires
+**without the unit actually stopping**, so bravo keeps announcing and
+keeps echoing `serving`, and the fleet renders `INCONSISTENT` rather than
+`DRAINED` — which is the correct rendering of "recorded as stopped,
+observably up"; on a real box the announce would simply be absent. And
+bravo's own `daemon.log` carries no `executed desired-intent verb` line
+for *either* record on this path, so an early draft of the rig grepped
+for one and printed an empty result under a heading promising evidence —
+C17's G7 exactly. The pid is the evidence; the log line was removed
+rather than left decorative.
+
+The rest of this table stands unchanged: a real `.service` stop, the
+shutdown case, Steam's `%command%` and `TimeoutStopSec` end to end all
+need a scratch box, a reboot, or Valve.
 
 ### Inner loop — PASS (2026-08-08)
 
@@ -403,8 +472,12 @@ controller. Documented with its usual causes.
 
 ## For the reconciliation pass
 
-Nothing here was applied — the three shared documents are owned by the
-reconciliation pass.
+> **APPLIED by C26b (2026-08-08).** §4's axis-2 amendment, the README row
+> and both `AGENTS.md` bullets landed as drafted. The open question below
+> was left OPEN and is recorded as such in `fleet-control.md` §4 rather
+> than decided by a pass whose job is bookkeeping. The README row also
+> carries the live gate C26b ran (`gate-c24-stop-record.sh`), which this
+> section could not have known about.
 
 ### `docs/design/fleet-control.md` §4 (axis 2, and the display table)
 

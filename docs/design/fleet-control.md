@@ -200,6 +200,35 @@ Intent is only ever declared, never inferred: the control plane must
 not guess "drained?" from observations and act on the guess (display
 uncertainty, yes; act, no).
 
+*Amended C24.* This axis gains a second class of author. A cell unit's
+own stop hook is one of the declarers — the reserved reason
+`stopped out of band` (`fleetapi.StopIntentReason`, written by fleetd
+when a hook posts `state: unit_stopped`) marks a record whose author is
+the unit rather than a human. It is still a declaration, not an
+inference: nothing reads a probe and concludes intent. What separates it
+from every other entry on this axis is that it carries **no why**, so
+the control plane refuses it five things a human's declaration gets — it
+is never handed back as `desired_intent`, it loses to the cell's own
+drained echo, it never counts as a pending request, it never overwrites
+an entry that does carry a why, and **it does not explain an absence**
+(an `always_on` cell whose stack crashed fires the same `ExecStopPost`
+as one an operator stopped, and must alarm exactly as before). The
+paired `ExecStartPost` (`unit_started`) retires the record and nothing
+else. The first of those five is the load-bearing one: an announcing
+cell answers a drained `desired_intent` by RUNNING `cell_cmds.drain`, so
+a record handed back would stop the stack it only described — measured
+on the harness, where the same cell's llama-swap survives the record and
+dies to a human's drain in the same run
+(`scripts/fleetlab/gate-c24-stop-record.sh`). Packaging: `deploy/cell/`.
+
+**Open, deliberately**: a stop record renders **DRAINED** with the
+reserved reason, which is what C24 chose and compensated for by making
+every why-consuming surface ignore it. The alternative — display stays
+`DRAINED?`, the intent block carries the record — is arguably truer to
+the display table below and costs nothing in C9 or the doctor, but it
+makes `Display == DRAINED?` no longer imply `Intent == nil`, which
+several surfaces read as a pair today.
+
 **Axis 3 — model residency (llama-swap-owned, never duplicated).**
 `stopped / starting / ready / draining` + TTL, straight from each
 cell's llama-swap, exactly as fleetapi already merges it. Which model
@@ -244,6 +273,15 @@ a page. Delivery — never evaluation — is gated by a declared fleet-scope
 **Membership** (which cells exist, which models each serves, with what
 flags) is *config, not state*: backend defs + the `cells:` map,
 rendered into the front's peers file. It changes rarely, through git.
+
+*Amended C26a.* **The rendered catalog is a namespace**, and every
+client-facing id in it — a `models` key, an alias, a cloud peer's model —
+is unique by construction, with `router.Render` refusing a config that
+says otherwise. A peer's model ids are canonical in the same sense def
+names are, so an alias equal to one is unresolvable and `alias_owner`
+cannot arbitrate it (that key settles which of two *alias claimants*
+wins). Peer ids are not themselves claimants, because `Render` emits no
+aliases for a peer stanza.
 
 ### Derived display states (computed at read time, never stored)
 
@@ -529,6 +567,7 @@ a different thing.
 | **Blanket fail-closed fingerprints** | Fail-closed only for embed-class; a normalization bug must not yank a working chat model. |
 | **Registry on the data path** (absent-cells answered by fleetd with reasoned 503 bodies) | Nice UX, violates invariant 1. Revisit only if typed `UPSTREAM_DOWN` + status surfaces prove insufficient. |
 | **Visible-repoint alias tier** (a catalog id like `best-coder` whose target fleetd re-resolves on membership transitions, shown in the catalog and evented) | Rejected 2026-08-06 ([C21](fleet-control-plan/c21-alias-tier.md)). Its two safe cases — candidate present, no candidate at all — are already what a declared alias plus §4's class policy do; the entire delta is the substitution case, which answers `200 OK` from a model the caller did not name. Prune and hold are both fail-LOUD, and this would be the first mechanism here that is not. The proposed defence, visibility, lands on the OPERATOR (event, `fleet_status`, the page) while the harm lands on the CONSUMER, whose only channels are `/v1/models` — which attributes an id to a peer, never to a model — and the completion response, which is endpoint-dependent (a chat response named the concrete model; an embeddings response echoed the alias back). Making it visible there means rewriting responses at the front, which is invariant 1. The workaround is a declared alias with `router.alias_owner` moved by hand: one line, in the diff, on the operator's clock — membership through git, as §4 says. C21 also closed the INVISIBLE version of this that had shipped since C3: alias ownership was resolved over the defs that survived the prune, so a pruned roaming owner handed its alias to a co-claimant on another cell, with no event and nothing in `fleet_status`. Revisit conditions are named in the phase doc §10. |
+| **Live shadow routing at the front** (the front duplicates each model-dispatched request to a candidate as it flows, and scores the copy) | Rejected 2026-08-08 ([C25](fleet-control-plan/c25-bench-replay.md) §2). Ground rule 1 permits observing the data plane; a shadow is a second *emission*. On a single-GPU cell it contends for the GPU serving the request it is measuring, so there is no version of it that leaves hot-path latency unchanged; it must buffer the request body before forwarding, which changes flush timing; a shadow for a non-resident candidate JIT-loads it and evicts the model serving the user, which is C8's cardinal rule violated in its worst direction; and its failure modes are either backpressure on a user's request or a silently short n. It is also a residency decision taken by the front, which axis 3 gives to llama-swap. The replacement is offline replay of captures llama-swap already holds and is already going to evict. |
 | **Automatic front failover** (a standby that promotes itself when the front stops answering) | Rejected by C19, on invariant 3 rather than on cost. `vibe fleet mirror` makes a MANUAL recovery fast; the code's only contribution to two-boxes-answering is a refusal (`TakeoverProbe`) an operator can override. See §3. |
 
 ## 10. Friction-pain scorecard at plan completion

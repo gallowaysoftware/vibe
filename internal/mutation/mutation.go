@@ -973,6 +973,60 @@ var Registry = []Mutation{
 			"by falsifying the request — and a sample you had to falsify is no longer YOUR workload, " +
 			"which was this phase's entire point. Same objection C7a raised to injecting stream_options.",
 	},
+	// U6 (PR #48) hand-verified these three and deliberately did not add
+	// them: eight sibling branches were landing in parallel, and a shared
+	// slice literal is exactly where a merge-created defect comes from.
+	// The reconciliation pass is where that debt gets paid.
+	{
+		Name:     "c8/a probe issued through Run carries no deadline",
+		File:     "internal/vibe/modelprobe/modelprobe.go",
+		Find:     "\tctx, cancel := context.WithTimeout(ctx, probeTimeout)\n\tdefer cancel()\n",
+		Replace:  "\tctx, cancel := context.WithCancel(ctx)\n\tdefer cancel()\n",
+		Pkg:      "./internal/vibe/modelprobe/",
+		MustFail: []string{"TestProbeDeadlines_EveryProbeRequestCarriesItsOwnBound"},
+		Why: "Start is not the only caller: `vibe model try` calls Run directly and the default client " +
+			"has no timeout of its own, so without this line a wedged llama-server holds the cell's " +
+			"single probe slot for as long as the socket stays open.",
+	},
+	{
+		Name:     "c8/the residency read's error is dropped",
+		File:     "internal/vibe/modelprobe/modelprobe.go",
+		Find:     "\tresident, err := p.isResident(ctx, model)\n\tif err != nil {\n\t\treturn p.note(model, spec.Kind, \"cannot read local llama-swap /running: \"+err.Error())\n\t}\n",
+		Replace:  "\tresident, _ := p.isResident(ctx, model)\n",
+		Pkg:      "./internal/vibe/modelprobe/",
+		MustFail: []string{"TestProbeDeadlines_AResidencyReadThatNeverAnswersIsNotAResidencyVerdict", "TestIsResidentsErrorIsNeverDiscarded"},
+		Why: "`false, err` is no answer and `false, nil` is an answered no. Dropping the error prints " +
+			"\"not resident — warm it first\" — the note that means the cardinal rule fired — when " +
+			"nothing was checked, and sends the operator to warm a model that was already warm.",
+	},
+	{
+		Name:     "c8/an abandoned probe is not billed as an attempt",
+		File:     "internal/vibe/modelprobe/modelprobe.go",
+		Find:     "\tp.markAttempt(model, now)\n\tres, err := p.measure(ctx, spec)\n\tif err != nil {\n\t\treturn p.note(model, spec.Kind, \"probe request failed: \"+err.Error())\n\t}\n",
+		Replace:  "\tres, err := p.measure(ctx, spec)\n\tif err != nil {\n\t\treturn p.note(model, spec.Kind, \"probe request failed: \"+err.Error())\n\t}\n\tp.markAttempt(model, now)\n",
+		Pkg:      "./internal/vibe/modelprobe/",
+		MustFail: []string{"TestProbeDeadlines_AnAbandonedProbeIsAFailedAttemptAndNeverAMeasurement"},
+		Why: "an abandoned probe spent the GPU time anyway. Billing only successes makes a timing-out " +
+			"model the CHEAPEST thing to probe, and a wedged box re-probes it every interval against " +
+			"neither the cooldown nor the 96/day cap.",
+	},
+	{
+		Name: "c26b/the model-rewrite reader buffers the stream",
+		File: "internal/vibe/proxy/proxy.go",
+		Find: "\t\t\temit := len(r.buf)\n\t\t\tif !r.eof {\n" +
+			"\t\t\t\tif keep := r.maxNeedle() - 1; emit > keep {\n" +
+			"\t\t\t\t\temit -= keep\n\t\t\t\t} else {\n\t\t\t\t\temit = 0\n\t\t\t\t}\n\t\t\t}\n",
+		Replace:  "\t\t\temit := len(r.buf)\n\t\t\tif !r.eof {\n\t\t\t\temit = 0\n\t\t\t}\n",
+		Pkg:      "./internal/vibe/proxy/",
+		MustFail: []string{"TestProxy_StreamingCompletionIsUnbuffered"},
+		Why: "ground rule 1, mechanically. The rewrite reader holds back a needle-length tail so a " +
+			"match split across chunks is still found; holding back EVERYTHING until EOF is the same " +
+			"code one condition simpler and passes every correctness test in the package, because the " +
+			"bytes are still right — they just arrive at the end. Claude Code kills a stalled stream " +
+			"at ~5 min, so that turns a slow model into a broken one. Registered because the guard " +
+			"went red once in CI for a reason of its own making (C26b), and a guard people have " +
+			"learned to re-run is worse than no guard.",
+	},
 }
 
 // ── tree copying and patching ────────────────────────────────────────
