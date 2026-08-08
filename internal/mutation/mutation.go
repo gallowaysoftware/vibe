@@ -358,6 +358,21 @@ var Registry = []Mutation{
 			"one it wrote. A human's --reason gaming is the same shape.",
 	},
 
+	// ── a new display state that stops paging (C27) ───────────────────
+	{
+		Name:     "c27/a stopped always_on cell no longer pages",
+		File:     "internal/vibe/fleetapi/notify.go",
+		Find:     "\tcase DisplayStopped, DisplayDrainedQ, DisplayOffAway, DisplayOffAwayQ:",
+		Replace:  "\tcase DisplayDrainedQ, DisplayOffAway, DisplayOffAwayQ:",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestC27StoppedAlarmsForAnAlwaysOnCell", "TestC24StopRecordDoesNotSilenceTheAlwaysOnAlarm"},
+		Why: "absentAlarm's switch ends in `default: return \"\", false` — no alarm. A \"down\" state " +
+			"missing from its case list therefore stops paging SILENTLY, and STOPPED is written by " +
+			"the cell unit's own stop hook, which a crash fires exactly as `systemctl stop` does. " +
+			"The heavy cell dies at 03:00, the box says \"I stopped\" on the way down, and the " +
+			"notifier answers by going quiet for the one incident it exists for.",
+	},
+
 	// ── the credential never leaks ────────────────────────────────────
 	{
 		Name:     "c9/the webhook URL stops being scrubbed",

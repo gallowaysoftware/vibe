@@ -242,9 +242,13 @@ func (s *Server) mcpTools() []any {
 		map[string]any{
 			"name": "fleet_status",
 			"description": "Fleet-wide state: one derived row per cell (SERVING / DRAINED / " +
-				"DRAINED? / OFF / OFF/AWAY / INCONSISTENT) with resident models, declared " +
-				"intent (why a cell is drained), last-seen for absent cells, and per-model " +
-				"cold-start ETA history. Answer 'what is every cell doing, and why' with this.",
+				"STOPPED / DRAINED? / OFF / OFF/AWAY / OFF/AWAY? / INCONSISTENT) with resident " +
+				"models, declared intent (why a cell is drained), last-seen for absent cells, and " +
+				"per-model cold-start ETA history. DRAINED means somebody chose it and said why; " +
+				"STOPPED means the cell's own unit recorded that it stopped and nothing recorded " +
+				"why (a clean stop and a crash look identical); DRAINED? means nothing is " +
+				"recorded at all. None of the three is a reason to act — they are for humans. " +
+				"Answer 'what is every cell doing, and why' with this.",
 			"inputSchema": map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},

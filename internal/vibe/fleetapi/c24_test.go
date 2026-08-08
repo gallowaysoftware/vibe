@@ -211,7 +211,13 @@ func TestC24StopRecordDoesNotSilenceTheAlwaysOnAlarm(t *testing.T) {
 		alarm   bool
 		wantSub string
 	}{
-		{"stop record, host up", CellSnapshot{Name: "heavy", Class: string(fleetcfg.ClassAlwaysOn),
+		// C27 gave this pairing its own display state; the DRAINED row
+		// below stays as the defensive one, because absentAlarm must
+		// answer the same way for a snapshot the local deriver no longer
+		// produces.
+		{"stop record, host up (C27: STOPPED)", CellSnapshot{Name: "heavy", Class: string(fleetcfg.ClassAlwaysOn),
+			Display: DisplayStopped, Intent: stop}, true, "nothing recorded why"},
+		{"stop record rendered DRAINED (pre-C27 shape)", CellSnapshot{Name: "heavy", Class: string(fleetcfg.ClassAlwaysOn),
 			Display: DisplayDrained, Intent: stop}, true, "nothing recorded why"},
 		{"stop record, box gone", CellSnapshot{Name: "heavy", Class: string(fleetcfg.ClassAlwaysOn),
 			Display: DisplayOff, Intent: stop}, true, "nothing recorded why"},

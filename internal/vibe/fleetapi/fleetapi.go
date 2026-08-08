@@ -157,8 +157,11 @@ type CellSnapshot struct {
 	// an omitted field is how missing evidence gets read as idleness.
 	Activity *CellActivity `json:"activity,omitempty"`
 	// Display is the derived display state (design doc §4 table), computed
-	// at read time: SERVING / DRAINED / DRAINED? / OFF / OFF/AWAY /
-	// OFF/AWAY? / INCONSISTENT.
+	// at read time: SERVING / DRAINED / STOPPED / DRAINED? / OFF /
+	// OFF/AWAY / OFF/AWAY? / INCONSISTENT. STOPPED (C27) is the cell
+	// unit's own stop record: more than DRAINED?'s nothing, less than a
+	// human's declaration. Consumers that need the record itself still
+	// read Intent — an OFF cell may carry one too.
 	Display string `json:"display"`
 }
 

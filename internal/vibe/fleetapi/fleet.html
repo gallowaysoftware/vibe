@@ -6,7 +6,8 @@
 <title>fleet</title>
 <style>
   :root { --bg: #14171c; --panel: #1c2129; --text: #d8dee6; --dim: #8b95a3; --line: #2a313d;
-          --green: #4caf7d; --amber: #d9a13b; --gray: #6b7686; --red: #d95f5f; --blue: #5b9bd5; }
+          --green: #4caf7d; --amber: #d9a13b; --gray: #6b7686; --red: #d95f5f; --blue: #5b9bd5;
+          --violet: #967bdc; }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif; }
   header { display: flex; align-items: baseline; gap: 16px; padding: 14px 20px; border-bottom: 1px solid var(--line); }
@@ -24,8 +25,15 @@
   .b-serving { background: rgba(76,175,125,.15); color: var(--green); }
   .b-drained { background: rgba(217,161,59,.15); color: var(--amber); }
   .b-drainedq { background: rgba(217,161,59,.08); color: var(--amber); border: 1px dashed var(--amber); }
+  /* C27: the unit's own stop record. Between DRAINED (somebody chose it)
+     and DRAINED? (nobody knows), and distinguishable from both at a
+     glance: violet, solid — not a shade of the amber pair. */
+  .b-stopped { background: rgba(150,123,220,.15); color: var(--violet); }
   .b-off { background: rgba(107,118,134,.15); color: var(--gray); }
   .b-inconsistent { background: rgba(217,95,95,.15); color: var(--red); }
+  /* A display state this build of the page does not know. It must look
+     WRONG rather than look off — see badgeClass. */
+  .b-unknown { background: rgba(217,95,95,.08); color: var(--red); border: 1px dashed var(--red); }
   .cls { color: var(--dim); font-size: 12px; }
   .models { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
   .m-ready { color: var(--green); } .m-starting { color: var(--amber); } .m-other { color: var(--dim); }
@@ -266,12 +274,24 @@ function leftUntil(ts) {
   if (s < 3600) return (s / 60 | 0) + "m left";
   return (s / 3600 | 0) + "h " + ((s % 3600) / 60 | 0) + "m left";
 }
+// Every state in fleetapi/display.go gets its own line, INCLUDING the
+// three that share b-off, and the fall-through is b-unknown rather than
+// b-off (C27). The old chain ended in `return "b-off"`, so a display
+// state added to fleetapi and forgotten here rendered as if the box were
+// merely off — a page confidently describing a state this build has
+// never heard of, which is the browser version of a switch with a silent
+// default. c27_test.go reads THIS function out of the embedded page and
+// fails until every state is named.
 function badgeClass(d) {
   if (d === "SERVING") return "b-serving";
   if (d === "DRAINED") return "b-drained";
+  if (d === "STOPPED") return "b-stopped";
   if (d === "DRAINED?") return "b-drainedq";
+  if (d === "OFF") return "b-off";
+  if (d === "OFF/AWAY") return "b-off";
+  if (d === "OFF/AWAY?") return "b-off";
   if (d === "INCONSISTENT") return "b-inconsistent";
-  return "b-off";
+  return "b-unknown";
 }
 function modelSpan(m) {
   const cls = m.state === "ready" ? "m-ready" : (m.state === "starting" ? "m-starting" : "m-other");

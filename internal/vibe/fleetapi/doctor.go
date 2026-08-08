@@ -1360,16 +1360,28 @@ func (s *Server) checkIntentHygiene(rep *DoctorReport, snap StateSnapshot) {
 		// now holds the when — but it declares no reason, so it stays in
 		// this bucket. The check must not get quieter because the box
 		// managed to say "I stopped" on the way down; what it gains is a
-		// timestamp and a fix that names the wrapper.
+		// timestamp and a fix that names the wrapper. C27 named that
+		// display STOPPED; this branch keys on the RECORD and not on the
+		// display, so the rename cannot change which bucket a cell lands
+		// in — only the word inside the sentence.
 		if IsStopRecord(c.Intent) {
 			undeclared = append(undeclared, c.Name+" "+c.Display+
 				" (recorded by its own unit stop at "+c.Intent.Since.UTC().Format(time.RFC3339)+"; nothing declared why)")
 			continue
 		}
 		switch c.Display {
-		case DisplayDrainedQ:
+		case DisplayDrainedQ, DisplayStopped:
 			// The cell stopped with NO entry in the intent store: nothing
 			// declared this, which is the whole point of the "?".
+			//
+			// STOPPED rides along for the same reason it is named in
+			// absentAlarm's switch. Today the branch above catches every
+			// STOPPED cell — the display is derived FROM the record — so
+			// this arm is unreachable through `displayState`, and that is
+			// the point: a `default` that silently drops an undeclared
+			// stop out of the sit-down report is the fall-through this
+			// phase exists to prevent. Gated on a hand-built snapshot,
+			// because the doctor reads a document.
 			undeclared = append(undeclared, c.Name+" "+c.Display)
 		case DisplayInconsistent:
 			// INCONSISTENT is the opposite: the intent IS declared and the
