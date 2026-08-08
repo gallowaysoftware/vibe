@@ -76,6 +76,7 @@ func TestSwapContract(t *testing.T) {
 			t.Run("I4_refused_requests_still_log_a_row", func(t *testing.T) { i4(t, tgt) })
 			t.Run("I5_connect_delivers_current_state", func(t *testing.T) { i5(t, tgt) })
 			t.Run("I6_api_version_names_the_build", func(t *testing.T) { i6(t, tgt) })
+			t.Run("I7_a_capture_is_fetchable_by_activity_id", func(t *testing.T) { i7(t, tgt) })
 		})
 	}
 }

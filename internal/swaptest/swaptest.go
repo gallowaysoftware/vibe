@@ -3,6 +3,7 @@ package swaptest
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -489,12 +490,18 @@ func (c *Cell) startRequest(model, reqPath string, stream bool) (id int64, done 
 }
 
 func (c *Cell) handleChat(w http.ResponseWriter, r *http.Request) {
+	// The raw bytes are kept because llama-swap keeps them: a metered
+	// request's verbatim body goes into the capture buffer, and the C25
+	// harvest reads it back at GET /api/captures/{id}. A double that
+	// answered completions without recording one would let a harvest be
+	// written against a route nothing ever populates.
+	raw, _ := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 	var body struct {
 		Model    string           `json:"model"`
 		Stream   bool             `json:"stream"`
 		Messages []map[string]any `json:"messages"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Model == "" {
+	if err := json.Unmarshal(raw, &body); err != nil || body.Model == "" {
 		c.Fail(body.Model, "/v1/chat/completions", http.StatusBadRequest, "invalid request body")
 		http.Error(w, `{"error":{"message":"invalid request body"}}`, http.StatusBadRequest)
 		return
@@ -516,7 +523,7 @@ func (c *Cell) handleChat(w http.ResponseWriter, r *http.Request) {
 	// changes an activity row's resp_content_type, and a double that always
 	// logs text/event-stream lets "streaming rows carry tokens" pass over a
 	// row nobody streamed.
-	_, done := c.startRequest(body.Model, "/v1/chat/completions", body.Stream)
+	id, done := c.startRequest(body.Model, "/v1/chat/completions", body.Stream)
 	if delay > 0 {
 		select {
 		case <-time.After(delay):
@@ -527,34 +534,54 @@ func (c *Cell) handleChat(w http.ResponseWriter, r *http.Request) {
 		Cache: 0, Draft: NotReported, DraftAcc: NotReported, Input: 12, Output: 1,
 		PromptPerSecond: 1200, TokensPerSecond: 90,
 	}, 200*time.Millisecond)
+
+	var resp []byte
 	if body.Stream {
-		c.writeChatStream(w, body.Model)
-		return
+		resp = chatStreamBytes(body.Model)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(resp)
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+	} else {
+		resp, _ = json.Marshal(map[string]any{
+			"id":      "chatcmpl-swaptest",
+			"object":  "chat.completion",
+			"model":   body.Model,
+			"choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": "ok"}, "finish_reason": "stop"}},
+			"usage":   map[string]any{"prompt_tokens": 12, "completion_tokens": 1, "total_tokens": 13},
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(resp)
 	}
-	writeJSON(w, map[string]any{
-		"id":      "chatcmpl-swaptest",
-		"object":  "chat.completion",
-		"model":   body.Model,
-		"choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": "ok"}, "finish_reason": "stop"}},
-		"usage":   map[string]any{"prompt_tokens": 12, "completion_tokens": 1, "total_tokens": 13},
+	// Recorded AFTER the answer, the way llama-swap's capture middleware
+	// does. The bytes are the caller's own request and this double's own
+	// canned reply — synthetic by construction, which is the only kind of
+	// capture anything in this repository may hold.
+	c.SetCapture(id, Capture{
+		ReqPath:     "/v1/chat/completions",
+		ReqHeaders:  map[string]string{"content-type": "application/json"},
+		ReqBody:     raw,
+		RespHeaders: map[string]string{"content-type": w.Header().Get("Content-Type")},
+		RespBody:    resp,
 	})
 }
 
-// writeChatStream answers a streamed completion the way llama.cpp does,
+// chatStreamBytes is a streamed completion the way llama.cpp emits one,
 // down to the trailing timings block — which is what llama-swap parses to
 // fill an activity row on a chat path, and the reason a stream needs no
 // stream_options cooperation to be measured.
-func (c *Cell) writeChatStream(w http.ResponseWriter, model string) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-	fl, _ := w.(http.Flusher)
+//
+// It returns the bytes rather than writing them because the same bytes go
+// into the capture buffer, and a stream the double could not hand back is
+// a stream no capture consumer could be tested against.
+func chatStreamBytes(model string) []byte {
+	var out []byte
 	chunk := func(v any) {
 		b, _ := json.Marshal(v)
-		_, _ = w.Write([]byte("data: " + string(b) + "\n\n"))
-		if fl != nil {
-			fl.Flush()
-		}
+		out = append(out, []byte("data: "+string(b)+"\n\n")...)
 	}
 	chunk(map[string]any{
 		"id": "chatcmpl-swaptest", "object": "chat.completion.chunk", "model": model,
@@ -570,10 +597,8 @@ func (c *Cell) writeChatStream(w http.ResponseWriter, model string) {
 			"cache_n": 0,
 		},
 	})
-	_, _ = w.Write([]byte("data: [DONE]\n\n"))
-	if fl != nil {
-		fl.Flush()
-	}
+	out = append(out, []byte("data: [DONE]\n\n")...)
+	return out
 }
 
 func (c *Cell) handleEmbed(w http.ResponseWriter, r *http.Request) {
