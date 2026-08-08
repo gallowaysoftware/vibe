@@ -33,7 +33,7 @@ to be implementable on its own after that.
 | [C23](c23-fleetlab-port-base.md) | A port base for `scripts/fleetlab`: one lab's teardown cannot reach another's | ~120 lines of shell + a ~400-line Go test package | futures item 15 | merged (#57); unit gates U1-U9 green (isolation + a negative control that removes the isolation); **L1-L3 PASS**, L3 being C16's L4 |
 | [C24](c24-drain-where-reclaim-happens.md) | Drain where reclaim happens: the launcher wrapper, and the unit's own stop | ~350 lines of shell + `fleetapi.StopIntentReason` | C2, C3, C14 | merged (#58); unit gates green over the SHIPPED files, +2 registry entries; **the live stop-record gate PASS** (harness, 2026-08-08, C26b — `gate-c24-stop-record.sh`, with a positive control); the unit half and the shutdown case still owed |
 | [C25](c25-bench-replay.md) | `vibe model try --replay`: your own traffic as the benchmark, and the refusal that ships first | 1315 non-comment production + 2364 test lines | C8, C18 (composition), C7a (the activity walk) | merged (#59); delivered as a C18 flag rather than a top-level verb; design + independent review (12 findings, one a test that asserted nothing); unit gates U1-U14 green, 18 predicates mutation-verified; **L2 PASS on real v239 and v247**; L1, L3, L4 NOT RUN (L4 needs metal) |
-| [C26a](c26a-deferred-fixes.md) | The four deferred fixes: the last `sh -c` site, a check that fired for the wrong boxes, a silent peer-id collision, the missing starter | ~250 lines | #14, U3, C13 | merged (#60); all gates PASS; 7 new registry entries (44/44 at merge; the registry stands at **62** after C25) |
+| [C26a](c26a-deferred-fixes.md) | The four deferred fixes: the last `sh -c` site, a check that fired for the wrong boxes, a silent peer-id collision, the missing starter | ~250 lines | #14, U3, C13 | merged (#60); all gates PASS; 7 new registry entries (44/44 at merge; the registry reached **62** with C25 and **66** with C26b) |
 
 C10 (await extensions) is the last of the three branches cut from
 `c9e8bcf` in parallel; C11 and then C9 landed ahead of it. None of the
@@ -490,7 +490,7 @@ now carries an **APPLIED by** marker at its own heading, because C22 left
 none and the only way to tell an outstanding section from a spent one was
 to diff the shared files by hand.
 
-Three things it found that bookkeeping alone would not have.
+Four things it found that bookkeeping alone would not have.
 
 - **Two phases proposed opposite rules under the same word.** C26a asked
   that a doctor check which cannot apply return *not-applicable, never
@@ -516,6 +516,21 @@ Three things it found that bookkeeping alone would not have.
   above was re-read against its phase doc and names a physical fact or a
   wall clock. Before writing a live gate off, ask C25's question:
   **does this invariant need a FLEET, or one process?**
+- **The guard on ground rule 1 could go red for a reason of its own.**
+  `TestProxy_StreamingCompletionIsUnbuffered` failed once in CI on a diff
+  touching zero lines of `internal/vibe/proxy`, and was re-run. Two real
+  defects in the test, both in teardown: it left a parked upstream
+  handler unreleased on every early-exit path (a `t.Fatal` above the
+  release cost a measured 10 s of teardown *and* printed a
+  ReverseProxy copy error belonging to no assertion — the CI signature,
+  manufactured by the test itself), and both of its hops dialled
+  `http.DefaultTransport`, which every `httptest.Server.Close` in the
+  binary reaches into. Fixed in the test; `proxy.go` is byte-identical.
+  The initiating CI event was **not** reproduced and the write-up says
+  so. The guard is now registered in `internal/mutation`, because a
+  flaky guard on the one invariant standing between a long generation
+  and a client timeout is worse than no guard: it teaches the fleet to
+  re-run.
 
 ## Ground rules for the implementing agent
 

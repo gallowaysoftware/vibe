@@ -1,12 +1,12 @@
 package proxy
 
 import (
-	"bufio"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -23,7 +23,23 @@ import (
 // A frontend that stalls here is not a subtle regression. Claude Code
 // drops a request after five minutes of silence, so a proxy that buffers a
 // stream instead of flushing it turns a slow model into a broken one.
+//
+// Every socket in this rig belongs to the subtest that opened it, and the
+// teardown order below is part of the test. A connection closed under
+// httputil.ReverseProxy's body copy makes it panic with ErrAbortHandler,
+// which truncates the chunked response the client is reading — and that
+// arrives here as "unexpected EOF" from a read the assertion cannot tell
+// apart from the proxy having buffered the completion. Both halves of that
+// sentence are reachable through shared state: the client and the proxy's
+// upstream dialer are both http.DefaultTransport unless told otherwise,
+// and every httptest.Server.Close in this binary (there are dozens) calls
+// http.DefaultTransport.CloseIdleConnections as a courtesy. A guard that
+// can go red for a reason other than its own trains everyone to re-run it.
 func TestProxy_StreamingCompletionIsUnbuffered(t *testing.T) {
+	const (
+		firstFrame = "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n"
+		doneFrame  = "data: [DONE]\n\n"
+	)
 	for _, tc := range []struct {
 		name  string
 		setup func(p *Proxy, upstream *url.URL)
@@ -39,35 +55,57 @@ func TestProxy_StreamingCompletionIsUnbuffered(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			released := make(chan struct{})
-			second := make(chan struct{})
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseUpstream := func() { releaseOnce.Do(func() { close(release) }) }
+
 			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.WriteHeader(http.StatusOK)
-				_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n")
+				_, _ = io.WriteString(w, firstFrame)
 				w.(http.Flusher).Flush()
-				select {
-				case <-released:
-				case <-time.After(10 * time.Second):
-				}
-				_, _ = io.WriteString(w, "data: [DONE]\n\n")
+				// No timeout here: the teardown releases it on every exit
+				// path, so the handler cannot outlive the subtest and
+				// httptest.Server.Close cannot be left waiting on it.
+				<-release
+				_, _ = io.WriteString(w, doneFrame)
 				w.(http.Flusher).Flush()
-				close(second)
 			}))
 			defer up.Close()
+			upstreamConns := &http.Transport{}
+			defer upstreamConns.CloseIdleConnections()
 			uu, _ := url.Parse(up.URL)
 
 			p := New("127.0.0.1:0")
 			tc.setup(p, uu)
+			dialUpstreamWith(p, upstreamConns)
 			front := httptest.NewServer(p)
 			defer front.Close()
 
-			resp, err := http.Post(front.URL+"/v1/chat/completions", "application/json", //nolint:bodyclose // deferred below; bodyclose can't see past the reader goroutine
+			clientConns := &http.Transport{}
+			defer clientConns.CloseIdleConnections()
+			client := &http.Client{Transport: clientConns}
+
+			resp, err := client.Post(front.URL+"/v1/chat/completions", "application/json", //nolint:bodyclose // closed by the teardown below, which bodyclose cannot follow
 				strings.NewReader(`{"model":"alias","stream":true,"messages":[]}`))
 			if err != nil {
 				t.Fatalf("post: %v", err)
 			}
-			defer resp.Body.Close()
+
+			readerDone := make(chan struct{})
+			// Runs before front.Close/up.Close (defers are LIFO), in the one
+			// order that cannot manufacture the failure this test reports:
+			// let the upstream finish so the response ends on its own, then
+			// close the body — which is also what unparks a reader still
+			// waiting on a stream that never came — then join it. A body
+			// closed while the copy is live cancels the front request's
+			// context, which closes the upstream connection out from under
+			// ReverseProxy and logs a copy error belonging to no assertion.
+			defer func() {
+				releaseUpstream()
+				resp.Body.Close()
+				<-readerDone
+			}()
 
 			// Bytes must reach the client while the upstream is still
 			// holding the connection open. If the proxy buffered the
@@ -86,6 +124,7 @@ func TestProxy_StreamingCompletionIsUnbuffered(t *testing.T) {
 			first := make(chan readResult, 1)
 			buf := make([]byte, 4096)
 			go func() {
+				defer close(readerDone)
 				n, err := resp.Body.Read(buf)
 				first <- readResult{n, err}
 			}()
@@ -107,17 +146,32 @@ func TestProxy_StreamingCompletionIsUnbuffered(t *testing.T) {
 					"streaming: the proxy is buffering the completion path")
 			}
 
-			close(released)
-			<-second
-			rest, err := io.ReadAll(bufio.NewReader(resp.Body))
+			releaseUpstream()
+			rest, err := io.ReadAll(resp.Body)
 			if err != nil {
 				t.Fatalf("read rest: %v", err)
 			}
 			whole := string(head) + string(rest)
-			if want := "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\ndata: [DONE]\n\n"; whole != want {
+			if want := firstFrame + doneFrame; whole != want {
 				t.Errorf("stream = %q, want the upstream's bytes verbatim %q", whole, want)
 			}
 		})
+	}
+}
+
+// dialUpstreamWith points every backend the proxy currently holds at tr, so
+// the hop the streaming assertion depends on is dialed from a pool this test
+// owns. Backends are built inside SetBackend/AddRoute/SetModelRewrite, and
+// SetModelRewrite rebuilds the default one, so this belongs after a case's
+// setup and before the front server takes a request.
+func dialUpstreamWith(p *Proxy, tr http.RoundTripper) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.def != nil {
+		p.def.rp.Transport = tr
+	}
+	for _, be := range p.routes {
+		be.rp.Transport = tr
 	}
 }
 

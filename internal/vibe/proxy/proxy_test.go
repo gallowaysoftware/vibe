@@ -165,9 +165,14 @@ func TestProxy_AggregatesModels_NoDefault(t *testing.T) {
 }
 
 func TestProxy_AggregatesModels_NoDefault_AllRoutesDown_Returns503(t *testing.T) {
-	deadSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	deadURL, _ := url.Parse(deadSrv.URL)
-	deadSrv.Close()
+	// A closed httptest server is not a dead address, it is a FREE one: the
+	// port goes back to the ephemeral pool and any other server in this
+	// binary — or on the box — can rebind it, at which point the "dead"
+	// upstream answers and this test fails for a reason nowhere near its
+	// subject. (Observed under concurrent runs of this package.) Port 1 is
+	// the house idiom for an address that refuses immediately and can never
+	// be bound by an unprivileged process.
+	deadURL, _ := url.Parse("http://127.0.0.1:1")
 
 	p := New("127.0.0.1:0")
 	p.AddRoute("tiny-classifier", deadURL)

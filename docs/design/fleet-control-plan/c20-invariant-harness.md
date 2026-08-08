@@ -838,8 +838,8 @@ Each of these was planted and watched, not read:
 ## For the reconciliation pass
 
 > **APPLIED by C22 (PR #46, 2026-08-06)** — verified against the tree by
-> C26b. The registry size quoted below has moved on: it is **62** entries
-> as of C25.
+> C26b. The registry size quoted below has moved on: **62** entries as of
+> C25, **66** as of C26b.
 
 This branch does not touch `AGENTS.md`,
 `docs/design/fleet-control-plan/README.md` or

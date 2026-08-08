@@ -164,6 +164,28 @@ stand-in.
   makes fleetd's `clean` refuse the cell's WHOLE announce — presence,
   intent echo, usage and probes with it. An upstream dependency the
   conformance suite does not replay is the hole C16 exists to close.
+- **A streaming guard must own its sockets.**
+  `TestProxy_StreamingCompletionIsUnbuffered` pins ground rule 1 (the SSE
+  keepalive) and went red once in CI on a diff touching **zero** lines of
+  `internal/vibe/proxy`. The chain is worth knowing for every
+  proxied-stream test here: a connection closed under
+  `httputil.ReverseProxy`'s body copy makes it log `read error during
+  body copy` and panic `ErrAbortHandler`, which truncates the chunked
+  response and reaches the client as `unexpected EOF` — **indistinguishable,
+  at the assertion, from the proxy having buffered the completion.** So a
+  test on this path must: dial BOTH hops from `*http.Transport`s it owns
+  (both default to `http.DefaultTransport`, and every
+  `httptest.Server.Close` in the binary calls `CloseIdleConnections` on it
+  as a documented courtesy); release a parked upstream handler on EVERY
+  exit path (`Close` waits for its handlers, so a `t.Fatal` above the
+  release cost a measured 10 s of teardown and printed a copy error
+  belonging to no assertion); close each transport's idle conns before its
+  server; and join any reader goroutine before closing the body. Related,
+  same package: **a closed `httptest` server is not a dead address, it is
+  a free one** — the port returns to the ephemeral pool and something else
+  can rebind it, so an "upstream is down" fixture uses `127.0.0.1:1`.
+  A guard that can go red for a reason other than its own trains everyone
+  to re-run it, which is worse than no guard.
 - **A shell command in a test is a shell-dependent test.** `/bin/sh` is
   bash on the workstation and dash in CI, and the difference is not
   cosmetic: bash exec-optimises `sh -c '<one word>'` while dash forks, so
