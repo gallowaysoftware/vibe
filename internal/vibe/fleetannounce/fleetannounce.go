@@ -32,6 +32,7 @@ import (
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 	"github.com/gallowaysoftware/vibe/internal/vibe/router"
+	"github.com/gallowaysoftware/vibe/internal/vibe/shellcmd"
 )
 
 // Config is the announce loop's complete input.
@@ -466,10 +467,21 @@ func (c *Client) reconcile(ctx context.Context, resp *fleetapi.AnnounceResponse)
 	}
 }
 
+// verbBudget bounds one desired-intent verb. Sixty seconds, matching the
+// daemon's cellCmdTimeout default: it is the same class of command (one
+// systemd unit stop, generously) reached from the announce loop instead of
+// from an RPC. Derived from the caller's context, so a shorter deadline
+// upstream still wins.
+const verbBudget = 60 * time.Second
+
 // runVerb executes a drain/resume verb via sh -c (same semantics as the
 // daemon's cell_cmds: bounded, stderr reported), returning whether it
 // RAN successfully — intent is stamped only then, so a failed or
 // unconfigured verb keeps the request pending and the mismatch visible.
+//
+// The budget below is only a bound because execSh's production value goes
+// through shellcmd: a deadline that kills `sh` and then waits on what `sh`
+// forked returns `signal: killed` on schedule and does not return at all.
 func (c *Client) runVerb(ctx context.Context, name, cmd string) bool {
 	if cmd == "" {
 		// Log once per unique request (the heartbeat would otherwise
@@ -482,7 +494,7 @@ func (c *Client) runVerb(ctx context.Context, name, cmd string) bool {
 		c.mu.Unlock()
 		return false
 	}
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, verbBudget)
 	defer cancel()
 	out, err := execSh(ctx, cmd)
 	if err != nil {
@@ -726,13 +738,51 @@ func (c *Client) token() string {
 	return strings.TrimSpace(string(data))
 }
 
-// execSh runs a command via sh -c, returning combined output.
-func execSh(ctx context.Context, cmd string) (string, error) {
-	out, err := execCmd(ctx, "sh", "-c", cmd)
+// verbKillGrace is the second half of a desired-intent verb's bound: how
+// long Wait tolerates the command's output pipes staying open AFTER the
+// 60s budget has already killed it.
+//
+// It exists because a context deadline on its own does not end this call —
+// exec.CommandContext kills `sh`, and `sh` hands its stdout/stderr to
+// whatever it forked. internal/vibe/shellcmd's package comment carries the
+// full derivation; this constant is only how long THIS verb waits.
+//
+// Two seconds, matching the daemon's cellCmdWaitDelay because it is the
+// same class of command (a `systemctl stop` on the same box): the last
+// stderr line worth logging arrives immediately or not at all, and two
+// seconds is noise next to the 60s budget above it.
+const verbKillGrace = 2 * time.Second
+
+// execSh is the verb seam: tests replace it to script a verb's outcome
+// without handing an operator's shell string to a real shell.
+//
+// Its production value is runShellVerb and nothing else. That is pinned by
+// TestVerbSeam_ProductionDefaultIsTheBoundedRunner rather than assumed,
+// because a seam is the standard way a bound stops being exercised: every
+// test in this package replaces this variable, so if the default drifted
+// off shellcmd nothing here would notice. The bound is proved by driving
+// runVerb with a real forking command through the unreplaced seam
+// (TestDesiredIntentVerb_*), which is the only arrangement where the
+// production path and the tested path are the same path.
+var execSh = runShellVerb
+
+// runShellVerb runs a desired-intent verb via sh -c, returning trimmed
+// combined output.
+//
+// shellcmd.New, not a bare exec.CommandContext: a cell verb is an
+// operator's shell string, and runVerb's 60s budget only bounds it if the
+// kill reaches what the shell forked and the wait cannot outlive the kill.
+// This was the fourth and last call site in the repo still deriving that
+// for itself — which is to say, still not deriving it at all.
+func runShellVerb(ctx context.Context, cmd string) (string, error) {
+	out, err := verbCmd(ctx, cmd).CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
 
-// execCmd is the sh seam (tests record instead of executing).
-var execCmd = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+// verbCmd builds the verb's command without running it, so a test can read
+// the three fields back off the result on a platform where a process
+// cannot be driven out of its own group. Split out for exactly that
+// reason; runShellVerb is its only production caller.
+func verbCmd(ctx context.Context, cmd string) *exec.Cmd {
+	return shellcmd.New(ctx, cmd, verbKillGrace)
 }

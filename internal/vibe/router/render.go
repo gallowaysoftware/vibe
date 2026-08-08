@@ -7,6 +7,7 @@ package router
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -412,6 +413,10 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 		cfg.Hooks = h
 	}
 
+	if err := checkCatalogIDsUnique(cfg); err != nil {
+		return "", err
+	}
+
 	body, err := yaml.Marshal(cfg)
 	if err != nil {
 		return "", fmt.Errorf("marshal llama-swap config: %w", err)
@@ -424,6 +429,53 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 		body = merged
 	}
 	return headerComment + string(body), nil
+}
+
+// checkCatalogIDsUnique refuses a config that advertises one client-facing
+// id from two entries.
+//
+// resolveAliases is the alias half of this rule and cannot be the whole of
+// it: it sees defs, not the rendered catalog, so it says nothing about a
+// llama_server def NAMED after a peer's model id (no alias involved), nor
+// about two cloud peers listing the same id. Both render two entries under
+// one id in silence, and llama-swap then serves whichever won — which is
+// the "advertise an id nothing can route to" failure with the sign flipped:
+// the id resolves, just not reliably to the thing the operator meant.
+//
+// It runs over the rendered cfg rather than over defs on purpose. That is
+// the artifact clients actually see, so this catches the class rather than
+// the two paths into it that are known today.
+//
+// Sorted iteration: a map-order-dependent error message would name a
+// different pair on different runs, and an error a human cannot reproduce
+// is most of the way to no error at all.
+func checkCatalogIDsUnique(cfg swapConfig) error {
+	owner := map[string]string{}
+	claim := func(id, by string) error {
+		if prev, dup := owner[id]; dup {
+			return fmt.Errorf("rendered catalog advertises %q twice (%s and %s): llama-swap would serve whichever entry wins, so the id resolves to a model nobody chose", id, prev, by)
+		}
+		owner[id] = by
+		return nil
+	}
+	for _, name := range slices.Sorted(maps.Keys(cfg.Models)) {
+		if err := claim(name, "models."+name); err != nil {
+			return err
+		}
+		for _, a := range cfg.Models[name].Aliases {
+			if err := claim(a, "alias of models."+name); err != nil {
+				return err
+			}
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(cfg.Peers)) {
+		for _, id := range cfg.Peers[name].Models {
+			if err := claim(id, "peers."+name); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // mergeExtras folds the extras file's top-level sections into the rendered
@@ -484,20 +536,49 @@ func ResolveAliases(defs []*profile.BackendDef) (map[string][]string, error) {
 }
 
 // aliasClaimants selects the defs whose ids the router serves directly —
-// the same set Render turns into models:/peers: entries. cloud_peer defs
-// are excluded: their catalog ids come from cloud_peer.models, so they
-// neither claim aliases nor reserve names.
-func aliasClaimants(defs []*profile.BackendDef) []*profile.BackendDef {
-	out := make([]*profile.BackendDef, 0, len(defs))
+// the same set Render turns into models: entries — and, separately, the
+// catalog ids a cloud peer serves, keyed to the def that declares them.
+//
+// cloud_peer defs are still not CLAIMANTS: Render emits no aliases for a
+// peer stanza (`p := &swapPeer{Proxy: cp.BaseURL, Models: cp.Models}`), so
+// letting a peer win an alias would take that alias off the def that would
+// actually have served it and advertise nothing in its place.
+//
+// But their model ids are RESERVED, which is what was missing. A cloud
+// peer's catalog ids are its cloud_peer.models entries, never its def name
+// (AGENTS.md, PR #14) — and this function keyed everything off def.Name, so
+// a llama_server def whose alias equalled a peer's model id sailed through
+// resolution and rendered two entries claiming one client-facing id, with
+// no error. Reserving those ids sends that collision down the same path an
+// alias equal to a def NAME already takes.
+//
+// Why an error rather than router.alias_owner disambiguation: alias_owner
+// arbitrates between two claimants of the same ALIAS. It has never had
+// anything to say about an alias that equals a canonical id — an id is not
+// a claim, it is the thing claims are measured against, and `names[a]` has
+// always been an unresolvable error for exactly that reason. A peer's model
+// ids are canonical in precisely that sense, so they get the same treatment
+// with a message that names the peer.
+func aliasClaimants(defs []*profile.BackendDef) (claimants []*profile.BackendDef, peerIDs map[string]string) {
+	claimants = make([]*profile.BackendDef, 0, len(defs))
+	peerIDs = map[string]string{}
 	for _, d := range defs {
 		if !d.Backend.External {
 			continue
 		}
+		if cp := d.Backend.CloudPeer; cp != nil {
+			for _, id := range cp.Models {
+				if _, taken := peerIDs[id]; !taken {
+					peerIDs[id] = d.Name
+				}
+			}
+			continue
+		}
 		if d.Backend.LlamaServer != nil || d.Backend.ComfyUI != nil || d.Backend.MLXServer != nil {
-			out = append(out, d)
+			claimants = append(claimants, d)
 		}
 	}
-	return out
+	return claimants, peerIDs
 }
 
 // resolveAliases computes each rendered model's alias list and enforces the
@@ -510,7 +591,7 @@ func aliasClaimants(defs []*profile.BackendDef) []*profile.BackendDef {
 // configs stay valid. A def's own name is never an alias (the models: key
 // already serves it), and an alias equal to another def's name is an
 // unresolvable error: model ids are canonical and always win.
-func resolveAliases(modelDefs []*profile.BackendDef) (map[string][]string, error) {
+func resolveAliases(modelDefs []*profile.BackendDef, peerIDs map[string]string) (map[string][]string, error) {
 	names := make(map[string]bool, len(modelDefs))
 	for _, def := range modelDefs {
 		names[def.Name] = true
@@ -539,6 +620,14 @@ func resolveAliases(modelDefs []*profile.BackendDef) (map[string][]string, error
 			if names[a] {
 				other := a
 				return nil, fmt.Errorf("backend %s: alias %q collides with backend def %q (def names are canonical model ids and cannot be claimed as aliases)", def.Name, a, other)
+			}
+			if peer, taken := peerIDs[a]; taken {
+				// Rendering both would put two entries in the catalog under
+				// one client-facing id — a models: alias and a peers: model —
+				// and llama-swap would route it to whichever won. An id that
+				// resolves to whichever entry wins is the same failure as an
+				// id nothing can route to; it just takes longer to notice.
+				return nil, fmt.Errorf("backend %s: alias %q collides with cloud peer %s's model id (a peer's catalog ids are its cloud_peer.models entries and are canonical, exactly like def names; rename the alias or drop the id from the peer)", def.Name, a, peer)
 			}
 			claims[a] = append(claims[a], claim{def: def, owner: owner})
 			claimed[def.Name] = append(claimed[def.Name], a)

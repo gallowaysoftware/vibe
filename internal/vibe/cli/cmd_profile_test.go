@@ -200,6 +200,15 @@ func fillReplacements(t *testing.T, body, kind string) string {
 		// llama-embed-service ships with concrete values; the only
 		// REPLACE-marked items are advisory ("REPLACE if you...").
 		// No-op fill is enough for the loader to accept it.
+	case "cloud-peer":
+		// The only fill any template here needs that touches NOTHING on
+		// disk: a cloud peer has no weights, no venv and no image, so the
+		// substitutions are three strings and the file loads. Everything
+		// filled is a value only the operator's provider can supply — the
+		// boundary this template is written to.
+		body = strings.ReplaceAll(body, "https://api.REPLACE-provider.example", "https://api.example.com")
+		body = strings.ReplaceAll(body, "REPLACE_PROVIDER_API_KEY", "EXAMPLE_API_KEY")
+		body = strings.ReplaceAll(body, "REPLACE-model-id", "example-model-id")
 	case "tabby-api":
 		// The tabby-api template requires the model_dir basename to
 		// match the alias (validator enforces this). We name both
@@ -493,6 +502,43 @@ func TestProfileNew_KindComfyUI(t *testing.T) {
 	for _, line := range strings.Split(got, "\n") {
 		if strings.HasPrefix(strings.TrimRight(line, " \t"), "frontend:") {
 			t.Errorf("comfyui template should not declare a top-level frontend block; offending line: %q", line)
+		}
+	}
+}
+
+// TestProfileNew_KindCloudPeer is the finding, spelled as the command that
+// used to fail: `vibe profile new <name> --kind cloud-peer` had no template
+// to resolve, so the one shape PR #14 legalised — a harness pointed at a
+// model the router serves — was the one shape the CLI could not generate.
+//
+// The generated file's loadability is covered by TestProfileInit_Kinds
+// (which fills and loads every bundled kind); what is asserted here is that
+// the kind resolves at all, and that the starter carries the two halves
+// that make it useful: a peer backend and a frontend to point at it.
+func TestProfileNew_KindCloudPeer(t *testing.T) {
+	profilesDir := stubProfileEnv(t)
+	cmd := profileCmd()
+	cmd.SetArgs([]string{"new", "fleetpeer", "--kind", "cloud-peer"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(profilesDir, "fleetpeer.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	for _, want := range []string{"cloud_peer:", "api_key_env:", "models:", "kind: external", "name: fleetpeer"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("generated cloud-peer profile missing %q:\n%s", want, got)
+		}
+	}
+	// The boundary: a starter may name an env VAR, never a key, and may
+	// point at the reference fleet by placeholder, never at a real host.
+	for _, leak := range []string{"sk-", "Bearer ", "thegalloways"} {
+		if strings.Contains(got, leak) {
+			t.Errorf("the cloud-peer template carries %q — a starter ships example values only:\n%s", leak, got)
 		}
 	}
 }

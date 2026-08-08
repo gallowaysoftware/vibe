@@ -186,12 +186,12 @@ func TestConflictRule_NewerDesiredExecutes(t *testing.T) {
 	}
 
 	var verbs []string
-	orig := execCmd
-	execCmd = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-		verbs = append(verbs, strings.Join(args, " "))
-		return nil, nil
+	orig := execSh
+	execSh = func(ctx context.Context, cmd string) (string, error) {
+		verbs = append(verbs, cmd)
+		return "", nil
 	}
-	defer func() { execCmd = orig }()
+	defer func() { execSh = orig }()
 
 	if err := c.announceOnce(t.Context()); err != nil {
 		t.Fatal(err)
@@ -227,11 +227,11 @@ func TestConflictRule_FailingVerbNeverAcks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	orig := execCmd
-	execCmd = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-		return nil, fmt.Errorf("exit status 4")
+	orig := execSh
+	execSh = func(ctx context.Context, cmd string) (string, error) {
+		return "", fmt.Errorf("exit status 4")
 	}
-	defer func() { execCmd = orig }()
+	defer func() { execSh = orig }()
 
 	if err := c.announceOnce(t.Context()); err != nil {
 		t.Fatal(err)
@@ -283,12 +283,12 @@ func TestConflictRule_AlreadyInStateReStamps(t *testing.T) {
 		State: "drained", Reason: "x", Since: time.Now().UTC().Add(time.Minute),
 	}
 	verbs := 0
-	orig := execCmd
-	execCmd = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+	orig := execSh
+	execSh = func(ctx context.Context, cmd string) (string, error) {
 		verbs++
-		return nil, nil
+		return "", nil
 	}
-	defer func() { execCmd = orig }()
+	defer func() { execSh = orig }()
 
 	before := c.LocalIntent().Since
 	if err := c.announceOnce(t.Context()); err != nil {
@@ -320,12 +320,12 @@ func TestConflictRule_OlderDesiredIgnored(t *testing.T) {
 		t.Fatal(err)
 	}
 	verbs := 0
-	orig := execCmd
-	execCmd = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+	orig := execSh
+	execSh = func(ctx context.Context, cmd string) (string, error) {
 		verbs++
-		return nil, nil
+		return "", nil
 	}
-	defer func() { execCmd = orig }()
+	defer func() { execSh = orig }()
 
 	if err := c.announceOnce(t.Context()); err != nil {
 		t.Fatal(err)

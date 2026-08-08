@@ -11,36 +11,161 @@ import (
 	"testing"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
+	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 )
 
 // ─── checkLlamaBinary ───────────────────────────────────────────────────────
 
-func TestCheckLlamaBinary_Found(t *testing.T) {
+// The four shapes a box can be in. Before C26a this check ran the top two
+// rows only — it asked $PATH and nothing else — so row three FAILED doctor
+// (exit non-zero) on a laptop whose only profiles are cloud_peer, pointed
+// at a peer through a remote front. The same mis-fire hit comfyui-only and
+// mlx-only boxes, which is why the applicable set is computed from what is
+// DECLARED rather than from any one backend kind.
+
+func TestCheckLlamaBinary_DeclaredAndPresent(t *testing.T) {
 	env := &doctorEnv{lookPath: func(name string) (string, error) {
 		if name != "llama-server" {
 			t.Fatalf("unexpected lookup of %q", name)
 		}
 		return "/opt/bin/llama-server", nil
 	}}
-	r := checkLlamaBinary(env)
+	r, ok := checkLlamaBinary(env, []string{"profile coder"})
+	if !ok {
+		t.Fatal("a box that declares a llama_server backend must be told about the binary")
+	}
 	if r.Status != statusOK {
 		t.Fatalf("status = %v, want OK", r.Status)
 	}
-	if r.Message != "/opt/bin/llama-server" {
-		t.Fatalf("message = %q", r.Message)
+	if !strings.Contains(r.Message, "/opt/bin/llama-server") || !strings.Contains(r.Message, "profile coder") {
+		t.Fatalf("message = %q, want the path AND what needs it", r.Message)
 	}
 }
 
-func TestCheckLlamaBinary_Missing(t *testing.T) {
+func TestCheckLlamaBinary_DeclaredAndMissingStillFails(t *testing.T) {
 	env := &doctorEnv{lookPath: func(string) (string, error) {
 		return "", errors.New("not found")
 	}}
-	r := checkLlamaBinary(env)
+	r, ok := checkLlamaBinary(env, []string{"profile coder"})
+	if !ok {
+		t.Fatal("not-applicable on a box that declares a llama_server backend: the check would never fire again")
+	}
 	if r.Status != statusFail {
-		t.Fatalf("status = %v, want FAIL", r.Status)
+		t.Fatalf("status = %v, want FAIL — a declared llama_server backend with no binary cannot start", r.Status)
 	}
 	if !strings.Contains(r.Message, "install llama.cpp") {
 		t.Fatalf("message lacks install hint: %q", r.Message)
+	}
+	if !strings.Contains(r.Message, "profile coder") {
+		t.Fatalf("message does not name what needs it: %q", r.Message)
+	}
+}
+
+// The finding itself: nothing on disk spawns llama-server, so its absence
+// is not a fault. Not-applicable, NOT a pass — a green "llama-server: ok"
+// on a box with no binary would be a claim doctor cannot make.
+func TestCheckLlamaBinary_NothingDeclaresItIsNotApplicable(t *testing.T) {
+	env := &doctorEnv{lookPath: func(string) (string, error) {
+		t.Fatal("$PATH was consulted for a binary nothing on this box would ever invoke")
+		return "", nil
+	}}
+	if _, ok := checkLlamaBinary(env, nil); ok {
+		t.Fatal("a cloud_peer-only (or comfyui-only, or mlx-only) box was failed for a missing llama-server it will never invoke")
+	}
+}
+
+// ─── llamaServerUsers: the declaration scan ─────────────────────────────────
+
+// TestLlamaServerUsers_TheFourShapesOnDisk is the scan the check is gated
+// on. The mixed box is the row that matters: one cloud_peer profile and one
+// llama_server backend def must still produce a user, or a fleet box would
+// stop being told its binary is missing.
+func TestLlamaServerUsers_TheFourShapesOnDisk(t *testing.T) {
+	const cloudPeer = `name: peer
+backend:
+  cloud_peer:
+    base_url: https://api.example.com
+    api_key_env: EXAMPLE_API_KEY
+    models: [example-model]
+`
+	const llamaProfile = `name: coder
+backend:
+  llama_server:
+    path: /nonexistent/model.gguf
+    alias: coder
+    context: 4096
+`
+	// A definition that pins its own binary never consults $PATH.
+	const pinnedBinary = `name: custom
+backend:
+  llama_server:
+    binary: /opt/llama/bin/llama-server
+    path: /nonexistent/model.gguf
+    alias: custom
+    context: 4096
+`
+	for _, tc := range []struct {
+		name     string
+		profiles map[string]string
+		backends map[string]string
+		want     []string
+	}{
+		{"nothing at all", nil, nil, nil},
+		{"a cloud_peer-only box", map[string]string{"peer.yaml": cloudPeer}, nil, nil},
+		{"a llama_server profile", map[string]string{"coder.yaml": llamaProfile}, nil, []string{"profile coder"}},
+		{"a llama_server backend def", nil, map[string]string{"gpu.yaml": llamaProfile}, []string{"backend gpu"}},
+		{"a mixed box", map[string]string{"peer.yaml": cloudPeer}, map[string]string{"gpu.yaml": llamaProfile},
+			[]string{"backend gpu"}},
+		{"a pinned binary is not a $PATH user", map[string]string{"custom.yaml": pinnedBinary}, nil, nil},
+		{"an unparseable file is skipped, not fatal", map[string]string{"junk.yaml": "::: not yaml"}, nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backendsDir, profilesDir := setDoctorFixtureDirs(t)
+			for n, body := range tc.profiles {
+				if err := os.WriteFile(filepath.Join(profilesDir, n), []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for n, body := range tc.backends {
+				if err := os.WriteFile(filepath.Join(backendsDir, n), []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got := llamaServerUsers(profilesDir, backendsDir)
+			if len(got) != len(tc.want) {
+				t.Fatalf("users = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("users = %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// A llama_server profile whose model file is not on disk yet still DECLARES
+// the binary. Scanning through profile.Load (which validates the path) would
+// drop it and quietly make the check not-applicable on exactly the box that
+// needs it — the disarm this repo keeps finding, one layer down.
+func TestLlamaServerUsers_AnUnpulledModelStillDeclaresTheBinary(t *testing.T) {
+	_, profilesDir := setDoctorFixtureDirs(t)
+	body := `name: coder
+backend:
+  llama_server:
+    path: ` + filepath.Join(t.TempDir(), "not-downloaded-yet.gguf") + `
+    alias: coder
+    context: 4096
+`
+	path := filepath.Join(profilesDir, "coder.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := profile.Load(path); err == nil {
+		t.Fatal("the premise of this test is gone: the loader now accepts a missing model path")
+	}
+	if got := llamaServerUsers(profilesDir, paths.BackendsDir()); len(got) != 1 {
+		t.Fatalf("users = %v, want the profile counted despite its model not being pulled yet", got)
 	}
 }
 
@@ -53,7 +178,10 @@ func TestCheckLlamaVersion_OK(t *testing.T) {
 			return []byte("version: b9159-88b55f4\n"), nil
 		},
 	}
-	r := checkLlamaVersion(context.Background(), env)
+	r, ok := checkLlamaVersion(context.Background(), env, []string{"profile coder"})
+	if !ok {
+		t.Fatal("not-applicable on a box that declares a llama_server backend")
+	}
 	if r.Status != statusOK {
 		t.Fatalf("status = %v, want OK; message=%q", r.Status, r.Message)
 	}
@@ -69,7 +197,7 @@ func TestCheckLlamaVersion_NonZeroExitWithOutput(t *testing.T) {
 			return []byte("version foo\n"), errors.New("exit status 1")
 		},
 	}
-	r := checkLlamaVersion(context.Background(), env)
+	r, _ := checkLlamaVersion(context.Background(), env, []string{"profile coder"})
 	if r.Status != statusWarn {
 		t.Fatalf("status = %v, want WARN", r.Status)
 	}
@@ -83,9 +211,25 @@ func TestCheckLlamaVersion_Skipped(t *testing.T) {
 			return nil, nil
 		},
 	}
-	r := checkLlamaVersion(context.Background(), env)
-	if r.Status != statusWarn {
-		t.Fatalf("status = %v, want WARN (skipped)", r.Status)
+	r, ok := checkLlamaVersion(context.Background(), env, []string{"profile coder"})
+	if !ok || r.Status != statusWarn {
+		t.Fatalf("ok=%v status = %v, want ok=true WARN (skipped)", ok, r.Status)
+	}
+}
+
+// The version check is gated on the SAME scan as the binary check: warning
+// "skipped (llama-server not on $PATH)" on a box that never spawns it is
+// the same mis-fire one line down, and gating one and not the other is how
+// a guard ends up on some of its call paths.
+func TestCheckLlamaVersion_NothingDeclaresItIsNotApplicable(t *testing.T) {
+	env := &doctorEnv{
+		lookPath: func(string) (string, error) {
+			t.Fatal("$PATH was consulted for a binary nothing on this box would ever invoke")
+			return "", nil
+		},
+	}
+	if _, ok := checkLlamaVersion(context.Background(), env, nil); ok {
+		t.Fatal("a cloud_peer-only box was warned about a llama-server version it will never ask for")
 	}
 }
 

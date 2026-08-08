@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/daemon"
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
@@ -263,8 +264,16 @@ func runChecks(ctx context.Context, env *doctorEnv) []checkResult {
 
 	results := []checkResult{}
 
-	results = append(results, checkLlamaBinary(env))
-	results = append(results, checkLlamaVersion(ctx, env))
+	// One declaration scan, two checks. Both are about the same binary, so
+	// a box that declares nothing needing it must see neither — a FAIL on
+	// the first and a "skipped" WARN on the second are the same mis-fire.
+	llamaUsers := llamaServerUsers(paths.ProfilesDir(), paths.BackendsDir())
+	if r, ok := checkLlamaBinary(env, llamaUsers); ok {
+		results = append(results, r)
+	}
+	if r, ok := checkLlamaVersion(ctx, env, llamaUsers); ok {
+		results = append(results, r)
+	}
 	results = append(results, checkHFBinary(env))
 	results = append(results, checkHFAuth(ctx, env))
 	results = append(results, checkXDGDirs())
@@ -307,25 +316,108 @@ func runChecks(ctx context.Context, env *doctorEnv) []checkResult {
 
 // ─── individual checks ──────────────────────────────────────────────────────
 
-func checkLlamaBinary(env *doctorEnv) checkResult {
+// checkLlamaBinary fails when llama-server is missing from $PATH AND
+// something on disk would spawn it from $PATH. The second half is the
+// point: this check used to fail unconditionally, so a box whose only
+// profiles are cloud_peer — a laptop pointed at a peer through a remote
+// front, supported since PR #14 — exited non-zero over a binary it will
+// never invoke. The same mis-fire hit comfyui-only and mlx-only boxes,
+// which is why the fix keys on "what is declared" rather than on any one
+// backend kind.
+//
+// Same shape as checkRSVGForVision and checkDockerForProfiles: ok=false
+// means not-applicable and the runner appends nothing.
+//
+// The name stays "llama-server" under C13's rule (a check is named for what
+// it proves) because what it proves has not changed — llama-server is on
+// $PATH — only whether it runs at all. `docker` and `rsvg-convert (vision)`
+// are named the same way, after the tool, with applicability carried by the
+// ok=false gate rather than by the name.
+func checkLlamaBinary(env *doctorEnv, users []string) (checkResult, bool) {
+	const name = "llama-server"
+	if len(users) == 0 {
+		return checkResult{}, false
+	}
+	needs := "needed by " + strings.Join(users, ", ")
 	path, err := env.lookPath("llama-server")
 	if err != nil {
 		return checkResult{
-			Name:    "llama-server",
+			Name:    name,
 			Status:  statusFail,
-			Message: "not found on $PATH — install llama.cpp (https://github.com/ggml-org/llama.cpp)",
-		}
+			Message: "not found on $PATH (" + needs + ") — install llama.cpp (https://github.com/ggml-org/llama.cpp)",
+		}, true
 	}
-	return checkResult{Name: "llama-server", Status: statusOK, Message: path}
+	return checkResult{Name: name, Status: statusOK, Message: path + " (" + needs + ")"}, true
 }
 
-func checkLlamaVersion(ctx context.Context, env *doctorEnv) checkResult {
+// llamaServerUsers names the profile and backend definitions on disk that
+// would spawn `llama-server` off $PATH, sorted and deduplicated. Empty
+// means nothing on this box needs the binary.
+//
+// A definition that pins its own `binary:` is deliberately NOT a user: it
+// names an absolute path and never consults $PATH, so a fleet box running a
+// custom build must not be failed over a binary nothing looks for.
+//
+// Declaration is read straight from the YAML rather than through
+// profile.Load, which is what every other scan here does. The difference
+// matters for this check alone: profile.Load VALIDATES, and a llama_server
+// profile whose GGUF has not been pulled yet fails to load — which under a
+// Load-based scan would silently make this check not-applicable on exactly
+// the box that most needs it. What is asked here is what the file DECLARES,
+// and that is answerable without the model being on disk. Unparseable files
+// are skipped; the `profiles` and `backends` checks surface those.
+func llamaServerUsers(profilesDir, backendsDir string) []string {
+	var out []string
+	scan := func(dir, prefix string) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
+				continue
+			}
+			raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+			if err != nil {
+				continue
+			}
+			var decl struct {
+				Backend struct {
+					LlamaServer *struct {
+						Binary string `yaml:"binary"`
+					} `yaml:"llama_server"`
+				} `yaml:"backend"`
+			}
+			if err := yaml.Unmarshal(raw, &decl); err != nil {
+				continue
+			}
+			if decl.Backend.LlamaServer == nil || decl.Backend.LlamaServer.Binary != "" {
+				continue
+			}
+			out = append(out, prefix+strings.TrimSuffix(e.Name(), ".yaml"))
+		}
+	}
+	scan(backendsDir, "backend ")
+	scan(profilesDir, "profile ")
+	sort.Strings(out)
+	return slices.Compact(out)
+}
+
+// checkLlamaVersion is gated on the same declaration scan as
+// checkLlamaBinary: a box that never spawns llama-server has no version to
+// report, and warning "skipped (not on $PATH)" there is the same mis-fire
+// one line down. Gating one and not the other is how a guard ends up on
+// some of its call paths.
+func checkLlamaVersion(ctx context.Context, env *doctorEnv, users []string) (checkResult, bool) {
+	if len(users) == 0 {
+		return checkResult{}, false
+	}
 	if _, err := env.lookPath("llama-server"); err != nil {
 		return checkResult{
 			Name:    "llama-server --version",
 			Status:  statusWarn,
 			Message: "skipped (llama-server not on $PATH)",
-		}
+		}, true
 	}
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -339,22 +431,22 @@ func checkLlamaVersion(ctx context.Context, env *doctorEnv) checkResult {
 				Name:    "llama-server --version",
 				Status:  statusWarn,
 				Message: "exited non-zero: " + err.Error(),
-			}
+			}, true
 		}
 		return checkResult{
 			Name:    "llama-server --version",
 			Status:  statusWarn,
 			Message: version + " (non-zero exit)",
-		}
+		}, true
 	}
 	if version == "" {
 		return checkResult{
 			Name:    "llama-server --version",
 			Status:  statusWarn,
 			Message: "no output",
-		}
+		}, true
 	}
-	return checkResult{Name: "llama-server --version", Status: statusOK, Message: version}
+	return checkResult{Name: "llama-server --version", Status: statusOK, Message: version}, true
 }
 
 func checkHFBinary(env *doctorEnv) checkResult {

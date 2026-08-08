@@ -1,0 +1,93 @@
+# Starter profile: a cloud model the ROUTER serves, with a local frontend
+# pointed at it.
+#
+# This file was dropped by `vibe profile new __PROFILE_NAME__ --kind cloud-peer`. Edit
+# the REPLACE-marked lines below, then `vibe start __PROFILE_NAME__`.
+#
+# cloud_peer implies external: there is never a process for vibe to launch,
+# so it verifies the router's catalog serves these ids and then gets out of
+# the way. Residency and lifecycle belong to the router — a peer's ids are
+# proxied straight through to the provider.
+#
+# This is the laptop shape: no GPU, no weights, a harness pointed at a model
+# the fleet front already serves. Swap the backend for a llama_server /
+# mlx_server `backend_ref` and the frontend below is unchanged, because
+# ${MODEL_ALIAS}, ${MODEL_CONTEXT} and ${VIBE_API} come from whichever
+# backend is active.
+#
+# Requires in ~/.config/vibe/config.yaml:
+#   client_api_url: http://<router-host>:9000     # backs ${VIBE_API}
+# A profile referencing ${VIBE_API} without that set refuses to activate and
+# says so, rather than rendering an empty endpoint into the harness config.
+
+name: __PROFILE_NAME__
+description: __PROFILE_NAME__ (cloud_peer via the router)
+
+backend:
+  cloud_peer:
+    # REPLACE: the provider's OpenAI-compatible base URL.
+    base_url: https://api.REPLACE-provider.example
+    # The NAME of an environment variable, never the key itself. The value
+    # lives in the ROUTER's environment (the llama-swap unit's
+    # EnvironmentFile) and is rendered into the peer stanza as
+    # apiKey: ${env.REPLACE_PROVIDER_API_KEY} by `vibe router render` on the
+    # router host. vibe renders config, never secrets — a key written here
+    # would land in every rendered file this profile touches.
+    api_key_env: REPLACE_PROVIDER_API_KEY
+    # REPLACE: the ids the provider serves, exactly as it spells them —
+    # these become the catalog ids clients ask for, and they are canonical:
+    # a llama_server def elsewhere in the fleet may not claim one as an
+    # alias.
+    #
+    # Exactly one id keeps ${MODEL_ALIAS} unambiguous. List several and
+    # ${MODEL_ALIAS} is left UNSET, so a template referencing it fails by
+    # name instead of vibe picking a model for you; name the model literally
+    # in that case.
+    models:
+      - REPLACE-model-id
+    # Wire formats the peer speaks. openai is the one the router proxies.
+    formats: [openai]
+    # REPLACE: metadata for ${MODEL_CONTEXT}. The provider owns the real
+    # limit and vibe cannot ask it, so this is a declaration, not an
+    # observation. Omit it and ${MODEL_CONTEXT} goes unset rather than
+    # rendering 0.
+    context: 131072
+
+# A frontend is optional on a peer profile — drop this whole block for a
+# headless peer consumed over the proxy by vamp stages. Pointing a harness
+# at a model the router already serves is the reason most peer profiles
+# exist, so the starter includes it.
+frontend:
+  kind: external
+  # opencode reads its config once at startup and does not hot-reload, so
+  # relaunching it is required to pick up a new endpoint.
+  restart_required: true
+  write_file: ${VIBE_STATE_DIR}/frontend/__PROFILE_NAME__/opencode.json
+  # MCP servers to wire into this profile. Each name resolves to
+  # $XDG_CONFIG_HOME/vibe/mcp/<name>.yaml. Uncomment after dropping in
+  # matching definitions:
+  # mcps: [vibe-search]
+  env:
+    OPENCODE_CONFIG: ${WRITE_FILE}
+  template:
+    $schema: https://opencode.ai/config.json
+    provider:
+      vibe-fleet:
+        npm: "@ai-sdk/openai-compatible"
+        name: vibe (router peer)
+        options:
+          baseURL: ${VIBE_API}
+        models:
+          ${MODEL_ALIAS}:
+            name: ${MODEL_ALIAS}
+            limit:
+              # A whole-string ${MODEL_CONTEXT} keeps its native numeric
+              # type on expansion. Quote it and the harness reads no window
+              # at all, which surfaces nowhere near here.
+              context: ${MODEL_CONTEXT}
+              output: 8192
+    model: vibe-fleet/${MODEL_ALIAS}
+
+# No local model, no weights, no VRAM: the router (and the provider behind
+# it) own everything this profile points at.
+estimated_vram_gb: 0
