@@ -69,10 +69,11 @@ it:
   no laptop that leaves the building, no clock skew between hosts.
 
 What is still owed, and the physical fact each row needs. C17 rebuilt
-this list by running every gate #34 called runnable; C16, C18 and C19
-added their own. "Needs hardware" is not an answer — each row names the
-specific fact, and nothing here is a scheduling problem dressed up as a
-physical one.
+this list by running every gate #34 called runnable; C16, C18, C19, C24
+and C25 added their own; C26b re-read every row against its phase doc and
+ran the two that turned out to be schedulable rather than physical.
+"Needs hardware" is not an answer — each row names the specific fact, and
+nothing here is a scheduling problem dressed up as a physical one.
 
 | gate | the physical fact it needs |
 |---|---|
