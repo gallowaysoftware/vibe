@@ -577,6 +577,11 @@ and the failure mode is a fixture commit that publishes a real prompt.
 
 ## 9. For the reconciliation pass
 
+> **The build added to this section rather than editing it.** Everything
+> below is as the design branch wrote it and is still correct;
+> [§12](#12-for-the-reconciliation-pass-execution-addendum) carries the
+> two corrections and one addition the implementation produced. Read both.
+
 This branch does not touch `AGENTS.md`,
 `docs/design/fleet-control-plan/README.md` or
 `docs/design/fleet-control.md`. Everything meant for them is below.
