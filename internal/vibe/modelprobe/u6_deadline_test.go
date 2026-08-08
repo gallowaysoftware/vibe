@@ -549,9 +549,14 @@ func TestProbeDeadlines_AnAbandonedProbeIsAFailedAttemptAndNeverAMeasurement(t *
 
 // TestProbeDeadlines_AHungProbeStillReleasesTheCell: the single-flight
 // lock is held for the whole of Run, so a probe that hangs holds the
-// cell's only probe slot. probeTimeout is what puts a ceiling on that;
-// without it, one wedged model would make every OTHER model on the box
-// unprobeable for as long as the socket stayed open.
+// cell's only probe slot. A bound on the probe is what puts a ceiling on
+// that; without one, a wedged model would make every OTHER model on the
+// box unprobeable for as long as the socket stayed open.
+//
+// The elapse here is the CLIENT's timeout, which is a bound the caller
+// brought — so what this pins is the recovery, not the bound. The case
+// where the prober's own deadline is the only one in play is
+// TestProbeDeadlines_TheProbersOwnBoundIsTheOnlyOneModelTryHas.
 func TestProbeDeadlines_AHungProbeStillReleasesTheCell(t *testing.T) {
 	sw, srv := newU6Swap(t, map[string]string{"qwen": "ready", "other": "ready"})
 	release := sw.holdOpen(t, "chat")
@@ -577,6 +582,112 @@ func TestProbeDeadlines_AHungProbeStillReleasesTheCell(t *testing.T) {
 		t.Fatalf("the abandoned probe still holds the cell: %q", res.Note)
 	}
 	release()
+}
+
+// TestProbeDeadlines_TheProbersOwnBoundIsTheOnlyOneModelTryHas is the
+// shape this PR's production change exists for, and until this test the
+// only shape the file did not cover.
+//
+// Every other ELAPSE test above borrows its deadline: a 150ms caller
+// context, or a 150ms client timeout. Both are real production
+// mechanisms, but both mean the thing that ends the probe belongs to
+// somebody else — so none of them can tell a prober that gives up from
+// one that never does. `vibe model try measure` is exactly the caller
+// that brings neither: modeltry.go builds its Prober with the command's
+// context (no deadline of its own) and the runner's plain
+// &http.Client{} (no Timeout), and calls Run directly. Under that shape
+// the prober's own bounds are the ONLY things between a llama-swap that
+// accepts the connection and says nothing, and a `vibe model try` that
+// never returns.
+//
+// The elapse is runningTimeout's, because it is the one of the two that
+// can be waited out in a test — probeTimeout is three minutes on
+// purpose. They are the same mechanism (a context deadline the prober
+// itself installed, down the same http.Client) and the VALUE test above
+// pins probeTimeout's number.
+//
+// setRunning is what makes the sequence modeltry's rather than a
+// fixture's: measureOne warms a model and ONLY THEN probes it, because
+// C8's cardinal rule is that a probe never loads one. That order is
+// load-bearing for the assertion below that no completion was issued — a
+// model that was never resident yields zero completions too, and a test
+// that starts from a warm-looking fixture cannot tell the two apart. The
+// first Run here proves the refusal is the reason at first, the warm
+// removes that reason, and only then is a zero meaningful.
+func TestProbeDeadlines_TheProbersOwnBoundIsTheOnlyOneModelTryHas(t *testing.T) {
+	// Nothing warm yet: this is the cell before `vibe model try` has
+	// loaded anything.
+	sw, srv := newU6Swap(t, map[string]string{})
+	// modeltry's own client and context shape: no Timeout, no deadline.
+	// srv.Client() is not used, deliberately — it is the fixture's, and
+	// borrowing its transport settings would be borrowing a bound.
+	p := u6Prober(t, srv, &http.Client{}, testClock())
+
+	if res := p.Run(context.Background(), "qwen", false); !strings.Contains(res.Note, "not resident") {
+		t.Fatalf("setup: an unwarmed model must refuse with the cardinal rule, got %q", res.Note)
+	}
+	if n := sw.chatCalls.Load(); n != 0 {
+		t.Fatalf("setup: %d completions for an unwarmed model", n)
+	}
+
+	// The warm — what measureOne does before it probes, and what makes
+	// the completion request (the only place probeTimeout's three
+	// minutes can be spent) reachable at all.
+	sw.setRunning("qwen", "ready")
+
+	// ...and now llama-swap accepts the residency read and says nothing.
+	// Nothing in this call carries a deadline except the two the prober
+	// installs itself.
+	release := sw.holdOpen(t, "running")
+	done := make(chan *fleetapi.AnnounceProbe, 1)
+	start := time.Now()
+	go func() { done <- p.Run(context.Background(), "qwen", false) }()
+
+	var res *fleetapi.AnnounceProbe
+	select {
+	case res = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the probe never gave up. With no caller deadline and no client timeout — `vibe model try`'s " +
+			"exact shape — the prober's own bounds are the only thing that can end it, and neither fired")
+	}
+	// Spelled as literals for the reason recorded on the VALUE test: an
+	// assertion phrased in terms of the constant it checks moves when the
+	// constant does. Wide on both sides — this is an elapse, not a value —
+	// but 20s still separates "gave up on the 5s residency bound" from
+	// "spent the whole 3m probe budget on a localhost GET".
+	if el := time.Since(start); el < 2*time.Second || el > 20*time.Second {
+		t.Fatalf("the residency read gave up after %s, want ~5s (runningTimeout). Longer and a hung "+
+			"llama-swap holds this cell's only probe slot for the whole probe budget to learn nothing; "+
+			"much shorter and a busy box's own localhost read starts failing", el)
+	}
+
+	// The hazard, restated under the shape that has no other bound: what
+	// ended the probe was a timeout, and a timeout is not a residency
+	// verdict.
+	if !strings.Contains(res.Note, "cannot read local llama-swap /running") {
+		t.Fatalf("note = %q; a residency read the prober abandoned must say so", res.Note)
+	}
+	if strings.Contains(res.Note, "not resident") {
+		t.Fatalf("note = %q: the model WAS warmed and llama-swap simply never answered, and the operator "+
+			"is being told to go warm it again", res.Note)
+	}
+	// Meaningful only because of the warm above: the model is resident, so
+	// a zero here is the cardinal rule holding through a failure path, not
+	// the residency refusal returning it for free.
+	if n := sw.chatCalls.Load(); n != 0 {
+		t.Fatalf("issued %d completions without a residency answer", n)
+	}
+
+	// The cell came back: the bound released the single-flight lock, so
+	// the next model is probeable.
+	release()
+	second := p.Run(context.Background(), "qwen", false)
+	if strings.Contains(second.Note, "already running") {
+		t.Fatalf("the abandoned probe still holds the cell: %q", second.Note)
+	}
+	if second.Value <= 0 {
+		t.Fatalf("the recovered probe measured nothing: %+v", second)
+	}
 }
 
 // ── structural: the hazard, pinned where it would be reintroduced ───────
