@@ -186,19 +186,58 @@ func TestReplayIsRefusedBeforeTheTwentyMinutePull(t *testing.T) {
 // TestWithoutTheFlagNoCaptureIsEverRead is the smallest and most important
 // assertion in this file. A verb that read the operator's prompts in order
 // to decide whether to read the operator's prompts would be a bad joke.
+//
+// It has to REACH the harvest call site to mean anything, which is the
+// review finding that produced this version: the first one pointed the
+// command at a dead fleetd, so `trialDeclareAndWait` returned before
+// `harvestReplaySample` was ever called, and deleting the `if !gate.replay`
+// guard left it green. A test that cannot distinguish "the guard held"
+// from "the code never ran" is this repo's third such finding in a week.
+//
+// So it drives against a fleetd that ACCEPTS the lease, runs both ways,
+// and asserts the run got past the declarations in each — a positive
+// control on the negative assertion.
 func TestWithoutTheFlagNoCaptureIsEverRead(t *testing.T) {
-	b := newC25Box(t)
-	id := b.swap.Request("qwen3.6-27b", "/v1/chat/completions",
-		swaptest.Tokens{Input: 40, Output: 8, Cache: 0, Draft: -1, DraftAcc: -1}, 0)
-	b.swap.SetCapture(id, swaptest.Capture{ReqPath: "/v1/chat/completions", ReqBody: []byte(`{"messages":[]}`)})
+	seedCapture := func(b *c25Box) {
+		id := b.swap.Request("qwen3.6-27b", "/v1/chat/completions",
+			swaptest.Tokens{Input: 40, Output: 8, Cache: 0, Draft: -1, DraftAcc: -1}, 0)
+		b.swap.SetCapture(id, swaptest.Capture{
+			ReqPath: "/v1/chat/completions",
+			ReqBody: []byte(`{"model":"qwen3.6-27b","max_tokens":8,"messages":[{"role":"user","content":"synthetic"}]}`),
+		})
+	}
+	drive := func(t *testing.T, replay bool) (*c25Box, string) {
+		t.Helper()
+		b := newC25Box(t)
+		seedCapture(b)
+		fd := &trialFleetd{idle: observedIdle(3600)}
+		ts := fd.start(t)
+		var out bytes.Buffer
+		// The run is expected to end at the measurement (swaptest does not
+		// model a JIT load, so neither model is resident) — long past the
+		// harvest, which is the point.
+		_ = runModelTry(t.Context(), &out, b.runner(t), ts.URL, c25Req(),
+			trialGateOpts{quiet: time.Minute, now: true, replay: replay})
+		require.NotEmpty(t, fd.posts,
+			"the run never reached the declarations, so it never reached the harvest either and this test proves nothing:\n%s", out.String())
+		require.Contains(t, out.String(), "applied",
+			"the run must get PAST the apply, which is the step the harvest sits immediately before:\n%s", out.String())
+		return b, out.String()
+	}
 
-	run := b.runner(t)
-	var out bytes.Buffer
-	// The run stops at the fleetd resolution, which is fine: the harvest
-	// would have happened before that only if the flag were set, and the
-	// assertion is about the capture endpoint never being touched.
-	_ = runModelTry(t.Context(), &out, run, "http://127.0.0.1:1", c25Req(),
-		trialGateOpts{quiet: time.Minute, now: true})
-	require.Equal(t, 0, b.swap.CaptureReads(),
-		"a trial without --replay must not fetch a single capture; %s", out.String())
+	t.Run("without the flag, not one capture is fetched", func(t *testing.T) {
+		b, out := drive(t, false)
+		require.Equal(t, 0, b.swap.CaptureReads(),
+			"a trial without --replay must not fetch a single capture:\n%s", out)
+		require.NotContains(t, out, "harvesting")
+	})
+
+	// The positive control. Without it the assertion above would pass on a
+	// build where the harvest is broken, unreachable or deleted.
+	t.Run("with the flag, it is", func(t *testing.T) {
+		b, out := drive(t, true)
+		require.Positive(t, b.swap.CaptureReads(),
+			"with --replay the harvest must actually run, or the negative case above proves nothing:\n%s", out)
+		require.Contains(t, out, "harvesting")
+	})
 }

@@ -87,10 +87,14 @@ func TestRecorderFetchesOnlyThroughTheCaptureRefusal(t *testing.T) {
 		// talks to a real llama-swap, but it writes nothing to git — the
 		// risk this rule addresses is a FIXTURE COMMIT, and the recorder is
 		// the only thing here that performs one.
-		Files:        []string{"record_test.go"},
-		Trigger:      []string{"NewRequestWithContext", "NewRequest", "Get", "Post"},
-		Require:      []string{"RefuseCaptureEndpoint"},
-		MinProducers: 3,
+		Files: []string{"record_test.go"},
+		// The trigger set is what BUILDS a request; the requirement is the
+		// one builder that guards the URL it is handed. guardedRequest
+		// satisfies it directly, and every other producer satisfies it by
+		// going through guardedRequest.
+		Trigger:      []string{"NewRequestWithContext", "NewRequest", "Get", "Post", "guardedRequest"},
+		Require:      []string{"RefuseCaptureEndpoint", "guardedRequest"},
+		MinProducers: 4,
 		Exempt:       map[string]string{},
 		Because: "internal/swaptest's recorder reads a REAL llama-swap on the operator's box and writes what it " +
 			"reads into a public repository. GET /api/captures/{id} answers the verbatim prompt, system prompt, " +

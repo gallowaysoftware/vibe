@@ -38,9 +38,18 @@ type SampleStats struct {
 	Candidates   int `json:"candidates"`
 	SkippedBasis int `json:"skipped_basis"`
 	Evicted      int `json:"evicted"`
-	Malformed    int `json:"malformed"`
-	Replayable   int `json:"replayable"`
-	Floor        int `json:"floor"`
+	// Refused counts capture fetches the cell answered with something
+	// other than 200 or 404 — a 401 on a cell that keys its own
+	// llama-swap, most likely — and RefusedStatus is the first such code.
+	// Both are kept apart from Malformed because "this box will not let me
+	// read them" and "I read it and could not use it" need different
+	// sentences, and folding either into "there is nothing to replay"
+	// states a falsehood about the operator's own workload.
+	Refused       int `json:"refused"`
+	RefusedStatus int `json:"refused_status"`
+	Malformed     int `json:"malformed"`
+	Replayable    int `json:"replayable"`
+	Floor         int `json:"floor"`
 }
 
 // SideScore is one model over the whole sample. Counts, plus rates that
@@ -167,7 +176,7 @@ func (s *Set) score(cell string, inc, cand replayResult) *Report {
 		Candidate: sideScore(cand, s.items, s.opt.RateFloor),
 	}
 	r.Paired = pairedScore(inc, cand)
-	r.Divergence = divergenceScore(s.items, inc, cand)
+	r.Divergence = divergenceScore(s.items, inc, cand, s.opt.RateFloor)
 	if len(s.items) < s.opt.RateFloor {
 		r.Rows = rows(s.items, inc, cand)
 	}
@@ -232,16 +241,23 @@ func sideScore(res replayResult, items []sample, floor int) SideScore {
 	// reason they are observed.Values: a proportion on n = 3 rendered as
 	// "0%" is a claim nobody measured, and this repo's most-repeated
 	// defect class is absent evidence read as a healthy value.
+	//
+	// Each rate is gated on ITS OWN DENOMINATOR, not on the sample size.
+	// They are different numbers and the difference is the whole point: in
+	// a 40-sample run of ordinary chat traffic only a handful of requests
+	// may have declared `tools` at all, so `ToolCalled / ToolsOffered`
+	// could be three-of-five wearing a forty-sample floor's authority.
+	// That is the same defect the paired scalar had, one field over, and
+	// the review that found it is why the floor is applied here rather
+	// than once at the top.
+	if sc.ToolsOffered >= floor {
+		sc.ToolCallRate = observed.Known(float64(sc.ToolCalled) / float64(sc.ToolsOffered))
+	}
+	if sc.ToolCalled >= floor {
+		sc.ArgsValidRate = observed.Known(float64(sc.ArgsValidJSON) / float64(sc.ToolCalled))
+	}
 	if sc.Requests >= floor {
-		if sc.ToolsOffered > 0 {
-			sc.ToolCallRate = observed.Known(float64(sc.ToolCalled) / float64(sc.ToolsOffered))
-		}
-		if sc.ToolCalled > 0 {
-			sc.ArgsValidRate = observed.Known(float64(sc.ArgsValidJSON) / float64(sc.ToolCalled))
-		}
-		if sc.Requests > 0 {
-			sc.FailureRate = observed.Known(float64(sc.Failed) / float64(sc.Requests))
-		}
+		sc.FailureRate = observed.Known(float64(sc.Failed) / float64(sc.Requests))
 	}
 	return sc
 }
@@ -287,7 +303,7 @@ func pairedScore(inc, cand replayResult) PairedScore {
 	return p
 }
 
-func divergenceScore(items []sample, inc, cand replayResult) DivergenceScore {
+func divergenceScore(items []sample, inc, cand replayResult, floor int) DivergenceScore {
 	var d DivergenceScore
 	n := min(len(inc.shapes), len(cand.shapes))
 	for i := range n {
@@ -307,19 +323,26 @@ func divergenceScore(items []sample, inc, cand replayResult) DivergenceScore {
 			d.CandidateDisagreed++
 		}
 	}
-	if d.N == 0 {
+	// The divergence n has its OWN floor, and it is not the sample size:
+	// non-200 rows and unreducible recorded bodies drop out, so d.N is
+	// routinely far below the number of samples replayed — the report
+	// prints a caveat saying exactly that. Without this rung, one sample
+	// where the incumbent agreed and the candidate did not prints
+	// "100 points ABOVE the floor", which is a proportion difference
+	// computed on n = 1.
+	if d.N < floor {
 		return d
 	}
-	floor := float64(d.IncumbentDisagreed) / float64(d.N)
+	noise := float64(d.IncumbentDisagreed) / float64(d.N)
 	got := float64(d.CandidateDisagreed) / float64(d.N)
-	if got <= floor {
+	if got <= noise {
 		// The candidate is inside the noise the incumbent makes against
 		// its own recorded output. There is no divergence claim to make,
 		// and the report prints none.
 		return d
 	}
 	d.Claimed = true
-	d.Excess = observed.Known(got - floor)
+	d.Excess = observed.Known(got - noise)
 	return d
 }
 

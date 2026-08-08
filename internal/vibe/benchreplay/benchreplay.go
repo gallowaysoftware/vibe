@@ -132,6 +132,16 @@ const DefaultReplayTimeout = 5 * time.Minute
 // for.
 const DefaultSideBudget = 90 * time.Minute
 
+// DefaultHarvestBudget bounds the walk-and-fetch that precedes the apply.
+//
+// MaxPages by up to 999 rows, each candidate row costing a fetch with its
+// own captureFetchTimeout, and a row that 404s or 401s never counting
+// toward MaxSample: the fetch count has no cap of its own. It is small
+// because the buffer it reads is 10 MB of RAM — a harvest that takes ten
+// minutes is a cell in trouble, not a big sample — and because it sits
+// immediately in front of a config write that evicts every resident model.
+const DefaultHarvestBudget = 10 * time.Minute
+
 // activityLimit is llama-swap's own cap on the activity endpoint's `limit`
 // parameter; asking for more is answered with fewer, silently.
 const activityLimit = 999
@@ -197,6 +207,7 @@ type Options struct {
 	RateFloor     int
 	ReplayTimeout time.Duration
 	SideBudget    time.Duration
+	HarvestBudget time.Duration
 }
 
 func (o Options) withDefaults() Options {
@@ -220,6 +231,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.SideBudget <= 0 {
 		o.SideBudget = DefaultSideBudget
+	}
+	if o.HarvestBudget <= 0 {
+		o.HarvestBudget = DefaultHarvestBudget
 	}
 	return o
 }

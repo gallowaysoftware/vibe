@@ -228,7 +228,7 @@ func shapeOf(status int, body []byte, f requestFacts) shape {
 // every client performs it — so they are joined, which is what lets the
 // noise floor mean anything on a fleet whose rows are all
 // text/event-stream.
-func shapeOfRecorded(status int, body []byte, f requestFacts) shape {
+func shapeOfRecorded(status int, contentType string, body []byte, f requestFacts) shape {
 	if status != 0 && status != 200 {
 		// llama-swap stores the request but never the response body for a
 		// non-200 (metrics.go's recorder.Status() != 200 branch). The most
@@ -236,18 +236,42 @@ func shapeOfRecorded(status int, body []byte, f requestFacts) shape {
 		// compare against; they are counted, never guessed at.
 		return shape{status: status, toolOutcome: ToolNone, finish: FinishNone}
 	}
-	if looksLikeSSE(body) {
+	if isSSE(contentType, body) {
 		return shapeOfStream(status, body, f)
 	}
 	return shapeOf(status, body, f)
 }
 
-func looksLikeSSE(body []byte) bool {
+// isSSE decides which reducer a recorded body needs.
+//
+// The capture carries `resp_headers`, and content-type is the discriminator
+// llama-swap already put on the wire — the same field C7a keys
+// resp_content_type on. It is used FIRST, because the fallback is a
+// heuristic and a heuristic that ran first would misroute an ordinary JSON
+// completion whose content happens to contain the characters "data:" (a
+// data URI, a pasted log line, the words "data: see below"). Such a body
+// finds no line beginning with `data:` in the stream reducer, comes back
+// UNKNOWN, and silently leaves the divergence denominator — shrinking the
+// n of a figure that is already a proportion.
+//
+// The fallback exists because a capture may carry no headers at all, and
+// it matches on a line PREFIX rather than a substring for the same reason.
+func isSSE(contentType string, body []byte) bool {
+	if ct := strings.ToLower(contentType); ct != "" {
+		return strings.Contains(ct, "event-stream")
+	}
 	head := body
 	if len(head) > 4096 {
 		head = head[:4096]
 	}
-	return strings.Contains(string(head), "data:")
+	for _, line := range strings.SplitN(string(head), "\n", 64) {
+		t := strings.TrimSpace(line)
+		if t == "" {
+			continue
+		}
+		return strings.HasPrefix(t, "data:")
+	}
+	return false
 }
 
 // shapeOfStream folds an SSE capture into the same shape a JSON response

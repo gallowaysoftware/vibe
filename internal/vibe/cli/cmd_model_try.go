@@ -419,6 +419,18 @@ func runModelTry(ctx context.Context, out io.Writer, runner *modeltry.Runner, ap
 		fmt.Fprintln(out, "  apply it:    systemctl --user restart llama-swap   (this evicts whatever is resident)")
 		fmt.Fprintln(out, "  then:        vibe model try <same args>            (resumes at the measurement)")
 		fmt.Fprintln(out, "  or undo it:  vibe model try end")
+		if sample.Len() > 0 {
+			// The privacy cost was paid and there is nothing to show for
+			// it. Say so: the operator's own recent prompts were read into
+			// this process, this process is about to exit, and the restart
+			// they were just told to perform empties the buffer — so the
+			// resumed run will measure without a replay and cannot say why
+			// unless it is said here.
+			fmt.Fprintf(out, "\n  the %d harvested capture(s) are DISCARDED with this process. They were never written\n", sample.Len())
+			fmt.Fprintln(out, "  anywhere, and the restart above empties llama-swap's capture buffer, so the resumed")
+			fmt.Fprintln(out, "  run will measure throughput without a replay. `vibe model try end` and re-run with")
+			fmt.Fprintln(out, "  --replay to score against fresh traffic.")
+		}
 		return nil
 	}
 

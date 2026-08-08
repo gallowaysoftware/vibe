@@ -11,6 +11,7 @@ import (
 	"go/token"
 	"math"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -48,7 +49,8 @@ var reportFields = map[string]bool{
 	"SampleStats.Walked": true, "SampleStats.Candidates": true,
 	"SampleStats.SkippedBasis": true, "SampleStats.Evicted": true,
 	"SampleStats.Malformed": true, "SampleStats.Replayable": true,
-	"SampleStats.Floor": true,
+	"SampleStats.Floor": true, "SampleStats.Refused": true,
+	"SampleStats.RefusedStatus": true,
 
 	"SideScore.Model": true, "SideScore.Metric": true, "SideScore.Requests": true,
 	"SideScore.Answered": true, "SideScore.Failed": true, "SideScore.ToolsOffered": true,
@@ -106,9 +108,23 @@ func TestReportCannotCarryABody(t *testing.T) {
 			return
 		}
 		seen[rt] = true
-		// observed.Value is this repo's own gated type (C20) and time.Time
-		// is stdlib; neither can hold operator text.
-		if strings.HasPrefix(rt.String(), "observed.Value[") || rt.String() == "time.Time" {
+		if rt.String() == "time.Time" {
+			return // stdlib; cannot hold operator text
+		}
+		// observed.Value is this repo's own gated type (C20), but it is
+		// GENERIC, and returning on the name alone was an escape hatch a
+		// review found: an `observed.Value[string]` field would satisfy the
+		// walk (its Kind is Struct, so the closed-set requirement below
+		// never fires) and could carry a prompt. The parameter is what
+		// matters, so it is the thing inspected.
+		if strings.HasPrefix(rt.String(), "observed.Value[") {
+			arg := rt.Field(0).Type // the unexported `v T`
+			switch arg.Kind() {
+			case reflect.Int, reflect.Int64, reflect.Float64, reflect.Bool:
+			default:
+				t.Errorf("observed.Value[%s] on this graph: the wrapper is gated, its type argument is not. "+
+					"A Value[string] passes a walk that stops at the wrapper's name and can still carry a prompt", arg)
+			}
 			return
 		}
 		for i := range rt.NumField() {
@@ -435,7 +451,10 @@ func TestNoiseFloorSuppressesTheDivergenceClaim(t *testing.T) {
 			}
 			return scripted{200, toolResponse("read_file", `{"path":"x"}`, 6, 10)}
 		}
-		set, err := Harvest(t.Context(), Options{LlamaSwapURL: f.url}, "incumbent", false)
+		// RateFloor 4 so the divergence n (4) clears its OWN floor: the
+		// suppression under test is the NOISE floor, and a fixture that
+		// tripped the n floor instead would pass for the wrong reason.
+		set, err := Harvest(t.Context(), Options{LlamaSwapURL: f.url, RateFloor: 4}, "incumbent", false)
 		require.NoError(t, err)
 		rep, err := set.Run(t.Context(), "c", Side{Model: "incumbent"}, Side{Model: "candidate"})
 		require.NoError(t, err)
@@ -467,6 +486,94 @@ func TestNoiseFloorSuppressesTheDivergenceClaim(t *testing.T) {
 		require.True(t, known)
 		require.InDelta(t, 0.5, excess, 0.001, "4/4 against a floor of 2/4 is an excess of 0.5, not a divergence of 1.0")
 	})
+}
+
+// TestEachRateIsGatedOnItsOwnDenominator is the review finding that the
+// rate floor was applied to the SAMPLE SIZE while the rates divide by
+// something else.
+//
+// In ordinary chat traffic most requests declare no tools at all, so a
+// 40-sample run can compute `ToolCalled / ToolsOffered` over five
+// requests and print it wearing a forty-sample floor's authority. That is
+// D1's defect one field over.
+func TestEachRateIsGatedOnItsOwnDenominator(t *testing.T) {
+	f := newFakeCell(t)
+	f.warm("incumbent", "candidate")
+	const n = 6
+	// Six samples, but only two of them declare tools.
+	for id := int64(1); id <= n; id++ {
+		body := plainRequest("p")
+		if id <= 2 {
+			body = toolRequest("p", 64)
+		}
+		f.row(id, "incumbent", "/v1/chat/completions", 200, body, "")
+	}
+	f.chat = func(string, int) scripted {
+		return scripted{200, toolResponse("read_file", `{"path":"a"}`, 4, 10)}
+	}
+	// A floor the SAMPLE clears and the tool denominator does not.
+	set, err := Harvest(t.Context(), Options{LlamaSwapURL: f.url, RateFloor: n}, "incumbent", false)
+	require.NoError(t, err)
+	rep, err := set.Run(t.Context(), "c", Side{Model: "incumbent"}, Side{Model: "candidate"})
+	require.NoError(t, err)
+
+	require.Equal(t, n, rep.Candidate.Requests)
+	require.Equal(t, 2, rep.Candidate.ToolsOffered)
+	require.True(t, rep.Candidate.FailureRate.IsKnown(),
+		"the failure rate divides by Requests, which clears the floor")
+	require.False(t, rep.Candidate.ToolCallRate.IsKnown(),
+		"the tool-call rate divides by ToolsOffered (2), not by the sample size (6): two-of-two must not be printed as a rate")
+
+	var out bytes.Buffer
+	rep.Render(&out)
+	require.Contains(t, out.String(), "unknown")
+}
+
+// TestTheDivergenceExcessHasItsOwnFloor is the second half of the same
+// finding. d.N is routinely far below the sample size — non-200 rows and
+// unreducible bodies drop out, and the report has a caveat saying so — so
+// without a floor of its own, one sample where the incumbent agreed and
+// the candidate did not prints "100 points ABOVE the floor".
+func TestTheDivergenceExcessHasItsOwnFloor(t *testing.T) {
+	build := func(t *testing.T, n, floor int) *Report {
+		t.Helper()
+		f := newFakeCell(t)
+		f.warm("incumbent", "candidate")
+		for id := 1; id <= n; id++ {
+			f.row(int64(id), "incumbent", "/v1/chat/completions", 200, toolRequest("p", 64),
+				streamedToolResponse("read_file", `{"pa`, `th":"x"}`, "tool_calls", 6))
+		}
+		f.chat = func(model string, _ int) scripted {
+			if model == "candidate" {
+				return scripted{200, proseResponse("no tool for you", "stop", 5, 10)}
+			}
+			return scripted{200, toolResponse("read_file", `{"path":"x"}`, 6, 10)}
+		}
+		set, err := Harvest(t.Context(), Options{LlamaSwapURL: f.url, RateFloor: floor}, "incumbent", false)
+		require.NoError(t, err)
+		rep, err := set.Run(t.Context(), "c", Side{Model: "incumbent"}, Side{Model: "candidate"})
+		require.NoError(t, err)
+		return rep
+	}
+
+	// One sample, incumbent agreeing, candidate disagreeing: the raw
+	// arithmetic is a 100-point excess, and it is not printed.
+	under := build(t, 1, 4)
+	require.Equal(t, 1, under.Divergence.N)
+	require.Equal(t, 1, under.Divergence.CandidateDisagreed, "the disagreement is COUNTED; only the proportion is withheld")
+	require.False(t, under.Divergence.Claimed)
+	require.False(t, under.Divergence.Excess.IsKnown())
+	var out bytes.Buffer
+	under.Render(&out)
+	require.NotContains(t, out.String(), "ABOVE the floor")
+
+	// Four of the same, against a floor of four: now it is claimed, so the
+	// suppression above is the floor firing rather than the fixture being
+	// broken.
+	at := build(t, 4, 4)
+	require.Equal(t, 4, at.Divergence.N)
+	require.True(t, at.Divergence.Claimed)
+	require.True(t, at.Divergence.Excess.IsKnown())
 }
 
 func TestDivergenceIsNotMeasuredWhenTheRecordedResponseCannotBeReduced(t *testing.T) {
@@ -530,7 +637,56 @@ func TestEveryRefusalFiresByNameAndWritesNothing(t *testing.T) {
 		f.row(1, "incumbent", "/v1/embeddings", 200, `{"model":"incumbent","input":["x"]}`, "")
 		_, err := Harvest(t.Context(), Options{LlamaSwapURL: f.url}, "incumbent", false)
 		require.ErrorIs(t, err, ErrNoCaptures)
-		require.Contains(t, err.Error(), "1 were not chat requests")
+		require.Contains(t, err.Error(), "1 were not replayable chat requests")
+	})
+
+	// The review finding this covers: on a cell that keys its own
+	// llama-swap — the case C15 exists for, and the one swapauth.go's own
+	// comment says matters — EVERY capture fetch 401s, and folding that
+	// into "there is nothing to replay" invents a fact about the
+	// operator's workload out of a credential problem.
+	t.Run("a refused fetch is not an idle box", func(t *testing.T) {
+		keyed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/api/captures/") {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			writeJSON(w, map[string]any{
+				"data": []fakeRow{
+					{ID: 1, Model: "incumbent", ReqPath: "/v1/chat/completions", Status: 200, HasCapture: true},
+					{ID: 2, Model: "incumbent", ReqPath: "/v1/chat/completions", Status: 200, HasCapture: true},
+				},
+				"page": 1, "limit": 999, "total": 2, "total_pages": 1,
+			})
+		}))
+		t.Cleanup(keyed.Close)
+		_, err := Harvest(t.Context(), Options{LlamaSwapURL: keyed.URL}, "incumbent", false)
+		require.ErrorIs(t, err, ErrNoCaptures)
+		require.Contains(t, err.Error(), "REFUSED")
+		require.Contains(t, err.Error(), "401")
+		require.Contains(t, err.Error(), "not about what the cell has served",
+			"a 401 on every fetch says what this process could READ; rendering it as a fact about the workload is the absent-evidence class")
+	})
+
+	// The other half of the same finding: an endpoint this package cannot
+	// rebuild a request for is not a request the MODEL failed.
+	t.Run("a chat-basis path the replay cannot rebuild is skipped, not failed", func(t *testing.T) {
+		for _, path := range []string{"/v1/completions", "/infill", "/completion", "/v1/responses", "/v1/messages"} {
+			f := newFakeCell(t)
+			f.row(1, "incumbent", path, 200, plainRequest("p"), "")
+			_, err := Harvest(t.Context(), Options{LlamaSwapURL: f.url}, "incumbent", false)
+			require.ErrorIs(t, err, ErrNoCaptures, "%s must not be harvested", path)
+			require.Contains(t, err.Error(), "1 were not replayable chat requests", "%s", path)
+		}
+		// And the two spellings that ARE replayable still are, or the
+		// filter above would be refusing the whole feature.
+		for _, path := range []string{"/v1/chat/completions", "/v/chat/completions"} {
+			f := newFakeCell(t)
+			f.row(1, "incumbent", path, 200, plainRequest("p"), "")
+			set, err := Harvest(t.Context(), Options{LlamaSwapURL: f.url}, "incumbent", false)
+			require.NoError(t, err, "%s", path)
+			require.Equal(t, 1, set.Len())
+		}
 	})
 
 	t.Run("an unreadable config is UNKNOWN, never enabled", func(t *testing.T) {
@@ -952,7 +1108,7 @@ func TestSchemaConformanceIsGroundedInTheRequest(t *testing.T) {
 	// A STREAMED recorded response does not claim schema conformance at
 	// all: judging it would need the text reassembled, and §5 refuses to
 	// reassemble streamed text. Wanted is dropped rather than answered no.
-	streamed := shapeOfRecorded(200, []byte(streamedProseResponse(`{"answer":1}`, "stop", 6)), asked)
+	streamed := shapeOfRecorded(200, "text/event-stream", []byte(streamedProseResponse(`{"answer":1}`, "stop", 6)), asked)
 	require.True(t, streamed.known)
 	require.False(t, streamed.schemaWanted,
 		"an unanswerable question is dropped, not answered `did not conform` — that would be a failure nobody measured")
@@ -1011,6 +1167,35 @@ func TestTheSampleIsCappedAtTheNewestNAndSaysHowManyWereAvailable(t *testing.T) 
 	}
 }
 
+// TestTheHarvestHasItsOwnWallBound. MaxPages by up to 999 rows, each
+// candidate row costing a fetch with its own 30 s timeout, and a row that
+// 404s or 401s never counting toward MaxSample: the fetch count has no cap
+// of its own. It runs under the trial's four-hour lease and C11 hold and
+// immediately in front of a config write that evicts every resident model.
+func TestTheHarvestHasItsOwnWallBound(t *testing.T) {
+	f := newFakeCell(t)
+	for id := int64(1); id <= 6; id++ {
+		f.row(id, "incumbent", "/v1/chat/completions", 200, plainRequest("p"), "")
+	}
+	now := time.Unix(1_700_000_000, 0)
+	tick := func() time.Time {
+		now = now.Add(time.Minute)
+		return now
+	}
+	_, err := Harvest(t.Context(), Options{
+		LlamaSwapURL: f.url, Now: tick, HarvestBudget: 2 * time.Minute,
+	}, "incumbent", false)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "budget")
+	require.Less(t, f.captureReads(6), 1, "the walk must stop; if the last row was fetched the deadline never elapsed")
+
+	// The same fixture inside a budget it fits: the assertion above is the
+	// bound firing rather than the harvest being broken.
+	set, err := Harvest(t.Context(), Options{LlamaSwapURL: f.url}, "incumbent", false)
+	require.NoError(t, err)
+	require.Equal(t, 6, set.Len())
+}
+
 func TestOptionsDefaultsAreTheDocumentedConstants(t *testing.T) {
 	o := Options{}.withDefaults()
 	require.Equal(t, DefaultMaxSample, o.MaxSample)
@@ -1018,6 +1203,7 @@ func TestOptionsDefaultsAreTheDocumentedConstants(t *testing.T) {
 	require.Equal(t, DefaultRateFloor, o.RateFloor)
 	require.Equal(t, DefaultReplayTimeout, o.ReplayTimeout)
 	require.Equal(t, DefaultSideBudget, o.SideBudget)
+	require.Equal(t, DefaultHarvestBudget, o.HarvestBudget)
 	require.NotNil(t, o.HTTP)
 	require.NotNil(t, o.Now)
 }

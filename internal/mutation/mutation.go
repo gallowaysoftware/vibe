@@ -762,8 +762,8 @@ var Registry = []Mutation{
 	{
 		Name:     "c25/the recorder's fetch guard moves off the one fetch path",
 		File:     "internal/swaptest/record_test.go",
-		Find:     "\tif why := RefuseCaptureEndpoint(url); why != \"\" {\n\t\tt.Fatal(why)\n\t}\n\tctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)",
-		Replace:  "\tctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)",
+		Find:     "\tif why := RefuseCaptureEndpoint(url); why != \"\" {\n\t\tt.Fatal(why)\n\t}\n\treq, err := http.NewRequestWithContext(ctx, method, url, body)",
+		Replace:  "\treq, err := http.NewRequestWithContext(ctx, method, url, body)",
 		Pkg:      "./internal/swaptest/",
 		MustFail: []string{"TestRecorderFetchesOnlyThroughTheCaptureRefusal"},
 		Why: "the refusal exists and is not called. recordGET is the recorder's ONE fetch path, so a " +
@@ -798,7 +798,7 @@ var Registry = []Mutation{
 	{
 		Name:     "c25/the divergence claim stops being gated on the noise floor",
 		File:     "internal/vibe/benchreplay/score.go",
-		Find:     "\tif got <= floor {",
+		Find:     "\tif got <= noise {",
 		Replace:  "\tif false {",
 		Pkg:      "./internal/vibe/benchreplay/",
 		MustFail: []string{"TestNoiseFloorSuppressesTheDivergenceClaim"},
@@ -872,6 +872,82 @@ var Registry = []Mutation{
 			"would be measuring a cell the fleet had resumed using. The refusal rather than a short " +
 			"n is the other half: a side that replayed 31 of 40 while the other replayed 40 is a " +
 			"metric lying about its own n.",
+	},
+	{
+		Name:     "c25/a rate is gated on the sample size instead of its own denominator",
+		File:     "internal/vibe/benchreplay/score.go",
+		Find:     "\tif sc.ToolsOffered >= floor {",
+		Replace:  "\tif sc.Requests >= floor {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestEachRateIsGatedOnItsOwnDenominator"},
+		Why: "the tool-call rate divides by the number of requests that OFFERED tools, not by the " +
+			"sample size, and in ordinary chat traffic most requests offer none. A 40-sample run " +
+			"can therefore compute three-of-five and print it wearing a forty-sample floor's " +
+			"authority — which is the number the operator adopts or rejects a model on.",
+	},
+	{
+		Name:     "c25/the divergence excess loses its n floor",
+		File:     "internal/vibe/benchreplay/score.go",
+		Find:     "\tif d.N < floor {",
+		Replace:  "\tif d.N == 0 {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestTheDivergenceExcessHasItsOwnFloor"},
+		Why: "the divergence n is routinely far below the sample size — non-200 rows carry no " +
+			"recorded response body and unreducible ones drop out — so without a floor of its own, " +
+			"ONE sample where the incumbent agreed and the candidate did not prints `100 points " +
+			"ABOVE the floor`. A proportion difference is still a proportion.",
+	},
+	{
+		Name:     "c25/a chat-basis path the replay cannot rebuild is admitted",
+		File:     "internal/vibe/benchreplay/harvest.go",
+		Find:     " || !replayable(row.ReqPath) {",
+		Replace:  " {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestEveryRefusalFiresByNameAndWritesNothing"},
+		Why: "usagemeter's chat basis covers /v1/completions, /infill, /completion, /v1/responses " +
+			"and /v1/messages as well as chat-completions — real endpoints a llama.cpp cell serves, " +
+			"with request shapes this package cannot rebuild. Admitted, the rewrite fails, the shape " +
+			"comes back unknown, and the row is scored as a request the MODEL failed on both sides. " +
+			"/v1/messages is worse: it parses, is POSTed to the wrong API, and its Anthropic-shaped " +
+			"tools array reads as `no tools declared`, so it leaves the tool-call denominator silently.",
+	},
+	{
+		Name:     "c25/a refused capture fetch reads as an idle box",
+		File:     "internal/vibe/benchreplay/harvest.go",
+		Find:     "\t\tif set.stats.Refused > 0 {",
+		Replace:  "\t\tif false {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestEveryRefusalFiresByNameAndWritesNothing"},
+		Why: "on a cell that keys its own llama-swap — the case C15 exists for, and the one " +
+			"swapauth.go's comment says matters — EVERY capture fetch answers 401. Folding that into " +
+			"`this cell has served nothing recently` invents a fact about the operator's workload out " +
+			"of a credential problem, in the sentence they act on. Absent evidence read as a healthy " +
+			"value, one more time.",
+	},
+	{
+		Name:     "c25/the harvest loses its wall bound",
+		File:     "internal/vibe/benchreplay/harvest.go",
+		Find:     "\t\t\tif opt.Now().After(deadline) {",
+		Replace:  "\t\t\t_ = deadline\n\t\t\tif false {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestTheHarvestHasItsOwnWallBound"},
+		Why: "MaxPages by up to 999 rows, each candidate costing a fetch with its own 30s timeout, " +
+			"and a row that 404s or 401s never counting toward MaxSample — so the fetch count has no " +
+			"cap of its own. It runs under the trial's four-hour lease and C11 hold, immediately in " +
+			"front of a config write that evicts every resident model.",
+	},
+	{
+		Name:     "c25/a trial without --replay reads the operator's captures",
+		File:     "internal/vibe/cli/cmd_model_try.go",
+		Find:     "\tif !gate.replay {\n\t\treturn nil, nil\n\t}",
+		Replace:  "\tif false {\n\t\treturn nil, nil\n\t}",
+		Pkg:      "./internal/vibe/cli/",
+		MustFail: []string{"TestWithoutTheFlagNoCaptureIsEverRead"},
+		Why: "the one guard between an ordinary `vibe model try` and a read of the operator's " +
+			"verbatim prompts. A verb that read them in order to decide whether to read them would " +
+			"be a bad joke — and the first version of the test that covers this could not see the " +
+			"deletion at all, because it drove against a dead fleetd and returned before the harvest " +
+			"call site was ever reached. Registered so the reachability cannot rot again.",
 	},
 	{
 		Name:     "c25/the replay edits the client's own sampling",

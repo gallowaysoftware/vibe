@@ -5,7 +5,10 @@ Status: **BUILT (2026-08-08)**, off `c25-bench-replay` branched from
 `vibe model try --replay` — a flag on [C18](c18-model-try.md)'s trial
 sequence, not a `vibe bench` verb, for the reason §4 gives. See
 [§11 Execution](#11-execution-2026-08-08) for what shipped, the gate
-results and the two defects the phase's own tests found in it.
+results, the two defects the phase's own tests found in it, and
+[§13](#13-adversarial-review-addendum-independent-pass) for the
+independent pass's twelve — one of which was a test that asserted
+nothing and was mutation-proved to.
 
 The design half below is unchanged from the DESIGN ONLY commit
 (`c25-bench-replay-design`, branched from `main` at `cb8b336`), which
@@ -1042,7 +1045,7 @@ correct.
 
 **§9's README status row** should now read:
 
-> | [C25](c25-bench-replay.md) | `vibe model try --replay`: your own traffic as the benchmark | 1262 non-comment production lines + 2088 test | C8, C18 (composition), C7a (the activity walk) | **BUILT (2026-08-08)**; delivered as a C18 flag rather than a top-level verb; U1–U14 green, 10 predicates mutation-verified, the capture contract measured against real v239 and v247 binaries; L2 PASS on real v239+v247; L1, L3, L4 NOT RUN (L4 needs metal) |
+> | [C25](c25-bench-replay.md) | `vibe model try --replay`: your own traffic as the benchmark | 1262 non-comment production lines + 2088 test | C8, C18 (composition), C7a (the activity walk) | **BUILT (2026-08-08)**; delivered as a C18 flag rather than a top-level verb; U1–U14 green, 17 predicates mutation-verified (harness 54/54), the capture contract measured against real v239 and v247 binaries; L2 PASS on real v239+v247; L1, L3, L4 NOT RUN (L4 needs metal) |
 
 Plus a row in the owed-gates table for **C25 L4**, matching C18 L5's
 wording (*needs metal, not a time budget*), and rows for **C25 L1, L2's
@@ -1063,3 +1066,161 @@ routing at the front, verbatim as §9 drafts it. Nothing in the build
 softened that argument — if anything the replay's own accounting caveat
 ("this run added N real requests to this cell-day", for traffic the
 operator ASKED for) makes the shadow's silent version worse.
+
+---
+
+## 13. Adversarial-review addendum (independent pass)
+
+An independent pass over the feature and self-review commits.
+**Twelve findings, one that the reviewer mutation-proved was covered by
+nothing.** All fixed; every production predicate below is registered in
+`internal/mutation`, which now reports **54/54 guards mutation-verified**.
+
+**REV-1 (blocker-class, in the TESTS) —
+`TestWithoutTheFlagNoCaptureIsEverRead` asserted nothing, and the
+reviewer proved it.** The test drove `runModelTry` at a dead fleetd
+(`http://127.0.0.1:1`), so `trialDeclareAndWait` failed on the lease POST
+and returned *before* `harvestReplaySample` was ever called. Replacing
+`if !gate.replay { return nil, nil }` with `if false` — deleting the one
+guard between an ordinary `vibe model try` and a read of the operator's
+verbatim prompts — left the named test PASSING and the whole
+`internal/vibe/cli` package green.
+
+This is the third "test asserting less than its name claims" this plan
+has found in a week, and it landed on the phase's most important
+negative. The fix is a fleetd that ACCEPTS the lease, both directions
+driven, and two positive controls: the run must have posted a lease and
+must have reached the apply, or the negative assertion is about code that
+never executed. Both directions are now mutation-verified — `if false`
+(harvest always) reddens the without-flag case, `if true` (harvest never)
+reddens the with-flag case — and the entry is registered.
+
+**REV-2 (major) — the headline number was computed below its own
+floor.** The rate floor was applied to `sc.Requests`, and the rates
+divide by something else: `ToolCallRate = ToolCalled / ToolsOffered`,
+and `ToolsOffered` counts only answered requests whose captured body
+declared `tools`. In ordinary chat traffic most requests declare none, so
+a 40-sample run could compute three-of-five and print it wearing a
+forty-sample floor's authority — D1's defect one field over, in the
+number an operator adopts or rejects a model on.
+`TestAtTheFloorTheRatesAppear` passed over it because its fixture made
+the two denominators equal. Each rate is gated on ITS OWN denominator
+now, and `TestEachRateIsGatedOnItsOwnDenominator` uses a fixture where
+they differ.
+
+**REV-3 (major) — the divergence excess had no n floor at all.** Only
+`d.N == 0` was guarded, and `d.N` is routinely far below the sample size
+— non-200 rows carry no recorded response body and unreducible ones drop
+out, which the report's own caveat says. At `d.N == 1` with the incumbent
+agreeing and the candidate not, it printed *"100 points ABOVE the
+floor"*. A proportion difference is still a proportion; `DefaultRateFloor`
+now gates it, and `TestTheDivergenceExcessHasItsOwnFloor` pins both
+directions.
+
+**REV-4 (major) — a request the HARNESS could not replay was scored as a
+request the MODEL failed.** The harvest admitted every
+`usagemeter.BasisChat` path, and that set is wider than chat-completions:
+`/v1/completions`, `/infill`, `/completion`, `/v1/responses` and
+`/v1/messages` are all real endpoints a llama.cpp cell serves. The replay
+POSTs to `/v1/chat/completions` and rewrites an object that must carry
+`messages`, so those rows failed the rewrite, came back as unknown
+shapes, and were counted `Failed` on BOTH sides. `/v1/messages` was
+worse: it parses, gets POSTed to the wrong API, and its Anthropic-shaped
+`tools` array reads as "no tools declared" — so it silently left the
+tool-call denominator REV-2 is about. A `replayablePaths` set of exactly
+the two chat-completions spellings now gates it, and the rest are counted
+`skipped_basis`.
+
+**REV-5 (major) — an auth failure rendered as "this cell has served
+nothing recently".** Every non-200-non-404 from the capture endpoint was
+folded into `malformed`, and the `ErrNoCaptures` sentence named neither.
+On a cell that keys its own llama-swap — the case C15 exists for, and the
+one `swapauth.go`'s own new comment says matters — every capture fetch
+401s and the operator was told a falsehood about their own workload.
+`fetchRefused` is now a separate outcome carrying the status CODE (a
+number, never a body), `SampleStats` gained `Refused`/`RefusedStatus`,
+and the refusal says the difference in as many words: *"this is a
+statement about what this process could read and not about what the cell
+has served."* Absent evidence read as a healthy value, caught one more
+time.
+
+Related and NOT fixed here: this package cannot import `fleetapi` (its
+own `TestNothingCrossesABox` forbids it) so it presents no llama-swap
+key at all, and §4's reuse table says swapauth's posture is reused when
+it is not. C18 has the identical gap and C15's futures item still owns
+the fix; this phase adds a refusal that names it rather than a second
+credential resolver.
+
+**REV-6 (minor) — the harvest had no wall bound.** `MaxPages` by up to
+999 rows, each candidate costing a fetch with its own 30 s timeout, and a
+row that 404s or 401s never counting toward `MaxSample`: the fetch count
+was uncapped. The self-review had given the REPLAY a `SideBudget` for
+exactly this argument and stopped one function short.
+`DefaultHarvestBudget` is 10 minutes, and it refuses.
+
+**REV-7 (minor) — SSE detection was a substring search, and the header
+that answers it was decoded and thrown away.** `looksLikeSSE` returned
+true if `"data:"` appeared anywhere in the first 4096 bytes, so an
+ordinary JSON completion whose content contained a data URI or a pasted
+log line routed to the stream reducer, found no `data:` LINE, came back
+UNKNOWN, and silently left the divergence denominator REV-3 is about.
+Meanwhile `resp_headers` was on the wire and unread. Content-type is the
+discriminator now, with a line-PREFIX heuristic as the fallback for a
+capture that carries no headers.
+
+**REV-8 (minor) — `--replay` on a cell without `-watch-config` read the
+operator's traffic and threw it away silently.** On the not-live branch
+the command returns before `Measure`, discarding a sample harvested
+seconds earlier; the resumed run then hits `ErrAlreadyApplied` and
+measures without a replay. The privacy cost was paid for zero output. It
+now says so, and says that the restart it just prescribed is what empties
+the buffer.
+
+**REV-9 (nit) — U1's walk had a one-type-parameter escape hatch.** It
+returned early on any type whose name began `observed.Value[`, without
+inspecting the argument. An `observed.Value[string]` field would have
+satisfied the walk — its `Kind()` is `Struct`, so the closed-set
+requirement never fires — and could have carried a prompt. Adding it
+would still have required an edit to `reportFields`, so it was a
+deliberate act rather than an accident; but the gate's stated claim would
+not have been the thing that stopped it. The walk inspects the type
+argument now.
+
+**REV-10 (nit) — one of the three recorder guards was decorative.**
+`recordEvents` guarded the literal `base + "/api/events"`, which can
+never be a capture route, and the astscan rule checks only that the CALL
+appears in the function. A future helper could pass the scan while
+guarding the wrong string. All three fetches now go through one
+`guardedRequest` builder where the guarded value and the fetched value
+are the same variable by construction, and the rule requires that
+builder.
+
+**REV-11 (nit) — `DropAllCaptures` also zeroed `captureReads`.** A reload
+empties the buffer; it does not un-count reads that already happened, and
+a test asserting on the count across a modelled reload would have been
+silently misled.
+
+**REV-12 (nit) — the double stopped streaming.** Building the SSE body
+for the capture buffer turned a per-chunk flush into one write, so any
+future assertion about incremental delivery or TTFT against the double
+would have measured a single write. It flushes per frame again, and still
+records the same bytes.
+
+**Verified sound by the independent pass**, so a later one need not
+re-derive it: the harvest is unreachable after the apply by three
+independent means and the reviewer could not find a fourth path (`Stage`
+only ever renders with `write=false`, `--dry-run` returns before both the
+early refusal and the harvest, `end` never measures); `median` is correct
+for even counts and every division in the scorer is guarded; `disagree`'s
+streamed-versus-JSON asymmetries hit both sides identically, so the noise
+floor absorbs them; no byte of a capture body, tool name or
+response-derived error string reaches stdout, the journal or a return
+value on any traced path; `Cell.SetCapture` is never called while `c.mu`
+is held; and `-race` is clean across all four packages.
+
+**Mutation-verified predicates in this pass (6).** The `--replay` guard
+in both directions; the per-denominator rate floor; the divergence n
+floor; the replayable-path filter; the refused-fetch refusal; the harvest
+wall bound. With the feature and self-review commits that is **17 C25
+entries** in the registry, and the harness reports **54/54 verified in
+52 s**.

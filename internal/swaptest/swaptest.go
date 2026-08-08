@@ -537,13 +537,25 @@ func (c *Cell) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	var resp []byte
 	if body.Stream {
+		// Written FRAME BY FRAME with a flush after each, because that is
+		// what a stream is: a double that buffers the whole body and writes
+		// it once makes every assertion about incremental delivery or TTFT
+		// measure a single write. The same bytes go into the capture
+		// buffer, which is why chatStreamBytes returns them rather than
+		// writing them.
 		resp = chatStreamBytes(body.Model)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(resp)
-		if fl, ok := w.(http.Flusher); ok {
-			fl.Flush()
+		fl, _ := w.(http.Flusher)
+		for _, frame := range strings.SplitAfter(string(resp), "\n\n") {
+			if frame == "" {
+				continue
+			}
+			_, _ = w.Write([]byte(frame))
+			if fl != nil {
+				fl.Flush()
+			}
 		}
 	} else {
 		resp, _ = json.Marshal(map[string]any{

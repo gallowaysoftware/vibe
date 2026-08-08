@@ -86,7 +86,10 @@ func (c *Cell) DropCapture(id int64) {
 func (c *Cell) DropAllCaptures() {
 	c.mu.Lock()
 	c.captures = nil
-	c.captureReads = 0
+	// captureReads is NOT reset. A reload empties the buffer; it does not
+	// un-count reads that already happened, and a test asserting on the
+	// count across a modelled reload would be silently misled by a double
+	// that pretended otherwise.
 	c.mu.Unlock()
 }
 

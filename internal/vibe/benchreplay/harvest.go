@@ -40,6 +40,9 @@ type sample struct {
 	reqBody  []byte
 	facts    requestFacts
 	recorded shape
+	// status carries the capture endpoint's HTTP code on the REFUSED path
+	// and nothing else. A number, never a body.
+	status int
 }
 
 // Set is a harvested sample. Every field is unexported: there is no way to
@@ -131,6 +134,14 @@ func Harvest(ctx context.Context, opt Options, model string, applied bool) (*Set
 	}
 
 	set := &Set{opt: opt, model: model}
+	// The harvest's own wall bound. MaxPages x up to 999 rows, each
+	// candidate row costing a fetch with its own captureFetchTimeout, and a
+	// row that 404s or 401s never counts toward MaxSample — so without this
+	// the fetch count is uncapped. It runs in the same command as the
+	// replay, under the same four-hour lease and C11 hold, and immediately
+	// before the disruptive apply, so it refuses rather than holding the
+	// cell open.
+	deadline := opt.Now().Add(opt.HarvestBudget)
 	for page := 1; page <= opt.MaxPages && len(set.items) < opt.MaxSample; page++ {
 		p, err := fetchActivityPage(ctx, opt, page)
 		if err != nil {
@@ -140,14 +151,33 @@ func Harvest(ctx context.Context, opt Options, model string, applied bool) (*Set
 			break
 		}
 		for _, row := range p.Data {
+			if opt.Now().After(deadline) {
+				return nil, fmt.Errorf("the harvest ran past its %s budget after %d row(s), with %d capture(s) in hand",
+					opt.HarvestBudget, set.stats.Walked, len(set.items))
+			}
 			set.stats.Walked++
 			if row.Model != model || !row.HasCapture {
 				continue
 			}
+			// Two filters, and they are not the same filter.
+			//
 			// The basis branch is usagemeter's, on req_path and never on
 			// backend kind: only the chat family has the tool-call and
 			// finish-reason structure this package scores.
-			if usagemeter.BasisFor(row.ReqPath) != usagemeter.BasisChat {
+			//
+			// The second is narrower and it is the one a review had to
+			// find: usagemeter's chat basis also covers /v1/completions,
+			// /infill, /completion, /v1/responses and /v1/messages —
+			// real endpoints a llama.cpp cell serves, with request shapes
+			// this package cannot rebuild. Admitting them meant the
+			// rewrite failed, `one` returned an unknown shape, and the
+			// row was counted as a request the MODEL failed, on both
+			// sides. A request the harness could not construct is not a
+			// model's failure, and /v1/messages is worse than the rest:
+			// it parses, gets POSTed to the wrong API, and its
+			// Anthropic-shaped `tools` array reads as "no tools
+			// declared", so it silently leaves the tool-call denominator.
+			if usagemeter.BasisFor(row.ReqPath) != usagemeter.BasisChat || !replayable(row.ReqPath) {
 				set.stats.SkippedBasis++
 				continue
 			}
@@ -166,6 +196,11 @@ func Harvest(ctx context.Context, opt Options, model string, applied bool) (*Set
 				// retrying asks for a row that is by definition older than
 				// the one that displaced it.
 				set.stats.Evicted++
+			case fetchRefused:
+				set.stats.Refused++
+				if set.stats.RefusedStatus == 0 {
+					set.stats.RefusedStatus = s.status
+				}
 			case fetchMalformed:
 				set.stats.Malformed++
 			}
@@ -177,10 +212,50 @@ func Harvest(ctx context.Context, opt Options, model string, applied bool) (*Set
 	set.stats.Replayable = len(set.items)
 	set.stats.Floor = opt.RateFloor
 	if len(set.items) == 0 {
-		return nil, fmt.Errorf("%w (walked %d row(s) on %s: %d advertised a capture, %d had been evicted, %d were not chat requests)",
-			ErrNoCaptures, set.stats.Walked, model, set.stats.Candidates, set.stats.Evicted, set.stats.SkippedBasis)
+		// Every arithmetic term is named, including the two a review found
+		// missing. Without `refused` in this sentence, a cell that keys its
+		// own llama-swap — the case C15 exists for, and the one
+		// swapauth.go's own comment says matters — answers 401 to every
+		// capture fetch and the operator is told the box has served nothing
+		// recently. That is a fact about the WORKLOAD invented out of a
+		// credential problem: the most-repeated defect class in this repo,
+		// in the sentence an operator acts on.
+		if set.stats.Refused > 0 {
+			return nil, fmt.Errorf("%w — but note that %d of %d capture fetch(es) were REFUSED with HTTP %d rather than answered, so this is a statement about what this process could read and not about what the cell has served. A cell that keys its own llama-swap needs the key; this command sends none (C15, C18 §8)",
+				ErrNoCaptures, set.stats.Refused, set.stats.Candidates, set.stats.RefusedStatus)
+		}
+		return nil, fmt.Errorf("%w (walked %d row(s) on %s: %d advertised a capture, %d had been evicted, %d could not be read, %d were not replayable chat requests)",
+			ErrNoCaptures, set.stats.Walked, model, set.stats.Candidates,
+			set.stats.Evicted, set.stats.Malformed, set.stats.SkippedBasis)
 	}
 	return set, nil
+}
+
+// replayablePaths are the endpoints whose captured body this package can
+// reconstruct into a request: the OpenAI chat-completions shape, in
+// llama-swap's two spellings of it (the /v/ form is its versionless route,
+// stripped before forwarding upstream).
+//
+// Nothing else. The replay POSTs to /v1/chat/completions and rewrites two
+// keys of an object that must carry `messages`; a text-completion body or
+// an Anthropic-shaped one is not that object, and pretending otherwise
+// scores the harness's own inability as the model's.
+var replayablePaths = map[string]bool{
+	"/v1/chat/completions": true,
+	"/v/chat/completions":  true,
+}
+
+func replayable(reqPath string) bool {
+	p := reqPath
+	if i := strings.IndexByte(p, '?'); i >= 0 {
+		p = p[:i]
+	}
+	if rest, ok := strings.CutPrefix(p, "/upstream/"); ok {
+		if i := strings.IndexByte(rest, '/'); i >= 0 {
+			p = rest[i:]
+		}
+	}
+	return replayablePaths[p]
 }
 
 type fetchOutcome int
@@ -188,6 +263,14 @@ type fetchOutcome int
 const (
 	fetchOK fetchOutcome = iota
 	fetchEvicted
+	// fetchRefused: the capture endpoint answered a non-200 that is not a
+	// 404 — a 401 on a cell that keys its own llama-swap, a 500, anything
+	// else. It is kept apart from fetchMalformed because the two need
+	// different sentences: one says "this box will not let me read them",
+	// the other says "I read it and could not use it", and folding both
+	// into "there is nothing to replay" tells the operator a falsehood
+	// about their own workload.
+	fetchRefused
 	fetchMalformed
 )
 
@@ -216,7 +299,7 @@ func fetchSample(ctx context.Context, opt Options, row activityRow) (sample, fet
 		// endpoint is reported by activity id and status and nothing else,
 		// because everything that endpoint says is about a capture.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return sample{}, fetchMalformed
+		return sample{status: resp.StatusCode}, fetchRefused
 	}
 	var payload capturePayload
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxCaptureBytes)).Decode(&payload); err != nil {
@@ -230,7 +313,7 @@ func fetchSample(ctx context.Context, opt Options, row activityRow) (sample, fet
 		activityID: row.ID,
 		reqBody:    payload.ReqBody,
 		facts:      facts,
-		recorded:   shapeOfRecorded(row.Status, payload.RespBody, facts),
+		recorded:   shapeOfRecorded(row.Status, payload.RespHeaders["content-type"], payload.RespBody, facts),
 	}, fetchOK
 }
 
