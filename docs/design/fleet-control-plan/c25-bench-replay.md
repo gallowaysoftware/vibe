@@ -666,11 +666,11 @@ is a fixture commit that publishes a real prompt to a public repository.
 | the measured auth row | `internal/vibe/fleetapi/swapauth.go` | +12 |
 | `IncludeTests` / `Files` | `internal/astscan/astscan.go` | +26 |
 | ten registry entries | `internal/mutation/mutation.go` | +130 |
-| tests (U1–U13, plus the fake) | six `c25_test.go` / `fake_test.go` / `capture_contract_test.go` | 2088 |
+| tests (U1–U13, plus the fake) | six `c25_test.go` / `fake_test.go` / `capture_contract_test.go` | 2364 |
 
-**Against §8's estimate**: ~700 production lines predicted, **1262
-non-comment production lines** shipped (2150 including comments), and
-~800 test lines predicted against 2088. The overshoot is one thing:
+**Against §8's estimate**: ~700 production lines predicted, **1315
+non-comment production lines** shipped, and ~800 test lines predicted
+against 2364. The overshoot is one thing:
 §5's structural scorer needed a response reducer that handles BOTH a
 JSON completion and a buffered SSE frame stream, because the reference
 fleet's rows are all `text/event-stream` and without the streaming path
@@ -877,10 +877,12 @@ llama-swap does and because those bytes are synthetic by construction.
 | U13 | the route behaves identically under v239 and v247 | **PASS**, and further than asked — see below |
 | U14 | full inner loop | **PASS** — `go build ./...`, `go vet ./...`, `gofmt -l .` silent, `go mod tidy` byte-clean, `golangci-lint run` **0 issues**, `go test -race ./...`, and `-race -count=5` over the eight touched packages |
 
-**Ten production predicates are mutation-verified** and registered in
-`internal/mutation`, so CI re-proves them on every PR rather than this
-paragraph being the only record. The full harness reports **42/42 guards
-mutation-verified in 40s**. The ten:
+**Seventeen production predicates are mutation-verified** and registered
+in `internal/mutation`, so CI re-proves them on every PR rather than this
+paragraph being the only record. The full harness reports **61/61 guards
+mutation-verified in 62s** across the whole registry. The eleven from the
+feature and self-review commits (the review pass's six are in
+[§13](#13-adversarial-review-addendum-independent-pass)):
 
 | mutation | red |
 |---|---|
@@ -894,6 +896,7 @@ mutation-verified in 40s**. The ten:
 | an unreducible recorded response counts as agreement | `TestDivergenceIsNotMeasuredWhenTheRecordedResponseCannotBeReduced` |
 | a replay loads a model that is not resident | `TestEveryRefusalFiresByNameAndWritesNothing` |
 | the replay edits the client's own sampling (a `seed`, `temperature: 0`) | `TestReplayRewritesOnlyTheModelAndTheStreamFlag` |
+| a replay side loses its wall bound | `TestASideThatOutrunsItsBudgetRefusesRatherThanTruncating` |
 
 #### U13, promoted: the capture contract measured against real binaries
 
@@ -1045,7 +1048,7 @@ correct.
 
 **§9's README status row** should now read:
 
-> | [C25](c25-bench-replay.md) | `vibe model try --replay`: your own traffic as the benchmark | 1262 non-comment production lines + 2088 test | C8, C18 (composition), C7a (the activity walk) | **BUILT (2026-08-08)**; delivered as a C18 flag rather than a top-level verb; U1–U14 green, 17 predicates mutation-verified (harness 54/54), the capture contract measured against real v239 and v247 binaries; L2 PASS on real v239+v247; L1, L3, L4 NOT RUN (L4 needs metal) |
+> | [C25](c25-bench-replay.md) | `vibe model try --replay`: your own traffic as the benchmark | 1315 non-comment production lines + 2364 test | C8, C18 (composition), C7a (the activity walk) | **BUILT (2026-08-08)**; delivered as a C18 flag rather than a top-level verb; U1–U14 green, 17 predicates mutation-verified (harness 61/61), the capture contract measured against real v239 and v247 binaries; L2 PASS on real v239+v247; L1, L3, L4 NOT RUN (L4 needs metal) |
 
 Plus a row in the owed-gates table for **C25 L4**, matching C18 L5's
 wording (*needs metal, not a time budget*), and rows for **C25 L1, L2's
@@ -1074,7 +1077,7 @@ operator ASKED for) makes the shadow's silent version worse.
 An independent pass over the feature and self-review commits.
 **Twelve findings, one that the reviewer mutation-proved was covered by
 nothing.** All fixed; every production predicate below is registered in
-`internal/mutation`, which now reports **54/54 guards mutation-verified**.
+`internal/mutation`, which now reports **61/61 guards mutation-verified**.
 
 **REV-1 (blocker-class, in the TESTS) —
 `TestWithoutTheFlagNoCaptureIsEverRead` asserted nothing, and the
@@ -1222,5 +1225,5 @@ is held; and `-race` is clean across all four packages.
 in both directions; the per-denominator rate floor; the divergence n
 floor; the replayable-path filter; the refused-fetch refusal; the harvest
 wall bound. With the feature and self-review commits that is **17 C25
-entries** in the registry, and the harness reports **54/54 verified in
-52 s**.
+entries** in the registry, and the harness reports **61/61 verified in
+62 s**.
