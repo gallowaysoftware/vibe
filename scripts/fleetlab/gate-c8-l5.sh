@@ -8,7 +8,7 @@
 set -uo pipefail
 source "$(dirname "$0")/gl.sh"
 
-CELL=charlie; MODEL=lab-embed-c; PORT=9643; SPORT=6010
+CELL=charlie; MODEL=lab-embed-c; PORT=$(cell_port charlie); SPORT=$(cell_sport charlie)
 PROBEFILE=$LAB/state/ann-$CELL/vibe/fleet/model-probe.json
 ROUNDS=${ROUNDS:-4}
 

@@ -10,7 +10,7 @@ leases() { curl -fsS -m 10 -H "Authorization: Bearer $VIBE_TOKEN" "$VIBE_API/api
 
 hr "0. baseline: no leases, and a real request so the idle window is a measured one"
 leases
-curl -fsS -m 180 http://127.0.0.1:9642/v1/embeddings -H 'Content-Type: application/json' \
+curl -fsS -m 180 "http://127.0.0.1:$(cell_port bravo)/v1/embeddings" -H 'Content-Type: application/json' \
   -d '{"model":"lab-embed-b","input":"C17 13d activity edge"}' | jq -c '{usage}'
 state | jq -c ".cells[]|select(.name==\"$CELL\")|.activity"
 

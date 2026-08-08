@@ -18,13 +18,16 @@
 # processes it starts itself live under $UPGRADE_DIR (default
 # /tmp/vibe-upgrade) on ports 9810-9819 with upstreams at 6100+.
 #
-# The one exception is deliberate and worth knowing before you run it:
-# `canary` step 2 hands off to scripts/fleetlab, which binds ITS fixed
-# 9600-9799 range and whose `down` sweep is anchored on the shared upstream
-# ports. A second lab on this box will be killed by it (futures item 15).
+# `canary` step 2 hands off to scripts/fleetlab, which takes its own
+# 200-port block from FLEETLAB_PORT_BASE. That used to be a fixed
+# 9600-9799 with a `down` sweep anchored on a shared upstream range, so a
+# canary run would kill any other lab on the box (futures item 15, closed
+# by C23). Set FLEETLAB_PORT_BASE if someone else already holds the
+# default block; the lab refuses a base that would reach production.
 #
 # Knobs:
 #   UPGRADE_DIR    scratch root                    (default /tmp/vibe-upgrade)
+#   FLEETLAB_PORT_BASE  the port block canary's lab takes (default 9600)
 #   LLAMA_SERVER   llama-server binary             (default ~/.local/bin/llama-server)
 #   IMAGE_REPO     the front's image repository    (default ghcr.io/mostlygeek/llama-swap)
 #   IMAGE_FLAVOUR  the front's image flavour        (default cpu — the front owns no GPU)
@@ -209,13 +212,16 @@ cmd_canary() {
   note "scripts/fleetlab stands four REAL llama-swap processes, a real fleetd and both"
   note "announcer shapes on localhost. This is where drain, suspend, the probe guard and"
   note "both warm loops meet the candidate's in-flight wire."
-  FLEETLAB_DIR=$DIR/fleetlab LLAMA_SWAP="$bin" "$REPO/scripts/fleetlab/lab.sh" up || {
-    FLEETLAB_DIR=$DIR/fleetlab "$REPO/scripts/fleetlab/lab.sh" down
+  note "lab dir $DIR/fleetlab, port base ${FLEETLAB_PORT_BASE:-9600}"
+  export FLEETLAB_DIR=$DIR/fleetlab
+  export FLEETLAB_PORT_BASE=${FLEETLAB_PORT_BASE:-9600}
+  LLAMA_SWAP="$bin" "$REPO/scripts/fleetlab/lab.sh" up || {
+    "$REPO/scripts/fleetlab/lab.sh" down
     die "the lab did not come up on $v"
   }
-  FLEETLAB_DIR=$DIR/fleetlab LLAMA_SWAP="$bin" "$REPO/scripts/fleetlab/lab.sh" prove | tee "$LOGS/lab-prove-$v.txt"
+  LLAMA_SWAP="$bin" "$REPO/scripts/fleetlab/lab.sh" prove | tee "$LOGS/lab-prove-$v.txt"
   rc=${PIPESTATUS[0]}
-  FLEETLAB_DIR=$DIR/fleetlab "$REPO/scripts/fleetlab/lab.sh" down
+  "$REPO/scripts/fleetlab/lab.sh" down
   [[ $rc -eq 0 ]] || die "the lab's proofs failed on $v — see $LOGS/lab-prove-$v.txt"
   note ""
   note "next: ritual.sh gate $v"

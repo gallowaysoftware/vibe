@@ -26,7 +26,7 @@ restart_fleetd() {
 }
 sleepblk() { state | jq -c '.sleep.entries[]?'; }
 cellblk()  { state | jq -c '.cells[]|select(.name=="'"$CELL"'")|{display,intent}'; }
-poke() { curl -fsS -m 180 http://127.0.0.1:9642/v1/embeddings -H 'Content-Type: application/json' \
+poke() { curl -fsS -m 180 "http://127.0.0.1:$(cell_port bravo)/v1/embeddings" -H 'Content-Type: application/json' \
            -d '{"model":"lab-embed-b","input":"C17 C14 L3 the operator is typing"}' >/dev/null && echo "# request served at $(date -Is)"; }
 
 cron_at() { TZ=$FTZ date -d "+$1 minutes" "+%-M %-H * * *"; }

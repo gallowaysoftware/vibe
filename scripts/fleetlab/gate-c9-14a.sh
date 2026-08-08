@@ -16,7 +16,7 @@ restart_fleetd() {
 
 hr "0. point the notifier at a real ntfy topic (random, public, lab-only content)"
 cp "$LAB/etc/vibe/config.yaml" "$LAB/etc/vibe/config.yaml.c17bak"
-sed -i "s#url: \"http://127.0.0.1:9724/fleetlab\"#url: \"$URL\"#" "$LAB/etc/vibe/config.yaml"
+sed -i "s#url: \"http://127.0.0.1:$LAB_NOTIFY_PORT/fleetlab\"#url: \"$URL\"#" "$LAB/etc/vibe/config.yaml"
 grep -n "url:" "$LAB/etc/vibe/config.yaml"
 restart_fleetd
 sleep 5

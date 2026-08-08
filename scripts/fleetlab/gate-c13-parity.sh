@@ -13,7 +13,7 @@ restart_charlie() { # $1 = XDG_CONFIG_HOME
   ( export XDG_CONFIG_HOME=$1 XDG_STATE_HOME=$LAB/state/ann-charlie XDG_RUNTIME_DIR=$LAB/run/rt-ann-charlie
     mkdir -p "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
     nohup "$BIN" fleet announce --cell charlie --registry "$VIBE_API" --token-file "$LAB/state/fleetd/vibe/token" \
-      --llama-swap http://127.0.0.1:9643 --llama-server "${LLAMA_SERVER:-$HOME/.local/bin/llama-server}" \
+      --llama-swap "http://127.0.0.1:$(cell_port charlie)" --llama-server "${LLAMA_SERVER:-$HOME/.local/bin/llama-server}" \
       >>"$LAB/logs/announce-charlie.log" 2>&1 & echo $! > "$LAB/run/announce-charlie.pid" )
   sleep 25
 }
