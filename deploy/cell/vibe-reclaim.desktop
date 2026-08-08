@@ -1,0 +1,19 @@
+[Desktop Entry]
+# EXAMPLE VALUES. Install to ~/.local/share/applications/ and edit Exec=
+# for the application you actually reclaim the box for.
+#
+# The desktop-shortcut form of the declared reclaim (fleet-control C24):
+# the icon a human double-clicks IS the drain, so the fleet learns the
+# box is theirs at the same instant they take it, and gets it back when
+# the application exits.
+#
+# Terminal=false is why the wrapper passes --yes: there is no terminal to
+# answer a lease prompt on, and a shortcut that silently does nothing is
+# worse than one that reclaims and reports.
+Type=Application
+Name=Blender (reclaim this cell)
+Comment=Drain this vibe cell for the session, resume when the app exits
+Exec=env VIBE_RECLAIM_REASON=blender /usr/local/bin/vibe-reclaim.sh /usr/bin/blender %F
+Icon=blender
+Terminal=false
+Categories=Graphics;3DGraphics;

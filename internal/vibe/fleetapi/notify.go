@@ -278,12 +278,27 @@ func absentAlarm(c CellSnapshot) (string, bool) {
 	if c.Class != string(fleetcfg.ClassAlwaysOn) {
 		return "", false
 	}
+	// C24: a unit's own stop record is NOT a declaration. `systemctl
+	// stop` and a crash-stop fire the same ExecStopPost, so a record
+	// that says "stopped out of band" is the always_on alarm's subject,
+	// not its suppression — silencing the page because the box managed
+	// to say "I stopped" on the way down is how this notifier gets muted
+	// for exactly the incident it exists for.
+	stopRecord := IsStopRecord(c.Intent)
 	switch c.Display {
 	case DisplayDrainedQ, DisplayOffAway, DisplayOffAwayQ:
+	case DisplayDrained, DisplayOff:
+		if !stopRecord {
+			return "", false
+		}
 	default:
 		return "", false
 	}
-	detail := fmt.Sprintf("always_on cell %s is %s with no declared intent", c.Name, c.Display)
+	why := "with no declared intent"
+	if stopRecord {
+		why = "with no declared intent (its unit recorded the stop; nothing recorded why)"
+	}
+	detail := fmt.Sprintf("always_on cell %s is %s %s", c.Name, c.Display, why)
 	if c.LastSeen != nil {
 		detail += fmt.Sprintf(" (last seen %s)", c.LastSeen.UTC().Format(time.RFC3339))
 	}

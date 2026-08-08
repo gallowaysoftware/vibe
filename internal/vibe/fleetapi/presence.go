@@ -276,6 +276,16 @@ func resolveIntent(intent Intent, hasIntent bool, echo *AnnounceIntent) (eff Int
 		servingRequest = false
 	}
 	pending = hasIntent && (servingRequest || (intent.State == "drained" && (echo == nil || echo.Since.Before(intent.Since))))
+	// C24: a stop record is not a REQUEST — the unit wrote down that it
+	// stopped, it asked the cell for nothing, and there is no ack coming
+	// from a box whose stack is down. Left as pending it renders
+	// "requested, awaiting cell ack" in `vibe cell status` for a stop
+	// nobody requested, and `vibe fleet doctor` calls it residue two
+	// minutes later, every night the box is off — the permanent-WARN
+	// shape C14 had to fix for a sleeping box.
+	if IsStopRecord(&intent) {
+		pending = false
+	}
 	if !hasIntent || servingRequest {
 		return Intent{}, false, pending
 	}

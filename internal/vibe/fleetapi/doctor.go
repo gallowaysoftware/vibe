@@ -1313,6 +1313,12 @@ func explainedCells(snap StateSnapshot) map[string]string {
 	for _, c := range snap.Cells {
 		switch {
 		// C11's ladder order: drained > held > class-normal absence.
+		// C24 splits the first rung: a stop record explains why a loop is
+		// not acting (the stack is down) without claiming anybody
+		// declared it — "declared (stopped out of band)" would be the
+		// contradiction this function exists to remove.
+		case IsStopRecord(c.Intent):
+			out[c.Name] = "cell's unit recorded its own stop; nothing declared why"
 		case c.Intent != nil && c.Intent.State == "drained":
 			out[c.Name] = "cell drained, declared" + reasonSuffix(c.Intent.Reason)
 		default:
@@ -1350,6 +1356,16 @@ func (s *Server) checkIntentHygiene(rep *DoctorReport, snap StateSnapshot) {
 		if c.IntentPending && !young && !asleep {
 			pending = append(pending, c.Name)
 		}
+		// C24: a stop record moves the display off DRAINED? — the store
+		// now holds the when — but it declares no reason, so it stays in
+		// this bucket. The check must not get quieter because the box
+		// managed to say "I stopped" on the way down; what it gains is a
+		// timestamp and a fix that names the wrapper.
+		if IsStopRecord(c.Intent) {
+			undeclared = append(undeclared, c.Name+" "+c.Display+
+				" (recorded by its own unit stop at "+c.Intent.Since.UTC().Format(time.RFC3339)+"; nothing declared why)")
+			continue
+		}
 		switch c.Display {
 		case DisplayDrainedQ:
 			// The cell stopped with NO entry in the intent store: nothing
@@ -1382,10 +1398,15 @@ func (s *Server) checkIntentHygiene(rep *DoctorReport, snap StateSnapshot) {
 		det = append(det, "declared drained but still answering: "+strings.Join(unreconciled, ", ")+
 			" (INCONSISTENT — evidence outranks the declaration, and nothing acts on either)")
 	}
+	fix := "`vibe cell resume <cell>` clears a stale drain; a stuck request means the cell is not reconciling."
+	if len(undeclared) > 0 {
+		fix += " An undeclared stop is a reclaim that bypassed the verb: run the launcher through " +
+			"`vibe cell drain --until-exit -- <command>` (deploy/cell) so the next one declares itself."
+	}
 	rep.Add(DoctorCheck{ID: "intent.hygiene", Level: LevelWarn,
 		Summary: "the intent axis has residue",
 		Detail:  strings.Join(det, "; "),
-		Fix:     "`vibe cell resume <cell>` clears a stale drain; a stuck request means the cell is not reconciling."})
+		Fix:     fix})
 }
 
 func (s *Server) checkLeases(rep *DoctorReport) {
