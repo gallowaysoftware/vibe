@@ -44,8 +44,8 @@ display state into `fleetapi.IsStopRecord` to get it back:
 
 A display state that its own consumers have to work around is the wrong
 display state. `STOPPED` lets the derivation carry the fact once. The
-side-channel does not vanish (§4), but it shrinks to the one arm where
-it is genuinely load-bearing.
+side-channel does not vanish — §3 is why it cannot — but it shrinks from
+"the thing that decides two arms" to "the thing that disambiguates OFF".
 
 ## 3. The decision: host unreachable stays OFF
 
