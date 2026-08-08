@@ -42,6 +42,7 @@ type fakeCell struct {
 	resident  map[string]bool
 	rows      []fakeRow
 	captures  map[int64]swaptest.Capture
+	refused   map[int64]int
 	reads     map[int64]int
 	chatCalls map[string]int
 	chatBody  map[string][][]byte
@@ -64,6 +65,7 @@ func newFakeCell(t *testing.T) *fakeCell {
 	f := &fakeCell{
 		resident:  map[string]bool{},
 		captures:  map[int64]swaptest.Capture{},
+		refused:   map[int64]int{},
 		reads:     map[int64]int{},
 		chatCalls: map[string]int{},
 		chatBody:  map[string][][]byte{},
@@ -119,13 +121,30 @@ func (f *fakeCell) handleCapture(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.reads[id]++
 	c, ok := f.captures[id]
+	status := f.refused[id]
 	f.mu.Unlock()
+	if status != 0 {
+		w.WriteHeader(status)
+		return
+	}
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"error":"capture not found"}`))
 		return
 	}
 	writeJSON(w, c)
+}
+
+// refuse makes one capture answer a non-200-non-404: a 401 on a cell that
+// keys its own llama-swap, which is a different thing from an eviction and
+// must not be counted as one.
+func (f *fakeCell) refuse(id int64, status int) {
+	f.mu.Lock()
+	if f.refused == nil {
+		f.refused = map[int64]int{}
+	}
+	f.refused[id] = status
+	f.mu.Unlock()
 }
 
 func (f *fakeCell) handleChat(w http.ResponseWriter, r *http.Request) {

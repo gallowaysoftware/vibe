@@ -21,8 +21,19 @@ import (
 func (r *Report) Render(w io.Writer) {
 	n := r.Sample.Replayable
 	fmt.Fprintf(w, "replay: %d of this cell's own recent requests, through both models\n", n)
-	fmt.Fprintf(w, "  sampled:  %d walked, %d advertised a capture, %d evicted before the fetch, %d not chat, %d unreadable\n",
+	// Every term of the arithmetic, including the two that mean "this
+	// process could not read it" rather than "the cell did not serve it".
+	// A denominator that quietly shrank is a denominator nobody can judge,
+	// and `refused` in particular is a credential problem wearing a
+	// workload's clothes.
+	fmt.Fprintf(w, "  sampled:  %d walked, %d advertised a capture, %d evicted before the fetch, %d not replayable, %d unreadable\n",
 		r.Sample.Walked, r.Sample.Candidates, r.Sample.Evicted, r.Sample.SkippedBasis, r.Sample.Malformed)
+	if r.Sample.Refused > 0 {
+		fmt.Fprintf(w, "  REFUSED:  %d capture fetch(es) answered HTTP %d rather than the capture. That is what this\n",
+			r.Sample.Refused, r.Sample.RefusedStatus)
+		fmt.Fprintln(w, "            process could read, not what this cell served — a cell that keys its own")
+		fmt.Fprintln(w, "            llama-swap needs the key, and this command sends none (C15, C18 §8).")
+	}
 
 	if n < r.Sample.Floor {
 		fmt.Fprintf(w, "\n  n = %d is below the rate floor of %d, so NO rate is shown. A proportion on this many\n", n, r.Sample.Floor)

@@ -925,6 +925,18 @@ var Registry = []Mutation{
 			"value, one more time.",
 	},
 	{
+		Name:     "c25/a partially refused harvest reports a short n and no reason",
+		File:     "internal/vibe/benchreplay/report.go",
+		Find:     "\tif r.Sample.Refused > 0 {",
+		Replace:  "\tif false {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestAPartiallyRefusedHarvestSaysSoOnTheReport"},
+		Why: "the mixed case the refusal STRING cannot cover: some capture fetches answered and some " +
+			"401'd, so the harvest succeeds with a short n and prints a denominator that shrank for a " +
+			"reason it never names. The reason is a credential problem wearing a workload's clothes, " +
+			"and the operator reads the number as a fact about what their box serves.",
+	},
+	{
 		Name:     "c25/the harvest loses its wall bound",
 		File:     "internal/vibe/benchreplay/harvest.go",
 		Find:     "\t\t\tif opt.Now().After(deadline) {",

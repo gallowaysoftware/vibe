@@ -972,6 +972,38 @@ func TestAnEvictedCaptureIsCountedAndNeverRetried(t *testing.T) {
 	rep.Render(&out)
 	require.Contains(t, out.String(), "evicted",
 		"the loss has to appear on the same screen as the number; an n that shrank silently is an n nobody can judge")
+	require.NotContains(t, out.String(), "REFUSED",
+		"nothing was refused here; a banner that fires when it should not is one nobody reads when it should")
+}
+
+// TestAPartiallyRefusedHarvestSaysSoOnTheReport is the mixed case the
+// refusal string cannot cover: some fetches answered and some 401'd, so
+// the harvest SUCCEEDS with a short n. Without the banner the report shows
+// a denominator that shrank for a reason it never names, and the reason is
+// a credential problem wearing a workload's clothes.
+func TestAPartiallyRefusedHarvestSaysSoOnTheReport(t *testing.T) {
+	f := newFakeCell(t)
+	f.warm("incumbent", "candidate")
+	f.row(1, "incumbent", "/v1/chat/completions", 200, plainRequest("p"), "")
+	f.row(2, "incumbent", "/v1/chat/completions", 200, plainRequest("p"), "")
+	// Row 3 advertises a capture the cell will not hand over.
+	f.rowWithoutCapture(3, "incumbent", "/v1/chat/completions")
+	f.refuse(3, http.StatusUnauthorized)
+
+	set, err := Harvest(t.Context(), Options{LlamaSwapURL: f.url}, "incumbent", false)
+	require.NoError(t, err)
+	require.Equal(t, 2, set.Len())
+	require.Equal(t, 1, set.stats.Refused)
+	require.Equal(t, http.StatusUnauthorized, set.stats.RefusedStatus)
+	require.Equal(t, 0, set.stats.Evicted, "a 401 is not an eviction; conflating them loses the only actionable half")
+
+	rep, err := set.Run(t.Context(), "c", Side{Model: "incumbent"}, Side{Model: "candidate"})
+	require.NoError(t, err)
+	var out bytes.Buffer
+	rep.Render(&out)
+	require.Contains(t, out.String(), "REFUSED")
+	require.Contains(t, out.String(), "401")
+	require.Contains(t, out.String(), "not what this cell served")
 }
 
 // ── the harvest against the SHARED double ───────────────────────────────

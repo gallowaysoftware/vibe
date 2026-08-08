@@ -877,9 +877,9 @@ llama-swap does and because those bytes are synthetic by construction.
 | U13 | the route behaves identically under v239 and v247 | **PASS**, and further than asked — see below |
 | U14 | full inner loop | **PASS** — `go build ./...`, `go vet ./...`, `gofmt -l .` silent, `go mod tidy` byte-clean, `golangci-lint run` **0 issues**, `go test -race ./...`, and `-race -count=5` over the eight touched packages |
 
-**Seventeen production predicates are mutation-verified** and registered
+**Eighteen production predicates are mutation-verified** and registered
 in `internal/mutation`, so CI re-proves them on every PR rather than this
-paragraph being the only record. The full harness reports **61/61 guards
+paragraph being the only record. The full harness reports **62/62 guards
 mutation-verified in 62s** across the whole registry. The eleven from the
 feature and self-review commits (the review pass's six are in
 [§13](#13-adversarial-review-addendum-independent-pass)):
@@ -1048,7 +1048,7 @@ correct.
 
 **§9's README status row** should now read:
 
-> | [C25](c25-bench-replay.md) | `vibe model try --replay`: your own traffic as the benchmark | 1315 non-comment production lines + 2364 test | C8, C18 (composition), C7a (the activity walk) | **BUILT (2026-08-08)**; delivered as a C18 flag rather than a top-level verb; U1–U14 green, 17 predicates mutation-verified (harness 61/61), the capture contract measured against real v239 and v247 binaries; L2 PASS on real v239+v247; L1, L3, L4 NOT RUN (L4 needs metal) |
+> | [C25](c25-bench-replay.md) | `vibe model try --replay`: your own traffic as the benchmark | 1315 non-comment production lines + 2364 test | C8, C18 (composition), C7a (the activity walk) | **BUILT (2026-08-08)**; delivered as a C18 flag rather than a top-level verb; U1–U14 green, 18 predicates mutation-verified (harness 62/62), the capture contract measured against real v239 and v247 binaries; L2 PASS on real v239+v247; L1, L3, L4 NOT RUN (L4 needs metal) |
 
 Plus a row in the owed-gates table for **C25 L4**, matching C18 L5's
 wording (*needs metal, not a time budget*), and rows for **C25 L1, L2's
@@ -1077,7 +1077,7 @@ operator ASKED for) makes the shadow's silent version worse.
 An independent pass over the feature and self-review commits.
 **Twelve findings, one that the reviewer mutation-proved was covered by
 nothing.** All fixed; every production predicate below is registered in
-`internal/mutation`, which now reports **61/61 guards mutation-verified**.
+`internal/mutation`, which now reports **62/62 guards mutation-verified**.
 
 **REV-1 (blocker-class, in the TESTS) —
 `TestWithoutTheFlagNoCaptureIsEverRead` asserted nothing, and the
@@ -1221,9 +1221,18 @@ response-derived error string reaches stdout, the journal or a return
 value on any traced path; `Cell.SetCapture` is never called while `c.mu`
 is held; and `-race` is clean across all four packages.
 
-**Mutation-verified predicates in this pass (6).** The `--replay` guard
+**Mutation-verified predicates in this pass (7).** The `--replay` guard
 in both directions; the per-denominator rate floor; the divergence n
-floor; the replayable-path filter; the refused-fetch refusal; the harvest
-wall bound. With the feature and self-review commits that is **17 C25
-entries** in the registry, and the harness reports **61/61 verified in
-62 s**.
+floor; the replayable-path filter; the refused-fetch refusal; the
+partially-refused report banner; the harvest wall bound. With the feature
+and self-review commits that is **18 C25 entries** in the registry, and
+the harness reports **62/62 verified in 62 s**.
+
+REV-5 has one more surface than the reviewer named, found while writing
+its fix. The refusal string covers the case where NOTHING could be read;
+the case where SOME fetches answered and some 401'd succeeds, with a
+short n and a denominator that shrank for a reason the report never
+stated. The `sampled:` line now names every term of its own arithmetic
+and a `REFUSED:` banner appears when there is one, saying in as many
+words that it describes what this process could read rather than what the
+cell served.
