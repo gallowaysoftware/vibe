@@ -464,6 +464,8 @@ controller. Documented with its usual causes.
   reserved reason. A fourth flavour of "down" would ripple into the page,
   the CLI, C9, the doctor and the design doc's §4 table, which this
   phase may not edit — raised for the reconciliation pass below instead.
+  *(C27 did exactly that ripple, deliberately and with the alarm
+  behaviour pinned over 108 combinations: the state is `STOPPED`.)*
 - **No inference anywhere.** The record is written by the stop, not
   derived from a probe. Nothing in this phase reads availability and
   concludes intent.
@@ -498,6 +500,13 @@ Axis 2 gains a second class of author. Suggested amendment:
 > one an operator stopped, and must alarm exactly as before). The paired
 > `ExecStartPost` (`unit_started`) retires the record and nothing else.
 > Packaging: `deploy/cell/`.
+
+> **SETTLED by C27 (2026-08-08)** — see
+> [c27-stopped-display-state.md](c27-stopped-display-state.md). The
+> answer is neither: the record gets its own state, `STOPPED`, matching
+> the `unit_stopped` / `unit_started` verbs this phase already shipped.
+> `Display == DRAINED?` therefore still implies `Intent == nil`. A stop
+> record whose HOST is also unreachable stays OFF.
 
 Open question for the design owner, deliberately left open: **should a
 stop record render `DRAINED` or keep the `DRAINED?` question?** This

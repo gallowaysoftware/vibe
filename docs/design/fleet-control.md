@@ -221,13 +221,17 @@ on the harness, where the same cell's llama-swap survives the record and
 dies to a human's drain in the same run
 (`scripts/fleetlab/gate-c24-stop-record.sh`). Packaging: `deploy/cell/`.
 
-**Open, deliberately**: a stop record renders **DRAINED** with the
-reserved reason, which is what C24 chose and compensated for by making
-every why-consuming surface ignore it. The alternative — display stays
-`DRAINED?`, the intent block carries the record — is arguably truer to
-the display table below and costs nothing in C9 or the doctor, but it
-makes `Display == DRAINED?` no longer imply `Intent == nil`, which
-several surfaces read as a pair today.
+*Settled C27.* The open question left here by C24 — should a stop record
+render `DRAINED` or keep the `DRAINED?` question — is answered with
+**neither**. It gets its own display state, **STOPPED**, matching the
+wire verbs C24 already ships (`unit_stopped` / `unit_started`). The two
+candidates were each wrong in one direction: `DRAINED` says somebody
+chose this and wrote down why, and `DRAINED?` says nothing is recorded
+at all, while the record is more than the second and less than the
+first. The confusion was already load-bearing — `notify.absentAlarm` and
+`doctor.explainedCells` both had to reach past the display state into
+`fleetapi.IsStopRecord` to recover a distinction the display had lost.
+It actuates nothing, exactly like every other state in this table.
 
 **Axis 3 — model residency (llama-swap-owned, never duplicated).**
 `stopped / starting / ready / draining` + TTL, straight from each
@@ -264,7 +268,10 @@ never alarms; what alarms is the wake that did not deliver.
 evaluates that column against this table's own derived display states
 and delivers it to one webhook. `always_on` absence alarms *only when
 intent does not explain it* — a declared drain (DRAINED / OFF) is not an
-alarm, an absence with no entry (DRAINED?) is. `opportunistic` and
+alarm, an absence with no entry (DRAINED?) is, and so is **STOPPED**: a
+record of the stop is not a reason for it (*C27*; an OFF cell carrying a
+stop record alarms too, which is why `absentAlarm` still reads
+`IsStopRecord` on that one arm). `opportunistic` and
 `roaming` absence never alarms, and `INCONSISTENT` is a nag rather than
 a page. Delivery — never evaluation — is gated by a declared fleet-scope
 `notify.scope` (away/home) whose suppressions stay visible in
@@ -289,9 +296,10 @@ aliases for a peer stanza.
 |---|---|---|---|
 | up | up | — | **SERVING** (+ resident models, or "up-cold, will JIT") |
 | down | up | — | **SERVING** — a responding cell is proof of life; the host probe (e.g. a firewalled SSH port) loses to it |
-| up | down | drained | **DRAINED** ("gaming, since 21:04, eta 23:00") |
+| up | down | drained | **DRAINED** ("gaming, since 21:04, eta 23:00") — somebody CHOSE this |
+| up | down | stop record | **STOPPED** *(C27)* — the cell unit's own `ExecStopPost` recorded that the stack stopped, and when. A clean `systemctl stop` and a crash fire the identical hook, so this is a fact about the stack, never an explanation: it does not suppress the `always_on` alarm and the doctor still calls it undeclared |
 | up | down | none | **DRAINED?** — deliberate stop or crash loop; flagged with a deep link to cell logs, never acted on |
-| down | — | drained | **OFF** (was drained first) |
+| down | — | drained *or* stop record | **OFF** (was drained first) — the host being unreachable dominates; the record itself is still on the `intent` field, which is where the alarm reads it |
 | down | — | none | **OFF/AWAY** with `last_seen` (per-cell transition timestamps recorded — and persisted — starting in C1; today's watcher keeps only a boolean up/down map) |
 | no probe | down | none | **OFF/AWAY?** — without a `host_probe` the host/cell distinction is unknowable; shown with last_seen |
 | up | up | drained | **INCONSISTENT** — resume forgot to clear intent; status nags until cleared |
