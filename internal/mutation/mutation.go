@@ -738,6 +738,241 @@ var Registry = []Mutation{
 			"starter that fails validation sends a first-time operator to debug their own typing for " +
 			"a file they did not write.",
 	},
+
+	// ── class 5: private traffic reaching a place it may not (C25) ────
+	//
+	// C25 replays a cell's own recent requests through a candidate model,
+	// and the bytes it handles are the verbatim prompts and completions of
+	// real requests. The failure mode is not a wrong number; it is a
+	// prompt in a public git repository or on somebody's terminal.
+	{
+		Name:     "c25/the fixture recorder stops refusing the captures endpoint",
+		File:     "internal/swaptest/captures.go",
+		Find:     "\tif !strings.Contains(strings.ToLower(p), CaptureRoutePrefix) {",
+		Replace:  "\tif true || !strings.Contains(strings.ToLower(p), CaptureRoutePrefix) {",
+		Pkg:      "./internal/swaptest/",
+		MustFail: []string{"TestRefuseCaptureEndpoint_RefusesEveryFormOfTheRoute"},
+		Why: "internal/swaptest's recorder reads a REAL llama-swap on the operator's box and commits " +
+			"what it reads to a PUBLIC repository. GET /api/captures/{id} answers the verbatim prompt, " +
+			"system prompt, tool definitions and completion of a real request, and the recorder's two " +
+			"existing redactions cannot help: they work because the sensitive part is a substring of " +
+			"something still worth keeping, and a capture's sensitive part is the whole object. " +
+			"Without this refusal the next fixture commit publishes somebody's prompt.",
+	},
+	{
+		Name:     "c25/the recorder's fetch guard moves off the one fetch path",
+		File:     "internal/swaptest/record_test.go",
+		Find:     "\tif why := RefuseCaptureEndpoint(url); why != \"\" {\n\t\tt.Fatal(why)\n\t}\n\treq, err := http.NewRequestWithContext(ctx, method, url, body)",
+		Replace:  "\treq, err := http.NewRequestWithContext(ctx, method, url, body)",
+		Pkg:      "./internal/swaptest/",
+		MustFail: []string{"TestRecorderFetchesOnlyThroughTheCaptureRefusal"},
+		Why: "the refusal exists and is not called. recordGET is the recorder's ONE fetch path, so a " +
+			"guard removed from it is a guard removed from everything — and the AST scan is what " +
+			"notices, because a reviewer reading the endpoint LIST would see nothing wrong.",
+	},
+	{
+		Name:     "c25/the replay sample is harvested after the apply",
+		File:     "internal/vibe/modeltry/modeltry.go",
+		Find:     "\treturn benchreplay.Harvest(ctx, opt, t.Incumbent, t.State == StateApplied || t.State == StateMeasured)",
+		Replace:  "\treturn benchreplay.Harvest(ctx, opt, t.Incumbent, false)",
+		Pkg:      "./internal/vibe/modeltry/",
+		MustFail: []string{"TestHarvestIsRefusedOnceTheTrialIsApplied"},
+		Why: "the apply writes the cell's llama-swap config, and `-watch-config` does not mutate a " +
+			"running server — it builds a new one, with a fresh EMPTY capture buffer. So at the moment " +
+			"the candidate first exists the sample is gone, and a harvest that ran anyway would score " +
+			"a model against no evidence. The ordering constraint and the privacy invariant are the " +
+			"same constraint: the only place a sample can live across an apply is this process's memory.",
+	},
+	{
+		Name:     "c25/an undeclared tool name is echoed instead of marked",
+		File:     "internal/vibe/benchreplay/shape.go",
+		Find:     "\t\ts.toolOutcome = ToolUndeclared\n\t\tif f.toolNames[tc.Function.Name] {\n\t\t\ts.toolOutcome = ToolDeclared\n\t\t}",
+		Replace:  "\t\ts.toolOutcome = tc.Function.Name",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestUndeclaredToolNameIsReportedAndNeverEchoed", "TestClosedSetStringsAreActuallyClosed"},
+		Why: "a tool name a model invented is MODEL OUTPUT, which is to say private traffic, and the " +
+			"per-request table is a thing an operator pastes into a chat window. The closed set " +
+			"none/declared/<undeclared> is what keeps the field from being a channel for it, and it " +
+			"is also what makes Report's string fields checkable at all.",
+	},
+	{
+		Name:     "c25/the divergence claim stops being gated on the noise floor",
+		File:     "internal/vibe/benchreplay/score.go",
+		Find:     "\tif got <= noise {",
+		Replace:  "\tif false {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestNoiseFloorSuppressesTheDivergenceClaim"},
+		Why: "a captured request carries the CLIENT's own temperature, so replaying it through the " +
+			"very model that produced the recorded response yields different text: the divergence " +
+			"floor is not zero and is not knowable in advance. Reporting a candidate's raw " +
+			"disagreement rate as divergence therefore reports the sampler, and it does it in the " +
+			"direction that makes every candidate look worse than the incumbent.",
+	},
+	{
+		Name:     "c25/a proportion is printed below the rate floor",
+		File:     "internal/vibe/benchreplay/score.go",
+		Find:     "\tif sc.Requests >= floor {",
+		Replace:  "\tif true {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestBelowTheFloorThereIsATableAndNoRate"},
+		Why: "n is whatever survived a 10 MB FIFO buffer, not something the operator chose, and a " +
+			"tool-call rate on three requests is noise wearing a percent sign. The rates are " +
+			"observed.Values so that under the floor they read `unknown` rather than a number — the " +
+			"absent-evidence-as-a-healthy-value class, in the one screen this phase exists to print.",
+	},
+	{
+		Name:     "c25/the paired ratio becomes a ratio of means",
+		File:     "internal/vibe/benchreplay/score.go",
+		Find:     "\tp.MedianRatio = observed.Known(median(ratios))",
+		Replace:  "\tsum := 0.0\n\tfor _, r := range ratios {\n\t\tsum += r\n\t}\n\tp.MedianRatio = observed.Known(sum / float64(len(ratios)))",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestPairedRatioIsAMedianOfRatiosNotARatioOfMeans"},
+		Why: "the sample is the cell's own traffic, so it contains one 100k-token agentic request " +
+			"beside thirty small ones. A mean lets that single request decide the answer; the median " +
+			"of per-request ratios is the figure both sides having seen the IDENTICAL sample actually " +
+			"licenses.",
+	},
+	{
+		Name:     "c25/an unreducible recorded response counts as agreement",
+		File:     "internal/vibe/benchreplay/score.go",
+		Find:     "\t\tif !rec.known || !inc.shapes[i].known || !cand.shapes[i].known {",
+		Replace:  "\t\tif false {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestDivergenceIsNotMeasuredWhenTheRecordedResponseCannotBeReduced"},
+		Why: "llama-swap stores the request but NEVER the response body for a non-200, and a request " +
+			"that made the model choke is the most interesting one to replay and the one with nothing " +
+			"to diverge from. A zero-valued shape scores as `answered nothing, called no tool, " +
+			"finished with none` — three claims nobody measured, folded into a divergence figure.",
+	},
+	{
+		Name:     "c25/a replay loads a model that is not resident",
+		File:     "internal/vibe/benchreplay/replay.go",
+		Find:     "\tif !resident {\n\t\treturn replayResult{}, fmt.Errorf(\"%s is %w\", side.Model, ErrNotResident)\n\t}",
+		Replace:  "\t_ = resident",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestEveryRefusalFiresByNameAndWritesNothing"},
+		Why: "C8's cardinal rule, on the other side of the seam. llama-swap's contract is " +
+			"JIT-on-request, so replaying n requests at a model that is not resident STARTS it — and " +
+			"on a one-model cell that evicts the model serving the user. The measurement would have " +
+			"become an actuator, and the thing it actuated is eviction.",
+	},
+	{
+		Name: "c25/a replay side loses its wall bound",
+		File: "internal/vibe/benchreplay/replay.go",
+		Find: "\t\tif s.opt.Now().After(deadline) {",
+		// `_ = deadline` keeps it compiling: a mutation that fails to build
+		// proves nothing about the guard.
+		Replace:  "\t\t_ = deadline\n\t\tif false {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestASideThatOutrunsItsBudgetRefusesRatherThanTruncating"},
+		Why: "a per-request timeout is not a bound on the command: 40 samples at the 5-minute " +
+			"per-request timeout is nearly four hours PER SIDE, and the sample is real agentic " +
+			"traffic carrying its own max_tokens. `vibe model try` holds a four-hour lease and a " +
+			"four-hour C11 hold on the incumbent while this runs, so a replay that outlived them " +
+			"would be measuring a cell the fleet had resumed using. The refusal rather than a short " +
+			"n is the other half: a side that replayed 31 of 40 while the other replayed 40 is a " +
+			"metric lying about its own n.",
+	},
+	{
+		Name:     "c25/a rate is gated on the sample size instead of its own denominator",
+		File:     "internal/vibe/benchreplay/score.go",
+		Find:     "\tif sc.ToolsOffered >= floor {",
+		Replace:  "\tif sc.Requests >= floor {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestEachRateIsGatedOnItsOwnDenominator"},
+		Why: "the tool-call rate divides by the number of requests that OFFERED tools, not by the " +
+			"sample size, and in ordinary chat traffic most requests offer none. A 40-sample run " +
+			"can therefore compute three-of-five and print it wearing a forty-sample floor's " +
+			"authority — which is the number the operator adopts or rejects a model on.",
+	},
+	{
+		Name:     "c25/the divergence excess loses its n floor",
+		File:     "internal/vibe/benchreplay/score.go",
+		Find:     "\tif d.N < floor {",
+		Replace:  "\tif d.N == 0 {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestTheDivergenceExcessHasItsOwnFloor"},
+		Why: "the divergence n is routinely far below the sample size — non-200 rows carry no " +
+			"recorded response body and unreducible ones drop out — so without a floor of its own, " +
+			"ONE sample where the incumbent agreed and the candidate did not prints `100 points " +
+			"ABOVE the floor`. A proportion difference is still a proportion.",
+	},
+	{
+		Name:     "c25/a chat-basis path the replay cannot rebuild is admitted",
+		File:     "internal/vibe/benchreplay/harvest.go",
+		Find:     " || !replayable(row.ReqPath) {",
+		Replace:  " {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestEveryRefusalFiresByNameAndWritesNothing"},
+		Why: "usagemeter's chat basis covers /v1/completions, /infill, /completion, /v1/responses " +
+			"and /v1/messages as well as chat-completions — real endpoints a llama.cpp cell serves, " +
+			"with request shapes this package cannot rebuild. Admitted, the rewrite fails, the shape " +
+			"comes back unknown, and the row is scored as a request the MODEL failed on both sides. " +
+			"/v1/messages is worse: it parses, is POSTed to the wrong API, and its Anthropic-shaped " +
+			"tools array reads as `no tools declared`, so it leaves the tool-call denominator silently.",
+	},
+	{
+		Name:     "c25/a refused capture fetch reads as an idle box",
+		File:     "internal/vibe/benchreplay/harvest.go",
+		Find:     "\t\tif set.stats.Refused > 0 {",
+		Replace:  "\t\tif false {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestEveryRefusalFiresByNameAndWritesNothing"},
+		Why: "on a cell that keys its own llama-swap — the case C15 exists for, and the one " +
+			"swapauth.go's comment says matters — EVERY capture fetch answers 401. Folding that into " +
+			"`this cell has served nothing recently` invents a fact about the operator's workload out " +
+			"of a credential problem, in the sentence they act on. Absent evidence read as a healthy " +
+			"value, one more time.",
+	},
+	{
+		Name:     "c25/a partially refused harvest reports a short n and no reason",
+		File:     "internal/vibe/benchreplay/report.go",
+		Find:     "\tif r.Sample.Refused > 0 {",
+		Replace:  "\tif false {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestAPartiallyRefusedHarvestSaysSoOnTheReport"},
+		Why: "the mixed case the refusal STRING cannot cover: some capture fetches answered and some " +
+			"401'd, so the harvest succeeds with a short n and prints a denominator that shrank for a " +
+			"reason it never names. The reason is a credential problem wearing a workload's clothes, " +
+			"and the operator reads the number as a fact about what their box serves.",
+	},
+	{
+		Name:     "c25/the harvest loses its wall bound",
+		File:     "internal/vibe/benchreplay/harvest.go",
+		Find:     "\t\t\tif opt.Now().After(deadline) {",
+		Replace:  "\t\t\t_ = deadline\n\t\t\tif false {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestTheHarvestHasItsOwnWallBound"},
+		Why: "MaxPages by up to 999 rows, each candidate costing a fetch with its own 30s timeout, " +
+			"and a row that 404s or 401s never counting toward MaxSample — so the fetch count has no " +
+			"cap of its own. It runs under the trial's four-hour lease and C11 hold, immediately in " +
+			"front of a config write that evicts every resident model.",
+	},
+	{
+		Name:     "c25/a trial without --replay reads the operator's captures",
+		File:     "internal/vibe/cli/cmd_model_try.go",
+		Find:     "\tif !gate.replay {\n\t\treturn nil, nil\n\t}",
+		Replace:  "\tif false {\n\t\treturn nil, nil\n\t}",
+		Pkg:      "./internal/vibe/cli/",
+		MustFail: []string{"TestWithoutTheFlagNoCaptureIsEverRead"},
+		Why: "the one guard between an ordinary `vibe model try` and a read of the operator's " +
+			"verbatim prompts. A verb that read them in order to decide whether to read them would " +
+			"be a bad joke — and the first version of the test that covers this could not see the " +
+			"deletion at all, because it drove against a dead fleetd and returned before the harvest " +
+			"call site was ever reached. Registered so the reachability cannot rot again.",
+	},
+	{
+		Name:     "c25/the replay edits the client's own sampling",
+		File:     "internal/vibe/benchreplay/replay.go",
+		Find:     "\tobj[\"stream\"] = json.RawMessage(\"false\")",
+		Replace:  "\tobj[\"stream\"] = json.RawMessage(\"false\")\n\tobj[\"seed\"] = json.RawMessage(\"42\")\n\tobj[\"temperature\"] = json.RawMessage(\"0\")",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestReplayRewritesOnlyTheModelAndTheStreamFlag"},
+		Why: "the obvious fix to a noisy divergence metric, and the wrong one. Real agentic clients " +
+			"send temperature above zero and no seed; injecting either makes the replay deterministic " +
+			"by falsifying the request — and a sample you had to falsify is no longer YOUR workload, " +
+			"which was this phase's entire point. Same objection C7a raised to injecting stream_options.",
+	},
 }
 
 // ── tree copying and patching ────────────────────────────────────────

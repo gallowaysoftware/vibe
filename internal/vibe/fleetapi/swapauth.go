@@ -20,6 +20,18 @@ import (
 // `X-Api-Key: <key>` are accepted; this package sends the former, because
 // it is also what a reverse proxy in front of a cell would honour.
 //
+// `GET /api/captures/{id}` — the endpoint C25's replay harvest reads —
+// joins that list, MEASURED on 2026-08-08 against real v239 (dd81801) and
+// v247 (40027d6) binaries rather than read off upstream source, which is
+// how C25's design doc had it. Identical on both: 401 with no key, 401
+// with a wrong key, 404 for an id the FIFO buffer no longer holds, 400 for
+// an id that is not an integer, and the object itself is
+// `{id, req_path, req_headers, req_body, resp_headers, resp_body}` with
+// base64 bodies. The consequence for the fleet is the one C25 §1d names
+// and nothing here can fix: any holder of a cell's llama-swap key can read
+// that cell's recent prompts and completions verbatim, because
+// captureBuffer defaults to 10 MB and vibe's renderer sets it nowhere.
+//
 // So a fleet that sets apiKeys did not merely lose its warms — before this
 // phase it lost every probe, the whole events stream (and with it in-flight
 // evidence, per-model activity and the idle windows the warm policy is

@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/gallowaysoftware/vibe/internal/vibe/benchreplay"
 	"github.com/gallowaysoftware/vibe/internal/vibe/daemon"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetapi"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
@@ -71,7 +72,7 @@ func modelTryCmd() *cobra.Command {
 		file, revision, like, as, dest, apiFlag string
 		cellFlag, configFlag, extrasFlag        string
 		quiet, waitFor                          time.Duration
-		now, dryRun, skipDisk                   bool
+		now, dryRun, skipDisk, replay           bool
 		minFreeGB                               float64
 	)
 	cmd := &cobra.Command{
@@ -89,7 +90,13 @@ func modelTryCmd() *cobra.Command {
 			"resident model and truncates any generation still running after 30s. That is why the\n" +
 			"apply waits for an observed idle window. --now skips the wait and says what it costs.\n\n" +
 			"Re-running the command resumes: every step is journalled, and `vibe model try end` rolls\n" +
-			"back whatever the journal says happened.",
+			"back whatever the journal says happened.\n\n" +
+			"--replay adds the half throughput cannot answer: both models are scored against n of\n" +
+			"THIS cell's own recent requests — tool-call rate, argument validity, finish reasons,\n" +
+			"paired tok/s — instead of one canned prompt. The sample is harvested BEFORE the apply,\n" +
+			"because the apply is the reload that empties llama-swap's capture buffer. It is replayed\n" +
+			"in place and only scores are emitted: no prompt, no completion and no tool name reaches\n" +
+			"the terminal, the journal, a log or any other box.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmdContext(cmd)
@@ -106,7 +113,7 @@ func modelTryCmd() *cobra.Command {
 			return runModelTry(ctx, cmd.OutOrStdout(), runner, apiFlag, modeltry.PlanRequest{
 				Repo: args[0], File: file, Revision: revision, Like: like, As: as, Dest: dest,
 				SkipDiskCheck: skipDisk,
-			}, trialGateOpts{quiet: quiet, wait: waitFor, now: now, dryRun: dryRun})
+			}, trialGateOpts{quiet: quiet, wait: waitFor, now: now, dryRun: dryRun, replay: replay})
 		},
 	}
 	cmd.Flags().StringVar(&file, "file", "", "the file to pull from the repo (e.g. Qwen3.6-27B-Q5_K_XL.gguf)")
@@ -123,6 +130,7 @@ func modelTryCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&now, "now", false, "apply immediately, accepting that a reload evicts residents and truncates streams past 30s")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the plan and the def that would be written, then stop")
 	cmd.Flags().BoolVar(&skipDisk, "skip-disk-check", false, "pull even when free space cannot be verified against the file size")
+	cmd.Flags().BoolVar(&replay, "replay", false, "also replay n of this cell's own recent requests through both models and score them structurally (emits only scores; see C25)")
 	cmd.Flags().Float64Var(&minFreeGB, "min-free", float64(modeltry.DefaultMinFreeBytes)/(1<<30), "GiB that must remain free on the library filesystem after the pull")
 
 	cmd.AddCommand(modelTryStatusCmd(), modelTryEndCmd())
@@ -308,6 +316,10 @@ type trialGateOpts struct {
 	wait   time.Duration
 	now    bool
 	dryRun bool
+	// replay asks for C25's structural comparison. It changes the ORDER of
+	// the sequence, which is the only reason it lives on this struct: the
+	// sample has to be taken before the apply.
+	replay bool
 }
 
 func runModelTry(ctx context.Context, out io.Writer, runner *modeltry.Runner, apiFlag string, req modeltry.PlanRequest, gate trialGateOpts) error {
@@ -351,6 +363,17 @@ func runModelTry(ctx context.Context, out io.Writer, runner *modeltry.Runner, ap
 		return nil
 	}
 
+	// C10's issue-the-refusal-first rule, applied to --replay. The
+	// authoritative refusal lives in the harvest, which runs immediately
+	// before the apply; this is the same function asked the same question
+	// twenty minutes earlier, so a cell that retains no bodies says so
+	// before the operator spends a 20 GB pull on a replay it cannot have.
+	if gate.replay {
+		if disabled, known := benchreplay.CapturesDisabled(t.ConfigPath).Observed(); known && disabled {
+			return fmt.Errorf("--replay: %w", benchreplay.ErrCapturesDisabled)
+		}
+	}
+
 	fmt.Fprintln(out, "fetching...")
 	if err := runner.Fetch(ctx, t, progressPrinter(out)); err != nil {
 		return err
@@ -368,6 +391,21 @@ func runModelTry(ctx context.Context, out io.Writer, runner *modeltry.Runner, ap
 		return err
 	}
 
+	// C25's harvest, HERE and nowhere else: after the idle wait, so the
+	// sample is the freshest traffic this cell served, and before the
+	// apply, because the apply writes the config and a `-watch-config`
+	// reload allocates a fresh, empty capture buffer. At the moment the
+	// candidate first exists, the sample is gone.
+	//
+	// A refusal here stops the run BEFORE the disruptive write, which is
+	// C10's issue-the-refusal-first rule: an operator who asked for a
+	// replay and cannot have one should not first have every resident
+	// model on the box evicted.
+	sample, err := harvestReplaySample(ctx, out, runner, t, gate)
+	if err != nil {
+		return err
+	}
+
 	res, err := runner.Apply(ctx, t)
 	if err != nil {
 		return err
@@ -381,11 +419,23 @@ func runModelTry(ctx context.Context, out io.Writer, runner *modeltry.Runner, ap
 		fmt.Fprintln(out, "  apply it:    systemctl --user restart llama-swap   (this evicts whatever is resident)")
 		fmt.Fprintln(out, "  then:        vibe model try <same args>            (resumes at the measurement)")
 		fmt.Fprintln(out, "  or undo it:  vibe model try end")
+		if sample.Len() > 0 {
+			// The privacy cost was paid and there is nothing to show for
+			// it. Say so: the operator's own recent prompts were read into
+			// this process, this process is about to exit, and the restart
+			// they were just told to perform empties the buffer — so the
+			// resumed run will measure without a replay and cannot say why
+			// unless it is said here.
+			fmt.Fprintf(out, "\n  the %d harvested capture(s) are DISCARDED with this process. They were never written\n", sample.Len())
+			fmt.Fprintln(out, "  anywhere, and the restart above empties llama-swap's capture buffer, so the resumed")
+			fmt.Fprintln(out, "  run will measure throughput without a replay. `vibe model try end` and re-run with")
+			fmt.Fprintln(out, "  --replay to score against fresh traffic.")
+		}
 		return nil
 	}
 
 	fmt.Fprintln(out, "warming both models and measuring (this is the slow part)...")
-	cmp, err := runner.Measure(ctx, t)
+	cmp, err := runner.Measure(ctx, t, sample)
 	if err != nil {
 		return err
 	}
@@ -394,6 +444,44 @@ func runModelTry(ctx context.Context, out io.Writer, runner *modeltry.Runner, ap
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "the trial is still applied on this cell. `vibe model try status` for the next commands.")
 	return nil
+}
+
+// harvestReplaySample takes C25's sample, or explains why there is none.
+//
+// Two shapes of "no sample", and they are deliberately different answers:
+//
+//   - --replay was not asked for. Nothing happens, nothing is printed, no
+//     request is issued and no capture is read. A verb that read the
+//     operator's prompts to decide whether to read the operator's prompts
+//     would be a bad joke.
+//   - --replay WAS asked for and the cell cannot supply one. That is a
+//     refusal with an instruction, before the config is written: captures
+//     turned off names the config key, an empty buffer says the box has
+//     served nothing recently. n = 0 is never a score of 0, and a run that
+//     silently skipped the replay would have printed a comparison the
+//     operator would read as the one they asked for.
+//
+// A trial RESUMED past the apply is the third case, and it is handled by
+// modeltry.Harvest rather than here: the buffer it would have read no
+// longer exists, so it refuses and the run measures without a replay.
+func harvestReplaySample(ctx context.Context, out io.Writer, runner *modeltry.Runner, t *modeltry.Trial, gate trialGateOpts) (*benchreplay.Set, error) {
+	if !gate.replay {
+		return nil, nil
+	}
+	fmt.Fprintf(out, "harvesting this cell's recent %s traffic BEFORE the apply (the apply's reload empties llama-swap's capture buffer)...\n", t.Incumbent)
+	set, err := runner.Harvest(ctx, t, benchreplay.Options{})
+	if errors.Is(err, benchreplay.ErrAlreadyApplied) {
+		// Not fatal, and not silent. This is the resume case the design
+		// names: the trial goes on without a replay and says why.
+		fmt.Fprintln(out, "  no replay: this trial was already applied, so the capture buffer that held the sample was emptied by that reload.")
+		fmt.Fprintln(out, "  `vibe model try end` and re-run with --replay to score against fresh traffic.")
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	fmt.Fprintf(out, "  harvested %d capture(s), held in this process's memory only — never written, never sent.\n", set.Len())
+	return set, nil
 }
 
 // trialDeclareAndWait is the control-plane half: the two declarations and

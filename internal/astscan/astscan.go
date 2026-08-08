@@ -56,7 +56,8 @@ type Rule struct {
 	// Name identifies the rule in failure messages.
 	Name string
 	// Dir is the package directory to scan, relative to the test's own
-	// directory. Non-test .go files only: a rule is about production code.
+	// directory. Non-test .go files only unless IncludeTests is set: a
+	// rule is normally about production code.
 	Dir string
 	// Trigger names make a function a producer. A name matches either a
 	// bare call (`warmFn(...)`) or a selector call (`http.NewRequest(...)`,
@@ -78,6 +79,25 @@ type Rule struct {
 	// Because is appended to every finding: the sentence a future agent
 	// reads when the scan fails on their new code.
 	Because string
+	// IncludeTests scans _test.go files too. Off by default, because a
+	// rule is normally about production code and test helpers trip every
+	// such rule for uninteresting reasons.
+	//
+	// It exists for the one case where the CODE THAT MATTERS lives in a
+	// test file: internal/swaptest's fixture recorder talks to a real
+	// llama-swap on the operator's box and writes what it reads into a
+	// PUBLIC repository (fleet-control C25 §1e). Whether every fetch there
+	// passes the captures refusal is exactly the kind of one-of-N question
+	// this package exists to answer, and the file's suffix should not be
+	// what decides it.
+	IncludeTests bool
+	// Files narrows the scan to these base names within Dir. Empty means
+	// every file the other filters admit.
+	//
+	// A named file that is not present is an ERROR, for the same reason a
+	// stale exemption is: a rule that silently stops examining the file it
+	// is about has retired itself.
+	Files []string
 }
 
 // Finding is one producer that triggers without requiring.
@@ -113,15 +133,26 @@ func (r Rule) Check() (Result, error) {
 	fset := token.NewFileSet()
 	exemptUsed := map[string]bool{}
 
+	only := set(r.Files)
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
 		n := e.Name()
-		if e.IsDir() || !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
+		if e.IsDir() || !strings.HasSuffix(n, ".go") {
+			continue
+		}
+		if !r.IncludeTests && strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		if len(only) > 0 && !only[n] {
 			continue
 		}
 		names = append(names, n)
 	}
 	sort.Strings(names)
+	if len(only) > 0 && len(names) != len(only) {
+		return res, fmt.Errorf("astscan %s: Files names %v but %s holds %v: a rule that stopped examining the file it is about has retired itself",
+			r.Name, r.Files, r.Dir, names)
+	}
 
 	for _, name := range names {
 		path := filepath.Join(r.Dir, name)

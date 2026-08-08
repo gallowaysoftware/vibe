@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -59,11 +60,7 @@ func TestRecord(t *testing.T) {
 		t.Logf("  %s (%d bytes)", name, len(b))
 	}
 
-	for _, g := range []struct{ name, path string }{
-		{"running.json", "/running"},
-		{"models.json", "/v1/models"},
-		{"activity-page.json", "/api/metrics/activity?sort=id&order=desc&limit=5&page=1"},
-	} {
+	for _, g := range recordedEndpoints {
 		body := recordGET(t, base+g.path)
 		write(g.name, foldHome(indentJSON(t, body)))
 	}
@@ -130,11 +127,47 @@ func recordedVersion(t *testing.T) (version, commit string) {
 	return m[1], m[2]
 }
 
+// recordedEndpoints is the recorder's complete GET list, as data rather
+// than as a literal inside the loop. It is data so U8's gate can assert on
+// it: the one endpoint that must never appear here is /api/captures/{id},
+// and a list a test can read is the difference between a rule and a hope.
+var recordedEndpoints = []struct{ name, path string }{
+	{"running.json", "/running"},
+	{"models.json", "/v1/models"},
+	{"activity-page.json", "/api/metrics/activity?sort=id&order=desc&limit=5&page=1"},
+}
+
+// guardedRequest is the ONE place this recorder builds an HTTP request,
+// and it refuses the captures endpoint before it builds one.
+//
+// It is a builder rather than three call-site checks for two reasons. A
+// guard in one of N call paths is not a guard — the recurring finding this
+// repo has paid for repeatedly. And a check written at a call site can be
+// applied to the wrong string: a review found `recordEvents` guarding the
+// literal `base + "/api/events"`, which can never be a capture route, so
+// the astscan rule saw a call and proved nothing. Here the guarded value
+// and the fetched value are the same variable, by construction.
+//
+// A capture is the case foldHome and the logData redaction cannot handle:
+// its sensitive part is the whole object, not a substring of it. See
+// RefuseCaptureEndpoint (captures.go) for the argument.
+func guardedRequest(t *testing.T, ctx context.Context, method, url string, body io.Reader) *http.Request {
+	t.Helper()
+	if why := RefuseCaptureEndpoint(url); why != "" {
+		t.Fatal(why)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	if err != nil {
+		t.Fatalf("build %s %s: %v", method, url, err)
+	}
+	return req
+}
+
 func recordGET(t *testing.T, url string) []byte {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req := guardedRequest(t, ctx, http.MethodGet, url, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
@@ -157,7 +190,7 @@ func recordEvents(t *testing.T, base string, budget time.Duration, drive func())
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/events", nil)
+	req := guardedRequest(t, ctx, http.MethodGet, base+"/api/events", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET /api/events: %v", err)
@@ -315,7 +348,7 @@ func pokeChat(t *testing.T, base, model string) {
 func postJSON(t *testing.T, url, body string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(body))
+	req := guardedRequest(t, ctx, http.MethodPost, url, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
