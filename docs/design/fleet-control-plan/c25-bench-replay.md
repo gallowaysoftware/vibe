@@ -43,7 +43,7 @@ the code wins:
 | storage | `cache.New(captureBufferMB * 1024 * 1024)` — in-process, `internal/server/metrics.go` | same |
 | eviction | FIFO by insertion, `internal/cache/cache.go` | same |
 | enumeration | none; `has_capture` on each `/api/metrics/activity` row | same |
-| auth | `apiChain` — 401 without the key, like every route but `/health` | same |
+| auth | `apiChain` — 401 without the key, like every route but `/health`. **Read off source, not measured** — see §4 | same |
 
 **There is no version skew.** That is the phase's one piece of good
 luck: the CI conformance matrix
@@ -345,7 +345,7 @@ a sample could otherwise be taken, and by then it does not exist.
 | `internal/vibe/usagemeter` | the `/api/metrics/activity` walk (newest-first, `limit` capped at 999, the page loop), C15 key handling, and `BasisFor` to keep chat captures and drop the rest |
 | `internal/vibe/modelprobe` | `isResident` and the never-load refusal; the cooldown/daily-cap shape; `MetricDecode` vs `MetricE2E` never compared; `Config.ReadOnly` (added by C18 for this exact reason — replay reads the cell's probe state and writes none of it) |
 | `internal/vibe/modeltry` | the journal, the lease, the hold, the apply, the rollback, the report renderer and its caveat block |
-| `internal/vibe/fleetapi/swapauth.go` | the measured auth map: `/api/captures/{id}` is on `apiChain`, so it 401s without the key like everything but `/health` |
+| `internal/vibe/fleetapi/swapauth.go` | the key-reading and `Authorization: Bearer` posture, unchanged. **Note the gap**: that file's endpoint list is one someone verified against a real v239 binary, and `/api/captures/{id}` is not on it. The claim in §1's table — that it sits on `apiChain` and so 401s without a key — is read off upstream *source*, not measured. It is one `curl` to promote, and the implementer should do that and extend swapauth.go's comment rather than inherit an unverified row |
 | `internal/swaptest` | the double, extended with a synthetic `/api/captures/{id}` |
 
 ### C8's hardest rule, inherited with three teeth

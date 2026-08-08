@@ -156,8 +156,8 @@ Medium:
    render mount (only where `fleet.front_config` declares the shared
    mount) and each cell's announced capacity.
 8. **Usage rollups** — **SHIPPED as
-   [C7a](fleet-control-plan/c7a-usage-ledger.md) (2026-08-03) +
-   [C7b](fleet-control-plan/c7b-savings-screen.md) (2026-08-04)**, with
+   [C7a](fleet-control-plan/c7a-usage-ledger.md) (2026-08-03, PR #24) +
+   [C7b](fleet-control-plan/c7b-savings-screen.md) (2026-08-03, PR #25)**, with
    one clause inverted, one clause that shipped structurally and was
    ungated for five days, and **the hole this entry named for itself
    still open — not attempted-and-failed, but not closeable from this
