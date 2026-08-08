@@ -292,6 +292,15 @@ Mutation-checked rather than assumed:
 - a `systemctl daemon-reload` added to the hook: the tripwire gate fails,
   naming the command.
 
+The two that would not survive a rewrite of this phase's own code are in
+C20's permanent registry (`internal/mutation`, +2 → 19 entries), so they
+run on every PR rather than once here:
+
+- `c24/a recorded stop is handed back to the cell as a command` —
+  disarms the `stopRecord` branch in `handleAnnounce`; §3, mechanically.
+- `c24/a unit's stop overwrites the declaration that knows why` —
+  disarms the fill-if-absent guard; §8b R-5, mechanically.
+
 ### Live — NOT RUN, and the reason for each
 
 Per ground rule 10, these are gates that **were not attempted**, each

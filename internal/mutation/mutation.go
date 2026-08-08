@@ -330,6 +330,34 @@ var Registry = []Mutation{
 			"value's Location — with no error, no type mismatch and no way to notice from the output.",
 	},
 
+	// ── a recorder that becomes an actuator (C24) ─────────────────────
+	{
+		Name:     "c24/a recorded stop is handed back to the cell as a command",
+		File:     "internal/vibe/fleetapi/announce.go",
+		Find:     "\tstopRecord := hasRequest && IsStopRecord(&req2)",
+		Replace:  "\tstopRecord := false && hasRequest && IsStopRecord(&req2)",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestC24StopRecordIsNeverHandedBackAsACommand", "TestC24StopRecordLosesToTheCellsOwnDrain"},
+		Why: "a cell unit's ExecStopPost hook writes that it stopped. Treated as an ordinary intent " +
+			"REQUEST, that record is handed to the announcing cell as desired_intent, and " +
+			"fleetannounce.reconcile answers a drained one by RUNNING cell_cmds.drain — so the hook " +
+			"stops the serving stack of a box that has just come back, on the first heartbeat, " +
+			"through a path nothing in the hook or the unit file can see.",
+	},
+	{
+		Name:     "c24/a unit's stop overwrites the declaration that knows why",
+		File:     "internal/vibe/fleetapi/intent.go",
+		Find:     "\t\t\tif cur, had := next[cell]; had && cur.State == \"drained\" && !IsStopRecord(&cur) {",
+		Replace:  "\t\t\tif cur, had := next[cell]; false && had && cur.State == \"drained\" && !IsStopRecord(&cur) {",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestC24StopRecordNeverOverwritesADeclaration"},
+		Why: "C14's scheduled suspend records {drained, asleep per sleep_schedule, eta 07:15} and THEN " +
+			"takes the box down through the same unit stop that fires the hook. A stop record that " +
+			"overwrites it makes the fleet forget it put the box to sleep: the doctor calls the night " +
+			"undeclared and the wake's clear-first ordering has a different record to clear than the " +
+			"one it wrote. A human's --reason gaming is the same shape.",
+	},
+
 	// ── the credential never leaks ────────────────────────────────────
 	{
 		Name:     "c9/the webhook URL stops being scrubbed",
