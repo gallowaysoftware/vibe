@@ -178,9 +178,13 @@ state's class, so it cannot regress to `b-off`.
 - `internal/vibe/fleetmcp/fleetmcp.go` — the tool description.
 - `deploy/cell/vibe-cell-intent.sh`, `deploy/cell/README.md`.
 - `internal/vibe/fleetapi/c27_test.go`, `internal/vibe/fleetmcp/c27_test.go`.
+- `internal/vibe/fleetapi/c24_test.go` — one row added to the alarm
+  table, and the pre-C27 pairing kept beside it.
+- `internal/vibe/fleetapi/c14_test.go` — the wall-clock flake below.
 - `internal/mutation/mutation.go` — the registry entry (+1 → 67).
 - `scripts/fleetlab/gate-c27-stopped-badge.sh` — the live rig.
-- `docs/design/fleet-control.md` §4.
+- `docs/design/fleet-control.md` §4, this plan's README (row + ground
+  rule 2), `AGENTS.md` (the state list and the alarm bullet).
 
 ## Acceptance gates
 
