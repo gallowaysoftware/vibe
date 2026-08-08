@@ -1169,7 +1169,19 @@ func (s *Server) checkAnnouncerAgent(rep *DoctorReport, c CellSnapshot, p Presen
 	id := "roaming.announcer"
 	roaming := c.Class == string(fleetcfg.ClassRoaming)
 	if c.HostReachable == nil {
-		if roaming {
+		switch {
+		case c.HostProbeUnfinished:
+			// fleetd's own snapshot budget expired with this box's probe
+			// still in flight. Saying "no host_probe" here would hand the
+			// operator a config edit for a setting that IS set and WAS
+			// dialled — certNotAfter's distinction between the report's
+			// deadline and the endpoint's, on the presence axis.
+			rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelUnknown,
+				Summary: "host_probe did not finish inside fleetd's snapshot budget",
+				Detail: "this row is about the BUDGET, not about the box: the probe was dialled and the round " +
+					"ran out of time, so nothing was learned about whether this host is up.",
+				Fix: "re-run doctor; if it persists, the probe address is being dropped rather than refused."})
+		case roaming:
 			rep.Add(DoctorCheck{ID: id, Cell: c.Name, Level: LevelUnknown,
 				Summary: "no host_probe, so 'box away' and 'announcer stopped' are the same observation",
 				Fix:     "set cells." + c.Name + ".host_probe to make this answerable."})

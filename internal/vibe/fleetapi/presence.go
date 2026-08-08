@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/observed"
 )
 
 // Presence bookkeeping: per-cell last-sighting timestamps (axis 1 —
@@ -16,20 +18,87 @@ import (
 // distinguishes "host up, cell down" from "host down".
 
 // hostProbeTimeout bounds the host-level TCP dial so a filtered port
-// can't stall the state snapshot past snapshotTimeout.
+// can't stall the state snapshot past snapshotTimeout. The inequality is
+// the whole point of the number and is pinned by a test: a host probe
+// allowed to outlive the snapshot budget turns every OTHER cell's row
+// into a deadline expiry.
 const hostProbeTimeout = 2 * time.Second
+
+// hostDialer connects to one host-probe address. It is a SEAM, not a
+// convenience. tlsBlackhole — this package's only "far side that hangs"
+// primitive — accepts and holds, which stalls a handshake but not
+// connect(2): by the time it holds, the kernel has already completed the
+// three-way handshake, so probeTCP sees an instant success. The shape
+// hostProbeTimeout exists for is a DROPPED SYN, which no in-process
+// listener can produce and no unprivileged test can arrange, so the dial
+// itself is injected instead.
+type hostDialer func(ctx context.Context, addr string) (net.Conn, error)
+
+// dialTCP is the production hostDialer.
+func dialTCP(ctx context.Context, addr string) (net.Conn, error) {
+	var d net.Dialer
+	return d.DialContext(ctx, "tcp", addr)
+}
 
 // probeTCP reports whether addr (host:port) accepts a TCP connection.
 // Any completed handshake is proof the host is up; the service behind
-// the port is irrelevant (the fleet convention is an SSH port).
-func probeTCP(ctx context.Context, addr string) bool {
-	d := net.Dialer{Timeout: hostProbeTimeout}
-	conn, err := d.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return false
+// the port is irrelevant (the fleet convention is an SSH port). A zero
+// timeout means hostProbeTimeout, a nil dial means dialTCP — the same
+// defaulting certNotAfter does with its dial timeout.
+//
+// The result is an observed.Value and not a bool because THREE different
+// facts used to leave here spelled `false`, and the display ladder
+// renders one of them to the operator as "your machine is switched off":
+//
+//   - the handshake completed — a true observation;
+//   - the dial failed on the endpoint's own terms (refused, or nothing
+//     answered within timeout) — a false observation, and an honest one;
+//   - ctx expired — fleetd's OWN snapshot budget ran out, possibly
+//     before this dial was attempted at all. NOTHING was observed about
+//     the host, and an unknown is the only honest thing to say. It is
+//     the distinction certNotAfter draws between "the report's deadline"
+//     and "this endpoint's dial", one subsystem over.
+//
+// Residual ambiguity, stated rather than hidden (certNotAfter's summary
+// does the same): a refused connection is arguably proof the host is up
+// — an RST came back from its IP stack — and this still reports false.
+// The fleet's host_probe convention is a port a live box always answers,
+// and the design's OFF/AWAY ladder reads a refused probe as absent.
+// Changing that is a semantics decision about the ladder, not a timeout
+// fix, so it is written down here rather than made in passing.
+func probeTCP(ctx context.Context, addr string, timeout time.Duration, dial hostDialer) observed.Value[bool] {
+	if timeout <= 0 {
+		timeout = hostProbeTimeout
 	}
-	_ = conn.Close()
-	return true
+	if dial == nil {
+		dial = dialTCP
+	}
+	dctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := dial(dctx, addr)
+	if conn != nil {
+		// Before the error check: net.Dialer never returns both, but
+		// hostDialer is a seam and a caller-supplied one that does would
+		// leak a socket per probe per round, forever.
+		defer conn.Close()
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			// The SNAPSHOT's budget, not this host's silence. Checked on
+			// the OUTER ctx deliberately: dctx is always expired on the
+			// timeout path, and reading that one would report every
+			// filtered port as "we never looked".
+			//
+			// A real refusal that lands in the microseconds AFTER the
+			// round's deadline reads as unknown here. That is the safe
+			// direction — it withholds an observation rather than
+			// inventing one — and hostProbeTimeout being a second inside
+			// snapshotTimeout is what keeps the window that narrow.
+			return observed.Value[bool]{}
+		}
+		return observed.Known(false)
+	}
+	return observed.Known(true)
 }
 
 // lastSeenPersistAge bounds how stale the on-disk last_seen may be. A
@@ -115,6 +184,9 @@ func (s *Server) decorate(snap *CellSnapshot) {
 		echo = p.IntentEcho
 		fresh := !p.Stale && !p.Withdrawn
 		if fresh {
+			// A heartbeat that arrived IS the host answering, so it
+			// settles a probe that never finished (see the marker's
+			// single clear at the end of this function).
 			snap.HostReachable = new(bool)
 			*snap.HostReachable = true
 			switch {
@@ -165,6 +237,14 @@ func (s *Server) decorate(snap *CellSnapshot) {
 		snap.LastSeen = &t
 	}
 	snap.Leases = leases
+	// One structural clear rather than a line in every branch above:
+	// HostProbeUnfinished exists to explain a MISSING host_reachable, so
+	// whichever writer produced one has settled it. Per-branch clears
+	// would make the invariant a thing three writers must remember, and
+	// a fourth (peer aggregation is the obvious next one) would not.
+	if snap.HostReachable != nil {
+		snap.HostProbeUnfinished = false
+	}
 	snap.Display = displayState(snap.HostReachable, snap.Reachable, snap.Intent)
 }
 
