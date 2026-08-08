@@ -63,6 +63,16 @@ type warmLoopConfig struct {
 	// emptyGrace is the time nothing-resident must persist before the
 	// empty-restore fires (default 30s ≈ two announce intervals).
 	emptyGrace time.Duration
+	// warmTimeout bounds one warm call (default warmTimeout, 10m). It is
+	// a field for the same reason tick and emptyGrace are: a deadline
+	// nothing can dial down is a deadline no test ever reaches, and the
+	// repo's whole vocabulary for "unreachable" is an immediate
+	// ECONNREFUSED — which returns in microseconds and exercises no
+	// deadline at all. Zero means the production constant, resolved at
+	// the USE site (restore) rather than at wiring, because restore is
+	// called directly with a hand-built config in three tests and a
+	// zero there would be an instantly-expired context, not a default.
+	warmTimeout time.Duration
 }
 
 // StartWarmLoop launches the warm-target policy with production
@@ -180,9 +190,18 @@ func (s *Server) evalWarmTarget(t WarmTarget, st *warmTargetState, cfg warmLoopC
 	}
 
 	// warmCtx, not context.Background(): the probe is on an s.wg
-	// goroutine, so an unlinked one holds Close() for the full
-	// snapshotTimeout the same way CC-2's warm did for warmTimeout.
-	ctx, cancel := s.warmCtx(snapshotTimeout)
+	// goroutine, so an unlinked one holds Close() for the full probe
+	// budget the same way CC-2's warm did for warmTimeout.
+	//
+	// s.snapTimeout, not the constant. This is the same probe round the
+	// state handler runs, so it has to be the same budget — and the field
+	// IS the budget, because it is what New wires and what the probe
+	// client is built around. Naming the constant here forked the budget
+	// in two: everything else in the round reads the field, so a fleetd
+	// that lowered it got a shorter state response and a warm loop still
+	// probing on the compiled-in three seconds. A duplicated budget is
+	// only ever discovered by the half that did not move.
+	ctx, cancel := s.warmCtx(s.snapTimeout)
 	snap := s.snapshotCell(ctx, Cell{Name: t.Cell, URL: s.cellURL(t.Cell)})
 	cancel()
 	if !snap.Reachable {
@@ -318,6 +337,18 @@ func (s *Server) swapIdleFor(cell string, residents []string) (time.Duration, st
 // Close() hostage.
 const warmTimeout = 10 * time.Minute
 
+// warmBound resolves a warm's deadline: the injected one when a caller
+// dialled it down, the production constant otherwise. A non-positive
+// duration must never reach warmCtx — context.WithTimeout(bg, 0) is
+// already expired, so a zero-valued seam would silently convert every
+// warm into an instant deadline-exceeded instead of a 10-minute one.
+func warmBound(d time.Duration) time.Duration {
+	if d <= 0 {
+		return warmTimeout
+	}
+	return d
+}
+
 // warmCtx builds a warm's timeout context and links cancellation to
 // s.done. Both warm loops call warmFn synchronously from goroutines
 // registered on s.wg, so an unlinked context lets Close() → wg.Wait()
@@ -361,7 +392,7 @@ func (s *Server) restore(t WarmTarget, st *warmTargetState, cfg warmLoopConfig, 
 		s.setWarmState(st, "skipped", why)
 		return
 	}
-	ctx, cancel := s.warmCtx(warmTimeout)
+	ctx, cancel := s.warmCtx(warmBound(cfg.warmTimeout))
 	defer cancel()
 	var err error
 	if s.frontCanRoute(t.Cell) {

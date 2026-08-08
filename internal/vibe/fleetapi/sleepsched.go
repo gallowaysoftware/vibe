@@ -125,6 +125,14 @@ type sleepLoopConfig struct {
 	warmFn    func(ctx context.Context, frontURL, model string) error
 	tick      time.Duration
 	poll      time.Duration
+	// suspendTimeout bounds one suspend RPC (default suspendTimeout,
+	// 90s). A field for the same reason tick and poll are: suspending a
+	// cell is the most consequential verb in the design — it takes a box
+	// off the fleet — and a deadline no test can dial down is a deadline
+	// no test ever reaches. Resolved at the USE site (trySuspend) so a
+	// hand-built config in a test is a DEFAULT, not an instantly-expired
+	// context.
+	suspendTimeout time.Duration
 }
 
 // SuspendFunc runs the suspend verb against one cell. It is injected
@@ -390,7 +398,7 @@ func (s *Server) trySuspend(e SleepScheduleEntry, st *sleepScheduleState, cfg sl
 	// exist, and the entry would sit as "requested, awaiting ack" all
 	// night for an ack a sleeping box cannot give.
 	issued := time.Now().UTC()
-	ctx, cancel := s.warmCtx(suspendTimeout)
+	ctx, cancel := s.warmCtx(suspendBound(cfg.suspendTimeout))
 	err := cfg.suspendFn(ctx, e.Cell, SleepIntentReason)
 	cancel()
 	if err != nil {
@@ -427,8 +435,40 @@ func (s *Server) trySuspend(e SleepScheduleEntry, st *sleepScheduleState, cfg sl
 }
 
 // suspendTimeout bounds one suspend RPC. Generous relative to the verb
-// (a unit stop plus a logind call) and far below the minute tick.
+// (a unit stop plus a logind call).
+//
+// It is NOT below the minute tick — the comment here used to claim that
+// and 90s > 60s, so a wedged suspend costs the entry one dropped
+// evaluation (trySuspend runs synchronously on the entry goroutine and a
+// Go ticker drops rather than queues). That is a DELAY, not a loss:
+// sleepDue compares `!now.Before(*st.NextWake)`, so a due wake that
+// missed its own minute still fires on the following tick, and the
+// pending suspend likewise survives. Worst case either half runs a
+// minute late, for any pair of crons — including a suspend and a wake
+// configured a minute apart. Said plainly because the wrong version of
+// this sentence is exactly what stops the next reader checking the
+// arithmetic.
+//
+// The VALUE is a judgement call with no second quantity in the codebase
+// to pin it against, unlike sleepReturnGrace (which must outlast
+// staleAfter). Mutating 90s to 10s kills no test, by construction: the
+// tests assert the bound is applied, defaults correctly and dies with
+// the server, and they name this constant rather than duplicating its
+// literal. A test asserting `suspendTimeout == 90*time.Second` would
+// detect the edit and prove nothing about the fleet.
 const suspendTimeout = 90 * time.Second
+
+// suspendBound resolves the suspend RPC's deadline: warmBound's rule for
+// the other consequential verb. Non-positive is the production constant,
+// never an already-expired context — a suspend that "fails" in
+// microseconds because a seam was left zero would report `failed` every
+// night and leave the box drawing its idle watts.
+func suspendBound(d time.Duration) time.Duration {
+	if d <= 0 {
+		return suspendTimeout
+	}
+	return d
+}
 
 // runWakeSequence is the paired wake: clear OUR intent, send the wake,
 // await the return, warm the declared models. Order matters — see the
