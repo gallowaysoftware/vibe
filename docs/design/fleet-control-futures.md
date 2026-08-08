@@ -155,15 +155,86 @@ Medium:
    own container, so the report separates fleetd's state dir, the front's
    render mount (only where `fleet.front_config` declares the shared
    mount) and each cell's announced capacity.
-8. **Usage rollups** — fleetd scrapes each cell's `/api/metrics` on
-   the probe loop (llama-swap's are in-memory and vanish on restart),
-   persists per-model × cell × day counts, exposes
-   `/api/fleet/usage` + an MCP tool. Price cloud-peer ids at API
-   rates and local ids counterfactually: "the fleet served 41M tokens
-   that would have been $310" is the number that makes the homelab
-   quotable. Counts only, never bodies. Note: cloud calls that bypass
-   the front hole this ledger — routing cloud through the front is
-   what makes it complete.
+8. **Usage rollups** — **SHIPPED as
+   [C7a](fleet-control-plan/c7a-usage-ledger.md) (2026-08-03) +
+   [C7b](fleet-control-plan/c7b-savings-screen.md) (2026-08-04)**, with
+   one clause inverted, one clause that shipped structurally and was
+   ungated for five days, and **the hole this entry named for itself
+   still open — not attempted-and-failed, but not closeable from this
+   repo**. Checked clause by clause against the code on 2026-08-08
+   (C25); five notes for whoever reads this next.
+
+   **The scrape shipped INVERTED, and the inversion is the
+   improvement.** This entry asked for a fleetd pull on the probe loop.
+   What shipped is a cell-side collector (`internal/vibe/usagemeter`)
+   that tails its OWN llama-swap over localhost and piggybacks
+   cumulative counters on the announce
+   (`internal/vibe/daemon/announce.go:68`,
+   `internal/vibe/usagemeter/usagemeter.go:762`), folded by fleetd at
+   `internal/vibe/fleetapi/usage.go:253`. Three reasons the pull was
+   wrong, all argued in C7a: a pull re-inverts C3, only the cell can
+   resolve an alias to the canonical def name a price may key on, and
+   the endpoint is `/api/metrics/activity` — one row per request,
+   written at request COMPLETION — not the counter `/metrics` this
+   entry assumed, so a model swapping out mid-burst loses nothing. The
+   parenthetical's real worry is answered twice: `store: {path: …}` on
+   every cell (C7a §0), plus the epoch/id-reset rule for the cells
+   where it is not set.
+
+   **Persistence, the route and the tool shipped as written.**
+   Per-(day, cell, model, basis, epoch) buckets in an append-only JSONL
+   ledger (`fleetapi/usage.go:79-95`, `paths/paths.go:111`);
+   `GET /api/fleet/usage` (`fleetapi/routes.go:154`); `fleet_usage`
+   (`fleetmcp/fleetmcp.go:349`, dispatched at `:565`). C7b added the
+   money half as a second pair rather than widening these
+   (`fleet_savings`, `fleetmcp.go:365`).
+
+   **Both pricings shipped, and the counterfactual came out narrower
+   than this entry imagined.** Cloud-peer ids are priced at the real
+   model's real rate off the FRONT's activity log
+   (`daemon/cloudspend.go:49-107`) — a bill reconstruction, not a
+   counterfactual. Local ids are priced counterfactually
+   (`fleetapi/savings.go`), but against **the same open-weight model
+   rented from a real host**, not against a frontier model. The
+   "$310 that makes the homelab quotable" framing above is precisely
+   the trap C7b was written to avoid: the frontier comparable moves the
+   answer about seventy-fold, and a screen that can only render triumph
+   will. The honest shape of that sentence is a range with the caveat
+   attached to the same payload the agent reads.
+
+   **"Counts only, never bodies" shipped structurally and was NOT
+   gated.** It holds because `usagemeter.ActivityRow`
+   (`usagemeter.go:63-71`) decodes a strict SUBSET of llama-swap's row:
+   llama-swap also sends `error_msg` (built from the upstream's
+   response body), `metadata` (arbitrary client strings) and
+   `has_capture`, the last of which advertises a verbatim
+   prompt-and-completion capture retrievable at
+   `GET /api/captures/{id}`. `encoding/json`'s ignore-unknown-fields
+   default was the entire mechanism, and that default is a property of
+   a struct definition that one line can change. Closed on 2026-08-08
+   with two named, mutation-verified gates in
+   `internal/vibe/usagemeter/bodies_test.go` —
+   `TestActivityRow_CannotCarryABody` (the type may hold only the
+   counting fields) and
+   `TestPoll_TextOnTheWireReachesNeitherTheStateFileNorTheWire` (a real
+   poll over a row carrying prompt-shaped text in all three fields
+   leaks it to neither the state file nor the announce).
+
+   **The named hole is still open, and it is a routing decision rather
+   than missing code.** Cloud calls that go THROUGH the front are now
+   counted — that is C7b §6, and it did not exist when this entry was
+   written. Cloud calls that bypass the front are invisible to every
+   mechanism here, because the control plane's only observation point
+   is a llama-swap the request never touches; no instrumentation this
+   repo could add would see them, so this is not a gate anybody failed
+   to attempt. Completing the ledger means the operator pointing the
+   harness at the front, which is a config act on the client box. What
+   the code owes in the meantime is to say so where the number is read,
+   and it does: the savings caveat names "or bypassing the front is
+   missing, so the token totals are a floor"
+   (`fleetapi/savings.go:251`), and it rides the MCP payload rather
+   than the page precisely so an agent cannot quote the number without
+   it.
 9. **`sleep_schedule`** — **SHIPPED as
    [C14](fleet-control-plan/c14-sleep-schedule.md) (2026-08-05).**
    Declared cron suspend, guarded (not triggered) by in-flight requests,
