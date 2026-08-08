@@ -19,6 +19,7 @@ package fleetnotify
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -53,25 +54,32 @@ func stall(release <-chan struct{}, r *http.Request) {
 // within limit. Bounded rather than blocking on purpose: a disarmed
 // deadline must produce a NAMED failure here, not a package-level test
 // timeout that reads as infrastructure trouble.
-func sendWithin(t *testing.T, limit time.Duration, ctx context.Context, s *WebhookSink, n Notification) (error, time.Duration) {
+//
+// The elapsed time comes FIRST and the error last, per the stdlib's
+// ordering. That is not only convention here: what these tests measure is
+// how long the attempt cost, and every caller reads it on the error path
+// (an attempt that succeeded against a far side that never answered is
+// itself the failure). The error is the outcome, not a peer of the
+// measurement, so it goes where a reader looks for one.
+func sendWithin(t *testing.T, ctx context.Context, limit time.Duration, s *WebhookSink, n Notification) (time.Duration, error) {
 	t.Helper()
 	type result struct {
-		err     error
 		elapsed time.Duration
+		err     error
 	}
 	done := make(chan result, 1)
 	start := time.Now()
 	go func() {
 		err := s.Send(ctx, n)
-		done <- result{err: err, elapsed: time.Since(start)}
+		done <- result{elapsed: time.Since(start), err: err}
 	}()
 	select {
 	case r := <-done:
-		return r.err, r.elapsed
+		return r.elapsed, r.err
 	case <-time.After(limit):
 		t.Fatalf("Send did not return within %s against a far side that accepted the connection and said nothing — "+
 			"the attempt budget is not being applied", limit)
-		return nil, 0
+		return 0, nil
 	}
 }
 
@@ -88,7 +96,7 @@ func TestWebhookSink_AttemptTimeoutElapsesAgainstABlockingEndpoint(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sendErr, elapsed := sendWithin(t, 5*time.Second, context.Background(), sink, testNotification())
+	elapsed, sendErr := sendWithin(t, context.Background(), 5*time.Second, sink, testNotification())
 	if sendErr == nil {
 		t.Fatal("a webhook that never answered reported a successful delivery")
 	}
@@ -118,7 +126,12 @@ func TestWebhookSink_AttemptTimeoutElapsesAgainstABlockingEndpoint(t *testing.T)
 // body it did send is still scrubbed, because a webhook that echoes the
 // request path back is how a topic reaches last_error.
 func TestWebhookSink_AttemptTimeoutBoundsAStalledResponseBody(t *testing.T) {
-	const budget = 40 * time.Millisecond
+	// Generous on purpose. The claim is "the deadline fires DURING the body
+	// read", so the header has to arrive first for the test to be about the
+	// body at all; a budget tight enough for a loaded box to miss the
+	// handshake would quietly demote this to the header-stall case it is
+	// supposed to be the other half of.
+	const budget = 250 * time.Millisecond
 	srv := blockingEndpoint(t, func(w http.ResponseWriter, r *http.Request, release <-chan struct{}) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte("no such topic /" + secretTopic + " (token " + secretToken + ") "))
@@ -132,7 +145,7 @@ func TestWebhookSink_AttemptTimeoutBoundsAStalledResponseBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sendErr, elapsed := sendWithin(t, 5*time.Second, context.Background(), sink, testNotification())
+	elapsed, sendErr := sendWithin(t, context.Background(), 5*time.Second, sink, testNotification())
 	if sendErr == nil {
 		t.Fatal("a 500 with a stalled body reported a successful delivery")
 	}
@@ -141,6 +154,27 @@ func TestWebhookSink_AttemptTimeoutBoundsAStalledResponseBody(t *testing.T) {
 	}
 	if !Retryable(sendErr) {
 		t.Fatalf("a 5xx must stay retryable even when its body stalled: %v", sendErr)
+	}
+	// The status is what makes this test about the BODY. A budget that fired
+	// before the response header would produce a transport SendError —
+	// Status 0, also retryable, also non-nil — and every assertion above
+	// would still pass, leaving the name claiming a half nothing checked.
+	var se *SendError
+	if !errors.As(sendErr, &se) {
+		t.Fatalf("want a *SendError, got %T: %v", sendErr, sendErr)
+	}
+	if se.Status != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500: the deadline fired before the response header arrived, so this ran as the "+
+			"header-stall case rather than the stalled-BODY case it is named for", se.Status)
+	}
+	// And the partial body it did send reached the error, which is what
+	// makes the scrub below an assertion about a real leak path rather than
+	// about an empty string.
+	if se.Msg == "" {
+		t.Fatal("the partial body never reached the error; the scrub assertion below would prove nothing")
+	}
+	if !strings.Contains(se.Msg, redacted) {
+		t.Fatalf("the echoed topic was not redacted out of the partial body: %q", se.Msg)
 	}
 	assertNoSecret(t, "stalled-body error string", sendErr.Error())
 }
@@ -159,12 +193,25 @@ func TestWebhookSink_ContextCancellationBeatsALongAttemptBudget(t *testing.T) {
 	time.AfterFunc(20*time.Millisecond, cancel)
 	defer cancel()
 
-	sendErr, elapsed := sendWithin(t, 5*time.Second, ctx, sink, testNotification())
+	elapsed, sendErr := sendWithin(t, ctx, 5*time.Second, sink, testNotification())
 	if sendErr == nil {
 		t.Fatal("a cancelled Send reported a successful delivery")
 	}
-	if elapsed > 30*time.Second {
-		t.Fatalf("cancellation waited %s on the attempt budget", elapsed)
+	// Tighter than sendWithin's own 5s guard, deliberately. A bound LOOSER
+	// than the helper's is dead code — the helper would already have failed
+	// the test — and a dead assertion is how a test comes to claim more than
+	// it checks.
+	if elapsed > 2*time.Second {
+		t.Fatalf("cancellation took %s; cancel fired at 20ms and the attempt budget is an hour, so this did not "+
+			"return on the cancellation", elapsed)
+	}
+	// And it returned BECAUSE of the cancellation. With an hour-long budget
+	// against a far side that never answers, nothing else can end this
+	// attempt — but saying so is what keeps the name honest if either bound
+	// changes. (net/http words this "context canceled" or "request
+	// canceled" depending on where in the round trip it lands.)
+	if !strings.Contains(strings.ToLower(sendErr.Error()), "cancel") {
+		t.Fatalf("the error does not read as a cancellation: %v", sendErr)
 	}
 	assertNoSecret(t, "cancelled error string", sendErr.Error())
 	if strings.Contains(sendErr.Error(), redacted) {
@@ -235,8 +282,16 @@ func TestNewWebhookSink_AttemptBudgetIsAlwaysSet(t *testing.T) {
 // as a test seam, and a seam that quietly drops the declared deadline is
 // how a bound stops existing without anybody editing it.
 func TestNewWebhookSink_AnInjectedClientIsStillBounded(t *testing.T) {
+	// The sentinel Transport is the load-bearing half of "copy rather than
+	// mutate". Building a FRESH &http.Client{Timeout: ...} instead of
+	// copying would leave the caller unmutated and the budget correct — so
+	// every other assertion here would still pass — while silently
+	// discarding the transport the caller injected the client FOR. A seam
+	// that keeps the deadline and drops the round-tripper is a seam that
+	// stopped being a seam.
 	t.Run("an unbounded client gets the default", func(t *testing.T) {
-		injected := &http.Client{}
+		tr := &http.Transport{}
+		injected := &http.Client{Transport: tr}
 		sink, err := NewWebhookSink(WebhookConfig{URL: "https://ntfy.example.invalid/hook", Client: injected})
 		if err != nil {
 			t.Fatal(err)
@@ -247,9 +302,14 @@ func TestNewWebhookSink_AnInjectedClientIsStillBounded(t *testing.T) {
 		if injected.Timeout != 0 {
 			t.Fatal("the caller's own client was mutated; it is shared and not ours to change")
 		}
+		if sink.hc.Transport != tr {
+			t.Fatal("the injected client was REPLACED rather than copied: its Transport was dropped, so the seam " +
+				"no longer routes anywhere the caller chose")
+		}
 	})
 	t.Run("an explicit Timeout wins over the client's", func(t *testing.T) {
-		injected := &http.Client{Timeout: time.Hour}
+		tr := &http.Transport{}
+		injected := &http.Client{Timeout: time.Hour, Transport: tr}
 		sink, err := NewWebhookSink(WebhookConfig{URL: "https://ntfy.example.invalid/hook", Client: injected, Timeout: 40 * time.Millisecond})
 		if err != nil {
 			t.Fatal(err)
@@ -259,6 +319,9 @@ func TestNewWebhookSink_AnInjectedClientIsStillBounded(t *testing.T) {
 		}
 		if injected.Timeout != time.Hour {
 			t.Fatal("the caller's own client was mutated")
+		}
+		if sink.hc.Transport != tr {
+			t.Fatal("the injected client was REPLACED rather than copied: its Transport was dropped")
 		}
 	})
 	t.Run("a client's own budget survives when none is declared", func(t *testing.T) {
