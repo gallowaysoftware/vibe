@@ -195,6 +195,39 @@ var Registry = []Mutation{
 			"this house works and when it was away.",
 	},
 
+	// ── class 4: a catalog that advertises what it cannot serve ───────
+	{
+		Name: "catalog/discovery falls back through to the upstream's own shape",
+		File: "internal/vibe/proxy/proxy.go",
+		Find: "\tif r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, \"/v1/models\") {\n" +
+			"\t\tp.serveModels(w, r, def, rw)\n\t\treturn\n\t}",
+		Replace: "\tif false && r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, \"/v1/models\") {\n" +
+			"\t\tp.serveModels(w, r, def, rw)\n\t\treturn\n\t}",
+		Pkg: "./internal/vibe/proxy/",
+		MustFail: []string{
+			"TestProxy_OllamaShapedUpstreamIsServedAsOpenAI",
+			"TestProxy_UnrecognisedCatalogShapeIsNotForwarded",
+			"TestOllamaShapedCell_CatalogIDIsRoutable",
+		},
+		Why: "this is the novodoo defect exactly: with no routes and no rewrite the proxy forwarded " +
+			"whatever shape its upstream emitted, so an Ollama-shaped backend made the cell an " +
+			"Ollama-shaped peer. Every consumer in this repo reads data[] — vamp then substitutes " +
+			"the literal id \"vibe\" — so the cell advertises a model, a client pins the id, and the " +
+			"completion 404s while the cell serves fine.",
+	},
+	{
+		Name:     "catalog/an unreadable shape becomes an empty catalog",
+		File:     "internal/vibe/modelcat/modelcat.go",
+		Find:     "\tif !haveData && !c.hasOllama {\n\t\treturn nil, ErrShape\n\t}",
+		Replace:  "\tif false && !haveData && !c.hasOllama {\n\t\treturn nil, ErrShape\n\t}",
+		Pkg:      "./internal/vibe/modelcat/",
+		MustFail: []string{"TestParse_UnrecognisedShapeIsAnErrorNotAnEmptyCatalog"},
+		Why: "a shape nobody recognised must not become a valid-looking empty catalog. \"This cell " +
+			"serves nothing\" is a CLAIM, and a parser that failed has no standing to make it — the " +
+			"quiet version of that claim is indistinguishable from a genuinely idle cell, which is " +
+			"how an unroutable peer stayed in the fleet's catalog undetected.",
+	},
+
 	// ── the completeness tables ───────────────────────────────────────
 	{
 		Name:     "c19/a fleet state file falls outside the mirror",
