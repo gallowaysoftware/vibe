@@ -8,10 +8,10 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"os/exec"
-	"syscall"
 	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/shellcmd"
 )
 
 // Wake-on-LAN (fleet-control C2): fleetd sends the magic packet from its
@@ -77,24 +77,15 @@ const wakeCmdKillGrace = 5 * time.Second
 // shell forked, and a WaitDelay so Wait cannot outlive the kill by more
 // than the grace. Split out of RunWakeCmd so a test can read the wiring
 // back off the built command without starting anything.
+//
+// The wiring itself moved to internal/vibe/shellcmd after U3 met the
+// identical defect in the daemon's drain verb and derived the identical
+// answer: two independent derivations of a subtle process-control shape
+// is how "a guard in one of N call paths" starts. The grace stays here
+// because it is a property of THIS verb — a wake talks to a BMC over the
+// network, a drain talks to systemd on the same box.
 func wakeCommand(ctx context.Context, script string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "sh", "-c", script)
-	// Setpgid makes the shell a group leader, so the negative-pid kill
-	// below reaches everything it forked. A non-interactive shell runs no
-	// job control, so even backgrounded work stays in this group.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
-			if errors.Is(err, syscall.ESRCH) {
-				// The whole group is already gone: not a failure to cancel.
-				return os.ErrProcessDone
-			}
-			return err
-		}
-		return nil
-	}
-	cmd.WaitDelay = wakeCmdKillGrace
-	return cmd
+	return shellcmd.New(ctx, script, wakeCmdKillGrace)
 }
 
 // RunWakeCmd runs a cell's wake.cmd from hosts.yaml under wakeCmdTimeout

@@ -447,54 +447,59 @@ var Registry = []Mutation{
 			"one-character version of this bug is invisible to every other test in the package.",
 	},
 	{
-		Name: "u5/the wake command's kill stops reaching what the shell forked",
-		File: "internal/vibe/fleetapi/wake.go",
-		// The whole block, not just the Setpgid line: leaving the
-		// negative-pid Cancel behind with no group of its own would signal
-		// the TEST BINARY's process group, which is a mutation that takes
-		// the harness down rather than one that proves anything.
-		Find: "\tcmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}\n" +
-			"\tcmd.Cancel = func() error {\n" +
-			"\t\tif err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {\n" +
-			"\t\t\tif errors.Is(err, syscall.ESRCH) {\n" +
-			"\t\t\t\t// The whole group is already gone: not a failure to cancel.\n" +
-			"\t\t\t\treturn os.ErrProcessDone\n" +
-			"\t\t\t}\n" +
-			"\t\t\treturn err\n" +
-			"\t\t}\n" +
-			"\t\treturn nil\n" +
-			"\t}\n",
-		Replace: "\t_, _ = os.Stdout, syscall.ESRCH\n",
-		Pkg:     "./internal/vibe/fleetapi/",
-		MustFail: []string{
-			"TestU5_TheWakeFallbackCommandIsKilledAtTheWakeCmdTimeout",
-			"TestU5_TheWakeFallbackCommandDiesWithItsCallersContext",
-			"TestU5_TheWakeCommandKillsWhatTheShellForked",
-			"TestU5_TheWakeCommandBoundsTheWaitItCannotKill",
-		},
+		Name: "shellcmd/the kill stops reaching what the shell forked",
+		File: "internal/vibe/shellcmd/shellcmd.go",
+		// One character, not the whole block. Deleting Setpgid while
+		// leaving the negative-pid Cancel behind would signal the TEST
+		// BINARY's process group — a mutation that takes the harness down
+		// rather than one that proves anything. Dropping the minus keeps
+		// the group and removes the reach, which is the defect exactly.
+		Find:     "syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)",
+		Replace:  "syscall.Kill(cmd.Process.Pid, syscall.SIGKILL)",
+		Pkg:      "./internal/vibe/shellcmd/",
+		MustFail: []string{"TestNew_TheKillReachesWhatTheShellForked"},
 		Why: "the deadline that fires but does not return. exec.CommandContext kills the process it " +
 			"STARTED, and /bin/sh is dash on the fleet's boxes — dash FORKS the operator's ipmitool " +
 			"rather than exec'ing into it, so the kill lands on the shell while the grandchild keeps " +
-			"the stdout pipe open and CombinedOutput's Wait blocks on the copy until the far side " +
-			"answers on its own. Without its own process group there is nothing for the negative-pid " +
-			"kill to signal. This shipped: the tests that were supposed to prove wakeCmdTimeout went " +
-			"green on a dev box where /bin/sh is bash (which execs, so the bug is invisible) and red " +
-			"on CI at exactly the command's own runtime, twice.",
+			"the stdout pipe open and Wait blocks on the copy until the far side answers on its own. " +
+			"This shipped TWICE, in the wake command (U5) and the drain verb (U3): both times the " +
+			"tests meant to prove the deadline went green on a dev box where /bin/sh is bash (which " +
+			"execs, so the bug is invisible) and red on CI at exactly the command's own runtime.",
 	},
 	{
-		Name:     "u5/the wake command's Wait outlives the kill it could not deliver",
-		File:     "internal/vibe/fleetapi/wake.go",
-		Find:     "\tcmd.WaitDelay = wakeCmdKillGrace\n",
+		Name:     "shellcmd/the Wait outlives the kill it could not deliver",
+		File:     "internal/vibe/shellcmd/shellcmd.go",
+		Find:     "\tcmd.WaitDelay = killGrace\n",
 		Replace:  "",
-		Pkg:      "./internal/vibe/fleetapi/",
-		MustFail: []string{"TestU5_TheWakeCommandBoundsTheWaitItCannotKill"},
+		Pkg:      "./internal/vibe/shellcmd/",
+		MustFail: []string{"TestNew_TheWaitIsBoundedEvenWhenTheKillCannotLand", "TestNew_WiresBothHalvesOfTheDeath"},
 		Why: "the backstop for the descendant SIGKILL cannot reach: one that setsid'd out of the " +
 			"group, or one wedged in uninterruptible I/O. A zero WaitDelay is documented to mean Wait " +
-			"blocks INDEFINITELY on the I/O pipes, so that process pins the wake goroutine for as long " +
-			"as it lives. Pinned by a wiring assertion rather than a behavioural one on purpose, and " +
-			"the entry says so: while the group kill works the backstop never fires, so the two " +
-			"deadline tests stay green through this edit — driving a process out of its own group " +
-			"needs a helper binary, which is more machinery than the guard is worth.",
+			"blocks INDEFINITELY on the I/O pipes, so that process pins the caller for as long as it " +
+			"lives. U5 could only pin this by wiring assertion; U3 found that setsid(1) drives a " +
+			"process out of its own group in one word, so the behavioural half exists now — and both " +
+			"are named, because setsid is absent on macOS and a test that SKIPS is a test that did " +
+			"not run.",
+	},
+	{
+		Name: "u5/the wake command stops sharing the builder",
+		File: "internal/vibe/fleetapi/wake.go",
+		Find: "\treturn shellcmd.New(ctx, script, wakeCmdKillGrace)",
+		// Disarmed at the call site rather than swapped for a bare
+		// exec.CommandContext: dropping the only shellcmd reference leaves
+		// the import unused and the tree does not build, and a mutation
+		// that does not COMPILE proves nothing. (Tried it; the harness
+		// said so.) The effect is the same — this site stops getting what
+		// the shared builder gives every other one.
+		Replace: "\tc := shellcmd.New(ctx, script, wakeCmdKillGrace)\n" +
+			"\tc.SysProcAttr, c.Cancel, c.WaitDelay = nil, nil, 0\n" +
+			"\treturn c",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestU5_TheWakeCommandKillsWhatTheShellForked", "TestU5_TheWakeCommandBoundsTheWaitItCannotKill"},
+		Why: "the shape a wake command had before U5, which is also the shape the drain verb still " +
+			"had after it. A guard on one of N call paths is this repo's most recurring defect, so " +
+			"each site's membership is pinned separately from the builder's own correctness — that " +
+			"is the whole reason the builder is shared rather than copied.",
 	},
 	{
 		Name:     "u5/the CLI's degraded wake stops sharing fleetd's runner",
@@ -522,6 +527,50 @@ var Registry = []Mutation{
 			"constant, so a fleetd that tuned the budget moved every probe in the round except this " +
 			"one, which silently kept the compiled-in 3s against a cell that accepts and never " +
 			"answers. A duplicated budget is only ever discovered by the half that did not move.",
+	},
+
+	// ── class 4, met again in the daemon's two shell call sites ───────
+	//
+	// The same defect as u5's wake command, in the other two places this
+	// repo hands an operator's shell string to exec: `cell_cmds.drain`
+	// and a profile's lifecycle hooks. Found independently, from the same
+	// symptom (CI red at exactly the command's own runtime, green on a
+	// workstation where /bin/sh is bash) — which is the argument both for
+	// the builder being SHARED and for each site's membership being
+	// pinned separately from the builder's own correctness.
+	{
+		Name: "u3/the drain verb's budget stops reaching its command",
+		File: "internal/vibe/daemon/cell_drain.go",
+		Find: "\tc := shellcmd.New(ctx, cmd, cellCmdWaitDelay)",
+		// Disarmed AT the call site rather than swapped for a bare
+		// exec.CommandContext, which would need an import this file no
+		// longer has — and a mutation that fails to COMPILE proves
+		// nothing. The effect is the same: this one site stops getting
+		// what the shared builder gives every other one.
+		Replace: "\tc := shellcmd.New(ctx, cmd, cellCmdWaitDelay)\n" +
+			"\tc.SysProcAttr, c.Cancel, c.WaitDelay = nil, nil, 0",
+		Pkg:      "./internal/vibe/daemon/",
+		MustFail: []string{"TestCellDrain_HungVerbSurfacesUnavailableAtTheBudget"},
+		Why: "the drain verb is where this wave met the defect: the budget fired on schedule, the " +
+			"error said `signal: killed`, and the call still took 30.003s against a 400ms bound " +
+			"because the sleep the shell forked still held the stderr pipe. A cell whose reclaim is " +
+			"half-run while the RPC has already answered Unavailable is indistinguishable, on the " +
+			"wire, from one where the bound worked.",
+	},
+	{
+		Name: "u3/a lifecycle hook stops sharing the builder",
+		File: "internal/vibe/daemon/daemon.go",
+		Find: "\t\tc := shellcmd.New(ctx, cmd, hookWaitDelay)",
+		Replace: "\t\tc := shellcmd.New(ctx, cmd, hookWaitDelay)\n" +
+			"\t\tc.SysProcAttr, c.Cancel, c.WaitDelay = nil, nil, 0",
+		Pkg:      "./internal/vibe/daemon/",
+		MustFail: []string{"TestRunHooks_ACancelledPhaseDoesNotWaitOnWhatTheHookForked"},
+		Why: "the third operator-shell site, and the one with NO deadline of its own — hooks run " +
+			"under the RPC's context. That made the missing reach worse here rather than better: " +
+			"there was no bound to be inert, so a cancelled `vibe start` killed the hook's shell and " +
+			"then waited on whatever the hook had forked, with nothing anywhere to end it. This site " +
+			"was found by grepping for the shape once U5 gave it a name, which is the argument for " +
+			"the shape having one.",
 	},
 }
 

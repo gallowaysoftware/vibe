@@ -41,6 +41,7 @@ import (
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 	"github.com/gallowaysoftware/vibe/internal/vibe/proxy"
+	"github.com/gallowaysoftware/vibe/internal/vibe/shellcmd"
 	"github.com/gallowaysoftware/vibe/internal/vibe/supervisor"
 	"github.com/gallowaysoftware/vibe/internal/vibe/vram"
 	vibev1 "github.com/gallowaysoftware/vibe/proto/vibe/v1"
@@ -203,8 +204,9 @@ type ProbeTarget struct {
 }
 
 // CellCmds maps the unified verbs to this box's process regime. Commands
-// run via sh -c with a 60s timeout; a failing drain must surface stderr
-// (a stopped-but-reporting unit is the classic silent failure).
+// run via sh -c with a 60s default timeout (cmd_timeout); a failing drain
+// must surface stderr (a stopped-but-reporting unit is the classic silent
+// failure).
 type CellCmds struct {
 	// Drain reclaims the box (e.g. "systemctl --user stop llama-swap") —
 	// a unit stop, never a kill, and never unload-all (an unloaded model
@@ -227,6 +229,13 @@ type CellCmds struct {
 	// blocks until the machine freezes turns the RPC into a transport
 	// error and the outcome into a guess.
 	Suspend string `yaml:"suspend,omitempty"`
+	// CmdTimeout bounds every verb above (Go duration string, e.g. "90s").
+	// Empty is cellCmdTimeout's 60s, which fits a systemd unit stop; a box
+	// whose regime is genuinely slower declares the longer budget here
+	// rather than losing the bound. An unparseable or non-positive value
+	// logs and falls back to the default: a zero budget would expire every
+	// verb before it started.
+	CmdTimeout string `yaml:"cmd_timeout,omitempty"`
 }
 
 // FleetConfig is the daemon's cell identity and registry pointer. C3's
@@ -1662,13 +1671,31 @@ func (d *Daemon) stopActive(ctx context.Context) error {
 	return nil
 }
 
+// hookWaitDelay bounds how long a lifecycle hook's output pipes may stay
+// open after the hook's own process is gone.
+//
+// The third of this repo's operator-shell call sites, and it had the same
+// hole as the other two: `sh -c` hands its stdout/stderr to whatever it
+// forks, CombinedOutput's Wait waits for the pipe COPY rather than the
+// process, and a hook that leaves anything behind held `vibe start` /
+// `vibe stop` open with no bound whatsoever. There is no deadline on this
+// path to make inert — the hooks run under the RPC's own context — which
+// is precisely why it needed a WaitDelay more than the bounded paths did:
+// a cancelled ctx killed the shell and then waited on the child forever.
+//
+// Longer than the cell verbs' two seconds because a hook is arbitrary
+// user setup (a mount, a pull, a warm-up) rather than one unit stop, and
+// this delay only ever starts counting once the hook process itself has
+// exited or been killed.
+const hookWaitDelay = 5 * time.Second
+
 // runHooks executes a profile's lifecycle hook commands sequentially, each via
 // `sh -c` with the daemon's environment. When abortOnErr is true (pre_start),
 // the first failing hook returns an error so the caller aborts the start;
 // otherwise (post_stop) failures are logged and the remaining hooks still run.
 func runHooks(ctx context.Context, profileName, phase string, cmds []string, abortOnErr bool) error {
 	for i, cmd := range cmds {
-		c := exec.CommandContext(ctx, "sh", "-c", cmd)
+		c := shellcmd.New(ctx, cmd, hookWaitDelay)
 		c.Env = os.Environ()
 		out, err := c.CombinedOutput()
 		if err != nil {
