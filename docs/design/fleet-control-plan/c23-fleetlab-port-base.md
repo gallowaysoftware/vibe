@@ -226,7 +226,7 @@ verdict instead.
   every gate rig follows the lab it was pointed at. `render_cell`'s
   `STARTPORT` argument is now optional and defaults to the cell's derived
   upstream port.
-- **Eleven gate rigs** had literal ports (`PORT=9641`, `SPORT=5990`,
+- **Twelve gate rigs** had literal ports (`PORT=9641`, `SPORT=5990`,
   `http://127.0.0.1:9643`, `render_cell alpha 5990`, the notify sink's
   9724, `marionette.py`'s usage line). All now derive. This was not
   optional polish: a rig with a literal `9641`, run against a lab on base
