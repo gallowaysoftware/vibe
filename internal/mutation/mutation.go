@@ -600,6 +600,144 @@ var Registry = []Mutation{
 			"was found by grepping for the shape once U5 gave it a name, which is the argument for " +
 			"the shape having one.",
 	},
+
+	// ── class 4, the fourth site — and the seam in front of it ────────
+	//
+	// fleetannounce's desired-intent verb was the last `sh -c` in the repo
+	// still building its own command. It was deferred out of U3 because of
+	// its test seam: every test in that package replaces execSh, so moving
+	// the production path onto shellcmd without touching the seam would
+	// have produced a bound that no test in the package ever executes.
+	// Both halves are pinned — the call site's membership, and the seam's
+	// default — because either alone leaves the verb unbounded.
+	{
+		Name: "c26a/the desired-intent verb stops sharing the builder",
+		File: "internal/vibe/fleetannounce/fleetannounce.go",
+		Find: "\treturn shellcmd.New(ctx, cmd, verbKillGrace)",
+		// Disarmed at the call site rather than swapped for a bare
+		// exec.CommandContext: this file needs os/exec for the *exec.Cmd
+		// return type either way, but the disarm is the honest shape of the
+		// regression — the site stops getting what the shared builder gives
+		// every other one.
+		Replace: "\tc := shellcmd.New(ctx, cmd, verbKillGrace)\n" +
+			"\tc.SysProcAttr, c.Cancel, c.WaitDelay = nil, nil, 0\n" +
+			"\treturn c",
+		Pkg: "./internal/vibe/fleetannounce/",
+		MustFail: []string{
+			"TestVerbSeam_ProductionDefaultIsTheBoundedRunner",
+			"TestDesiredIntentVerb_TheBudgetReachesWhatTheShellForked",
+			"TestDesiredIntentVerb_TheWaitIsBoundedEvenWhenTheKillCannotLand",
+		},
+		Why: "the fourth operator-shell site, reached from the announce loop rather than an RPC. A " +
+			"drain arriving as a desired_intent runs the operator's `systemctl stop` here; with the " +
+			"kill landing on `sh` alone, the 60s budget fires on schedule, the cell logs `signal: " +
+			"killed`, and the loop does not return until the reclaim finishes on its own — while " +
+			"fleetd is told the drain failed and hands the request back on the next heartbeat.",
+	},
+	{
+		Name: "c26a/the verb seam's default drifts off the builder",
+		File: "internal/vibe/fleetannounce/fleetannounce.go",
+		Find: "var execSh = runShellVerb",
+		Replace: "var execSh = func(ctx context.Context, cmd string) (string, error) {\n" +
+			"\tc := verbCmd(ctx, cmd)\n" +
+			"\tc.SysProcAttr, c.Cancel, c.WaitDelay = nil, nil, 0\n" +
+			"\tout, err := c.CombinedOutput()\n" +
+			"\treturn strings.TrimSpace(string(out)), err\n" +
+			"}",
+		Pkg: "./internal/vibe/fleetannounce/",
+		MustFail: []string{
+			"TestVerbSeam_ProductionDefaultIsTheBoundedRunner",
+			"TestDesiredIntentVerb_TheBudgetReachesWhatTheShellForked",
+			"TestDesiredIntentVerb_TheWaitIsBoundedEvenWhenTheKillCannotLand",
+		},
+		Why: "the reason this fix was deferred rather than typed. Every test in fleetannounce assigns " +
+			"over execSh, so a default that quietly stops going through shellcmd leaves all of them " +
+			"green while the cell's verbs go unbounded again. A seam that tests replace with something " +
+			"skipping the bounds is a seam that guarantees the bounds are never tested; the three " +
+			"tests named here are the ones that run the UNREPLACED default.",
+	},
+
+	// ── class 5: a check that fires for a box it does not describe ────
+	{
+		Name: "c26a/doctor fails a box for a binary nothing on it declares",
+		File: "internal/vibe/cli/cmd_doctor.go",
+		Find: "\tconst name = \"llama-server\"\n\tif len(users) == 0 {\n\t\treturn checkResult{}, false\n\t}\n",
+		// Back to asking $PATH and nothing else, which is the shape that
+		// shipped.
+		Replace:  "\tconst name = \"llama-server\"\n",
+		Pkg:      "./internal/vibe/cli/",
+		MustFail: []string{"TestCheckLlamaBinary_NothingDeclaresItIsNotApplicable"},
+		Why: "a laptop whose only profiles are cloud_peer — pointed at a peer through a remote front, " +
+			"which PR #14 made a supported configuration — exited non-zero from `vibe doctor` over a " +
+			"binary it will never invoke. Same for comfyui-only and mlx-only boxes. A doctor that " +
+			"fails for a reason that does not apply is a doctor operators learn to ignore, which " +
+			"costs every OTHER check on the box.",
+	},
+	{
+		Name:     "c26a/the declaration scan stops seeing backend defs",
+		File:     "internal/vibe/cli/cmd_doctor.go",
+		Find:     "\tscan(backendsDir, \"backend \")\n",
+		Replace:  "",
+		Pkg:      "./internal/vibe/cli/",
+		MustFail: []string{"TestLlamaServerUsers_TheFourShapesOnDisk"},
+		Why: "the applicable set has two sources, and a fleet box's llama_server declarations live in " +
+			"backends/, not profiles/. Scanning only profiles/ makes the check not-applicable on " +
+			"exactly the boxes that spawn llama-server most — the not-applicable path is the one that " +
+			"has to be hardest to reach by accident, because its failure is silence.",
+	},
+
+	// ── class 6: two entries, one client-facing id ────────────────────
+	{
+		Name: "c26a/a cloud peer's model ids stop being canonical",
+		File: "internal/vibe/router/render.go",
+		Find: "\t\t\tfor _, id := range cp.Models {\n" +
+			"\t\t\t\tif _, taken := peerIDs[id]; !taken {\n" +
+			"\t\t\t\t\tpeerIDs[id] = d.Name\n" +
+			"\t\t\t\t}\n" +
+			"\t\t\t}\n",
+		Replace: "",
+		Pkg:     "./internal/vibe/router/",
+		MustFail: []string{
+			"TestResolveAliases_APeerModelIDIsCanonicalAndCannotBeAliased",
+			"TestRender_TheAliasPeerCollisionSurfacesFromRender",
+		},
+		Why: "PR #14's rule met a second time: a cloud peer's catalog ids are its cloud_peer.models " +
+			"entries, never its def name, so code keyed by def.Name works for every other backend " +
+			"kind and silently misses for peers. Without the reservation a llama_server def whose " +
+			"alias equals a peer's model id resolves cleanly and renders two entries under one id, " +
+			"and llama-swap serves whichever wins.",
+	},
+	{
+		Name:     "c26a/the rendered catalog stops being checked for duplicate ids",
+		File:     "internal/vibe/router/render.go",
+		Find:     "\tif err := checkCatalogIDsUnique(cfg); err != nil {\n\t\treturn \"\", err\n\t}\n\n",
+		Replace:  "",
+		Pkg:      "./internal/vibe/router/",
+		MustFail: []string{"TestRender_NoCatalogIDIsAdvertisedTwice"},
+		Why: "the alias reservation cannot be the whole rule: it sees DEFS, so it says nothing about a " +
+			"llama_server def NAMED after a peer's model id (no alias involved) or two peers listing " +
+			"the same id. Both put two entries in one catalog under one id. Checking the rendered " +
+			"config instead of the defs is what makes this cover the class rather than the two paths " +
+			"into it that are known today.",
+	},
+
+	// ── class 7: a starter template the loader then refuses ───────────
+	{
+		Name: "c26a/the cloud-peer starter stops being loadable",
+		File: "internal/vibe/cli/profile_templates/cloud-peer.yaml",
+		Find: "    models:\n      - REPLACE-model-id\n",
+		// A peer with no ids is a peer that serves nothing; validateCloudPeer
+		// refuses it, which is the whole point — a template `vibe profile
+		// new` can emit and `vibe start` then rejects is a broken command.
+		Replace:  "    models: []\n",
+		Pkg:      "./internal/vibe/cli/",
+		MustFail: []string{"TestProfileInit_Kinds"},
+		Why: "`vibe profile new --kind cloud-peer` had no template at all before C26a, so the one " +
+			"shape PR #14 legalised was the one the CLI could not generate. The guard that matters " +
+			"for a template is not that it exists but that what the command drops actually LOADS: a " +
+			"starter that fails validation sends a first-time operator to debug their own typing for " +
+			"a file they did not write.",
+	},
 }
 
 // ── tree copying and patching ────────────────────────────────────────

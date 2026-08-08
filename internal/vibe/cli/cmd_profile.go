@@ -228,10 +228,12 @@ var profileFrontendEnum = []string{
 // For kind=llama-server the --frontend flag is sugar that selects the
 // frontend-specific variant (external -> llama-server, docker-compose ->
 // docker-compose, managed -> managed). For every other kind --frontend is
-// ignored — those backends either ship their own UI (comfyui) or are
+// ignored — those backends either ship their own UI (comfyui), are
 // service-mode sidecars with no frontend (tabby-api, http-service,
-// llama-embed-service) — and the kind maps straight to the same-named
-// template. Any kind matching a bundled template filename is accepted.
+// llama-embed-service), or carry the only frontend shape that makes sense
+// for them (cloud-peer: external, since there is no local process to wrap)
+// — and the kind maps straight to the same-named template. Any kind
+// matching a bundled template filename is accepted.
 func templateForKindFrontend(kind, frontend string) (string, error) {
 	if kind == "llama-server" {
 		switch frontend {
