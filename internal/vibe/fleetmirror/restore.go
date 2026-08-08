@@ -502,21 +502,30 @@ func classifyDialErr(err error) (probeVerdict, string) {
 	if errors.Is(err, syscall.ECONNREFUSED) {
 		return verdictNothingThere, ""
 	}
-	// The recorded name does not resolve FROM HERE.
+	// The recorded name does not resolve FROM HERE — and "from here" is
+	// the whole of it. NXDOMAIN was a definite negative for two phases on
+	// the reasoning that "the identity a standby assumes IS that name; if
+	// it resolves nowhere, no client is reaching the old front by it",
+	// which reasons about the wrong host. Resolution happens on the box
+	// doing the asking, and the box doing the asking is by construction
+	// the one that was NOT the front: a standby on another VLAN whose
+	// resolver has no internal zone, or whose /etc/resolv.conf points at
+	// the front host that just died, NXDOMAINs every recorded name while
+	// the old front is alive and serving every client that already holds
+	// its address.
 	//
-	// KNOWN FAIL-OPEN, kept only because this package's fixtures rest on
-	// it (see the U2 addendum in docs/design/fleet-control-plan/
-	// c19-front-failover.md). Resolution happens on the CLIENT, not on the
-	// standby: a resolver with no internal zone, or a /etc/resolv.conf
-	// pointing at the front host that just died, NXDOMAINs every recorded
-	// name while the old front is alive and serving every client by IP —
-	// and this branch calls that a dead front. Closing it is two lines
-	// (classify as unsettled, and give standby.opts() a refusing Dial so
-	// no restore test touches the network), in a test file this change
-	// does not own.
+	// That is the shape this branch has to fail closed on, because it is
+	// not a rare one: a resolver that answers nothing answers nothing for
+	// EVERY recorded name at once, so the whole scan settles clean and the
+	// restore proceeds. Nothing about the old front was learned; what was
+	// learned is that this box cannot ask. An operator who has confirmed
+	// the old front is down pays one --force, or names an address the
+	// probe can settle with --probe-addr.
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
-		return verdictNothingThere, ""
+		return verdictUnsettled, "the name does not resolve from here, which is a fact about THIS box's " +
+			"resolver and not about the old front: a standby whose resolver lacks the internal zone " +
+			"NXDOMAINs every recorded name, including the name of a front that is alive and serving"
 	}
 	// A timeout is the dangerous one, and it is the ordinary presentation
 	// of a firewall that DROPs rather than REJECTs.
@@ -592,8 +601,9 @@ func Restore(opts RestoreOptions) (*RestoreReport, error) {
 				names = append(names, u.What+" ("+u.Addr+"): "+u.Why)
 			}
 			return rep, fmt.Errorf("%w: %s. This is about the DIAL, not about the host — nothing was learned, "+
-				"and an empty hit list from a probe that timed out is not evidence that the old front is dead. "+
-				"Reading it as one is how a firewalled but LIVE front becomes a second fleetd folding the same "+
+				"and an empty hit list from a probe that never settled is not evidence that the old front is dead. "+
+				"Reading it as one is how a front that is merely firewalled off, or merely absent from THIS "+
+				"box's resolver, becomes a second LIVE fleetd folding the same "+
 				"cumulative totals into a second ledger that can never afterwards be reconciled. "+
 				"Confirm the old front is DOWN by hand and re-run with --force, or give the probe an address it "+
 				"can settle with --probe-addr",

@@ -47,6 +47,26 @@ LAB_ETC_DIR=$LAB/etc/vibe
 LAB_FRONT_CFG=$LAB/cells/front/config.yaml
 
 die() { echo "DRILL ABORTED: $*" >&2; exit 1; }
+# need_dir is the answer to a defect this rig shipped with. The drill
+# `rm -rf`s $DRILL and then re-made only four of the six directories it
+# writes into, so step 4b's two log redirections and two pidfile writes
+# failed on EVERY clean run, the standby never started, and steps 5-7 —
+# including the recovery timing this whole rig exists to measure —
+# printed `NOT REACHED in 60s`. That reads as a measurement: the standby
+# was watched for a minute and did not come up. It was not one. Nothing
+# was ever started, so nothing was ever measured, and a drill that
+# silently skips its measured steps is worse than one that stops.
+#
+# "Not attempted" and "did not make it in time" must never share a line
+# (ground rule 10). This is the wall between them: a missing directory is
+# fatal here, so NOT REACHED downstream can only mean the second.
+need_dir() {
+  local d
+  for d in "$@"; do
+    [[ -d $d ]] || die "$d does not exist. The drill would have redirected its logs and pidfiles into
+  nothing, never started the standby, and reported NOT REACHED for the steps it never ran."
+  done
+}
 ledger_lines() { [[ -f $1 ]] && wc -l <"$1" | tr -d ' ' || echo 0; }
 sha_of() { [[ -f $1 ]] && sha256sum "$1" | cut -c1-12 || echo "(absent)"; }
 have() { command -v "$1" >/dev/null 2>&1 || die "need $1 on PATH"; }
@@ -56,7 +76,12 @@ have jq
 state >/dev/null 2>&1 || die "fleetd is not answering at $VIBE_API — run ./lab.sh up first"
 
 rm -rf "${DRILL:?}"
-mkdir -p "$MIRROR" "$SB_STATE" "$SB_ETC" "$(dirname "$SB_FRONT")"
+# $DRILL/run and $DRILL/logs are as required as the other four: step 4b
+# writes two logs and two pidfiles into them, and the cleanup trap reads
+# the pidfiles back. They were missing from this line since the feature
+# commit — see need_dir.
+mkdir -p "$MIRROR" "$SB_STATE" "$SB_ETC" "$(dirname "$SB_FRONT")" "$DRILL/run" "$DRILL/logs"
+need_dir "$MIRROR" "$SB_STATE" "$SB_ETC" "$(dirname "$SB_FRONT")" "$DRILL/run" "$DRILL/logs"
 
 # ─────────────────────────────────────────────────────────── 0. seed state
 hr "0. state worth losing"
@@ -185,12 +210,28 @@ hr "4. restore onto the standby box"
 sed -i "s|front_config: .*|front_config: $SB_FRONT|" "$SB_ETC/vibe/config.yaml"
 
 hr "4b. start the standby front and fleetd on the SAME addresses"
+# Re-checked HERE and not only at the top: everything between is free to
+# have removed them, and this is the line whose silent failure cost this
+# gate its headline number.
+need_dir "$DRILL/run" "$DRILL/logs"
 env CUDA_VISIBLE_DEVICES= "$LLAMA_SWAP" -config "$SB_FRONT" \
   -listen "127.0.0.1:$FRONT_PORT" -watch-config >"$DRILL/logs/standby-front.log" 2>&1 &
 echo $! >"$DRILL/run/standby-front.pid"
 env XDG_CONFIG_HOME="$SB_ETC" XDG_STATE_HOME="$SB_STATE" XDG_RUNTIME_DIR="$DRILL/run/rt" \
   "$BIN" daemon >"$DRILL/logs/standby-fleetd.log" 2>&1 &
 echo $! >"$DRILL/run/standby-fleetd.pid"
+# And confirm both are actually alive before the clock starts. A process
+# that died in its first breath — a bad config, a port already taken, a
+# redirection that failed — produces the same NOT REACHED as one that is
+# merely slow, and the timing section below cannot tell them apart.
+sleep 1
+for n in standby-front standby-fleetd; do
+  p=$(cat "$DRILL/run/$n.pid" 2>/dev/null)
+  [[ -n ${p:-} ]] || die "$n wrote no pidfile — it was never started, and nothing below would have measured it"
+  kill -0 "$p" 2>/dev/null ||
+    die "$n (pid $p) was gone within a second. Its log:
+$(tail -n 20 "$DRILL/logs/$n.log" 2>/dev/null || echo '  (no log)')"
+done
 
 # ─────────────────────────────────────────────────────────── 5. the clock
 hr "5. recovery timings (from the SIGKILL)"
@@ -202,7 +243,11 @@ wait_for() { # $1 label, $2 seconds, rest: command
     if "$@" >/dev/null 2>&1; then printf '  %-34s %s\n' "$label" "$(elapsed)"; return 0; fi
     sleep 0.5
   done
-  printf '  %-34s NOT REACHED in %ss\n' "$label" "$limit"
+  # NOT REACHED now means one thing only: the standby WAS started, and did
+  # not get there in $limit seconds. "Never started" is fatal well before
+  # this point (need_dir, and the liveness check at the end of 4b), which
+  # is the whole reason those exist — the two must not share a line.
+  printf '  %-34s NOT REACHED in %ss (the standby was started; logs in %s)\n' "$label" "$limit" "$DRILL/logs"
   return 1
 }
 wait_for "fleetd answering" 60 curl -fsS -m 3 "http://127.0.0.1:$FLEETD_PORT/ui/fleet"

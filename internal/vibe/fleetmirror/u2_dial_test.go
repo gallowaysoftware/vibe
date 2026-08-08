@@ -221,11 +221,6 @@ func TestTakeoverProbe_TheDefaultDialerStillSettlesARealRefusal(t *testing.T) {
 func TestClassifyDialErr_OnlyADefiniteNegativeMeansNothingIsThere(t *testing.T) {
 	definite := map[string]error{
 		"connection refused (RST)": &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED},
-		// NXDOMAIN is here under protest and with a written reason: it is a
-		// KNOWN FAIL-OPEN this change did not close, because every restore
-		// fixture in this package rests on it. See classifyDialErr and the
-		// U2 addendum. When it is closed, this line moves down.
-		"the name does not resolve from here": &net.OpError{Op: "dial", Err: &net.DNSError{Err: "no such host", IsNotFound: true}},
 	}
 	for name, err := range definite {
 		t.Run("definite/"+name, func(t *testing.T) {
@@ -246,11 +241,19 @@ func TestClassifyDialErr_OnlyADefiniteNegativeMeansNothingIsThere(t *testing.T) 
 		"connection reset by a live peer": &net.OpError{Op: "dial", Err: syscall.ECONNRESET},
 		"os deadline exceeded":            os.ErrDeadlineExceeded,
 		"context deadline":                context.DeadlineExceeded,
-		"host unreachable":                &net.OpError{Op: "dial", Err: syscall.EHOSTUNREACH},
-		"network unreachable":             &net.OpError{Op: "dial", Err: syscall.ENETUNREACH},
-		"blocked by local policy":         &net.OpError{Op: "dial", Err: syscall.EACCES},
-		"resolver is unwell":              &net.OpError{Op: "dial", Err: &net.DNSError{Err: "server misbehaving", IsTemporary: true}},
-		"something nobody planned":        errors.New("a brand new failure mode"),
+		// NXDOMAIN was in the DEFINITE map above, under protest and with a
+		// written reason: closing it would have failed roughly a dozen
+		// restore fixtures that reached their green light through it, so U2
+		// named it and left it. This line moving down is that fail-open
+		// closed. Resolution happens on the box doing the asking, and the
+		// box doing the asking is the standby — a resolver with no view of
+		// the internal zone NXDOMAINs the name of a front that is alive.
+		"the name does not resolve from here": &net.OpError{Op: "dial", Err: &net.DNSError{Err: "no such host", IsNotFound: true}},
+		"host unreachable":                    &net.OpError{Op: "dial", Err: syscall.EHOSTUNREACH},
+		"network unreachable":                 &net.OpError{Op: "dial", Err: syscall.ENETUNREACH},
+		"blocked by local policy":             &net.OpError{Op: "dial", Err: syscall.EACCES},
+		"resolver is unwell":                  &net.OpError{Op: "dial", Err: &net.DNSError{Err: "server misbehaving", IsTemporary: true}},
+		"something nobody planned":            errors.New("a brand new failure mode"),
 	}
 	for name, err := range doubt {
 		t.Run("doubt/"+name, func(t *testing.T) {
@@ -304,6 +307,63 @@ func TestRestore_RefusesWhenTheProbeCouldNotFindOut(t *testing.T) {
 	require.Empty(t, rep.Probed, "an address the probe could not settle was reported as evidence")
 	_, statErr := os.Stat(filepath.Join(sb.state, "token"))
 	require.ErrorIs(t, statErr, fs.ErrNotExist, "the refusal still placed the fleet's token")
+}
+
+// TestRestore_AResolverThatNXDOMAINsEverythingIsNotADeadFront is the
+// fail-open U2 named in its addendum and could not close, because the
+// fixtures that would have failed were in a file it did not own.
+//
+// The scenario is one broken RESOLVER, not one retired name. A standby
+// whose /etc/resolv.conf points at the front host that just died, or
+// which sits where the internal zone is not served, NXDOMAINs every
+// recorded name at once — including the name of a front that is alive
+// and serving every client that already holds its address. Under the old
+// classification each of those was a definite negative, so the whole
+// scan settled clean, `Hits` was empty and the restore PROCEEDED: two
+// fronts under one identity, reached through the guard rather than
+// around it, and reached by the single most ordinary way a spare box
+// differs from the one it is replacing.
+//
+// The all-NXDOMAIN scan is the shape that matters, because a resolver
+// that cannot answer cannot answer for anything: the failure arrives on
+// every address simultaneously, which is precisely what made it look
+// like unanimous evidence of absence.
+func TestRestore_AResolverThatNXDOMAINsEverythingIsNotADeadFront(t *testing.T) {
+	archive := mirroredArchive(t)
+	sb := newStandby(t)
+	nxdomain := func(name string) func() (net.Conn, error) {
+		return func() (net.Conn, error) {
+			return nil, &net.OpError{Op: "dial", Err: &net.DNSError{
+				Err: "no such host", Name: name, IsNotFound: true}}
+		}
+	}
+	answers := map[string]func() (net.Conn, error){
+		fleetdAddr: nxdomain("fleetd.example.lan"),
+		frontAddr:  nxdomain("front.example.lan"),
+	}
+
+	rep, err := Restore(dialing(sb.opts(archive), answers))
+	require.ErrorIs(t, err, ErrProbeInconclusive,
+		"a resolver that answered nothing was read as a front that is gone")
+	require.Equal(t, 0, rep.Wrote)
+	require.Empty(t, rep.Probed,
+		"an NXDOMAIN was reported as evidence about the old front; it is evidence about this box's resolver")
+	require.Len(t, rep.Unresolved, 2, "the refusal does not name both names it could not resolve")
+	for _, u := range rep.Unresolved {
+		require.Contains(t, u.Why, "resolver",
+			"an unsettled DNS dial must say the doubt is about resolution, or the operator debugs the wrong host")
+	}
+	require.NoFileExists(t, filepath.Join(sb.state, "token"),
+		"the refusal still placed the fleet's token")
+
+	// --force remains the escape, and it is the right one here: a human
+	// standing in front of the old box can establish what this box's
+	// resolver cannot.
+	forced := dialing(sb.opts(archive), answers)
+	forced.Force = true
+	after, err := Restore(forced)
+	require.NoError(t, err)
+	require.Greater(t, after.Wrote, 0)
 }
 
 // TestRestore_ATimedOutProbeIsNotReportedAsNothingToDial pins the ORDER
