@@ -59,11 +59,7 @@ func TestRecord(t *testing.T) {
 		t.Logf("  %s (%d bytes)", name, len(b))
 	}
 
-	for _, g := range []struct{ name, path string }{
-		{"running.json", "/running"},
-		{"models.json", "/v1/models"},
-		{"activity-page.json", "/api/metrics/activity?sort=id&order=desc&limit=5&page=1"},
-	} {
+	for _, g := range recordedEndpoints {
 		body := recordGET(t, base+g.path)
 		write(g.name, foldHome(indentJSON(t, body)))
 	}
@@ -130,8 +126,29 @@ func recordedVersion(t *testing.T) (version, commit string) {
 	return m[1], m[2]
 }
 
+// recordedEndpoints is the recorder's complete GET list, as data rather
+// than as a literal inside the loop. It is data so U8's gate can assert on
+// it: the one endpoint that must never appear here is /api/captures/{id},
+// and a list a test can read is the difference between a rule and a hope.
+var recordedEndpoints = []struct{ name, path string }{
+	{"running.json", "/running"},
+	{"models.json", "/v1/models"},
+	{"activity-page.json", "/api/metrics/activity?sort=id&order=desc&limit=5&page=1"},
+}
+
 func recordGET(t *testing.T, url string) []byte {
 	t.Helper()
+	// The refusal, at the ONE place this recorder fetches anything. It is
+	// here rather than at the call sites because a guard in one of N call
+	// paths is not a guard, and because the next endpoint somebody adds
+	// will be added to recordedEndpoints, not to this function.
+	//
+	// A capture is the case foldHome and the logData redaction cannot
+	// handle: its sensitive part is the whole object, not a substring of
+	// it. See RefuseCaptureEndpoint (captures.go) for the argument.
+	if why := RefuseCaptureEndpoint(url); why != "" {
+		t.Fatal(why)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -155,6 +172,9 @@ func recordGET(t *testing.T, url string) []byte {
 // redacted plus the original payload sizes.
 func recordEvents(t *testing.T, base string, budget time.Duration, drive func()) ([]byte, []int) {
 	t.Helper()
+	if why := RefuseCaptureEndpoint(base + "/api/events"); why != "" {
+		t.Fatal(why)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/events", nil)
@@ -313,6 +333,9 @@ func pokeChat(t *testing.T, base, model string) {
 }
 
 func postJSON(t *testing.T, url, body string) {
+	if why := RefuseCaptureEndpoint(url); why != "" {
+		t.Fatal(why)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(body))

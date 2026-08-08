@@ -132,6 +132,11 @@ type Cell struct {
 	nextID    int64
 	chatDelay time.Duration
 	subs      map[*stream]struct{}
+	// captures is llama-swap's in-process capture buffer. Nil by default:
+	// a row advertises has_capture and the fetch 404s until a test writes
+	// a SYNTHETIC one (see captures.go).
+	captures     map[int64]Capture
+	captureReads int
 
 	// faults
 	dropAfter     int
@@ -181,6 +186,11 @@ func NewCell(t TB, opts ...Option) *Cell {
 	mux.HandleFunc("/v1/models", c.handleModels)
 	mux.HandleFunc("/api/events", c.handleEvents)
 	mux.HandleFunc("/api/metrics/activity", c.handleActivity)
+	// The real route is method- and pattern-matched exactly like this
+	// (GET /api/captures/{id}, apiChain, upstream server.go:269 on v239
+	// and :311 on v247). A double that answered any method or any id shape
+	// would let a harvest's URL construction be wrong and still pass.
+	mux.HandleFunc("GET /api/captures/{id}", c.handleCapture)
 	mux.HandleFunc("/v1/chat/completions", c.handleChat)
 	mux.HandleFunc("/v1/embeddings", c.handleEmbed)
 	mux.HandleFunc("/unload", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
