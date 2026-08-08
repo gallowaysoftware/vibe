@@ -1056,8 +1056,10 @@ correct.
 > | [C25](c25-bench-replay.md) | `vibe model try --replay`: your own traffic as the benchmark | 1315 non-comment production lines + 2364 test | C8, C18 (composition), C7a (the activity walk) | **BUILT (2026-08-08)**; delivered as a C18 flag rather than a top-level verb; U1–U14 green, 18 predicates mutation-verified (harness 62/62), the capture contract measured against real v239 and v247 binaries; L2 PASS on real v239+v247; L1, L3, L4 NOT RUN (L4 needs metal) |
 
 Plus a row in the owed-gates table for **C25 L4**, matching C18 L5's
-wording (*needs metal, not a time budget*), and rows for **C25 L1, L2's
-remainder and L3** as time-budget gates.
+wording (*needs metal, not a time budget*), and rows for **C25 L1 and
+L3** as time-budget gates. **L2 needs no row: it PASSED** on real v239
+and v247 (§11), and it is the one gate in this phase that turned out not
+to need a lab at all.
 
 **New, for `docs/design/fleet-control-futures.md` item 15**
 (`scripts/fleetlab` port offsets, shipped as `FLEETLAB_PORT_BASE` in
