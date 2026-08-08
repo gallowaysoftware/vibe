@@ -446,6 +446,83 @@ var Registry = []Mutation{
 			"and a shutdown during the morning wake waits half a minute per wedged cell. The " +
 			"one-character version of this bug is invisible to every other test in the package.",
 	},
+	{
+		Name: "u5/the wake command's kill stops reaching what the shell forked",
+		File: "internal/vibe/fleetapi/wake.go",
+		// The whole block, not just the Setpgid line: leaving the
+		// negative-pid Cancel behind with no group of its own would signal
+		// the TEST BINARY's process group, which is a mutation that takes
+		// the harness down rather than one that proves anything.
+		Find: "\tcmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}\n" +
+			"\tcmd.Cancel = func() error {\n" +
+			"\t\tif err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {\n" +
+			"\t\t\tif errors.Is(err, syscall.ESRCH) {\n" +
+			"\t\t\t\t// The whole group is already gone: not a failure to cancel.\n" +
+			"\t\t\t\treturn os.ErrProcessDone\n" +
+			"\t\t\t}\n" +
+			"\t\t\treturn err\n" +
+			"\t\t}\n" +
+			"\t\treturn nil\n" +
+			"\t}\n",
+		Replace: "\t_, _ = os.Stdout, syscall.ESRCH\n",
+		Pkg:     "./internal/vibe/fleetapi/",
+		MustFail: []string{
+			"TestU5_TheWakeFallbackCommandIsKilledAtTheWakeCmdTimeout",
+			"TestU5_TheWakeFallbackCommandDiesWithItsCallersContext",
+			"TestU5_TheWakeCommandKillsWhatTheShellForked",
+			"TestU5_TheWakeCommandBoundsTheWaitItCannotKill",
+		},
+		Why: "the deadline that fires but does not return. exec.CommandContext kills the process it " +
+			"STARTED, and /bin/sh is dash on the fleet's boxes — dash FORKS the operator's ipmitool " +
+			"rather than exec'ing into it, so the kill lands on the shell while the grandchild keeps " +
+			"the stdout pipe open and CombinedOutput's Wait blocks on the copy until the far side " +
+			"answers on its own. Without its own process group there is nothing for the negative-pid " +
+			"kill to signal. This shipped: the tests that were supposed to prove wakeCmdTimeout went " +
+			"green on a dev box where /bin/sh is bash (which execs, so the bug is invisible) and red " +
+			"on CI at exactly the command's own runtime, twice.",
+	},
+	{
+		Name:     "u5/the wake command's Wait outlives the kill it could not deliver",
+		File:     "internal/vibe/fleetapi/wake.go",
+		Find:     "\tcmd.WaitDelay = wakeCmdKillGrace\n",
+		Replace:  "",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestU5_TheWakeCommandBoundsTheWaitItCannotKill"},
+		Why: "the backstop for the descendant SIGKILL cannot reach: one that setsid'd out of the " +
+			"group, or one wedged in uninterruptible I/O. A zero WaitDelay is documented to mean Wait " +
+			"blocks INDEFINITELY on the I/O pipes, so that process pins the wake goroutine for as long " +
+			"as it lives. Pinned by a wiring assertion rather than a behavioural one on purpose, and " +
+			"the entry says so: while the group kill works the backstop never fires, so the two " +
+			"deadline tests stay green through this edit — driving a process out of its own group " +
+			"needs a helper binary, which is more machinery than the guard is worth.",
+	},
+	{
+		Name:     "u5/the CLI's degraded wake stops sharing fleetd's runner",
+		File:     "internal/vibe/cli/cmd_cell_actuate.go",
+		Find:     "fleetapi.RunWakeCmd(sigCtx, c.Wake.Cmd)",
+		Replace:  "exec.CommandContext(sigCtx, \"sh\", \"-c\", c.Wake.Cmd).CombinedOutput()",
+		Pkg:      "./internal/vibe/cli/",
+		MustFail: []string{"TestWakeCellDegradedPathBoundsTheOperatorsCommand"},
+		Why: "the second of the two call paths that run an operator's wake.cmd, and the shape the " +
+			"first one had before U5: no deadline of its own and a cancellation that kills the shell " +
+			"and then waits on the ssh the shell forked. `vibe cell wake` is the path an operator " +
+			"reaches for when fleetd is DOWN, which is exactly when it must not hang. A guard on one " +
+			"of N call paths is this repo's most recurring defect, so the sharing is pinned rather " +
+			"than assumed.",
+	},
+	{
+		Name:     "u5/the warm target's probe forks the snapshot budget in two",
+		File:     "internal/vibe/fleetapi/warmtarget.go",
+		Find:     "ctx, cancel := s.warmCtx(s.snapTimeout)",
+		Replace:  "ctx, cancel := s.warmCtx(snapshotTimeout)",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestU5_TheWarmTargetProbeRunsOnTheServersSnapshotBudget"},
+		Why: "one quantity, two sources of truth. The warm loop's fallback probe is the same round " +
+			"the state handler runs, and U1 made that budget a field; this call site kept naming the " +
+			"constant, so a fleetd that tuned the budget moved every probe in the round except this " +
+			"one, which silently kept the compiled-in 3s against a cell that accepts and never " +
+			"answers. A duplicated budget is only ever discovered by the half that did not move.",
+	},
 }
 
 // ── tree copying and patching ────────────────────────────────────────

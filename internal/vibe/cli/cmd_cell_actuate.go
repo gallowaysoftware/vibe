@@ -476,8 +476,21 @@ func wakeCell(ctx context.Context, out io.Writer, apiFlag, cell string) error {
 		return fmt.Errorf("cells.%s has no wake: config in hosts.yaml", cell)
 	}
 	if c.Wake.Cmd != "" {
-		cmd := exec.CommandContext(ctx, "sh", "-c", c.Wake.Cmd)
-		if out2, err := cmd.CombinedOutput(); err != nil {
+		// fleetapi's runner, not a bare exec: it is the same operator
+		// command from the same hosts.yaml as fleetd's wake, so it gets the
+		// same deadline and the same process-group kill. A plain
+		// exec.CommandContext kills the shell and then waits on whatever the
+		// shell forked, which on a dash box is the operator's ssh.
+		//
+		// NotifyContext for the reason the drain hook above uses it, and
+		// this call site NEEDS it now: the runner puts the command in its
+		// own process group, so Ctrl-C no longer reaches it through the
+		// terminal's foreground group. Cancellation is the channel that
+		// replaces it, and it is a better one — the group kill reaches the
+		// descendants the terminal signal never did anything about.
+		sigCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if out2, err := fleetapi.RunWakeCmd(sigCtx, c.Wake.Cmd); err != nil {
 			return fmt.Errorf("wake command failed: %v: %s", err, out2)
 		}
 		fmt.Fprintf(out, "wake sent to %s directly (cmd)\n", cell)

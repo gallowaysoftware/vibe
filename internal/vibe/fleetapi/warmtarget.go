@@ -190,9 +190,18 @@ func (s *Server) evalWarmTarget(t WarmTarget, st *warmTargetState, cfg warmLoopC
 	}
 
 	// warmCtx, not context.Background(): the probe is on an s.wg
-	// goroutine, so an unlinked one holds Close() for the full
-	// snapshotTimeout the same way CC-2's warm did for warmTimeout.
-	ctx, cancel := s.warmCtx(snapshotTimeout)
+	// goroutine, so an unlinked one holds Close() for the full probe
+	// budget the same way CC-2's warm did for warmTimeout.
+	//
+	// s.snapTimeout, not the constant. This is the same probe round the
+	// state handler runs, so it has to be the same budget — and the field
+	// IS the budget, because it is what New wires and what the probe
+	// client is built around. Naming the constant here forked the budget
+	// in two: everything else in the round reads the field, so a fleetd
+	// that lowered it got a shorter state response and a warm loop still
+	// probing on the compiled-in three seconds. A duplicated budget is
+	// only ever discovered by the half that did not move.
+	ctx, cancel := s.warmCtx(s.snapTimeout)
 	snap := s.snapshotCell(ctx, Cell{Name: t.Cell, URL: s.cellURL(t.Cell)})
 	cancel()
 	if !snap.Reachable {

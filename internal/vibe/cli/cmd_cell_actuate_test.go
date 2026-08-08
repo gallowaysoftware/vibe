@@ -425,6 +425,57 @@ func TestWakeCellViaFleetd(t *testing.T) {
 	}
 }
 
+// TestWakeCellDegradedPathBoundsTheOperatorsCommand. `vibe cell wake`
+// runs the SAME wake.cmd fleetd does — it is the fleetd-is-down path for
+// the same hosts.yaml entry — and it ran it through a bare
+// exec.CommandContext with no deadline of its own. A guard on one of two
+// call paths is the defect class this pass exists to close, so the second
+// path gets the assertion rather than the assumption.
+//
+// The command forks (`& wait`) on purpose: /bin/sh is dash on the fleet's
+// boxes and dash forks an operator's `ssh`/`ipmitool` rather than exec'ing
+// into it, so cancelling the shell leaves a grandchild holding the pipes
+// CombinedOutput reads and the call blocks on the copy. That is what
+// fleetapi.RunWakeCmd's process-group kill is for, and this test is what
+// says the CLI goes through it.
+func TestWakeCellDegradedPathBoundsTheOperatorsCommand(t *testing.T) {
+	writeHosts(t, `
+cells:
+  front:    { url: "http://127.0.0.1:1", class: always_on }
+  gpu-cell: { url: "http://127.0.0.1:1", class: opportunistic,
+              wake: { cmd: "sleep 8 & wait" } }
+`)
+	// Cancelled well before the command could finish on its own, so the
+	// cancellation is the only thing that can end it.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	var out bytes.Buffer
+	start := time.Now()
+	// An unreachable fleetd is what routes this to the degraded path.
+	err := wakeCell(ctx, &out, "http://127.0.0.1:1", "gpu-cell")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("a wake command that was cancelled reported success")
+	}
+	// The error must be the COMMAND's, not "no hosts.yaml wake config for
+	// the direct path". Any earlier failure returns in microseconds and
+	// would sail through the timing assertion below having run nothing —
+	// which is exactly what the first draft of this test did.
+	if !strings.Contains(err.Error(), "wake command failed") {
+		t.Fatalf("the degraded path never reached the wake command: %v", err)
+	}
+	// Two seconds: comfortably above the ~300ms a working kill takes and
+	// comfortably below both the command's own 8s and the 5s WaitDelay
+	// backstop, so neither an unbounded run nor a backstop-only one can
+	// pass. A ceiling above either proves nothing.
+	if elapsed > 2*time.Second {
+		t.Errorf("the degraded wake took %v after a 300ms cancellation: the operator's command is not "+
+			"running under fleetapi.RunWakeCmd, so nothing kills what the shell forked", elapsed)
+	}
+}
+
 // TestPrintDrainReport_WaitStatus pins MIN-N's human-facing half: the
 // operator who asked for quiescence sees whether it happened.
 func TestPrintDrainReport_WaitStatus(t *testing.T) {

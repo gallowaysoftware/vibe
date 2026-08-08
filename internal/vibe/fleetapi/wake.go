@@ -8,7 +8,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
+	"syscall"
 	"time"
 )
 
@@ -42,6 +44,72 @@ const defaultWakeBroadcast = "255.255.255.255:9"
 // deadline no test ever reaches. Production never assigns it; the wake
 // verbs read it and nothing else does.
 var wakeCmdTimeout = 30 * time.Second
+
+// wakeCmdKillGrace bounds the SECOND half of the fallback command's
+// death, and it exists because the first half is not enough on its own.
+//
+// exec.CommandContext kills the process it STARTED. `sh -c` is not that
+// process on the fleet's own boxes: /bin/sh is dash on Debian and
+// Ubuntu, dash forks the command rather than exec'ing into it, and the
+// grandchild inherits the stdout/stderr pipes CombinedOutput reads.
+// Killing the shell therefore leaves the pipes open, and Wait — which
+// waits for the COPY to finish, not for the process — blocks until the
+// operator's ipmitool/ssh returns on its own. That is the unbounded wait
+// the deadline above was written to prevent, and it survived the
+// deadline: a wedged wake pinned the goroutine for as long as the far
+// side stayed quiet, on CI and on every fleet box.
+//
+// So: kill the process GROUP (below), which reaches the descendants dash
+// forked, and keep WaitDelay as the backstop for the one that got away —
+// a command that setsid'd out of the group, or wedged in D-state where
+// SIGKILL cannot land. WaitDelay is what closes the parent's pipe ends
+// regardless, so Wait returns whatever the far side is doing.
+//
+// Both halves are needed and neither substitutes for the other, which is
+// why each is pinned separately: the group kill by the two wake deadline
+// tests (they assert the call returns BEFORE this grace, so a run that
+// needed the backstop is red), WaitDelay by the wiring test that reads it
+// back off the built command.
+const wakeCmdKillGrace = 5 * time.Second
+
+// wakeCommand builds the fallback command with both halves of its death
+// wired: a process group of its own so the kill reaches whatever the
+// shell forked, and a WaitDelay so Wait cannot outlive the kill by more
+// than the grace. Split out of RunWakeCmd so a test can read the wiring
+// back off the built command without starting anything.
+func wakeCommand(ctx context.Context, script string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "sh", "-c", script)
+	// Setpgid makes the shell a group leader, so the negative-pid kill
+	// below reaches everything it forked. A non-interactive shell runs no
+	// job control, so even backgrounded work stays in this group.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				// The whole group is already gone: not a failure to cancel.
+				return os.ErrProcessDone
+			}
+			return err
+		}
+		return nil
+	}
+	cmd.WaitDelay = wakeCmdKillGrace
+	return cmd
+}
+
+// RunWakeCmd runs a cell's wake.cmd from hosts.yaml under wakeCmdTimeout
+// AND the caller's ctx, and returns its combined output.
+//
+// Exported for the CLI's degraded wake path (fleetd down — the operator's
+// own box runs the command), the way SendMagicPacket is. That path ran
+// the same operator command through a bare exec.CommandContext, so it
+// carried this defect too: no deadline of its own, and a Ctrl-C that
+// killed the shell and then waited on the ssh the shell had forked.
+func RunWakeCmd(ctx context.Context, script string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, wakeCmdTimeout)
+	defer cancel()
+	return wakeCommand(ctx, script).CombinedOutput()
+}
 
 // wakeRequest is the POST /api/fleet/wake body.
 type wakeRequest struct {
@@ -115,10 +183,7 @@ func (s *Server) SendWake(ctx context.Context, cellName string) (*wakeResponse, 
 	}
 
 	if wake.Cmd != "" {
-		ctx, cancel := context.WithTimeout(ctx, wakeCmdTimeout)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, "sh", "-c", wake.Cmd)
-		out, err := cmd.CombinedOutput()
+		out, err := RunWakeCmd(ctx, wake.Cmd)
 		if err != nil {
 			return nil, fmt.Errorf("wake command failed: %v: %s", err, string(out))
 		}

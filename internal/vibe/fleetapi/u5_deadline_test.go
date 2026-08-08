@@ -29,7 +29,13 @@ package fleetapi
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -141,18 +147,30 @@ func u5WarmState(s *Server, st *warmTargetState) warmTargetState {
 // u5HangingWakeCmd is a fallback command that never returns on its own,
 // so the ONLY thing that can end it is a deadline or a cancellation.
 //
+// The `& wait` is the whole point and is not decoration. An operator's
+// wake command is `ipmitool ...` or `ssh switch ...`, and /bin/sh on the
+// fleet's boxes is dash, which FORKS such a command instead of exec'ing
+// into it. Killing the shell then leaves a grandchild holding the
+// stdout/stderr pipes CombinedOutput reads, and Wait blocks on the copy
+// until that grandchild finishes on its own — the deadline fires and the
+// call does not return. This version reproduces that shape under any
+// shell, including the bash that /bin/sh points at on the dev box, where
+// a bare `sleep 8` is exec'd and the bug is invisible. The first draft of
+// these tests used the bare form, passed locally, and went red on CI at
+// exactly eight seconds, twice.
+//
 // Eight seconds rather than thirty purely for the mutation registry's
 // runtime: an unmutated run never waits for it (the bound fires in
 // ~300ms), but a run with the bound REMOVED waits the whole thing, and
-// the registry pays that cost on every CI run. It only has to outlast
-// the five-second upper bound the two wake tests assert, with enough
+// the registry pays that cost on every CI run. It has to outlast
+// wakeCmdKillGrace — the ceiling the two wake tests assert — by enough
 // margin that a loaded box cannot make the two readings overlap.
-const u5HangingWakeCmd = "sleep 8"
+const u5HangingWakeCmd = "sleep 8 & wait"
 
 // u5SetWakeCmdTimeout dials the wake fallback's bound down for one test
 // and restores it. Safe because nothing in this package runs tests in
-// parallel and the var is read only on the Cmd branch of SendWake, which
-// exactly one other test reaches (c2's `touch`, synchronously).
+// parallel and the var is read only on RunWakeCmd's path, which outside
+// this file exactly one test reaches (c2's `touch`, synchronously).
 func u5SetWakeCmdTimeout(t *testing.T, d time.Duration) {
 	t.Helper()
 	prev := wakeCmdTimeout
@@ -254,6 +272,45 @@ func TestU5_WarmScheduleCarriesTheSameWarmTimeout(t *testing.T) {
 	require.NoError(t, got.ctxErr)
 	require.WithinDuration(t, before.Add(warmTimeout), got.deadline, 5*time.Second,
 		"the warm schedule does not carry the same bound as the warm target")
+}
+
+// ─── the warm loop's OTHER deadline: one budget, one source ─────────────────
+
+// TestU5_TheWarmTargetProbeRunsOnTheServersSnapshotBudget. The warm loop
+// falls back to probing a cell that does not announce, and that probe is
+// the same round the state handler runs — so it must be the same budget.
+// It was not: the handler and the probe client read s.snapTimeout (U1's
+// field) and this one call site still named the snapshotTimeout CONSTANT,
+// so a fleetd that lowered the budget got a faster state response and a
+// warm loop still sitting on the compiled-in three seconds against a cell
+// that accepts and never answers.
+//
+// Two sources of truth for one quantity are only ever discovered by the
+// half that did not move, which is why the divergence gets a test rather
+// than a comment. With U1's wiring test above it (New sets the field FROM
+// the constant), the chain is closed end to end: constant → field → every
+// use site in the round.
+func TestU5_TheWarmTargetProbeRunsOnTheServersSnapshotBudget(t *testing.T) {
+	s := newWarmServer(t, []Cell{{Name: "heavy", URL: u1StallCell(t), Class: "opportunistic"}})
+	s.snapTimeout = 300 * time.Millisecond
+	// No announce on purpose: presence is what routes the eval to the
+	// probe branch, and the probe branch is the one that owns the budget.
+	st := &warmTargetState{Cell: "heavy", Model: "default-model"}
+
+	start := time.Now()
+	s.evalWarmTarget(WarmTarget{Cell: "heavy", Model: "default-model"}, st, warmLoopConfig{frontURL: "http://front.test"})
+	elapsed := time.Since(start)
+
+	// Loose like U1's: the claim is the SHAPE — the round is bounded by
+	// the server's configured budget — not a benchmark. The 3s constant
+	// blows straight through it, which is the divergence this pins.
+	require.Less(t, elapsed, 1500*time.Millisecond,
+		"the warm target's probe outlasted the budget this server was configured with: it is running on "+
+			"the snapshotTimeout constant, not s.snapTimeout, so lowering the fleet's probe budget moves "+
+			"every other probe in the round and leaves this one behind")
+	require.Equal(t, "skipped", u5WarmState(s, st).State)
+	require.Contains(t, u5WarmState(s, st).Detail, "cell unreachable",
+		"a probe fleetd's own budget cut short must not be reported as anything but unreachable here")
 }
 
 // ─── suspendTimeout: the most consequential verb ────────────────────────────
@@ -466,6 +523,15 @@ func TestU5_TheReturnGraceNeedsBothHalvesOfTheEvidence(t *testing.T) {
 // hangs — the far side accepted the TCP connection and stopped talking —
 // is the normal failure of exactly those tools, and without the bound it
 // pins the wake goroutine forever.
+//
+// The ceiling is wakeCmdKillGrace, named, and that is the whole
+// assertion. Two bounds can end this call and they mean opposite things:
+// the group kill means the deadline reached the command TREE and the
+// operator's ssh is dead, the WaitDelay backstop means fleetd gave up on
+// the pipes and walked away from a process that is still running. A
+// ceiling above the grace cannot tell them apart, which is how the
+// original five-second one passed on bash while the tree survived under
+// dash.
 func TestU5_TheWakeFallbackCommandIsKilledAtTheWakeCmdTimeout(t *testing.T) {
 	u5SetWakeCmdTimeout(t, 300*time.Millisecond)
 	s := newWarmServer(t, []Cell{{
@@ -479,7 +545,9 @@ func TestU5_TheWakeFallbackCommandIsKilledAtTheWakeCmdTimeout(t *testing.T) {
 
 	require.Error(t, err, "a wake command that never returned was reported as a delivered wake")
 	require.Nil(t, resp)
-	require.Less(t, elapsed, 5*time.Second, "the wake fallback ran unbounded — wakeCmdTimeout is not applied")
+	require.Less(t, elapsed, wakeCmdKillGrace,
+		"the wake fallback outlived its deadline by the whole kill grace: the kill reached the shell "+
+			"but not what the shell forked, so only the WaitDelay backstop ended the call")
 	require.GreaterOrEqual(t, elapsed, 250*time.Millisecond,
 		"the command was killed before its own deadline: the context was dead on arrival, not bounded")
 	require.Contains(t, err.Error(), "wake command failed")
@@ -505,8 +573,84 @@ func TestU5_TheWakeFallbackCommandDiesWithItsCallersContext(t *testing.T) {
 	elapsed := time.Since(start)
 
 	require.Error(t, err)
-	require.Less(t, elapsed, 5*time.Second,
-		"SendWake ignored its caller's context: the fallback command is bounded only by its own 30s timeout")
+	require.Less(t, elapsed, wakeCmdKillGrace,
+		"SendWake ignored its caller's context, or honoured it and then waited on the command tree "+
+			"anyway: cancellation must reach what the shell forked, not just the shell")
+}
+
+// TestU5_TheWakeCommandKillsWhatTheShellForked is the mechanism the two
+// tests above assert the CONSEQUENCE of, asserted directly: a wake
+// command that outlives fleetd's deadline is a process still talking to
+// the hardware, and one per wedged wake attempt accumulates. `sh -c` is
+// dash on the fleet's boxes and dash forks, so the grandchild is the
+// normal case rather than the exotic one.
+func TestU5_TheWakeCommandKillsWhatTheShellForked(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "grandchild.pid")
+	u5SetWakeCmdTimeout(t, 300*time.Millisecond)
+	s := newWarmServer(t, []Cell{{
+		Name: "gpu-cell", URL: "http://127.0.0.1:1", Class: "opportunistic",
+		Wake: &WakeSpec{Cmd: "sleep 8 & echo $! > " + pidFile + "; wait"},
+	}})
+
+	_, err := s.SendWake(context.Background(), "gpu-cell")
+	require.Error(t, err)
+
+	raw, rerr := os.ReadFile(pidFile)
+	require.NoError(t, rerr, "the command never recorded its forked child; this test proves nothing without it")
+	pid, perr := strconv.Atoi(strings.TrimSpace(string(raw)))
+	require.NoError(t, perr)
+	require.True(t, u5Reaped(pid),
+		"the shell was killed and the sleep it forked was left running: the deadline ended fleetd's "+
+			"wait, not the operator's command, and every wedged wake leaks one of these")
+}
+
+// u5ReapBudget is how long u5Reaped waits for the signalled process to
+// disappear. It polls at all only because an orphan killed by the group
+// signal is a ZOMBIE until its new parent reaps it, which is prompt but
+// not instantaneous.
+//
+// The budget must stay FAR below u5HangingWakeCmd's eight seconds, and
+// that is the whole reason it is a named constant. A generous one lets a
+// leaked process read as reaped simply because the test outlasted it:
+// three seconds was the first draft, and it reported PASS against a
+// deliberately broken build where the sleep ran its full course.
+const u5ReapBudget = time.Second
+
+// u5Reaped reports whether pid is gone. Signal 0 is the existence probe.
+func u5Reaped(pid int) bool {
+	deadline := time.Now().Add(u5ReapBudget)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+// TestU5_TheWakeCommandBoundsTheWaitItCannotKill pins the backstop the
+// two deadline tests above deliberately cannot reach. They prove the
+// group kill works, and while it works WaitDelay never fires — so
+// deleting it would leave them both green. It is not redundant with the
+// kill: WaitDelay closes the PARENT's pipe ends, which is the only thing
+// that bounds Wait against a descendant SIGKILL cannot reach (one that
+// setsid'd out of the group, or one wedged in uninterruptible I/O).
+//
+// A wiring assertion, and it claims only what it reads: that the built
+// command carries both halves. Driving a process out of its own group
+// needs a helper binary, which is more machinery than the guard is worth.
+func TestU5_TheWakeCommandBoundsTheWaitItCannotKill(t *testing.T) {
+	cmd := wakeCommand(context.Background(), "true")
+
+	require.NotNil(t, cmd.SysProcAttr, "the wake command shares fleetd's process group")
+	require.True(t, cmd.SysProcAttr.Setpgid,
+		"without its own group there is nothing for the cancel below to signal but fleetd itself")
+	require.NotNil(t, cmd.Cancel,
+		"the default cancel kills only the shell, and dash forks the operator's command out of reach of it")
+	require.Positive(t, cmd.WaitDelay,
+		"WaitDelay is zero, which is documented to mean Wait blocks INDEFINITELY on the I/O pipes: "+
+			"a descendant the group kill cannot reach pins the wake goroutine for as long as it lives")
 }
 
 // TestU5_PostWakeWarmsCarryTheGraceAndTheWarmTimeout. The wake sequence
