@@ -64,9 +64,10 @@ Three decisions worth writing down:
 
 - **`exec`, not a call.** The deferred resume lives inside the `vibe`
   process. A shell sitting between Steam and vibe is one more thing that
-  has to forward SIGINT, and it does not — `TestC24WrapperExecsSoSignals
-  ReachTheResume` asserts the launcher's child pid IS the wrapped
-  process, then signals it and checks the signal arrived.
+  has to forward SIGINT, and it does not.
+  `TestC24WrapperExecsSoSignalsReachTheResume` asserts the launcher's
+  child pid IS the wrapped process, then signals it and checks the
+  signal arrived.
 - **`--yes`.** A lease is advisory by design (§5 of the design doc: "this
   reports, it does not block"). Without `--yes`, `drainCell` refuses on
   a non-tty — so a lease somebody left open on Tuesday stops the game

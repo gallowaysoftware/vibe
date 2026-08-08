@@ -18,6 +18,10 @@
 # therefore never fails: it says what it could not do, on stderr, into
 # the unit's journal, and exits 0.
 #
+# Needs a fleetd that knows the unit_stopped / unit_started verbs (C24).
+# An older one answers 400 and this hook does nothing — see the case
+# below for why that spelling is the safe one under version skew.
+#
 # Environment (set them in the drop-in, see llama-swap.service.d/):
 #   VIBE_FLEETD_URL     fleetd base URL, e.g. http://front-host:9001
 #   VIBE_CELL           this cell's name in hosts.yaml, e.g. gpu-cell
