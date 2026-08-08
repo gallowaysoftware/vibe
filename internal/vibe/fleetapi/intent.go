@@ -34,6 +34,40 @@ type intentResponse struct {
 	State  string  `json:"state"`
 }
 
+// StopIntentReason is the reserved intent reason a cell unit's own stop
+// hook writes (C24: drain where reclaim happens). It marks a record
+// whose AUTHOR is the unit rather than a human or an agent: the serving
+// stack stopped, that is all it knows, and in particular it does not
+// know why.
+//
+// Reserved reason rather than a new field, for C14's reason — a stop is
+// an ordinary drained entry on axis 2 and adds no state to the design's
+// table. What the marker buys is four behaviours a human's declaration
+// must NOT get, each of which is a bug if it is missing:
+//
+//  1. it is never handed back to the cell as desired_intent (announce.go).
+//     The record describes a stop that already happened; sending it to
+//     an announcing cell makes reconcile run cell_cmds.drain on a box
+//     that just came back — the recorder becomes an actuator.
+//  2. it loses to the cell's own drained echo (announce.go): a drained
+//     echo is only ever produced by a DECLARED drain at the box, so the
+//     stop record is redundant the moment one arrives, and leaving it
+//     would stamp "stopped out of band" over the operator's own drain.
+//  3. it is never "pending" (presence.go): nothing was requested of the
+//     cell, so there is no ack to wait for and no residue to report.
+//  4. it does not explain absence (notify.go, doctor.go). A crash stops
+//     the unit exactly as a `systemctl stop` does, so an always_on cell
+//     whose stack died still alarms. The record adds the WHEN and the
+//     WHAT; the WHY is still missing, and every surface that cares about
+//     the why behaves exactly as it did before this record existed.
+const StopIntentReason = "stopped out of band"
+
+// IsStopRecord reports whether an intent entry was written by a cell
+// unit's own stop hook rather than declared by a human or an agent.
+func IsStopRecord(in *Intent) bool {
+	return in != nil && in.State == "drained" && in.Reason == StopIntentReason
+}
+
 // handleIntent sets or clears one cell's declared intent. Unknown cells
 // and unknown states are 400s — a typo'd cell name must fail loudly, not
 // record intent for a cell that doesn't exist.
@@ -132,6 +166,31 @@ func (s *Server) SetIntentAt(cell, state, reason, eta string, since time.Time) (
 	since = since.UTC()
 	switch state {
 	case "serving":
+		if reason == StopIntentReason {
+			// C24, the unit's start half: retire the STOP RECORD this
+			// cell's own stop hook left, and nothing else.
+			//
+			// Two things it must never do, both of which the ordinary
+			// serving path does. It must not clear a HUMAN's declaration
+			// — the operator is still gaming; the unit merely started —
+			// so a record it did not write is answered with what is
+			// there and left alone. And on an announcing cell it must
+			// not become a serving REQUEST: a request is handed back as
+			// desired_intent, where the announcer's reconcile runs
+			// cell_cmds.resume. A hook that records must not be able to
+			// actuate, and the way to guarantee that is to make the
+			// write it performs incapable of producing a command.
+			cur, had := next[cell]
+			if !had {
+				return nil, nil
+			}
+			if !IsStopRecord(&cur) {
+				c := cur
+				return &c, nil
+			}
+			delete(next, cell)
+			break
+		}
 		if announcing {
 			in := Intent{State: "serving", Since: since}
 			next[cell] = in

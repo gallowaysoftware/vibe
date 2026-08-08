@@ -3,6 +3,8 @@
 package cli
 
 import (
+	"errors"
+
 	"github.com/spf13/cobra"
 
 	"github.com/gallowaysoftware/vibe/internal/buildinfo"
@@ -17,13 +19,25 @@ func Execute() error {
 }
 
 // ExitCode reports the process exit status a command asked for, or 0
-// when the error carries no preference. `vibe fleet doctor` is the one
-// caller today: its exit status IS part of its output (1 FAIL / 2 WARN /
+// when the error carries no preference. `vibe fleet doctor` is one
+// caller: its exit status IS part of its output (1 FAIL / 2 WARN /
 // 3 only-UNKNOWNs), and the report it already printed is the message, so
 // the caller must not also print an error line.
+//
+// C24 adds the second: `vibe cell drain --until-exit -- <command>` is a
+// WRAPPER, and a wrapper that swallows its child's status is a wrapper a
+// launcher cannot be pointed at — Steam, a .desktop Exec= and any `&&`
+// in a shell all read the code, and every failure would arrive as 1. A
+// signal death reports ExitCode() == -1, which is not a status any
+// process may exit with, so it falls through to the ordinary "vibe: …"
+// line and 1.
 func ExitCode(err error) int {
 	if err == nil {
 		return 0
+	}
+	var ec exitCodeError
+	if errors.As(err, &ec) && ec.code > 0 {
+		return ec.code
 	}
 	return doctorExitCode(err)
 }

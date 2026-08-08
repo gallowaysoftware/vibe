@@ -637,7 +637,24 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	s.mu.Lock()
 	req2, hasRequest := s.intents[req.Cell]
 	echo := p.IntentEcho
-	if hasRequest && echo != nil && !echo.Since.IsZero() && req2.Since.Before(echo.Since) {
+	stopRecord := hasRequest && IsStopRecord(&req2)
+	switch {
+	// C24, both halves of the stop record's contract, before the
+	// conflict rule can see it. A stop record is not a request: it is
+	// the unit's own note that it stopped, so it is never handed back
+	// (handing it to reconcile runs cell_cmds.drain on a box that just
+	// came back), and it is dropped the moment the cell echoes a drain
+	// of its own — a drained echo comes only from a declared drain at
+	// the box, which outranks a record written by the stop.
+	case stopRecord && echo != nil && echo.State == "drained":
+		next = make(map[string]Intent, len(s.intents))
+		for k, v := range s.intents {
+			next[k] = v
+		}
+		delete(next, req.Cell)
+	case stopRecord:
+		// desired stays nil: recorded, never commanded.
+	case hasRequest && echo != nil && !echo.Since.IsZero() && req2.Since.Before(echo.Since):
 		next = make(map[string]Intent, len(s.intents))
 		for k, v := range s.intents {
 			next[k] = v
@@ -652,7 +669,7 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 		} else {
 			delete(next, req.Cell)
 		}
-	} else if hasRequest {
+	case hasRequest:
 		d := req2
 		desired = &d
 	}

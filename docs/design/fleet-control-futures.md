@@ -95,11 +95,36 @@ Small (days):
    **not a pin** — residency stays llama-swap's, so the cell's own TTL
    can still unload the held model; the hold only guarantees fleetd
    won't be the one to evict it.
-5. **Drain where reclaim happens** — a documented Steam launch-option
-   / desktop-shortcut wrapper for `vibe cell drain --until-exit --`,
-   plus an `ExecStopPost` hook on cell units that best-effort records
-   out-of-band stops as intent. One line of packaging that decides
-   whether the intent axis stays trustworthy.
+5. **Drain where reclaim happens** — **SHIPPED as
+   [C24](fleet-control-plan/c24-drain-where-reclaim-happens.md)
+   (2026-08-08).** The wrapper, its Steam / `.desktop` / shell forms and
+   the unit drop-in all live in `deploy/cell/`, beside the two
+   deployments that were already there. Four notes for whoever reads this
+   next. **The hook half was one heartbeat from being an actuator**: a
+   registry drained entry is handed to an announcing cell as
+   `desired_intent`, and `fleetannounce.reconcile` answers that by
+   RUNNING `cell_cmds.drain` — so the naive "POST drained on stop" stops
+   the serving stack of a box that has just come back, through a path
+   nothing in the hook or the unit file can see. What closes it is a
+   reserved reason (`fleetapi.StopIntentReason`, C14's pattern) that
+   makes the record structurally incapable of producing a command, in
+   both directions: the start half retires a stop record and **only** a
+   stop record, so it can neither clear a human's declared reclaim nor
+   store a serving request. **A recorded stop explains nothing**: a crash
+   fires the same `ExecStopPost` as `systemctl stop`, so an `always_on`
+   cell still alarms and `vibe fleet doctor` still calls the stop
+   undeclared — the record adds the *when*, never the *why*, and every
+   surface that answers "why is this box down" is as loud as it was
+   before. **`ExecStopPost` alone was not enough**, which is a correction
+   to this entry: without the paired `ExecStartPost` the record outlives
+   the stop and the box comes back INCONSISTENT — a stale drain, the very
+   thing the entry set out to prevent. And a **follow-up this phase did
+   not take**: on an announcing cell the vibe daemon keeps heartbeating
+   `serving` after the serving stack stops (the echo is `{state, since}`
+   and cannot say "the stack under me is down"), so the record renders
+   INCONSISTENT rather than DRAINED until the announcer goes stale. The
+   fix is a reason or a serving-stack liveness bit on the announce echo —
+   an additive wire change, and its own small phase.
 6. **Guest read-only token** — **SHIPPED as
    [C12](fleet-control-plan/c12-guest-token.md) (2026-08-04).** A second
    bearer honored only on `GET /api/fleet/state` + `/events`. Three
