@@ -4,7 +4,7 @@
 set -uo pipefail
 source "$(dirname "$0")/gl.sh"
 
-FRONT_PORT=9640; ALPHA_PORT=9641
+FRONT_PORT=$(cell_port front); ALPHA_PORT=$(cell_port alpha)
 LEDGER=$LAB/state/fleetd/vibe/fleet/usage.jsonl
 FRONT_STATE=$LAB/state/ann-front
 
@@ -39,7 +39,7 @@ echo "# alpha, chat probes (64 output tokens each):"
 curl -fsS -m 10 "http://127.0.0.1:$ALPHA_PORT/api/metrics/activity" | jq -c '[.data[]|select(.model=="lab-chat" and .tokens.output_tokens==64)]|{n:length,tokens:(map(.tokens.input_tokens+.tokens.output_tokens)|add)}'
 curl -fsS -m 10 "http://127.0.0.1:$ALPHA_PORT/api/metrics/activity" | jq -r '[.data[]|select(.model=="lab-chat" and .tokens.output_tokens==64)] | if length>0 then ((map(.tokens.input_tokens+.tokens.output_tokens)|add)/length) as $p | "  \($p) tokens per chat probe x 96/day cap = \(($p*96)|floor) tokens/cell/day" else "  (none)" end'
 echo "# charlie, embed probes (64-input batches):"
-curl -fsS -m 10 "http://127.0.0.1:9643/api/metrics/activity" | jq -c '[.data[]|select(.req_path=="/v1/embeddings" and .tokens.input_tokens>=300)]|{n:length,tokens:(map(.tokens.input_tokens)|add)}'
+curl -fsS -m 10 "http://127.0.0.1:$(cell_port charlie)/api/metrics/activity" | jq -c '[.data[]|select(.req_path=="/v1/embeddings" and .tokens.input_tokens>=300)]|{n:length,tokens:(map(.tokens.input_tokens)|add)}'
 echo "# and how the ledger classified them (none of these is a poke):"
 usage | jq -c '[.buckets[]|select(.basis=="chat" or .basis=="embed")|{cell,model,basis,req,poke_req,err_req,unmeasured_req,out,in_fresh}]'
 hr done

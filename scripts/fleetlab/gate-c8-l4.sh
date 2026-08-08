@@ -10,7 +10,7 @@
 set -uo pipefail
 source "$(dirname "$0")/gl.sh"
 
-CELL=alpha; MODEL=lab-chat; PORT=9641
+CELL=alpha; MODEL=lab-chat; PORT=$(cell_port alpha)
 PROBEFILE=$LAB/state/ann-$CELL/vibe/fleet/model-probe.json
 
 # /api/fleet/usage returns `buckets`, not `rows`. Reading `.rows[]?` yields

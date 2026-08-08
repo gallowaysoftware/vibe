@@ -13,7 +13,7 @@
 set -uo pipefail
 source "$(dirname "$0")/gl.sh"
 
-CELL=alpha; MODEL=lab-embed-a; PORT=9641
+CELL=alpha; MODEL=lab-embed-a; PORT=$(cell_port alpha)
 CELLETC=$LAB/etc-$CELL
 SINK=$LAB/logs/notify.log
 FRONTCFG=$LAB/cells/front/config.yaml

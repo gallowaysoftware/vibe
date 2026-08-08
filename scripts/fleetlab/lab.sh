@@ -13,8 +13,10 @@
 #   ./lab.sh prove    run the four end-to-end proofs and print raw output
 #   ./lab.sh render   re-render every cell config from the backend defs
 #   ./lab.sh env      print the exported env for driving vibe CLI by hand
+#   ./lab.sh ports    print this instance's derived port table
 #
-# Ports (deliberately inside the ranges reserved for the lab):
+# Ports are DERIVED from FLEETLAB_PORT_BASE (default 9600 — today's table
+# exactly). See ports.sh. At the default base:
 #   9640 front llama-swap      9641 alpha   9642 bravo   9643 charlie
 #   9651/9652/9653             per-cell host_probe TCP listeners
 #   9720 fleetd proxy_port (proxy disabled)   9721 fleetd control plane
@@ -24,10 +26,18 @@
 # A production fleet on the same box (llama-swap on :9000, a daemon on
 # :9001, upstreams 5800+, ~/.config/vibe, ~/.local/state/vibe) is never
 # read or written: every process here gets its own XDG triple under $LAB,
-# and every kill pattern is anchored on a lab-only path or port range.
+# and every kill pattern is anchored on a lab-only path or on THIS
+# instance's own derived upstream window. ports.sh refuses outright a
+# base whose windows would cover a production port.
+#
+# TWO INSTANCES ON ONE BOX need their own FLEETLAB_DIR *and* their own
+# FLEETLAB_PORT_BASE (bases are multiples of 200: 9600, 9800, 10000 …).
+# Neither half is optional: the dir separates the configs, the base
+# separates the ports, and `down` sweeps on both.
 #
 # Knobs (all optional):
 #   FLEETLAB_DIR    scratch root                  (default /tmp/fleetlab)
+#   FLEETLAB_PORT_BASE  this instance's 200-port block (default 9600)
 #   LLAMA_SWAP      llama-swap v239+ binary       (default ~/.local/bin/llama-swap)
 #   LLAMA_SERVER    llama-server binary           (default ~/.local/bin/llama-server)
 #   CHAT_GGUF       a small chat GGUF             (the chat-path gates need it)
@@ -41,6 +51,12 @@ set -uo pipefail
 
 LAB=${FLEETLAB_DIR:-/tmp/fleetlab}
 REPO=${FLEETLAB_REPO:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}
+# The port table and the collision guard. Sourced, not copied: a second
+# copy of the port list is the bug this instance-isolation work exists to
+# remove. It exits non-zero on a base that is not a multiple of 200 or
+# that would cover a production port.
+# shellcheck source=scripts/fleetlab/ports.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/ports.sh"
 BIN=$LAB/bin/vibe
 LLAMA_SWAP=${LLAMA_SWAP:-$HOME/.local/bin/llama-swap}
 LLAMA_SERVER=${LLAMA_SERVER:-$HOME/.local/bin/llama-server}
@@ -56,35 +72,12 @@ LOGS=$LAB/logs
 CELLS=$LAB/cells
 
 FLEETD_STATE=$STATE/fleetd
-FLEETD_URL=http://127.0.0.1:9721
+# FLEETD_URL and BRAVO_DAEMON_URL come from ports.sh.
 TOKEN_FILE=$FLEETD_STATE/vibe/token
 
 CHAT_GGUF=${CHAT_GGUF:-$HOME/models/qwen2.5-coder-7b/qwen2.5-coder-7b-instruct-q4_k_m.gguf}
 BGE_LARGE=${BGE_LARGE:-$HOME/models/bge-large-en-v1.5-gguf/bge-large-en-v1.5-q8_0.gguf}
 BGE_M3=${BGE_M3:-$HOME/models/bge-m3-GGUF/bge-m3-Q8_0.gguf}
-
-# name:port:class:startPort:hostprobe
-CELL_LIST=(
-  "front:9640:always_on:5980:"
-  "alpha:9641:always_on:5990:9651"
-  "bravo:9642:opportunistic:6000:9652"
-  "charlie:9643:roaming:6010:9653"
-)
-
-cell_field() { local want=$1 idx=$2 e; for e in "${CELL_LIST[@]}"; do
-  IFS=: read -r n p c s h <<<"$e"; [[ $n == "$want" ]] || continue
-  case $idx in n) echo "$n";; p) echo "$p";; c) echo "$c";; s) echo "$s";; h) echo "$h";; esac; return; done; }
-cell_port()  { cell_field "$1" p; }
-cell_class() { cell_field "$1" c; }
-cell_sport() { cell_field "$1" s; }
-cell_probe() { cell_field "$1" h; }
-model_cells() { echo "alpha bravo charlie"; }
-all_cells()   { echo "front alpha bravo charlie"; }
-# bravo runs a FULL vibe cell daemon (in-daemon announce loop + cell_cmds,
-# so C2 drain/resume and C14 suspend are exercisable); alpha and charlie run
-# the slim `vibe fleet announce` loop. Both announcer modes in one fleet.
-slim_cells()  { echo "alpha charlie"; }
-BRAVO_DAEMON_URL=http://127.0.0.1:9723
 
 say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[warn]\033[0m %s\n' "$*" >&2; }
@@ -157,31 +150,40 @@ stop_one() {
 }
 
 # sweep kills anything a previous crashed run left behind. Every pattern is
-# anchored on a lab-only path or a lab-only upstream port range, so it can
-# never match the production llama-swap (:9000, config in ~/.config,
-# upstreams 5800-5809) or the production daemon.
+# anchored on THIS instance's identity — its $LAB path, or its own derived
+# upstream window — so it can never match the production llama-swap (:9000,
+# config in ~/.config, upstreams 5800-5809), the production daemon, or
+# ANOTHER LAB INSTANCE.
+#
+# The upstream half used to be `--port (59[89][0-9]|60[01][0-9])`: a
+# constant every instance shared, because every instance had the same
+# ports. A second lab's `down` was therefore entitled to kill the first's
+# llama-servers, and it surfaces in the other operator's session as a
+# phantom bug — a gate that fails for a reason nowhere in their diff. It
+# blocked C16's L4 outright. The window is now derived from
+# FLEETLAB_PORT_BASE, and ports.sh's multiple-of-200 rule is what
+# guarantees two instances' windows do not overlap.
 sweep() {
-  local pat pids
-  for pat in \
-    "llama-swap -config $LAB/" \
-    "$LAB/bin/vibe " \
-    "$LAB/bin/notify-sink.py" \
+  local pat pids sig
+  # One list, walked twice (TERM then KILL). It used to be written out
+  # twice, and a pattern added to one copy and not the other is a process
+  # that survives `down` for a reason nobody can see.
+  local -a patterns=(
+    "llama-swap -config $LAB/"
+    "$LAB/bin/vibe "
+    "$LAB/bin/notify-sink.py"
     "$TAG-hostprobe"
-  do
-    pids=$(pgrep -f -- "$pat" 2>/dev/null | grep -v "^$$\$")
-    [[ -n $pids ]] && kill -TERM $pids 2>/dev/null
+  )
+  for sig in TERM KILL; do
+    for pat in "${patterns[@]}"; do
+      pids=$(pgrep -f -- "$pat" 2>/dev/null | grep -v "^$$\$")
+      [[ -n $pids ]] && kill -"$sig" $pids 2>/dev/null
+    done
+    # llama-server children of a KILL-9'd swap: only this instance's window.
+    pids=$(lab_upstream_pids "$LAB_UPSTREAM_LO" "$LAB_UPSTREAM_HI")
+    [[ -n $pids ]] && kill -"$sig" $pids 2>/dev/null
+    [[ $sig == TERM ]] && sleep 1
   done
-  sleep 1
-  # llama-server children of a KILL-9'd swap: only the lab's upstream ranges.
-  pids=$(pgrep -f -- 'llama-server .*--port (59[89][0-9]|60[01][0-9])' 2>/dev/null)
-  [[ -n $pids ]] && kill -TERM $pids 2>/dev/null
-  sleep 0.5
-  for pat in "llama-swap -config $LAB/" "$LAB/bin/vibe " "$LAB/bin/notify-sink.py" "$TAG-hostprobe"; do
-    pids=$(pgrep -f -- "$pat" 2>/dev/null | grep -v "^$$\$")
-    [[ -n $pids ]] && kill -KILL $pids 2>/dev/null
-  done
-  pids=$(pgrep -f -- 'llama-server .*--port (59[89][0-9]|60[01][0-9])' 2>/dev/null)
-  [[ -n $pids ]] && kill -KILL $pids 2>/dev/null
   return 0
 }
 
@@ -269,28 +271,28 @@ fleetd_url: "$FLEETD_URL"
 
 cells:
   front:
-    url: "http://127.0.0.1:9640"
+    url: "http://127.0.0.1:$(cell_port front)"
     class: always_on
     power: {source: declared, watts_idle: 12, watts_busy: 20}
   alpha:
-    url: "http://127.0.0.1:9641"
+    url: "http://127.0.0.1:$(cell_port alpha)"
     class: always_on
-    host_probe: "127.0.0.1:9651"
+    host_probe: "127.0.0.1:$(cell_probe alpha)"
     power: {source: declared, watts_idle: 80, watts_busy: 300}
     capital_cost: 1200
     capital_note: "lab cell, synthetic number"
   bravo:
-    url: "http://127.0.0.1:9642"
+    url: "http://127.0.0.1:$(cell_port bravo)"
     class: opportunistic
-    host_probe: "127.0.0.1:9652"
+    host_probe: "127.0.0.1:$(cell_probe bravo)"
     daemon_url: "$BRAVO_DAEMON_URL"
     token_file: "$STATE/bravo/vibe/token"
     wake: {cmd: "$LAB/bin/fake-wake.sh bravo"}
     power: {source: declared, watts_idle: 40, watts_busy: 120}
   charlie:
-    url: "http://127.0.0.1:9643"
+    url: "http://127.0.0.1:$(cell_port charlie)"
     class: roaming
-    host_probe: "127.0.0.1:9653"
+    host_probe: "127.0.0.1:$(cell_probe charlie)"
 
 model_classes:
   lab-embed-a: embed
@@ -307,12 +309,12 @@ pricing:
 EOF
 
   # --- fleetd config. disable_proxy so nothing binds a router port; the
-  #     control plane is 9721. front_config points at the front cell's
+  #     control plane is base+121. front_config points at the front cell's
   #     -watch-config file, which is what turns on C3's render loop.
   cat >"$ETC/vibe/config.yaml" <<EOF
-proxy_port: 9720
+proxy_port: $LAB_PROXY_PORT
 disable_proxy: true
-http_addr: "127.0.0.1:9721"
+http_addr: "127.0.0.1:$LAB_FLEETD_PORT"
 llama_binary: $LLAMA_SERVER
 fleet_registry: true
 fleet:
@@ -320,7 +322,7 @@ fleet:
   timezone: America/Toronto
   guest_token_file: $FLEETD_STATE/vibe/guest-token
   notify:
-    url: "http://127.0.0.1:9724/fleetlab"
+    url: "http://127.0.0.1:$LAB_NOTIFY_PORT/fleetlab"
     interval: 15s
     rate_per_hour: 60
     burst: 10
@@ -342,9 +344,9 @@ EOF
   ln -sfn "$ETC/vibe/backends" "$ETC_BRAVO/vibe/backends"
   ln -sfn "$ETC/vibe/hosts.yaml" "$ETC_BRAVO/vibe/hosts.yaml"
   cat >"$ETC_BRAVO/vibe/config.yaml" <<EOF
-proxy_port: 9642
+proxy_port: $(cell_port bravo)
 disable_proxy: true
-http_addr: "127.0.0.1:9723"
+http_addr: "127.0.0.1:$LAB_BRAVO_DAEMON_PORT"
 bind_all: false
 llama_binary: $LLAMA_SERVER
 cell_cmds:
@@ -467,9 +469,12 @@ reap_orphan_upstreams() {
   for c in $(all_cells); do
     pid_alive "swap-$c" && continue
     sport=$(cell_sport "$c")
-    pids=$(pgrep -f -- "llama-server .*--port ${sport:0:3}[0-9]" 2>/dev/null)
+    # This cell's own ten upstream ports, numerically. The old
+    # `${sport:0:3}[0-9]` prefix regex only worked while every startPort
+    # happened to be a multiple of ten with a shared three-digit stem.
+    pids=$(lab_upstream_pids "$sport" "$((sport + 9))")
     if [[ -n $pids ]]; then
-      warn "reaping orphaned upstream(s) on ${sport}x for cell $c: $pids"
+      warn "reaping orphaned upstream(s) on $sport-$((sport + 9)) for cell $c: $pids"
       kill -TERM $pids 2>/dev/null; sleep 1; kill -KILL $pids 2>/dev/null
     fi
   done
@@ -502,8 +507,8 @@ cmd_up() {
   say "rendering per-cell llama-swap configs (vibe router render --cell N --extras)"
   render_cells || die "render failed"
 
-  say "starting the C9 notification sink on 9724"
-  start_bg notify-sink python3 "$LAB/bin/notify-sink.py" "$LOGS/notify.log" 9724
+  say "starting the C9 notification sink on $LAB_NOTIFY_PORT"
+  start_bg notify-sink python3 "$LAB/bin/notify-sink.py" "$LOGS/notify.log" "$LAB_NOTIFY_PORT"
 
   say "starting host_probe listeners"
   local c port
@@ -530,14 +535,14 @@ cmd_up() {
       || die "cell $c did not answer /v1/models — see $LOGS/swap-$c.log"
   done
 
-  say "starting bravo's cell daemon (in-daemon announce + cell_cmds) on 9723"
+  say "starting bravo's cell daemon (in-daemon announce + cell_cmds) on $LAB_BRAVO_DAEMON_PORT"
   ( export XDG_CONFIG_HOME=$ETC_BRAVO XDG_STATE_HOME=$STATE/bravo XDG_RUNTIME_DIR=$RUN/rt-bravo
     mkdir -p "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
     start_bg cell-bravo "$BIN" daemon )
   for _ in $(seq 1 60); do [[ -s $STATE/bravo/vibe/token ]] && break; sleep 0.25; done
   [[ -s $STATE/bravo/vibe/token ]] || warn "bravo cell daemon never minted a token — see $LOGS/cell-bravo.log"
 
-  say "starting fleetd (vibe daemon, fleet_registry: true) on 9721"
+  say "starting fleetd (vibe daemon, fleet_registry: true) on $LAB_FLEETD_PORT"
   ( vibe_env fleetd; start_bg fleetd "$BIN" daemon )
   wait_http "$FLEETD_URL/ui/fleet" 30 || die "fleetd did not come up — see $LOGS/fleetd.log"
   for _ in $(seq 1 40); do [[ -s $TOKEN_FILE ]] && break; sleep 0.25; done
@@ -607,6 +612,7 @@ hr() { printf '\n\033[1m--- %s\033[0m\n' "$*"; }
 
 cmd_prove() {
   local tok; tok=$(token)
+  local alpha; alpha=http://127.0.0.1:$(cell_port alpha)
 
   hr "PROOF 1: fleetd state — every cell present with its hosts.yaml class"
   state | jq '[.cells | sort_by(.name)[] | {name, class, url, display, reachable, host_reachable,
@@ -614,15 +620,15 @@ cmd_prove() {
       seq: .presence.seq, models: ((.models//[])|map(.id))}]'
 
   hr "PROOF 2: a real request through a cell, then that cell's /api/metrics/activity"
-  echo "# POST http://127.0.0.1:9641/v1/embeddings model=lab-embed-a"
-  curl -fsS -m 120 http://127.0.0.1:9641/v1/embeddings -H 'Content-Type: application/json' \
+  echo "# POST $alpha/v1/embeddings model=lab-embed-a"
+  curl -fsS -m 120 "$alpha/v1/embeddings" -H 'Content-Type: application/json' \
     -d '{"model":"lab-embed-a","input":"fleetlab proof two"}' | jq '{model, usage}'
-  echo "# POST http://127.0.0.1:9641/v1/chat/completions model=lab-chat"
-  curl -fsS -m 300 http://127.0.0.1:9641/v1/chat/completions -H 'Content-Type: application/json' \
+  echo "# POST $alpha/v1/chat/completions model=lab-chat"
+  curl -fsS -m 300 "$alpha/v1/chat/completions" -H 'Content-Type: application/json' \
     -d '{"model":"lab-chat","messages":[{"role":"user","content":"reply with the single word: proof"}],"max_tokens":8}' \
     | jq '{model, content: .choices[0].message.content, usage, timings: {prompt_n: .timings.prompt_n, cache_n: .timings.cache_n, predicted_n: .timings.predicted_n}}'
-  echo "# GET http://127.0.0.1:9641/api/metrics/activity"
-  curl -fsS -m 10 "http://127.0.0.1:9641/api/metrics/activity" | jq '{total, rows: [.data[] | {id, model, req_path, resp_status_code, tokens, duration_ms}]}'
+  echo "# GET $alpha/api/metrics/activity"
+  curl -fsS -m 10 "$alpha/api/metrics/activity" | jq '{total, rows: [.data[] | {id, model, req_path, resp_status_code, tokens, duration_ms}]}'
   echo "# persistent store on disk (C7a §0 — the config production lacks):"
   ls -la "$CELLS"/*/activity.db 2>/dev/null
 
@@ -647,7 +653,7 @@ cmd_prove() {
   echo "# restart charlie's announcer"
   ( vibe_env ann-charlie
     start_bg announce-charlie "$BIN" fleet announce --cell charlie --registry "$FLEETD_URL" \
-      --token-file "$TOKEN_FILE" --llama-swap http://127.0.0.1:9643 --llama-server "$LLAMA_SERVER" )
+      --token-file "$TOKEN_FILE" --llama-swap "http://127.0.0.1:$(cell_port charlie)" --llama-server "$LLAMA_SERVER" )
   sleep 20
   state | jq -r '.cells[] | select(.name=="charlie") | "charlie\tannouncing=\(.presence.announcing // false)\tstale=\(.presence.stale // false)\tdisplay=\(.display)\tmodels=\((.models//[])|length)"'
 }
@@ -661,6 +667,7 @@ case "${1:-}" in
   prove)  cmd_prove ;;
   render) render_cells && say "rendered" ;;
   env)    cmd_env ;;
+  ports)  lab_ports_table ;;
   state)  state | jq . ;;
-  *) sed -n '2,30p' "$0"; exit 2 ;;
+  *) sed -n '2,42p' "$0"; exit 2 ;;
 esac

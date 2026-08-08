@@ -29,7 +29,7 @@
 set -uo pipefail
 source "$(dirname "$0")/gl.sh"
 
-FRONT=http://127.0.0.1:9640
+FRONT=http://127.0.0.1:$(cell_port front)
 DEFS=$LAB/etc/vibe/backends
 FRONT_CFG=$LAB/cells/front/config.yaml
 [[ -d $DEFS ]] || { echo "no $DEFS — is the lab up with this FLEETLAB_DIR?" >&2; exit 1; }
@@ -115,8 +115,8 @@ PY
 tail -n 3 "$DEFS/lab-chat.yaml" "$DEFS/lab-embed-a.yaml" "$DEFS/lab-embed-c.yaml"
 
 hr "1. re-render the two cells so their own llama-swaps answer to the aliases"
-render_cell alpha 5990 || exit 1
-render_cell charlie 6010 || exit 1
+render_cell alpha || exit 1
+render_cell charlie || exit 1
 sleep 5   # -watch-config polls at 2s
 
 hr "2. wait for fleetd's presence loop to re-render the front"
@@ -178,8 +178,8 @@ p=$(peer_of lab-embed-a); [[ $p == alpha ]]; check "alpha keeps serving its own 
 hr "7. the owner comes home"
 ( export XDG_CONFIG_HOME=$LAB/etc XDG_STATE_HOME=$LAB/state/ann-charlie XDG_RUNTIME_DIR=$LAB/run/rt-ann-charlie
   mkdir -p "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
-  nohup "$BIN" fleet announce --cell charlie --registry http://127.0.0.1:9721 \
-    --token-file "$LAB/state/fleetd/vibe/token" --llama-swap http://127.0.0.1:9643 \
+  nohup "$BIN" fleet announce --cell charlie --registry "$FLEETD_URL" \
+    --token-file "$LAB/state/fleetd/vibe/token" --llama-swap "http://127.0.0.1:$(cell_port charlie)" \
     --llama-server "${LLAMA_SERVER:-$HOME/.local/bin/llama-server}" \
     >>"$LAB/logs/announce-charlie.log" 2>&1 & echo $! > "$LAB/run/announce-charlie.pid" )
 for _ in $(seq 1 40); do

@@ -22,9 +22,14 @@ var exempt = map[string]string{
 	// their argv carries llama-swap's own config path and not the rig's
 	// $LAB — the port range is the only handle the sweep has. It is a
 	// standalone range (5960-5979, spelled 59[67][0-9]) that no other rig
-	// uses, but it is still a literal, and futures item 15
-	// (FLEETLAB_PORT_BASE) is the real fix. Recorded here so the next
-	// reader finds the hazard rather than rediscovering it.
+	// uses, but it is still a literal.
+	//
+	// C23 gave lab.sh the FLEETLAB_PORT_BASE knob and re-anchored ITS
+	// sweep on a derived window; this rig is a separate fleet with its own
+	// C15LAB_DIR and its own fixed ports, and was left alone. So the
+	// hazard here is unchanged and narrower than it was: two concurrent
+	// runs of gate-c15-warm-auth.sh on one box still collide. Recorded so
+	// the next reader finds it rather than rediscovering it.
 	"scripts/fleetlab/gate-c15-warm-auth.sh:66:unscoped-kill": "llama-server argv carries no rig path; anchored on this rig's private 5960-5979 range instead",
 	"scripts/fleetlab/gate-c15-warm-auth.sh:67:unscoped-kill": "the rig's own host-probe helper, named for the gate (c15-hostprobe)",
 	// The two temp-directory traps the widened walk brought in. Both are

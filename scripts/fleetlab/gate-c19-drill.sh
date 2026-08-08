@@ -40,8 +40,8 @@ SB_STATE=$SB/state                   # -> $SB_STATE/vibe is XDG_STATE_HOME/vibe
 SB_ETC=$SB/etc                       # -> $SB_ETC/vibe is XDG_CONFIG_HOME/vibe
 SB_FRONT=$SB/front-config/config.yaml
 
-FRONT_PORT=9640
-FLEETD_PORT=9721
+FRONT_PORT=$(cell_port front)
+FLEETD_PORT=$LAB_FLEETD_PORT
 LAB_STATE_DIR=$LAB/state/fleetd/vibe
 LAB_ETC_DIR=$LAB/etc/vibe
 LAB_FRONT_CFG=$LAB/cells/front/config.yaml
@@ -191,7 +191,7 @@ curl -fsS -m 3 "http://127.0.0.1:$FLEETD_PORT/ui/fleet" >/dev/null 2>&1 && die "
 curl -fsS -m 3 "http://127.0.0.1:$FRONT_PORT/v1/models" >/dev/null 2>&1 && die "the front survived the kill"
 
 hr "3b. invariant 4: the CELLS keep serving with the control plane gone"
-for c in alpha:9641 charlie:9643; do
+for c in "alpha:$(cell_port alpha)" "charlie:$(cell_port charlie)"; do
   n=$(curl -fsS -m 5 "http://127.0.0.1:${c#*:}/v1/models" | jq -r '.data | length' 2>/dev/null)
   printf '  %-8s /v1/models -> %s model(s)\n' "${c%%:*}" "${n:-UNREACHABLE}"
 done

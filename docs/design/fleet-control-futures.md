@@ -345,14 +345,22 @@ Medium:
     real ask is that the 30 s be a flag, so a cell whose generations run
     longer can stop cleanly. `drain --wait` stays the local answer either
     way and `TimeoutStopSec` must still exceed the grace.
-15. **A port offset for `scripts/fleetlab`.** It binds fixed ports
-    (9600-9799, upstreams 5980-6019), so two lab instances cannot coexist
-    on one box — and `down`'s sweep is anchored partly on that shared
-    upstream range, so the second instance is entitled to kill the
-    first's processes. This blocked C16's L4 gate outright. One
-    `FLEETLAB_PORT_BASE` knob threaded through `CELL_LIST` and the sweep
-    patterns; small, and the parallel-agent workflow this repo now uses
-    hits it immediately.
+15. **A port offset for `scripts/fleetlab`** — **SHIPPED as
+    [C23](fleet-control-plan/c23-fleetlab-port-base.md) (2026-08-08).**
+    It bound fixed ports (9600-9799, upstreams 5980-6019), so two lab
+    instances could not coexist on one box — and `down`'s sweep was
+    anchored partly on that shared upstream range, so the second instance
+    was entitled to kill the first's processes. This blocked C16's L4
+    gate outright; L4 ran and passed the day the knob landed. Three notes
+    for whoever reads this next. **The sweep was the whole feature**, not
+    the ports: two labs "starting" is a convenience, one lab's `down`
+    provably not reaching the other's processes is the property, and the
+    llama-server children are the hard half because they carry no lab
+    path on their argv. **The collision rule is mechanical** — a base
+    must be a multiple of 200, which is what makes two instances' windows
+    disjoint, and the script refuses one that is not. And **the guard is
+    part of the feature**: a base whose windows would cover `:9000` or
+    `:9001` is refused before `down` reaches the sweep at all.
 
 Large:
 

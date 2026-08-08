@@ -5,7 +5,7 @@ Answers the DOM half of C12 L1 — which controls the page actually renders
 under a guest token — with a real browser engine rather than by reading the
 HTML source. Run it directly:
 
-    python3 marionette.py http://127.0.0.1:9721/ui/fleet "$TOKEN" out.json
+    python3 marionette.py "$VIBE_API/ui/fleet" "$TOKEN" out.json   # VIBE_API from gl.sh
 
 once with the guest token and once with the operator token, and diff.
 

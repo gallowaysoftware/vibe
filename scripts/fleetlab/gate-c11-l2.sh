@@ -5,7 +5,7 @@
 set -uo pipefail
 source "$(dirname "$0")/gl.sh"
 
-CELL=alpha; PORT=9641; SPORT=5990
+CELL=alpha; PORT=$(cell_port alpha); SPORT=$(cell_sport alpha)
 HELD=lab-embed-a
 DEFAULT=lab-chat   # the cell's warm target (restore_after_idle 2m)
 

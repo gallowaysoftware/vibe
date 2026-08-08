@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # shared helpers for the C17 gate scripts
 LAB=${FLEETLAB_DIR:-/tmp/fleetlab}
+# The SAME port table lab.sh derives, from the SAME knob. A rig that keeps
+# its own copy of :9641 drives whichever lab holds the default base — which,
+# once two instances can coexist, is somebody else's. Pass the pair
+# (FLEETLAB_DIR + FLEETLAB_PORT_BASE) the lab was started with.
+# shellcheck source=scripts/fleetlab/ports.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/ports.sh"
 BIN=$LAB/bin/vibe
 export XDG_CONFIG_HOME=$LAB/etc
 export XDG_STATE_HOME=$LAB/state/fleetd
 export XDG_RUNTIME_DIR=$LAB/run/rt-fleetd
-export VIBE_API=http://127.0.0.1:9721
+export VIBE_API=$FLEETD_URL
 export VIBE_TOKEN=$(cat "$LAB/state/fleetd/vibe/token" 2>/dev/null)
 
 # fleetd's OWN log. $LAB/logs/fleetd.log holds only what the process wrote
@@ -24,15 +30,17 @@ mcptext() { mcp "$@" | jq -r '.result.content[0].text // .error.message // .'; }
 ts() { date -Is; }
 hr() { printf '\n=== %s  %s ===\n' "$(date -Is)" "$*"; }
 
-# render_cell CELL STARTPORT — re-render one cell's llama-swap config the
+# render_cell CELL [STARTPORT] — re-render one cell's llama-swap config the
 # way lab.sh does, INCLUDING lab.sh's verification that the startPort
 # rewrite applied. `vibe router render` hardcodes startPort: 5800, which is
 # production's upstream range on this box; a rig that renders and does not
 # check has silently pointed a lab cell at the production ports. Every
 # failure here is fatal to the rig, because everything after it would be
 # measuring the wrong process.
+# STARTPORT defaults to the cell's derived upstream port, so a rig no
+# longer has to repeat a constant that moves with FLEETLAB_PORT_BASE.
 render_cell() {
-  local cell=$1 sport=$2 out=$LAB/cells/$1/config.yaml
+  local cell=$1 sport=${2:-$(cell_sport "$1")} out=$LAB/cells/$1/config.yaml
   "$BIN" router render --cell "$cell" --extras "$LAB/cells/$cell/extras.yaml" \
     --llama-server "${LLAMA_SERVER:-$HOME/.local/bin/llama-server}" --out "$out" >/dev/null 2>&1 ||
     { echo "render $cell FAILED" >&2; return 1; }

@@ -22,6 +22,9 @@ assumption rather than on hardware.
 | `bravo` | 9642 | `opportunistic` | `lab-embed-b` | a full `vibe daemon` cell — `cell_cmds`, drain/resume/suspend, in-daemon announce |
 | `charlie` | 9643 | `roaming` | `lab-embed-c` | slim |
 
+Those ports are the **default** base (9600); every one of them is derived
+— see [Two labs on one box](#two-labs-on-one-box) and `./lab.sh ports`.
+
 Plus: a per-cell `host_probe` TCP listener (9651–9653) independent of the
 llama-swap port, so "the box answers but is not announcing" is a real
 state; a webhook sink on 9724 standing in for ntfy; a persistent
@@ -38,8 +41,50 @@ FLEETLAB_DIR=/tmp/fleetlab ./lab.sh up      # build, render, start, wait healthy
                            ./lab.sh status  # processes + a fleetd state summary
                            ./lab.sh prove   # four end-to-end proofs, raw output
                            ./lab.sh env     # env for driving the vibe CLI by hand
+                           ./lab.sh ports   # this instance's derived port table
                            ./lab.sh down    # idempotent, works after a crash
 ```
+
+## Two labs on one box
+
+`FLEETLAB_PORT_BASE` (default **9600**) is the base of this instance's
+200-port block. Every port the lab binds is derived from it in
+[`ports.sh`](ports.sh) — the four cells, the three host probes, fleetd,
+bravo's cell daemon, the webhook sink, **and the llama-server upstream
+range**. There is one table; `lab.sh` and `gl.sh` both source it.
+
+```
+FLEETLAB_DIR=/tmp/fleetlab-b FLEETLAB_PORT_BASE=10000 ./lab.sh up
+FLEETLAB_DIR=/tmp/fleetlab-b FLEETLAB_PORT_BASE=10000 ./gate-c11-l2.sh
+```
+
+**The collision rule, for concurrent agents.**
+
+1. A base must be a **multiple of 200**, and the script refuses one that
+   is not. Two instances therefore differ by at least a full block, which
+   is what makes both their windows disjoint.
+2. **Set both knobs, always.** `FLEETLAB_DIR` alone is not isolation:
+   the dir separates the configs, the base separates the ports, and
+   `down` sweeps on both. A second lab that reuses the default base is
+   entitled to kill the first's llama-servers — that was the state of
+   the world before C23 and it cost C16 its L4 gate.
+3. **Pass the same pair to the gate rigs.** They source `gl.sh`, which
+   derives the same table; a rig run without the base drives whichever
+   lab holds the default block, which may be somebody else's.
+4. `ss -ltn` before you take a block, and say which one you took.
+
+The base also has a hard floor. `ports.sh` refuses outright a base whose
+listen or upstream window would cover the production llama-swap on
+`:9000`, the production daemon on `:9001`, production's 5800–5809
+upstreams, or `scripts/upgrade/ritual.sh`'s own 9810–9819 / 6100–6139. It
+refuses *before* `down` reaches the sweep, because a refusal that arrives
+after the kill is not a guard.
+
+Two rigs are NOT covered by the knob and keep fixed ports:
+`gate-c15-warm-auth.sh` (its own two-cell fleet on 9660–9671, upstreams
+5960–5979, its own `C15LAB_DIR`) and `scripts/upgrade/ritual.sh`'s own
+listeners. Neither collides with any lab block, but two concurrent runs
+of *the same* rig still collide with each other.
 
 ## Why it cannot touch production
 
@@ -49,8 +94,9 @@ Both halves matter, and both are load-bearing rather than tidy:
   and `XDG_RUNTIME_DIR` under `$FLEETLAB_DIR`. A lab fleetd cannot read
   or write `~/.config/vibe` or `~/.local/state/vibe`, so it cannot see
   the real `hosts.yaml`, mint into the real token file, or drain a real
-  cell. Ports are 9600–9799 and upstreams 5980–6019, clear of a
-  production llama-swap on `:9000` with upstreams at 5800+.
+  cell. Ports are 9600–9799 and upstreams 5980–6019 at the default base,
+  clear of a production llama-swap on `:9000` with upstreams at 5800+ —
+  and `ports.sh` refuses a base that would not be.
 - **`CUDA_VISIBLE_DEVICES=""` on every cell.** Not tidiness. With
   `--n-gpu-layers 0` llama.cpp still builds a CUDA backend and reserves
   scheduler buffers, which aborts inside `libggml-cuda` when the card is
@@ -58,9 +104,16 @@ Both halves matter, and both are load-bearing rather than tidy:
   which is what makes it safe to run beside a box whose GPU is holding
   production models.
 
-`sweep` (called by `down`) anchors every kill pattern on a lab-only path
-or a lab-only upstream port range, so a crashed run cleans up after
-itself without ever matching a production process.
+`sweep` (called by `down`) anchors every kill pattern on **this
+instance's** identity — its `$FLEETLAB_DIR` path, or its own derived
+upstream window — so a crashed run cleans up after itself without ever
+matching a production process *or another lab's*. The upstream half is
+the one that had to change: llama-server children carry no lab path on
+their argv (llama-swap builds it from the rendered config), so their port
+is the only handle, and it used to be a constant every instance shared.
+`internal/fleetlab` is the gate that keeps it honest — two instances,
+real processes, one `down`, and a negative control that puts them on the
+same base and watches the sweep reach across.
 
 ## What it proved, and what it cannot
 
@@ -112,10 +165,11 @@ Two limits to state every time it is used:
 ## The gate scripts
 
 One script per gate, beside `lab.sh`. Each sources `gl.sh` (the scratch
-XDG triple + `state`/`mcp` helpers), drives a running lab, prints raw
-evidence, and cleans up whatever config it changed. Bring the lab up
-first (`FLEETLAB_DIR=/tmp/fleetlab ./lab.sh up`) and pass the same
-`FLEETLAB_DIR`.
+XDG triple, the derived port table, and the `state`/`mcp` helpers),
+drives a running lab, prints raw evidence, and cleans up whatever config
+it changed. Bring the lab up first
+(`FLEETLAB_DIR=/tmp/fleetlab ./lab.sh up`) and pass the same
+`FLEETLAB_DIR` **and** `FLEETLAB_PORT_BASE`.
 
 | script | gate | runtime |
 |---|---|---|
@@ -181,11 +235,19 @@ If a rig re-renders a cell config, use `gl.sh`'s `render_cell` rather than
 open-coding `router render` + the startPort `sed`: the renderer hardcodes
 `startPort: 5800`, which is **production's** upstream range on this box, and
 `render_cell` fails loudly if the rewrite did not apply. `lab.sh` has
-always checked this; the first cut of the C17 rigs did not.
+always checked this; the first cut of the C17 rigs did not. Call it as
+`render_cell alpha` and let it take the cell's derived upstream port —
+the second argument is now optional, and a rig that passes `5990` has
+pinned itself to the default base.
+
+And name no port. `gl.sh` exports the whole derived table: `cell_port`,
+`cell_sport`, `cell_probe`, `$FLEETD_URL`, `$LAB_NOTIFY_PORT`,
+`$LAB_BRAVO_DAEMON_PORT`, `$VIBE_API`. A literal `9641` in a rig is a rig
+that drives whichever lab holds the default block.
 
 ## Requirements
 
-`go`, `jq`, `socat`, `python3`, a llama-swap v239+ binary, a llama-server
-binary, and three small GGUFs (one chat + two embedding) named by
-`CHAT_GGUF` / `BGE_LARGE` / `BGE_M3`. Everything else the script writes
-itself. `firefox` for `marionette.py`.
+`go`, `jq`, `socat`, `python3`, `ps`, `pgrep`, `awk`, a llama-swap v239+
+binary, a llama-server binary, and three small GGUFs (one chat + two
+embedding) named by `CHAT_GGUF` / `BGE_LARGE` / `BGE_M3`. Everything else
+the script writes itself. `firefox` for `marionette.py`.
