@@ -952,14 +952,38 @@ sets it nowhere.
 | # | gate | status |
 |---|---|---|
 | L1 | **the n gate** — how many captures a real 10 MB buffer holds after a day of agentic traffic, and the token-length distribution | **NOT RUN.** Needs a time budget: one day of ordinary use on the reference fleet, then one activity walk. §1a's 125–160 remains arithmetic. `DefaultMaxSample = 40` and `DefaultRateFloor = 20` are set against that arithmetic and should be re-examined once L1 has a real number. |
-| L2 | **the reload-wipe gate** — `has_capture` flips false and the fetch 404s after a `-watch-config` touch | **PARTIALLY DISCHARGED; the remainder NOT RUN.** The mechanism was read out of upstream source (`llama-swap.go:244` → `server.New` → `newMetricsMonitor(…, cfg.CaptureBuffer, st)`), the double reproduces it (`DropAllCaptures`), and the harvest is gated against that reproduction (`TestReplayHarvestsBeforeTheConfigIsWritten`). What has **not** been run is the same sequence against a real `-watch-config` binary, which needs `scripts/fleetlab` with offsettable ports (futures item 15): this phase ran alongside sibling agents in the same checkout and the rig's `down` sweep is anchored on a shared port range. |
+| L2 | **the reload-wipe gate** — `has_capture` flips false and the fetch 404s after a `-watch-config` touch | **PASS (2026-08-08), on real v239 and v247 binaries** — see the transcript below. It needed no lab at all: `scripts/fleetlab` was the wrong tool, because the gate is one llama-swap on a private port, and reaching for the shared rig was what made three earlier phases record it UNRUN. |
 | L3 | **the leak gate on metal** — a full run against a real cell with the operator's own traffic in the buffer, `strace`-ing every file the process touches and grepping the whole terminal transcript | **NOT RUN.** Needs a willingness to run it against real traffic, which is the only way it means anything. U3 is its synthetic twin and covers the same surfaces — stdout, the journal, the marshalled report, the caveats, every refusal path — with a marker instead of a prompt. |
 | L4 | **the magnitude gate** — a real GPU, a real candidate, and a tool-call rate difference a human agrees with | **NOT RUN — needs metal**, the same qualification C18's L5 carries and for the same reason. This phase's whole output is a judgement about a model, and CPU models tool-call differently than GPU ones; nothing in a CPU lab exercises it. |
 
+**L2's transcript**, on a private port with a private config, driving one
+completion through a real llama-swap started with `-watch-config`,
+appending one comment line to its config, and waiting out the 2 s poll:
+
+```
+=== v239, -watch-config ===
+  BEFORE  row id=1  "has_capture":true
+  BEFORE  GET /api/captures/1 -> 200
+  ... touched the config; waiting out the 2s poll
+  AFTER   the same row still in the activity store? 1
+  AFTER   "has_capture":false
+  AFTER   GET /api/captures/1 -> 404
+=== v247 — identical, line for line ===
+```
+
+That is §1b's whole claim, measured: the activity **store** is carried
+across the reload and the capture **buffer** is not, `overlayCaptureState`
+recomputes `has_capture` from the live buffer so the surviving row stops
+advertising a capture rather than advertising one that 404s, and nothing
+about the models changed — a comment appended to the config is a config
+CHANGE as far as `-watch-config` is concerned, which is exactly what
+C18's apply is. The harvest-before-apply ordering is therefore a
+description of the binary's behaviour rather than of upstream's source.
+
 **Not attempted and not possible are different**, and the difference is
-recorded above: L1, L2's remainder and L3 need a time budget or a
-willingness this session did not have; L4 needs hardware. None of the
-four was attempted.
+recorded above: L1 and L3 need a time budget or a willingness this
+session did not have; L4 needs hardware. Neither was attempted. L2 was
+run and passed.
 
 ### §10's open questions, answered where the build had to decide
 
@@ -1018,16 +1042,21 @@ correct.
 
 **§9's README status row** should now read:
 
-> | [C25](c25-bench-replay.md) | `vibe model try --replay`: your own traffic as the benchmark | 1262 non-comment production lines + 2088 test | C8, C18 (composition), C7a (the activity walk) | **BUILT (2026-08-08)**; delivered as a C18 flag rather than a top-level verb; U1–U14 green, 10 predicates mutation-verified, the capture contract measured against real v239 and v247 binaries; L1–L4 NOT RUN (L4 needs metal) |
+> | [C25](c25-bench-replay.md) | `vibe model try --replay`: your own traffic as the benchmark | 1262 non-comment production lines + 2088 test | C8, C18 (composition), C7a (the activity walk) | **BUILT (2026-08-08)**; delivered as a C18 flag rather than a top-level verb; U1–U14 green, 10 predicates mutation-verified, the capture contract measured against real v239 and v247 binaries; L2 PASS on real v239+v247; L1, L3, L4 NOT RUN (L4 needs metal) |
 
 Plus a row in the owed-gates table for **C25 L4**, matching C18 L5's
 wording (*needs metal, not a time budget*), and rows for **C25 L1, L2's
 remainder and L3** as time-budget gates.
 
 **New, for `docs/design/fleet-control-futures.md` item 15**
-(`scripts/fleetlab` port offsets): C25's L2 is now another phase blocked
-on it, after C16's and C18's. Three phases have recorded a live gate as
-UNRUN for the same reason.
+(`scripts/fleetlab` port offsets, shipped as `FLEETLAB_PORT_BASE` in
+C23): C25's L2 did **not** need it, and that is worth recording beside
+the item. The gate is one llama-swap on a private port with a private
+config; reaching for the shared four-cell rig is what made it look like a
+lab gate, and three earlier phases recorded a live gate UNRUN for a
+scheduling reason that the gate itself never had. Before the next phase
+writes `scripts/fleetlab/gate-cNN.sh`, the question worth asking is
+whether the invariant needs a FLEET or one process.
 
 **Unchanged**: the `fleet-control.md` §9 rejection row for live shadow
 routing at the front, verbatim as §9 drafts it. Nothing in the build
