@@ -9,7 +9,11 @@ on a full local inner loop. **Live gate L1 PASS** — the fire drill ran
 against a real four-cell fleetlab: mirror, refusal, `SIGKILL` of a real
 fleetd and a real llama-swap front, restore onto a standby, **10.1 s and
 14.1 s** (two runs) to three cells announcing again with the same token,
-the same declared intent and a byte-identical usage ledger. L2 (the same drill on real
+the same declared intent and a byte-identical usage ledger. **Those
+timings are UNVERIFIED against the committed rig** — the script in
+`scripts/` could not have produced them, and what it was patched to on
+the night is not recorded; see
+[U3](#u3--the-two-cross-unit-fixes-2026-08-08). L2 (the same drill on real
 hardware) is **UNRUN** — it needs the fleet. See
 [Acceptance gates](#acceptance-gates).
 
@@ -246,7 +250,10 @@ restores the documented shape.
 
 ## 6. What is still manual, and how long the real thing takes
 
-The drill's mechanical half is **10 seconds**. The runbook budgets
+The drill's mechanical half is **10 seconds** (measured, but on a
+locally-patched rig — see the qualification under L1 and
+[U3](#u3--the-two-cross-unit-fixes-2026-08-08); the order of magnitude is
+what this section rests on and that is not in doubt). The runbook budgets
 **10–15 minutes** for the real recovery, and the difference is entirely
 human or physical:
 
@@ -322,7 +329,7 @@ Live (a real fleet, or the harness):
 
 | # | gate | result |
 |---|---|---|
-| L1 | the fire drill end to end against a real four-cell fleetlab: mirror → refusal → SIGKILL → restore → standby → timings → survival | **PASS** — see Execution (feature commit; the second review pass could not re-run it, see its addendum) |
+| L1 | the fire drill end to end against a real four-cell fleetlab: mirror → refusal → SIGKILL → restore → standby → timings → survival | **PASS, with its timings UNVERIFIED** — the drill ran and the survival evidence stands, but steps 5–7 cannot execute under the committed script (U3 fix 2), so the recovery numbers came from a locally-patched copy nobody wrote down. See Execution and [U3](#u3--the-two-cross-unit-fixes-2026-08-08) |
 | L2 | the same drill on real hardware: the gpu-cell box as the standby, the pinned image pulled, DNS repointed, cells re-announcing across a LAN | **UNRUN** — needs the fleet (SSH blocked, the LAN does not route from here) |
 | L3 | a real off-host destination (NFS/CIFS mount) over a week of nightly timer runs, with `mirror.age` moving OK → WARN when the timer is stopped | **UNRUN** — wall clock, not hardware |
 | L4 | *(review 2)* the five refusals driven through the real `vibe fleet mirror` binary against a synthetic front-host state dir | **PASS** — see Execution |
@@ -433,6 +440,31 @@ on one box with no network, no image pull, no DNS and no human. It is
 evidence that the state survives and the identity is assumable; it is not
 a prediction of a real recovery, which the runbook puts at 10–15 minutes
 for the reasons in §6. Nothing here crossed a LAN.
+
+**And the timings are UNVERIFIED (added by U3, 2026-08-08).** The script
+committed as `scripts/fleetlab/gate-c19-drill.sh` cannot produce a
+*timed* "5. recovery timings" block: it `rm -rf`s `$DRILL` and then
+re-creates four of the six directories it writes into, so step 4b's two
+log redirections and two pidfile writes fail, the standby is never
+started, and all three of step 5's lines come out `NOT REACHED in 60s`
+(with steps 6 and 7 then interrogating a control plane that is not
+running). That has been true
+since the feature commit. **Whatever produced the 10.1 s and 14.1 s above
+was therefore a locally-patched copy of this script, and what the patch
+was is not recorded** — the L5 transcript below is explicit that ITS
+6.1 s came from a `/tmp` copy with the two directories added, and no such
+note was ever written for L1.
+
+The numbers stay because deleting them would destroy the only record
+there is, and because the *survival* half of this transcript (token
+identical, the same `since` on bravo's intent, the ledger sha unchanged,
+`fleetd.token` reporting *loaded*) does not depend on the timing block at
+all and is unaffected. What is unverified is narrow and specific: the
+seconds. **What would verify them:** re-run
+`FLEETLAB_DIR=… ./gate-c19-drill.sh` against a four-cell fleetlab on the
+fixed script and read the block off a run whose rig is byte-identical to
+the one in the repository. U3 fixed the script and could not re-run it —
+see [U3](#u3--the-two-cross-unit-fixes-2026-08-08) for why.
 
 ### L2, L3 UNRUN
 
@@ -1057,8 +1089,9 @@ is what remains of it in the mixed case).
 **Residuals, all named rather than fixed here. The first is a KNOWN
 FAIL-OPEN and the most important line in this addendum.**
 
-1. **A DNS `IsNotFound` is still judged a definite negative, and the
-   reason it survives is fixture coupling, not conviction.** The first
+1. **CLOSED by U3 (2026-08-08).** *A DNS `IsNotFound` is still judged a
+   definite negative, and the
+   reason it survives is fixture coupling, not conviction.* The first
    draft justified it as "the identity a standby assumes IS that name; if
    it resolves nowhere, no client is reaching the old front by it" —
    which reasons about the wrong host. Resolution happens on the CLIENT.
@@ -1078,8 +1111,12 @@ FAIL-OPEN and the most important line in this addendum.**
    touches the network. Both are in `mirror_test.go`, which this unit
    does not own. **Whoever owns that file next should do it.**
 
-2. **The pre-existing restore tests now depend on the developer's
-   resolver.** Before this change any dial error was `continue` and the
+   *It was both lines, exactly as predicted, plus ten fixture setups —
+   see [U3](#u3--the-two-cross-unit-fixes-2026-08-08).*
+
+2. **CLOSED by U3 (2026-08-08), by the same two lines.** *The
+   pre-existing restore tests now depend on the developer's
+   resolver.* Before this change any dial error was `continue` and the
    address was appended to `probed` BEFORE the dial, so those tests
    passed on any resolver. Now, on a resolver that resolves
    `.example.lan` — ISP NXDOMAIN hijacking, a captive portal, a corporate
@@ -1120,7 +1157,8 @@ FAIL-OPEN and the most important line in this addendum.**
    one-shot CLI; `ScanTakeover` is exported, and a daemon caller would
    accumulate two goroutines and a socket per probe.
 
-5. **`gate-c19-drill.sh` never creates `$DRILL/run` or `$DRILL/logs`**
+5. **CLOSED by U3 (2026-08-08).** *`gate-c19-drill.sh` never creates
+   `$DRILL/run` or `$DRILL/logs`*
    (it `rm -rf`s `$DRILL` and then makes only four dirs), so step 4b's
    two redirections and two pidfile writes fail, and steps 5-7 — the
    standby coming up, and the RECOVERY TIMING the drill exists to
@@ -1130,6 +1168,147 @@ FAIL-OPEN and the most important line in this addendum.**
    `"$DRILL/run/rt" "$DRILL/logs"` added to line 59's `mkdir -p` in the
    /tmp copy. The one-word fix belongs in `scripts/`, which this unit
    does not own.
+
+   *U3 made the `mkdir -p` complete and made a missing directory FATAL
+   rather than a `NOT REACHED`. It also followed this residual back to
+   L1: the same defect means the committed script could never have
+   produced L1's timings either, and that qualification is now on the
+   L1 transcript.*
+
+## U3 — the two cross-unit fixes (2026-08-08)
+
+Off `origin/main` at `937c46a`, as `fix/cross-unit-dns-and-drill`. Both
+were known, both were diagnosed in the U2 addendum above as residuals 1,
+2 and 5, and neither could be fixed from the branch that found it: one
+needed a test file that unit did not own, the other needed `scripts/`.
+Nothing here is a new discovery. What is new is that they are closed.
+
+### Fix 1 — the DNS fail-open in the takeover probe
+
+Two changes in `internal/vibe/fleetmirror`, one production and one
+fixture, and the second is not the smaller of the two:
+
+1. `classifyDialErr` now returns `verdictUnsettled` for a
+   `*net.DNSError` with `IsNotFound`, with a `Why` that says the doubt is
+   about **this box's resolver** and not about the old front. NXDOMAIN
+   therefore lands in `TakeoverScan.Unknown`, and `Restore`'s existing
+   `len(scan.Unknown) > 0` branch turns an all-NXDOMAIN scan into
+   `ErrProbeInconclusive` instead of a clean empty hit list. (Its message
+   said "a probe that timed out", which was the only unsettled state that
+   existed when it was written; it now says "never settled" and names the
+   resolver case beside the firewall one.)
+2. `standby.opts()` in `mirror_test.go` now carries a `Dial` that
+   answers `ECONNREFUSED` for everything, so no restore fixture in this
+   package reaches a resolver or a socket.
+
+The second is not incidental to the first, it is what makes the first
+honest. Before it, every restore fixture in this package got its green
+light from `front.example.lan` and `fleetd.example.lan` failing to
+resolve on the developer's box: the probe's own fail-open, load-bearing
+underneath the suite whose job is to guard it. The same suite would have
+passed identically on a standby whose resolver was broken while the old
+front was up, which is the scenario the whole phase exists for.
+
+**The fixture accounting**, because "roughly a dozen" was the reason this
+was deferred and the split matters:
+
+- **One assertion was pinning the bug**, and said so:
+  `TestClassifyDialErr_OnlyADefiniteNegativeMeansNothingIsThere` listed
+  `"the name does not resolve from here"` in its `definite` map — the map
+  of errors that are ALLOWED to mean "nothing is there" — under a comment
+  reading *"here under protest… when it is closed, this line moves
+  down"*. It has moved down, into `doubt`. That comment is the reason
+  this was a five-minute job rather than an archaeology one, and it is
+  the argument for writing residuals down at the line rather than only in
+  a doc.
+- **Ten fixtures were merely resting on it** and needed setup, not
+  rethinking: `TestRestore_PlacesFilesAndKeepsTheTokenMode`,
+  `_DoesNotOverwriteWithoutBeingAsked`,
+  `_SkipsSlotsWithNoDestinationAndNeverPlacesExtras`,
+  `_DryRunWritesNothing`, `_RefusesContentThatChangedAfterVerification`,
+  `_PreservesTheAppendOnlyLedgerItWouldReplace`,
+  `_ExtendingTheLedgerNeedsNoSidecar`, `_ARecordedAddressIsStillProbed`,
+  `_RefusesToMixTwoFleetsInOneStateDir` and
+  `_WritesNothingWhenAPayloadChangedAfterVerification`. Measured, not
+  estimated: with the production fix in and the test files reverted,
+  those ten fail and nothing else does.
+- **Two fixtures keep the real dialer, by name and with a reason.**
+  `TestRestore_RefusesWhileTheFleetsOwnAddressAnswers` sets `Dial = nil`
+  because its subject is a real socket answering, and
+  `TestRestore_RefusesWhenThereWasNothingToProbe`'s `--probe-addr` leg
+  does the same so one path in the review suite still gets its definite
+  negative off an actual `connect()`. Both dial loopback literals, so no
+  resolver is involved either way.
+
+**The new test** is
+`TestRestore_AResolverThatNXDOMAINsEverythingIsNotADeadFront`: both
+recorded names NXDOMAIN, which is what one broken resolver does — it
+fails for every name at once, which is exactly what made it look like
+unanimous evidence of absence. It asserts `ErrProbeInconclusive`, an
+empty `Probed`, both names in `Unresolved`, no token on disk, and that
+`--force` still gets through.
+
+**Mutation-bound.** Reverting `restore.go` alone: the new test fails with
+`Expected error … but got nil` — the restore PROCEEDED, i.e. two fronts
+under one identity — and the classifier's `doubt/the name does not
+resolve from here` subtest fails with `expected 3, actual 2`. Both
+restored.
+
+### Fix 2 — `gate-c19-drill.sh`, and where L1's headline number came from
+
+`scripts/fleetlab/gate-c19-drill.sh` `rm -rf`s `$DRILL` and then
+re-creates four of the six directories it writes into. Fixed: `$DRILL/run`
+and `$DRILL/logs` are in the `mkdir -p`, a `need_dir` helper makes a
+missing directory FATAL wherever the script is about to write into one,
+and step 4b now checks that the standby front and fleetd are still alive
+a second after launch before the clock starts.
+
+The point of the `need_dir` guard is ground rule 10 in miniature. `NOT
+REACHED in 60s` reads as a measurement — the standby was watched for a
+minute and did not come up. It was not one: nothing had been started, so
+nothing was measured, and "not attempted" was wearing "did not make it"'s
+clothes. Those must not share a line, so a missing directory now stops
+the drill, and the `NOT REACHED` message says in as many words that the
+standby was running.
+
+**Following it back one step is the finding.** The defect has been there
+since the feature commit (`cfb3d40`) with the `rm -rf` already above the
+`mkdir -p`, so no run of the committed script can ever have had those
+directories — they cannot be left lying around by earlier work, because
+the script deletes their parent first. **The committed rig has never been
+able to produce a timed "5. recovery timings" block; all three of its
+lines come out `NOT REACHED`.** So L1's 10.1 s
+and 14.1 s, and §6's "the drill's mechanical half is 10 seconds", came
+from a patched copy of the script whose patch was never recorded. L5's
+6.1 s has the same provenance and, to its credit, says so.
+
+The numbers are qualified in place rather than deleted: they are the only
+record there is, the survival evidence in the same transcripts does not
+depend on them, and an order of magnitude of "seconds, not minutes" is
+what §6 actually leans on. What is unverified is the seconds.
+
+**L7 — the drill on the fixed script: NOT RUN, and it is not
+'not possible'.** It is runnable; it was not run here. `gate-c19-drill.sh`
+requires `./lab.sh up` (it refuses without a lab binary and a fleetd
+answering at `127.0.0.1:9721`) and then drives the shared fleetlab port
+range — front `9640`, cells `9641-9643`, fleetd `9721` — and SIGKILLs
+processes in it. Four other agents were working this box concurrently and
+`lab.sh`'s teardown sweep is not scoped to a single rig, so running it
+would have killed their labs. The gate stays open.
+
+What WAS run, and is therefore all that may be claimed: `bash -n` over
+the script (clean), `internal/shelllint` (clean), the precondition path
+end to end under a bogus `FLEETLAB_DIR` (aborts at the missing lab binary
+before creating or deleting anything), and `need_dir` in isolation
+(present directory passes, absent directory exits 1 and the line after it
+never runs). That is a syntax-and-guard check. It is not the drill.
+
+**To close L7:** `FLEETLAB_DIR=/tmp/fleetlab-c19 ./lab.sh up` then
+`FLEETLAB_DIR=/tmp/fleetlab-c19 ./gate-c19-drill.sh` on a box where the
+9640-9643/9721 range is free, and paste the "5. recovery timings" block
+in beside L1's. If the fix is right the block prints three durations; if
+it is wrong it now aborts with a named directory instead of three
+`NOT REACHED` lines.
 
 ## For the reconciliation pass
 
@@ -1218,6 +1397,28 @@ A new section, "Front failover (fleet-control C19)":
   clearest available illustration of why invariant 3 is worth its cost.
 - The status table: `vibe fleet mirror` beside `vibe fleet doctor`, and
   `mirror.age` / `mirror.contents` in the doctor's check list.
+
+### Added by U3 (2026-08-08)
+
+Two amendments to the three bullets above, both from this unit and
+neither applied here:
+
+- **AGENTS.md**, in the front-failover section's first bullet: the
+  refusal fails closed on *doubt*, not only on an answer. A dial that
+  times out, a name that NXDOMAINs, and any error class nobody
+  enumerated all stop the restore (`ErrProbeInconclusive`); only an
+  answer (`ErrTakeover`) and a definite `ECONNREFUSED` are conclusions.
+  The NXDOMAIN case is worth its own clause, because it is the one that
+  fires on **every recorded name simultaneously** — a standby's resolver
+  is either useful or it is not — and it therefore used to look like
+  unanimous evidence that the old front was gone. `--force` remains the
+  single escape, and it is a claim that a human checked.
+- **`docs/design/fleet-control-plan/README.md`**, C19's row: the status
+  string should read *"L1 PASS (harness fire drill; recovery timings
+  UNVERIFIED — see the C19 doc's U3 section)"* rather than
+  *"L1 PASS (harness fire drill, 10.1 s recovery)"*. The drill ran and
+  the state survived it; the seconds came off a rig that is not the one
+  in the repository.
 
 ### A note for whoever merges C18
 

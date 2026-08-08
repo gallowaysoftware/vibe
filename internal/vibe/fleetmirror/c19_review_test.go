@@ -85,7 +85,7 @@ func TestRestore_PreservesTheAppendOnlyLedgerItWouldReplace(t *testing.T) {
 		write(t, filepath.Join(sb.state, filepath.FromSlash(rel)), "x", 0o600)
 	}
 
-	o := RestoreOptions{Archive: rc.Archive, StateDir: sb.state, Overwrite: true}
+	o := RestoreOptions{Archive: rc.Archive, StateDir: sb.state, Overwrite: true, Dial: refusingDial}
 	rep, err := Restore(o)
 	if err != nil {
 		t.Fatalf("restore: %v", err)
@@ -125,7 +125,7 @@ func TestRestore_ExtendingTheLedgerNeedsNoSidecar(t *testing.T) {
 	}
 	write(t, filepath.Join(sb.state, "fleet", "usage.jsonl"), "{\"day\":", 0o644)
 
-	rep, err := Restore(RestoreOptions{Archive: rc.Archive, StateDir: sb.state, Overwrite: true})
+	rep, err := Restore(RestoreOptions{Archive: rc.Archive, StateDir: sb.state, Overwrite: true, Dial: refusingDial})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,6 +166,12 @@ func TestRestore_RefusesWhenThereWasNothingToProbe(t *testing.T) {
 	// --probe-addr is the escape that is still a probe: name the old
 	// front and the refusal becomes a real answer.
 	withAddr := sb.opts(rc.Archive)
+	// The real dialer, deliberately: deadAddr is a loopback literal, so no
+	// resolver is involved, and this keeps one path in the review suite
+	// where a definite negative comes off an actual socket rather than out
+	// of a fake.
+	withAddr.Dial = nil
+	withAddr.DialTimeout = 2 * time.Second // a real dial gets a real budget
 	withAddr.ProbeAddrs = []string{deadAddr(t)}
 	got, err := Restore(withAddr)
 	if err != nil {

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -496,8 +497,28 @@ func newStandby(t *testing.T) standby {
 	return s
 }
 
+// refusingDial answers every address with ECONNREFUSED — a definite
+// negative — and touches neither the resolver nor the network.
+//
+// It is here because of what used to stand in its place: nothing.
+// newFixture records `front.example.lan:9000` and
+// `fleetd.example.lan:9001`, no restore fixture in this package ever set
+// RestoreOptions.Dial, and until this change a name that did not resolve
+// was classified as "nothing is there". Every green light below was
+// therefore granted by the developer's resolver failing to answer — the
+// takeover probe's own fail-open, load-bearing underneath the suite that
+// exists to guard it, and a suite that would have passed identically on a
+// standby whose resolver was broken while the old front was up.
+//
+// Now the fixtures assert what they say they assert. A test that wants
+// the real network sets Dial back to nil and says why.
+func refusingDial(_, _ string, _ time.Duration) (net.Conn, error) {
+	return nil, &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}
+}
+
 func (s standby) opts(archive string) RestoreOptions {
-	return RestoreOptions{Archive: archive, StateDir: s.state, ConfigDir: s.config, FrontConfig: s.front}
+	return RestoreOptions{Archive: archive, StateDir: s.state, ConfigDir: s.config, FrontConfig: s.front,
+		Dial: refusingDial, DialTimeout: 40 * time.Millisecond}
 }
 
 func TestRestore_PlacesFilesAndKeepsTheTokenMode(t *testing.T) {
@@ -573,7 +594,18 @@ func TestRestore_RefusesWhileTheFleetsOwnAddressAnswers(t *testing.T) {
 	}
 
 	sb := newStandby(t)
-	rep, err := Restore(sb.opts(rc.Archive))
+	live := sb.opts(rc.Archive)
+	// The one fixture in this file that wants the real dialer: the point
+	// of the test is a REAL socket answering on the fleet's own address,
+	// and the addresses above are this test's own loopback listener, so no
+	// resolver is involved either way.
+	live.Dial = nil
+	// ...and a real timeout with it: the fake's 40ms is generous for a
+	// function call and thin for a loopback connect on a loaded CI box,
+	// and this test failing for that reason would say "restore ran while
+	// the address answered" about a dial that never finished.
+	live.DialTimeout = 2 * time.Second
+	rep, err := Restore(live)
 	if !errors.Is(err, ErrTakeover) {
 		t.Fatalf("restore ran while the fleet's address still answered: %v", err)
 	}
@@ -633,7 +665,7 @@ func TestRestore_DoesNotOverwriteWithoutBeingAsked(t *testing.T) {
 	for _, rel := range []string{"token", "fleet/intent.json", "fleet/usage.jsonl"} {
 		write(t, filepath.Join(all.state, filepath.FromSlash(rel)), "ALREADY-HERE", 0o600)
 	}
-	allOpts := RestoreOptions{Archive: rc.Archive, StateDir: all.state}
+	allOpts := RestoreOptions{Archive: rc.Archive, StateDir: all.state, Dial: refusingDial}
 	repAll, err := Restore(allOpts)
 	if err != nil {
 		t.Fatalf("a fully-present state slot is a report, not a refusal: %v", err)
@@ -675,7 +707,7 @@ func TestRestore_SkipsSlotsWithNoDestinationAndNeverPlacesExtras(t *testing.T) {
 		t.Fatal(err)
 	}
 	sb := newStandby(t)
-	only := RestoreOptions{Archive: rc.Archive, StateDir: sb.state}
+	only := RestoreOptions{Archive: rc.Archive, StateDir: sb.state, Dial: refusingDial}
 	rep, err := Restore(only)
 	if err != nil {
 		t.Fatalf("restore: %v", err)
