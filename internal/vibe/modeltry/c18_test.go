@@ -671,7 +671,7 @@ func TestAppliedButNotLiveIsItsOwnAnswer(t *testing.T) {
 	if tr.State != StateApplied {
 		t.Fatalf("state %q: the config is written, so the rollback is owed", tr.State)
 	}
-	if _, err := run.Measure(ctx, tr); err == nil || !strings.Contains(err.Error(), "not in this cell's llama-swap catalog") {
+	if _, err := run.Measure(ctx, tr, nil); err == nil || !strings.Contains(err.Error(), "not in this cell's llama-swap catalog") {
 		t.Fatalf("a measurement against a model nothing serves must be refused, got %v", err)
 	}
 }
@@ -703,7 +703,7 @@ func TestMeasureProbesBothSidesAndSaysWhatItIsNot(t *testing.T) {
 	if _, err := run.Apply(ctx, tr); err != nil {
 		t.Fatal(err)
 	}
-	cmp, err := run.Measure(ctx, tr)
+	cmp, err := run.Measure(ctx, tr, nil)
 	if err != nil {
 		t.Fatalf("measure: %v", err)
 	}
@@ -938,7 +938,7 @@ func TestStepsRefuseOutOfOrder(t *testing.T) {
 	if _, err := run.Apply(ctx, tr); err == nil || !strings.Contains(err.Error(), "cannot apply") {
 		t.Fatalf("applying before staging must be refused, got %v", err)
 	}
-	if _, err := run.Measure(ctx, tr); err == nil || !strings.Contains(err.Error(), "apply it first") {
+	if _, err := run.Measure(ctx, tr, nil); err == nil || !strings.Contains(err.Error(), "apply it first") {
 		t.Fatalf("measuring before applying must be refused, got %v", err)
 	}
 }
@@ -1814,7 +1814,7 @@ func TestMeasureNeverWritesTheCellsSharedProbeState(t *testing.T) {
 	if _, err := run.Apply(ctx, tr); err != nil {
 		t.Fatal(err)
 	}
-	cmp, err := run.Measure(ctx, tr)
+	cmp, err := run.Measure(ctx, tr, nil)
 	if err != nil {
 		t.Fatalf("measure: %v", err)
 	}

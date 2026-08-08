@@ -31,9 +31,21 @@ func caveats(c *Comparison) []string {
 	if c.Trial.Note != "" || c.Incumbent.Note != "" {
 		out = append(out, "at least one side did not produce a rate; see its note. An absent number is not a slow one.")
 	}
-	out = append(out,
-		"nothing here says the answer is right. Throughput is not quality: a faster model that tool-calls worse is a worse model, and no probe in this repo measures that.",
-	)
+	// The quality caveat is C18's own, and C25 is the phase that fills it.
+	// It stops printing when a replay actually measured the thing, because
+	// a caveat that is the same every time is a caveat nobody reads.
+	if c.Replay == nil {
+		out = append(out,
+			"nothing here says the answer is right. Throughput is not quality: a faster model that tool-calls worse is a worse model, and no probe in this repo measures that. `--replay` scores both models against this cell's own recent requests instead (C25).",
+		)
+	} else {
+		out = append(out,
+			"the throughput rows above are ONE sample each. The replay block below is the multi-request one, and it is the half that says anything about tool-calling.",
+		)
+	}
+	if c.ReplayNote != "" {
+		out = append(out, "a replay was asked for and did not produce a score; its reason is printed above. An absent replay is not a passing one.")
+	}
 	return out
 }
 
@@ -89,6 +101,18 @@ func (c *Comparison) Render(w io.Writer) {
 	if c.Incumbent.Note != "" {
 		fmt.Fprintf(w, "  %s: %s\n", c.Incumbent.Model, c.Incumbent.Note)
 	}
+	// The C25 block, when there is one. It goes ABOVE the caveats because
+	// its own caveats are printed with it, and below the throughput table
+	// because the operator asked about speed first.
+	if c.ReplayNote != "" {
+		fmt.Fprintf(w, "\n  replay: %s\n", c.ReplayNote)
+	}
+	if c.Replay != nil {
+		fmt.Fprintln(w)
+		c.Replay.Render(w)
+		fmt.Fprintln(w)
+	}
+
 	fmt.Fprintln(w, "what this number is not:")
 	for _, s := range c.Caveats {
 		fmt.Fprintf(w, "  - %s\n", wrapIndent(s, 74, "    "))

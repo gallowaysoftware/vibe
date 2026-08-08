@@ -57,6 +57,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/gallowaysoftware/vibe/internal/vibe/benchreplay"
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 	"github.com/gallowaysoftware/vibe/internal/vibe/hfdownload"
 	"github.com/gallowaysoftware/vibe/internal/vibe/modelprobe"
@@ -224,6 +225,19 @@ type Comparison struct {
 	// Caveats are the sentences printed WITH the number, C7b's rule: a
 	// screen that can only render triumph will.
 	Caveats []string `json:"caveats,omitempty"`
+	// Replay is C25's structural block: the same two models scored
+	// against n of THIS CELL's own recent requests instead of one canned
+	// prompt. Nil when --replay was not asked for, and nil when the sample
+	// could not be harvested — the two are different, and ReplayNote says
+	// which.
+	//
+	// It is journalled, and journalling it is safe because benchreplay's
+	// Report cannot carry a body: no []byte, no map, no open-set string,
+	// gated by a reflection walk with an explicit field allowlist. The
+	// SAMPLE is a different matter and is persisted nowhere, ever.
+	Replay *benchreplay.Report `json:"replay,omitempty"`
+	// ReplayNote is why there is no replay block, when one was asked for.
+	ReplayNote string `json:"replay_note,omitempty"`
 }
 
 // Options wires a Runner. Every path and URL is injected so the tests
@@ -958,6 +972,43 @@ func (r *Runner) catalog(ctx context.Context) ([]string, error) {
 
 // ── measure ─────────────────────────────────────────────────────────────
 
+// Harvest takes the C25 replay sample off this cell — BEFORE the apply,
+// which is the only time it exists.
+//
+// C18's apply writes the cell's llama-swap config, and a `-watch-config`
+// reload does not mutate a running server: it builds a new one, and the
+// new one allocates a fresh, empty capture buffer. The activity STORE is
+// carried across; the capture buffer is not. So at the moment the
+// candidate first exists, the sample is gone.
+//
+// The ordering is therefore enforced rather than documented, in two
+// places that cannot be satisfied out of order:
+//
+//   - this method refuses once the journal says `applied` or `measured`,
+//     and the journal is what a resumed process reads;
+//   - Measure takes the sample as a PARAMETER, and benchreplay.Harvest is
+//     the only producer of one, so there is no path from inside the
+//     measurement to a sample of a buffer the apply has already emptied.
+//
+// A trial resumed at `applied` — the not-live case, or a process death —
+// therefore measures without a replay and says so. That is the honest
+// outcome: the sample it would have used no longer exists.
+func (r *Runner) Harvest(ctx context.Context, t *Trial, opt benchreplay.Options) (*benchreplay.Set, error) {
+	if opt.LlamaSwapURL == "" {
+		opt.LlamaSwapURL = r.opt.LlamaSwapURL
+	}
+	if opt.ConfigPath == "" {
+		opt.ConfigPath = r.opt.ConfigPath
+	}
+	if opt.HTTP == nil {
+		opt.HTTP = r.opt.HTTP
+	}
+	if opt.Now == nil {
+		opt.Now = r.opt.Now
+	}
+	return benchreplay.Harvest(ctx, opt, t.Incumbent, t.State == StateApplied || t.State == StateMeasured)
+}
+
 // Measure warms and probes both sides and records the comparison.
 //
 // The order is incumbent first, then trial, and it is not arbitrary: on
@@ -965,7 +1016,7 @@ func (r *Runner) catalog(ctx context.Context) ([]string, error) {
 // measured concurrently or in an interleaved way, and whichever goes
 // second was written to disk more recently. That is a caveat, not a
 // control, and it is printed with the number.
-func (r *Runner) Measure(ctx context.Context, t *Trial) (*Comparison, error) {
+func (r *Runner) Measure(ctx context.Context, t *Trial, replay *benchreplay.Set) (*Comparison, error) {
 	if t.State != StateApplied && t.State != StateMeasured {
 		return nil, fmt.Errorf("cannot measure a trial in state %q (apply it first)", t.State)
 	}
@@ -1001,8 +1052,43 @@ func (r *Runner) Measure(ctx context.Context, t *Trial) (*Comparison, error) {
 	}
 
 	cmp := &Comparison{At: r.opt.Now().UTC(), Cell: r.opt.Cell}
-	cmp.Incumbent = r.measureOne(ctx, prober, specs, defs, t.Incumbent)
-	cmp.Trial = r.measureOne(ctx, prober, specs, defs, t.Def)
+	// The two sides, in the one order a single-GPU cell allows, with each
+	// side's C8 probe AND its C25 replay taken while that side is the
+	// resident one. Interleaving them this way is what keeps the sequence
+	// at two cold loads rather than four: warm+probe+replay the incumbent,
+	// then warm+probe+replay the candidate, which evicts it.
+	//
+	// benchreplay never loads a model — C8's cardinal rule holds on its
+	// side of the seam too — so it re-checks /running itself and refuses.
+	if replay.Len() > 0 {
+		rep, rerr := replay.Run(ctx, r.opt.Cell,
+			benchreplay.Side{Model: t.Incumbent, Warm: func(ctx context.Context) error {
+				cmp.Incumbent = r.measureOne(ctx, prober, specs, defs, t.Incumbent)
+				return nil
+			}},
+			benchreplay.Side{Model: t.Def, Warm: func(ctx context.Context) error {
+				cmp.Trial = r.measureOne(ctx, prober, specs, defs, t.Def)
+				return nil
+			}},
+		)
+		if rerr != nil {
+			// A failed replay must not cost the throughput comparison, and
+			// it must not be silent either. printableSnippet for the same
+			// reason every other stored string here gets it: this note is
+			// journalled and re-printed by every later `status`.
+			cmp.ReplayNote = printableSnippet("the replay produced no score: " + rerr.Error())
+		} else {
+			cmp.Replay = rep
+		}
+	}
+	// Whichever side the replay did not prepare is measured here. Both,
+	// when there is no replay; neither, when there is one and it ran.
+	if cmp.Incumbent.Model == "" {
+		cmp.Incumbent = r.measureOne(ctx, prober, specs, defs, t.Incumbent)
+	}
+	if cmp.Trial.Model == "" {
+		cmp.Trial = r.measureOne(ctx, prober, specs, defs, t.Def)
+	}
 	cmp.Trial.WeightsBytes = fileSize(t.WeightsPath)
 	if inc := findDef(defs, t.Incumbent); inc != nil && inc.Backend.LlamaServer != nil {
 		cmp.Incumbent.WeightsBytes = fileSize(inc.Backend.LlamaServer.Path)

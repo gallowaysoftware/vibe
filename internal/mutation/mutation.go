@@ -738,6 +738,136 @@ var Registry = []Mutation{
 			"starter that fails validation sends a first-time operator to debug their own typing for " +
 			"a file they did not write.",
 	},
+
+	// ── class 5: private traffic reaching a place it may not (C25) ────
+	//
+	// C25 replays a cell's own recent requests through a candidate model,
+	// and the bytes it handles are the verbatim prompts and completions of
+	// real requests. The failure mode is not a wrong number; it is a
+	// prompt in a public git repository or on somebody's terminal.
+	{
+		Name:     "c25/the fixture recorder stops refusing the captures endpoint",
+		File:     "internal/swaptest/captures.go",
+		Find:     "\tif !strings.Contains(strings.ToLower(p), CaptureRoutePrefix) {",
+		Replace:  "\tif true || !strings.Contains(strings.ToLower(p), CaptureRoutePrefix) {",
+		Pkg:      "./internal/swaptest/",
+		MustFail: []string{"TestRefuseCaptureEndpoint_RefusesEveryFormOfTheRoute"},
+		Why: "internal/swaptest's recorder reads a REAL llama-swap on the operator's box and commits " +
+			"what it reads to a PUBLIC repository. GET /api/captures/{id} answers the verbatim prompt, " +
+			"system prompt, tool definitions and completion of a real request, and the recorder's two " +
+			"existing redactions cannot help: they work because the sensitive part is a substring of " +
+			"something still worth keeping, and a capture's sensitive part is the whole object. " +
+			"Without this refusal the next fixture commit publishes somebody's prompt.",
+	},
+	{
+		Name:     "c25/the recorder's fetch guard moves off the one fetch path",
+		File:     "internal/swaptest/record_test.go",
+		Find:     "\tif why := RefuseCaptureEndpoint(url); why != \"\" {\n\t\tt.Fatal(why)\n\t}\n\tctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)",
+		Replace:  "\tctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)",
+		Pkg:      "./internal/swaptest/",
+		MustFail: []string{"TestRecorderFetchesOnlyThroughTheCaptureRefusal"},
+		Why: "the refusal exists and is not called. recordGET is the recorder's ONE fetch path, so a " +
+			"guard removed from it is a guard removed from everything — and the AST scan is what " +
+			"notices, because a reviewer reading the endpoint LIST would see nothing wrong.",
+	},
+	{
+		Name:     "c25/the replay sample is harvested after the apply",
+		File:     "internal/vibe/modeltry/modeltry.go",
+		Find:     "\treturn benchreplay.Harvest(ctx, opt, t.Incumbent, t.State == StateApplied || t.State == StateMeasured)",
+		Replace:  "\treturn benchreplay.Harvest(ctx, opt, t.Incumbent, false)",
+		Pkg:      "./internal/vibe/modeltry/",
+		MustFail: []string{"TestHarvestIsRefusedOnceTheTrialIsApplied"},
+		Why: "the apply writes the cell's llama-swap config, and `-watch-config` does not mutate a " +
+			"running server — it builds a new one, with a fresh EMPTY capture buffer. So at the moment " +
+			"the candidate first exists the sample is gone, and a harvest that ran anyway would score " +
+			"a model against no evidence. The ordering constraint and the privacy invariant are the " +
+			"same constraint: the only place a sample can live across an apply is this process's memory.",
+	},
+	{
+		Name:     "c25/an undeclared tool name is echoed instead of marked",
+		File:     "internal/vibe/benchreplay/shape.go",
+		Find:     "\t\ts.toolOutcome = ToolUndeclared\n\t\tif f.toolNames[tc.Function.Name] {\n\t\t\ts.toolOutcome = ToolDeclared\n\t\t}",
+		Replace:  "\t\ts.toolOutcome = tc.Function.Name",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestUndeclaredToolNameIsReportedAndNeverEchoed", "TestClosedSetStringsAreActuallyClosed"},
+		Why: "a tool name a model invented is MODEL OUTPUT, which is to say private traffic, and the " +
+			"per-request table is a thing an operator pastes into a chat window. The closed set " +
+			"none/declared/<undeclared> is what keeps the field from being a channel for it, and it " +
+			"is also what makes Report's string fields checkable at all.",
+	},
+	{
+		Name:     "c25/the divergence claim stops being gated on the noise floor",
+		File:     "internal/vibe/benchreplay/score.go",
+		Find:     "\tif got <= floor {",
+		Replace:  "\tif false {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestNoiseFloorSuppressesTheDivergenceClaim"},
+		Why: "a captured request carries the CLIENT's own temperature, so replaying it through the " +
+			"very model that produced the recorded response yields different text: the divergence " +
+			"floor is not zero and is not knowable in advance. Reporting a candidate's raw " +
+			"disagreement rate as divergence therefore reports the sampler, and it does it in the " +
+			"direction that makes every candidate look worse than the incumbent.",
+	},
+	{
+		Name:     "c25/a proportion is printed below the rate floor",
+		File:     "internal/vibe/benchreplay/score.go",
+		Find:     "\tif sc.Requests >= floor {",
+		Replace:  "\tif true {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestBelowTheFloorThereIsATableAndNoRate"},
+		Why: "n is whatever survived a 10 MB FIFO buffer, not something the operator chose, and a " +
+			"tool-call rate on three requests is noise wearing a percent sign. The rates are " +
+			"observed.Values so that under the floor they read `unknown` rather than a number — the " +
+			"absent-evidence-as-a-healthy-value class, in the one screen this phase exists to print.",
+	},
+	{
+		Name:     "c25/the paired ratio becomes a ratio of means",
+		File:     "internal/vibe/benchreplay/score.go",
+		Find:     "\tp.MedianRatio = observed.Known(median(ratios))",
+		Replace:  "\tsum := 0.0\n\tfor _, r := range ratios {\n\t\tsum += r\n\t}\n\tp.MedianRatio = observed.Known(sum / float64(len(ratios)))",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestPairedRatioIsAMedianOfRatiosNotARatioOfMeans"},
+		Why: "the sample is the cell's own traffic, so it contains one 100k-token agentic request " +
+			"beside thirty small ones. A mean lets that single request decide the answer; the median " +
+			"of per-request ratios is the figure both sides having seen the IDENTICAL sample actually " +
+			"licenses.",
+	},
+	{
+		Name:     "c25/an unreducible recorded response counts as agreement",
+		File:     "internal/vibe/benchreplay/score.go",
+		Find:     "\t\tif !rec.known || !inc.shapes[i].known || !cand.shapes[i].known {",
+		Replace:  "\t\tif false {",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestDivergenceIsNotMeasuredWhenTheRecordedResponseCannotBeReduced"},
+		Why: "llama-swap stores the request but NEVER the response body for a non-200, and a request " +
+			"that made the model choke is the most interesting one to replay and the one with nothing " +
+			"to diverge from. A zero-valued shape scores as `answered nothing, called no tool, " +
+			"finished with none` — three claims nobody measured, folded into a divergence figure.",
+	},
+	{
+		Name:     "c25/a replay loads a model that is not resident",
+		File:     "internal/vibe/benchreplay/replay.go",
+		Find:     "\tif !resident {\n\t\treturn replayResult{}, fmt.Errorf(\"%s is %w\", side.Model, ErrNotResident)\n\t}",
+		Replace:  "\t_ = resident",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestEveryRefusalFiresByNameAndWritesNothing"},
+		Why: "C8's cardinal rule, on the other side of the seam. llama-swap's contract is " +
+			"JIT-on-request, so replaying n requests at a model that is not resident STARTS it — and " +
+			"on a one-model cell that evicts the model serving the user. The measurement would have " +
+			"become an actuator, and the thing it actuated is eviction.",
+	},
+	{
+		Name:     "c25/the replay edits the client's own sampling",
+		File:     "internal/vibe/benchreplay/replay.go",
+		Find:     "\tobj[\"stream\"] = json.RawMessage(\"false\")",
+		Replace:  "\tobj[\"stream\"] = json.RawMessage(\"false\")\n\tobj[\"seed\"] = json.RawMessage(\"42\")\n\tobj[\"temperature\"] = json.RawMessage(\"0\")",
+		Pkg:      "./internal/vibe/benchreplay/",
+		MustFail: []string{"TestReplayRewritesOnlyTheModelAndTheStreamFlag"},
+		Why: "the obvious fix to a noisy divergence metric, and the wrong one. Real agentic clients " +
+			"send temperature above zero and no seed; injecting either makes the replay deterministic " +
+			"by falsifying the request — and a sample you had to falsify is no longer YOUR workload, " +
+			"which was this phase's entire point. Same objection C7a raised to injecting stream_options.",
+	},
 }
 
 // ── tree copying and patching ────────────────────────────────────────
