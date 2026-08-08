@@ -72,6 +72,30 @@ func SpecsFromDefs(defs []*profile.BackendDef, llamaBinary string) map[string]Sp
 		}
 		out[def.Name] = spec
 	}
+	// A cloud peer is the one kind whose def name is NOT the id the catalog
+	// serves: the router renders peers[<def>] = {models: [...]}, so clients —
+	// and this map's callers, which look up by CATALOG id — see the entries
+	// of cloud_peer.models. Keyed only by def name, the Disabled flag above
+	// is inert: the lookup misses, falls through to the chat default, and the
+	// only thing left between a probe verb and a paid /v1/chat/completions is
+	// the residency check happening not to list peers. Same expansion as
+	// daemon.cloudPeerModelIDs.
+	//
+	// Second pass, and it does not overwrite: an id already claimed here came
+	// from a def naming a local process, and disabling that probe because a
+	// peer happens to serve the same id would silently stop measuring the
+	// model this cell actually runs.
+	for _, def := range defs {
+		if def == nil || def.Backend.CloudPeer == nil {
+			continue
+		}
+		for _, id := range def.Backend.CloudPeer.Models {
+			if _, taken := out[id]; taken {
+				continue
+			}
+			out[id] = Spec{Model: id, Kind: KindChat, Disabled: true}
+		}
+	}
 	return out
 }
 
