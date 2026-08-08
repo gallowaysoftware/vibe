@@ -1,10 +1,12 @@
 # C24 — drain where reclaim happens
 
-Status: **PR OPEN**, off `c24-drain-where-reclaim-happens` branched from
-`main` at `cb8b336`. Two commits: the packaging + the rules it needs to
-be safe, and ground rule 9's adversarial self-review (§8b — five
+Status: **PR OPEN** (#58), off `c24-drain-where-reclaim-happens` branched
+from `main` at `cb8b336`. Four commits: the packaging + the rules it
+needs to be safe, ground rule 9's adversarial self-review (§8b — five
 findings, all fixed, two of them the phase's own headline defect reached
-by routes the feature commit had not looked at). Backlog item 5
+by routes the feature commit had not looked at), a doc correction, and
+the two mutation-registry entries that keep the load-bearing pair honest
+after this phase is history. Backlog item 5
 ([fleet-control-futures.md](../fleet-control-futures.md) §2):
 
 > **Drain where reclaim happens** — a documented Steam launch-option /
