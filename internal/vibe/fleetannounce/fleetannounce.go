@@ -604,11 +604,26 @@ func (c *Client) gatherModels(ctx context.Context) ([]fleetapi.AnnounceModel, er
 		m.Probe = probes[def.Name]
 		out = append(out, m)
 	}
+	// A cloud peer's catalog ids are its cloud_peer.models entries, never its
+	// def name, so they can never appear in covered above — they would every
+	// one of them be reported as drift with no backend def, which is false
+	// and sends an operator looking for a YAML that is already there. They
+	// still announce hashless below (correct: there is no argv to fingerprint
+	// for a model this cell does not run); only the diagnostic changes.
+	peerServed := map[string]bool{}
+	for _, def := range c.cfg.Defs {
+		if def.Backend.CloudPeer == nil {
+			continue
+		}
+		for _, id := range def.Backend.CloudPeer.Models {
+			peerServed[id] = true
+		}
+	}
 	for id := range catalog {
 		if covered[id] {
 			continue
 		}
-		if !c.deflessWarned[id] {
+		if !c.deflessWarned[id] && !peerServed[id] {
 			c.logger.Warn("catalog model has no backend def — announcing unverifiable (no flags fingerprint)", "model", id)
 			c.deflessWarned[id] = true
 		}

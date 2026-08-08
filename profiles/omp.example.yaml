@@ -9,42 +9,62 @@
 # rendered config is complete.
 #
 # Requires in ~/.config/vibe/config.yaml:
-#   search_url: http://<vibe-search-host>:14003    # backs ${VIBE_SEARCH}
+#   client_api_url: http://<router-host>:9000     # backs ${VIBE_API}
+#   search_url: http://<vibe-search-host>:14003   # backs ${VIBE_SEARCH}
 # A profile referencing ${VIBE_SEARCH} without that set refuses to activate
 # and says so, rather than rendering an empty endpoint into the config.
 
 name: omp
 description: oh-my-pi against the fleet router, with central search + fetch
 
-# The model lives on the fleet router, so there is nothing local to launch:
-# external means vibe verifies the router serves this id and then gets out
-# of the way. Swap to a llama_server/mlx_server backend_ref for the
-# disconnected case — everything below is unchanged, because ${MODEL_ALIAS}
-# and ${VIBE_API} come from whichever backend is active.
+# A cloud model the router already serves. cloud_peer implies external: there
+# is never a process to launch, so vibe verifies the router's catalog serves
+# these ids and then gets out of the way. Swap to a llama_server/mlx_server
+# backend_ref for the disconnected case — everything below is unchanged,
+# because ${MODEL_ALIAS}, ${MODEL_CONTEXT}, and ${VIBE_API} come from
+# whichever backend is active.
+#
+# Readiness probes client_api_url when it is set, so a model only the fleet
+# front serves passes on a box whose own cell has never heard of it.
 backend:
-  external: true
-  llama_server:
-    # REPLACE: the GGUF path is only consulted when vibe runs the model
-    # itself. With external: true it is metadata.
-    path: ~/models/REPLACE-ME.gguf
-    alias: kimi-k3
+  cloud_peer:
+    base_url: https://api.moonshot.ai
+    # The key lives in the ROUTER's environment, never here. Rendered into
+    # the llama-swap peer stanza as apiKey: ${env.MOONSHOT_API_KEY} by
+    # `vibe router render` on the router host.
+    api_key_env: MOONSHOT_API_KEY
+    # Exactly one id, so ${MODEL_ALIAS} is unambiguous. List several and
+    # ${MODEL_ALIAS} is left unset — a template referencing it then fails by
+    # name instead of vibe picking a model for you; name the model literally
+    # in that case.
+    models:
+      - kimi-k3
+    formats: [openai]
+    # Metadata for ${MODEL_CONTEXT}: the provider owns the real limit, vibe
+    # cannot ask it. Omit and ${MODEL_CONTEXT} goes unset rather than
+    # rendering 0.
     context: 1048576
 
 frontend:
   kind: external
-  app: omp
   # omp reads its config once at startup.
   restart_required: true
 
   env:
-    # Isolated auth, sessions, settings, and caches for this profile. Use
-    # omp's own mechanism rather than inventing a parallel state dir; pair
-    # with `omp --profile omp --alias omp-fleet` for a shell shortcut.
-    OMP_PROFILE: omp
+    # Isolated auth, sessions, settings, and caches: everything omp keeps
+    # (agent.db included) lands under this dir, so this profile shares no
+    # state with a bare `omp`.
+    #
     # PI_CONFIG_DIR is joined onto $HOME unconditionally — an absolute path
     # comes back mangled and a literal ~ is not expanded. Keep it
     # home-relative and keep it in sync with write_files below by hand.
-    # (PI_CODING_AGENT_DIR would override this entirely; don't set both.)
+    #
+    # Set this ALONE. OMP_PROFILE/PI_PROFILE nests a second level inside it
+    # (`omp config path` then reports <PI_CONFIG_DIR>/profiles/<name>/agent),
+    # so setting both points omp at a directory vibe never wrote — it starts
+    # clean and silently falls back to whichever cloud provider has
+    # credentials in the environment. PI_CODING_AGENT_DIR overrides this
+    # entirely; don't set that either.
     PI_CONFIG_DIR: .omp-vibe/omp
 
   # Two files because omp splits providers from settings. The first entry
@@ -63,7 +83,10 @@ frontend:
               - id: ${MODEL_ALIAS}
                 name: ${MODEL_ALIAS}
                 reasoning: true
-                input: [text]
+                # Declaring image input is also what lets omp's default
+                # snapcompact strategy work — it archives history as dense
+                # images and needs a vision-capable model to read them back.
+                input: [text, image]
                 contextWindow: ${MODEL_CONTEXT}
                 maxTokens: 131072
                 # REPLACE per model. These flags are what make tool calls
@@ -84,10 +107,12 @@ frontend:
           default: fleet/${MODEL_ALIAS}
         providers:
           # Pin the search provider: the default "auto" chain would
-          # otherwise fall through to a free scraper and quietly stop using
-          # the paid plane.
-          webSearchOrder:
-            - searxng
+          # otherwise fall through to a paid provider and quietly stop using
+          # the fleet's plane. Singular `webSearch` — omp has no
+          # `webSearchOrder` key, and an unknown key here is ignored rather
+          # than rejected, which looks configured while leaving search on
+          # "auto".
+          webSearch: searxng
         searxng:
           # Not actually SearXNG — vibe-search speaks that wire contract
           # because it is the one search endpoint harnesses let you
@@ -98,6 +123,12 @@ frontend:
           # never secrets. Set it once per machine with
           #   omp config set searxng.token <token>
           # or export SEARXNG_TOKEN.
+        startup:
+          # config.yml is regenerated on every launch, so anything meant to
+          # stick belongs here — `omp config set` survives only until the
+          # next `vibe start`/`vibe run` overwrites it.
+          setupWizard: false
+          quiet: true
 
 # NOTE — page fetch is not configured here. omp resolves MCP servers from
 # ~/.claude.json (shared with Claude Code) or a project-level .mcp.json, not
@@ -111,7 +142,10 @@ frontend:
 #   }
 #
 # Search goes through omp's NATIVE path above (not MCP), which is why the
-# two halves are configured in different places.
+# two halves are configured in different places. A harness whose search is
+# NOT redirectable (opencode hardwires Exa/Parallel) has to take search over
+# MCP too — run vibe-search with --mcp-expose-search and it serves both
+# tools there.
 
 # No local model, no VRAM: the router owns the weights.
 estimated_vram_gb: 0

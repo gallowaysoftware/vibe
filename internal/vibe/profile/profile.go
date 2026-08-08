@@ -149,6 +149,12 @@ type CloudPeerBackend struct {
 	// Formats documents which API surfaces the peer speaks ("openai",
 	// "anthropic"). Informational for now: routing is by model id.
 	Formats []string `yaml:"formats,omitempty"`
+	// Context is the peer's context window, advertised to a frontend as
+	// ${MODEL_CONTEXT}. Metadata only — the provider owns the real limit and
+	// vibe has no way to ask it. Optional because a peer is useful without a
+	// frontend; when unset ${MODEL_CONTEXT} is left unexpanded rather than
+	// rendering 0, which a harness would read as "no room" or ignore.
+	Context int `yaml:"context,omitempty"`
 }
 
 // LlamaServerBackend supervises a llama-server child process exposing an
@@ -924,7 +930,19 @@ func validateHTTPServer(h *HTTPServerBackend) error {
 	return nil
 }
 
-func validateLlamaServer(m *LlamaServerBackend) error {
+// validateLlamaServer checks a llama_server block. external says the router
+// owns the process, which decides whether the on-disk artifacts have to be
+// here: vibe launches nothing for an external backend, so a client box gets
+// to reference a def whose weights live on the router host. The renderer
+// already assumes a path may not exist yet (that is the whole huggingface
+// case), so this loosens where the file is, not whether it is checked.
+func validateLlamaServer(m *LlamaServerBackend, external bool) error {
+	// offBox: the artifacts belong to whichever host runs the process, not to
+	// this one. Two independent reasons say so — cell: names another box
+	// (fleet.md §4.2's host: rule) and external: hands the lifecycle to the
+	// router — and they gate exactly the same checks, so they answer as one
+	// question. Everything that holds wherever the process runs still runs.
+	offBox := external || m.cellScoped
 	if m.Path == "" {
 		return errors.New("backend.llama_server.path is required")
 	}
@@ -936,11 +954,10 @@ func validateLlamaServer(m *LlamaServerBackend) error {
 			return errors.New("backend.llama_server.huggingface.file is required when huggingface is set")
 		}
 		// path doesn't need to exist; `vibe pull` will create it.
-	} else if m.cellScoped {
-		// cell: set ⇒ the path exists on the cell, not necessarily here;
-		// fleet.md §4.2's host: rule applied to cell:.
-	} else if _, err := os.Stat(m.Path); err != nil {
-		return fmt.Errorf("backend.llama_server.path %s: %w", m.Path, err)
+	} else if !offBox {
+		if _, err := os.Stat(m.Path); err != nil {
+			return fmt.Errorf("backend.llama_server.path %s: %w", m.Path, err)
+		}
 	}
 	if m.Alias == "" {
 		return errors.New("backend.llama_server.alias is required (must match /v1/models id)")
@@ -948,7 +965,7 @@ func validateLlamaServer(m *LlamaServerBackend) error {
 	if m.Context <= 0 {
 		return errors.New("backend.llama_server.context must be > 0")
 	}
-	if m.Binary != "" && !m.cellScoped {
+	if m.Binary != "" && !offBox {
 		if err := validateExecutable("backend.llama_server.binary", m.Binary); err != nil {
 			return err
 		}
@@ -956,12 +973,16 @@ func validateLlamaServer(m *LlamaServerBackend) error {
 	if m.ChatTemplateFile != "" {
 		// Catch the ordering constraint here rather than letting llama-server
 		// exit at start: it only accepts a template file once --jinja has been
-		// parsed, and vibe emits --jinja from this same struct.
+		// parsed, and vibe emits --jinja from this same struct. The ordering
+		// rule holds wherever the process runs; only the file's presence is
+		// the router host's business.
 		if !m.Jinja {
 			return errors.New("backend.llama_server.chat_template_file requires jinja: true (llama-server rejects a template file unless --jinja precedes it)")
 		}
-		if _, err := os.Stat(m.ChatTemplateFile); err != nil && !m.cellScoped {
-			return fmt.Errorf("backend.llama_server.chat_template_file %s: %w", m.ChatTemplateFile, err)
+		if !offBox {
+			if _, err := os.Stat(m.ChatTemplateFile); err != nil {
+				return fmt.Errorf("backend.llama_server.chat_template_file %s: %w", m.ChatTemplateFile, err)
+			}
 		}
 	}
 	if m.Huggingface != nil && m.Huggingface.MMProjFile != "" && m.MMProj == "" {
@@ -971,8 +992,8 @@ func validateLlamaServer(m *LlamaServerBackend) error {
 		// If no HF spec covers the mmproj, the file must already exist.
 		// Mirrors the Path/Huggingface relationship above.
 		hasHFPull := m.Huggingface != nil && m.Huggingface.MMProjFile != ""
-		if !hasHFPull {
-			if _, err := os.Stat(m.MMProj); err != nil && !m.cellScoped {
+		if !hasHFPull && !offBox {
+			if _, err := os.Stat(m.MMProj); err != nil {
 				return fmt.Errorf("backend.llama_server.mmproj %s: %w", m.MMProj, err)
 			}
 		}
@@ -985,8 +1006,8 @@ func validateLlamaServer(m *LlamaServerBackend) error {
 	}
 	if m.DraftModel != "" {
 		hasHFPull := m.Huggingface != nil && m.Huggingface.DraftFile != ""
-		if !hasHFPull {
-			if _, err := os.Stat(m.DraftModel); err != nil && !m.cellScoped {
+		if !hasHFPull && !offBox {
+			if _, err := os.Stat(m.DraftModel); err != nil {
 				return fmt.Errorf("backend.llama_server.draft_model %s: %w", m.DraftModel, err)
 			}
 		}
@@ -1039,6 +1060,9 @@ func validateCloudPeer(c *CloudPeerBackend) error {
 	if c.APIKeyEnv != "" && !envVarNameRE.MatchString(c.APIKeyEnv) {
 		return fmt.Errorf("backend.cloud_peer.api_key_env %q is not a valid environment variable name", c.APIKeyEnv)
 	}
+	if c.Context < 0 {
+		return errors.New("backend.cloud_peer.context must be > 0 when set")
+	}
 	for _, f := range c.Formats {
 		switch f {
 		case "openai", "anthropic":
@@ -1090,17 +1114,15 @@ func (p *Profile) validateFrontend() error {
 		return nil
 	}
 
-	// cloud_peer backends have no single model alias for ${MODEL_ALIAS} to
-	// expand from and no vibe-side activation to hang a frontend on — the
-	// router proxies clients straight to the cloud API. Point a frontend at
-	// a specific peer model via its own config instead.
-	if p.Backend.CloudPeer != nil {
-		if !p.Frontend.IsZero() {
-			return errors.New("frontend is not supported for cloud_peer backends (clients reach peer models through the router by model id)")
-		}
-		return nil
-	}
-
+	// cloud_peer joins the same group: a frontend is optional, not forbidden.
+	// Pointing a harness at a cloud model the router already serves is the
+	// whole reason a peer exists — refusing it left the one thing a profile is
+	// for to be hand-configured on every machine. ${MODEL_ALIAS} resolves from
+	// a single-model peer; a multi-model peer leaves it unset so a template
+	// referencing it fails by name rather than picking a model on the user's
+	// behalf. Nothing is launched either way — the router proxies straight to
+	// the cloud API.
+	//
 	// tabby_api backends are pipeline-driven by default — vamp text stages
 	// reach the OpenAI-compatible /v1 surface through the proxy without
 	// needing a UI. If a user wants OpenWebUI on top, they can add an
@@ -1113,7 +1135,7 @@ func (p *Profile) validateFrontend() error {
 	// spawns, or a vamp text stage over the proxy) and with a frontend
 	// attached (pi/omp on the laptop). Demanding a frontend would make the
 	// disconnected-laptop and fleet-node uses two different definitions.
-	if p.Backend.TabbyAPI != nil || p.Backend.MLXServer != nil {
+	if p.Backend.TabbyAPI != nil || p.Backend.MLXServer != nil || p.Backend.CloudPeer != nil {
 		if p.Frontend.IsZero() {
 			return nil
 		}

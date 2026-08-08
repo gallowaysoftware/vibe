@@ -293,7 +293,7 @@ func (b Backend) validate() error {
 	}
 	switch {
 	case b.LlamaServer != nil:
-		return validateLlamaServer(b.LlamaServer)
+		return validateLlamaServer(b.LlamaServer, b.External)
 	case b.ComfyUI != nil:
 		return validateComfyUI(b.ComfyUI)
 	case b.HTTPServer != nil:

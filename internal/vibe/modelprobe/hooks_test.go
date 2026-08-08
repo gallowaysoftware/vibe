@@ -64,6 +64,49 @@ func TestSpecsFromDefs_CloudPeersAreNeverProbed(t *testing.T) {
 	}
 }
 
+// The test above passes for the wrong reason: its def is NAMED after the one
+// model it serves, the single case where a peer's def name and its catalog id
+// coincide. Callers look this map up by CATALOG id, and the router renders
+// peers[<def>] = {models: [...]} — so a normally-named peer ("anthropic"
+// serving "claude-sonnet-5") missed the map entirely, fell through to the
+// probeable chat default, and left a paid /v1/chat/completions one residency
+// check away.
+func TestSpecsFromDefs_CloudPeerIsKeyedByCatalogIDNotDefName(t *testing.T) {
+	def := &profile.BackendDef{
+		Name: "anthropic",
+		Backend: profile.Backend{External: true, CloudPeer: &profile.CloudPeerBackend{
+			BaseURL: "https://api.example.test",
+			Models:  []string{"claude-opus-5", "claude-sonnet-5"},
+		}},
+	}
+	specs := SpecsFromDefs([]*profile.BackendDef{def}, "/usr/bin/llama-server")
+	for _, id := range []string{"claude-opus-5", "claude-sonnet-5"} {
+		s, ok := specs[id]
+		if !ok {
+			t.Fatalf("catalog id %q has no spec — the lookup misses and the probe runs at the provider's expense", id)
+		}
+		if !s.Disabled {
+			t.Errorf("catalog id %q is probeable; every probe of it is a paid request", id)
+		}
+	}
+}
+
+// A peer must not silently switch off a probe for a model this cell actually
+// runs. If a local def already claims the id, that def's spec is the one
+// about a real local process and it stays.
+func TestSpecsFromDefs_CloudPeerDoesNotDisableALocalModelOfTheSameID(t *testing.T) {
+	peer := &profile.BackendDef{
+		Name: "peer",
+		Backend: profile.Backend{External: true, CloudPeer: &profile.CloudPeerBackend{
+			BaseURL: "https://api.example.test", Models: []string{"qwen3.6-27b"},
+		}},
+	}
+	specs := SpecsFromDefs([]*profile.BackendDef{llamaDef("qwen3.6-27b"), peer}, "/usr/bin/llama-server")
+	if specs["qwen3.6-27b"].Disabled {
+		t.Fatal("a locally-served model stopped being measured because a peer advertises the same id")
+	}
+}
+
 // TestSpecsFromDefs_BindsTheBaselineToTheRenderedFlags: the fingerprint
 // is what makes "the def changed" distinguishable from "the model got
 // slower".

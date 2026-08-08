@@ -1,9 +1,11 @@
 package fleetannounce
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -698,5 +700,65 @@ func TestAnnounce_UsageBlockRidesTheHeartbeatAndIsOptional(t *testing.T) {
 	}
 	if !sawCtx {
 		t.Error("Usage hook was called without the announce context")
+	}
+}
+
+// A cloud peer's catalog ids are its cloud_peer.models entries, never its def
+// name, so they can never land in `covered` — and every announce reported all
+// of them as drift with no backend def. The def is right there; the message
+// sends an operator hunting a YAML that already exists. Announcing them
+// hashless is correct (there is no argv to fingerprint for a model this cell
+// does not run) — only the diagnostic was wrong.
+func TestGatherModelsCloudPeerIDsAreNotReportedAsDefless(t *testing.T) {
+	reg := newFakeRegistry(t)
+	swap := newFakeLlamaSwap(t, `{"running":[{"model":"qwen","state":"ready"}]}`)
+	// The catalog carries the peer's model ids plus one genuine stray.
+	swap.catalog = `{"object":"list","data":[{"id":"qwen"},{"id":"claude-sonnet-5"},{"id":"claude-opus-5"},{"id":"a-real-stray"}]}`
+
+	peer := &profile.BackendDef{
+		Name: "anthropic",
+		Backend: profile.Backend{External: true, CloudPeer: &profile.CloudPeerBackend{
+			BaseURL: "https://api.example.test",
+			Models:  []string{"claude-sonnet-5", "claude-opus-5"},
+		}},
+	}
+	var logs bytes.Buffer
+	cfg := testConfig(reg, swap, testDef("qwen", ""), peer)
+	cfg.Logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	c, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.announceOnce(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	got := logs.String()
+	for _, id := range []string{"claude-sonnet-5", "claude-opus-5"} {
+		if strings.Contains(got, id) {
+			t.Errorf("peer model %q was reported as having no backend def:\n%s", id, got)
+		}
+	}
+	// The warning must still fire for something that genuinely has no def, or
+	// this fix would have silenced real drift.
+	if !strings.Contains(got, "a-real-stray") {
+		t.Errorf("a genuinely defless catalog id stopped being reported:\n%s", got)
+	}
+
+	// ...and the peer models are still announced, hashless.
+	last := reg.calls()[len(reg.calls())-1]
+	byID := map[string]fleetapi.AnnounceModel{}
+	for _, m := range last.Models {
+		byID[m.ID] = m
+	}
+	for _, id := range []string{"claude-sonnet-5", "claude-opus-5"} {
+		m, ok := byID[id]
+		if !ok {
+			t.Errorf("peer model %q stopped being announced", id)
+			continue
+		}
+		if m.FlagsSHA256 != "" {
+			t.Errorf("peer model %q announced a flags fingerprint; there is no argv to hash", id)
+		}
 	}
 }
