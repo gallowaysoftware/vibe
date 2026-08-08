@@ -260,6 +260,7 @@ record, which is the intended shape.
 - `internal/vibe/fleetapi/notify.go`, `doctor.go` — rule 4.
 - `internal/vibe/cli/root.go` — the wrapper's exit status.
 - `internal/vibe/fleetapi/c24_test.go`, `internal/vibe/cli/c24_test.go`.
+- `internal/mutation/mutation.go` — the two registry entries.
 
 ## Acceptance gates
 
@@ -288,14 +289,15 @@ record, which is the intended shape.
 
 Mutation-checked rather than assumed:
 
-- `IsStopRecord` → `return false`: **all 7** fleetapi C24 tests fail.
+- `IsStopRecord` → `return false`: **all 9** fleetapi C24 tests fail
+  (9 run, 9 red).
 - `exec` removed from the wrapper: the signal gate fails on the pid
   comparison, naming the consequence.
 - a `systemctl daemon-reload` added to the hook: the tripwire gate fails,
   naming the command.
 
 The two that would not survive a rewrite of this phase's own code are in
-C20's permanent registry (`internal/mutation`, +2 → 19 entries), so they
+C20's permanent registry (`internal/mutation`, +2 → 22 entries), so they
 run on every PR rather than once here:
 
 - `c24/a recorded stop is handed back to the cell as a command` —
