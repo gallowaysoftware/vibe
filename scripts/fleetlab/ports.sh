@@ -60,6 +60,16 @@ lab_ports_overlap() { # lo1 hi1 lo2 hi2 -> 0 if the ranges intersect
 }
 
 lab_ports_check() {
+  # `down`'s upstream sweep reads ps and filters with awk. Missing either
+  # one does not fail — it reaps NOTHING, quietly, and leaves a previous
+  # crash's llama-servers holding this instance's ports while every log
+  # line says the lab came down cleanly. Refuse instead.
+  local t
+  for t in ps awk pgrep; do
+    command -v "$t" >/dev/null 2>&1 ||
+      lab_ports_die "$t is required — \`down\`'s sweep cannot identify this instance's processes without it"
+  done
+
   [[ $LAB_PORT_BASE =~ ^[0-9]+$ ]] ||
     lab_ports_die "FLEETLAB_PORT_BASE must be a whole number (got '$LAB_PORT_BASE')"
   (( LAB_PORT_BASE % LAB_PORT_SPAN == 0 )) ||

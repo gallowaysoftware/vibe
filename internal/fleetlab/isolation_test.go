@@ -474,6 +474,36 @@ func TestGuardRefusesADangerousBase(t *testing.T) {
 	}
 }
 
+// TestGuardRefusesAMissingSweepTool. `down`'s upstream half reads `ps`
+// and filters with `awk`. Missing either does not fail — it reaps
+// NOTHING, quietly, while every line of output says the lab came down
+// cleanly. That is the same shape of silence this whole phase is about,
+// so it is refused rather than degraded.
+func TestGuardRefusesAMissingSweepTool(t *testing.T) {
+	requireTools(t)
+	bash, err := exec.LookPath("bash")
+	require.NoError(t, err)
+
+	// A PATH holding everything lab.sh needs to reach the guard, minus
+	// `ps`. Symlinks rather than a copied directory so the farm stays
+	// obviously exhaustive.
+	farm := filepath.Join(t.TempDir(), "bin")
+	require.NoError(t, os.MkdirAll(farm, 0o755))
+	for _, tool := range []string{"dirname", "basename", "sed", "cat", "grep", "awk", "pgrep", "env"} {
+		src, err := exec.LookPath(tool)
+		if err != nil {
+			t.Skipf("%s not on PATH", tool)
+		}
+		require.NoError(t, os.Symlink(src, filepath.Join(farm, tool)))
+	}
+
+	cmd := exec.Command(bash, filepath.Join("..", "..", "scripts", "fleetlab", "lab.sh"), "ports")
+	cmd.Env = []string{"PATH=" + farm, "HOME=" + t.TempDir()}
+	out, err := cmd.CombinedOutput()
+	require.Error(t, err, "a lab that cannot run `ps` must refuse: %s", out)
+	require.Contains(t, string(out), "ps is required")
+}
+
 // TestGuardRefusesBeforeAnythingIsSwept — the guard is not advice. `down`
 // on a refused base must not reach the sweep at all, or a mistyped base
 // would still kill whatever the old patterns matched.

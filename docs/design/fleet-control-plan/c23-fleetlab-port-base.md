@@ -126,6 +126,12 @@ victim process: `down` on base 9000 exits 2, prints the reason, never
 prints `down (idempotent)`, and the victim is still running. A guard that
 reports the mistake after the kill is not a guard.
 
+It also refuses a box with no `ps`, `awk` or `pgrep`. Missing those does
+not make the sweep fail — it makes it reap **nothing**, quietly, while
+every line of output says the lab came down cleanly. That is the same
+shape of silence the phase exists to remove, so it is a refusal rather
+than a degradation.
+
 The last two rows are a superset of what the backlog asked for. They are
 in because `ritual.sh` *drives* a lab instance (C16's canary step 2), so
 it is a base picker like any other and must not be able to eat its own
@@ -159,8 +165,9 @@ Unit — `internal/fleetlab`, `go test -race`:
 | U4 | a non-default base shifts **every** number in the table by the same amount and leaves nothing on the old block (bases 10000, 10200, 20000) | PASS |
 | U5 | the guard refuses: listen window over `:9000`/`:9001`; upstream window over `:9000` (base 12600); listen window over production upstreams; listen window over `ritual.sh`; a base that is not a multiple of 200; a non-numeric base; an upstream window below 1024 | PASS |
 | U6 | the guard refuses **before the sweep runs** — a live victim process survives a `down` on a refused base, and `down (idempotent)` is never printed | PASS |
-| U7 | `internal/shelllint` still green over the new `ports.sh` and every edited rig | PASS |
-| U8 | full inner loop: `go build`, `go vet`, `go test -race ./...`, `gofmt -l`, `go mod tidy`, `golangci-lint run` | PASS |
+| U7 | the guard refuses a box with no `ps` (a silently empty sweep, run against a PATH symlink farm holding everything else) | PASS |
+| U8 | `internal/shelllint` still green over the new `ports.sh` and every edited rig | PASS |
+| U9 | full inner loop: `go build`, `go vet`, `go test -race ./...`, `gofmt -l`, `go mod tidy`, `golangci-lint run` | PASS |
 
 Live (a real four-cell lab, real llama-swap processes):
 
