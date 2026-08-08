@@ -80,7 +80,22 @@ const embedBatch = 64
 // answers inside it (64 tokens at 0.5 tok/s is ~128s... which is why
 // this is generous); past it the probe is abandoned and recorded as a
 // failed attempt rather than left hanging.
+//
+// It is applied in Run, not in Start, because Start is not the only
+// caller: `vibe model try` (C18) calls Run directly with the command's
+// context, and Config.HTTPClient defaults to a client with NO timeout of
+// its own — so a wedged llama-server left that path unbounded, holding
+// the cell's single probe slot for as long as the socket stayed open.
 const probeTimeout = 3 * time.Minute
+
+// runningTimeout bounds the local /running read INSIDE probeTimeout. It
+// is short on purpose and the shortness is the point: the residency read
+// is the cheapest request in the phase (localhost, no model work), it
+// runs while the single-flight lock is held, and it is the one request
+// whose failure must NOT be reported as an answer. Letting it inherit
+// the whole probe budget would mean a hung llama-swap locks this cell out
+// of probing anything for three minutes to learn nothing.
+const runningTimeout = 5 * time.Second
 
 // The budget, enforced HERE rather than at the queue: C6 made piggyback
 // delivery at-least-once, so a redelivered command must not buy a second
@@ -138,8 +153,10 @@ type Config struct {
 	// Specs resolves a model id to its probe spec. Nil means every model
 	// probes as chat with no fingerprint binding.
 	Specs func(model string) Spec
-	// HTTPClient is the transport seam; nil gets a client with no
-	// timeout (probeTimeout is the bound, applied per request).
+	// HTTPClient is the transport seam; nil gets a client with no timeout
+	// of its own. The bound is probeTimeout, applied to the context in Run
+	// so that every entry point — Start, and `vibe model try`'s direct Run
+	// — gets it whatever client it supplies.
 	HTTPClient *http.Client
 	// Logger; nil → slog.Default.
 	Logger *slog.Logger
@@ -346,9 +363,10 @@ func (p *Prober) Results() map[string]*fleetapi.AnnounceProbe {
 // slow.
 func (p *Prober) Start(model string, rebaseline bool) {
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
-		defer cancel()
-		p.Run(ctx, model, rebaseline)
+		// No deadline here: probeTimeout lives in Run, so the announce
+		// loop's path and `vibe model try`'s path are bounded by the same
+		// line rather than by two that can drift apart.
+		p.Run(context.Background(), model, rebaseline)
 	}()
 }
 
@@ -356,6 +374,12 @@ func (p *Prober) Start(model string, rebaseline bool) {
 // recorded. Every refusal path records a block too — a probe that did
 // not happen must be visible with its reason, not silently absent.
 func (p *Prober) Run(ctx context.Context, model string, rebaseline bool) *fleetapi.AnnounceProbe {
+	// The end-to-end bound, taken as the MINIMUM with whatever the caller
+	// brought: a caller with a shorter deadline keeps it, a caller with
+	// none (or with a client that has no timeout) still gets this one.
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+
 	if !p.runMu.TryLock() {
 		// Refused, not queued: a serial probe train is a budget leak.
 		return p.note(model, "", "a probe is already running on this cell")
@@ -446,8 +470,18 @@ func (p *Prober) markAttempt(model string, now time.Time) {
 // isResident reads the LOCAL llama-swap's /running. Anything other than
 // a ready model is not resident for probe purposes: a "starting" model is
 // mid-load and timing it measures the load, not the model.
+//
+// THE ERROR IS NOT DROPPABLE. `false, err` means "no answer", which is
+// the ABSENCE of a residency verdict, and `false, nil` means "asked and
+// told no". A caller writing `ok, _ := p.isResident(...)` turns the first
+// into the second — a /running that timed out would be reported to the
+// operator as "not resident — warm it first", the one note that says the
+// safety rule fired when in fact nothing was checked. That is C20's class
+// 1 (absent evidence read as a definite value), six occurrences so far,
+// one of which silently disarmed eight busy guards.
+// TestIsResidentsErrorIsNeverDiscarded pins it structurally.
 func (p *Prober) isResident(ctx context.Context, model string) (bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, runningTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(p.cfg.LlamaSwapURL, "/")+"/running", nil)
 	if err != nil {
