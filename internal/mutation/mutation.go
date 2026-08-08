@@ -523,6 +523,41 @@ var Registry = []Mutation{
 			"one, which silently kept the compiled-in 3s against a cell that accepts and never " +
 			"answers. A duplicated budget is only ever discovered by the half that did not move.",
 	},
+
+	// ── class 4, met a second time in the daemon's cell verbs ─────────
+	//
+	// The same defect as u5's wake command, in the other place this repo
+	// hands an operator's shell string to exec: `cell_cmds.drain`. Found
+	// independently, from the same symptom (CI red at exactly the
+	// command's own runtime, green on a workstation where /bin/sh is
+	// bash), which is the argument for these two entries existing
+	// separately rather than one standing in for both — the recurring
+	// shape here is a guard that lives in one of N call paths.
+	{
+		Name:     "u3/the verb kill reaches the shell and not its work",
+		File:     "internal/vibe/daemon/cell_drain.go",
+		Find:     "syscall.Kill(-c.Process.Pid, syscall.SIGKILL)",
+		Replace:  "syscall.Kill(c.Process.Pid, syscall.SIGKILL)",
+		Pkg:      "./internal/vibe/daemon/",
+		MustFail: []string{"TestCellDrain_HungVerbSurfacesUnavailableAtTheBudget"},
+		Why: "a cell verb is a shell command, and exec.CommandContext kills only the shell. Drop the " +
+			"minus sign and a `systemctl --user stop llama-swap && ...` cut off at its budget goes on " +
+			"running with nobody waiting on it — the reclaim half-done, the RPC already answered " +
+			"Unavailable, and no way to tell that apart from the bound having worked.",
+	},
+	{
+		Name:     "u3/the verb budget stops bounding the WAIT",
+		File:     "internal/vibe/daemon/cell_drain.go",
+		Find:     "\tc.WaitDelay = cellCmdWaitDelay",
+		Replace:  "\t_ = cellCmdWaitDelay",
+		Pkg:      "./internal/vibe/daemon/",
+		MustFail: []string{"TestCellDrain_TheBudgetEndsTheCallEvenWhenTheWorkEscapesTheKill"},
+		Why: "Cmd.Wait does not return while any process holds the stderr pipe `sh` handed down, so a " +
+			"verb whose work left the group (job control, setsid, a daemonising helper) holds the RPC " +
+			"past its deadline no matter what the group kill reaches. This is the defect this unit " +
+			"found: the budget fired on schedule, the error said `signal: killed`, and the call still " +
+			"took 30.003s against a 400ms bound.",
+	},
 }
 
 // ── tree copying and patching ────────────────────────────────────────

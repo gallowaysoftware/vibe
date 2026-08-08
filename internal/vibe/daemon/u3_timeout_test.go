@@ -23,6 +23,8 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -30,7 +32,9 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -154,6 +158,8 @@ func TestOutboundBudgets_TheDocumentedValues(t *testing.T) {
 	}{
 		{"cellCmdTimeout", cellCmdTimeout, 60 * time.Second,
 			"one systemd unit stop, generously; a box with a slower regime raises cell_cmds.cmd_timeout instead"},
+		{"cellCmdWaitDelay", cellCmdWaitDelay, 2 * time.Second,
+			"the half of the verb bound the deadline alone does not cover: long enough to still capture a killed command's last stderr line, noise next to a 60s budget"},
 		{"doctorAuthTimeout", doctorAuthTimeout, 5 * time.Second,
 			"doctor probes EVERY cell serially, so this number times the fleet size is how long a report on a dark fleet takes"},
 		{"announceStopTimeout", announceStopTimeout, 3 * time.Second,
@@ -234,19 +240,102 @@ func TestVerbCtx_CarriesTheBudgetAndOutlivesTheRPC(t *testing.T) {
 	}
 }
 
+// ─── the verb's command tree ────────────────────────────────────────────────
+
+// forkingVerb is the hung drain command the two budget tests below run.
+// %s is a path it writes its background child's pid to.
+//
+// A background job and a `wait`, not the one-word `sleep 30` this test
+// was first written with, because that version proved nothing on the
+// machine most of this code gets written on. bash turns `sh -c 'sleep
+// 30'` into an EXEC — the shell replaces itself with sleep, so the single
+// process exec.CommandContext kills really is the whole command and a
+// budget with no reach past the shell looks armed. dash does not do that,
+// and NO shell can do it for a command containing a `;`, a `&&`, a
+// subshell or a background job — which is what every real
+// cell_cmds.drain looks like. The result was a test that passed on the
+// workstation and failed in CI at 30.003s against a 400ms budget: the
+// grandchild held the inherited stderr pipe open, and Cmd.Wait does not
+// return while a writer to it lives.
+//
+// `sleep 10`, not 30: long enough that the natural end is far outside
+// every window here, short enough that a mutation run which does hit it
+// costs ten seconds rather than half a minute.
+const forkingVerb = "sleep 10 & echo $! > %s; wait"
+
+// escapedVerb is forkingVerb with job control on. POSIX requires a
+// background job under `set -m` to run in a process group of its OWN,
+// which puts it out of the group kill's reach — leaving cellCmdWaitDelay
+// as the only thing that can end the call. It is the daemonising-helper
+// case, reproduced with nothing but the shell.
+const escapedVerb = "set -m; " + forkingVerb
+
+// grandchildPID reads the pid the verb recorded, polling because "the
+// first thing the command does" still happens after a fork and an exec.
+func grandchildPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if b, err := os.ReadFile(path); err == nil {
+			if pid, cerr := strconv.Atoi(strings.TrimSpace(string(b))); cerr == nil && pid > 0 {
+				return pid
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the drain command never recorded a background pid at %s: the forking verb this test depends on did not run, so nothing here measured a budget", path)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// pidAlive probes for existence with signal 0, the same technique
+// vamp.IsAlive uses. EPERM counts as alive: a process owned by someone
+// else is still a process.
+func pidAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// pidGoneWithin polls for a pid to disappear rather than looking once: a
+// killed process is a zombie until its reaper gets to it, and the shell
+// that would have reaped this one was killed alongside it. Measured at
+// ~5ms via init on Linux, but it is not zero.
+func pidGoneWithin(pid int, limit time.Duration) bool {
+	deadline := time.Now().Add(limit)
+	for time.Now().Before(deadline) {
+		if !pidAlive(pid) {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return !pidAlive(pid)
+}
+
 // TestCellDrain_HungVerbSurfacesUnavailableAtTheBudget is the whole
 // sentence in cellCmdTimeout's doc comment, executed: "a hung unit stop
 // must surface as Unavailable, not a stuck RPC".
 //
-// No seam. The real runCellCmd, a real `sh -c sleep 30` (a unit stop that
+// No seam. The real runCellCmd, a real forking `sh -c` (a unit stop that
 // never returns), and the real exec kill — because SetCellCmdRunner
 // proves the daemon's half of the contract and proves nothing about
-// whether exec.CommandContext is actually wired to the budget.
+// whether the budget reaches the process tree.
+//
+// Two answers, not one, because the RPC returning is only half of a
+// bound. The reply arriving on time while the work runs on is a drain
+// that reported failure and left a half-run reclaim on the box, and on
+// the wire that is indistinguishable from the budget having worked.
 func TestCellDrain_HungVerbSurfacesUnavailableAtTheBudget(t *testing.T) {
 	t.Parallel()
+	pidFile := filepath.Join(t.TempDir(), "grandchild.pid")
 	d := New(Config{
 		ProxyPort: deadPort(t), // the resident probe must not be what we time
-		CellCmds:  CellCmds{Drain: "sleep 30", CmdTimeout: "400ms"},
+		CellCmds: CellCmds{
+			Drain:      fmt.Sprintf(forkingVerb, pidFile),
+			CmdTimeout: "400ms",
+		},
 	})
 
 	start := time.Now()
@@ -257,7 +346,67 @@ func TestCellDrain_HungVerbSurfacesUnavailableAtTheBudget(t *testing.T) {
 	if got := connect.CodeOf(err); got != connect.CodeUnavailable {
 		t.Fatalf("hung drain → %v (%v), want Unavailable: a stuck verb is the cell being unavailable, not the request being malformed", got, err)
 	}
-	wantElapsed(t, start, 400*time.Millisecond, 15*time.Second, "a drain whose command hangs")
+	// The ceiling is the budget plus the wait delay: the two bounds that
+	// are allowed to end this call, and nothing else. Written in terms of
+	// the constant so a changed value moves the window with it —
+	// TestOutboundBudgets_TheDocumentedValues is what keeps the value
+	// itself honest.
+	wantElapsed(t, start, 400*time.Millisecond, 400*time.Millisecond+cellCmdWaitDelay+2*time.Second,
+		"a drain whose command hangs")
+
+	pid := grandchildPID(t, pidFile)
+	if !pidGoneWithin(pid, 5*time.Second) {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		t.Fatalf("the drain command's background child (pid %d) outlived the verb that started it: the budget killed the shell in front of the work and nothing else, so a `systemctl stop` cut off at the budget goes on running with nobody waiting on it", pid)
+	}
+}
+
+// TestCellDrain_TheBudgetEndsTheCallEvenWhenTheWorkEscapesTheKill is the
+// other half, and the reason cellCmdWaitDelay exists as well as the group
+// kill.
+//
+// A command that puts its work in a process group of its own — job
+// control here, `setsid` or a daemonising helper in the field — is out of
+// reach of a kill aimed at the verb's group. The work therefore SURVIVES,
+// which this test asserts rather than tolerates: with the child alive and
+// still holding the stderr pipe it inherited, the only thing that can
+// have ended the call is exec closing those pipes at the wait delay.
+func TestCellDrain_TheBudgetEndsTheCallEvenWhenTheWorkEscapesTheKill(t *testing.T) {
+	t.Parallel()
+	pidFile := filepath.Join(t.TempDir(), "grandchild.pid")
+	d := New(Config{
+		ProxyPort: deadPort(t),
+		CellCmds: CellCmds{
+			Drain:      fmt.Sprintf(escapedVerb, pidFile),
+			CmdTimeout: "400ms",
+		},
+	})
+
+	start := time.Now()
+	_, err := d.CellDrain(context.Background(), connect.NewRequest(&vibev1.CellDrainRequest{}))
+	elapsed := time.Since(start)
+	if got := connect.CodeOf(err); got != connect.CodeUnavailable {
+		t.Fatalf("hung drain → %v (%v), want Unavailable", got, err)
+	}
+
+	// Ceiling first: at 10s the escaped child has ended on its own and
+	// every diagnostic below reads as something else's fault.
+	if ceiling := 400*time.Millisecond + cellCmdWaitDelay + 2*time.Second; elapsed > ceiling {
+		t.Fatalf("a drain whose work escaped the kill took %v, past the %v ceiling: nothing bounded the WAIT, so the call ended when the command finished on its own — the deadline fired into the void and the error still said `signal: killed`",
+			elapsed.Round(time.Millisecond), ceiling)
+	}
+
+	pid := grandchildPID(t, pidFile)
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	pgid, gerr := syscall.Getpgid(pid)
+	if !pidAlive(pid) || gerr != nil || pgid != pid {
+		t.Fatalf("the background child (pid %d, pgid %d, err %v) did not survive in a group of its own, so this test exercised the group kill and NOT cellCmdWaitDelay: this shell did not honour `set -m` for a background job, and the escape needs a different spelling here",
+			pid, pgid, gerr)
+	}
+	if floor := 400*time.Millisecond + cellCmdWaitDelay; elapsed < floor {
+		t.Fatalf("the call returned in %v, sooner than the %v it must spend when a writer to its pipes outlives the kill — whatever ended it, it was not the wait delay",
+			elapsed.Round(time.Millisecond), floor)
+	}
 }
 
 // TestCellResume_HungVerbSurfacesUnavailableAtTheBudget: the same budget

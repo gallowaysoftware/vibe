@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"connectrpc.com/connect"
@@ -288,11 +290,78 @@ func (d *Daemon) verbCtx(ctx context.Context) (context.Context, context.CancelFu
 	return context.WithTimeout(context.WithoutCancel(ctx), d.cellCmdBudget())
 }
 
+// cellCmdWaitDelay is the second half of a verb's bound: how long Wait
+// tolerates the command's output pipes staying open AFTER the budget has
+// already killed it.
+//
+// It exists because a context deadline on its own does not end this call,
+// which is the defect this constant was added to fix. exec.CommandContext
+// kills the direct child — `sh` — and nothing else, and Cmd.Run does not
+// return until every writer to the stderr pipe has closed it. `sh -c`
+// hands that pipe to whatever it spawns, so ANY verb the shell cannot
+// exec-optimise into itself keeps a grandchild holding the write end:
+// `systemctl stop a && systemctl stop b`, a subshell, a backgrounded job,
+// or even a plain one-word command under a shell that does not do that
+// optimisation. The deadline then fires on schedule, kills `sh`, and the
+// RPC still does not return until the grandchild finishes on its own —
+// observed at 30.003s against a 400ms budget, reporting `signal: killed`
+// the whole time. An armed guard, an accurate-looking error, and no
+// bound: the shape this wave exists to catch.
+//
+// Two mechanisms, because they answer different halves and neither
+// subsumes the other (see runCellCmd):
+//
+//   - Setpgid plus a group kill ends the WORK. A half-run `systemctl
+//     stop` that outlives the verb that launched it is the part an
+//     operator pays for later, and killing only the shell in front of it
+//     leaves exactly that.
+//   - WaitDelay ends the WAIT, unconditionally. A grandchild that left
+//     the group under its own steam — job control, setsid, a daemonising
+//     helper — is out of the group kill's reach, and without this the
+//     reply is behind it again. exec closes the pipes and returns.
+//
+// Two seconds: long enough that a killed command's last stderr line is
+// still captured for the error the operator reads, short enough that it
+// is noise next to a 60s budget.
+const cellCmdWaitDelay = 2 * time.Second
+
 // runCellCmd executes a cell verb via sh -c, returning captured stderr for
 // the error path. Assigned to Daemon.cellCmdRunner in New so tests can
 // script verb outcomes.
+//
+// The three lines after CommandContext are what make the caller's budget
+// an actual bound rather than a deadline that fires into the void — see
+// cellCmdWaitDelay for what each one covers and what the absence of it
+// cost.
 func runCellCmd(ctx context.Context, cmd string) (string, error) {
 	c := exec.CommandContext(ctx, "sh", "-c", cmd)
+	// Its own process group, so the budget can reach the command's whole
+	// tree instead of just the shell standing in front of it.
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.Cancel = func() error {
+		if c.Process == nil {
+			return os.ErrProcessDone
+		}
+		// The negative pid is the group. SIGKILL rather than a graceful
+		// SIGTERM on purpose: the graceful window IS the budget the
+		// command has just spent (60s by default), and a verb that
+		// ignored it is by definition not the kind that will honour a
+		// term. Matching exec.CommandContext's own default signal also
+		// keeps the failure mode the one every reader already expects,
+		// with the single difference that it now lands on the group.
+		if err := syscall.Kill(-c.Process.Pid, syscall.SIGKILL); err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				// The whole group is already gone: the command finished
+				// on the same tick the deadline fired. Say so, so a
+				// command that beat the wire still reports its own
+				// result instead of the context's.
+				return os.ErrProcessDone
+			}
+			return err
+		}
+		return nil
+	}
+	c.WaitDelay = cellCmdWaitDelay
 	var stderr bytes.Buffer
 	c.Stderr = &stderr
 	err := c.Run()
