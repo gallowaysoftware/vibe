@@ -231,6 +231,12 @@ stand-in.
   GET is blocked — page SIZE is the discriminator, since a short page is
   legitimately short. A failed escalation is reported, never silently
   downgraded to the thin result.
+  - **`--mcp-expose-search`** also serves `web_search` over `/mcp`. Off by
+    default because a client with a redirectable search endpoint should
+    keep its native path (richer rendering, its own provider chain). Turn
+    it on for harnesses that have no such endpoint — opencode's
+    `websearch` accepts only `exa` or `parallel` via
+    `OPENCODE_WEBSEARCH_PROVIDER`, so MCP is its only route to the plane.
 - **`search_url` (`~/.config/vibe/config.yaml`)** backs `${VIBE_SEARCH}`
   in frontend templates and env, so one profile points a harness at
   models, search, and fetch together. Client-facing only — nothing in
@@ -238,6 +244,17 @@ stand-in.
   is left out of the expansion map entirely so a profile referencing it
   fails to activate with a message naming `search_url`, instead of
   rendering an empty URL into a harness config.
+- **`${MODEL_ALIAS}` / `${MODEL_CONTEXT}` follow the same rule.** They
+  used to be always-known (every backend declared both), so rendering the
+  zero value was harmless. A `cloud_peer` need not declare either, and
+  `""` / `0` reaching a harness config means an unroutable model id or a
+  context window of zero — so both drop out of the expansion map when
+  unset and a template referencing one fails by name. `optionalVars` in
+  `expand.go` carries the per-variable hint; add new optional vars there.
+  Both are resolved in ONE place, `frontendModelVars` in
+  `internal/vibe/daemon/daemon.go` — a dispatch over backend kinds, whose
+  test walks every arm of the union because forgetting one renders an
+  empty model id rather than failing.
 - **Fleet control plane (fleet-control C1+).** `docs/design/fleet-control.md`
   is the design; the phase plan (C0–C21, all merged) is
   `docs/design/fleet-control-plan/`. The pieces an agent must not break:
@@ -1991,6 +2008,46 @@ planned. The short version an agent needs:
   for it: readiness is a GET on the router's `/v1/models` matching
   alias|backend_ref|name — NEVER a completion (that JIT-loads the model and
   defeats lazy loading). Stop leaves the model to the router's TTL.
+  - The catalog probed is **`client_api_url` when set**, else loopback
+    (`externalCatalogURL`). This is the one readiness check that is not
+    about a local process — it asserts "the model a rendered frontend is
+    about to request exists where that frontend will ask", so it has to
+    follow the clients. Probing loopback instead failed a fleet-only model
+    (a cloud peer, another cell's weights) that would have worked, and
+    passed a local cell shadowing the same id. Parse the catalog with
+    `internal/vibe/modelcat`, never a local `data[]` decode: a remote
+    front may answer in the Ollama shape, which decodes to an EMPTY
+    catalog and reads here as "serving nothing".
+  - On-disk artifacts (`path`, `mmproj`, `draft_model`,
+    `chat_template_file`, `binary`) are **not** stat'd for an external
+    backend: the router host owns them, and requiring them locally stopped
+    a laptop from carrying a profile for a model the front serves. Same
+    gate as `cell:` (they share the `offBox` predicate in
+    `validateLlamaServer`). Rules that hold wherever the process runs
+    (jinja-before-template-file) still apply.
+- **`cloud_peer` may carry a frontend.** Pointing a harness at a cloud model
+  the router already serves is the whole reason a peer exists. A
+  single-entry `models:` supplies `${MODEL_ALIAS}` (a peer's model ids ARE
+  the router's — no def-name indirection); several leave it unset rather
+  than choosing for the user. `context:` supplies `${MODEL_CONTEXT}`,
+  metadata only. This does NOT give vibe an opinion about the peer's
+  residency: `cloud_peer` still implies `external`, so nothing is launched,
+  supervised, or VRAM-checked. Touching this means touching all of:
+  `validateFrontend`, `frontendModelVars`, the frontend-activation kind
+  gate in `Start`, and `Pull`'s early returns — a peer has nothing to pull,
+  and `vibe start` pulls first. `profiles/omp.example.yaml` is the worked
+  example, and it is EXECUTED by a test (`example_profile_test.go`) rather
+  than merely read.
+- **A cloud peer's catalog ids are its `cloud_peer.models` entries, NEVER
+  its def name.** Every other backend kind is served under its def name, so
+  code that keys a map by `def.Name` and is then looked up by CATALOG id
+  works for all of them and silently misses for peers. That is not a
+  hypothetical: it made `modelprobe`'s "never probe a paid peer" guard
+  inert and made `fleetannounce` report every peer model as having no
+  backend def. `daemon.cloudPeerModelIDs` is the reference expansion —
+  reach for it (or copy its three lines) rather than assuming def name is
+  an id. A fixture that names the def after its single model hides this
+  bug; name them differently in tests.
 - **Canonical model id = backend def name** (e.g. `qwen3.6-27b`); llama-server
   aliases exist for legacy client state. Alias collisions across defs are an
   error resolved by explicit ownership, not magic.
