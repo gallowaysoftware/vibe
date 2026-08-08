@@ -1,6 +1,8 @@
 package astscan
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -128,6 +130,61 @@ func TestUnreadableDirIsAnError(t *testing.T) {
 	r.Dir = "testdata/there-is-no-such-package"
 	if _, err := r.Check(); err == nil {
 		t.Fatal("a missing directory scanned clean")
+	}
+}
+
+// TestForeignDirStopsAtANestedCheckout is the fixture form of the bug that
+// made every module-wide scan in this repo fail locally and pass in CI.
+// Both directions: the module's own directories must NOT be foreign, or
+// the walk stops at the first subdirectory and every scan goes inert.
+func TestForeignDirStopsAtANestedCheckout(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, body string) {
+		t.Helper()
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The module itself: a go.mod and a real .git directory at the root.
+	write("go.mod", "module example.com/m\n")
+	if err := os.MkdirAll(filepath.Join(root, ".git", "refs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write("internal/pkg/pkg.go", "package pkg\n")
+	// A git WORKTREE parked inside the tree: .git is a FILE. This is the
+	// shape that was actually there — nine of them, one per agent.
+	write(".claude/worktrees/agent-a1/.git", "gitdir: /home/x/src/m/.git/worktrees/agent-a1\n")
+	write(".claude/worktrees/agent-a1/internal/pkg/pkg.go", "package pkg\n")
+	// A nested clone somewhere with no telltale name at all.
+	if err := os.MkdirAll(filepath.Join(root, "tmp", "checkout", ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A nested MODULE, which is somebody else's source even without a .git.
+	write("contrib/vendored/go.mod", "module example.com/other\n")
+
+	for _, rel := range []string{".claude/worktrees/agent-a1", "tmp/checkout", "contrib/vendored"} {
+		if !ForeignDir(root, filepath.Join(root, rel)) {
+			t.Errorf("%s: not reported foreign — the walk descends into a second copy of the module, "+
+				"which inflates every inertness floor and flags files no exemption key can name", rel)
+		}
+	}
+	for _, rel := range []string{".", "internal", "internal/pkg", ".claude", ".claude/worktrees", "contrib"} {
+		if ForeignDir(root, filepath.Join(root, rel)) {
+			t.Errorf("%s: reported foreign — this module's own tree is being skipped, and a scan that "+
+				"walks nothing passes forever", rel)
+		}
+	}
+	// The root is reached as the walk's own first argument, in whatever
+	// spelling the caller used. It has both markers and must never be
+	// foreign, or the walk stops before it starts.
+	for _, spelling := range []string{root, root + "/", filepath.Join(root, "internal", "..")} {
+		if ForeignDir(root, spelling) {
+			t.Errorf("the walk root spelled %q was reported foreign: the scan would examine zero files", spelling)
+		}
 	}
 }
 

@@ -212,6 +212,52 @@ func (r Rule) Err(res Result) error {
 	return fmt.Errorf("%s:\n  %s", r.Name, strings.Join(msgs, "\n  "))
 }
 
+// ForeignDir reports whether the directory at path — reached while walking
+// the module rooted at root — belongs to a tree that is not this module's
+// own source.
+//
+// It exists because of a real failure, not a hypothetical one. The scans in
+// internal/vibe/observed walk the WHOLE module from `../../..` so that a
+// package a future phase adds is covered without anybody remembering to
+// list it. This repo routinely has git worktrees INSIDE the tree
+// (.claude/worktrees/*, one per parallel agent), and each of those is a
+// complete second copy of this module's source. The walk descended into
+// all of them: it reported 2080 source files and 17223 functions where the
+// module has 208 and 1721, flagged the SAME exempted function once per
+// worktree under a path no exemption key could ever match, and so failed
+// for every developer with a worktree while passing in CI, where a fresh
+// clone has none. It also inflated the inertness floors by an order of
+// magnitude, which is the worse half: a floor that a foreign tree can
+// satisfy stops being able to notice that this module's own code went away.
+//
+// Two signals, both cheap and both properties of the directory rather than
+// of its name — a name list would have to be updated by whoever next
+// invents a place to park a checkout:
+//
+//   - a nested checkout. `git worktree add` writes .git as a FILE (a
+//     gitdir pointer), not a directory, so a walk that skips directories
+//     named .git — as this one did — walks straight into a worktree.
+//   - a nested module. Vendored source or a fixture with its own go.mod is
+//     not this module's code and its conventions are not this module's.
+//
+// root itself is never foreign: it has both a .git and a go.mod, and a
+// walk that skipped its own starting point would examine nothing at all.
+func ForeignDir(root, path string) bool {
+	if filepath.Clean(path) == filepath.Clean(root) {
+		return false
+	}
+	// Lstat, not Stat: the gitdir pointer is what identifies a worktree,
+	// and a broken pointer (a worktree whose main repo has moved) still
+	// marks the tree as somebody else's.
+	if _, err := os.Lstat(filepath.Join(path, ".git")); err == nil {
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+		return true
+	}
+	return false
+}
+
 func set(names []string) map[string]bool {
 	m := make(map[string]bool, len(names))
 	for _, n := range names {
