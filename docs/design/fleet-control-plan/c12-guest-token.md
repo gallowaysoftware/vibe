@@ -1,6 +1,6 @@
 # C12 — Guest read-only token: sharing status without sharing drain
 
-Status: PR OPEN (2026-08-05), feature + self-review + **adversarial
+Status: **merged** (#31) (2026-08-05), feature + self-review + **adversarial
 review** commits. Unit gates 1–14 (plus 11b) green on a full local inner
 loop (`go build`, `go vet`, `go test -race -count=5`, `golangci-lint
 run` 0 issues, `gofmt -l .` silent, `go mod tidy` clean). Live gate L2

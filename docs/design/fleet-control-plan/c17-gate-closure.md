@@ -1,6 +1,6 @@
 # C17 — closing the gate-honesty gap
 
-Status: **PR OPEN** (2026-08-05), off `feat/c17-gate-closure` branched
+Status: **merged** (#40) (2026-08-05), off `feat/c17-gate-closure` branched
 from `main` at `0c275fd`. **No production Go code changes** — this phase
 is a measurement pass, and its output is evidence. What it adds is
 fourteen repeatable gate scripts under
