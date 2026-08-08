@@ -143,10 +143,20 @@ to `AGENTS.md`.
 ### 1e. The one place a capture could become a committed corpus is this repo
 
 `internal/swaptest/record_test.go` records real endpoint responses off a
-real llama-swap into files that get committed. It already redacts
-`logData` payloads and `$HOME`. If it ever learns `/api/captures/{id}`,
-the next fixture commit publishes a real prompt from the recording box
-to a public repo.
+real llama-swap into files that get committed. Its author already has
+the right instinct — `foldHome`'s comment says it in as many words:
+
+> The repo is public and `/running` echoes the whole llama-server argv
+
+— and the recorder performs two named redactions for that reason
+(`logData` payloads, `$HOME`), both declared in `RECORDED`. **Captures
+are the case that posture cannot handle.** Redaction works when the
+sensitive part is a substring of something you still want; a capture's
+sensitive part is the whole object. Fold the home directory out of a
+prompt and you still have the prompt. There is no redaction that leaves
+a useful capture fixture behind, so the only correct handling is refusal.
+If the recorder ever learns `/api/captures/{id}`, the next fixture commit
+publishes a real prompt from the recording box to a public repo.
 
 So the rule the backlog entry wrote for the fleet applies first to the
 repo: **the recorder must refuse the captures endpoint by name**, and
