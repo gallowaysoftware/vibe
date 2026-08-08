@@ -38,8 +38,8 @@ func TestC27FleetStatusDescribesEveryDisplayState(t *testing.T) {
 		t.Fatal("fleet_status's description no longer enumerates the display states where this guard looks")
 	}
 	list := desc[open+len("per cell ("):]
-	if close := strings.Index(list, ")"); close >= 0 {
-		list = list[:close]
+	if end := strings.Index(list, ")"); end >= 0 {
+		list = list[:end]
 	}
 	for _, d := range fleetapi.DisplayStates {
 		if !strings.Contains(list, d) {

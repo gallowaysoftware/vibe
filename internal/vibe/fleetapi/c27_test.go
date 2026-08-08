@@ -138,10 +138,13 @@ func c27Combos() []c27Combo {
 // For all 108 combinations of class × availability × intent × reason it
 // computes the display TWICE — once with main's derivation, once with
 // this phase's — and then runs the real `absentAlarm` and the real
-// `checkIntentHygiene` on both. The alarm's firing decision and its
-// notify KEY (kind+scope, which is what dedup and re-fire are keyed on)
-// must be identical, and so must the doctor's level and bucket
-// membership. The operator PROSE is allowed to differ in exactly one
+// `checkIntentHygiene` on both. The alarm's firing decision must be
+// identical, and so must the doctor's level and bucket membership. (The
+// notify KEY is `kind + "\x00" + scope` and neither is derived from the
+// display, so no detail text can move dedup, re-fire or resolve;
+// `TestC27StoppedAlarmsForAnAlwaysOnCell` walks the whole
+// SetIntent → decorate → notifyConditions path and names the key it
+// gets.) The operator PROSE is allowed to differ in exactly one
 // way: where the display word itself appears in it, because that word is
 // the change. Substituting the old state name for the new one must make
 // the two strings equal — anything else is a behaviour change wearing a
@@ -277,6 +280,24 @@ func TestC27StoppedAlarmsForAnAlwaysOnCell(t *testing.T) {
 			Class: string(class), Display: DisplayStopped, Intent: stop}); fired {
 			t.Errorf("%s absence alarmed: the class table's alarm column is the whole policy", class)
 		}
+	}
+
+	// End to end, through the real path a fleetd walks: the stop record is
+	// written by the endpoint's own writer, `decorate` derives the
+	// display, and `notifyConditions` — not absentAlarm directly — is what
+	// the evaluator calls. Asserting the KEY, because kind+scope is what
+	// dedup, re-fire and resolve are keyed on.
+	s := notifyServer(t, []Cell{{Name: "front", URL: "http://127.0.0.1:1", Class: "always_on"}})
+	if _, err := s.SetIntent("front", "drained", StopIntentReason, ""); err != nil {
+		t.Fatal(err)
+	}
+	cell := snapCell(s, "front", false, boolp(true))
+	if cell.Display != DisplayStopped {
+		t.Fatalf("display = %s, want STOPPED — the rest of this proves nothing", cell.Display)
+	}
+	got := kinds(s.notifyConditions(StateSnapshot{Cells: []CellSnapshot{cell}}))
+	if len(got) != 1 || got[0] != "cell_absent/front" {
+		t.Errorf("conditions for a STOPPED always_on cell = %v, want exactly [cell_absent/front]", got)
 	}
 }
 
