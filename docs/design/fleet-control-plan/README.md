@@ -1,4 +1,4 @@
-# Fleet-control implementation plan (C0–C26a)
+# Fleet-control implementation plan (C0–C27)
 
 Execution plan for [../fleet-control.md](../fleet-control.md). Each
 phase is one PR, independently shippable, and pays for itself before
@@ -33,7 +33,8 @@ to be implementable on its own after that.
 | [C23](c23-fleetlab-port-base.md) | A port base for `scripts/fleetlab`: one lab's teardown cannot reach another's | ~120 lines of shell + a ~400-line Go test package | futures item 15 | merged (#57); unit gates U1-U9 green (isolation + a negative control that removes the isolation); **L1-L3 PASS**, L3 being C16's L4 |
 | [C24](c24-drain-where-reclaim-happens.md) | Drain where reclaim happens: the launcher wrapper, and the unit's own stop | ~350 lines of shell + `fleetapi.StopIntentReason` | C2, C3, C14 | merged (#58); unit gates green over the SHIPPED files, +2 registry entries; **the live stop-record gate PASS** (harness, 2026-08-08, C26b — `gate-c24-stop-record.sh`, with a positive control); the unit half and the shutdown case still owed |
 | [C25](c25-bench-replay.md) | `vibe model try --replay`: your own traffic as the benchmark, and the refusal that ships first | 1315 non-comment production + 2364 test lines | C8, C18 (composition), C7a (the activity walk) | merged (#59); delivered as a C18 flag rather than a top-level verb; design + independent review (12 findings, one a test that asserted nothing); unit gates U1-U14 green, 18 predicates mutation-verified; **L2 PASS on real v239 and v247**; L1, L3, L4 NOT RUN (L4 needs metal) |
-| [C26a](c26a-deferred-fixes.md) | The four deferred fixes: the last `sh -c` site, a check that fired for the wrong boxes, a silent peer-id collision, the missing starter | ~250 lines | #14, U3, C13 | merged (#60); all gates PASS; 7 new registry entries (44/44 at merge; the registry reached **62** with C25 and **66** with C26b) |
+| [C26a](c26a-deferred-fixes.md) | The four deferred fixes: the last `sh -c` site, a check that fired for the wrong boxes, a silent peer-id collision, the missing starter | ~250 lines | #14, U3, C13 | merged (#60); all gates PASS; 7 new registry entries (44/44 at merge; the registry reached **62** with C25, **66** with C26b and **67** with C27) |
+| [C27](c27-stopped-display-state.md) | `STOPPED`: the unit's own stop record, given its own display state — the question C24 left open | ~40 production lines (a constant, one `case`, and the page) + 448 test lines + a 116-line rig | C24, C9, C13 | merged (#63); the display-only invariant asserted over **108** combinations of class × availability × intent × reason (6 displays changed, **0** alarm or doctor outcomes); found and fixed the page's `b-off` fall-through; +1 registry entry (**67**); **live gate PASS** (harness — the webhook was handed "always_on cell alpha is STOPPED …" by a fleetd that had seen nothing else) |
 
 C10 (await extensions) is the last of the three branches cut from
 `c9e8bcf` in parallel; C11 and then C9 landed ahead of it. None of the
@@ -532,6 +533,24 @@ Four things it found that bookkeeping alone would not have.
   and a client timeout is worse than no guard: it teaches the fleet to
   re-run.
 
+**C27 (2026-08-08)** answers the one question C26b deliberately left
+open, and its lesson is about *why* a naming question was worth a phase.
+The stop record rendered `DRAINED` — a state whose meaning is "somebody
+chose this and said why" — and the consumers that needed the difference
+got it back by reaching past the display into `IsStopRecord`. **A display
+state its own consumers have to work around is the wrong display state.**
+Two things it carries forward. The invariant was written as a real test
+rather than as a claim: 108 combinations of class × availability ×
+intent × reason, each evaluated through `main`'s derivation *and*
+today's, with the real alarm and the real doctor run over both (6
+displays changed, 0 outcomes) — and the test fails if nothing changed, so
+it cannot pass by proving a no-op. And the guard written for the new
+state found an older one: `badgeClass` ended in `return "b-off"` with
+three states relying on that fall-through, so a state the page had never
+heard of rendered as a box that is merely off. **Every fall-through in a
+rendering surface is a confident wrong answer waiting for a new enum
+value.**
+
 ## Ground rules for the implementing agent
 
 1. **The streaming contract is inviolable.** The data plane (client →
@@ -554,6 +573,10 @@ Four things it found that bookkeeping alone would not have.
    observed, intent is declared, residency belongs to llama-swap.
    Never store one system's state in another. Never act on inferred
    intent — the `DRAINED?` display state is a question, not a trigger.
+   *Amended C27:* nor is `STOPPED`. A display state actuates nothing,
+   whatever it is derived from; a cell unit's own stop record is a fact
+   about the stack, and the surface that renders it is not the surface
+   that decides anything.
 3. **Boundary rule.** This repo gets mechanisms with reference-fleet
    example values only. Real addresses, tokens, MAC addresses, plists,
    and compose overrides go to the private fleet repo. If an

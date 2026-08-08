@@ -354,9 +354,18 @@ stand-in.
   - State axes (design §4): availability is OBSERVED, intent is
     DECLARED (`$XDG_STATE_HOME/vibe/fleet/intent.json`), residency is
     llama-swap-owned. The derived display states (SERVING / DRAINED /
-    `DRAINED?` / OFF / OFF/AWAY / OFF/AWAY? / INCONSISTENT) are computed
-    at read time in `fleetapi/display.go`. **Never act on `DRAINED?`**
-    or inferred intent — display states are for humans.
+    STOPPED / `DRAINED?` / OFF / OFF/AWAY / OFF/AWAY? / INCONSISTENT) are
+    computed at read time in `fleetapi/display.go`. **Never act on
+    `DRAINED?` or `STOPPED`** or inferred intent — display states are for
+    humans. The three are three different facts and the words are load
+    bearing (C27): DRAINED means somebody CHOSE this and said why,
+    STOPPED means the cell unit's own `ExecStopPost` recorded that the
+    stack stopped (a clean stop and a crash are indistinguishable), and
+    `DRAINED?` means the intent store holds nothing at all. **Adding a
+    ninth state means naming it in `absentAlarm`'s switch, the doctor's,
+    `fleet.html`'s `badgeClass` and the `fleet_status` tool description**
+    — `fleetapi.DisplayStates` plus `c27_test.go` fail until you do,
+    which is the only reason they exist.
   - Token visibility (fleetd runs containerized): the daemon logs
     "token CREATED (new)" vs "token loaded" at startup, and bearer 401s
     count into `/api/fleet/state`'s `daemon.auth_rejected` — a
@@ -985,7 +994,15 @@ stand-in.
     explained and does not page; absent with NO entry is `DRAINED?` and
     pages. That reads the intent store's emptiness as a fact, never as a
     guess about what the operator meant, and it actuates nothing.
-    INCONSISTENT is a nag, not an alarm.
+    INCONSISTENT is a nag, not an alarm. **STOPPED pages** (C27): a
+    record of the stop is not a reason for it, and `absentAlarm`'s switch
+    ends in `default: return "", false`, so a "down" state missing from
+    its case list stops paging SILENTLY for exactly the incident the
+    notifier exists for. That case is pinned in `internal/mutation`
+    (`c27/a stopped always_on cell no longer pages`). The
+    `IsStopRecord` side-channel is still read on the OFF arm, because a
+    stop record whose host also went silent renders OFF — the box being
+    gone dominates.
   - **Persistence needs a set, not an event**: `renderPass` rebuilds
     `Server.fpMismatch` every pass, preserving `FirstSeen`. Without
     `fleet.front_config` there are no passes, so the status reports
@@ -2320,7 +2337,7 @@ planned. The short version an agent needs:
 
 ## Fleet control (node state / intent / presence, 2026-08-02+)
 
-`docs/design/fleet-control.md` is the design; the C0–C26a execution plan
+`docs/design/fleet-control.md` is the design; the C0–C27 execution plan
 lives in `docs/design/fleet-control-plan/` (one phase = one PR, each
 phase doc ends in acceptance gates that are the definition of done),
 and the ranked v2 backlog is `docs/design/fleet-control-futures.md`.
@@ -2328,7 +2345,7 @@ Every phase in that directory is merged. The invariants an agent must not
 violate while implementing or touching adjacent code: the data plane
 (client → front → cell llama-swap) gains no new hop; availability is
 observed, intent is declared, model residency stays llama-swap-owned;
-the `DRAINED?` display state is never acted on; mutation goes through
+the `DRAINED?` and `STOPPED` display states are never acted on; mutation goes through
 the daemon's bearer-authed control plane, never SSH-from-a-container;
 and nothing re-points a catalog id that a human did not declare (C21),
 including the front's own identity (C19 — failover is manual).

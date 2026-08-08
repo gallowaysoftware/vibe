@@ -274,6 +274,12 @@ func (s *Server) notifyConditions(snap StateSnapshot) []fleetnotify.Condition {
 // entry, which is the design's "deliberate stop or crash loop" and
 // exactly what an alarm is for. INCONSISTENT is not an alarm: the cell
 // answers, the fleet serves, and the design already calls it a nag.
+//
+// C27 gives the stop record its own display state, and STOPPED joins the
+// ALARMING list — a new "down" state that is not named in this switch
+// falls to `default` and silently stops paging for an always_on cell
+// that went away, which is precisely the incident this notifier exists
+// for. `internal/mutation`'s c27 entry disarms that case on every PR.
 func absentAlarm(c CellSnapshot) (string, bool) {
 	if c.Class != string(fleetcfg.ClassAlwaysOn) {
 		return "", false
@@ -284,9 +290,20 @@ func absentAlarm(c CellSnapshot) (string, bool) {
 	// not its suppression — silencing the page because the box managed
 	// to say "I stopped" on the way down is how this notifier gets muted
 	// for exactly the incident it exists for.
+	//
+	// C27 moved most of that fact into the display state, and the
+	// side-channel is still needed for exactly one arm: OFF. A stop
+	// record whose host has ALSO gone silent renders OFF, because the
+	// box being gone dominates — so OFF is the one display that means
+	// "declared drain" for one cell and "recorded stop" for another, and
+	// only the Intent field separates them. The DRAINED arm keeps its
+	// guard as well, deliberately: a pair `displayState` no longer
+	// produces still has to alarm the same way if anything ever hands
+	// this function one, so the alarm outcome stays a total function of
+	// (class, display, intent) rather than of the reachable subset.
 	stopRecord := IsStopRecord(c.Intent)
 	switch c.Display {
-	case DisplayDrainedQ, DisplayOffAway, DisplayOffAwayQ:
+	case DisplayStopped, DisplayDrainedQ, DisplayOffAway, DisplayOffAwayQ:
 	case DisplayDrained, DisplayOff:
 		if !stopRecord {
 			return "", false

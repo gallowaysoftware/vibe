@@ -119,7 +119,7 @@ case "$code" in
 		# Deliberately hedged: fleetd keeps an existing declaration (a
 		# human's drain, C14's scheduled sleep) rather than letting the
 		# unit overwrite a reason with none.
-		say "recorded: $cell stopped; unless something had already declared why, the fleet now shows DRAINED with no reason"
+		say "recorded: $cell stopped; unless something had already declared why, the fleet now shows STOPPED — the stop, with no reason"
 	else
 		say "recorded: $cell started; fleetd retired its stop record if it held one — a declared drain, if one is in force, is untouched"
 	fi

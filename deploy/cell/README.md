@@ -160,11 +160,15 @@ On a cell that announces (C3), the vibe daemon is its own unit and keeps
 heartbeating `serving` after the serving stack stops — the echo is
 state-only, so it cannot say "the stack under me is down". fleetd trusts
 a fresh announce over a failed probe, so the pair renders
-**INCONSISTENT** rather than DRAINED until the announcer goes stale. The
+**INCONSISTENT** rather than STOPPED until the announcer goes stale. The
 record is still there and still says when; the display is the part that
 is wrong, and fixing it needs a reason (or a serving-stack liveness bit)
 on the announce echo, which is a wire change. Written up as the C24
 follow-up in `docs/design/fleet-control-futures.md`.
 
-Cells that fleetd reaches by probe — no announcer — render DRAINED with
-the record, which is the intended shape.
+Cells that fleetd reaches by probe — no announcer — render **STOPPED**
+with the record, which is the intended shape. *Amended C27:* that state
+used to be DRAINED, which conflated "somebody chose this and said why"
+with "the unit recorded that it stopped, and nothing knows why".
+`STOPPED` is the second of those; the host being unreachable as well
+still reads OFF, because the box being gone dominates.

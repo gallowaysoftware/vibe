@@ -8,6 +8,7 @@ package fleetapi
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -521,6 +522,16 @@ func TestSleepSchedule_AbandonsAfterTheDeferWindow(t *testing.T) {
 	presenceOf(s, sleepCell) // announcing, in-flight never reported: deferred
 	sp, e := &suspendProbe{}, sleepEntry()
 	e.MaxDefer = 30 * time.Minute
+	// The fixture's suspend cron is a REAL time of day (23:30 UTC) and
+	// `now` is the real clock, so this test used to fail for every run
+	// started inside the 31 minutes before it: the second evaluation
+	// crossed the cron minute, the suspend re-armed, DeferredSince and
+	// deferUntil reset, and the night was never abandoned. That is a
+	// ~2%-of-the-day red CI measuring the wall clock rather than the
+	// abandonment rule. Pin the cron half a day from whatever time it is
+	// — `armed` supplies the due suspend this test actually drives.
+	far := time.Now().UTC().Add(12 * time.Hour)
+	e.Suspend = fmt.Sprintf("%d %d * * *", far.Minute(), far.Hour())
 	cfg := sleepCfg(s, sp, nil, nil)
 	now := time.Now()
 	st := armed(s, now)
