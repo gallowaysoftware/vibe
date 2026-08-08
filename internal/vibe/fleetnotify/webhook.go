@@ -91,11 +91,24 @@ type WebhookConfig struct {
 	Token string
 	// Format is FormatText (default) or FormatJSON.
 	Format string
-	// Timeout bounds one attempt (default 10s).
+	// Timeout bounds one attempt (default defaultAttemptTimeout). It is
+	// the ONLY bound on a far side that accepts the connection and then
+	// says nothing — the Deliverer's retry budget bounds attempts, not the
+	// wall time of one, and ctx bounds shutdown, not a hung POST. An ntfy
+	// behind a reverse proxy that stalls is the shape this catches;
+	// connection-refused, the only unreachable this package used to be
+	// tested against, never reaches a timer at all.
 	Timeout time.Duration
-	// Client overrides the HTTP client (tests).
+	// Client overrides the HTTP client (tests). Timeout still applies: it
+	// is copied onto the client rather than dropped, because a declared
+	// bound that silently does nothing is worse than no field.
 	Client *http.Client
 }
+
+// defaultAttemptTimeout bounds one delivery attempt when the caller
+// declares none. The production caller (daemon.startNotifyLoop) declares
+// none, so this is the number that actually runs.
+const defaultAttemptTimeout = 10 * time.Second
 
 // WebhookSink posts notifications to one endpoint.
 type WebhookSink struct {
@@ -134,11 +147,23 @@ func NewWebhookSink(cfg WebhookConfig) (*WebhookSink, error) {
 	}
 	timeout := cfg.Timeout
 	if timeout <= 0 {
-		timeout = 10 * time.Second
+		timeout = defaultAttemptTimeout
 	}
+	// An injected client must still end up bounded. Copy rather than
+	// mutate — the client belongs to the caller and its Transport is meant
+	// to be shared — and let an explicit cfg.Timeout win over whatever the
+	// client carries, because a declared bound that silently does nothing
+	// is worse than no field at all. A client that already declares its own
+	// deadline and a config that declares none is left exactly as handed
+	// over.
 	hc := cfg.Client
-	if hc == nil {
+	switch {
+	case hc == nil:
 		hc = &http.Client{Timeout: timeout}
+	case cfg.Timeout > 0 && hc.Timeout != cfg.Timeout, hc.Timeout <= 0:
+		cp := *hc
+		cp.Timeout = timeout
+		hc = &cp
 	}
 	if u.Scheme == "http" && u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost" && u.Hostname() != "::1" {
 		// The topic is IN the path, so plaintext puts a bearer-equivalent
