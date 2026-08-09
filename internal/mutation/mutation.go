@@ -735,6 +735,21 @@ var Registry = []Mutation{
 			"config instead of the defs is what makes this cover the class rather than the two paths " +
 			"into it that are known today.",
 	},
+	{
+		Name:     "c26a/the catalog check runs before the extras merge again",
+		File:     "internal/vibe/router/render.go",
+		Find:     "\t\tif err := checkCatalogIDsUnique(mergedCfg); err != nil {",
+		Replace:  "\t\tif err := checkCatalogIDsUnique(cfg); err != nil {",
+		Pkg:      "./internal/vibe/router/",
+		MustFail: []string{"TestRender_NoCatalogIDIsAdvertisedTwice"},
+		Why: "the entry above pinned the check and NOT where it runs, and the check shipped upstream " +
+			"of the extras merge — so the namespace invariant held everywhere except the front, which " +
+			"is the one host that always renders with extras (fleet.front_extras carries its apiKeys) " +
+			"and the one config the whole fleet dials. mergeExtras guards the map KEYS it merges and " +
+			"nothing inside them, so an extras alias or a model id under an extras peer went into the " +
+			"catalog unexamined: three entries advertising one id, exit 0. This mutation is the shipped " +
+			"defect exactly — check the pre-merge structure — and it must stay red.",
+	},
 
 	// ── class 7: a starter template the loader then refuses ───────────
 	{

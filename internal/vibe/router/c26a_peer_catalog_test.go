@@ -16,8 +16,12 @@ package router
 // def.Name and only def.Name.
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
@@ -140,6 +144,13 @@ func TestRender_TheAliasPeerCollisionSurfacesFromRender(t *testing.T) {
 //
 // The check runs over the rendered config — the artifact clients see — so
 // it covers the class rather than the two known paths into it.
+//
+// "The rendered config" has two halves, which is what the extras subtests
+// below are here for: what the defs render, and what the extras merge
+// then folds into the same maps. This test asserted only the first for
+// three phases, so the check it is the backstop for ran only over the
+// first, and the front — which never renders without extras — was the
+// host the invariant did not hold on.
 func TestRender_NoCatalogIDIsAdvertisedTwice(t *testing.T) {
 	t.Run("a def named after a peer's model id", func(t *testing.T) {
 		// No alias involved anywhere, so alias resolution is not even
@@ -198,4 +209,239 @@ func TestRender_NoCatalogIDIsAdvertisedTwice(t *testing.T) {
 			t.Errorf("peer models = %v, want both ids", got)
 		}
 	})
+
+	// ── the extras half ──────────────────────────────────────────────
+	//
+	// Every case above renders with no extras file, and that was the
+	// gap between what this test's name claimed and what it asserted.
+	// The check ran on the config built from defs, BEFORE mergeExtras
+	// folded the extras file into the same models:/peers: maps — so the
+	// invariant held on every host except the one it matters most on.
+	// The front always renders with extras (fleet.front_extras is where
+	// its apiKeys come from, AGENTS.md), which makes the front the one
+	// config the whole fleet dials and the one config the namespace rule
+	// did not cover.
+	//
+	// mergeExtras has a guard of its own, and it works — for the map KEYS
+	// it merges, pinned below so nobody "hardens" the half that was never
+	// broken. It looks at nothing INSIDE those keys: an alias list, or a
+	// model id under an extras peer, went straight into the catalog.
+
+	t.Run("extras: an alias collides with a def name", func(t *testing.T) {
+		out, err := Render([]*profile.BackendDef{llamaDef("alpha", "alpha-legacy")}, Options{
+			LlamaServerBinary: testBinary,
+			ExtrasPath: extrasFile(t, `models:
+  bravo:
+    cmd: /bin/true
+    ttl: 300
+    aliases: [alpha]
+`),
+		})
+		wantExtrasCollision(t, out, err, `"alpha"`, "models.alpha", "alias of models.bravo")
+	})
+
+	t.Run("extras: an alias collides with a def's alias", func(t *testing.T) {
+		// The escape as filed: three entries advertise alpha-legacy (the
+		// def's alias, the extras model's alias, the extras peer's model
+		// id) and the render used to exit 0.
+		out, err := Render([]*profile.BackendDef{llamaDef("alpha", "alpha-legacy")}, Options{
+			LlamaServerBinary: testBinary,
+			ExtrasPath: extrasFile(t, `models:
+  bravo:
+    cmd: /bin/true
+    ttl: 300
+    aliases: [alpha-legacy]
+peers:
+  simcell:
+    proxy: http://127.0.0.1:9101
+    models: [alpha-legacy]
+`),
+		})
+		wantExtrasCollision(t, out, err, `"alpha-legacy"`, "alias of models.alpha", "alias of models.bravo")
+	})
+
+	t.Run("extras: two extras aliases collide with each other", func(t *testing.T) {
+		// Neither claimant is a def, so nothing upstream of the merged
+		// config can see this one at all.
+		out, err := Render([]*profile.BackendDef{llamaDef("alpha", "alpha-legacy")}, Options{
+			LlamaServerBinary: testBinary,
+			ExtrasPath: extrasFile(t, `models:
+  bravo:
+    cmd: /bin/true
+    ttl: 300
+    aliases: [shared]
+  charlie:
+    cmd: /bin/true
+    ttl: 300
+    aliases: [shared]
+`),
+		})
+		wantExtrasCollision(t, out, err, `"shared"`, "alias of models.bravo", "alias of models.charlie")
+	})
+
+	t.Run("extras: a peer's model id collides with a def name", func(t *testing.T) {
+		out, err := Render([]*profile.BackendDef{llamaDef("alpha", "alpha-legacy")}, Options{
+			LlamaServerBinary: testBinary,
+			ExtrasPath: extrasFile(t, `peers:
+  simcell:
+    proxy: http://127.0.0.1:9101
+    models: [alpha]
+`),
+		})
+		wantExtrasCollision(t, out, err, `"alpha"`, "models.alpha", "peers.simcell")
+	})
+
+	t.Run("extras: a peer's model id collides with a def's alias", func(t *testing.T) {
+		out, err := Render([]*profile.BackendDef{llamaDef("alpha", "alpha-legacy")}, Options{
+			LlamaServerBinary: testBinary,
+			ExtrasPath: extrasFile(t, `peers:
+  simcell:
+    proxy: http://127.0.0.1:9101
+    models: [alpha-legacy]
+`),
+		})
+		wantExtrasCollision(t, out, err, `"alpha-legacy"`, "alias of models.alpha", "peers.simcell")
+	})
+
+	t.Run("extras: a peer's model id collides on the front render", func(t *testing.T) {
+		// The front, where this is not hypothetical: its whole catalog is
+		// peer stanzas and it always merges extras.
+		defs := []*profile.BackendDef{claimDef("gpu-coder", "gpu", false, "best-coder")}
+		out, err := Render(defs, Options{
+			Cell: fleetcfg.FrontCell, Hosts: testHosts(t, peerCatalogHosts), LlamaServerBinary: testBinary,
+			ExtrasPath: extrasFile(t, `peers:
+  simcell:
+    proxy: http://127.0.0.1:9101
+    models: [best-coder]
+`),
+		})
+		wantExtrasCollision(t, out, err, `"best-coder"`, "peers.gpu", "peers.simcell")
+	})
+
+	t.Run("extras: a models key collision is still mergeExtras' catch", func(t *testing.T) {
+		// The half that already worked, pinned: this must keep failing at
+		// the merge, with the message that tells the operator to express
+		// it in the def — not fall through to the catalog check.
+		_, err := Render([]*profile.BackendDef{llamaDef("alpha", "alpha-legacy")}, Options{
+			LlamaServerBinary: testBinary,
+			ExtrasPath: extrasFile(t, `models:
+  alpha:
+    cmd: /bin/true
+    ttl: 300
+`),
+		})
+		if err == nil {
+			t.Fatal("an extras models: key that shadows a rendered def merged silently")
+		}
+		for _, want := range []string{"models.alpha", "express it in the def instead"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not contain %q — the merge guard is the right layer for a key collision", err, want)
+			}
+		}
+	})
+
+	t.Run("extras: a legitimate file still renders, extras-only sections and all", func(t *testing.T) {
+		// The ceiling on the whole extras half. A guard that refuses the
+		// front's real extras file would take the fleet down harder than
+		// the defect it fixes: apiKeys, arbitrary-cmd tenants, sim peers
+		// and routing: all live in this file and none of them are things
+		// swapConfig models.
+		out, err := Render([]*profile.BackendDef{llamaDef("alpha", "alpha-legacy")}, Options{
+			LlamaServerBinary: testBinary,
+			ExtrasPath: extrasFile(t, `models:
+  bravo:
+    cmd: /bin/true
+    ttl: 300
+    aliases: [bravo-legacy]
+peers:
+  simcell:
+    proxy: http://127.0.0.1:9101
+    models: [remote-1]
+apiKeys:
+  - sk-front-key
+routing:
+  router:
+    use: group
+`),
+		})
+		if err != nil {
+			t.Fatalf("a legitimate extras file was refused: %v", err)
+		}
+		cfg := parseRendered(t, out)
+		if got := cfg.Models["alpha"].Aliases; len(got) != 1 || got[0] != "alpha-legacy" {
+			t.Errorf("def alpha aliases = %v, want [alpha-legacy] (the merge must not disturb the render)", got)
+		}
+		if _, ok := cfg.Models["bravo"]; !ok {
+			t.Error("extras model bravo missing from the merged config")
+		}
+		if got := cfg.Peers["simcell"].Models; len(got) != 1 || got[0] != "remote-1" {
+			t.Errorf("extras peer models = %v, want [remote-1]", got)
+		}
+		var whole map[string]any
+		if err := yaml.Unmarshal([]byte(out), &whole); err != nil {
+			t.Fatalf("merged config is not YAML: %v", err)
+		}
+		// The reparse the check does is a plain Unmarshal for exactly
+		// this reason: KnownFields(true) would reject both of these and
+		// take the front's credential with it.
+		for _, section := range []string{"routing", "apiKeys"} {
+			if _, ok := whole[section]; !ok {
+				t.Errorf("extras-only section %q was lost — the catalog check must not filter the merged config", section)
+			}
+		}
+	})
+
+	t.Run("extras: an empty model entry is refused, not panicked on", func(t *testing.T) {
+		// `models:\n  ghost:` decodes to a nil *swapModel. The check now
+		// reads user-authored bytes, so a hand-written extras file must
+		// not be able to crash the renderer — llama-swap gets to have the
+		// opinion about a model with no cmd.
+		out, err := Render([]*profile.BackendDef{llamaDef("alpha", "alpha-legacy")}, Options{
+			LlamaServerBinary: testBinary,
+			ExtrasPath: extrasFile(t, `models:
+  ghost:
+`),
+		})
+		if err != nil {
+			t.Fatalf("an empty extras model entry: %v", err)
+		}
+		if !strings.Contains(out, "ghost") {
+			t.Errorf("the empty entry vanished from the merge:\n%s", out)
+		}
+	})
+}
+
+// extrasFile writes a router-extras file under t.TempDir() and returns
+// its path.
+//
+// Always an explicit path: Options.ExtrasPath defaults, in the CLI, to
+// the operator's live ~/.config/vibe/router-extras.yaml, and a unit test
+// that reads the running fleet's config has bitten this package before.
+func extrasFile(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "router-extras.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write extras fixture: %v", err)
+	}
+	return path
+}
+
+// wantExtrasCollision asserts the render refused, names the contested id
+// and both claimants, and says the duplicate came from the EXTRAS file.
+//
+// The last part is not decoration. The pre-merge check's message is
+// phrased for a defect in the defs; reused verbatim for a collision that
+// only exists after the merge, it sends an operator to audit
+// ~/.config/vibe/backends/, where every def is innocent and nothing they
+// can change will fix it.
+func wantExtrasCollision(t *testing.T, out string, err error, want ...string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("the extras merge put two entries in the catalog under one id and the render said nothing:\n%s", out)
+	}
+	for _, w := range append(want, "router extras", "front_extras") {
+		if !strings.Contains(err.Error(), w) {
+			t.Errorf("error %q does not mention %q", err, w)
+		}
+	}
 }
