@@ -179,3 +179,77 @@ func TestRenderMermaid_LabelEscapeOnSpecialCharacters(t *testing.T) {
 		t.Fatalf("expected quoted label around capability containing a colon, got:\n%s", got)
 	}
 }
+
+// vizStage builds a one-stage pipeline whose capability is the string
+// under test — capability goes straight into the node label and is the
+// one label component Validate never charset-checks.
+func vizStage(capability string) *Pipeline {
+	return &Pipeline{
+		Name: "esc",
+		Stages: []Stage{{
+			ID:         "weird",
+			Type:       StageTypeText,
+			Capability: capability,
+			Prompt:     "hi",
+			Output:     "x.txt",
+		}},
+	}
+}
+
+// TestRenderMermaid_QuotedLabelUsesMermaidEntitiesNotBackslashes covers
+// what the sibling test's name implies but its assertion cannot reach:
+// the one line of escapeLabel that transforms label CONTENT. Mermaid
+// has no backslash escape inside a quoted label — the entity is
+// #quot; — so emitting \" produced the very parse error the quoting
+// exists to prevent.
+func TestRenderMermaid_QuotedLabelUsesMermaidEntitiesNotBackslashes(t *testing.T) {
+	got := RenderMermaid(vizStage(`say "hi"`), VizOptions{})
+	if strings.Contains(got, `\"`) {
+		t.Errorf("backslash escape is not Mermaid syntax; it is a parse error:\n%s", got)
+	}
+	if !strings.Contains(got, "#quot;hi#quot;") {
+		t.Errorf("embedded quotes should become #quot; entities, got:\n%s", got)
+	}
+	// A literal # is the entity introducer and must itself be escaped,
+	// or it swallows whatever follows it.
+	hash := RenderMermaid(vizStage("c#1"), VizOptions{})
+	if !strings.Contains(hash, "c#35;1") {
+		t.Errorf("literal # should become #35;, got:\n%s", hash)
+	}
+}
+
+// TestRenderMermaid_LabelCannotInjectFlowchartSyntax pins the widened
+// trigger. The old denylist (`:|"()[]`) held none of the characters
+// that can inject STRUCTURE, and Stage.Capability is never charset-
+// validated — Validate only requires it to be non-empty — so a
+// model-generated `capability: "a-->b"` emitted an unquoted
+// `weird[a · a-->b]`, which Mermaid reads as an extra edge.
+func TestRenderMermaid_LabelCannotInjectFlowchartSyntax(t *testing.T) {
+	for _, capability := range []string{"a-->b", "a<b", "a{b}", "a;b", "a&b"} {
+		got := RenderMermaid(vizStage(capability), VizOptions{})
+		line := ""
+		for _, l := range strings.Split(got, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(l), "weird[") {
+				line = strings.TrimSpace(l)
+				break
+			}
+		}
+		if line == "" {
+			t.Fatalf("capability %q: no node line in:\n%s", capability, got)
+		}
+		if !strings.HasPrefix(line, `weird["`) || !strings.HasSuffix(line, `"]`) {
+			t.Errorf("capability %q rendered unquoted: %s", capability, line)
+		}
+	}
+	// An inert label is still emitted bare, so the allowlist has not
+	// simply become "quote everything unconditionally". Asserted against
+	// escapeLabel directly: every RENDERED label carries the " · "
+	// separator, which is itself outside the inert set, so the bare form
+	// is unreachable through RenderMermaid.
+	if got := escapeLabel("write draft 2.0"); got != "write draft 2.0" {
+		t.Errorf("inert label was quoted: %q", got)
+	}
+	if got := escapeLabel("a-b"); got == "a-b" {
+		t.Error(`"a-b" must be quoted: a hyphen is one keystroke from an edge`)
+	}
+}

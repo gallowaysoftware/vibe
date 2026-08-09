@@ -190,11 +190,22 @@ func Compare(runA, runB string, opts CompareOpts) (DiffReport, error) {
 	// way the user reads the YAML even when stages were added/removed.
 	rep.Stages = compareStages(a, b, opts)
 	if opts.StageFilter != "" {
+		known := make([]string, 0, len(rep.Stages))
 		filtered := rep.Stages[:0]
 		for _, s := range rep.Stages {
+			known = append(known, s.ID)
 			if s.ID == opts.StageFilter {
 				filtered = append(filtered, s)
 			}
+		}
+		// A filter that matches nothing is a typo, not a finding. Left
+		// silent it produced a report with the headers, zero stage
+		// blocks and a zero exit status — indistinguishable from "these
+		// two runs agree about that stage". The sibling command already
+		// refuses this: RenderStageForPipeline returns
+		// `stage %q not found (have: …)`.
+		if len(filtered) == 0 {
+			return DiffReport{}, fmt.Errorf("stage %q not found in either run (have: %s)", opts.StageFilter, strings.Join(known, ", "))
 		}
 		rep.Stages = filtered
 	}
@@ -602,6 +613,15 @@ func renderStagePromptForDiff(r *diffRun, stageID string) string {
 			}
 			if data, err := os.ReadFile(path); err == nil {
 				raw = string(data)
+			} else {
+				// Identical to the text branch, which had this and
+				// this one did not. Without it raw stays "", both
+				// sides render to "", compareStages sees them as
+				// equal, and a render stage whose prompt_file CHANGED
+				// between the two runs shows no diff at all —
+				// precisely when the file isn't reachable from the run
+				// dir, which the note above says is the normal case.
+				return "prompt_file: " + st.PromptFile
 			}
 		}
 		out, err := renderTemplate(stageID+":prompt", raw, st.Inputs, r.inputs, prior, r.path, nil)
@@ -676,6 +696,19 @@ func stagePriorOutputs(r *diffRun) map[string]*stageResult {
 			out[st.ID] = &stageResult{}
 			continue
 		}
+		// Same containment rule the executor and the dry run apply. The
+		// pipeline this path renders came from the run dir's
+		// pipeline.yaml.snapshot, which Executor.snapshot() writes
+		// VERBATIM before any stage runs — so a pipeline whose output
+		// template the executor would have refused still leaves the
+		// template on disk for the differ to render. filepath.Join
+		// cleans but does not contain, so without this an `output:`
+		// of "../../../../etc/passwd" is read and, being textual, is
+		// embedded whole into the diff report.
+		if err := ensureUnderRunDir(outPath); err != nil {
+			out[st.ID] = &stageResult{}
+			continue
+		}
 		full := filepath.Join(r.path, outPath)
 		data, err := os.ReadFile(full)
 		if err != nil {
@@ -741,6 +774,12 @@ func stageOutputMetadataOnly(r *diffRun, stageID string) StageOutputSide {
 	prior := stagePriorOutputs(r)
 	outPath, err := renderTemplate(stageID+":output", st.Output, st.Inputs, r.inputs, prior, r.path, nil)
 	if err != nil {
+		return StageOutputSide{Missing: true}
+	}
+	// Second of the two run-dir-escape paths in this file; see the note
+	// in stagePriorOutputs. This one feeds loadStageOutput, which reads
+	// the file and puts its bytes in StageOutputSide.Content.
+	if err := ensureUnderRunDir(outPath); err != nil {
 		return StageOutputSide{Missing: true}
 	}
 	full := filepath.Join(r.path, outPath)
@@ -813,10 +852,33 @@ func unifiedDiff(a, b, labelA, labelB string) string {
 	aLines := splitLinesKeepEmpty(a)
 	bLines := splitLinesKeepEmpty(b)
 	hunks := lineHunks(aLines, bLines)
-	if len(hunks) == 0 {
-		return ""
-	}
 	var out strings.Builder
+	if len(hunks) == 0 {
+		// a != b, yet every LINE matched. The difference is below line
+		// granularity: splitLinesKeepEmpty strips exactly one trailing
+		// newline, so "x\n" and "x" both become ["x"].
+		//
+		// Returning "" here is the sentinel for "no change", and every
+		// caller reads it that way — compareStages stores it, and the
+		// renderer then prints "output: (identical)" for two outputs
+		// that are NOT identical. Emit the difference git emits for
+		// the same case instead, so a real change is never rendered as
+		// its own absence.
+		fmt.Fprintf(&out, "--- %s\n", labelA)
+		fmt.Fprintf(&out, "+++ %s\n", labelB)
+		out.WriteString("@@ trailing-newline @@\n")
+		if strings.HasSuffix(a, "\n") {
+			out.WriteString("-\\ file ends with a newline\n")
+		} else {
+			out.WriteString("-\\ No newline at end of file\n")
+		}
+		if strings.HasSuffix(b, "\n") {
+			out.WriteString("+\\ file ends with a newline\n")
+		} else {
+			out.WriteString("+\\ No newline at end of file\n")
+		}
+		return out.String()
+	}
 	fmt.Fprintf(&out, "--- %s\n", labelA)
 	fmt.Fprintf(&out, "+++ %s\n", labelB)
 	for _, h := range hunks {

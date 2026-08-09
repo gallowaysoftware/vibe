@@ -3,8 +3,10 @@ package vamp
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -264,6 +266,79 @@ func TestExecutor_DryRunForeachItemsFromUpstream(t *testing.T) {
 			t.Errorf("expected %q in stubbed dry-run output, got:\n%s", want, stubGot)
 		}
 	}
+}
+
+// TestDryRunForeachElisionCountMatchesWhatWasElided pins the "... (N more
+// item(s) elided)" footer against what the loop above it actually skipped.
+// The print loop ALWAYS renders the last item (its `i < len(items)-1`
+// clause), so the old `len(items) - maxItemsToPrint` arithmetic
+// over-counted by one for every foreach past the cap — and at exactly
+// cap+1 items it announced an elision when nothing had been elided.
+//
+// Driven through dryRunForeachStage directly with a pre-seeded upstream:
+// DryRun's own synthetic outputs are always a 2-element array, so no
+// end-to-end pipeline can currently push a foreach past the cap.
+func TestDryRunForeachElisionCountMatchesWhatWasElided(t *testing.T) {
+	cases := []struct {
+		items int
+		want  string // "" means: no elision footer at all
+	}{
+		{items: 5, want: ""},  // 4 printed + the last one = all 5
+		{items: 6, want: "1"}, // 4 + last = 5 printed, 1 elided
+		{items: 10, want: "5"},
+	}
+	for _, tc := range cases {
+		var logBuf bytes.Buffer
+		exec := &Executor{
+			Pipeline:     &Pipeline{Name: "elide"},
+			Capabilities: &Capabilities{Mapping: map[string]CapabilityBinding{"reasoning": {Profile: "code"}}},
+			RunDir:       t.TempDir(),
+			Log:          &logBuf,
+		}
+		items := make([]string, tc.items)
+		for i := range items {
+			items[i] = fmt.Sprintf("%q", fmt.Sprintf("it%d", i))
+		}
+		state := &dryRunState{
+			executor:   exec,
+			stageOuts:  map[string]*stageResult{"src": {Output: "[" + strings.Join(items, ",") + "]"}},
+			stubbedFor: map[string]bool{},
+		}
+		st := &Stage{
+			ID: "consumer", Capability: "reasoning",
+			Inputs:  []string{"src"},
+			Foreach: &ForeachSpec{From: "src", Var: "it"},
+			Prompt:  "do {{.it}}",
+			Output:  "items/{{.it}}.txt",
+		}
+		if err := state.dryRunForeachStage(context.Background(), st, StageTypeText); err != nil {
+			t.Fatalf("%d items: %v", tc.items, err)
+		}
+		got := logBuf.String()
+		printed := strings.Count(got, "  item ")
+		if tc.want == "" {
+			if strings.Contains(got, "elided") {
+				t.Errorf("%d items: printed %d of %d and still claimed an elision:\n%s", tc.items, printed, tc.items, got)
+			}
+			continue
+		}
+		want := "... (" + tc.want + " more item(s) elided)"
+		if !strings.Contains(got, want) {
+			t.Errorf("%d items: want %q (printed %d), got:\n%s", tc.items, want, printed, got)
+		}
+		// The footer must agree with the number of item blocks printed.
+		if printed+atoiOrZero(tc.want) != tc.items {
+			t.Errorf("%d items: printed %d + elided %s != %d", tc.items, printed, tc.want, tc.items)
+		}
+	}
+}
+
+func atoiOrZero(s string) int {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // TestExecutor_DryRunDetectsForeachCollision verifies that two foreach items

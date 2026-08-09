@@ -2570,11 +2570,20 @@ func addIntTemplate(a, b int) int {
 // Returns a JSON array of strings; the caller is responsible for
 // re-wrapping each chunk with its source segment's host/voice/id.
 // maxChars <= 0 defaults to 300.
+//
+// Empty / whitespace-only input returns `[]`, matching
+// chunkParagraphsTemplate. It used to return `[""]`: one chunk holding
+// the empty string, which a TTS foreach dutifully fanned out into a
+// synthesis call with nothing to say. An upstream stage that produced
+// nothing must not read downstream as one unit of work.
 func splitSentencesTemplate(text string, maxChars int) string {
 	if maxChars <= 0 {
 		maxChars = 300
 	}
 	text = strings.TrimSpace(text)
+	if text == "" {
+		return "[]"
+	}
 	if len(text) <= maxChars {
 		b, _ := json.Marshal([]string{text})
 		return string(b)
@@ -2679,7 +2688,12 @@ func chunkParagraphsTemplate(text string, maxChars int) (string, error) {
 		Idx  int    `json:"idx"`
 		Text string `json:"text"`
 	}
-	var out []chunk
+	// Non-nil: a nil slice marshals to `null`, not `[]`, and this
+	// function's contract (and its only consumer, a foreach source) is an
+	// ARRAY. resolveForeachItems rejects a JSON null with "must be a JSON
+	// array ... got <nil>", so empty input used to fail the downstream
+	// stage instead of fanning out zero items.
+	out := []chunk{}
 	var cur strings.Builder
 	flush := func() {
 		s := strings.TrimSpace(cur.String())
@@ -2734,38 +2748,9 @@ func uniqueByKeyTemplate(key, raw string) (string, error) {
 	if key == "" {
 		return "", fmt.Errorf("uniqueByKey: key is required")
 	}
-	var b strings.Builder
-	for _, line := range strings.Split(raw, "\n") {
-		trim := strings.TrimSpace(line)
-		if trim == "```json" || trim == "```JSON" || trim == "```" {
-			continue
-		}
-		b.WriteString(line)
-		b.WriteByte('\n')
-	}
-	dec := json.NewDecoder(strings.NewReader(b.String()))
-	var flat []any
-	for {
-		var v any
-		err := dec.Decode(&v)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return "", fmt.Errorf("uniqueByKey: decode at offset %d: %w", dec.InputOffset(), err)
-		}
-		switch t := v.(type) {
-		case []any:
-			flat = append(flat, t...)
-		case map[string]any:
-			if items, ok := t["items"].([]any); ok {
-				flat = append(flat, items...)
-			} else {
-				flat = append(flat, t)
-			}
-		default:
-			flat = append(flat, t)
-		}
+	flat, err := jsonItems(raw)
+	if err != nil {
+		return "", fmt.Errorf("uniqueByKey: %w", err)
 	}
 	seen := make(map[string]bool)
 	var out []any
@@ -2817,38 +2802,9 @@ func filterByFieldTemplate(field, raw string) (string, error) {
 	if field == "" {
 		return "", fmt.Errorf("filterByField: field is required")
 	}
-	var b strings.Builder
-	for _, line := range strings.Split(raw, "\n") {
-		trim := strings.TrimSpace(line)
-		if trim == "```json" || trim == "```JSON" || trim == "```" {
-			continue
-		}
-		b.WriteString(line)
-		b.WriteByte('\n')
-	}
-	dec := json.NewDecoder(strings.NewReader(b.String()))
-	var flat []any
-	for {
-		var v any
-		err := dec.Decode(&v)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return "", fmt.Errorf("filterByField: decode at offset %d: %w", dec.InputOffset(), err)
-		}
-		switch t := v.(type) {
-		case []any:
-			flat = append(flat, t...)
-		case map[string]any:
-			if items, ok := t["items"].([]any); ok {
-				flat = append(flat, items...)
-			} else {
-				flat = append(flat, t)
-			}
-		default:
-			flat = append(flat, t)
-		}
+	flat, err := jsonItems(raw)
+	if err != nil {
+		return "", fmt.Errorf("filterByField: %w", err)
 	}
 	out := []any{}
 	for _, item := range flat {
@@ -3001,13 +2957,17 @@ func joinByFieldTemplate(field, leftRaw, rightRaw string) (string, error) {
 	return string(res), nil
 }
 
-// jsonItems decodes the same input shapes flattenItems /
-// uniqueByKey / filterByField accept (bare JSON array, wrapped
-// object, foreach-concatenated stream with optional markdown
-// fences) into a flat []any. Centralised so each helper that
-// accepts foreach output reads it consistently.
-func jsonItems(raw string) ([]any, error) {
+// stripJSONFences removes whole-line markdown code-fence markers
+// (```json / ```JSON / ```) from raw, leaving every other line intact.
+// LLM stages emit them even when the prompt forbids them.
+//
+// One implementation for the whole package on purpose: this used to be
+// copy-pasted into five helpers, which is precisely how a guard ends up
+// applied in one of N call paths. A fence form handled here is handled
+// by every helper that accepts foreach output.
+func stripJSONFences(raw string) string {
 	var b strings.Builder
+	b.Grow(len(raw))
 	for _, line := range strings.Split(raw, "\n") {
 		trim := strings.TrimSpace(line)
 		if trim == "```json" || trim == "```JSON" || trim == "```" {
@@ -3016,7 +2976,16 @@ func jsonItems(raw string) ([]any, error) {
 		b.WriteString(line)
 		b.WriteByte('\n')
 	}
-	dec := json.NewDecoder(strings.NewReader(b.String()))
+	return b.String()
+}
+
+// jsonItems decodes the same input shapes flattenItems /
+// uniqueByKey / filterByField accept (bare JSON array, wrapped
+// object, foreach-concatenated stream with optional markdown
+// fences) into a flat []any. Centralised so each helper that
+// accepts foreach output reads it consistently.
+func jsonItems(raw string) ([]any, error) {
+	dec := json.NewDecoder(strings.NewReader(stripJSONFences(raw)))
 	var out []any
 	for {
 		var v any
@@ -3055,18 +3024,20 @@ func jsonItems(raw string) ([]any, error) {
 // by quality, doesn't dedup by url (use uniqueByKey on the output for
 // that), doesn't fetch full content. Single responsibility: the wire
 // format of SearXNG responses → vamp's foreach-array shape.
+//
+// Two shapes of "nothing" are deliberately NOT the same thing. A search
+// that found nothing (`"results": []`, or `"results": null`, which
+// SearXNG emits for some engine sets) yields `{"items":[]}` and no
+// error — that is a real answer. Input holding no JSON response at all,
+// or a response object with no `results` KEY, is a wrong-shaped
+// upstream (an error body, a proxy page, an LLM echo, a webhook stage
+// that wrote nothing) and is an error. Without the distinction a
+// research pipeline whose search backend was down completes green with
+// zero sources and writes the report anyway.
 func parseSearXNGTemplate(raw string) (string, error) {
-	var b strings.Builder
-	for _, line := range strings.Split(raw, "\n") {
-		trim := strings.TrimSpace(line)
-		if trim == "```json" || trim == "```JSON" || trim == "```" {
-			continue
-		}
-		b.WriteString(line)
-		b.WriteByte('\n')
-	}
-	dec := json.NewDecoder(strings.NewReader(b.String()))
+	dec := json.NewDecoder(strings.NewReader(stripJSONFences(raw)))
 	var out []map[string]any
+	responses := 0
 	for {
 		var resp map[string]any
 		err := dec.Decode(&resp)
@@ -3076,8 +3047,15 @@ func parseSearXNGTemplate(raw string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("parseSearXNG: decode at offset %d: %w", dec.InputOffset(), err)
 		}
-		results, ok := resp["results"].([]any)
+		responses++
+		rawResults, hasKey := resp["results"]
+		if !hasKey {
+			return "", fmt.Errorf("parseSearXNG: response %d has no \"results\" field (not a SearXNG /search?format=json body)", responses)
+		}
+		results, ok := rawResults.([]any)
 		if !ok {
+			// Present but null (or a scalar): treat as an empty result
+			// set, which is what SearXNG means by it.
 			continue
 		}
 		for _, r := range results {
@@ -3099,6 +3077,9 @@ func parseSearXNGTemplate(raw string) (string, error) {
 				"snippet":     obj["content"],
 			})
 		}
+	}
+	if responses == 0 {
+		return "", fmt.Errorf("parseSearXNG: input decoded to no JSON response at all (upstream stage produced nothing?)")
 	}
 	if out == nil {
 		out = []map[string]any{}
@@ -3122,6 +3103,15 @@ func parseSearXNGTemplate(raw string) (string, error) {
 // matched terms in <span class="searchmatch">…</span>); url is
 // constructed from the title via the canonical
 // en.wikipedia.org/wiki/<Title> shape.
+//
+// A MediaWiki response that carries no `query` object is a FAULT, not
+// an empty result: the zero-hit shape is
+// `{"query":{"searchinfo":{"totalhits":0},"search":[]}}`, so `query`
+// is always present on success. The absent case is an `{"error":{...}}`
+// body (bad param mix, invalid title, rate limit) or something that
+// isn't a MediaWiki response at all — and folding either into
+// `{"items":[]}` is how a research pipeline reports success on a
+// document with no sources in it.
 func parseWikipediaSearchTemplate(raw string) (string, error) {
 	var resp map[string]any
 	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &resp); err != nil {
@@ -3129,11 +3119,11 @@ func parseWikipediaSearchTemplate(raw string) (string, error) {
 	}
 	query, ok := resp["query"].(map[string]any)
 	if !ok {
-		return `{"items":[]}`, nil
+		return "", fmt.Errorf("parseWikipediaSearch: response has no \"query\" object%s", mediawikiErrorSuffix(resp))
 	}
 	hits, ok := query["search"].([]any)
 	if !ok {
-		return `{"items":[]}`, nil
+		return "", fmt.Errorf("parseWikipediaSearch: response has no \"query.search\" array%s", mediawikiErrorSuffix(resp))
 	}
 	out := []map[string]any{}
 	for _, raw := range hits {
@@ -3230,6 +3220,12 @@ func parseArxivTemplate(raw string) (string, error) {
 // page (or one redirect target). Multi-page responses return only
 // the first page; if a pipeline needs multi-page fan-out it should
 // query each title separately.
+//
+// Same distinction parseWikipediaSearchTemplate draws: a page that
+// does not exist comes back as a `query.pages` entry with pageid -1
+// and is skipped (empty items, no error); a response with no `query`
+// object at all is a MediaWiki error or a non-MediaWiki body and is
+// an error.
 func parseWikipediaExtractTemplate(raw string) (string, error) {
 	var resp map[string]any
 	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &resp); err != nil {
@@ -3237,11 +3233,11 @@ func parseWikipediaExtractTemplate(raw string) (string, error) {
 	}
 	query, ok := resp["query"].(map[string]any)
 	if !ok {
-		return `{"items":[]}`, nil
+		return "", fmt.Errorf("parseWikipediaExtract: response has no \"query\" object%s", mediawikiErrorSuffix(resp))
 	}
 	pages, ok := query["pages"].(map[string]any)
 	if !ok {
-		return `{"items":[]}`, nil
+		return "", fmt.Errorf("parseWikipediaExtract: response has no \"query.pages\" object%s", mediawikiErrorSuffix(resp))
 	}
 	out := []map[string]any{}
 	for _, raw := range pages {
@@ -3296,16 +3292,7 @@ func parseWikipediaExtractTemplate(raw string) (string, error) {
 // single-element items array of themselves) so callers don't have to
 // special-case the no-items shape.
 func flattenItemsTemplate(raw string) (string, error) {
-	var b strings.Builder
-	for _, line := range strings.Split(raw, "\n") {
-		trim := strings.TrimSpace(line)
-		if trim == "```json" || trim == "```JSON" || trim == "```" {
-			continue
-		}
-		b.WriteString(line)
-		b.WriteByte('\n')
-	}
-	dec := json.NewDecoder(strings.NewReader(b.String()))
+	dec := json.NewDecoder(strings.NewReader(stripJSONFences(raw)))
 	var out []any
 	for {
 		var v any
@@ -3405,6 +3392,30 @@ func stripDataURIsTemplate(s string) string {
 var mdDataURIRE = regexp.MustCompile(`!\[([^\]]*)\]\(data:[^)]*\)`)
 
 var wikiSearchTagRE = regexp.MustCompile(`<[^>]*>`)
+
+// mediawikiErrorSuffix renders the `{"error":{"code":…,"info":…}}`
+// body MediaWiki returns on a rejected request as a trailing clause,
+// so the operator reading the failed stage sees WHY the API refused
+// rather than only that the shape was wrong. Empty when the response
+// carries no such object.
+func mediawikiErrorSuffix(resp map[string]any) string {
+	apiErr, ok := resp["error"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	code, _ := apiErr["code"].(string)
+	info, _ := apiErr["info"].(string)
+	switch {
+	case code != "" && info != "":
+		return fmt.Sprintf(" (MediaWiki error %s: %s)", code, info)
+	case code != "":
+		return fmt.Sprintf(" (MediaWiki error %s)", code)
+	case info != "":
+		return fmt.Sprintf(" (MediaWiki error: %s)", info)
+	default:
+		return " (MediaWiki returned an error object)"
+	}
+}
 
 // urlencodeTemplate percent-encodes v for safe use in a URL query
 // component. Accepts any value (stringified via fmt.Sprint) so foreach
@@ -3575,6 +3586,14 @@ func readFilesFromMatches(matches []string) (string, error) {
 //	{{ enumerateLessons "~/path/to/Module_1/Lesson_*" }}
 //
 // Filters out directories whose lesson.md exceeds 1 MB (textbooks).
+//
+// A glob that matches nothing is an ERROR, not an empty array — the
+// same contract readFilesTemplate and readLessonsTemplate already
+// enforce, and for the same reason: a typo'd or stale lesson root is
+// indistinguishable from a curriculum with no lessons once the result
+// is `[]`, and the foreach it feeds then completes green having done
+// no work. Likewise when every match is filtered out (not a directory,
+// no lesson.md, lesson.md over the size cap).
 func enumerateLessonsTemplate(pattern string) (string, error) {
 	if strings.HasPrefix(pattern, "~/") {
 		home, err := os.UserHomeDir()
@@ -3586,6 +3605,9 @@ func enumerateLessonsTemplate(pattern string) (string, error) {
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
 		return "", fmt.Errorf("enumerateLessons %s: %w", pattern, err)
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("enumerateLessons %s: no directories matched", pattern)
 	}
 	sort.Strings(matches)
 	const maxLessonSize = 1024 * 1024
@@ -3601,6 +3623,9 @@ func enumerateLessonsTemplate(pattern string) (string, error) {
 			continue
 		}
 		dirs = append(dirs, filepath.Base(m))
+	}
+	if len(dirs) == 0 {
+		return "", fmt.Errorf("enumerateLessons %s: %d matches but none is a directory holding a lesson.md under %d bytes", pattern, len(matches), maxLessonSize)
 	}
 	b, err := json.Marshal(dirs)
 	if err != nil {
@@ -3712,6 +3737,41 @@ func collapseWhitespace(s string) string {
 	return strings.TrimRight(out, " ")
 }
 
+// errLessonPathEscape marks a lesson name that resolves outside the
+// lesson root. Sentinel rather than a plain error for the same reason
+// errOutputPathEscape is one: it is the single failure a caller must
+// never fold into "this lesson simply has no images".
+var errLessonPathEscape = errors.New("lesson path escapes the lesson root")
+
+// lessonImageDir joins lessonRoot/<lesson>/images and refuses a lesson
+// name that resolves outside lessonRoot.
+//
+// This is the same threat ensureUnderRunDir documents, one directory
+// over. The lessons array these three helpers consume is a PRIOR
+// STAGE'S OUTPUT — `{{ enumerateImagePairs .inputs.lesson_root
+// .stages.list_lessons.output }}` — and a stage output is whatever the
+// model wrote. A lesson entry of "../../../../home/user/.ssh" makes
+// enumerateImagePairs emit image_path values pointing at files outside
+// the curriculum, and every one of those paths is then read by the
+// vision stage and attached to a prompt. filepath.Join alone does not
+// stop it: Join CLEANS, so the ".." segments are resolved rather than
+// rejected (an absolute lesson name is neutralised by Join, but ".."
+// is not).
+//
+// One shape of "stays under the root" for all three helpers,
+// deliberately: enumerateUniqueImages, enumerateImagePairs and
+// imageDescriptionsFor read the identical directory from the identical
+// untrusted array, and a guard on one of three is the defect class this
+// package keeps producing.
+func lessonImageDir(lessonRoot, lesson string) (string, error) {
+	dir := filepath.Join(lessonRoot, lesson, "images")
+	rel, err := filepath.Rel(lessonRoot, dir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%w: %q", errLessonPathEscape, lesson)
+	}
+	return dir, nil
+}
+
 // enumerateUniqueImagesTemplate walks every image referenced by the
 // given lessons (under `<lessonRoot>/<lesson>/images/`), hashes each
 // file's raw bytes, and returns one entry per unique content hash.
@@ -3748,7 +3808,10 @@ func enumerateUniqueImagesTemplate(lessonRoot, lessonsJSON string) (string, erro
 	}
 	seen := make(map[string]entry)
 	for _, lesson := range lessons {
-		imgDir := filepath.Join(root, lesson, "images")
+		imgDir, err := lessonImageDir(root, lesson)
+		if err != nil {
+			return "", fmt.Errorf("enumerateUniqueImages: %w", err)
+		}
 		entries, err := os.ReadDir(imgDir)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -3817,7 +3880,10 @@ func imageDescriptionsForLessonTemplate(runDir, lessonRoot, lesson string) (stri
 		".png": true, ".jpg": true, ".jpeg": true, ".gif": true,
 		".webp": true, ".bmp": true, ".svg": true,
 	}
-	imgDir := filepath.Join(root, lesson, "images")
+	imgDir, err := lessonImageDir(root, lesson)
+	if err != nil {
+		return "", fmt.Errorf("imageDescriptionsForLesson: %w", err)
+	}
 	entries, err := os.ReadDir(imgDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -3927,9 +3993,17 @@ func enumerateImagePairsTemplate(lessonRoot, lessonsJSON string) (string, error)
 		Image     string `json:"image"`
 		ImagePath string `json:"image_path"`
 	}
-	var pairs []pair
+	// Non-nil so a lesson set with no images marshals to `[]` rather than
+	// `null`. enumerateUniqueImages already emits `[]` (it builds through
+	// make); a `null` here reaches resolveForeachItems as a JSON null and
+	// fails with "foreach value must be a JSON array ... got <nil>"
+	// instead of an empty, well-formed fan-out.
+	pairs := []pair{}
 	for _, lesson := range lessons {
-		imgDir := filepath.Join(root, lesson, "images")
+		imgDir, err := lessonImageDir(root, lesson)
+		if err != nil {
+			return "", fmt.Errorf("enumerateImagePairs: %w", err)
+		}
 		entries, err := os.ReadDir(imgDir)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -3973,21 +4047,12 @@ func enumerateImagePairsTemplate(lessonRoot, lessonsJSON string) (string, error)
 // skipped) so a malformed per-item output fails the render stage with a
 // pointer at the offending position rather than dropping content downstream.
 func mergeJSONTemplate(raw string) (string, error) {
-	// Strip markdown code-fence markers anywhere in the input. We match the
-	// opening "```json" / "```" lines and closing "```" lines on a per-line
-	// basis so a fence that wraps one item doesn't accidentally consume the
-	// next. Inline-fence forms ("``` foo ```") aren't an LLM artifact we
-	// expect from JSON-output stages, so we don't try to handle them.
-	var b strings.Builder
-	for _, line := range strings.Split(raw, "\n") {
-		trim := strings.TrimSpace(line)
-		if trim == "```json" || trim == "```JSON" || trim == "```" {
-			continue
-		}
-		b.WriteString(line)
-		b.WriteByte('\n')
-	}
-	dec := json.NewDecoder(strings.NewReader(b.String()))
+	// stripJSONFences matches the opening "```json" / "```" lines and
+	// closing "```" lines on a per-line basis so a fence that wraps one
+	// item doesn't accidentally consume the next. Inline-fence forms
+	// ("``` foo ```") aren't an LLM artifact we expect from JSON-output
+	// stages, so we don't try to handle them.
+	dec := json.NewDecoder(strings.NewReader(stripJSONFences(raw)))
 	var merged []any
 	for {
 		var v any

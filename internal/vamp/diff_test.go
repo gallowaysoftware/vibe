@@ -401,6 +401,210 @@ func TestCompare_StageFilter(t *testing.T) {
 	}
 }
 
+// TestCompare_StageFilterNoMatchIsAnError pins that a typo'd --stage
+// fails instead of printing a clean, empty, exit-0 report that reads
+// like "these runs agree about that stage".
+func TestCompare_StageFilterNoMatchIsAnError(t *testing.T) {
+	root := t.TempDir()
+	start := time.Date(2026, 5, 15, 12, 0, 0, 0, time.Local)
+	rec := basicRec("demo", start,
+		StageRecord{ID: "script", DurationMS: 1, Status: "ok"},
+		StageRecord{ID: "render", DurationMS: 2, Status: "ok"},
+	)
+	a := writeDiffRun(t, root, "2026-05-15T12-00-00_a", rec, twoStageYAML, `{"topic":"x"}`, map[string]string{
+		"stages/script.md": "a\n", "stages/render.md": "a\n",
+	})
+	b := writeDiffRun(t, root, "2026-05-15T13-00-00_b", rec, twoStageYAML, `{"topic":"y"}`, map[string]string{
+		"stages/script.md": "b\n", "stages/render.md": "b\n",
+	})
+	_, err := Compare(a, b, CompareOpts{StageFilter: "scrpt"})
+	if err == nil {
+		t.Fatal("expected an error for a stage id present in neither run")
+	}
+	// The message must name what IS available, or the operator has to
+	// go read the yaml to find their typo.
+	if !strings.Contains(err.Error(), "script") || !strings.Contains(err.Error(), "render") {
+		t.Errorf("message should list the known stage ids, got %v", err)
+	}
+}
+
+// TestCompare_RefusesOutputPathEscapingTheRunDir pins the containment
+// rule on the differ, which was the one of four consumers of a rendered
+// `output:` template that did not apply it. Executor.snapshot writes
+// pipeline.yaml.snapshot verbatim BEFORE any stage runs, so a template
+// the executor would refuse still reaches this code — and the differ
+// reads the file and embeds textual content whole into its report.
+func TestCompare_RefusesOutputPathEscapingTheRunDir(t *testing.T) {
+	root := t.TempDir()
+	secret := filepath.Join(root, "secret.txt")
+	if err := writeFile(secret, "TOP-SECRET-CANARY\n"); err != nil {
+		t.Fatal(err)
+	}
+	// The run dirs live at <root>/<base>, so "../secret.txt" from
+	// inside a run dir resolves to the file above.
+	escapeYAML := "name: demo\nstages:\n  - id: x\n    type: text\n    capability: w\n" +
+		"    prompt: hi\n    output: ../secret.txt\n"
+	start := time.Date(2026, 5, 15, 12, 0, 0, 0, time.Local)
+	rec := basicRec("demo", start, StageRecord{ID: "x", DurationMS: 1, Status: "ok"})
+	a := writeDiffRun(t, root, "a", rec, escapeYAML, `{}`, nil)
+	b := writeDiffRun(t, root, "b", rec, escapeYAML, `{}`, nil)
+
+	rep, err := Compare(a, b, CompareOpts{})
+	if err != nil {
+		t.Fatalf("Compare: %v", err)
+	}
+	blob, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(blob), "TOP-SECRET-CANARY") {
+		t.Errorf("differ read a file outside the run dir into its report:\n%s", blob)
+	}
+	for _, s := range rep.Stages {
+		if s.OutputA.Path == "../secret.txt" && !s.OutputA.Missing {
+			t.Errorf("escaping output path resolved: %+v", s.OutputA)
+		}
+	}
+	// The OTHER rung. stagePriorOutputs reads each stage's output into
+	// the prior state used to render DOWNSTREAM templates, so an
+	// escaping `output:` on stage one lands in stage two's rendered
+	// prompt — a different leak, out of a different function, that the
+	// stat-side guard above cannot prevent. The two runs must name
+	// different files or the rendered prompts match and no diff is
+	// emitted at all.
+	if err := writeFile(filepath.Join(root, "secretA.txt"), "CANARY-A\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFile(filepath.Join(root, "secretB.txt"), "CANARY-B\n"); err != nil {
+		t.Fatal(err)
+	}
+	chain := func(target string) string {
+		return "name: demo\nstages:\n" +
+			"  - id: leak\n    type: text\n    capability: w\n    prompt: hi\n    output: ../" + target + "\n" +
+			"  - id: consumer\n    type: text\n    capability: w\n    inputs: [leak]\n" +
+			"    prompt: 'saw {{.stages.leak.output}}'\n    output: consumer.md\n"
+	}
+	chainRec := basicRec("demo", start,
+		StageRecord{ID: "leak", DurationMS: 1, Status: "ok"},
+		StageRecord{ID: "consumer", DurationMS: 1, Status: "ok"},
+	)
+	e := writeDiffRun(t, root, "e", chainRec, chain("secretA.txt"), `{}`, map[string]string{"consumer.md": "1\n"})
+	f := writeDiffRun(t, root, "f", chainRec, chain("secretB.txt"), `{}`, map[string]string{"consumer.md": "2\n"})
+	repChain, err := Compare(e, f, CompareOpts{})
+	if err != nil {
+		t.Fatalf("Compare: %v", err)
+	}
+	chainBlob, err := json.Marshal(repChain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(chainBlob), "CANARY-A") || strings.Contains(string(chainBlob), "CANARY-B") {
+		t.Errorf("prior-state read leaked an out-of-run-dir file into a downstream prompt:\n%s", chainBlob)
+	}
+
+	// The same fixture with an in-run-dir output must still resolve, so
+	// the guard is not just "the differ stopped reading anything".
+	okYAML := "name: demo\nstages:\n  - id: x\n    type: text\n    capability: w\n" +
+		"    prompt: hi\n    output: x.md\n"
+	c := writeDiffRun(t, root, "c", rec, okYAML, `{}`, map[string]string{"x.md": "VISIBLE\n"})
+	d := writeDiffRun(t, root, "d", rec, okYAML, `{}`, map[string]string{"x.md": "VISIBLE\n"})
+	repOK, err := Compare(c, d, CompareOpts{})
+	if err != nil {
+		t.Fatalf("Compare: %v", err)
+	}
+	if len(repOK.Stages) != 1 || repOK.Stages[0].OutputA.Missing {
+		t.Errorf("legitimate output path refused: %+v", repOK.Stages)
+	}
+}
+
+// TestUnifiedDiff_TrailingNewlineIsNotReportedAsIdentical closes the
+// second empty-return in unifiedDiff. splitLinesKeepEmpty strips exactly
+// one trailing newline, so "x\n" and "x" produce identical line slices
+// and zero hunks — and the "" that came back is the callers' sentinel
+// for "no change", which the renderer prints as "(identical)". A
+// missing final newline is one of the commonest real diffs there is.
+func TestUnifiedDiff_TrailingNewlineIsNotReportedAsIdentical(t *testing.T) {
+	got := unifiedDiff("x\n", "x", "a/out", "b/out")
+	if got == "" {
+		t.Fatal(`unifiedDiff("x\n", "x") = "" — a real difference reported as its own absence`)
+	}
+	if !strings.Contains(got, "No newline at end of file") {
+		t.Errorf("difference should be legible to a human, got:\n%s", got)
+	}
+	if !strings.Contains(got, "a/out") || !strings.Contains(got, "b/out") {
+		t.Errorf("labels missing from:\n%s", got)
+	}
+	// Reversed, and the equal case is still the sentinel.
+	if unifiedDiff("x", "x\n", "a", "b") == "" {
+		t.Error("reversed direction still reported as identical")
+	}
+	if unifiedDiff("x\n", "x\n", "a", "b") != "" {
+		t.Error(`equal inputs must still return "" — it is the no-change sentinel`)
+	}
+}
+
+// TestCompare_TrailingNewlineChangeSurfacesInTheReport carries the same
+// defect through the public surface: two runs whose output differs only
+// in its final newline must not render as identical.
+func TestCompare_TrailingNewlineChangeSurfacesInTheReport(t *testing.T) {
+	root := t.TempDir()
+	start := time.Date(2026, 5, 15, 12, 0, 0, 0, time.Local)
+	rec := basicRec("demo", start, StageRecord{ID: "x", DurationMS: 1, Status: "ok"})
+	yaml := "name: demo\nstages:\n  - id: x\n    type: text\n    capability: w\n    prompt: hi\n    output: x.md\n"
+	a := writeDiffRun(t, root, "a", rec, yaml, `{}`, map[string]string{"x.md": "hello\n"})
+	b := writeDiffRun(t, root, "b", rec, yaml, `{}`, map[string]string{"x.md": "hello"})
+	rep, err := Compare(a, b, CompareOpts{})
+	if err != nil {
+		t.Fatalf("Compare: %v", err)
+	}
+	if len(rep.Stages) != 1 {
+		t.Fatalf("want 1 stage, got %v", stageIDs(rep.Stages))
+	}
+	if rep.Stages[0].OutputDiff == "" {
+		t.Error("output changed but OutputDiff is empty — renderer will print (identical)")
+	}
+	var buf bytes.Buffer
+	if err := rep.Markdown(&buf, false); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), "output: (identical)") {
+		t.Errorf("human view claims the outputs are identical:\n%s", buf.String())
+	}
+}
+
+// TestCompare_RenderStageUnreachablePromptFileStillDiffs closes the
+// guard that the text branch had and the render branch did not. When a
+// prompt_file can't be read from the run dir — which the code's own
+// note calls the normal case — the render branch left raw as "", both
+// sides rendered to "", and compareStages concluded the prompt was
+// unchanged. A render stage that switched prompt files between two runs
+// showed nothing at all.
+func TestCompare_RenderStageUnreachablePromptFileStillDiffs(t *testing.T) {
+	root := t.TempDir()
+	start := time.Date(2026, 5, 15, 12, 0, 0, 0, time.Local)
+	rec := basicRec("demo", start, StageRecord{ID: "r", DurationMS: 1, Status: "ok"})
+	mk := func(promptFile string) string {
+		return "name: demo\nstages:\n  - id: r\n    type: render\n" +
+			"    prompt_file: " + promptFile + "\n    output: r.md\n"
+	}
+	a := writeDiffRun(t, root, "a", rec, mk("prompts/one.md"), `{}`, map[string]string{"r.md": "x\n"})
+	b := writeDiffRun(t, root, "b", rec, mk("prompts/two.md"), `{}`, map[string]string{"r.md": "x\n"})
+	rep, err := Compare(a, b, CompareOpts{})
+	if err != nil {
+		t.Fatalf("Compare: %v", err)
+	}
+	if len(rep.Stages) != 1 {
+		t.Fatalf("want 1 stage, got %v", stageIDs(rep.Stages))
+	}
+	if rep.Stages[0].PromptDiff == "" {
+		t.Fatal("render stage changed prompt_file but the diff is empty")
+	}
+	if !strings.Contains(rep.Stages[0].PromptDiff, "one.md") ||
+		!strings.Contains(rep.Stages[0].PromptDiff, "two.md") {
+		t.Errorf("diff should name both prompt files, got:\n%s", rep.Stages[0].PromptDiff)
+	}
+}
+
 func stageIDs(ss []StageDiff) []string {
 	out := make([]string, len(ss))
 	for i, s := range ss {
