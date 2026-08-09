@@ -2,9 +2,12 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"time"
+
+	"connectrpc.com/connect"
 
 	"github.com/gallowaysoftware/vibe/internal/vibe/paths"
 	"github.com/gallowaysoftware/vibe/internal/vibeclient"
@@ -34,4 +37,32 @@ func pingDaemon(timeout time.Duration) error {
 	defer cancel()
 	_, err := newClient().Status(ctx)
 	return err
+}
+
+// daemonAbsent reports whether a pingDaemon failure is evidence that there
+// is NO daemon, as opposed to one that did not answer inside the budget.
+//
+// The distinction is the whole point. "Nothing is running" is a claim, and
+// the only ping failure that supports it is one where the socket refused
+// the connection or was not there — measured, both arrive as
+// connect.CodeUnavailable ("connect: no such file or directory",
+// "connect: connection refused"). A ping that ran out of time arrives as
+// CodeDeadlineExceeded and is evidence of nothing: the daemon may be busy,
+// the box loaded, the handler wedged. Reporting that as "not running" is
+// this repo's most-repeated defect — absent evidence rendered as a
+// definite value — and it is worst on the surface a script reads.
+//
+// Fail-closed on purpose: only Unavailable-and-not-a-deadline is treated
+// as absence, so a code this build does not recognise, or a future
+// transport that maps a dial timeout to Unavailable while still wrapping
+// context.DeadlineExceeded, lands on "we do not know" rather than on a
+// claim.
+func daemonAbsent(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	return connect.CodeOf(err) == connect.CodeUnavailable
 }

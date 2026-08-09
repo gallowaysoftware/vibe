@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -184,23 +185,45 @@ func NewWebhookSink(cfg WebhookConfig) (*WebhookSink, error) {
 // Endpoint returns the redacted endpoint.
 func (s *WebhookSink) Endpoint() string { return s.redacted }
 
-// Scrub removes this sink's secrets from an arbitrary string. The path
-// is scrubbed as well as the whole URL because an ntfy topic is a path
-// segment, and a leaked topic is a leaked credential on its own.
-// URL first, then token: a token that also appears INSIDE the URL (a
-// `?auth=` query is a real webhook shape) would otherwise be replaced
-// first, leaving the whole-URL match to fail against a string that no
-// longer contains it.
+// Scrub removes this sink's secrets from an arbitrary string. The URL's
+// PARTS are scrubbed as well as the whole URL — see ScrubURL — because
+// an ntfy topic is a path segment and a `?auth=` query is a bearer, and
+// a leaked one of those is a leaked credential on its own.
+// URL first, then token: a token that also appears INSIDE the URL would
+// otherwise be replaced first, leaving the whole-URL match to fail
+// against a string that no longer contains it.
 func (s *WebhookSink) Scrub(msg string) string {
 	return scrubToken(ScrubURL(s.url, msg), s.token)
 }
 
-// ScrubURL removes rawURL — and, separately, its path — from an
-// arbitrary string. The path goes too because for every incoming-webhook
-// dialect this repo speaks (ntfy topics, Slack `/services/T…/B…/…`,
-// Discord `/api/webhooks/<id>/<token>`) the credential IS a path
-// segment, so a message that lost the host but kept the path is still a
-// leak.
+// ScrubURL removes rawURL — and, separately, each PART of it that can
+// carry the credential — from an arbitrary string.
+//
+// The whole-URL match alone is not enough, and the reason is the shape of
+// the messages this runs over: the far side quotes a FRAGMENT of the
+// request, not the string vibe sent. `r.RequestURI` in a 404 body is
+// path+query with no scheme and no host; a proxy names the path; a log
+// line names the query. None of those contain the whole URL, so none of
+// them are matched by it.
+//
+// So the parts go too, longest first (a shorter piece replaced first
+// would break the longer match that contains it):
+//
+//   - path+query, which is what an echoed RequestURI looks like;
+//   - the path, in both its escaped and decoded spellings — for every
+//     incoming-webhook dialect this repo speaks (ntfy topics, Slack
+//     `/services/T…/B…/…`, Discord `/api/webhooks/<id>/<token>`) the
+//     credential IS a path segment;
+//   - the query, because `?auth=<token>` is a real webhook shape and is
+//     the one the path fallback cannot reach at all when the path is
+//     bare "/" — there the whole-URL match used to be the only guard,
+//     and a quoted fragment walked straight past it onto
+//     GET /api/fleet/state, which is an AccessGuest route;
+//   - userinfo, which is where `https://bot:pass@host/hook` keeps it.
+//
+// A one-character path ("/") is skipped deliberately: redacting every
+// slash in the message would destroy the operator's diagnosis, and a "/"
+// is not a credential. Same reasoning for an absent query or userinfo.
 //
 // Exported because the trap it closes is not specific to a Sink: any
 // caller holding a webhook URL — vamp's webhook stage renders a fresh
@@ -217,10 +240,46 @@ func ScrubURL(rawURL, msg string) string {
 		return msg
 	}
 	out := strings.ReplaceAll(msg, raw, redacted)
-	if u, err := url.Parse(raw); err == nil && len(u.Path) > 1 {
-		out = strings.ReplaceAll(out, u.Path, redacted)
+	u, err := url.Parse(raw)
+	if err != nil {
+		// Unparseable: the whole-string match is all there is, and it has
+		// already run. Better than nothing and strictly not worse than
+		// the alternative of guessing at parts.
+		return out
+	}
+	for _, part := range scrubbableParts(u) {
+		out = strings.ReplaceAll(out, part, redacted)
 	}
 	return out
+}
+
+// scrubbableParts lists the substrings of u that may carry the
+// credential, longest first. Nothing shorter than two characters is
+// returned: a bare "/" path or a one-character query is not a secret and
+// replacing it would redact the message rather than the credential.
+func scrubbableParts(u *url.URL) []string {
+	var parts []string
+	add := func(s string) {
+		if len(s) > 1 {
+			parts = append(parts, s)
+		}
+	}
+	// RequestURI is path+query — the echoed-fragment shape — so it is
+	// both the longest and the one the old code could not see.
+	add(u.RequestURI())
+	add(u.EscapedPath())
+	add(u.Path)
+	add(u.RawQuery)
+	if u.User != nil {
+		// String() is "user:pass" (percent-encoded), and the password on
+		// its own, because a message may quote either.
+		add(u.User.String())
+		if pw, ok := u.User.Password(); ok {
+			add(pw)
+		}
+	}
+	sort.SliceStable(parts, func(i, j int) bool { return len(parts[i]) > len(parts[j]) })
+	return parts
 }
 
 // scrubToken removes a bearer token from msg. Empty token is a no-op,

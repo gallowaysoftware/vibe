@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 
@@ -32,6 +33,10 @@ type controlFake struct {
 	frontend *vibev1.FrontendInfo
 	starts   int
 	stops    int
+	// statusDelay stalls Status before it answers, so a test can be a
+	// daemon that is UP and merely slow — the case a ping budget cannot
+	// tell from a daemon that is gone unless somebody looks at the error.
+	statusDelay time.Duration
 }
 
 func newControlFake() *controlFake {
@@ -39,6 +44,12 @@ func newControlFake() *controlFake {
 }
 
 func (f *controlFake) Status(context.Context, *connect.Request[vibev1.StatusRequest]) (*connect.Response[vibev1.StatusResponse], error) {
+	f.mu.Lock()
+	delay := f.statusDelay
+	f.mu.Unlock()
+	// Outside the lock: the stall is meant to be a slow ANSWER, not a
+	// serialisation point every other RPC in the test queues behind.
+	time.Sleep(delay)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return connect.NewResponse(&vibev1.StatusResponse{Status: f.active, Services: f.services}), nil

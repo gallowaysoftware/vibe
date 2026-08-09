@@ -164,7 +164,74 @@ var cgnat = &net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}
 // The wording of the reason is load-bearing: it goes into the error the
 // caller sees, and "which is loopback" is the difference between an operator
 // understanding the refusal and filing a bug about DNS.
+//
+// Two passes, because an IPv6 address can CARRY an IPv4 one. The direct
+// predicates below see `::ffff:127.0.0.1` (net.IP.To4 normalizes it) and
+// nothing else: measured, `::127.0.0.1`, `64:ff9b::c0a8:1` and
+// `2002:7f00:1::` all came back as ordinary global unicast. Each is a
+// standard SSRF bypass, and the URL here is supplied by a model that has
+// just read a page somebody else wrote — `http://[64:ff9b::c0a8:1]/` in
+// that page is a request to 192.168.0.1 on any network with a NAT64
+// gateway, which is what a v6-only fleet has by construction.
+//
+// The wrapped address is UNWRAPPED and judged by the same rules rather
+// than the prefix being blocked outright, which matters: on a NAT64
+// network the well-known prefix is how every IPv4 host is reached, so
+// refusing it wholesale would stop the fetcher reaching the public
+// internet at all. 64:ff9b::1.1.1.1 is fine; 64:ff9b::192.168.0.1 is the
+// LAN.
 func blockedIPReason(ip net.IP) string {
+	if reason := directBlockedReason(ip); reason != "" {
+		return reason
+	}
+	if v4 := embeddedIPv4(ip); v4 != nil {
+		if reason := directBlockedReason(v4); reason != "" {
+			return reason + " (wrapped in an IPv6 transition address, which resolves to " + v4.String() + ")"
+		}
+	}
+	return ""
+}
+
+// embeddedIPv4 returns the IPv4 address an IPv6 address carries, for the
+// three transition encodings that carry one at a FIXED offset, or nil.
+//
+// Bounded on purpose. RFC 6052 also allows a network-specific NAT64
+// prefix at /32, /40, /48, /56 or /64, and this cannot know which an
+// operator chose — an unknown prefix stays an ordinary v6 address here,
+// and the operator's answer for a network like that is the same
+// VIBE_SEARCH_ALLOW_PRIVATE escape hatch the rest of this file documents,
+// in reverse. What is covered is what an attacker can use without knowing
+// anything about the target's network.
+func embeddedIPv4(ip net.IP) net.IP {
+	if len(ip) != net.IPv6len || ip.To4() != nil {
+		// Not v6, or already an IPv4-mapped form the direct pass saw.
+		return nil
+	}
+	switch {
+	case ip[0] == 0x20 && ip[1] == 0x02:
+		// 6to4, 2002:AABB:CCDD::/48 — the v4 address is bytes 2..5.
+		return net.IPv4(ip[2], ip[3], ip[4], ip[5])
+	case ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b:
+		// NAT64's well-known prefix 64:ff9b::/96 (and RFC 8215's
+		// 64:ff9b:1::/48), which RFC 6052 §2.1 fixes at /96 — last four
+		// bytes.
+		return net.IPv4(ip[12], ip[13], ip[14], ip[15])
+	}
+	// IPv4-compatible ::a.b.c.d (RFC 4291 §2.5.5.1, deprecated). `::` and
+	// `::1` share the twelve zero bytes and are already refused by the
+	// unspecified and loopback predicates, so reaching here with one is
+	// harmless — but 0.0.0.0/8 catches them anyway.
+	for _, b := range ip[:12] {
+		if b != 0 {
+			return nil
+		}
+	}
+	return net.IPv4(ip[12], ip[13], ip[14], ip[15])
+}
+
+// directBlockedReason is the predicate set, applied to one address as
+// given. blockedIPReason runs it twice — see there.
+func directBlockedReason(ip net.IP) string {
 	if len(ip) == 0 {
 		return "not an IP address"
 	}
