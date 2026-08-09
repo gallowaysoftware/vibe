@@ -38,20 +38,55 @@ Prerequisites:
 ```
 git clone https://github.com/gallowaysoftware/vibe
 cd vibe
-go build ./...
-go test -race ./...
+./scripts/check.sh
 ```
 
-The CI gate (`.github/workflows/ci.yml`) runs exactly these plus
-`gofmt -l` and `go mod tidy`. Run them locally before pushing:
+`scripts/check.sh` **is** the gate. It runs what the blocking CI job
+runs, in the same order, so the first thing that fails locally is the
+first thing that fails on the PR:
 
 ```
 go build ./...
 go vet ./...
-go test -race ./...
-gofmt -l .          # must print nothing
+golangci-lint run                        # v2.12.2 — see .golangci.yml
+go test -race -timeout 240s ./...
+gofmt -l .                               # must print nothing
 go mod tidy && git diff --exit-code go.mod go.sum
 ```
+
+Two of those are easy to get wrong by hand, which is why the script
+exists rather than a list you retype:
+
+- **`golangci-lint` is part of the gate**, not a nicety. It is its own
+  step in `ci.yml` (`bodyclose`, `misspell`, `unconvert` on top of the
+  standard set) and `go vet` alone does not cover it. Install it with
+  `go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2`.
+  Its cache is per-**user**, not per-checkout, so a run in one checkout
+  can report findings belonging to another — `check.sh` pins
+  `GOLANGCI_LINT_CACHE` inside the working tree so that cannot happen.
+- **`go mod tidy` on its own proves nothing.** It exits 0 having
+  rewritten `go.mod`; the `git diff --exit-code` after it is the actual
+  check.
+
+Three other jobs run on every PR and are not part of the local gate,
+because each is minutes rather than seconds and they run in parallel
+with the blocking one:
+
+| job | what it is |
+| --- | --- |
+| `mutation harness` | `internal/mutation`'s registry of {production line, edit that breaks it, tests that must go red}, applied one entry at a time to a copy of the tree. |
+| `conformance (llama-swap v239 / v247)` | `internal/swaptest`'s invariant list against two pinned **real** llama-swap builds. |
+| `drift` (scheduled, not on PRs) | the same list against whatever llama-swap released last. Meant to be red when upstream moves. |
+
+To have the gate run itself before every push — it does not run
+itself, and `core.hooksPath` is unset in a fresh clone:
+
+```
+git config core.hooksPath scripts/hooks
+```
+
+That is per-clone, never global; undo it with `git config --unset
+core.hooksPath`, and skip it once with `git push --no-verify`.
 
 ## Sending a PR
 

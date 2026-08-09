@@ -57,7 +57,10 @@ that gets removed from the launch options after one Friday night. What
 was stranded is still printed in the pre-drain report, which for Steam
 lands in the launcher log.
 
-**If the drain FAILS, the command does not run.** That is `vibe cell
+**If the drain FAILS — or is DECLINED — the command does not run.** An
+aborted drain (the confirmation refused at the pre-drain lease report) is
+a not-run for the same reason a failed one is: nothing was reclaimed, so
+launching would silently stop declaring. That is `vibe cell
 drain --until-exit`'s own semantic and the wrapper does not soften it: a
 wrapper that launched the game anyway would silently stop declaring, on
 exactly the box where nobody would notice for months. The failure is

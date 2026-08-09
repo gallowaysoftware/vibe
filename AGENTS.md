@@ -38,33 +38,69 @@ Generated code: `proto/vibe/v1/control.pb.go` and
 ## Inner loop
 
 ```
-go build ./...
-go vet ./...
-go test -race ./...
-gofmt -l .          # CI fails if this prints anything
-go mod tidy         # CI fails if this dirties go.mod/go.sum
-golangci-lint run   # CI runs this too (bodyclose, staticcheck, …) — vet alone is NOT enough
+./scripts/check.sh
 ```
 
-The CI workflow (`.github/workflows/ci.yml`) gates exactly these. Run
-them before pushing. (2026-07-12: a push failed CI on golangci-lint
-findings that vet+gofmt missed — the linter is part of the gate, not
-optional.)
+That is the whole gate, and it is the ONE entry point. It runs what the
+blocking CI job runs, in CI's order:
+
+```
+go build ./...
+go vet ./...
+golangci-lint run   # CI runs this too (bodyclose, staticcheck, …) — vet alone is NOT enough
+go test -race -timeout 240s ./...
+gofmt -l .          # CI fails if this prints anything
+go mod tidy && git diff --exit-code go.mod go.sum
+```
+
+(2026-07-12: a push failed CI on golangci-lint findings that vet+gofmt
+missed — the linter is part of the gate, not optional.)
+
+Two corrections this file used to get wrong, and the reason the list is
+now a script rather than something you retype:
+
+**`go mod tidy` alone is not what CI runs.** `ci.yml:38-42` runs
+`go mod tidy` *and then* `git diff --exit-code go.mod go.sum`. Tidy exits
+0 having rewritten the file; the diff is the entire check. An agent that
+ran the old line and pushed had verified nothing.
 
 **`golangci-lint`'s cache is per-USER, not per-checkout**, and this repo
 is worked in `.claude/worktrees/*` several at a time. A run can therefore
 report a finding whose path names a SIBLING worktree — code that is not
-in your tree and that your change cannot have caused. `golangci-lint
-cache clean` is the fix; a `.golangci.yml` exclude is not, because the
-path is real and it is the cache that is shared. Note the asymmetry:
-`go list ./...` does NOT cross worktrees (each has its own `go.mod`), so
-the `go` half of the loop never shows this and the linter half does.
+in your tree and that your change cannot have caused. Measured: a run
+exited 1 with 7 issues in **0 seconds**, every one of them from a sibling
+worktree that no longer existed on disk; after `golangci-lint cache
+clean`, 0 issues in 2s. That run analysed nothing.
 
-`go test -race ./...` is ~15s on a workstation. That number is an asset —
-it is why agents here run the whole gate before every push — so anything
-that pushes the blocking job past ~3 min is not worth whatever fidelity it
-buys. The llama-swap conformance work lives in SEPARATE CI jobs for
-exactly that reason.
+The false-red is the annoying case and it announces itself — the paths
+are visibly not yours. **The dangerous case is its mirror**: a cached
+*clean* verdict served over a tree that was never linted. It looks
+exactly like a pass and nothing distinguishes it. `check.sh` pins
+`GOLANGCI_LINT_CACHE` inside the worktree, which makes both impossible;
+`golangci-lint cache clean` is the manual fix, and a `.golangci.yml`
+exclude is not, because the path is real and it is the cache that is
+shared. Note the asymmetry: `go list ./...` does NOT cross worktrees
+(each has its own `go.mod`), so the `go` half of the loop never shows
+this and the linter half does.
+
+A script does not run itself. To have it fire before every push:
+
+```
+git config core.hooksPath scripts/hooks
+```
+
+Per-clone, never global; `--no-verify` skips it once.
+
+**Timings, measured on the 32-core workstation** (2026-08-09, three
+consecutive `-count=1` runs): `go test -race ./...` is **29s**, not the
+~15s this file claimed for months. `internal/vibe/daemon` (28.4s),
+`internal/vibe/cli` (24.1s) and `internal/vibe/modeltry` (23.3s)
+dominate and run in parallel. The whole of `check.sh` is ~36s. That
+number is still an asset — it is why agents here run the whole gate
+before every push — so anything that pushes the blocking job past ~3 min
+is not worth whatever fidelity it buys. The llama-swap conformance work
+and the mutation harness live in SEPARATE CI jobs for exactly that
+reason.
 
 ## Test doubles and upstream contracts
 
@@ -319,6 +355,35 @@ stand-in.
     it on for harnesses that have no such endpoint — opencode's
     `websearch` accepts only `exa` or `parallel` via
     `OPENCODE_WEBSEARCH_PROVIDER`, so MCP is its only route to the plane.
+  - **`VIBE_SEARCH_TOKEN` is REQUIRED**, and its absence is a refusal to
+    start rather than a warning (PR #66; before it, a missing token
+    served every route to anyone who could reach the port). The escape
+    is an explicit `--no-auth`, which is only sane on loopback — with a
+    non-loopback `--bind` it starts but warns, because every host that
+    can reach the address can then fetch pages through this one and
+    spend the search quota. `--bind 0.0.0.0` needs the token. The token
+    is read from the environment only: a `--token` flag would put the
+    secret in the process list for every user on the host.
+  - **Egress is refused at the DIALER, not on the parsed URL** — and
+    this is the general rule, not a detail of this service. It is the
+    egress form of *fail toward "no evidence"*: be wrong in the safe
+    direction. A URL check sees one string once; the dialer sees every
+    socket, which closes three holes in one place — the initial request,
+    every **redirect hop** (a public URL that 302s to `127.0.0.1` never
+    meets a second URL check, because there is no second URL), and **DNS
+    rebinding** (closed by connecting to the address that was validated
+    instead of handing the name back to the resolver). Non-globally-
+    routable destinations are refused. The guard is on the `direct`
+    fetcher only, deliberately: the SearXNG upstream and the Tavily API
+    are addresses the *operator* chose, and a private SearXNG container
+    is the documented zero-cost deployment.
+  - **`VIBE_SEARCH_ALLOW_PRIVATE=1`** turns that guard off process-wide.
+    A security opt-out, **off by default**, logged loudly at startup when
+    on. It exists because fetching the operator's own wiki or a NAS page
+    is legitimate, and a guard with no way out gets deleted rather than
+    configured. Read as exactly `"1"` — matching `VAMP_NO_CACHE` and
+    `VIBE_MUTATION_TEST` — so a stray `=0` in a unit file cannot read as
+    "on".
 - **`search_url` (`~/.config/vibe/config.yaml`)** backs `${VIBE_SEARCH}`
   in frontend templates and env, so one profile points a harness at
   models, search, and fetch together. Client-facing only — nothing in
@@ -419,6 +484,34 @@ stand-in.
   - MCP tools (fleetmcp): fleet_status, warm_model, unload_model,
     drain_cell, resume_cell, wake_cell, render_front (dry-run only
     until C3's apply path).
+  - **Every tool declares an EFFECT, and the vocabulary is three words**
+    (`toolEffect`, PR #70). `read` changes nothing on any cell, in any
+    store, or on disk — it is `fleet_doctor`'s prose claim ("This tool
+    CHANGES NOTHING") made machine-readable. `mutate` changes state
+    additively or reversibly: re-running it cannot lose work that
+    existed before it ran. `destructive` can destroy something
+    re-running cannot recreate — an in-flight generation, a box's
+    availability, a stored baseline. The zero value is
+    `effectUndeclared` and is never valid, so a new tool cannot arrive
+    unclassified. `toolDef` is the single authority: `tools/list`, the
+    annotation and the dispatch all read it.
+    - Only `readOnlyHint` and `destructiveHint` are emitted, plus
+      `openWorldHint: true` — a property of the fleet, not of any tool
+      (cells come and go, llama-swap owns residency, a human at the box
+      outranks every verb). **`idempotentHint` is deliberately ABSENT**:
+      nothing in the table records whether re-running a verb is a no-op,
+      and deriving the hint from the effect class would be exactly the
+      confident-answer-from-absent-evidence this plan keeps refusing.
+    - **The two arguable calls, both deliberate.** `unload_model` is
+      **destructive** — not because the model is hard to get back (the
+      next request JIT-loads it) but because llama-swap's unload stops
+      the upstream llama-server, so anything generating on that model
+      dies with it. Its own description says "without stopping
+      anything", which is about the CELL; an agent must not read it as a
+      promise about a stream. `probe_model` is **destructive** because
+      `rebaseline: true` deletes that model's stored baseline and no
+      amount of re-running brings the old one back. The annotation
+      describes what the tool MAY do, not what the common call does.
 - **Fleet presence (fleet-control C3).** Cells dial OUT; fleetd never
   needs an inbound port. The pieces an agent must not break:
   - `POST /api/fleet/announce` (fleetapi/announce.go) is the
@@ -547,7 +640,21 @@ stand-in.
     debounced state
     refreshes; action buttons POST `/mcp` tools/call — never add
     mutation routes for it; if a button needs something new, the MCP
-    facade is what's incomplete. `esc()` is the TEXT escaper and
+    facade is what's incomplete.
+    - **The page has a LIVENESS STATE, and it is a documented contract,
+      not styling.** A declarative `LIVENESS` ladder in `fleet.html`
+      (never → offline at 150s → stale on a failed request → stale at
+      45s → polling-only → live); the FIRST row whose conditions all
+      hold wins. `stale` and `offline` **neutralise every badge below
+      them**, because a green badge over a five-minute-old snapshot
+      asserts something the page cannot see. Note the two signals are
+      SEPARATE: the SSE stream being down is `POLLING ONLY` (degraded,
+      does *not* neutralise — the 30s poll still refreshes), while the
+      state poll failing or ageing out is what makes the data stale.
+      The ladder is declared as JSON precisely so a Go guard can parse
+      it rather than read prose out of `if` statements, and there is an
+      `internal/mutation` entry on it — so changing a threshold is a
+      deliberate contract change, not a CSS tweak. `esc()` is the TEXT escaper and
     `attr()` the attribute one — they stay separate because esc()'s
     output also feeds `textContent`.
   - **`model_classes` guards EVERY warm producer, at both ends**
@@ -794,6 +901,20 @@ stand-in.
     at all; under 14 covered days → "too early to project"; a hopeless
     rate → ">10 years at this rate". The screen is allowed to be
     unflattering — one that can only render triumph will.
+  - **`pricing.currency` (optional) names the unit** of
+    `electricity_price_per_kwh` and every `capital_cost`. It is a SHAPE
+    check (three ASCII uppercase letters), not an ISO-4217 registry
+    lookup — the failure it is written against is a typo (`cad`, `$`,
+    `"CAD "`) silently blanking the net. Three states, and the middle
+    one is the point: **unset is UNDECLARED, not a default** — the
+    report says on its face that the local currency was assumed to be
+    the price table's (USD) rather than quietly asserting it; declared
+    and MATCHING nets normally; **declared and DIFFERENT refuses to net
+    the two halves and removes the payback bars**, because this repo
+    ships no exchange rate and inventing one is exactly the
+    absent-evidence-as-a-confident-number failure the screen exists
+    against. A CAD hydro bill subtracted from USD token figures is a
+    confident wrong answer with no visible symptom.
   - **The price table is vendored, dated and embedded**
     (`prices.json`, models.dev + LiteLLM, both MIT, commits recorded).
     Refresh with `vibe fleet prices vendor` on a networked box; CI never
@@ -1695,7 +1816,13 @@ stand-in.
     `Find` stops matching is STALE and must be re-pointed, never deleted;
     a mutation that does not compile proves nothing. The staleness audit
     runs in the blocking test job (milliseconds); the runner is its own
-    CI job behind `VIBE_MUTATION_TEST=1` (~21 s warm, ~58 s cold).
+    CI job behind `VIBE_MUTATION_TEST=1` (**5m38s-6m3s on a GitHub runner**, three observed runs;
+    `77/77 guards mutation-verified in 4m2s` on a 32-core workstation,
+    both measured 2026-08-09 — the "~21 s / 16 mutations" this line used
+    to quote was the C20 shipping figure and had gone stale ~5x on
+    entries). Entries run in parallel, so wall time tracks worker count
+    more than entry count: 67 → 77 entries moved the workstation figure
+    243 s → 246 s.
     **When a review pass mutation-verifies a guard by hand, add the
     entry** — that is the whole point.
   - **`internal/astscan` is the reusable "every function that does X must
@@ -2291,7 +2418,12 @@ planned. The short version an agent needs:
   error resolved by explicit ownership, not magic. **The router's catalog is
   a namespace**: every client-facing id in it — a models key, an alias, a
   peer's model — is unique by construction, and the render refuses a config
-  that says otherwise.
+  that says otherwise. The uniqueness check runs **after** the
+  `--extras` merge, and that ordering is load-bearing rather than
+  incidental: the front's extras file is the one place a fleet operator
+  can introduce a duplicate id by hand, so a check that ran before the
+  merge could not see the only ids a human writes. (PR #64 — it ran
+  before the merge until then.)
 - **llama-swap retains recent request and response BODIES in RAM, by
   default, on every cell and the front.** `captureBuffer` defaults to
   10 MB and vibe's renderer sets it nowhere, so each llama-swap holds a

@@ -346,6 +346,10 @@ per-user YAML; `hosts.yaml tuning:` exists only to *override* defaults.
    cloud_api/routes/hosts.
 7. vamp's `IsVRAMRejection` string contract is replaced by typed Connect
    error details (vamp and daemon upgrade together).
+   **DONE for VRAM (PR #68, 2026-08-09), ahead of P7.** `StartRejection`
+   ships as a Connect error detail and `vibeclient.IsVRAMRejection` reads
+   it rather than the prose. Still pending `EnsureModelAvailable`:
+   `SLOT_HELD`, `NOT_STAGED`, `HOST_UNREACHABLE`.
 
 ## 5. Daemon / runtime
 
@@ -546,6 +550,13 @@ capabilities.yaml values become router aliases; resolution order: route alias
 
 Typed Connect error details (`VRAM_EXCEEDED | HOST_UNREACHABLE | SLOT_HELD |
 NOT_STAGED | NOT_FOUND`) replace the `IsVRAMRejection` substring contract.
+**As built (PR #68), `VRAM_EXCEEDED` is a PAIR**, not one value:
+`REASON_VRAM_EXCEEDS_CAPACITY` (larger than the machine — no amount of
+freeing fixes it, so it refuses regardless) and
+`REASON_VRAM_INSUFFICIENT_FREE` (fits the machine but not what is free
+right now — a warning unless the caller set `strict_vram`). They are
+split because they want different fixes from the operator and only one
+of them is caller-opt-in.
 `vamp run --warm` pre-ensures every declared capability in parallel before
 wave 1 so multiple 10-minute cold starts overlap. Cross-host pipelines
 (ComfyUI on localmodel + text on Sparks + TTS on llamaloft) work via per-host slots +

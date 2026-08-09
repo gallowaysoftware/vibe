@@ -139,6 +139,18 @@ backwards is 1.8× low, or 5× high if overcorrected.
 Per cell, `watts_idle` and `watts_busy` in hosts.yaml, plus a
 fleet-level `electricity_price_per_kwh` (reference example `0.15`):
 
+> **Amended (PR #70, 2026-08-09): the energy term is no longer
+> unconditionally subtracted.** `pricing.currency` names the unit of
+> `electricity_price_per_kwh` and every `capital_cost`. Unset means
+> UNDECLARED — the report states on its face that the local currency was
+> assumed to be the price table's (USD). Declared and DIFFERENT makes the
+> report **refuse to net** the two halves and removes the payback bars:
+> the repo ships no exchange rate, and a CAD hydro bill subtracted from
+> USD token figures is a confident wrong answer with no visible symptom.
+> The validator is a shape check (three ASCII uppercase letters), not an
+> ISO-4217 lookup — the failure it guards is a typo (`cad`, `$`,
+> `"CAD "`) silently blanking the net.
+
 ```
 wh = watts_idle × resident_seconds
    + (watts_busy − watts_idle) × busy_seconds
@@ -293,6 +305,9 @@ Bar widths come from `el.style.width` in JS, **never** an interpolated
 
 - No `capital_cost` → no payback bar. Not 0%, not ∞%, not an invented
   denominator.
+- `pricing.currency` declared and DIFFERENT from the price table's → the
+  two halves are not netted and the payback bars go away. Not a
+  converted number, because there is no rate to convert with. (PR #70.)
 - Model absent from the price table → tokens still show; header reads
   "N% of tokens priced".
 - No wattage → POWER is an em dash, NET is labelled "net (power not

@@ -306,6 +306,28 @@ workstation: 16 mutations, four workers, one ~8 MB tree copy each, and
 the baseline round is what warms the cache. In its own CI job, like the
 conformance matrix, so the blocking `test` job's ~15 s stays ~15 s.
 
+> **Re-measured 2026-08-09, and both numbers above have moved.** The
+> registry has grown from 16 entries to **77** (67 before PR #68 landed
+> the same day), and on a 32-core workstation the package takes
+> **245.7 s** — `77/77 guards mutation-verified in 4m2s`, 28.2 s of that
+> the baseline round. On the **GitHub-hosted runner**, which is the
+> machine the timeout actually applies to, the job measures **5m38s-6m3s** across three observed runs.
+> The blocking `test` job is **29 s**, not ~15 s.
+>
+> One thing the re-measurement teaches that the original did not: **wall
+> time here tracks WORKER COUNT far more than entry count.** Going 67 →
+> 77 entries moved the workstation figure 243 s → 246 s, while the same
+> 77 entries on a 4-core runner cost 38% more. So "how many entries can
+> we afford" is close to the wrong question; "how many workers does the
+> runner give us" is the real one.
+>
+> The paragraph above is left as the record of what C20 cost when it
+> shipped; it is not the current cost. `ci.yml`'s `-timeout 900s` is
+> about **2.5x** headroom against the slowest observed run, which is the
+> figure to reason with — a workstation measurement flatters it to 3.7x,
+> and budgeting against the mean rather than the top of the range would
+> flatter it again.
+
 The **staleness half runs in the blocking job**: `TestMutationRegistryIsCurrent`
 compiles nothing, costs milliseconds, and is what catches an entry that
 has come detached from the line it guards. An entry that has silently
@@ -839,7 +861,22 @@ Each of these was planted and watched, not read:
 
 > **APPLIED by C22 (PR #46, 2026-08-06)** — verified against the tree by
 > C26b. The registry size quoted below has moved on: **62** entries as of
-> C25, **66** as of C26b.
+> C25, **66** as of C26b, **67** measured 2026-08-09, and **77** after
+> PR #68 landed the same day (`77/77 guards mutation-verified in 4m2s`).
+> To take this number cheaply without a four-minute run, count
+> `TestMutationRegistryIsCurrent`'s subtests — it runs one per entry and
+> costs milliseconds.
+>
+> **`c26b/the model-rewrite reader buffers the stream` was re-pointed
+> (PR #65).** Its `Find` no longer names a fixed needle *length*
+> (`maxNeedle() - 1`) but `partialTail()` — the longest suffix that could
+> still become a match — and it gained a second `MustFail` entry,
+> `TestReplacingReader_HoldsBackOnlyAnAmbiguousTail`. The reason is worth
+> keeping: at the old size the guard's own upstream id was 27 bytes short
+> of the length that would have stalled it, so a hold-back bounded by
+> ambiguity and one bounded by the id were indistinguishable to it. A
+> registry entry can go stale by the line it guards being *rewritten
+> better*, not only by it being deleted.
 
 This branch does not touch `AGENTS.md`,
 `docs/design/fleet-control-plan/README.md` or

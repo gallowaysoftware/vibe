@@ -26,3 +26,7 @@ vendor/
 
 # Upstream binaries fetched by the conformance CI job / a local conformance run.
 .upstream/
+
+# scripts/check.sh pins GOLANGCI_LINT_CACHE here so the lint cache is
+# per-worktree instead of per-user (see the header comment in that file).
+/.cache/

@@ -461,6 +461,12 @@ poison for agentic tools.
 - **Typed errors survive (graft)**: a ~100-line shim in vamp maps warm/request
   failure bodies to `START_FAILED | NOT_FOUND | CAPACITY | UPSTREAM_DOWN`
   (replaces both `IsVRAMRejection` and fleet.md's Connect error scheme).
+  **Note before building it:** fleet.md's scheme is no longer a plan —
+  PR #68 shipped it for VRAM, `IsVRAMRejection` already reads the typed
+  detail, and four `internal/mutation` entries pin it. That is not a
+  contradiction with this item, but it means retiring the Connect scheme
+  is a deliberate retirement of those four registry entries, not
+  something to let go stale.
 - **Lease (settled judge Q)**: TTL-vs-long-pipelines is real — a 50-min
   ComfyUI stage between LLM calls would let the Spark model get reaped
   mid-run. Decision: vamp-side heartbeat, implemented once in vamp's

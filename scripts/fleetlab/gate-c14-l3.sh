@@ -22,7 +22,13 @@ restart_fleetd() {
   sleep 3
   ( export XDG_CONFIG_HOME=$LAB/etc XDG_STATE_HOME=$LAB/state/fleetd XDG_RUNTIME_DIR=$LAB/run/rt-fleetd
     nohup "$BIN" daemon >>"$LAB/logs/fleetd.log" 2>&1 & echo $! > "$LAB/run/fleetd.pid" )
-  for _ in $(seq 1 60); do curl -fsS -m 2 "$VIBE_API/ui/fleet" >/dev/null 2>&1 && break; sleep 0.5; done
+  # Falling out of this loop is a DEAD DAEMON, not a slow one; there is no
+  # `set -e` here, so the refusal has to be the exit. Otherwise `sleepblk`
+  # prints nothing for the whole run and "the suspend never fired" is
+  # indistinguishable from "nothing was watching".
+  for _ in $(seq 1 60); do curl -fsS -m 2 "$VIBE_API/ui/fleet" >/dev/null 2>&1 && return 0; sleep 0.5; done
+  echo "fleetd did not answer within 30s of the restart — REFUSING to continue (everything after this would measure a daemon that is not running; see $DLOG)" >&2
+  exit 1
 }
 sleepblk() { state | jq -c '.sleep.entries[]?'; }
 cellblk()  { state | jq -c '.cells[]|select(.name=="'"$CELL"'")|{display,intent}'; }

@@ -22,7 +22,13 @@ restart_fleetd() {
   kill -TERM "$(cat "$LAB/run/fleetd.pid")" 2>/dev/null; sleep 3
   ( export XDG_CONFIG_HOME=$LAB/etc XDG_STATE_HOME=$LAB/state/fleetd XDG_RUNTIME_DIR=$LAB/run/rt-fleetd
     nohup "$BIN" daemon >>"$LAB/logs/fleetd.log" 2>&1 & echo $! > "$LAB/run/fleetd.pid" )
-  for _ in $(seq 1 60); do curl -fsS -m 2 "$VIBE_API/ui/fleet" >/dev/null 2>&1 && break; sleep 0.5; done
+  # Falling out of this loop is a DEAD DAEMON, not a slow one; there is no
+  # `set -e` here, so the refusal has to be the exit. Otherwise `fp` and
+  # `notifyblk` print empty for the whole run and "no drift was detected"
+  # is indistinguishable from "nothing was detecting".
+  for _ in $(seq 1 60); do curl -fsS -m 2 "$VIBE_API/ui/fleet" >/dev/null 2>&1 && return 0; sleep 0.5; done
+  echo "fleetd did not answer within 30s of the restart — REFUSING to continue (everything after this would measure a daemon that is not running; see $DLOG)" >&2
+  exit 1
 }
 restart_announcer() { # $1 = XDG_CONFIG_HOME
   kill -TERM "$(cat "$LAB/run/announce-$CELL.pid")" 2>/dev/null; sleep 2
