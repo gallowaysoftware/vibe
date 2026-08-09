@@ -421,12 +421,28 @@ anything else is a pipeline error).
 | `pandoc`  | Document conversion via pandoc (docker `pandoc/core` by default, override with `binary:`). Used for markdown → EPUB study guides with `cover_image:`. |
 | `youtube` | Uploads a finished video via the YouTube Data API (OAuth token cache under XDG). |
 | `webhook` | Slack/Discord/Mattermost-style JSON POST. Honors `run_when: failure` so a failed pipeline still pings. |
-| `confirm` | Human-in-the-loop gate: prompts on stdin (TTY) or writes a marker file the operator clears with `vamp confirm <id-or-prefix> <stage-id> [--reject]` (detach mode). Optional `timeout: 30m` auto-rejects. |
+| `confirm` | Human-in-the-loop gate: prompts on stdin (TTY) or writes a marker file the operator clears with `vamp confirm <id-or-prefix> <stage-id> [--reject]` (detach mode). Its `timeout:` is the one that auto-REJECTS rather than erroring (see below). |
+
+**Per-attempt timeouts.** `timeout: 5m` is valid on **every** stage kind
+and bounds one ATTEMPT, not the stage: it composes with `retry:` the way
+an HTTP client's timeout composes with a retry budget (three attempts of
+five minutes, not one five-minute total the second attempt can never fit
+inside), and each foreach item is its own attempt. Absent means no bound,
+which is what every pipeline written before this has. It fires as
+`context.DeadlineExceeded`, which the retry classifier already counts as
+both `timeout` and `transient`. It used to be confirm-only — so the one
+thing a pipeline author could bound was the wait for a HUMAN, while a
+stalled model server or an ffmpeg wedged on a corrupt input ran until
+somebody noticed. `confirm` keeps its own meaning: its timeout is a
+decision (auto-reject), not an error.
 
 **Resumes.** `vamp run --resume <run-dir>` re-uses outputs already on
 disk, including per-foreach-item granularity (a failed item in an
-otherwise-successful foreach stage re-runs only that item). Snapshot
-drift aborts unless `--resume-force` is set.
+otherwise-successful foreach stage re-runs only that item). An output
+counts as done only if it exists, is non-empty, **and** — for
+`output_format: json` stages — still parses: a run killed mid-write
+leaves a truncated body that a resume must re-do rather than hand
+downstream. Snapshot drift aborts unless `--resume-force` is set.
 
 **Content-addressed cache.** Cacheable stages (`text`, `comfyui`,
 `audio`, `ffmpeg`, `render`, `compact`, `pandoc`, `mix`, `short`) hash their full

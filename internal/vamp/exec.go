@@ -119,6 +119,41 @@ const (
 	StageTypeShort StageType = "short"
 )
 
+// allStageTypes is THE list of stage types. Everything that has to reason
+// per-type derives from it rather than restating it, because a per-type
+// rule restated in N places is a rule that is right in N-1 of them: this
+// package shipped `pandoc` on the cacheable allow-list from 2026-05-21 while
+// the key composer had no branch for it, so every pandoc stage reported
+// "cache: miss" forever and re-converted a whole EPUB on every run.
+//
+// The three consumers:
+//
+//   - newStageRegistry (below) — TestEveryStageTypeHasAnExecutor asserts
+//     the key set is exactly this list, so a type with no executor cannot
+//     reach `executorFor`'s runtime error.
+//   - Schema()'s stage `type` enum (schema.go).
+//   - TestCacheableAndKeyableAgree (cache_contract_test.go) — walks the
+//     list and asserts stageCacheable and computeStageCacheKey answer the
+//     same question for every one of them. That is the guard that makes the
+//     defect above unrepresentable rather than merely fixed.
+//
+// The empty string is deliberately absent: it is a spelling of
+// StageTypeText (see stageTypeOrDefault), not a type of its own.
+var allStageTypes = []StageType{
+	StageTypeText,
+	StageTypeComfyUI,
+	StageTypeAudio,
+	StageTypeFFmpeg,
+	StageTypeYouTube,
+	StageTypeWebhook,
+	StageTypeConfirm,
+	StageTypeRender,
+	StageTypeCompact,
+	StageTypePandoc,
+	StageTypeMix,
+	StageTypeShort,
+}
+
 // StageExecutor implements the run of a single stage instance. The receiver
 // is shared across stages of the same type, so any per-stage state belongs
 // in StageInput, not on the executor.
@@ -428,20 +463,7 @@ func (e *Executor) Run(ctx context.Context) (runErr error) {
 	// Build the per-type executor registry. Per-stage routing happens through
 	// Stage.Type (empty defaults to text); the executor's per-call deps travel
 	// via StageInput.
-	e.registry = map[StageType]StageExecutor{
-		StageTypeText:    &visionExecutor{inference: e.Inference, multimodal: e.MultimodalInference},
-		StageTypeComfyUI: &comfyuiExecutor{pollInterval: time.Second},
-		StageTypeAudio:   &audioExecutor{},
-		StageTypeFFmpeg:  &ffmpegExecutor{},
-		StageTypeYouTube: &youtubeExecutor{},
-		StageTypeWebhook: &webhookExecutor{},
-		StageTypeConfirm: newConfirmExecutor(),
-		StageTypeRender:  &renderExecutor{},
-		StageTypeCompact: &compactExecutor{inference: e.Inference},
-		StageTypePandoc:  &pandocExecutor{},
-		StageTypeMix:     &mixExecutor{},
-		StageTypeShort:   &shortExecutor{},
-	}
+	e.registry = e.newStageRegistry()
 
 	// Stage lookup and dependency counts for wave-based scheduling.
 	byID := make(map[string]*Stage, len(e.Pipeline.Stages))
@@ -1901,12 +1923,16 @@ func (e *Executor) stageNotes(st *Stage) map[string]any {
 			n["max_tokens"] = mt
 		}
 	}
-	// Cache status — present for every cacheable stage (text /
-	// comfyui / audio / ffmpeg / render / compact / pandoc / mix).
-	// "hit" means the result came from the content-addressed cache;
-	// "miss" means it was a fresh execution that wrote to cache.
-	// Stages whose type isn't cacheable (webhook by default) omit
-	// the key entirely.
+	// Cache status. "hit" means the result came from the
+	// content-addressed cache; "miss" means it was a fresh execution
+	// that wrote to cache. Stages whose type isn't cacheable (webhook
+	// by default, youtube, confirm) omit the key entirely.
+	//
+	// stageCacheable is asked rather than a list being repeated here,
+	// because the last copy of that list in a comment named pandoc as
+	// cacheable for months while nothing cached it. computeStageCacheKey
+	// is the other half and TestCacheableAndKeyableAgree holds the two
+	// to the same answer.
 	if stageCacheable(st) {
 		e.mu.Lock()
 		hit := e.cacheHits != nil && e.cacheHits[st.ID]
@@ -1964,6 +1990,27 @@ func stageRequiresVibeProfile(st *Stage) bool {
 		return false
 	default:
 		return true
+	}
+}
+
+// newStageRegistry builds the per-type executor table. A method rather
+// than an inline literal in Run so a test can enumerate the types vamp
+// can actually execute WITHOUT starting a run — that enumeration is what
+// keeps allStageTypes honest.
+func (e *Executor) newStageRegistry() map[StageType]StageExecutor {
+	return map[StageType]StageExecutor{
+		StageTypeText:    &visionExecutor{inference: e.Inference, multimodal: e.MultimodalInference},
+		StageTypeComfyUI: &comfyuiExecutor{pollInterval: time.Second},
+		StageTypeAudio:   &audioExecutor{},
+		StageTypeFFmpeg:  &ffmpegExecutor{},
+		StageTypeYouTube: &youtubeExecutor{},
+		StageTypeWebhook: &webhookExecutor{},
+		StageTypeConfirm: newConfirmExecutor(),
+		StageTypeRender:  &renderExecutor{},
+		StageTypeCompact: &compactExecutor{inference: e.Inference},
+		StageTypePandoc:  &pandocExecutor{},
+		StageTypeMix:     &mixExecutor{},
+		StageTypeShort:   &shortExecutor{},
 	}
 }
 

@@ -197,7 +197,60 @@ func TestMutationsAreCaught(t *testing.T) {
 		caught++
 		t.Logf("caught  %-58s %s", o.name, o.dur.Round(time.Millisecond))
 	}
-	t.Logf("%d/%d guards mutation-verified in %s", caught, len(Registry), time.Since(start).Round(time.Second))
+	elapsed := time.Since(start)
+	t.Logf("%d/%d guards mutation-verified in %s", caught, len(Registry), elapsed.Round(time.Second))
+	reportBudget(t, elapsed, workers)
+}
+
+// budgetCeiling is the share of `go test -timeout` this job may consume
+// before it must be looked at.
+//
+// Two thirds, and the reasoning is about what a timeout DOES here rather
+// than about any particular duration. A timeout does not fail a guard, it
+// truncates the run: the job goes red having verified an unknown prefix of
+// the registry, which reads exactly like a real catch and is not one. So
+// the harness has to complain while there is still room, not at the wall.
+// One and a half times the current run is the room a doubling of the
+// registry would need.
+const budgetCeiling = 2.0 / 3.0
+
+// reportBudget is this job's sizing, MEASURED by the job, so the CI file
+// can point at a line in the log instead of carrying a number that decays.
+//
+// That number had gone stale three times in two days — "21s / 16
+// mutations", then "77 entries / 338-363s", then "97" while the registry
+// was at 123 — because every writer measured their own branch and the
+// registry kept growing under them. A comment cannot track a moving
+// figure. A run can report its own.
+//
+// The bound comes from t.Deadline(), which is the `-timeout` the job
+// actually passed rather than a copy of it: change `-timeout 900s` in
+// ci.yml and this assertion moves with it, and drop the flag entirely and
+// it says so instead of silently passing.
+func reportBudget(t *testing.T, elapsed time.Duration, workers int) {
+	t.Helper()
+	deadline, ok := t.Deadline()
+	if !ok {
+		t.Logf("SIZING: %d entries, %d workers, %s wall, no -timeout in force (budget unasserted)",
+			len(Registry), workers, elapsed.Round(time.Second))
+		return
+	}
+	// What remains, plus what this test spent, is the budget this test
+	// had. (Anything earlier tests in the package consumed is excluded,
+	// which is the conservative direction: it under-states the budget and
+	// so over-states the share used.)
+	budget := elapsed + time.Until(deadline)
+	share := float64(elapsed) / float64(budget)
+	t.Logf("SIZING: %d entries, %d workers, %s wall, %.0f%% of the %s -timeout (ceiling %.0f%%)",
+		len(Registry), workers, elapsed.Round(time.Second), share*100, budget.Round(time.Second), budgetCeiling*100)
+	if share > budgetCeiling {
+		t.Errorf("this job used %.0f%% of its %s -timeout (%s of wall clock over %d entries). Past %.0f%% the "+
+			"next few entries stop failing and start TRUNCATING: `go test` panics mid-run, the job goes red, "+
+			"and the redness says nothing about any guard. Decide deliberately — raise -timeout in "+
+			"ci.yml's mutation job, or raise the worker count (wall time here tracks WORKERS far more than "+
+			"entries: +59 entries cost +14s on a 32-core box), or retire coverage. Do not simply re-run.",
+			share*100, budget.Round(time.Second), elapsed.Round(time.Second), len(Registry), budgetCeiling*100)
+	}
 }
 
 // ── the runner's own guards ──────────────────────────────────────────

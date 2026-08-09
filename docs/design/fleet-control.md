@@ -552,7 +552,9 @@ by review, and the gates are worth knowing by name: the llama-swap
 recorded wire version in CI, plus real binaries where available);
 `internal/astscan`, the reusable "every function that does X must call
 Y" scan behind C15's credential rule and C4's warm-class rule;
-`internal/shelllint` over `scripts/`; and `internal/mutation`, a
+`internal/shelllint` over every shell script in the module (selected by
+`.sh` or by a shell shebang on an extensionless file, so `install.sh` and
+`scripts/hooks/pre-push` are covered too); and `internal/mutation`, a
 registry that re-runs the `| mutation | red |` tables the phase addenda
 already carried and reports UNPROTECTED when a guard's mutation leaves
 every named test green. None of them replaces ground rule 9's review

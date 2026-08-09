@@ -78,33 +78,41 @@ jobs:
   # asset. The two extra jobs run in parallel with it, so PR wall-clock is
   # set by whichever is slowest, not by the sum.
   #
-  # Measured 2026-08-09, both machines:
-  #   - ON THIS RUNNER: 5m38s / 5m52s / 6m3s across three observed runs.
-  #   - On a 32-core workstation: 245.7s at 77 entries, then 249.1s at 94
-  #     and 253.4s at 97 ("97/97 guards mutation-verified in 4m10s"), of
-  #     which ~30s is the baseline round that warms the cache — so the
-  #     per-entry cost after it is one package rebuild.
-  # Note what that series says: the registry grew 67 -> 77 -> 97 and the
-  # workstation time moved 243s -> 246s -> 253s, because the entries run
-  # in parallel. Wall time here tracks WORKER COUNT far more than entry
-  # count, which is why the runner figure is 38% higher for the same
-  # work — and why 900s still has room at 97.
+  # HOW BIG IS IT: read the log, not this comment.
   #
-  # (The previous figure here was "21s … (16 mutations)" — stale ~5x on
-  # entries and ~16x on time, because the registry kept growing and the
-  # comment did not. It then went stale again inside one day: the eight
-  # PRs merged 2026-08-09 took it 67 -> 94 while this block still said
-  # 77, because seven of the eight added entries and the one that wrote
-  # this block was measuring its own branch. Treat the number as decaying
-  # by default. If you add entries, re-measure this line.)
+  # The run prints its own sizing on the last line it emits —
   #
-  # NOTE the headroom, and note that the RUNNER is the number that
-  # matters: `-timeout 900s` is about **2.5x** the slowest run observed
-  # here (363s), not the 3.7x a workstation measurement suggests. The
-  # three samples spread 338-363s, so budget against the top of that
-  # range, not the mean. If this job starts timing out rather than
-  # failing, the timeout is the first thing to look at — a timeout here
-  # is not a red guard, it is an unfinished one.
+  #   SIZING: <n> entries, <w> workers, <t> wall, <p>% of the <T> -timeout
+  #
+  # — and reportBudget (internal/mutation/mutation_test.go) FAILS the job
+  # once that share crosses two thirds. The bound is read from
+  # t.Deadline(), which is the `-timeout` below rather than a copy of it,
+  # so editing that flag moves the assertion with it.
+  #
+  # This is deliberately not a number. The number lived here three times
+  # in two days and was wrong all three: "21s / 16 mutations", then "77
+  # entries / 338-363s", then "97" while the registry was already at 123.
+  # Every writer measured their own branch, the registry grew underneath
+  # them, and each figure read as current. A reader cannot tell a fresh
+  # measurement from a rotten one, so the job reports its own.
+  #
+  # What is durable, and is why 900s is the right flag rather than a
+  # guess: the entries run WORKERS-wide (4), so wall time tracks the
+  # worker count and the one-off baseline round far more than the entry
+  # count. Measured across five registry sizes on one 32-core box, 59
+  # extra entries cost 14 extra seconds — about a quarter-second each,
+  # against a baseline round of ~30s. THIS RUNNER is slower by ~1.4x and
+  # is the figure that matters, and it has run this job in the 5m40s-6m
+  # range. So the job would have to roughly double before reportBudget
+  # complains and roughly 2.5x before the flag truncates it — and it is
+  # reportBudget, not a human reading a comment, that will say when that
+  # stops being true. Leave `-timeout 900s` alone until it does.
+  #
+  # A timeout here is not a red guard, it is an unfinished one: `go test`
+  # panics having verified an unknown prefix of the registry, which looks
+  # exactly like a catch and is not one. That asymmetry is the whole
+  # reason the ceiling is asserted below the wall rather than at it.
+  #
   # TestMutationRegistryIsCurrent — the staleness half — costs milliseconds
   # and deliberately runs in the BLOCKING job instead, because an entry
   # that has come detached from the line it guards must be visible even on
@@ -135,6 +143,11 @@ jobs:
             echo "the mutation harness SKIPPED: VIBE_MUTATION_TEST did not reach the test binary, so this job verified nothing" >&2
             exit 1
           }
+          # The sizing line the comment above points at, lifted out of a
+          # 100-line -v log and into the step summary so it is READ. Its
+          # own assertion already ran inside the test; this is only the
+          # part a human would otherwise have to go looking for.
+          sed -n 's/.*\(SIZING: .*\)/\1/p' /tmp/mutation.log | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
   # internal/swaptest's conformance list, run against a REAL llama-swap.
   #

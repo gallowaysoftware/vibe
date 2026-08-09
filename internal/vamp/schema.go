@@ -47,7 +47,15 @@ type schemaProperty struct {
 // trips the generated schema and re-validates the example pipelines against
 // it so the two stay in sync.
 func Schema() *schemaProperty {
-	stageTypeEnum := []any{"", "text", "comfyui", "audio", "ffmpeg", "youtube", "webhook", "confirm", "render", "compact", "pandoc", "mix", "short"}
+	// Derived from allStageTypes, not restated: a hand-kept copy of that
+	// list is how `pandoc` came to be advertised as cacheable by one
+	// function and unknown to another. "" leads because an absent `type`
+	// is a valid spelling of text (stageTypeOrDefault).
+	stageTypeEnum := make([]any, 0, len(allStageTypes)+1)
+	stageTypeEnum = append(stageTypeEnum, "")
+	for _, t := range allStageTypes {
+		stageTypeEnum = append(stageTypeEnum, string(t))
+	}
 	// runWhenEnum captures the keyword forms only; template-form run_when
 	// values can be any Go text/template expression and are validated at
 	// LoadPipeline time. Leaving the field as `type: string` (no enum
