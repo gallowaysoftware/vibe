@@ -53,6 +53,22 @@ func TestProxy_StreamingCompletionIsUnbuffered(t *testing.T) {
 			p.SetBackend(u)
 			p.SetModelRewrite("alias", "upstream-id")
 		}},
+		// The same case at the id length the fleet actually runs. The
+		// rewrite reader's hold-back is measured in NEEDLES, and a needle
+		// is `"model": "` plus the upstream's id — 21 bytes for the toy id
+		// above, 76 for this one, against a 49-byte SSE frame. So the case
+		// above passed for 27 characters' worth of reasons no assertion
+		// mentioned: one more character of id than a frame is long and
+		// nothing reaches the client until the upstream finishes.
+		//
+		// SetModelRewrite has exactly one caller (Daemon.applyProfile, on
+		// the p.Backend.MLXServer arm), and mlx_lm.server insists on the
+		// absolute path it was launched with, so a path is not the awkward
+		// case here — it is the only case.
+		{"with a model rewrite for an mlx path", func(p *Proxy, u *url.URL) {
+			p.SetBackend(u)
+			p.SetModelRewrite("qwen-mlx", "/Users/me/models/mlx-community/Qwen3.5-Coder-30B-A3B-Instruct-4bit")
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			release := make(chan struct{})
@@ -112,11 +128,15 @@ func TestProxy_StreamingCompletionIsUnbuffered(t *testing.T) {
 			// response, this read blocks until the upstream finishes —
 			// which it will not do until we release it.
 			//
-			// Raw bytes rather than a full SSE frame, because the rewriting
-			// backend legitimately holds back one needle's length of tail
-			// between reads so a `"model": "…"` token split across a chunk
-			// boundary is still found. That hold-back predates this test and
-			// is not what it is guarding: full-response buffering is.
+			// Raw bytes rather than a full SSE frame: the rewriting backend
+			// holds back any tail that could still become a `"model": "…"`
+			// token split across a chunk boundary, and a stream whose last
+			// bytes happen to be such a tail may legitimately arrive one
+			// read short. What this asserts is that bytes MOVE while the
+			// upstream is still holding the connection — the hold-back
+			// being bounded by what is actually ambiguous, rather than by
+			// the length of the id, is what
+			// TestReplacingReader_HoldsBackOnlyAnAmbiguousTail pins.
 			type readResult struct {
 				n   int
 				err error
