@@ -22,7 +22,19 @@ import (
 // body" is a claim this package is entitled to, and this file is where it
 // is checked against a real journal on a real disk.
 
-const c25Marker = "PRIVATE-PROMPT-4d21ba the door code is 7781 and my mother's maiden name is"
+// c25Marker is the synthetic "private prompt". Every fragment of it that
+// requireNoC25Marker searches for has to be a string that CANNOT occur in
+// a journal by coincidence, which is why the door code carries a suffix.
+//
+// It read `the door code is 7781` until 2026-08-09, and the bare `"7781"`
+// in the fragment list matched a journal that had leaked nothing: the
+// document is full of numbers — durations in nanoseconds, Unix stamps,
+// tok/s floats — and one of them contained those four digits about 1.5%
+// of the time (measured: 3 failures in 200 runs, always this fragment).
+// A leak assertion that fires on a coincidence is worse than useless; it
+// is a guard people learn to re-run, which is how a real red one gets
+// waved through.
+const c25Marker = "PRIVATE-PROMPT-4d21ba the door code is 7781-4d21ba and my mother's maiden name is"
 
 // c25Rig drives the real sequence to `applied` with both models resident,
 // which is the state Measure requires and the state a harvest is too late
@@ -219,7 +231,9 @@ func syntheticCapture() swaptest.Capture {
 
 func requireNoC25Marker(t *testing.T, where, body string) {
 	t.Helper()
-	for _, frag := range []string{c25Marker, "door code", "7781", "maiden name", "PRIVATE-PROMPT-4d21ba"} {
+	// Every fragment here must be impossible to hit by coincidence — see
+	// c25Marker. "7781-4d21ba" rather than "7781" for exactly that reason.
+	for _, frag := range []string{c25Marker, "door code", "7781-4d21ba", "maiden name", "PRIVATE-PROMPT-4d21ba"} {
 		if strings.Contains(body, frag) {
 			t.Fatalf("%s contains %q — that is the verbatim text of a captured request, and this phase emits "+
 				"only scores (fleet-control C25 §3)", where, frag)

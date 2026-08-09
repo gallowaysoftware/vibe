@@ -435,13 +435,50 @@ Three things the doc did not spell out and the code had to decide:
 | 11. Role | **PASS** — both routes added to `daemon/fleet_registry_test.go:TestDaemon_FleetRegistryOff_NoMCP` |
 | 12. Streaming contract | **PASS** — `git diff --stat main..HEAD -- internal/vibe/proxy` is empty |
 | 13. Inner loop | **PASS** — build / vet / `gofmt -l .` (silent) / `go mod tidy` (clean) / `golangci-lint run` (0 issues) / `go test -race -count=5 ./...` run four times end to end, all green (see the honest note below) |
-| 14a. explicit send reaches a real sink | **PASS bar the phone (2026-08-05, C17, `scripts/fleetlab/gate-c9-14a.sh`).** The webhook half ran in #34 against a local receiver (`Tags: vibe-fleet,explicit`, `Title: vibe fleet: test`). C17 pointed the lab notifier at a **real ntfy.sh topic** (random, public, lab-only content) and read it back through ntfy's own API: `{"event":"message","title":"vibe fleet: test","message":"C17 gate 14a: a real ntfy topic, a lab fleet","tags":["vibe-fleet","explicit"],"priority":3}`. A real topic accepts the payload vibe sends. Gate 8 re-verified in the field at the same time: `fleet_status` showed `https://ntfy.sh/... (id 8518d5e7)` and the topic string appeared **zero** times in the whole state document and **zero** times in fleetd's log. **Still owed:** a phone with the ntfy app subscribed — a device, not a process. |
+| 14a. explicit send reaches a real sink | **PASS bar the phone (2026-08-05, C17, `scripts/fleetlab/gate-c9-14a.sh`).** The webhook half ran in #34 against a local receiver (`Tags: vibe-fleet,explicit`, `Title: vibe fleet: test`). C17 pointed the lab notifier at a **real ntfy.sh topic** (random, public, lab-only content) and read it back through ntfy's own API: `{"event":"message","title":"vibe fleet: test","message":"C17 gate 14a: a real ntfy topic, a lab fleet","tags":["vibe-fleet","explicit"],"priority":3}`. A real topic accepts the payload vibe sends. Gate 8 re-verified in the field at the same time: `fleet_status` showed `https://ntfy.sh/... (id 8518d5e7)` and the topic string appeared **zero** times in the whole state document. **The "zero times in fleetd's log" half of that sentence is WITHDRAWN as UNVERIFIED** — see the note below. **Still owed:** a phone with the ntfy app subscribed — a device, not a process. |
 | 14b. always_on outage pages once, resolves once | **PASS (2026-08-05, same harness).** The `always_on` front's llama-swap was SIGKILLed at 08:16:24 with no declared intent; display went `OFF/AWAY?` and **exactly one** delivery landed at 08:18:24 — the `KindCellAbsent` dwell to the second — with `Priority 4`, `Tags vibe-fleet,firing,cell_absent`. No repeat over the following 2.5 minutes of continued absence. The cell returned at 08:20:59 and **exactly one** resolve landed at 08:22:24 (the 1-minute ClearDwell plus one 15 s eval tick), tagged `resolved,cell_absent`. |
 | 14c. a real vacation window | **PASS (2026-08-05, same harness).** `notify away --until 2h`, then the front taken down: the alarm **fired** normally (`fired_at` recorded, dwell ran) and **nothing** was delivered — sink line count and `notify.delivery.sent` both frozen — while `fleet_status` showed `alarms[0] = {key: cell_absent/front, state: active}`, `suppressed: 1`, `suppressed_keys: [cell_absent/front]`, and the CLI printed `SUPPRESSED while away`. An explicit `notify test` during the window delivered immediately. `notify home` produced **exactly one** digest: `1 alarm notifications were suppressed while away: · cell_absent/front ×1 (STILL ACTIVE)`. Nine sink entries for the whole session, no duplicates anywhere. |
 | 14d. a def edited on the front but not pushed | **PASS (2026-08-05, C17, `scripts/fleetlab/gate-c9-14d.sh`).** The harness shares one backends dir between fleetd and its slim announcers, so this state could not exist there; the script gives alpha its **own** config root first — which is what a real cell has — and then edits only the front's copy of a `fingerprint: strict` def. The 15 m `fingerprint_drift` dwell was lowered to 30 s through the ordinary `fleet.notify.dwell` CONFIG key: what shrinks is the waiting, not the state machine. Mismatch appeared 22:56:43Z (`expected 30c382205f86, got fd4b94606e78`); alarm `pending` at 22:56:53Z; **exactly one** delivery at 22:57:38Z (`Priority 4 · Tags vibe-fleet,firing,fingerprint_drift · Title fleet: alpha/lab-embed-a`), with no repeat over 2.5 further minutes of continued drift. Pushing the def to the cell → `clearing` → **exactly one** resolve (`Priority 3 · Tags …,resolved,…`) and an empty alarm list. Two sink lines for the whole episode. Run separately, and it is C3's rule rather than C9's: the strict def **left the front's rendered peers within 45 s** of the drift and returned within 20 s of the revert — measured out-of-band, because the rig's own `render_stanzas` column matched the model as a mapping key (`lab-embed-a:`) when the peers-only front render lists it as a **sequence item** (`- lab-embed-a`), so that column read 0 for the whole run whether the def was in the render or not. Corrected in C17's adversarial pass (finding A5) and re-measured directly: an announced-vs-expected fingerprint divergence took `lab-embed-a` out of the front's peer list, with `flags fingerprint mismatch … mode=strict` and `excluding strict-fingerprint def from front render` in fleetd's own log and `front_renders` stepping 1 → 2. |
 | 14e. the class rule, in the field (bonus) | **PASS (2026-08-05, same harness)** — the gate C9's own §Finding argues for. An `opportunistic` cell had its daemon, llama-swap and host_probe all SIGKILLed in the same window as 14b's front outage and sat `OFF/AWAY` for 4+ minutes: **zero** notifications, from the same evaluator that was paging about the front at that moment. A `roaming` cell taken fully down for two minutes likewise produced zero. |
 | 14f. drain with an active lease (bonus) | **PASS (2026-08-05, same harness)** — an advisory lease was claimed, `vibe cell drain` first *refused* on a non-tty with the pre-drain lease report, and with `--yes` the alarm delivered with **zero** dwell: `bravo is drained (…) while 1 lease(s)/hold(s) are active: labbatch holds lab-embed-b`. |
 | 14g. a dead webhook cannot wedge the daemon (bonus) | **PASS (2026-08-05, same harness)** — the notifier was pointed at a true black hole (a listener that completes the handshake, reads the request and never writes a byte; a closed port would be a fast ECONNREFUSED and would not test this). Through 5 explicit sends plus a real alarm, `GET /api/fleet/state` answered 200 in 0.5–0.8 ms for 3 minutes while `delivery.retries` climbed 1 → 12. |
+
+**Withdrawn 2026-08-09: "zero times in fleetd's log" (gate 14a, gate 8's
+field half).** The only thing that ever produced that number was
+`gate-c9-14a.sh:35`:
+
+```sh
+grep -c "$TOPIC" "$LAB/logs/fleetd.log" || echo "0 occurrences of the topic in fleetd's log"
+```
+
+`$LAB/logs/fleetd.log` is **structurally empty**.
+`internal/vibe/daemon/logging.go:17-30` sends every slog line to
+`$XDG_STATE_HOME/vibe/daemon.log` and tees it to stderr *only when stderr
+is a character device*; the rig redirects stderr to a regular file, so
+the tee never fires and nothing is ever written to the file the rig
+grepped. Measured on the box that ran the gate: `logs/fleetd.log` **0
+bytes**, `state/fleetd/vibe/daemon.log` **34,726 bytes**. `gl.sh:17-21`
+documents this hazard verbatim and five sibling rigs already read
+`$DLOG`; this one did not. The grep therefore counted zero over an empty
+file and printed a sentence about the daemon's silence — a search that
+could not have found the topic even if fleetd had logged it on every
+line.
+
+The rig is fixed (it now greps `-a` over `$DLOG`), but the CLAIM is not
+retroactively earned by that: no run has yet searched fleetd's real log
+for the topic.
+
+**What would earn it:** re-run `scripts/fleetlab/gate-c9-14a.sh` and read
+step 3's second line, which now names the file it searched
+(`0 occurrences of the topic in fleetd's own log (<path>)`). A run whose
+`$DLOG` is non-empty and whose count is 0 earns the sentence; that is the
+whole of what is missing.
+
+Note the scope. **The security property itself is not in doubt** — it is
+covered independently by `TestDeliveryLogsNeverCarryTheSecret` and four
+sibling unit tests in gate 8's row above, and by an `internal/mutation`
+entry. What was vacuous is the *field re-verification*, and "not
+attempted" and "not possible" must never share a heading.
 
 **One honest note on gate 13.** An early full run printed a bare `FAIL`
 line through a `tail` pipeline that discarded the per-package detail; it

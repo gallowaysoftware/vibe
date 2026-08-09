@@ -8,10 +8,20 @@ restart_fleetd() {
   kill -TERM "$(cat "$LAB/run/fleetd.pid")" 2>/dev/null; sleep 3
   ( export XDG_CONFIG_HOME=$LAB/etc XDG_STATE_HOME=$LAB/state/fleetd XDG_RUNTIME_DIR=$LAB/run/rt-fleetd
     nohup "$BIN" daemon >>"$LAB/logs/fleetd.log" 2>&1 & echo $! > "$LAB/run/fleetd.pid" )
-  for _ in $(seq 1 60); do curl -fsS -m 2 "$VIBE_API/ui/fleet" >/dev/null 2>&1 && break; sleep 0.5; done
+  # Falling out of this loop is a DEAD DAEMON, not a slow one; there is no
+  # `set -e` here, so the refusal has to be the exit. Otherwise every sample
+  # after the restart reads an empty schedule and the gate "passes".
+  for _ in $(seq 1 60); do curl -fsS -m 2 "$VIBE_API/ui/fleet" >/dev/null 2>&1 && return 0; sleep 0.5; done
+  echo "fleetd did not answer within 30s of the restart — REFUSING to continue (everything after this would measure a daemon that is not running; see $DLOG)" >&2
+  exit 1
 }
 sched() { state | jq -c '.warm.schedule[]?|{cron,model,next_fire,last_fire,last_note}'; }
 
+# Restore a backup an earlier aborted run left behind BEFORE taking this
+# run's, or the `cp` below snapshots a config that already carries the
+# appended warm_schedule and step 4's restore makes it permanent. Three
+# sibling rigs already do this.
+[[ -f $LAB/etc/vibe/config.yaml.c17bak ]] && cp "$LAB/etc/vibe/config.yaml.c17bak" "$LAB/etc/vibe/config.yaml"
 cp "$LAB/etc/vibe/config.yaml" "$LAB/etc/vibe/config.yaml.c17bak"
 cat >>"$LAB/etc/vibe/config.yaml" <<'EOF'
 warm_schedule:

@@ -87,4 +87,20 @@ jobs:
           LLAMA_SERVER_BIN: ${{ github.workspace }}/.upstream/llama-server
           LLAMA_GGUF: ${{ github.workspace }}/.upstream/stories260K.gguf
           LD_LIBRARY_PATH: ${{ github.workspace }}/.upstream
-        run: go test -timeout 420s -v -run 'TestSwapContract/live|TestSwapBehaviour' ./internal/swaptest/
+        # Same latent hole as ci.yml's conformance step, and worse here:
+        # this leg's `-run` selects `TestSwapContract/live`, so with the
+        # `env:` block above dropped there is no live target to match,
+        # nothing is selected, and `go test` exits 0 having run ZERO
+        # subtests. A green alarm that rang for nothing is the one failure
+        # mode this whole workflow exists to avoid, so assert both halves.
+        run: |
+          set -euo pipefail
+          go test -timeout 420s -v -run 'TestSwapContract/live|TestSwapBehaviour' ./internal/swaptest/ | tee /tmp/conformance.log
+          grep -q 'TestSwapContract/live/exec' /tmp/conformance.log || {
+            echo "no live/exec target ran: LLAMA_SWAP_BIN did not reach the test binary; only the double was verified" >&2
+            exit 1
+          }
+          grep -q 'TestSwapBehaviour/B1' /tmp/conformance.log || {
+            echo "TestSwapBehaviour did not run: the loading-state keepalive that every cold-start client depends on was not exercised" >&2
+            exit 1
+          }

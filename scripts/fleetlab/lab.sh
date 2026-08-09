@@ -454,7 +454,12 @@ render_cells() {
     # llama-swap cells has to rewrite it here or every cell fights for the
     # same upstream ports (and with production's 5800-5809).
     sed -i "s/^startPort: 5800$/startPort: $sport/" "$out"
-    grep -q "^startPort: $sport$" "$out" || warn "$c: startPort rewrite did not apply"
+    # FATAL, matching gl.sh's render_cell. A `warn` here is advisory and this
+    # script has no `set -e`, so `up` went on to start a cell whose upstreams
+    # are still on 5800 — PRODUCTION's range on this box. ports.sh's principle:
+    # a refusal that arrives after the kill is not a guard.
+    grep -q "^startPort: $sport$" "$out" ||
+      die "$c: startPort rewrite did not apply — REFUSING to continue (5800 is production's range, and this cell would start on it)"
   done
 }
 

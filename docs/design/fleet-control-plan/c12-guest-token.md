@@ -90,6 +90,11 @@ that a read-only token should carry them. It should not:
   same fact at day resolution, forever, without a declaration.
 - `/api/fleet/savings` is money and hardware: what the boxes cost
   (`capital_cost`), what the electricity costs, a payback percentage.
+  (Since PR #70 the figures can involve **two currencies** — the
+  vendored price table's and a declared `pricing.currency` — and when
+  those differ the screen refuses to net them rather than inventing a
+  rate. That changes what the numbers mean, not who may read them: the
+  argument below is unaffected.)
   It is the most *quotable* screen in the fleet and the least
   status-shaped. The savings screen exposes more about the household
   than cell status does, which is the reason it exists — and the reason

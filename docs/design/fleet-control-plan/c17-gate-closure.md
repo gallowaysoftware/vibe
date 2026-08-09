@@ -211,9 +211,27 @@ $ curl 'https://ntfy.sh/<topic>/json?poll=1'
 
 C9 gate 8 (the URL is a credential) re-verified in the field at the same
 time: `fleet_status` shows `https://ntfy.sh/... (id 8518d5e7)`, and the
-topic appears **zero** times in the whole state document and **zero**
-times in fleetd's log. **Still owed:** a phone with the ntfy app
-subscribed — that is a device, not a process.
+topic appears **zero** times in the whole state document.
+
+> **WITHDRAWN 2026-08-09 — "and zero times in fleetd's log" is
+> UNVERIFIED.** That clause came from `gate-c9-14a.sh:35`, which grepped
+> `$LAB/logs/fleetd.log`. That file is structurally empty: the daemon
+> tees slog to stderr only when stderr is a character device
+> (`internal/vibe/daemon/logging.go:17-30`), the rig redirects to a
+> regular file, and every line goes to `$XDG_STATE_HOME/vibe/daemon.log`
+> instead — measured 0 bytes vs 34,726 bytes on the box that ran the
+> gate. The count was zero because the file was empty, not because the
+> topic was absent. The rig now greps `-a` over `$DLOG` (as five sibling
+> rigs already did), but fixing the rig does not retroactively earn the
+> claim: **no run has yet searched fleetd's real log for the topic.**
+> Re-running `gate-c9-14a.sh` over a non-empty `$DLOG` is what would earn
+> it. The security property itself is separately covered by
+> `TestDeliveryLogsNeverCarryTheSecret` and an `internal/mutation` entry;
+> it is the field re-verification that was vacuous. See
+> `c9-fleet-notify.md` for the full note.
+
+**Still owed:** a phone with the ntfy app subscribed — that is a device,
+not a process.
 
 ### C9 14d — a def edited on the front but not the cell (`gate-c9-14d.sh`)
 

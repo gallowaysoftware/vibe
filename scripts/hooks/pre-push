@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Opt-in pre-push hook: run the full CI gate before anything leaves the box.
+#
+# A script does not run itself. `core.hooksPath` is unset in a fresh clone,
+# so this file is inert until you ask for it:
+#
+#     git config core.hooksPath scripts/hooks
+#
+# That is per-clone and per-worktree, never global, and it is undone with
+# `git config --unset core.hooksPath`. Skip it for one push with
+# `git push --no-verify`.
+#
+# Note what enabling it costs: `core.hooksPath` replaces the hooks
+# directory wholesale, so any other hook you keep in .git/hooks stops
+# firing. Anything you want alongside this one belongs in scripts/hooks/.
+set -euo pipefail
+
+root=$(git rev-parse --show-toplevel)
+exec "$root/scripts/check.sh"

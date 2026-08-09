@@ -15,6 +15,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
@@ -24,6 +26,103 @@ import (
 )
 
 const ompExample = "../../../profiles/omp.example.yaml"
+
+const exampleGlob = "../../../profiles/*.example.yaml"
+
+// notAProfile lists files under profiles/ that the profile loader must NOT be
+// pointed at, with the reason. profiles/ is the examples directory for every
+// vibe YAML kind, not only for profiles: mcp.example.yaml is the worked
+// example for an MCP server definition under $XDG_CONFIG_HOME/vibe/mcp/, and
+// it is referenced from a profile by name (`frontend.mcps: [datadog]`) rather
+// than loaded as one. Feeding it to profile.Load fails at the parse step,
+// which is correct behaviour and not a defect in the example.
+var notAProfile = map[string]string{
+	"mcp.example.yaml": "an MCP server definition for vibe/mcp/, not a profile",
+}
+
+// tildePath finds the ~/-rooted filesystem values in an example's raw YAML.
+// Load stat()s backend.llama_server.path, backend.comfyui.dir (plus its
+// main.py) and frontend.binary, so an example that names a model this box
+// does not have fails validation for a reason that has nothing to do with the
+// example being correct. Rather than pin a fixture list that goes stale the
+// next time an example gains a path, the fixture is derived from the file
+// itself: every ~/-rooted value gets materialised under the test's own HOME.
+//
+// A NEW filesystem-valued key is deliberately not silently tolerated — it is
+// not in this regexp, nothing is created for it, and the stat error names the
+// field, which is the signal to extend this line.
+var tildePath = regexp.MustCompile(`(?m)^\s*(path|dir|binary|mmproj|draft_model|chat_template_file):\s*(~/\S+)\s*$`)
+
+// materialiseFixtures creates, under home, every ~/-rooted path the example
+// names. Files are written 0755 because frontend.binary is additionally
+// checked for the executable bit; a `dir:` gets the directory plus the
+// main.py that backend.comfyui.dir requires.
+func materialiseFixtures(t *testing.T, home, exampleFile string) {
+	t.Helper()
+	raw, err := os.ReadFile(exampleFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", exampleFile, err)
+	}
+	for _, m := range tildePath.FindAllStringSubmatch(string(raw), -1) {
+		key, target := m[1], filepath.Join(home, strings.TrimPrefix(m[2], "~/"))
+		if key == "dir" {
+			target = filepath.Join(target, "main.py")
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			t.Fatalf("fixture dir for %s: %v", target, err)
+		}
+		if err := os.WriteFile(target, []byte("# vibe test fixture\n"), 0o755); err != nil {
+			t.Fatalf("fixture %s: %v", target, err)
+		}
+	}
+}
+
+// TestExampleProfilesLoad is the generalisation of the omp case below.
+//
+// profiles/omp.example.yaml was DESCRIBED correctly and was unloadable for
+// months: an example reads as documentation, is never executed, and rots into
+// a description of something that does not work. The test below closed that
+// for omp alone, which left the other seven examples with exactly the
+// protection omp had before it broke — none.
+//
+// This runs every one of them through the real loader. It is shallow on
+// purpose: the deep per-example assertions (rendered config, expanded vars,
+// no leaked secrets) are the omp test's job, and the failure this guards is
+// the coarse one — the file no longer parses or no longer validates.
+func TestExampleProfilesLoad(t *testing.T) {
+	files, err := filepath.Glob(exampleGlob)
+	if err != nil {
+		t.Fatalf("glob %s: %v", exampleGlob, err)
+	}
+	sort.Strings(files)
+	// A glob that silently matches nothing is the classic vacuous pass: the
+	// loop body never runs and the test is green having loaded no example at
+	// all. The floor is the count today minus the non-profiles.
+	if want := len(notAProfile) + 7; len(files) < want {
+		t.Fatalf("glob %s matched %d files, want >= %d — the examples moved and this test stopped covering them",
+			exampleGlob, len(files), want)
+	}
+	for _, f := range files {
+		t.Run(filepath.Base(f), func(t *testing.T) {
+			if why, skip := notAProfile[filepath.Base(f)]; skip {
+				t.Skipf("not a profile: %s", why)
+			}
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+			t.Setenv("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
+			materialiseFixtures(t, home, f)
+
+			p, err := profile.Load(f)
+			if err != nil {
+				t.Fatalf("%s does not load: %v", f, err)
+			}
+			if p.Name == "" {
+				t.Errorf("%s loaded with an empty name: `vibe start` has nothing to address it by", f)
+			}
+		})
+	}
+}
 
 func TestOMPExampleProfileLoadsAndRenders(t *testing.T) {
 	// HOME first: the loader tilde-expands write_files paths at load time, so

@@ -50,14 +50,33 @@ jobs:
   # registry is that table, run on every PR.
   #
   # A SEPARATE job for the same reason as the conformance matrix: each
-  # entry is a package recompile, and the blocking `test` job's ~15s is an
+  # entry is a package recompile, and the blocking `test` job's ~29s is an
   # asset. The two extra jobs run in parallel with it, so PR wall-clock is
   # set by whichever is slowest, not by the sum.
   #
-  # Measured on a workstation: 21s with a warm build cache, 58s with a
-  # cold GOCACHE (16 mutations, 4 workers, one tree copy each). The
-  # baseline round is what warms the cache, so the per-entry cost after it
-  # is a single package rebuild.
+  # Measured 2026-08-09, both machines:
+  #   - ON THIS RUNNER: 5m38s / 5m52s / 6m3s across three observed runs.
+  #   - On a 32-core workstation: 245.7s for the package, reporting
+  #     "77/77 guards mutation-verified in 4m2s", of which 28.2s is the
+  #     baseline round that warms the cache — so the per-entry cost after
+  #     it is one package rebuild.
+  # Note what that pair says: the registry grew 67 -> 77 and the
+  # workstation time moved 243s -> 246s, because the entries run in
+  # parallel. Wall time here tracks WORKER COUNT far more than entry
+  # count, which is why the runner figure is 38% higher for the same
+  # work.
+  #
+  # (The previous figure here was "21s … (16 mutations)" — stale ~5x on
+  # entries and ~16x on time, because the registry kept growing and the
+  # comment did not. If you add entries, re-measure this line.)
+  #
+  # NOTE the headroom, and note that the RUNNER is the number that
+  # matters: `-timeout 900s` is about **2.5x** the slowest run observed
+  # here (363s), not the 3.7x a workstation measurement suggests. The
+  # three samples spread 338-363s, so budget against the top of that
+  # range, not the mean. If this job starts timing out rather than
+  # failing, the timeout is the first thing to look at — a timeout here
+  # is not a red guard, it is an unfinished one.
   # TestMutationRegistryIsCurrent — the staleness half — costs milliseconds
   # and deliberately runs in the BLOCKING job instead, because an entry
   # that has come detached from the line it guards must be visible even on
@@ -96,7 +115,7 @@ jobs:
   # BEHAVIOURS no wire shape can express, and they are what
   # `vibe cell drain --wait` and every cold-start client depend on. ~40s.
   #
-  # A SEPARATE job so the blocking `test` job's ~15s stays ~15s; the two run
+  # A SEPARATE job so the blocking `test` job's ~29s stays ~29s; the two run
   # in parallel, so PR wall-clock is unchanged.
   #
   # Both versions are exercised on purpose. v239 is what the fleet runs
@@ -178,4 +197,20 @@ jobs:
           LLAMA_SERVER_BIN: ${{ github.workspace }}/.upstream/llama-server
           LLAMA_GGUF: ${{ github.workspace }}/.upstream/stories260K.gguf
           LD_LIBRARY_PATH: ${{ github.workspace }}/.upstream
-        run: go test -timeout 420s -v -run 'TestSwapContract|TestSwapBehaviour' ./internal/swaptest/
+        # The `env:` block above is the ENTIRE gate on the live target.
+        # liveTarget() (internal/swaptest/live_test.go:44-50) returns
+        # `false` when any one of the three is empty, `targets()` then
+        # yields the doubles alone, and this step exits 0 with 16 green
+        # fake-only subtests having exercised no llama-swap at all.
+        #
+        # That is precisely the exposure the mutation job thirty lines
+        # above argues must be ASSERTED rather than assumed, and it was
+        # left unasserted here. A rename, a typo, or a merge that drops
+        # one line of `env:` is enough. So prove the live target ran.
+        run: |
+          set -euo pipefail
+          go test -timeout 420s -v -run 'TestSwapContract|TestSwapBehaviour' ./internal/swaptest/ | tee /tmp/conformance.log
+          grep -q 'TestSwapContract/live/exec' /tmp/conformance.log || {
+            echo "no live/exec target ran: LLAMA_SWAP_BIN did not reach the test binary; only the double was verified" >&2
+            exit 1
+          }
