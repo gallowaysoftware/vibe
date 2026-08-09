@@ -72,7 +72,7 @@ CPU sidecars running.
 			case skipActive:
 				fmt.Fprintln(cmd.OutOrStdout(), "active-mode profile SKIPPED (--skip-active)")
 			case req.Profile != "":
-				if err := vibeStart(cmd.OutOrStdout(), req.Profile, true); err != nil {
+				if err := vibeStartContext(cmd.Context(), cmd.OutOrStdout(), req.Profile, true); err != nil {
 					return err
 				}
 			default:
@@ -88,7 +88,7 @@ CPU sidecars running.
 						svc.Name, svc.SetupHint)
 					continue
 				}
-				if err := vibeStart(cmd.OutOrStdout(), name, false); err != nil {
+				if err := vibeStartContext(cmd.Context(), cmd.OutOrStdout(), name, false); err != nil {
 					return err
 				}
 			}
@@ -134,19 +134,42 @@ func parseVibeStartHint(hint string) string {
 	return m[1]
 }
 
-// vibeStart shells out to `vibe start <name>`. The vibe daemon
+// vibeStartTimeout bounds one `vibe start`. Starting a profile means the
+// daemon loading a model, which on a cold page cache is tens of seconds
+// for a large GGUF — so the number is generous. It exists because the
+// call had NO bound: a daemon wedged mid-start (the interesting failure,
+// as opposed to a refused connection, which returns instantly) left
+// `<pipeline> activate` sitting at a blank prompt with nothing to
+// report and nothing to cancel.
+const vibeStartTimeout = 5 * time.Minute
+
+// vibeStartContext shells out to `vibe start <name>`. The vibe daemon
 // distinguishes active-mode from service-mode internally via the
 // profile YAML's `mode:` field — we just say "start it" and let
 // the daemon route. The active arg is informational for the log
 // prefix.
-func vibeStart(w cobraOutputWriter, name string, active bool) error {
+//
+// It takes a ctx so the operator's ctrl-C reaches the child, and bounds
+// it regardless: the caller's context on the `activate` path has no
+// deadline of its own.
+func vibeStartContext(ctx context.Context, w cobraOutputWriter, name string, active bool) error {
 	tag := "service"
 	if active {
 		tag = "active"
 	}
-	c := exec.Command("vibe", "start", name)
+	ctx, cancel := context.WithTimeout(ctx, vibeStartTimeout)
+	defer cancel()
+	c := exec.CommandContext(ctx, "vibe", "start", name)
+	// A zero WaitDelay is documented as "Wait blocks indefinitely on the
+	// pipes", which would put the unbounded wait straight back after the
+	// deadline had done its job. CombinedOutput holds both pipes, so this
+	// is exactly the path that needs it.
+	c.WaitDelay = 2 * time.Second
 	out, err := c.CombinedOutput()
 	body := strings.TrimSpace(string(out))
+	if ctx.Err() != nil {
+		return fmt.Errorf("vibe start %s: no answer within %s (is the vibe daemon wedged? try `vibe ps`)\n%s", name, vibeStartTimeout, body)
+	}
 	// "already_exists" / "is already running" comes back from the
 	// daemon when the profile holds the slot already — treat as a
 	// no-op success.

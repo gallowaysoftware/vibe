@@ -77,3 +77,59 @@ func TestFailureSummary_UnknownPattern(t *testing.T) {
 		t.Errorf("unexpected hint line for unknown pattern: %s", out)
 	}
 }
+
+// TestFailureSummary_PrintsTheResumeCommand is the highest
+// value-per-character item in the review: --resume is fully built (per-
+// item foreach granularity, pipeline-drift detection, JSON revalidation
+// of resumed outputs) and no user-facing output mentioned it anywhere.
+// A ten-stage pipeline that died at stage nine printed a run dir, an
+// error, and no way to know that re-running the whole thing was not the
+// only option.
+func TestFailureSummary_PrintsTheResumeCommand(t *testing.T) {
+	runDir := t.TempDir()
+	e := &Executor{RunDir: runDir}
+	var buf bytes.Buffer
+	writeFailureSummary(&buf, "p", fmt.Errorf("stage nine: boom"), e)
+	out := buf.String()
+	if !strings.Contains(out, "resume:") {
+		t.Fatalf("failure summary never mentions --resume:\n%s", out)
+	}
+	// The whole command, not just the flag: a path the operator has to
+	// reassemble by hand is a path they get wrong.
+	if !strings.Contains(out, "--resume "+runDir) {
+		t.Errorf("resume line must carry the run dir verbatim:\n%s", out)
+	}
+	if !strings.Contains(out, " run ") {
+		t.Errorf("resume line must be a runnable command:\n%s", out)
+	}
+}
+
+// TestFailureSummary_NoResumeLineWhenAlreadyResuming: the command is
+// still correct on a resumed run, but the operator has already found
+// it, and repeating it costs a line of the thing they are reading to
+// find out what broke.
+func TestFailureSummary_NoResumeLineWhenAlreadyResuming(t *testing.T) {
+	runDir := t.TempDir()
+	e := &Executor{RunDir: runDir, ResumeDir: runDir}
+	var buf bytes.Buffer
+	writeFailureSummary(&buf, "p", fmt.Errorf("stage nine: boom"), e)
+	if strings.Contains(buf.String(), "resume:") {
+		t.Errorf("a resumed run should not re-advertise --resume:\n%s", buf.String())
+	}
+}
+
+// TestFailureSummary_NoRunDirNoResumeLine: a dry run or an internal-API
+// caller has no directory to resume from, and a resume command naming
+// an empty path is worse than none.
+func TestFailureSummary_NoRunDirNoResumeLine(t *testing.T) {
+	var buf bytes.Buffer
+	writeFailureSummary(&buf, "p", fmt.Errorf("stage nine: boom"), &Executor{})
+	if strings.Contains(buf.String(), "resume:") {
+		t.Errorf("no run dir means no resume line:\n%s", buf.String())
+	}
+	buf.Reset()
+	writeFailureSummary(&buf, "p", fmt.Errorf("stage nine: boom"), nil)
+	if strings.Contains(buf.String(), "resume:") {
+		t.Errorf("nil executor means no resume line:\n%s", buf.String())
+	}
+}

@@ -31,6 +31,31 @@ type recordingFFmpegRunner struct {
 	// simulate ffmpeg's side effects (e.g. creating the output file the
 	// real binary would).
 	onRun func(call recordedFFmpegCall) error
+	// emptyOutput reproduces the failure this double previously could not
+	// express: ffmpeg exiting 0 having written a 0-byte container. The
+	// default (false) writes a few plausible bytes instead, because
+	// "exited 0 and produced nothing" is now a stage failure and every
+	// pre-existing test here means to describe a SUCCESSFUL run.
+	emptyOutput bool
+}
+
+// writeFakeOutput creates the file the real ffmpeg would have written.
+// The output path is the last argv element by construction — every call
+// site appends "-y", outAbs last — which is also what the executor
+// stats afterwards.
+func (r *recordingFFmpegRunner) writeFakeOutput(args []string) error {
+	if len(args) == 0 {
+		return nil
+	}
+	out := args[len(args)-1]
+	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+		return err
+	}
+	var body []byte
+	if !r.emptyOutput {
+		body = []byte("fake-media-bytes")
+	}
+	return os.WriteFile(out, body, 0o644)
 }
 
 type recordedFFmpegCall struct {
@@ -54,7 +79,13 @@ func (r *recordingFFmpegRunner) Run(ctx context.Context, binary string, args []s
 			return err
 		}
 	}
-	return wantErr
+	if wantErr != nil {
+		return wantErr
+	}
+	// A zero exit means ffmpeg claims it produced the output. Produce it,
+	// so the double describes the real success path rather than a case
+	// the executor is now required to reject.
+	return r.writeFakeOutput(call.Args)
 }
 
 func (r *recordingFFmpegRunner) callCount() int {
@@ -485,5 +516,136 @@ func TestLineRingBuffer_AlwaysFullWriteCount(t *testing.T) {
 		if n != end-off {
 			t.Fatalf("MultiWriter.Write: n=%d, want %d", n, end-off)
 		}
+	}
+}
+
+// TestFFmpegExecutor_ZeroByteOutputFailsTheStage covers the failure the
+// exit code does not report.
+//
+// ffmpeg can exit 0 having written a 0-byte container — a filtergraph
+// error that never reaches the exit status. Nothing downstream notices:
+// the file exists, the stage is green, and the run "succeeds" with
+// silence in it. The cost is not one bad run. StageOutput.Files feeds
+// tryCachePut, os.ReadFile of a 0-byte file returns an empty NON-NIL
+// slice, and the cache's mode select reads non-nil Bytes as "binary
+// output" — so the empty artefact becomes a content-addressed entry that
+// replays on every later run with the same inputs.
+//
+// One case per output-producing mode, because the check has to be at
+// each of them: a guard added to whichever executor was written last is
+// how this got to four call sites with two of them covered.
+func TestFFmpegExecutor_ZeroByteOutputFailsTheStage(t *testing.T) {
+	cases := []struct {
+		name  string
+		stage func(runDir string) *Stage
+		setup func(t *testing.T, runDir string)
+		prior map[string]*stageResult
+	}{
+		{
+			name: "args",
+			stage: func(string) *Stage {
+				return &Stage{
+					ID:         "assemble",
+					Type:       StageTypeFFmpeg,
+					FFmpegArgs: []string{"-i", "in.png"},
+					Output:     "final.mp4",
+				}
+			},
+		},
+		{
+			name: "concat_wavs",
+			setup: func(t *testing.T, runDir string) {
+				for _, n := range []string{"segment_0.wav", "segment_1.wav"} {
+					if err := os.WriteFile(filepath.Join(runDir, n), []byte("RIFF....WAVE"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+			},
+			stage: func(string) *Stage {
+				return &Stage{
+					ID:         "join",
+					Type:       StageTypeFFmpeg,
+					ConcatWavs: true,
+					Output:     "book.mp3",
+				}
+			},
+		},
+		{
+			name: "concat_video",
+			setup: func(t *testing.T, runDir string) {
+				for _, n := range []string{"shot_0.mp4", "shot_1.mp4"} {
+					if err := os.WriteFile(filepath.Join(runDir, n), []byte("clipdata"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+			},
+			stage: func(runDir string) *Stage {
+				return &Stage{
+					ID:              "stitch",
+					Type:            StageTypeFFmpeg,
+					Inputs:          []string{"clips_list"},
+					ConcatVideoFrom: "clips_list",
+					ConcatVideoVar:  "item",
+					ConcatVideoFile: "{{ .item }}",
+					Output:          "final.mp4",
+				}
+			},
+			prior: map[string]*stageResult{},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			runDir := t.TempDir()
+			if c.setup != nil {
+				c.setup(t, runDir)
+			}
+			prior := c.prior
+			if c.name == "concat_video" {
+				clips, _ := json.Marshal([]string{
+					filepath.Join(runDir, "shot_0.mp4"),
+					filepath.Join(runDir, "shot_1.mp4"),
+				})
+				prior = map[string]*stageResult{"clips_list": {Output: string(clips)}}
+			}
+			st := c.stage(runDir)
+			runner := &recordingFFmpegRunner{emptyOutput: true}
+			exec := &ffmpegExecutor{runner: runner}
+			out, err := exec.Execute(context.Background(), StageInput{
+				Stage: st, Prior: prior, RunDir: runDir,
+			})
+			if err == nil {
+				t.Fatalf("ffmpeg exited 0 with a 0-byte output and the stage reported success: %v", out)
+			}
+			if !strings.Contains(err.Error(), "0-byte output") {
+				t.Errorf("error should name the empty output: %v", err)
+			}
+			if runner.callCount() != 1 {
+				t.Errorf("expected exactly one ffmpeg invocation, got %d", runner.callCount())
+			}
+		})
+	}
+}
+
+// TestRequireNonEmptyOutput covers the shared check directly, including
+// the case a Size()==0 test alone would miss: ffmpeg exiting 0 without
+// creating the file at all.
+func TestRequireNonEmptyOutput(t *testing.T) {
+	dir := t.TempDir()
+	empty := filepath.Join(dir, "empty.mp4")
+	if err := os.WriteFile(empty, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	full := filepath.Join(dir, "full.mp4")
+	if err := os.WriteFile(full, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := requireNonEmptyOutput("s", "ffmpeg", empty); err == nil {
+		t.Error("a 0-byte output must fail the stage")
+	}
+	if err := requireNonEmptyOutput("s", "ffmpeg", filepath.Join(dir, "absent.mp4")); err == nil {
+		t.Error("a missing output must fail the stage")
+	}
+	if err := requireNonEmptyOutput("s", "ffmpeg", full); err != nil {
+		t.Errorf("a non-empty output must pass: %v", err)
 	}
 }

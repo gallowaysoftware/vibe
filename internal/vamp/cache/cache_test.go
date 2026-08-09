@@ -301,6 +301,47 @@ func TestStore_Put_RejectsAmbiguousInput(t *testing.T) {
 	}
 }
 
+// TestStore_Put_RefusesAZeroLengthBinaryArtefact is the second half of
+// the empty-ffmpeg-output fix, and the one that decides whether a bad
+// run is a bad run or a permanent one.
+//
+// os.ReadFile of a 0-byte file returns an empty but NON-NIL slice, which
+// is exactly what Put's mode select reads as "binary output". Admitting
+// it writes a content-addressed entry, so every later run with the same
+// inputs replays the empty file — the cache is the mechanism that turns
+// one swallowed ffmpeg error into a pipeline that stays broken.
+//
+// The test asserts on the disk as well as the error: a Put that failed
+// halfway would leave an entry Get can find, which is the same poisoning
+// by a different route.
+func TestStore_Put_RefusesAZeroLengthBinaryArtefact(t *testing.T) {
+	root := t.TempDir()
+	s, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := strings.Repeat("b", 64)
+	// Non-nil, length zero: precisely what os.ReadFile("empty.mp4") hands back.
+	empty := []byte{}
+	if err := s.Put(PutInput{Hash: hash, StageType: "ffmpeg", Bytes: empty}); err == nil {
+		t.Fatal("Put stored a zero-length binary artefact; the failure would replay forever")
+	}
+	hit, err := s.Get(hash)
+	if err != nil {
+		t.Fatalf("Get after refused Put: %v", err)
+	}
+	if hit != nil {
+		t.Errorf("Get found an entry for a refused Put: %+v", hit)
+	}
+	total, count, err := s.Size()
+	if err != nil {
+		t.Fatalf("Size: %v", err)
+	}
+	if count != 0 || total != 0 {
+		t.Errorf("cache holds %d entr(ies)/%d bytes after a refused Put; it must stay clean", count, total)
+	}
+}
+
 // TestStore_Put_EmptyTextRoundTrips verifies that an intentional empty
 // text output (e.g. a compact stage whose source had no content) stores
 // and reads back as an empty string rather than erroring at Put time.

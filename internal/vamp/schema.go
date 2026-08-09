@@ -419,7 +419,11 @@ func Schema() *schemaProperty {
 				Type:        "string",
 				Description: "Approval prompt rendered to the operator (confirm stages).",
 			},
-			"timeout": durationSchema,
+			"timeout": {
+				Type:        "string",
+				Description: "Bound one attempt at this stage. Valid on every stage kind; absent means no bound. Composes with retry: the way an HTTP client's timeout composes with a retry budget (three attempts of `timeout: 5m`, not one 5m total), and each foreach item is its own attempt. A confirm stage's timeout is different in kind: it auto-REJECTS rather than erroring.",
+				Pattern:     durationSchema.Pattern,
+			},
 			"cleanup": {
 				Type:        "array",
 				Description: "Glob patterns (relative to the run dir) removed from disk after the stage's success path completes. Best-effort: cleanup failures log a warning and never fail the stage. Patterns must NOT escape the run dir (no absolute paths, no \"..\" segments). Only valid on stage types that produce a stable on-disk output (text/comfyui/audio/ffmpeg).",

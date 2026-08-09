@@ -113,7 +113,6 @@ const defaultAttemptTimeout = 10 * time.Second
 // WebhookSink posts notifications to one endpoint.
 type WebhookSink struct {
 	url      string
-	path     string
 	token    string
 	format   string
 	hc       *http.Client
@@ -175,7 +174,6 @@ func NewWebhookSink(cfg WebhookConfig) (*WebhookSink, error) {
 	}
 	return &WebhookSink{
 		url:      raw,
-		path:     u.Path,
 		token:    strings.TrimSpace(cfg.Token),
 		format:   format,
 		hc:       hc,
@@ -189,15 +187,49 @@ func (s *WebhookSink) Endpoint() string { return s.redacted }
 // Scrub removes this sink's secrets from an arbitrary string. The path
 // is scrubbed as well as the whole URL because an ntfy topic is a path
 // segment, and a leaked topic is a leaked credential on its own.
+// URL first, then token: a token that also appears INSIDE the URL (a
+// `?auth=` query is a real webhook shape) would otherwise be replaced
+// first, leaving the whole-URL match to fail against a string that no
+// longer contains it.
 func (s *WebhookSink) Scrub(msg string) string {
-	out := strings.ReplaceAll(msg, s.url, redacted)
-	if len(s.path) > 1 {
-		out = strings.ReplaceAll(out, s.path, redacted)
+	return scrubToken(ScrubURL(s.url, msg), s.token)
+}
+
+// ScrubURL removes rawURL — and, separately, its path — from an
+// arbitrary string. The path goes too because for every incoming-webhook
+// dialect this repo speaks (ntfy topics, Slack `/services/T…/B…/…`,
+// Discord `/api/webhooks/<id>/<token>`) the credential IS a path
+// segment, so a message that lost the host but kept the path is still a
+// leak.
+//
+// Exported because the trap it closes is not specific to a Sink: any
+// caller holding a webhook URL — vamp's webhook stage renders a fresh
+// one per stage from a template and never builds a Sink — must be able
+// to close it with THIS code rather than a second implementation that
+// drifts. (*WebhookSink).Scrub is a thin wrapper over it for exactly
+// that reason.
+//
+// An empty rawURL is a no-op: there is nothing to hide, and replacing
+// the empty string would otherwise redact every character in msg.
+func ScrubURL(rawURL, msg string) string {
+	raw := strings.TrimSpace(rawURL)
+	if raw == "" {
+		return msg
 	}
-	if s.token != "" {
-		out = strings.ReplaceAll(out, s.token, redacted)
+	out := strings.ReplaceAll(msg, raw, redacted)
+	if u, err := url.Parse(raw); err == nil && len(u.Path) > 1 {
+		out = strings.ReplaceAll(out, u.Path, redacted)
 	}
 	return out
+}
+
+// scrubToken removes a bearer token from msg. Empty token is a no-op,
+// for the same reason ScrubURL's empty-URL case is.
+func scrubToken(msg, token string) string {
+	if token == "" {
+		return msg
+	}
+	return strings.ReplaceAll(msg, token, redacted)
 }
 
 const redacted = "<redacted>"

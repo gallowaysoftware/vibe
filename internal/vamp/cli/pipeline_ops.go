@@ -150,7 +150,12 @@ func RunPipeline(ctx context.Context, p *vamp.Pipeline, pipelineDir string, pipe
 			return fmt.Errorf("create run dir: %w", err)
 		}
 		logPath := filepath.Join(runDir, vamp.LogFileName)
-		lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		// 0o600, not 0o644: this file is the persisted transcript of a
+		// detached run — rendered prompts, model output, and every line an
+		// executor chose to log. Nothing else on the box has a reason to
+		// read it, and world-readable was the multiplier that turned a
+		// single leaked string into a durable one.
+		lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 		if err != nil {
 			return fmt.Errorf("open log file: %w", err)
 		}
@@ -277,7 +282,7 @@ func ensureServicesUp(ctx context.Context, p *vamp.Pipeline, stdout io.Writer) e
 
 	fmt.Fprintf(stdout, "ensure-services: %d service(s) not up — starting now\n", len(startNames))
 	for _, name := range startNames {
-		if err := vibeStart(stdout, name, false); err != nil {
+		if err := vibeStartContext(ctx, stdout, name, false); err != nil {
 			return fmt.Errorf("ensure-services: %w", err)
 		}
 	}

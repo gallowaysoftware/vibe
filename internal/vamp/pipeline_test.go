@@ -1885,19 +1885,9 @@ stages:
 `,
 			want: "message is only valid",
 		},
-		{
-			name: "timeout_on_text",
-			yaml: `
-name: c
-stages:
-  - id: a
-    capability: r
-    prompt: hi
-    timeout: 5m
-    output: a.txt
-`,
-			want: "timeout is only valid",
-		},
+		// timeout is deliberately NOT here. It used to be — which is why
+		// the only boundable stage in vamp was the one that waits for a
+		// human. See TestValidate_TimeoutIsValidOnEveryStageKind.
 		{
 			name: "capability_on_confirm",
 			yaml: `
@@ -2146,5 +2136,66 @@ stages:
 	}
 	if !strings.Contains(err.Error(), "cleanup is only valid") {
 		t.Errorf("err = %v, want \"cleanup is only valid\" rejection", err)
+	}
+}
+
+// TestValidate_TimeoutIsValidOnEveryStageKind: `timeout:` used to be
+// confirm-only, which meant the ONLY thing a pipeline author could bound
+// was the wait for a human. A stalled model server, a ComfyUI job stuck
+// in the queue, an ffmpeg wedged on a corrupt input — none of them could
+// be given a deadline by the person who wrote the pipeline.
+func TestValidate_TimeoutIsValidOnEveryStageKind(t *testing.T) {
+	yaml := `
+name: x
+stages:
+  - id: think
+    capability: reasoning
+    prompt: hi
+    output: a.txt
+    timeout: 5m
+  - id: notify
+    type: webhook
+    url: https://example.com/h
+    body:
+      text: done
+    output: r.txt
+    timeout: 30s
+  - id: say
+    type: audio
+    voice: v
+    text: hello
+    output: a.wav
+    timeout: 90s
+`
+	p, err := LoadPipeline(writePipeline(t, yaml))
+	if err != nil {
+		t.Fatalf("timeout must be accepted on every stage kind: %v", err)
+	}
+	for _, s := range p.Stages {
+		if s.Timeout <= 0 {
+			t.Errorf("stage %s lost its timeout during load: %s", s.ID, s.Timeout)
+		}
+	}
+}
+
+// TestValidate_NegativeTimeoutRejected: zero means "no bound" and is the
+// default every existing pipeline carries, so the only illegal value is
+// a negative one — which is a typo, not a policy.
+func TestValidate_NegativeTimeoutRejected(t *testing.T) {
+	yaml := `
+name: x
+stages:
+  - id: think
+    capability: reasoning
+    prompt: hi
+    output: a.txt
+    timeout: -5s
+`
+	_, err := LoadPipeline(writePipeline(t, yaml))
+	if err == nil {
+		t.Fatal("expected a negative timeout to be rejected")
+	}
+	if !strings.Contains(err.Error(), "timeout must be >= 0") {
+		t.Errorf("err = %v, want a \"timeout must be >= 0\" rejection", err)
 	}
 }

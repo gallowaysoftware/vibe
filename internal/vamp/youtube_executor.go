@@ -31,7 +31,7 @@ type youtubeExecutor struct {
 	// doer is the injectable HTTP transport. Tests stub this so they can
 	// record each request (token exchange, resumable init, bytes upload,
 	// optional thumbnail) without making real YouTube calls. nil means use
-	// http.DefaultClient.
+	// defaultYouTubeClient().
 	doer httpDoer
 	// credsLoader, when non-nil, overrides the on-disk credentials JSON read.
 	// Tests use this to avoid writing a file per case.
@@ -39,7 +39,7 @@ type youtubeExecutor struct {
 }
 
 // httpDoer abstracts the single method we need from *http.Client so tests can
-// stub every outbound call. Production uses http.DefaultClient.
+// stub every outbound call. Production uses defaultYouTubeClient().
 type httpDoer interface {
 	Do(req *http.Request) (*http.Response, error)
 }
@@ -166,7 +166,7 @@ func (y *youtubeExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 
 	doer := y.doer
 	if doer == nil {
-		doer = http.DefaultClient
+		doer = defaultYouTubeClient()
 	}
 
 	if in.Log != nil {

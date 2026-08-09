@@ -3,6 +3,8 @@ package vamp
 import (
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -53,6 +55,50 @@ func writeFailureSummary(w io.Writer, pipelineName string, runErr error, e *Exec
 			break
 		}
 	}
+	if cmd := resumeCommand(e); cmd != "" {
+		fmt.Fprintf(w, "  resume: %s\n", cmd)
+	}
+}
+
+// resumeCommand renders the exact command that continues this run.
+//
+// --resume is the best-built thing in the runner — per-item foreach
+// granularity, pipeline-drift detection against the snapshot, JSON
+// re-validation of resumed outputs — and until this line, NOTHING in
+// any user-facing output mentioned that it exists. A ten-stage
+// pipeline that died at stage nine printed a run dir and an error, and
+// the operator's obvious move was to run the whole thing again.
+//
+// The run dir is already on the line above; what was missing was the
+// sentence that turns it into an action. Printing the whole command
+// rather than naming the flag is deliberate: a path the operator has to
+// copy out of one line and paste into another is a path they get wrong
+// at 02:00.
+//
+// Returns "" when there is no run dir to resume from, or when this run
+// WAS a resume — in that case the same command is still correct, but
+// the operator has already found it.
+func resumeCommand(e *Executor) string {
+	if e == nil || e.RunDir == "" || e.ResumeDir != "" {
+		return ""
+	}
+	// argv[0] as invoked. A mounted pipeline is its own binary
+	// (`my-pipeline run --resume …`); the generic CLI takes the pipeline
+	// path as an argument (`vamp run pipeline.yaml --resume …`). Both
+	// spellings come out right because both are read off the process
+	// that is printing the message.
+	exe := "vamp"
+	if len(os.Args) > 0 && strings.TrimSpace(os.Args[0]) != "" {
+		exe = filepath.Base(os.Args[0])
+	}
+	args := []string{exe, "run"}
+	// The pipeline argument, when this binary takes one. os.Args[1] is
+	// the subcommand; the file path follows it for the generic CLI.
+	if len(os.Args) > 2 && os.Args[1] == "run" && !strings.HasPrefix(os.Args[2], "-") {
+		args = append(args, os.Args[2])
+	}
+	args = append(args, "--resume", e.RunDir)
+	return strings.Join(args, " ")
 }
 
 // splitJoinedError unwraps an errors.Join chain into one string per

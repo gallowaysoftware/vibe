@@ -104,7 +104,7 @@ func (p *pandocExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 	if in.Log != nil {
 		fmt.Fprintf(in.Log, "pandoc: %s -> %s (engine=%s)\n", filepath.Base(srcAbs), outRel, binary)
 	}
-	cmd := exec.CommandContext(ctx, binary, args...)
+	cmd := command(ctx, binary, args...)
 	cmd.Stdout = in.Log
 	cmd.Stderr = in.Log
 	if err := cmd.Run(); err != nil {

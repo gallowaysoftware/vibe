@@ -446,9 +446,29 @@ type Stage struct {
 	// Required for confirm stages; rejected on every other stage type.
 	Message string `yaml:"message,omitempty"`
 
-	// Timeout, when non-zero, bounds how long a `type: confirm` stage will
-	// wait for the operator to respond before auto-rejecting. Zero (the
-	// default) means "wait forever". Rejected on every other stage type.
+	// Timeout, when non-zero, bounds one ATTEMPT at this stage. Zero (the
+	// default) means no bound, which is what every existing pipeline
+	// gets.
+	//
+	// Valid on every stage kind. It used to be confirm-only, which meant
+	// the single thing a pipeline author could bound was the wait for a
+	// HUMAN — while a stalled model server, a ComfyUI job that never
+	// leaves the queue, or an ffmpeg wedged on a corrupt input all ran
+	// until somebody noticed. On a 10-stage overnight pipeline that is
+	// the difference between "failed at 02:00, resumable" and "still
+	// sitting there at 09:00 having done nothing".
+	//
+	// Per ATTEMPT, not per stage: it composes with retry: the way an HTTP
+	// client's timeout composes with a retry budget, so `timeout: 5m` +
+	// `retry: {max_attempts: 3}` means three five-minute tries rather
+	// than one five-minute total that the second attempt can never fit
+	// inside. Foreach items are separate attempts and each gets the full
+	// bound. A timeout fires as context.DeadlineExceeded, which the retry
+	// classifier already treats as both `timeout` and `transient`.
+	//
+	// Confirm stages are the exception and keep their own handling: their
+	// timeout means "auto-REJECT", a decision rather than an error, and
+	// they enforce it themselves.
 	Timeout time.Duration `yaml:"timeout,omitempty"`
 
 	// Cleanup is an optional list of glob patterns (relative to the run
@@ -1217,9 +1237,6 @@ func (p *Pipeline) Validate() error {
 			if s.Message == "" {
 				return fmt.Errorf("%s: message is required for type: confirm stages", ctx)
 			}
-			if s.Timeout < 0 {
-				return fmt.Errorf("%s: timeout must be >= 0 (got %s)", ctx, s.Timeout)
-			}
 			if s.Capability != "" {
 				return fmt.Errorf("%s: capability is only valid on stage types that activate a vibe profile (confirm is a local prompt)", ctx)
 			}
@@ -1438,6 +1455,12 @@ func (p *Pipeline) Validate() error {
 		if s.OutputFormat != "" && s.OutputFormat != "json" {
 			return fmt.Errorf("%s: output_format %q is not supported (allowed: \"\", json)", ctx, s.OutputFormat)
 		}
+		// Timeout is valid on EVERY stage kind (see Stage.Timeout). Zero
+		// stays the default and still means "no bound", so nothing that
+		// runs today changes; negative is a typo, not a policy.
+		if s.Timeout < 0 {
+			return fmt.Errorf("%s: timeout must be >= 0 (got %s)", ctx, s.Timeout)
+		}
 		// Cleanup: optional list of glob patterns scrubbed after the stage's
 		// success path completes. Restricted to stage types that produce a
 		// stable on-disk output and own a meaningful chunk of intermediate
@@ -1595,15 +1618,19 @@ func rejectYouTubeFields(ctx string, s Stage) error {
 }
 
 // rejectConfirmFields rejects the confirm-only fields on non-confirm stages.
-// Mirrors rejectWebhookFields / rejectYouTubeFields. message is the human-
-// readable prompt, timeout bounds how long the stage waits for approval;
-// both only make sense on a confirm stage.
+// Mirrors rejectWebhookFields / rejectYouTubeFields. message is the
+// human-readable approval prompt, which only makes sense on a confirm
+// stage.
+//
+// timeout is deliberately NOT in this list. It used to be, which meant
+// the only stage that could be bounded was the one that waits for a
+// human — every stage that waits for a MACHINE (a stalled model server,
+// a ComfyUI queue that never completes, an ffmpeg that wedges on a
+// corrupt input) ran forever, and a pipeline author had no way to say
+// otherwise. See Stage.Timeout.
 func rejectConfirmFields(ctx string, s Stage) error {
 	if s.Message != "" {
 		return fmt.Errorf("%s: message is only valid on type: confirm stages", ctx)
-	}
-	if s.Timeout != 0 {
-		return fmt.Errorf("%s: timeout is only valid on type: confirm stages", ctx)
 	}
 	return nil
 }

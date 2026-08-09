@@ -1598,6 +1598,40 @@ func (e *Executor) runWithRetry(ctx context.Context, st *Stage, exec StageExecut
 	return out, err
 }
 
+// executeBounded runs one attempt at a stage under its declared
+// `timeout:`, and is the only place a vamp stage acquires a deadline.
+//
+// Zero (the default, and what every pipeline written before this had)
+// means no bound and the executor sees the caller's ctx untouched, so
+// the change is opt-in.
+//
+// Confirm stages are excluded: their timeout means "auto-REJECT", which
+// is a decision the confirm executor records as a stage result, not an
+// error. Cancelling its context instead would turn a deliberate
+// no-answer into an indistinguishable failure and lose the marker-file
+// bookkeeping.
+//
+// The bound is per ATTEMPT. A stage that hangs is the case this exists
+// for, and a hang consumed by the first attempt would otherwise leave
+// the retry policy nothing to retry with.
+func (e *Executor) executeBounded(ctx context.Context, st *Stage, exec StageExecutor, in StageInput) (*StageOutput, error) {
+	if st.Timeout <= 0 || stageTypeOrDefault(st) == StageTypeConfirm {
+		return exec.Execute(ctx, in)
+	}
+	bounded, cancel := context.WithTimeout(ctx, st.Timeout)
+	defer cancel()
+	out, err := exec.Execute(bounded, in)
+	// Name the deadline in the error. Executors wrap context errors in
+	// their own prose ("chat completion: context deadline exceeded"),
+	// which tells the operator what timed out but not that THEY set the
+	// clock, nor what to raise. The cause stays wrapped so the retry
+	// classifier's errors.Is(context.DeadlineExceeded) still matches.
+	if err != nil && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+		return nil, fmt.Errorf("stage %s: timeout %s exceeded: %w", st.ID, st.Timeout, err)
+	}
+	return out, err
+}
+
 // runWithRetryInner is the cacheless retry loop body extracted from
 // runWithRetry so the cache wrapper can compose cleanly around it. Its
 // semantics match the pre-cache behaviour exactly.
@@ -1607,7 +1641,7 @@ func (e *Executor) runWithRetryInner(ctx context.Context, st *Stage, exec StageE
 	// Skip the loop entirely so the existing call graph is unchanged for
 	// pipelines that don't opt in.
 	if policy == nil || policy.MaxAttempts <= 1 {
-		return exec.Execute(ctx, in)
+		return e.executeBounded(ctx, st, exec, in)
 	}
 	attempt := 0
 	backoff := policy.InitialBackoff
@@ -1616,7 +1650,7 @@ func (e *Executor) runWithRetryInner(ctx context.Context, st *Stage, exec StageE
 		itemTag = fmt.Sprintf("[%d]", in.ItemIdx)
 	}
 	for {
-		out, err := exec.Execute(ctx, in)
+		out, err := e.executeBounded(ctx, st, exec, in)
 		if err == nil {
 			if attempt > 0 {
 				e.logf("  -> stage %q%s recovered after %d retry(ies)", st.ID, itemTag, attempt)
@@ -2056,6 +2090,13 @@ func (e *Executor) tryResumeStage(st *Stage) (bool, error) {
 	}
 	outPath, err := e.renderOutputPath(st, nil)
 	if err != nil {
+		if errors.Is(err, errOutputPathEscape) {
+			// Not a "can't decide yet": no amount of later stage state
+			// makes "../../etc/passwd" a legal output path, and the next
+			// thing this function does with the rendered path is join it
+			// to RunDir and READ it. Refuse the run.
+			return false, err
+		}
 		// Output template may reference an upstream's .output that won't
 		// be available until a prior resumed-or-run stage populated
 		// stageOutputs. If template rendering fails we can't decide
@@ -2159,6 +2200,13 @@ func (e *Executor) tryResumeForeachStage(st *Stage) (*foreachResumeInfo, error) 
 		extra := map[string]any{st.Foreach.Var: item, "i": i}
 		path, err := e.renderOutputPath(st, extra)
 		if err != nil {
+			if errors.Is(err, errOutputPathEscape) {
+				// An item whose rendered path leaves the run dir is a
+				// refusal, not a missing dependency — and the very next
+				// line joins this path to RunDir and reads it. Surface it
+				// here instead of quietly reporting "nothing to resume".
+				return nil, err
+			}
 			// Output template can't render for this item; we can't decide
 			// resumability per-item without it. Treat the whole resume as
 			// not-applicable so the caller runs the stage from scratch
@@ -2313,6 +2361,43 @@ func renderPrompt(st *Stage, pipelineDir string, cliInputs map[string]string, pr
 	return renderTemplate(st.ID, raw, st.Inputs, cliInputs, prior, runDir, extra)
 }
 
+// errOutputPathEscape marks a rendered output path that resolves outside
+// the run dir. It is a sentinel rather than a plain error because the two
+// resume pre-passes swallow ordinary render failures on purpose — an
+// output template referencing an upstream stage that hasn't produced
+// anything yet is a "decide later", not a fault — and an escape is the
+// one render failure no later state can make legal. Without the
+// distinction the refusal is invisible: the pre-pass reports
+// "not resumable", the stage runs, and the only thing standing between
+// the model's string and the filesystem is this same guard on the write
+// path.
+var errOutputPathEscape = errors.New("output path escapes the run dir")
+
+// ensureUnderRunDir refuses a rendered path that would resolve outside
+// the run dir.
+//
+// This is not a hypothetical. A foreach item map is built from a PRIOR
+// STAGE'S PARSED LLM OUTPUT (resolveForeachItems), a stage's `output:`
+// template interpolates fields from it (`output: "{{.item.slug}}.wav"`),
+// and the result is handed to filepath.Join(e.RunDir, path) at four
+// separate call sites — two writes and two resume reads — with nothing
+// upstream cleaning or prefixing it. A sampled "../../etc/cron.d/x" is a
+// write outside the run dir; a sampled "/etc/passwd" is a read of it back
+// into a stage output, which is to say into the next prompt.
+//
+// Same rule as validateCleanupPatterns, deliberately: one shape of
+// "stays under the run dir" for the whole package, so a reader who has
+// verified one has verified both. Shared by the live executor and the
+// dry run, because a dry run that accepts a path the real run refuses is
+// a plan that lies.
+func ensureUnderRunDir(out string) error {
+	cleaned := filepath.Clean(out)
+	if filepath.IsAbs(cleaned) || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%w: %q", errOutputPathEscape, out)
+	}
+	return nil
+}
+
 // renderOutputPath renders the stage's Output template against the executor's
 // current state. The returned path is always relative to RunDir.
 func (e *Executor) renderOutputPath(st *Stage, extra map[string]any) (string, error) {
@@ -2321,13 +2406,8 @@ func (e *Executor) renderOutputPath(st *Stage, extra map[string]any) (string, er
 	if err != nil {
 		return "", err
 	}
-	// The rendered path is joined against e.RunDir and written to disk; a
-	// foreach item field sourced from upstream LLM JSON could otherwise escape
-	// the run dir (e.g. output: "{{.item.slug}}.wav" with slug "../../etc").
-	// Mirror validateCleanupPatterns' guard.
-	cleaned := filepath.Clean(out)
-	if filepath.IsAbs(cleaned) || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("output path %q escapes the run dir", out)
+	if err := ensureUnderRunDir(out); err != nil {
+		return "", err
 	}
 	return out, nil
 }

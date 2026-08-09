@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -30,12 +29,23 @@ type comfyuiExecutor struct {
 	pollInterval time.Duration
 	// newClient is the constructor for the underlying ComfyUI client; tests
 	// override it to inject a custom http.Client. Defaults to
-	// comfyui.New(baseURL, http.DefaultClient).
+	// comfyui.New(baseURL, defaultComfyUIClient()).
 	newClient func(baseURL string) *comfyui.Client
 }
 
 // Compile-time guarantee that comfyuiExecutor satisfies StageExecutor.
 var _ StageExecutor = (*comfyuiExecutor)(nil)
+
+// comfyuiWaitCeiling bounds the wait for a submitted workflow when the
+// stage declares no timeout of its own.
+//
+// Thirty minutes is chosen to be uninteresting rather than tight: the
+// slowest thing this repo actually runs through ComfyUI is a batch of
+// SDXL frames on a 5090, which is minutes, and a wait past half an hour
+// means the queue is stuck rather than busy. The point is that the
+// number EXISTS — an unbounded wait fails by never returning, which is
+// the one failure a run cannot report, resume from, or be woken up by.
+const comfyuiWaitCeiling = 30 * time.Minute
 
 // Execute runs one ComfyUI workflow invocation. For foreach stages the runner
 // calls this once per item with StageInput.Item populated; non-foreach
@@ -87,8 +97,28 @@ func (e *comfyuiExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 	if interval <= 0 {
 		interval = time.Second
 	}
-	history, err := client.WaitForCompletion(ctx, promptID, interval)
+	// The wait for a submitted workflow is the one wait in vamp with no
+	// natural end: the WS path blocks until a completion event that a
+	// crashed or OOM-killed ComfyUI worker will never send, and the
+	// polling fallback re-asks a server that keeps answering "not
+	// finished". Both honour ctx, and until stages could declare a
+	// `timeout:` nothing ever put one on it — so an overnight pipeline
+	// met a stuck queue by sitting on it until morning.
+	//
+	// A stage that declares its own timeout is already bounded by
+	// executeBounded, and a second deadline here would only report the
+	// wrong number. Otherwise apply the ceiling.
+	waitCtx := ctx
+	if st.Timeout <= 0 {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, comfyuiWaitCeiling)
+		defer cancel()
+	}
+	history, err := client.WaitForCompletion(waitCtx, promptID, interval)
 	if err != nil {
+		if st.Timeout <= 0 && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			return nil, fmt.Errorf("stage %s: workflow %s did not complete within %s (default ceiling; set the stage's timeout: to change it): %w", st.ID, promptID, comfyuiWaitCeiling, err)
+		}
 		return nil, fmt.Errorf("stage %s: wait for completion: %w", st.ID, err)
 	}
 
@@ -144,7 +174,7 @@ func (e *comfyuiExecutor) clientFor(baseURL string) *comfyui.Client {
 	if e.newClient != nil {
 		return e.newClient(baseURL)
 	}
-	return comfyui.New(baseURL, http.DefaultClient)
+	return comfyui.New(baseURL, defaultComfyUIClient())
 }
 
 // loadWorkflow reads st.Workflow (relative to pipelineDir when not absolute,

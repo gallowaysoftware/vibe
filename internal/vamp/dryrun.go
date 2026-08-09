@@ -525,8 +525,21 @@ func (s *dryRunState) snapshotPrior(deps []string) map[string]*stageResult {
 // renderOutputPath is the dry-run analogue of (*Executor).renderOutputPath:
 // it uses the dry-run state's synthesised stageOutputs rather than the live
 // executor's so the render can succeed before any real stage has run.
+//
+// It applies the same run-dir containment rule. A dry run exists to tell
+// the operator what the real run will do; one that prints
+// `output: ../../etc/passwd` as part of a clean plan and then fails at
+// stage 9 has answered the wrong question. The rule is shared code, not
+// a copy, so the two can't diverge.
 func (s *dryRunState) renderOutputPath(st *Stage, prior map[string]*stageResult, extra map[string]any) (string, error) {
-	return renderTemplate(st.ID+":output", st.Output, st.Inputs, s.executor.Inputs, prior, s.executor.RunDir, extra)
+	out, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, s.executor.Inputs, prior, s.executor.RunDir, extra)
+	if err != nil {
+		return "", err
+	}
+	if err := ensureUnderRunDir(out); err != nil {
+		return "", err
+	}
+	return out, nil
 }
 
 // syntheticOutputFor produces a placeholder string for a stage's downstream
