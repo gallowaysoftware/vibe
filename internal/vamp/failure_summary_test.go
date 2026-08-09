@@ -104,6 +104,38 @@ func TestFailureSummary_PrintsTheResumeCommand(t *testing.T) {
 	}
 }
 
+// TestPipelineArg covers the argv shapes the resume line has to survive.
+// The one that motivated it is `vamp run --input k=v pipeline.yaml`: a
+// positional read of argv[2] finds the flag, and the printed command
+// then has no pipeline in it — which cobra rejects, leaving the operator
+// to repair by hand the line that exists so they would not have to.
+func TestPipelineArg(t *testing.T) {
+	cases := []struct {
+		name string
+		argv []string
+		want string
+	}{
+		{"canonical", []string{"vamp", "run", "pipeline.yaml"}, "pipeline.yaml"},
+		{"flags first", []string{"vamp", "run", "--input", "k=v", "ep.yaml"}, "ep.yaml"},
+		{"flags after", []string{"vamp", "run", "ep.yml", "--detach"}, "ep.yml"},
+		{"uppercase ext", []string{"vamp", "run", "Ep.YAML"}, "Ep.YAML"},
+		{"path", []string{"vamp", "run", "/a/b/ep.yaml"}, "/a/b/ep.yaml"},
+		// A mounted pipeline binary: `run` takes no positional at all.
+		{"mounted", []string{"my-pipeline", "run"}, ""},
+		{"mounted detached", []string{"my-pipeline", "run", "--internal-run-job"}, ""},
+		// Not a run invocation, and the degenerate argv a test binary has.
+		{"other subcommand", []string{"vamp", "validate", "ep.yaml"}, ""},
+		{"short argv", []string{"vamp"}, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := pipelineArg(c.argv); got != c.want {
+				t.Errorf("pipelineArg(%q) = %q, want %q", c.argv, got, c.want)
+			}
+		})
+	}
+}
+
 // TestFailureSummary_NoResumeLineWhenAlreadyResuming: the command is
 // still correct on a resumed run, but the operator has already found
 // it, and repeating it costs a line of the thing they are reading to

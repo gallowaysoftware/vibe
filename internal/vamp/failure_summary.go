@@ -92,13 +92,37 @@ func resumeCommand(e *Executor) string {
 		exe = filepath.Base(os.Args[0])
 	}
 	args := []string{exe, "run"}
-	// The pipeline argument, when this binary takes one. os.Args[1] is
-	// the subcommand; the file path follows it for the generic CLI.
-	if len(os.Args) > 2 && os.Args[1] == "run" && !strings.HasPrefix(os.Args[2], "-") {
-		args = append(args, os.Args[2])
+	if p := pipelineArg(os.Args); p != "" {
+		args = append(args, p)
 	}
 	args = append(args, "--resume", e.RunDir)
 	return strings.Join(args, " ")
+}
+
+// pipelineArg recovers the pipeline-file argument from a `vamp run`
+// argv, or "" for a mounted pipeline binary (whose `run` takes no
+// positional).
+//
+// It looks for the .yaml/.yml rather than taking argv[2] positionally,
+// because `vamp run --input k=v pipeline.yaml` is a normal way to invoke
+// this and puts a flag there. Getting that case wrong prints a resume
+// command with no pipeline in it, which cobra rejects — and a line the
+// operator has to repair by hand at 02:00 is the failure this whole item
+// exists to avoid.
+func pipelineArg(argv []string) string {
+	if len(argv) < 3 || argv[1] != "run" {
+		return ""
+	}
+	for _, a := range argv[2:] {
+		if strings.HasPrefix(a, "-") {
+			continue
+		}
+		switch strings.ToLower(filepath.Ext(a)) {
+		case ".yaml", ".yml":
+			return a
+		}
+	}
+	return ""
 }
 
 // splitJoinedError unwraps an errors.Join chain into one string per
