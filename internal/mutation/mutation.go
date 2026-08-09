@@ -1040,6 +1040,51 @@ var Registry = []Mutation{
 			"model the CHEAPEST thing to probe, and a wedged box re-probes it every interval against " +
 			"neither the cooldown nor the 96/day cap.",
 	},
+	// ── the wrapper's exit status (U7) ────────────────────────────────
+	//
+	// Two commands in this repo are WRAPPERS a launcher is pointed at, and
+	// root.go states the rule for both: a wrapper that swallows its child's
+	// status is a wrapper a launcher cannot be pointed at. C24 fixed the
+	// drain wrapper and registered nothing; the `vibe run` half was found
+	// still returning nil eleven phases later. Both halves are registered
+	// now, because "we fixed this once" is exactly the claim this package
+	// exists to stop trusting.
+	{
+		Name:     "u7/`vibe run` swallows the frontend's exit status",
+		File:     "internal/vibe/cli/cmd_run.go",
+		Find:     "\t\treturn exitCodeError{msg: binary, code: exitErr.ExitCode()}",
+		Replace:  "\t\treturn nil",
+		Pkg:      "./internal/vibe/cli/",
+		MustFail: []string{"TestRunPropagatesTheFrontendsExitStatus", "TestFrontendExitError_CarriesTheChildsCode"},
+		Why: "`vibe run` is the wrapper README points a launcher at, and it returned nil for ANY " +
+			"*exec.ExitError — so a frontend that died on a bad config, an OOM or a panic reached the " +
+			"shell as a clean quit and `vibe run omp && next` ran next. The C24 sibling flattened 3 to " +
+			"1; this flattened it to 0, which is the worse direction. The comment that shipped over it " +
+			"claimed nil was needed \"so the teardown defer fires cleanly\", which is not how Go works — " +
+			"so the entry names the teardown assertion too.",
+	},
+	{
+		Name: "u7/an aborted drain reads as a completed one",
+		File: "internal/vibe/cli/cmd_cell_actuate.go",
+		Find: "\t\tif strings.ToLower(strings.TrimSpace(answer)) != \"y\" {\n" +
+			"\t\t\tfmt.Fprintln(out, \"aborted\")\n\t\t\treturn errDrainAborted\n\t\t}",
+		// The pre-U7 spelling: print "aborted" and answer the caller with
+		// the same nil a completed drain returns. The EOF branch above is
+		// deliberately NOT the mutation target — an empty answer falls
+		// through to this test anyway, so that branch is a redundancy and an
+		// entry on it would report UNPROTECTED for a guard that works.
+		Replace: "\t\tif strings.ToLower(strings.TrimSpace(answer)) != \"y\" {\n" +
+			"\t\t\tfmt.Fprintln(out, \"aborted\")\n\t\t\treturn nil\n\t\t}",
+		Pkg:      "./internal/vibe/cli/",
+		MustFail: []string{"TestCellDrainPromptAnswers", "TestDrainUntilExitAbortedDrainRunsNothing"},
+		Why: "the only caller that reads this error is drainUntilExit, whose whole contract is drain → " +
+			"run → resume. Answering an abort with nil ran the operator's command against a cell that " +
+			"was still serving, then issued a CellResume for a cell nothing had drained, and exited 0 — " +
+			"so the wrapper said the reclaim happened. The shipped launcher passes --yes and never " +
+			"reaches the prompt, which is why this survived: the defect is real only for a human typing " +
+			"the verb, and nothing in the suite could type it until the prompt got its test seams.",
+	},
+
 	{
 		Name: "c26b/the model-rewrite reader buffers the stream",
 		File: "internal/vibe/proxy/proxy.go",

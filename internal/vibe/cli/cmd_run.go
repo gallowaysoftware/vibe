@@ -187,23 +187,51 @@ func runCmd() *cobra.Command {
 				}
 			}()
 
-			if err := child.Wait(); err != nil {
-				// A non-zero exit from the frontend is its problem to report;
-				// surface the error but still return success-ish so the
-				// teardown defer fires cleanly. ExitError specifically is
-				// expected (user quit a TUI with q/^C).
-				var exitErr *exec.ExitError
-				if errors.As(err, &exitErr) {
-					return nil
-				}
-				return fmt.Errorf("wait for %s: %w", p.Frontend.Binary, err)
-			}
-			return nil
+			return frontendExitError(p.Frontend.Binary, child.Wait())
 		},
 	}
 	cmd.Flags().BoolVar(&noVRAMCheck, "no-vram-check", false, noVRAMCheckUsage)
 	cmd.Flags().StringVar(&session, "session", "", "resume a specific frontend session by id, pi/opencode's own flag spelling (passed through as --session <id>); other frontends' session flags go after -- instead, e.g. 'vibe run omp -- -r <id>'")
 	return cmd
+}
+
+// frontendExitError maps the frontend's Wait result onto the wrapper's
+// own exit status. `vibe run` is a WRAPPER — README documents it as the
+// thing a launcher is pointed at — and root.go's rule applies to it
+// exactly as it applies to `vibe cell drain --until-exit`: a wrapper that
+// swallows its child's status is a wrapper a launcher cannot be pointed
+// at, because Steam, a .desktop Exec= and every `&&` in a shell all read
+// the code.
+//
+// It used to `return nil` on any *exec.ExitError, with a comment claiming
+// two things that were both false: that it surfaced the error (it printed
+// nothing), and that nil was needed "so the teardown defer fires cleanly"
+// (Go runs deferred functions on an error return too — the deferred stop
+// above fires either way, and the C24 sibling drainUntilExit has returned
+// exitCodeError from this exact position since it shipped, with
+// TestC24WrapperPropagatesTheChildsStatus asserting drains=1 resumes=1 on
+// that path). The C24 bug flattened every wrapped failure to 1; this one
+// flattened it to 0, which is worse: the `&&` chain PROCEEDS.
+//
+// exitCodeError is what cli.ExitCode reads; a signal death reports
+// ExitCode() == -1, which is not a status any process may exit with, so
+// it falls through to the ordinary "vibe: …" line and 1.
+//
+// Pulled out of the RunE closure for the same reason validateRunArgs was:
+// so it is unit-testable against a real *exec.ExitError without a full
+// cobra/daemon round trip.
+func frontendExitError(binary string, err error) error {
+	if err == nil {
+		return nil
+	}
+	// ExitError specifically is expected (the user quit a TUI with q/^C),
+	// and its code is the frontend's own answer — pass it on rather than
+	// inventing one.
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitCodeError{msg: binary, code: exitErr.ExitCode()}
+	}
+	return fmt.Errorf("wait for %s: %w", binary, err)
 }
 
 // validateRunArgs enforces exactly one profile name before a `--`, or

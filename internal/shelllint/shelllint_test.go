@@ -32,19 +32,16 @@ var exempt = map[string]string{
 	// the next reader finds it rather than rediscovering it.
 	"scripts/fleetlab/gate-c15-warm-auth.sh:66:unscoped-kill": "llama-server argv carries no rig path; anchored on this rig's private 5960-5979 range instead",
 	"scripts/fleetlab/gate-c15-warm-auth.sh:67:unscoped-kill": "the rig's own host-probe helper, named for the gate (c15-hostprobe)",
-	// The two temp-directory traps the widened walk brought in. Both are
-	// `rm -rf "$VAR"` on a bare expansion, and in both the line ABOVE is
-	// what makes the expansion non-empty — verified by reading, not
-	// assumed:
+	// The temp-directory traps the widened walk brought in were
+	// `rm -rf "$VAR"` on a bare expansion, exempted because the line ABOVE
+	// each made the expansion non-empty. C20 recorded that both would be
+	// strictly better as ${VAR:?} and called it a one-line follow-up, "at
+	// which point these entries go stale and this table says so".
 	//
-	//   install.sh:177   [ -d "$tmpdir" ] || fatal "could not create temp directory"
-	//   install_test.sh  TMPROOT=$(mktemp -d …) under `set -eu`, which
-	//                    aborts the script if mktemp fails.
-	//
-	// Neither is mine to edit in this phase and both would be strictly
-	// better as ${tmpdir:?} / ${TMPROOT:?} — a one-line follow-up, at
-	// which point these two entries go stale and this table says so.
-	"install.sh:178:rm-rf-bare-var":              "the line above is `[ -d \"$tmpdir\" ] || fatal`, so an empty tmpdir aborts the installer before this trap is armed",
+	// install.sh's half took that follow-up (U7): its trap now reads
+	// `rm -rf "${tmpdir:?}"` and there is no finding left to exempt. The
+	// staleness rule is what said so — the entry failed the moment the
+	// hazard moved, exactly as designed. install_test.sh's is unchanged.
 	"internal/install_test.sh:26:rm-rf-bare-var": "TMPROOT is assigned from `mktemp -d` on the line above under `set -eu`, which aborts if it fails",
 }
 

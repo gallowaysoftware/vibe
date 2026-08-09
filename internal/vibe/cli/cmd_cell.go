@@ -110,7 +110,10 @@ func (t fleetdTarget) fetchState(ctx context.Context) (*fleetapi.StateSnapshot, 
 }
 
 func cellStatusCmd() *cobra.Command {
-	var apiFlag string
+	var (
+		apiFlag string
+		asJSON  bool
+	)
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show every cell's derived state, resident models, intent, and last-seen.",
@@ -127,13 +130,26 @@ func cellStatusCmd() *cobra.Command {
 			snap, err := target.fetchState(ctx)
 			out := cmd.OutOrStdout()
 			if err != nil {
+				// The degraded fallback is a DIFFERENT document: it is
+				// assembled by probing cells from this box, carries no intent
+				// and no last-seen, and shares nothing but the word "cell"
+				// with a state snapshot. Emitting it under --json would hand a
+				// script something shaped like fleetd's answer that fleetd
+				// never said, so --json fails here and names the human path.
+				if asJSON {
+					return fmt.Errorf("fleetd unreachable (%w) — --json emits the snapshot fleetd serves and nothing else; re-run without --json for the degraded direct-probe table", err)
+				}
 				return renderDegraded(out, err)
+			}
+			if asJSON {
+				return writeJSON(out, snap)
 			}
 			renderStatus(out, target.base, snap)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&apiFlag, "api", "", "fleetd base URL (default: $VIBE_API, hosts.yaml fleetd_url, or the local daemon)")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the snapshot as JSON (the same document /api/fleet/state serves)")
 	return cmd
 }
 
