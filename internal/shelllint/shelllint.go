@@ -260,6 +260,13 @@ func IsShellScript(path, name string) bool {
 // problem, and reporting it as "lint me" would fail the whole run on a
 // file the lint has no rules for anyway.
 func hasShellShebang(path string) bool {
+	// Regular files only. `os.Open` on a FIFO BLOCKS until a writer arrives,
+	// and this walk covers untracked directories — a stray pipe or socket
+	// under the module root would hang the lint rather than fail it, which is
+	// the one outcome worse than a wrong verdict.
+	if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
+		return false
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return false
