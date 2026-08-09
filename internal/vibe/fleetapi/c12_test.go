@@ -273,12 +273,20 @@ func TestFleetPage_A401FromMCPDoesNotPopTheTokenGate(t *testing.T) {
 			"tells a guest whose X-Vibe-Auth header was stripped that their working token is invalid")
 	}
 	// The button still fails LOUDLY, and the state fetch still gets to
-	// pop the gate for a token that really is dead.
-	if !strings.Contains(page, `flash(btn, old, "failed", true);`) {
+	// pop the gate for a token that really is dead. The failure text now
+	// lands in the persistent result panel as well as on the button —
+	// "failed" in a 60-character hover title was the whole reason a
+	// refused action was easy to miss.
+	if !strings.Contains(page, `flash(btn, old, true);`) {
 		t.Error("a refused action must still report failure on the button")
 	}
-	if !strings.Contains(page, `refresh().catch(() => {}); }, 1500)`) {
-		t.Error("flash() must re-run refresh(): /api/fleet/state is the route that can tell a stale " +
+	if !strings.Contains(page, `showResult(tool, args, "the call failed before the tool ran: `) {
+		t.Error("a refused action must put the failure somewhere it survives the next render()")
+	}
+	// tick() is refresh() with the failure handled; the gate-popping
+	// route is the same one.
+	if !strings.Contains(page, `tick(); }, 1500)`) {
+		t.Error("flash() must re-run the state fetch: /api/fleet/state is the route that can tell a stale " +
 			"control-plane token from a guest past their grant, and it pops the gate")
 	}
 	// Re-authenticating on #savings must not leave the un-hidden body

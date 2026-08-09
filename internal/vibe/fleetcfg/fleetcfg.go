@@ -89,9 +89,11 @@ type Cell struct {
 	// savings screen renders an em dash for this cell's electricity and
 	// labels its net "net (power not counted)" — never a zero.
 	Power *Power `yaml:"power,omitempty"`
-	// CapitalCost is what this cell's hardware cost, in the same currency
-	// as the price table (USD). Absent means NO payback bar for the cell:
-	// not 0%, not infinity, not an invented denominator.
+	// CapitalCost is what this cell's hardware cost, in Pricing.Currency
+	// (which defaults to nothing — see that field; an undeclared currency
+	// is reported as an assumption on the savings screen, never silently
+	// treated as the price table's). Absent means NO payback bar for the
+	// cell: not 0%, not infinity, not an invented denominator.
 	//
 	// For dual-use hardware the convention is the UPGRADE DELTA — the
 	// card's price minus what a gaming-adequate card would have cost.
@@ -141,7 +143,28 @@ const (
 type Pricing struct {
 	// ElectricityPricePerKWh prices the energy term (reference example
 	// 0.15). Zero means electricity is not counted and the page says so.
+	// Its unit is Currency, NOT the price table's.
 	ElectricityPricePerKWh float64 `yaml:"electricity_price_per_kwh,omitempty"`
+	// Currency is the ISO-4217 code that electricity_price_per_kwh and
+	// every cell's capital_cost are denominated in — the operator's own
+	// money, which is not necessarily the price table's.
+	//
+	// It exists because the savings screen computes `net = gross − power`
+	// and `recovered / capital_cost`, and every rate on the gross side
+	// comes out of internal/vibe/prices normalized to prices.Currency
+	// (USD). A fleet whose owner types a hydro bill in CAD and a hardware
+	// receipt in CAD was, until this field, having those numbers
+	// subtracted from and divided into USD figures — arithmetic that
+	// produces a confident wrong answer with no visible symptom.
+	//
+	// Unset is UNDECLARED, not a default: the report says the local
+	// currency was assumed to be the price table's, on the face of the
+	// screen, rather than quietly asserting it. Declared and DIFFERENT
+	// makes the report refuse to net the two halves — this repo does not
+	// ship an exchange rate, and inventing one would be exactly the
+	// absent-evidence-as-a-confident-number failure the whole savings
+	// screen is written against.
+	Currency string `yaml:"currency,omitempty"`
 	// Models maps a LOCAL model id (the canonical backend def name C7a
 	// keys the ledger on) to its pricing claim.
 	Models map[string]ModelPricing `yaml:"models,omitempty"`
@@ -636,6 +659,34 @@ func (f *File) WarmClassRefusal(model string) string {
 		"it, or correct model_classes if the class is wrong", model, class)
 }
 
+// isCurrencyCode is a SHAPE check, not a registry lookup: three ASCII
+// uppercase letters. Shipping the ISO-4217 list would make this package
+// the authority on which currencies exist, and the failure it is written
+// against is a typo ("cad", "$", "CAD ") reaching the savings screen as
+// a currency that will never equal the price table's and will therefore
+// silently blank the net.
+func isCurrencyCode(s string) bool {
+	if len(s) != 3 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < 'A' || s[i] > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
+// CurrencyOrEmpty is the normalized declared currency ("" when unset).
+// Callers get one spelling — trimmed and upper-cased — so a `currency:
+// usd` in hosts.yaml cannot compare unequal to the price table's code.
+func (p *Pricing) CurrencyOrEmpty() string {
+	if p == nil {
+		return ""
+	}
+	return strings.ToUpper(strings.TrimSpace(p.Currency))
+}
+
 func validatePower(cell string, p *Power) error {
 	if p == nil {
 		return nil
@@ -670,6 +721,15 @@ func (f *File) validatePricing() error {
 	}
 	if p.ElectricityPricePerKWh < 0 {
 		return errors.New("pricing.electricity_price_per_kwh must not be negative")
+	}
+	// Validated in SHAPE only, and only when present. Requiring it would
+	// fail every hosts.yaml already on disk — including the running
+	// fleet's — for a field that did not exist yesterday; the honest
+	// treatment of "unset" belongs on the screen (which says the local
+	// currency was assumed), not in a parser that refuses to boot.
+	if cur := strings.TrimSpace(p.Currency); cur != "" && !isCurrencyCode(cur) {
+		return fmt.Errorf("pricing.currency %q must be an ISO-4217 code such as \"USD\" or \"CAD\" — "+
+			"it names the unit of electricity_price_per_kwh and every cell's capital_cost", p.Currency)
 	}
 	for id, mp := range p.Models {
 		if strings.TrimSpace(id) == "" {

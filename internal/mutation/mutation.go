@@ -373,6 +373,53 @@ var Registry = []Mutation{
 			"notifier answers by going quiet for the one incident it exists for.",
 	},
 
+	{
+		Name: "c27/the state list an agent reads loses two states",
+		File: "internal/vibe/fleetmcp/fleetmcp.go",
+		Find: "\t\t\t\t\"STOPPED / DRAINED? / OFF / OFF/AWAY / OFF/AWAY? / INCONSISTENT) with resident \" +",
+		// The two deleted names are still SUBSTRINGS of the one that
+		// remains, which is exactly how the old guard stayed green.
+		Replace:  "\t\t\t\t\"STOPPED / DRAINED? / OFF/AWAY? / INCONSISTENT) with resident \" +",
+		Pkg:      "./internal/vibe/fleetmcp/",
+		MustFail: []string{"TestC27FleetStatusDescribesEveryDisplayState"},
+		Why: "the tool description is the ONLY place an agent learns what a `display` value means, and " +
+			"OFF ⊂ OFF/AWAY ⊂ OFF/AWAY?. The guard used to ask `strings.Contains(list, state)`, so " +
+			"deleting OFF and OFF/AWAY from the list left both as substrings of the survivor and the " +
+			"test stayed green — while an agent reading the list had never heard of either, and OFF is " +
+			"the state a whole box being gone renders as. Matched on TOKENS now, both directions.",
+	},
+
+	// ── class 1 again, on the read surfaces ───────────────────────────
+	{
+		Name: "page/a dead fleetd keeps rendering green",
+		File: "internal/vibe/fleetapi/fleet.html",
+		Find: `  {"level":"offline","min_age_s":150,"cls":"lv-offline","neutralise":true,"head":"OFFLINE",`,
+		// The banner still turns red; only the TABLE goes back to
+		// asserting a health it has no evidence for.
+		Replace:  `  {"level":"offline","min_age_s":150,"cls":"lv-offline","neutralise":false,"head":"OFFLINE",`,
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestFleetPage_OfflineStateFromHandlerToDOM"},
+		Why: "this is the phone-in-the-hallway surface. Before the liveness ladder, refresh() threw, " +
+			"every caller was an empty catch and render() ran only on success — so a dead fleetd left " +
+			"the table frozen with every SERVING badge green, cued by a timestamp in 12px grey. A " +
+			"badge's colour is a claim about a value OBSERVED now; once the observations stop " +
+			"arriving, leaving it green is absent evidence read as a healthy value.",
+	},
+	{
+		Name:     "savings/a CAD electricity bill is subtracted from a USD gross",
+		File:     "internal/vibe/fleetapi/savings.go",
+		Find:     "func (c CurrencyInfo) canNet() bool { return !c.Mixed }",
+		Replace:  "func (c CurrencyInfo) canNet() bool { return true }",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestSavings_MixedCurrencyRefusesToNet", "TestSavings_MixedCurrencyRemovesThePaybackBarAndSaysWhy"},
+		Why: "every rate on the token side comes out of internal/vibe/prices normalized to USD; " +
+			"electricity and capital are the household's own money. This fleet's owner is Canadian. " +
+			"`net = gross − power` across the two is not an approximation — it is a different " +
+			"quantity, and it renders as a perfectly plausible dollar figure with no symptom a reader " +
+			"could ever notice. canNet is the single gate every subtraction and every payback ratio " +
+			"in that file goes through.",
+	},
+
 	// ── the credential never leaks ────────────────────────────────────
 	{
 		Name:     "c9/the webhook URL stops being scrubbed",

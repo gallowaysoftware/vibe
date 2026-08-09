@@ -45,6 +45,15 @@ const SchemaVersion = 1
 // wrong.
 const StaleAfterDays = 90
 
+// Currency is the unit every rate in this package is normalized to (see
+// Row: "USD per million tokens", and the vendored artifact's own
+// notice). It is EXPORTED because the savings screen subtracts a locally
+// declared electricity cost from a figure priced out of this table, and
+// a subtraction across two currencies produces a wrong number that looks
+// exactly like a right one. Consumers compare their declared currency
+// against this constant instead of assuming they match.
+const Currency = "USD"
+
 // Source records one upstream the table was built from, with its licence
 // and the commit it was fetched at. Both upstreams are MIT; the notice
 // travels with the data.

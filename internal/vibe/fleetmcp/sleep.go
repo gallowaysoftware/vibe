@@ -16,11 +16,16 @@ import (
 // pair of verbs in the plan that takes a box off the fleet and brings it
 // back.
 
-func sleepTools() []any {
-	return []any{
-		map[string]any{
-			"name": "suspend_cell",
-			"description": "Suspend a cell — the whole BOX goes to sleep (the operator's " +
+func sleepTools() []toolDef {
+	return []toolDef{
+		{
+			// It takes a box off the fleet. Only wake_cell brings it back,
+			// and only if the cell has a wake path — which the tool checks
+			// precisely because getting this one wrong is unrecoverable
+			// without walking to the machine.
+			Effect: effectDestructive,
+			Name:   "suspend_cell",
+			Description: "Suspend a cell — the whole BOX goes to sleep (the operator's " +
 				"'goodnight' verb, and the manual half of sleep_schedule). It runs that " +
 				"cell's configured cell_cmds.suspend, which is house-specific and typically " +
 				"stops the serving stack first. Refuses, with the reason, when the cell is " +
@@ -30,7 +35,7 @@ func sleepTools() []any {
 				"took). Only opportunistic cells may sleep, never the front. Bring it back " +
 				"with wake_cell — and check the cell HAS a wake path before suspending, " +
 				"because nothing else can.",
-			"inputSchema": map[string]any{
+			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"cell":   map[string]any{"type": "string", "description": "Cell name from hosts.yaml (opportunistic class, with wake: configured)."},

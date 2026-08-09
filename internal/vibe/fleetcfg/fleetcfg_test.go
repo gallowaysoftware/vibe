@@ -341,6 +341,39 @@ func TestLoad_PricingRejectsNonsense(t *testing.T) {
 	}
 }
 
+// TestLoad_PricingCurrency: `pricing.currency` names the unit of
+// electricity_price_per_kwh and every capital_cost. A typo must be loud
+// at LOAD, because the savings screen compares it against the price
+// table's code — so a silently-accepted "cad" would refuse to net the
+// two halves forever, for a reason that reads like a real currency
+// mismatch.
+//
+// Absent stays valid on purpose. The field did not exist yesterday, and
+// a parser that refuses to boot without it takes a running fleet down
+// for a documentation improvement; the honest treatment of "unset" is on
+// the screen, which says the currency was assumed.
+func TestLoad_PricingCurrency(t *testing.T) {
+	for _, bad := range []string{"cad", "CA", "CADD", "$", "C4D"} {
+		if _, err := LoadFrom(writeHosts(t, c7bCells+"pricing:\n  currency: \""+bad+"\"\n")); err == nil {
+			t.Errorf("accepted pricing.currency %q", bad)
+		}
+	}
+	f, err := LoadFrom(writeHosts(t, c7bCells+"pricing:\n  currency: CAD\n"))
+	if err != nil {
+		t.Fatalf("CAD rejected: %v", err)
+	}
+	if got := f.Pricing.CurrencyOrEmpty(); got != "CAD" {
+		t.Errorf("CurrencyOrEmpty() = %q, want CAD", got)
+	}
+	f2, err := LoadFrom(writeHosts(t, c7bCells+"pricing:\n  electricity_price_per_kwh: 0.15\n"))
+	if err != nil {
+		t.Fatalf("an unset currency must stay valid: %v", err)
+	}
+	if got := f2.Pricing.CurrencyOrEmpty(); got != "" {
+		t.Errorf("CurrencyOrEmpty() = %q with nothing declared, want \"\"", got)
+	}
+}
+
 // WarmClassRefusal is the ONE sentence every warm producer refuses with —
 // fleetmcp's warm_model, C4's two loops, C14's post-wake warms and the
 // piggyback queue they share. A second copy is how one of them rots.
