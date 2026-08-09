@@ -152,6 +152,61 @@ message StartRequest {
   // profile or backend must be set. The active identity is the backend name,
   // so repeated activations of the same backend are no-op reuse.
   string backend = 4;
+  // strict_vram asks the daemon to REFUSE when the estimate exceeds
+  // currently-free memory, not merely when it exceeds the machine's total
+  // capacity. Default (false) is the warn-don't-block behaviour a human at
+  // `vibe start` gets: free memory is a moving target (the same profile on
+  // the same laptop read 15.2 GiB free and 23.5 GiB free minutes apart,
+  // purely from page cache), so refusing on it produced false negatives.
+  //
+  // A caller that has somewhere else to go sets this. vamp's capability
+  // candidate walk is the one in tree: it asks strictly for every candidate
+  // that still has a smaller one behind it, so "another model is resident"
+  // moves to the next candidate instead of thrashing — and asks the LAST
+  // candidate the ordinary way, because there is nothing to fall back to
+  // and a tight start usually works.
+  //
+  // no_vram_check wins over this: it skips the probe entirely.
+  bool strict_vram = 5;
+}
+
+// StartRejection is the machine-readable reason a Start was refused. The
+// daemon attaches it as a Connect error detail alongside the human-facing
+// message; vibeclient.IsVRAMRejection reads THIS, never the prose.
+//
+// It exists because the prose moved once already and took the contract with
+// it: the pre-flight message that vamp's candidate walk matched on
+// ("... free VRAM ...") was rewritten in 4a4c5ea, and both covering tests
+// kept passing because each one constructed the string it then asserted on.
+// A typed detail cannot rot that way — a producer that stops sending it
+// fails the classifier's test, which is what internal/mutation pins.
+//
+// fleet.md §8 reserves the rest of the space (HOST_UNREACHABLE, SLOT_HELD,
+// NOT_STAGED); they land here as new Reason values when P3/P7 arrive.
+message StartRejection {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    // The estimate is larger than the machine's total usable memory. No
+    // amount of freeing fixes this one, so it refuses regardless of
+    // strict_vram.
+    REASON_VRAM_EXCEEDS_CAPACITY = 1;
+    // The estimate exceeds currently-free memory but fits the machine.
+    // Only ever emitted when the caller set strict_vram — otherwise this
+    // condition is a warning and the start proceeds.
+    REASON_VRAM_INSUFFICIENT_FREE = 2;
+  }
+  Reason reason = 1;
+  // profile names what was refused (the profile or backend name).
+  string profile = 2;
+  // estimated_gib is the profile's declared estimated_vram_gb.
+  double estimated_gib = 3;
+  // free_gib is what the probe read. Always populated on a rejection: a
+  // probe that could not answer skips the check rather than refusing.
+  double free_gib = 4;
+  // total_gib is the machine's usable capacity, ABSENT when the capacity
+  // probe did not answer. Unreported is not zero — a zero capacity would
+  // read as "nothing fits here".
+  optional double total_gib = 5;
 }
 message StartResponse {
   Status status = 1;

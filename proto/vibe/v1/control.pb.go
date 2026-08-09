@@ -22,6 +22,61 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type StartRejection_Reason int32
+
+const (
+	StartRejection_REASON_UNSPECIFIED StartRejection_Reason = 0
+	// The estimate is larger than the machine's total usable memory. No
+	// amount of freeing fixes this one, so it refuses regardless of
+	// strict_vram.
+	StartRejection_REASON_VRAM_EXCEEDS_CAPACITY StartRejection_Reason = 1
+	// The estimate exceeds currently-free memory but fits the machine.
+	// Only ever emitted when the caller set strict_vram — otherwise this
+	// condition is a warning and the start proceeds.
+	StartRejection_REASON_VRAM_INSUFFICIENT_FREE StartRejection_Reason = 2
+)
+
+// Enum value maps for StartRejection_Reason.
+var (
+	StartRejection_Reason_name = map[int32]string{
+		0: "REASON_UNSPECIFIED",
+		1: "REASON_VRAM_EXCEEDS_CAPACITY",
+		2: "REASON_VRAM_INSUFFICIENT_FREE",
+	}
+	StartRejection_Reason_value = map[string]int32{
+		"REASON_UNSPECIFIED":            0,
+		"REASON_VRAM_EXCEEDS_CAPACITY":  1,
+		"REASON_VRAM_INSUFFICIENT_FREE": 2,
+	}
+)
+
+func (x StartRejection_Reason) Enum() *StartRejection_Reason {
+	p := new(StartRejection_Reason)
+	*p = x
+	return p
+}
+
+func (x StartRejection_Reason) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (StartRejection_Reason) Descriptor() protoreflect.EnumDescriptor {
+	return file_vibe_v1_control_proto_enumTypes[0].Descriptor()
+}
+
+func (StartRejection_Reason) Type() protoreflect.EnumType {
+	return &file_vibe_v1_control_proto_enumTypes[0]
+}
+
+func (x StartRejection_Reason) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use StartRejection_Reason.Descriptor instead.
+func (StartRejection_Reason) EnumDescriptor() ([]byte, []int) {
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{8, 0}
+}
+
 type PullProgress_Phase int32
 
 const (
@@ -61,11 +116,11 @@ func (x PullProgress_Phase) String() string {
 }
 
 func (PullProgress_Phase) Descriptor() protoreflect.EnumDescriptor {
-	return file_vibe_v1_control_proto_enumTypes[0].Descriptor()
+	return file_vibe_v1_control_proto_enumTypes[1].Descriptor()
 }
 
 func (PullProgress_Phase) Type() protoreflect.EnumType {
-	return &file_vibe_v1_control_proto_enumTypes[0]
+	return &file_vibe_v1_control_proto_enumTypes[1]
 }
 
 func (x PullProgress_Phase) Number() protoreflect.EnumNumber {
@@ -74,7 +129,7 @@ func (x PullProgress_Phase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PullProgress_Phase.Descriptor instead.
 func (PullProgress_Phase) EnumDescriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{23, 0}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{24, 0}
 }
 
 type Status struct {
@@ -546,7 +601,23 @@ type StartRequest struct {
 	// depends on a backend, not a frontend-bearing profile. Exactly one of
 	// profile or backend must be set. The active identity is the backend name,
 	// so repeated activations of the same backend are no-op reuse.
-	Backend       string `protobuf:"bytes,4,opt,name=backend,proto3" json:"backend,omitempty"`
+	Backend string `protobuf:"bytes,4,opt,name=backend,proto3" json:"backend,omitempty"`
+	// strict_vram asks the daemon to REFUSE when the estimate exceeds
+	// currently-free memory, not merely when it exceeds the machine's total
+	// capacity. Default (false) is the warn-don't-block behaviour a human at
+	// `vibe start` gets: free memory is a moving target (the same profile on
+	// the same laptop read 15.2 GiB free and 23.5 GiB free minutes apart,
+	// purely from page cache), so refusing on it produced false negatives.
+	//
+	// A caller that has somewhere else to go sets this. vamp's capability
+	// candidate walk is the one in tree: it asks strictly for every candidate
+	// that still has a smaller one behind it, so "another model is resident"
+	// moves to the next candidate instead of thrashing — and asks the LAST
+	// candidate the ordinary way, because there is nothing to fall back to
+	// and a tight start usually works.
+	//
+	// no_vram_check wins over this: it skips the probe entirely.
+	StrictVram    bool `protobuf:"varint,5,opt,name=strict_vram,json=strictVram,proto3" json:"strict_vram,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -609,6 +680,109 @@ func (x *StartRequest) GetBackend() string {
 	return ""
 }
 
+func (x *StartRequest) GetStrictVram() bool {
+	if x != nil {
+		return x.StrictVram
+	}
+	return false
+}
+
+// StartRejection is the machine-readable reason a Start was refused. The
+// daemon attaches it as a Connect error detail alongside the human-facing
+// message; vibeclient.IsVRAMRejection reads THIS, never the prose.
+//
+// It exists because the prose moved once already and took the contract with
+// it: the pre-flight message that vamp's candidate walk matched on
+// ("... free VRAM ...") was rewritten in 4a4c5ea, and both covering tests
+// kept passing because each one constructed the string it then asserted on.
+// A typed detail cannot rot that way — a producer that stops sending it
+// fails the classifier's test, which is what internal/mutation pins.
+//
+// fleet.md §8 reserves the rest of the space (HOST_UNREACHABLE, SLOT_HELD,
+// NOT_STAGED); they land here as new Reason values when P3/P7 arrive.
+type StartRejection struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Reason StartRejection_Reason  `protobuf:"varint,1,opt,name=reason,proto3,enum=vibe.v1.StartRejection_Reason" json:"reason,omitempty"`
+	// profile names what was refused (the profile or backend name).
+	Profile string `protobuf:"bytes,2,opt,name=profile,proto3" json:"profile,omitempty"`
+	// estimated_gib is the profile's declared estimated_vram_gb.
+	EstimatedGib float64 `protobuf:"fixed64,3,opt,name=estimated_gib,json=estimatedGib,proto3" json:"estimated_gib,omitempty"`
+	// free_gib is what the probe read. Always populated on a rejection: a
+	// probe that could not answer skips the check rather than refusing.
+	FreeGib float64 `protobuf:"fixed64,4,opt,name=free_gib,json=freeGib,proto3" json:"free_gib,omitempty"`
+	// total_gib is the machine's usable capacity, ABSENT when the capacity
+	// probe did not answer. Unreported is not zero — a zero capacity would
+	// read as "nothing fits here".
+	TotalGib      *float64 `protobuf:"fixed64,5,opt,name=total_gib,json=totalGib,proto3,oneof" json:"total_gib,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StartRejection) Reset() {
+	*x = StartRejection{}
+	mi := &file_vibe_v1_control_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StartRejection) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StartRejection) ProtoMessage() {}
+
+func (x *StartRejection) ProtoReflect() protoreflect.Message {
+	mi := &file_vibe_v1_control_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StartRejection.ProtoReflect.Descriptor instead.
+func (*StartRejection) Descriptor() ([]byte, []int) {
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *StartRejection) GetReason() StartRejection_Reason {
+	if x != nil {
+		return x.Reason
+	}
+	return StartRejection_REASON_UNSPECIFIED
+}
+
+func (x *StartRejection) GetProfile() string {
+	if x != nil {
+		return x.Profile
+	}
+	return ""
+}
+
+func (x *StartRejection) GetEstimatedGib() float64 {
+	if x != nil {
+		return x.EstimatedGib
+	}
+	return 0
+}
+
+func (x *StartRejection) GetFreeGib() float64 {
+	if x != nil {
+		return x.FreeGib
+	}
+	return 0
+}
+
+func (x *StartRejection) GetTotalGib() float64 {
+	if x != nil && x.TotalGib != nil {
+		return *x.TotalGib
+	}
+	return 0
+}
+
 type StartResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Status        *Status                `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
@@ -619,7 +793,7 @@ type StartResponse struct {
 
 func (x *StartResponse) Reset() {
 	*x = StartResponse{}
-	mi := &file_vibe_v1_control_proto_msgTypes[8]
+	mi := &file_vibe_v1_control_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -631,7 +805,7 @@ func (x *StartResponse) String() string {
 func (*StartResponse) ProtoMessage() {}
 
 func (x *StartResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[8]
+	mi := &file_vibe_v1_control_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -644,7 +818,7 @@ func (x *StartResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartResponse.ProtoReflect.Descriptor instead.
 func (*StartResponse) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{8}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *StartResponse) GetStatus() *Status {
@@ -677,7 +851,7 @@ type StopRequest struct {
 
 func (x *StopRequest) Reset() {
 	*x = StopRequest{}
-	mi := &file_vibe_v1_control_proto_msgTypes[9]
+	mi := &file_vibe_v1_control_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -689,7 +863,7 @@ func (x *StopRequest) String() string {
 func (*StopRequest) ProtoMessage() {}
 
 func (x *StopRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[9]
+	mi := &file_vibe_v1_control_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -702,7 +876,7 @@ func (x *StopRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopRequest.ProtoReflect.Descriptor instead.
 func (*StopRequest) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{9}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *StopRequest) GetProfile() string {
@@ -721,7 +895,7 @@ type StopResponse struct {
 
 func (x *StopResponse) Reset() {
 	*x = StopResponse{}
-	mi := &file_vibe_v1_control_proto_msgTypes[10]
+	mi := &file_vibe_v1_control_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -733,7 +907,7 @@ func (x *StopResponse) String() string {
 func (*StopResponse) ProtoMessage() {}
 
 func (x *StopResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[10]
+	mi := &file_vibe_v1_control_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -746,7 +920,7 @@ func (x *StopResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopResponse.ProtoReflect.Descriptor instead.
 func (*StopResponse) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{10}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *StopResponse) GetStatus() *Status {
@@ -764,7 +938,7 @@ type ShutdownRequest struct {
 
 func (x *ShutdownRequest) Reset() {
 	*x = ShutdownRequest{}
-	mi := &file_vibe_v1_control_proto_msgTypes[11]
+	mi := &file_vibe_v1_control_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -776,7 +950,7 @@ func (x *ShutdownRequest) String() string {
 func (*ShutdownRequest) ProtoMessage() {}
 
 func (x *ShutdownRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[11]
+	mi := &file_vibe_v1_control_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -789,7 +963,7 @@ func (x *ShutdownRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShutdownRequest.ProtoReflect.Descriptor instead.
 func (*ShutdownRequest) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{11}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{12}
 }
 
 type ShutdownResponse struct {
@@ -800,7 +974,7 @@ type ShutdownResponse struct {
 
 func (x *ShutdownResponse) Reset() {
 	*x = ShutdownResponse{}
-	mi := &file_vibe_v1_control_proto_msgTypes[12]
+	mi := &file_vibe_v1_control_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -812,7 +986,7 @@ func (x *ShutdownResponse) String() string {
 func (*ShutdownResponse) ProtoMessage() {}
 
 func (x *ShutdownResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[12]
+	mi := &file_vibe_v1_control_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -825,7 +999,7 @@ func (x *ShutdownResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShutdownResponse.ProtoReflect.Descriptor instead.
 func (*ShutdownResponse) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{12}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{13}
 }
 
 type LogsRequest struct {
@@ -840,7 +1014,7 @@ type LogsRequest struct {
 
 func (x *LogsRequest) Reset() {
 	*x = LogsRequest{}
-	mi := &file_vibe_v1_control_proto_msgTypes[13]
+	mi := &file_vibe_v1_control_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -852,7 +1026,7 @@ func (x *LogsRequest) String() string {
 func (*LogsRequest) ProtoMessage() {}
 
 func (x *LogsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[13]
+	mi := &file_vibe_v1_control_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -865,7 +1039,7 @@ func (x *LogsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogsRequest.ProtoReflect.Descriptor instead.
 func (*LogsRequest) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{13}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *LogsRequest) GetProfile() string {
@@ -884,7 +1058,7 @@ type LogsResponse struct {
 
 func (x *LogsResponse) Reset() {
 	*x = LogsResponse{}
-	mi := &file_vibe_v1_control_proto_msgTypes[14]
+	mi := &file_vibe_v1_control_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -896,7 +1070,7 @@ func (x *LogsResponse) String() string {
 func (*LogsResponse) ProtoMessage() {}
 
 func (x *LogsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[14]
+	mi := &file_vibe_v1_control_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -909,7 +1083,7 @@ func (x *LogsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogsResponse.ProtoReflect.Descriptor instead.
 func (*LogsResponse) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{14}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *LogsResponse) GetLines() []string {
@@ -928,7 +1102,7 @@ type PullRequest struct {
 
 func (x *PullRequest) Reset() {
 	*x = PullRequest{}
-	mi := &file_vibe_v1_control_proto_msgTypes[15]
+	mi := &file_vibe_v1_control_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -940,7 +1114,7 @@ func (x *PullRequest) String() string {
 func (*PullRequest) ProtoMessage() {}
 
 func (x *PullRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[15]
+	mi := &file_vibe_v1_control_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -953,7 +1127,7 @@ func (x *PullRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PullRequest.ProtoReflect.Descriptor instead.
 func (*PullRequest) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{15}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *PullRequest) GetProfile() string {
@@ -983,7 +1157,7 @@ type CellDrainRequest struct {
 
 func (x *CellDrainRequest) Reset() {
 	*x = CellDrainRequest{}
-	mi := &file_vibe_v1_control_proto_msgTypes[16]
+	mi := &file_vibe_v1_control_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -995,7 +1169,7 @@ func (x *CellDrainRequest) String() string {
 func (*CellDrainRequest) ProtoMessage() {}
 
 func (x *CellDrainRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[16]
+	mi := &file_vibe_v1_control_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1008,7 +1182,7 @@ func (x *CellDrainRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CellDrainRequest.ProtoReflect.Descriptor instead.
 func (*CellDrainRequest) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{16}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *CellDrainRequest) GetReason() string {
@@ -1048,7 +1222,7 @@ type LeaseView struct {
 
 func (x *LeaseView) Reset() {
 	*x = LeaseView{}
-	mi := &file_vibe_v1_control_proto_msgTypes[17]
+	mi := &file_vibe_v1_control_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1060,7 +1234,7 @@ func (x *LeaseView) String() string {
 func (*LeaseView) ProtoMessage() {}
 
 func (x *LeaseView) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[17]
+	mi := &file_vibe_v1_control_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1073,7 +1247,7 @@ func (x *LeaseView) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LeaseView.ProtoReflect.Descriptor instead.
 func (*LeaseView) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{17}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *LeaseView) GetCell() string {
@@ -1142,7 +1316,7 @@ type CellDrainResponse struct {
 
 func (x *CellDrainResponse) Reset() {
 	*x = CellDrainResponse{}
-	mi := &file_vibe_v1_control_proto_msgTypes[18]
+	mi := &file_vibe_v1_control_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1154,7 +1328,7 @@ func (x *CellDrainResponse) String() string {
 func (*CellDrainResponse) ProtoMessage() {}
 
 func (x *CellDrainResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[18]
+	mi := &file_vibe_v1_control_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1167,7 +1341,7 @@ func (x *CellDrainResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CellDrainResponse.ProtoReflect.Descriptor instead.
 func (*CellDrainResponse) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{18}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *CellDrainResponse) GetResidentModels() []string {
@@ -1213,7 +1387,7 @@ type CellResumeRequest struct {
 
 func (x *CellResumeRequest) Reset() {
 	*x = CellResumeRequest{}
-	mi := &file_vibe_v1_control_proto_msgTypes[19]
+	mi := &file_vibe_v1_control_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1225,7 +1399,7 @@ func (x *CellResumeRequest) String() string {
 func (*CellResumeRequest) ProtoMessage() {}
 
 func (x *CellResumeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[19]
+	mi := &file_vibe_v1_control_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1238,7 +1412,7 @@ func (x *CellResumeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CellResumeRequest.ProtoReflect.Descriptor instead.
 func (*CellResumeRequest) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{19}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{20}
 }
 
 type CellResumeResponse struct {
@@ -1249,7 +1423,7 @@ type CellResumeResponse struct {
 
 func (x *CellResumeResponse) Reset() {
 	*x = CellResumeResponse{}
-	mi := &file_vibe_v1_control_proto_msgTypes[20]
+	mi := &file_vibe_v1_control_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1261,7 +1435,7 @@ func (x *CellResumeResponse) String() string {
 func (*CellResumeResponse) ProtoMessage() {}
 
 func (x *CellResumeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[20]
+	mi := &file_vibe_v1_control_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1274,7 +1448,7 @@ func (x *CellResumeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CellResumeResponse.ProtoReflect.Descriptor instead.
 func (*CellResumeResponse) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{20}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{21}
 }
 
 type CellSuspendRequest struct {
@@ -1294,7 +1468,7 @@ type CellSuspendRequest struct {
 
 func (x *CellSuspendRequest) Reset() {
 	*x = CellSuspendRequest{}
-	mi := &file_vibe_v1_control_proto_msgTypes[21]
+	mi := &file_vibe_v1_control_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1306,7 +1480,7 @@ func (x *CellSuspendRequest) String() string {
 func (*CellSuspendRequest) ProtoMessage() {}
 
 func (x *CellSuspendRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[21]
+	mi := &file_vibe_v1_control_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1319,7 +1493,7 @@ func (x *CellSuspendRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CellSuspendRequest.ProtoReflect.Descriptor instead.
 func (*CellSuspendRequest) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{21}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *CellSuspendRequest) GetReason() string {
@@ -1353,7 +1527,7 @@ type CellSuspendResponse struct {
 
 func (x *CellSuspendResponse) Reset() {
 	*x = CellSuspendResponse{}
-	mi := &file_vibe_v1_control_proto_msgTypes[22]
+	mi := &file_vibe_v1_control_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1365,7 +1539,7 @@ func (x *CellSuspendResponse) String() string {
 func (*CellSuspendResponse) ProtoMessage() {}
 
 func (x *CellSuspendResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[22]
+	mi := &file_vibe_v1_control_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1378,7 +1552,7 @@ func (x *CellSuspendResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CellSuspendResponse.ProtoReflect.Descriptor instead.
 func (*CellSuspendResponse) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{22}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *CellSuspendResponse) GetResidentModels() []string {
@@ -1415,7 +1589,7 @@ type PullProgress struct {
 
 func (x *PullProgress) Reset() {
 	*x = PullProgress{}
-	mi := &file_vibe_v1_control_proto_msgTypes[23]
+	mi := &file_vibe_v1_control_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1427,7 +1601,7 @@ func (x *PullProgress) String() string {
 func (*PullProgress) ProtoMessage() {}
 
 func (x *PullProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_vibe_v1_control_proto_msgTypes[23]
+	mi := &file_vibe_v1_control_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1440,7 +1614,7 @@ func (x *PullProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PullProgress.ProtoReflect.Descriptor instead.
 func (*PullProgress) Descriptor() ([]byte, []int) {
-	return file_vibe_v1_control_proto_rawDescGZIP(), []int{23}
+	return file_vibe_v1_control_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *PullProgress) GetPhase() PullProgress_Phase {
@@ -1512,14 +1686,28 @@ const file_vibe_v1_control_proto_rawDesc = "" +
 	"\bservices\x18\x02 \x03(\v2\x0f.vibe.v1.StatusR\bservices\"\x15\n" +
 	"\x13ListProfilesRequest\"D\n" +
 	"\x14ListProfilesResponse\x12,\n" +
-	"\bprofiles\x18\x01 \x03(\v2\x10.vibe.v1.ProfileR\bprofiles\"\x86\x01\n" +
+	"\bprofiles\x18\x01 \x03(\v2\x10.vibe.v1.ProfileR\bprofiles\"\xa7\x01\n" +
 	"\fStartRequest\x12\x18\n" +
 	"\aprofile\x18\x01 \x01(\tR\aprofile\x12\"\n" +
 	"\rno_vram_check\x18\x02 \x01(\bR\vnoVramCheck\x12\x1e\n" +
 	"\n" +
 	"foreground\x18\x03 \x01(\bR\n" +
 	"foreground\x12\x18\n" +
-	"\abackend\x18\x04 \x01(\tR\abackend\"k\n" +
+	"\abackend\x18\x04 \x01(\tR\abackend\x12\x1f\n" +
+	"\vstrict_vram\x18\x05 \x01(\bR\n" +
+	"strictVram\"\xb9\x02\n" +
+	"\x0eStartRejection\x126\n" +
+	"\x06reason\x18\x01 \x01(\x0e2\x1e.vibe.v1.StartRejection.ReasonR\x06reason\x12\x18\n" +
+	"\aprofile\x18\x02 \x01(\tR\aprofile\x12#\n" +
+	"\restimated_gib\x18\x03 \x01(\x01R\festimatedGib\x12\x19\n" +
+	"\bfree_gib\x18\x04 \x01(\x01R\afreeGib\x12 \n" +
+	"\ttotal_gib\x18\x05 \x01(\x01H\x00R\btotalGib\x88\x01\x01\"e\n" +
+	"\x06Reason\x12\x16\n" +
+	"\x12REASON_UNSPECIFIED\x10\x00\x12 \n" +
+	"\x1cREASON_VRAM_EXCEEDS_CAPACITY\x10\x01\x12!\n" +
+	"\x1dREASON_VRAM_INSUFFICIENT_FREE\x10\x02B\f\n" +
+	"\n" +
+	"_total_gib\"k\n" +
 	"\rStartResponse\x12'\n" +
 	"\x06status\x18\x01 \x01(\v2\x0f.vibe.v1.StatusR\x06status\x121\n" +
 	"\bfrontend\x18\x02 \x01(\v2\x15.vibe.v1.FrontendInfoR\bfrontend\"'\n" +
@@ -1604,76 +1792,79 @@ func file_vibe_v1_control_proto_rawDescGZIP() []byte {
 	return file_vibe_v1_control_proto_rawDescData
 }
 
-var file_vibe_v1_control_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_vibe_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 26)
+var file_vibe_v1_control_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_vibe_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 27)
 var file_vibe_v1_control_proto_goTypes = []any{
-	(PullProgress_Phase)(0),       // 0: vibe.v1.PullProgress.Phase
-	(*Status)(nil),                // 1: vibe.v1.Status
-	(*Profile)(nil),               // 2: vibe.v1.Profile
-	(*FrontendInfo)(nil),          // 3: vibe.v1.FrontendInfo
-	(*StatusRequest)(nil),         // 4: vibe.v1.StatusRequest
-	(*StatusResponse)(nil),        // 5: vibe.v1.StatusResponse
-	(*ListProfilesRequest)(nil),   // 6: vibe.v1.ListProfilesRequest
-	(*ListProfilesResponse)(nil),  // 7: vibe.v1.ListProfilesResponse
-	(*StartRequest)(nil),          // 8: vibe.v1.StartRequest
-	(*StartResponse)(nil),         // 9: vibe.v1.StartResponse
-	(*StopRequest)(nil),           // 10: vibe.v1.StopRequest
-	(*StopResponse)(nil),          // 11: vibe.v1.StopResponse
-	(*ShutdownRequest)(nil),       // 12: vibe.v1.ShutdownRequest
-	(*ShutdownResponse)(nil),      // 13: vibe.v1.ShutdownResponse
-	(*LogsRequest)(nil),           // 14: vibe.v1.LogsRequest
-	(*LogsResponse)(nil),          // 15: vibe.v1.LogsResponse
-	(*PullRequest)(nil),           // 16: vibe.v1.PullRequest
-	(*CellDrainRequest)(nil),      // 17: vibe.v1.CellDrainRequest
-	(*LeaseView)(nil),             // 18: vibe.v1.LeaseView
-	(*CellDrainResponse)(nil),     // 19: vibe.v1.CellDrainResponse
-	(*CellResumeRequest)(nil),     // 20: vibe.v1.CellResumeRequest
-	(*CellResumeResponse)(nil),    // 21: vibe.v1.CellResumeResponse
-	(*CellSuspendRequest)(nil),    // 22: vibe.v1.CellSuspendRequest
-	(*CellSuspendResponse)(nil),   // 23: vibe.v1.CellSuspendResponse
-	(*PullProgress)(nil),          // 24: vibe.v1.PullProgress
-	nil,                           // 25: vibe.v1.Status.FrontendEnvEntry
-	nil,                           // 26: vibe.v1.FrontendInfo.EnvVarsEntry
-	(*timestamppb.Timestamp)(nil), // 27: google.protobuf.Timestamp
+	(StartRejection_Reason)(0),    // 0: vibe.v1.StartRejection.Reason
+	(PullProgress_Phase)(0),       // 1: vibe.v1.PullProgress.Phase
+	(*Status)(nil),                // 2: vibe.v1.Status
+	(*Profile)(nil),               // 3: vibe.v1.Profile
+	(*FrontendInfo)(nil),          // 4: vibe.v1.FrontendInfo
+	(*StatusRequest)(nil),         // 5: vibe.v1.StatusRequest
+	(*StatusResponse)(nil),        // 6: vibe.v1.StatusResponse
+	(*ListProfilesRequest)(nil),   // 7: vibe.v1.ListProfilesRequest
+	(*ListProfilesResponse)(nil),  // 8: vibe.v1.ListProfilesResponse
+	(*StartRequest)(nil),          // 9: vibe.v1.StartRequest
+	(*StartRejection)(nil),        // 10: vibe.v1.StartRejection
+	(*StartResponse)(nil),         // 11: vibe.v1.StartResponse
+	(*StopRequest)(nil),           // 12: vibe.v1.StopRequest
+	(*StopResponse)(nil),          // 13: vibe.v1.StopResponse
+	(*ShutdownRequest)(nil),       // 14: vibe.v1.ShutdownRequest
+	(*ShutdownResponse)(nil),      // 15: vibe.v1.ShutdownResponse
+	(*LogsRequest)(nil),           // 16: vibe.v1.LogsRequest
+	(*LogsResponse)(nil),          // 17: vibe.v1.LogsResponse
+	(*PullRequest)(nil),           // 18: vibe.v1.PullRequest
+	(*CellDrainRequest)(nil),      // 19: vibe.v1.CellDrainRequest
+	(*LeaseView)(nil),             // 20: vibe.v1.LeaseView
+	(*CellDrainResponse)(nil),     // 21: vibe.v1.CellDrainResponse
+	(*CellResumeRequest)(nil),     // 22: vibe.v1.CellResumeRequest
+	(*CellResumeResponse)(nil),    // 23: vibe.v1.CellResumeResponse
+	(*CellSuspendRequest)(nil),    // 24: vibe.v1.CellSuspendRequest
+	(*CellSuspendResponse)(nil),   // 25: vibe.v1.CellSuspendResponse
+	(*PullProgress)(nil),          // 26: vibe.v1.PullProgress
+	nil,                           // 27: vibe.v1.Status.FrontendEnvEntry
+	nil,                           // 28: vibe.v1.FrontendInfo.EnvVarsEntry
+	(*timestamppb.Timestamp)(nil), // 29: google.protobuf.Timestamp
 }
 var file_vibe_v1_control_proto_depIdxs = []int32{
-	27, // 0: vibe.v1.Status.started_at:type_name -> google.protobuf.Timestamp
-	25, // 1: vibe.v1.Status.frontend_env:type_name -> vibe.v1.Status.FrontendEnvEntry
-	26, // 2: vibe.v1.FrontendInfo.env_vars:type_name -> vibe.v1.FrontendInfo.EnvVarsEntry
-	1,  // 3: vibe.v1.StatusResponse.status:type_name -> vibe.v1.Status
-	1,  // 4: vibe.v1.StatusResponse.services:type_name -> vibe.v1.Status
-	2,  // 5: vibe.v1.ListProfilesResponse.profiles:type_name -> vibe.v1.Profile
-	1,  // 6: vibe.v1.StartResponse.status:type_name -> vibe.v1.Status
-	3,  // 7: vibe.v1.StartResponse.frontend:type_name -> vibe.v1.FrontendInfo
-	1,  // 8: vibe.v1.StopResponse.status:type_name -> vibe.v1.Status
-	27, // 9: vibe.v1.LeaseView.expires_at:type_name -> google.protobuf.Timestamp
-	18, // 10: vibe.v1.CellDrainResponse.active_leases:type_name -> vibe.v1.LeaseView
-	0,  // 11: vibe.v1.PullProgress.phase:type_name -> vibe.v1.PullProgress.Phase
-	4,  // 12: vibe.v1.ControlService.Status:input_type -> vibe.v1.StatusRequest
-	6,  // 13: vibe.v1.ControlService.ListProfiles:input_type -> vibe.v1.ListProfilesRequest
-	8,  // 14: vibe.v1.ControlService.Start:input_type -> vibe.v1.StartRequest
-	10, // 15: vibe.v1.ControlService.Stop:input_type -> vibe.v1.StopRequest
-	12, // 16: vibe.v1.ControlService.Shutdown:input_type -> vibe.v1.ShutdownRequest
-	14, // 17: vibe.v1.ControlService.Logs:input_type -> vibe.v1.LogsRequest
-	16, // 18: vibe.v1.ControlService.Pull:input_type -> vibe.v1.PullRequest
-	17, // 19: vibe.v1.ControlService.CellDrain:input_type -> vibe.v1.CellDrainRequest
-	20, // 20: vibe.v1.ControlService.CellResume:input_type -> vibe.v1.CellResumeRequest
-	22, // 21: vibe.v1.ControlService.CellSuspend:input_type -> vibe.v1.CellSuspendRequest
-	5,  // 22: vibe.v1.ControlService.Status:output_type -> vibe.v1.StatusResponse
-	7,  // 23: vibe.v1.ControlService.ListProfiles:output_type -> vibe.v1.ListProfilesResponse
-	9,  // 24: vibe.v1.ControlService.Start:output_type -> vibe.v1.StartResponse
-	11, // 25: vibe.v1.ControlService.Stop:output_type -> vibe.v1.StopResponse
-	13, // 26: vibe.v1.ControlService.Shutdown:output_type -> vibe.v1.ShutdownResponse
-	15, // 27: vibe.v1.ControlService.Logs:output_type -> vibe.v1.LogsResponse
-	24, // 28: vibe.v1.ControlService.Pull:output_type -> vibe.v1.PullProgress
-	19, // 29: vibe.v1.ControlService.CellDrain:output_type -> vibe.v1.CellDrainResponse
-	21, // 30: vibe.v1.ControlService.CellResume:output_type -> vibe.v1.CellResumeResponse
-	23, // 31: vibe.v1.ControlService.CellSuspend:output_type -> vibe.v1.CellSuspendResponse
-	22, // [22:32] is the sub-list for method output_type
-	12, // [12:22] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	29, // 0: vibe.v1.Status.started_at:type_name -> google.protobuf.Timestamp
+	27, // 1: vibe.v1.Status.frontend_env:type_name -> vibe.v1.Status.FrontendEnvEntry
+	28, // 2: vibe.v1.FrontendInfo.env_vars:type_name -> vibe.v1.FrontendInfo.EnvVarsEntry
+	2,  // 3: vibe.v1.StatusResponse.status:type_name -> vibe.v1.Status
+	2,  // 4: vibe.v1.StatusResponse.services:type_name -> vibe.v1.Status
+	3,  // 5: vibe.v1.ListProfilesResponse.profiles:type_name -> vibe.v1.Profile
+	0,  // 6: vibe.v1.StartRejection.reason:type_name -> vibe.v1.StartRejection.Reason
+	2,  // 7: vibe.v1.StartResponse.status:type_name -> vibe.v1.Status
+	4,  // 8: vibe.v1.StartResponse.frontend:type_name -> vibe.v1.FrontendInfo
+	2,  // 9: vibe.v1.StopResponse.status:type_name -> vibe.v1.Status
+	29, // 10: vibe.v1.LeaseView.expires_at:type_name -> google.protobuf.Timestamp
+	20, // 11: vibe.v1.CellDrainResponse.active_leases:type_name -> vibe.v1.LeaseView
+	1,  // 12: vibe.v1.PullProgress.phase:type_name -> vibe.v1.PullProgress.Phase
+	5,  // 13: vibe.v1.ControlService.Status:input_type -> vibe.v1.StatusRequest
+	7,  // 14: vibe.v1.ControlService.ListProfiles:input_type -> vibe.v1.ListProfilesRequest
+	9,  // 15: vibe.v1.ControlService.Start:input_type -> vibe.v1.StartRequest
+	12, // 16: vibe.v1.ControlService.Stop:input_type -> vibe.v1.StopRequest
+	14, // 17: vibe.v1.ControlService.Shutdown:input_type -> vibe.v1.ShutdownRequest
+	16, // 18: vibe.v1.ControlService.Logs:input_type -> vibe.v1.LogsRequest
+	18, // 19: vibe.v1.ControlService.Pull:input_type -> vibe.v1.PullRequest
+	19, // 20: vibe.v1.ControlService.CellDrain:input_type -> vibe.v1.CellDrainRequest
+	22, // 21: vibe.v1.ControlService.CellResume:input_type -> vibe.v1.CellResumeRequest
+	24, // 22: vibe.v1.ControlService.CellSuspend:input_type -> vibe.v1.CellSuspendRequest
+	6,  // 23: vibe.v1.ControlService.Status:output_type -> vibe.v1.StatusResponse
+	8,  // 24: vibe.v1.ControlService.ListProfiles:output_type -> vibe.v1.ListProfilesResponse
+	11, // 25: vibe.v1.ControlService.Start:output_type -> vibe.v1.StartResponse
+	13, // 26: vibe.v1.ControlService.Stop:output_type -> vibe.v1.StopResponse
+	15, // 27: vibe.v1.ControlService.Shutdown:output_type -> vibe.v1.ShutdownResponse
+	17, // 28: vibe.v1.ControlService.Logs:output_type -> vibe.v1.LogsResponse
+	26, // 29: vibe.v1.ControlService.Pull:output_type -> vibe.v1.PullProgress
+	21, // 30: vibe.v1.ControlService.CellDrain:output_type -> vibe.v1.CellDrainResponse
+	23, // 31: vibe.v1.ControlService.CellResume:output_type -> vibe.v1.CellResumeResponse
+	25, // 32: vibe.v1.ControlService.CellSuspend:output_type -> vibe.v1.CellSuspendResponse
+	23, // [23:33] is the sub-list for method output_type
+	13, // [13:23] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_vibe_v1_control_proto_init() }
@@ -1681,15 +1872,16 @@ func file_vibe_v1_control_proto_init() {
 	if File_vibe_v1_control_proto != nil {
 		return
 	}
-	file_vibe_v1_control_proto_msgTypes[18].OneofWrappers = []any{}
-	file_vibe_v1_control_proto_msgTypes[22].OneofWrappers = []any{}
+	file_vibe_v1_control_proto_msgTypes[8].OneofWrappers = []any{}
+	file_vibe_v1_control_proto_msgTypes[19].OneofWrappers = []any{}
+	file_vibe_v1_control_proto_msgTypes[23].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_vibe_v1_control_proto_rawDesc), len(file_vibe_v1_control_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   26,
+			NumEnums:      2,
+			NumMessages:   27,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

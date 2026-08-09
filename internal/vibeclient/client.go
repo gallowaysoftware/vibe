@@ -199,9 +199,18 @@ func (c *Client) Start(ctx context.Context, profile string) (*StartResult, error
 // heuristic). Foreground asks the daemon to render the frontend's config
 // + env but not spawn the binary; used by `vibe run` which exec's the
 // frontend in its own terminal.
+//
+// StrictVRAM asks the daemon to refuse when the estimate exceeds free
+// memory, not just when it exceeds the machine. Only a caller that can
+// do something else on refusal should set it — for a human at
+// `vibe start` a short free read is a warning, because free memory
+// moves. vamp's candidate walk is the caller it exists for, and it sets
+// it only while a smaller candidate is still behind the current one.
+// NoVRAMCheck wins: it skips the probe outright.
 type StartOptions struct {
 	NoVRAMCheck bool
 	Foreground  bool
+	StrictVRAM  bool
 }
 
 // StartWithOptions is the same as Start but exposes optional flags. Existing
@@ -212,6 +221,7 @@ func (c *Client) StartWithOptions(ctx context.Context, profile string, opts Star
 		Profile:     profile,
 		NoVramCheck: opts.NoVRAMCheck,
 		Foreground:  opts.Foreground,
+		StrictVram:  opts.StrictVRAM,
 	}))
 	if err != nil {
 		return nil, err
@@ -231,9 +241,17 @@ func (c *Client) StartBackend(ctx context.Context, backend string) (*StartResult
 // activating a backend directly has the same escape hatch as `vibe start`
 // and `vibe run`.
 func (c *Client) StartBackendOpts(ctx context.Context, backend string, noVRAMCheck bool) (*StartResult, error) {
+	return c.StartBackendWithOptions(ctx, backend, StartOptions{NoVRAMCheck: noVRAMCheck})
+}
+
+// StartBackendWithOptions is StartBackend with the full option set.
+// Foreground is not forwarded: a backend activation has no frontend to
+// hold in the foreground.
+func (c *Client) StartBackendWithOptions(ctx context.Context, backend string, opts StartOptions) (*StartResult, error) {
 	resp, err := c.rpc.Start(ctx, connect.NewRequest(&vibev1.StartRequest{
 		Backend:     backend,
-		NoVramCheck: noVRAMCheck,
+		NoVramCheck: opts.NoVRAMCheck,
+		StrictVram:  opts.StrictVRAM,
 	}))
 	if err != nil {
 		return nil, err
@@ -297,28 +315,64 @@ func (c *Client) Pull(ctx context.Context, profile string) (*PullStream, error) 
 	return &PullStream{s: stream}, nil
 }
 
-// IsVRAMRejection reports whether err is the daemon's pre-flight VRAM
-// rejection (i.e. "this profile needs more VRAM than is currently free").
+// IsVRAMRejection reports whether err is the daemon's pre-flight refusal
+// on a memory ground — either "this will never fit on this machine" or,
+// for a caller that asked for a strict pre-flight, "this does not fit
+// right now". Both are cases a caller with a smaller candidate should
+// move past rather than abort on.
 //
-// We identify it by the Connect status code AND a substring match on the
-// daemon's well-known message body. The dual check keeps unrelated
-// FailedPrecondition errors (e.g. "no profile is active") from being
-// misclassified as VRAM rejections, which would otherwise cause vamp's
-// candidate-fallback loop to swallow legitimate errors. We control both
-// ends of the wire so a string match is acceptable; if the daemon message
-// changes, IsVRAMRejection moves in lockstep.
+// It reads the typed vibev1.StartRejection detail the daemon attaches,
+// and NOTHING ELSE. It used to substring-match the daemon's human-facing
+// message for "free VRAM"; 4a4c5ea rewrote that message and deleted the
+// only condition that emitted it, and the match went dead without a
+// single test noticing — because both covering tests constructed the
+// string they then asserted on. A message is for a human and moves when
+// the wording improves; the reason is data and moves only when somebody
+// changes the schema.
+//
+// The Connect code is deliberately NOT part of the match. The detail
+// already discriminates — nothing else in the tree attaches one — so
+// requiring the code too would add a second coupling that can rot
+// independently, which is the failure mode this function is recovering
+// from. The daemon sends FailedPrecondition; a caller that cares can
+// read it from the error itself.
 func IsVRAMRejection(err error) bool {
+	_, ok := VRAMRejection(err)
+	return ok
+}
+
+// VRAMRejection returns the daemon's typed refusal detail when err is a
+// memory rejection, so a caller can report which reason fired and the
+// numbers behind it rather than re-parsing the message. The bool is
+// false for every other error, including a FailedPrecondition with no
+// detail and a rejection whose reason this build does not recognise —
+// an unknown reason is not a VRAM one.
+func VRAMRejection(err error) (*vibev1.StartRejection, bool) {
 	if err == nil {
-		return false
+		return nil, false
 	}
 	var ce *connect.Error
 	if !errors.As(err, &ce) {
-		return false
+		return nil, false
 	}
-	if ce.Code() != connect.CodeFailedPrecondition {
-		return false
+	for _, d := range ce.Details() {
+		v, verr := d.Value()
+		if verr != nil {
+			// A detail this build cannot resolve tells us nothing; it is
+			// not evidence of absence, but it is not a match either.
+			continue
+		}
+		r, ok := v.(*vibev1.StartRejection)
+		if !ok {
+			continue
+		}
+		switch r.GetReason() {
+		case vibev1.StartRejection_REASON_VRAM_EXCEEDS_CAPACITY,
+			vibev1.StartRejection_REASON_VRAM_INSUFFICIENT_FREE:
+			return r, true
+		}
 	}
-	return strings.Contains(ce.Message(), "free VRAM")
+	return nil, false
 }
 
 // IsNotFound reports whether err is a Connect NotFound — e.g. EnsureBackendActive
@@ -359,8 +413,15 @@ func IsNotFound(err error) bool {
 // would unconditionally Stop+Start, only to have the daemon reject
 // the Start with already_exists.
 func (c *Client) EnsureActive(ctx context.Context, profile string) (*vibev1.Status, error) {
+	return c.EnsureActiveWithOptions(ctx, profile, StartOptions{})
+}
+
+// EnsureActiveWithOptions is EnsureActive with the Start option set —
+// the entry point vamp's candidate walk uses to ask for a strict
+// pre-flight while it still has a smaller candidate in hand.
+func (c *Client) EnsureActiveWithOptions(ctx context.Context, profile string, opts StartOptions) (*vibev1.Status, error) {
 	return c.ensureActive(ctx, profile, func(ctx context.Context) (*StartResult, error) {
-		return c.Start(ctx, profile)
+		return c.StartWithOptions(ctx, profile, opts)
 	})
 }
 
@@ -370,8 +431,14 @@ func (c *Client) EnsureActive(ctx context.Context, profile string) (*vibev1.Stat
 // backend already active — or already running as a service-mode sidecar — is
 // reused without a needless stop/start.
 func (c *Client) EnsureBackendActive(ctx context.Context, backend string) (*vibev1.Status, error) {
+	return c.EnsureBackendActiveWithOptions(ctx, backend, StartOptions{})
+}
+
+// EnsureBackendActiveWithOptions is EnsureBackendActive with the Start
+// option set. See EnsureActiveWithOptions.
+func (c *Client) EnsureBackendActiveWithOptions(ctx context.Context, backend string, opts StartOptions) (*vibev1.Status, error) {
 	return c.ensureActive(ctx, backend, func(ctx context.Context) (*StartResult, error) {
-		return c.StartBackend(ctx, backend)
+		return c.StartBackendWithOptions(ctx, backend, opts)
 	})
 }
 
