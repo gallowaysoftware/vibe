@@ -295,8 +295,14 @@ func (s *dryRunState) dryRunForeachStage(ctx context.Context, st *Stage, stageTy
 		s.executor.dryRunLogf("    output: %s", outPaths[i])
 		printed++
 	}
-	if len(items) > maxItemsToPrint {
-		s.executor.dryRunLogf("  ... (%d more item(s) elided)", len(items)-maxItemsToPrint)
+	// Count what was actually skipped rather than assuming it is
+	// len(items)-maxItemsToPrint. The loop above ALWAYS prints the last
+	// item (the `i < len(items)-1` clause), so that arithmetic
+	// over-counted by one for every foreach longer than the cap — and
+	// for exactly maxItemsToPrint+1 items it announced an elision when
+	// nothing had been elided at all.
+	if elided := len(items) - printed; elided > 0 {
+		s.executor.dryRunLogf("  ... (%d more item(s) elided)", elided)
 	}
 
 	// Seed downstream visibility with the per-item synthesised outputs and the

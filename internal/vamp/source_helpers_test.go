@@ -5,6 +5,85 @@ import (
 	"testing"
 )
 
+// TestParseSearXNGTemplate_MissingResultsKeyIsAnError separates the two
+// shapes of "nothing". A search that found nothing carries a results
+// key (empty or null) and is a real answer; a body with no results key
+// at all is not a SearXNG response — it is an error page, a proxy body,
+// or an LLM echo — and must not be folded into "zero sources found",
+// because the research stage downstream reports success on it.
+func TestParseSearXNGTemplate_MissingResultsKeyIsAnError(t *testing.T) {
+	_, err := parseSearXNGTemplate(`{"error":"engine unavailable","query":"x"}`)
+	if err == nil {
+		t.Fatal("expected error for a response with no results key, got nil (silent zero sources)")
+	}
+	if !strings.Contains(err.Error(), "results") {
+		t.Errorf("error should name the missing field, got %v", err)
+	}
+	// The genuinely-empty shapes must still succeed: null and [].
+	for _, in := range []string{`{"query":"x","results":null}`, `{"query":"x","results":[]}`} {
+		got, err := parseSearXNGTemplate(in)
+		if err != nil {
+			t.Fatalf("empty-but-well-formed %s: unexpected error %v", in, err)
+		}
+		if got != `{"items":[]}` {
+			t.Errorf("%s: got %s, want empty items", in, got)
+		}
+	}
+}
+
+// TestParseSearXNGTemplate_EmptyInputIsAnError pins that an upstream
+// webhook stage which wrote nothing fails the render rather than
+// producing an empty-but-successful source list.
+func TestParseSearXNGTemplate_EmptyInputIsAnError(t *testing.T) {
+	for _, in := range []string{"", "   \n\n  ", "```json\n```"} {
+		if _, err := parseSearXNGTemplate(in); err == nil {
+			t.Errorf("parseSearXNG(%q) = nil error; want a failure, an empty upstream is not an empty search", in)
+		}
+	}
+}
+
+// TestParseWikipediaSearchTemplate_APIErrorIsNotZeroHits pins that a
+// MediaWiki {"error":{...}} body fails the stage. MediaWiki's zero-hit
+// shape always carries query.search, so an absent query object is a
+// refused request, never an empty result — and the operator needs the
+// API's own code/info in the message to act on it.
+func TestParseWikipediaSearchTemplate_APIErrorIsNotZeroHits(t *testing.T) {
+	in := `{"error":{"code":"invalidparammix","info":"The parameters srsearch, srlimit cannot be used together."},"servedby":"mw-api-ext"}`
+	_, err := parseWikipediaSearchTemplate(in)
+	if err == nil {
+		t.Fatal("expected error for a MediaWiki error body, got nil (silent zero hits)")
+	}
+	if !strings.Contains(err.Error(), "invalidparammix") {
+		t.Errorf("error should carry the MediaWiki code, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "cannot be used together") {
+		t.Errorf("error should carry the MediaWiki info, got %v", err)
+	}
+	// A body that is JSON but not a MediaWiki response at all also fails,
+	// with no error clause to quote.
+	if _, err := parseWikipediaSearchTemplate(`{"nothing":"here"}`); err == nil {
+		t.Error("expected error for a non-MediaWiki JSON body")
+	}
+}
+
+// TestParseWikipediaExtractTemplate_APIErrorIsNotZeroPages is the
+// sibling of the search-side check: the same guard, in the other
+// parser, because one of two is the defect class this package repeats.
+func TestParseWikipediaExtractTemplate_APIErrorIsNotZeroPages(t *testing.T) {
+	in := `{"error":{"code":"invalidtitle","info":"Bad title \"|\"."}}`
+	_, err := parseWikipediaExtractTemplate(in)
+	if err == nil {
+		t.Fatal("expected error for a MediaWiki error body, got nil (silent zero pages)")
+	}
+	if !strings.Contains(err.Error(), "invalidtitle") {
+		t.Errorf("error should carry the MediaWiki code, got %v", err)
+	}
+	// query present but pages absent is equally wrong-shaped.
+	if _, err := parseWikipediaExtractTemplate(`{"query":{"normalized":[]}}`); err == nil {
+		t.Error("expected error when query.pages is absent")
+	}
+}
+
 // TestFilterByFieldTemplate pins the kept/dropped semantics of
 // the generic field filter: bool true keeps, bool false drops,
 // missing key drops, non-empty string keeps, empty string drops,

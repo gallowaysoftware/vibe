@@ -1,12 +1,267 @@
 package vamp
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"text/template"
 )
+
+// TestParseJSONTemplate_ToleratesLLMOutputMess covers the two messes
+// parseJSON's doc comment promises to absorb and the sibling test never
+// exercises: markdown fences, and the verbose-CoT preamble Qwen3.6 and
+// friends emit before the JSON. The whole of extractFirstJSONBlock — a
+// hand-rolled brace/bracket/string state machine, reachable only through
+// this fallback and only ever fed model output — had no direct test.
+func TestParseJSONTemplate_ToleratesLLMOutputMess(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string // toJSON of the result
+	}{
+		{"fenced object", "```json\n{\"a\":1}\n```", `{"a":1}`},
+		{"fenced uppercase", "```JSON\n[1,2]\n```", `[1,2]`},
+		{"bare fence", "```\n{\"a\":1}\n```", `{"a":1}`},
+		{"thinking preamble", "Here's my thinking process:\n- consider x\n\n{\"a\":1}", `{"a":1}`},
+		{"preamble before array", "Reasoning done.\n[{\"k\":\"v\"}]", `[{"k":"v"}]`},
+		{"trailing chatter", "{\"a\":1}\n\nLet me know if you want more!", `{"a":1}`},
+		// Braces inside string literals must not close the block early.
+		{"brace inside string", "note:\n{\"a\":\"}\",\"b\":\"[\"}", `{"a":"}","b":"["}`},
+		// An escaped quote must not end the string state.
+		{"escaped quote", `chat: {"a":"say \"hi\"","b":2}`, `{"a":"say \"hi\"","b":2}`},
+		{"nested", "x\n{\"a\":{\"b\":[1,{\"c\":2}]}}", `{"a":{"b":[1,{"c":2}]}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := parseJSONTemplate(tc.in)
+			if err != nil {
+				t.Fatalf("parseJSON(%q): %v", tc.in, err)
+			}
+			got, err := toJSONTemplate(v)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("got %s, want %s", got, tc.want)
+			}
+		})
+	}
+	// No JSON at all is still an error, not an empty result: a stage that
+	// returned prose must not read downstream as an empty object.
+	for _, in := range []string{"", "   ", "no json here at all"} {
+		if _, err := parseJSONTemplate(in); err == nil {
+			t.Errorf("parseJSON(%q) = nil error; prose is not JSON", in)
+		}
+	}
+	// An unterminated block fails rather than returning a partial parse.
+	if _, err := parseJSONTemplate(`preamble {"a":1`); err == nil {
+		t.Error("unterminated object should not parse")
+	}
+}
+
+// lessonEscapeFixture builds a lesson root plus a sibling directory
+// holding an image the pipeline must never reach, and returns the root
+// and the "../<sibling>" lesson name that reaches it. The sibling is a
+// SIBLING of the root, not a child, so the only way to name it from
+// inside the root is to climb out.
+func lessonEscapeFixture(t *testing.T) (root, escapingLesson string) {
+	t.Helper()
+	base := t.TempDir()
+	root = filepath.Join(base, "curriculum")
+	if err := os.MkdirAll(filepath.Join(root, "Lesson_1", "images"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Lesson_1", "images", "ok.png"), []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(base, "private", "images"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "private", "images", "secret.png"), []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return root, "../private"
+}
+
+// TestEnumerateImagePairs_RefusesLessonEscapingTheRoot pins the guard on
+// the path that actually reaches a model. The lessons array is a prior
+// stage's output — i.e. whatever the model wrote — and every image_path
+// this helper emits is read and attached to a vision prompt. A lesson
+// name of "../private" used to resolve, silently, to a directory
+// outside the curriculum.
+func TestEnumerateImagePairs_RefusesLessonEscapingTheRoot(t *testing.T) {
+	root, escaping := lessonEscapeFixture(t)
+	got, err := enumerateImagePairsTemplate(root, `["`+escaping+`"]`)
+	if err == nil {
+		t.Fatalf("expected refusal, got %s", got)
+	}
+	if !errors.Is(err, errLessonPathEscape) {
+		t.Errorf("want errLessonPathEscape, got %v", err)
+	}
+	if strings.Contains(got, "secret.png") {
+		t.Errorf("leaked an out-of-root path: %s", got)
+	}
+	// A legitimate lesson still works, and a nested lesson name (a
+	// lesson root organised by module) is not collateral damage.
+	ok, err := enumerateImagePairsTemplate(root, `["Lesson_1"]`)
+	if err != nil {
+		t.Fatalf("legitimate lesson refused: %v", err)
+	}
+	if !strings.Contains(ok, "ok.png") {
+		t.Errorf("legitimate lesson lost its image: %s", ok)
+	}
+}
+
+// TestEnumerateUniqueImages_RefusesLessonEscapingTheRoot is the same
+// guard in the second of three helpers that join an untrusted lesson
+// name against the lesson root.
+func TestEnumerateUniqueImages_RefusesLessonEscapingTheRoot(t *testing.T) {
+	root, escaping := lessonEscapeFixture(t)
+	got, err := enumerateUniqueImagesTemplate(root, `["`+escaping+`"]`)
+	if err == nil {
+		t.Fatalf("expected refusal, got %s", got)
+	}
+	if !errors.Is(err, errLessonPathEscape) {
+		t.Errorf("want errLessonPathEscape, got %v", err)
+	}
+	ok, err := enumerateUniqueImagesTemplate(root, `["Lesson_1"]`)
+	if err != nil {
+		t.Fatalf("legitimate lesson refused: %v", err)
+	}
+	if !strings.Contains(ok, "ok.png") {
+		t.Errorf("legitimate lesson lost its image: %s", ok)
+	}
+}
+
+// TestImageDescriptionsFor_RefusesLessonEscapingTheRoot is the third.
+// Here the lesson name arrives as a foreach item binding, which is one
+// json.Unmarshal away from the model's own text.
+func TestImageDescriptionsFor_RefusesLessonEscapingTheRoot(t *testing.T) {
+	root, escaping := lessonEscapeFixture(t)
+	_, err := imageDescriptionsForLessonTemplate(t.TempDir(), root, escaping)
+	if err == nil {
+		t.Fatal("expected refusal, got nil error")
+	}
+	if !errors.Is(err, errLessonPathEscape) {
+		t.Errorf("want errLessonPathEscape, got %v", err)
+	}
+}
+
+// TestEnumerateImagePairs_NoImagesIsEmptyArrayNotNull pins the JSON
+// shape. A nil slice marshals to `null`, and resolveForeachItems
+// rejects a null with "must be a JSON array ... got <nil>" — so the
+// empty fan-out used to fail the downstream stage rather than run zero
+// iterations. enumerateUniqueImages already emitted `[]`; this is the
+// sibling that didn't.
+func TestEnumerateImagePairs_NoImagesIsEmptyArrayNotNull(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "Lesson_1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := enumerateImagePairsTemplate(root, `["Lesson_1"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "[]" {
+		t.Errorf("got %q, want []", got)
+	}
+}
+
+// TestChunkParagraphs_EmptyInputIsEmptyArrayNotNull holds the helper to
+// its own documented contract ("Empty / whitespace-only input returns
+// []"). It returned `null`, which is the one JSON value a foreach
+// source cannot be.
+func TestChunkParagraphs_EmptyInputIsEmptyArrayNotNull(t *testing.T) {
+	for _, in := range []string{"", "   ", "\n\n\t\n"} {
+		got, err := chunkParagraphsTemplate(in, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "[]" {
+			t.Errorf("chunkParagraphs(%q) = %q, want []", in, got)
+		}
+	}
+}
+
+// TestSplitSentences_EmptyInputIsEmptyArray pins the same rule in the
+// sentence splitter, whose siblings already had it. It returned
+// `[""]`: one chunk holding the empty string, which a TTS foreach fans
+// out into a synthesis call with nothing to say.
+func TestSplitSentences_EmptyInputIsEmptyArray(t *testing.T) {
+	for _, in := range []string{"", "   ", "\n \t\n"} {
+		if got := splitSentencesTemplate(in, 300); got != "[]" {
+			t.Errorf("splitSentences(%q) = %s, want []", in, got)
+		}
+	}
+	// Real text is untouched by the guard.
+	if got := splitSentencesTemplate("She breathed in.", 300); got != `["She breathed in."]` {
+		t.Errorf("non-empty input regressed: %s", got)
+	}
+}
+
+// TestEnumerateLessons_NoMatchesIsAnError gives enumerateDirs the
+// contract its two siblings (readFiles, readFileBatch) already have. A
+// stale or typo'd lesson root used to yield JSON `null` with no error,
+// so the foreach it feeds completed green having processed nothing.
+func TestEnumerateLessons_NoMatchesIsAnError(t *testing.T) {
+	dir := t.TempDir()
+	_, noMatchErr := enumerateLessonsTemplate(filepath.Join(dir, "Lesson_*"))
+	if noMatchErr == nil {
+		t.Fatal("expected error when the glob matches nothing")
+	}
+	// The two failures have different remedies — fix the glob vs. fix
+	// the lesson dirs — so the message must distinguish them, and
+	// asserting on it is what keeps each guard separately covered.
+	if !strings.Contains(noMatchErr.Error(), "no directories matched") {
+		t.Errorf("zero-match message should name the glob failure, got %v", noMatchErr)
+	}
+	// Matched, but nothing survives filtering: also an error, and the
+	// message must say so rather than repeat "no directories matched".
+	if err := os.MkdirAll(filepath.Join(dir, "Lesson_1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := enumerateLessonsTemplate(filepath.Join(dir, "Lesson_*"))
+	if err == nil {
+		t.Fatal("expected error when every match lacks a lesson.md")
+	}
+	if !strings.Contains(err.Error(), "lesson.md") {
+		t.Errorf("message should explain the filter, got %v", err)
+	}
+	// A real lesson dir still enumerates.
+	if err := os.WriteFile(filepath.Join(dir, "Lesson_1", "lesson.md"), []byte("# x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := enumerateLessonsTemplate(filepath.Join(dir, "Lesson_*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != `["Lesson_1"]` {
+		t.Errorf("got %s, want [\"Lesson_1\"]", got)
+	}
+}
+
+// TestLessonEscapeRefusalReachesTheTemplate proves the guard fires on
+// the surface pipelines actually use — a rendered template — and not
+// only when the Go function is called directly.
+func TestLessonEscapeRefusalReachesTheTemplate(t *testing.T) {
+	root, escaping := lessonEscapeFixture(t)
+	tmpl, err := template.New("t").Funcs(templateFuncs()).Parse(
+		`{{ enumerateImagePairs .root .lessons }}`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sb strings.Builder
+	err = tmpl.Execute(&sb, map[string]any{"root": root, "lessons": `["` + escaping + `"]`})
+	if err == nil {
+		t.Fatalf("template rendered an out-of-root fan-out: %s", sb.String())
+	}
+	if !strings.Contains(err.Error(), "escapes the lesson root") {
+		t.Errorf("want a lesson-root-escape failure, got %v", err)
+	}
+}
 
 // TestReadFileTemplate covers the happy path + error-on-missing.
 func TestReadFileTemplate(t *testing.T) {

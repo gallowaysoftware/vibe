@@ -169,19 +169,49 @@ func stageLabel(s Stage) string {
 	return strings.Join(parts, " · ")
 }
 
-// escapeLabel quotes a Mermaid node label when it contains characters
-// that would otherwise terminate the `[...]` shape early or produce a
-// parser error. Mermaid's rule of thumb: wrap in double quotes when the
-// label contains any of `[]"()` or whitespace-sensitive characters that
-// the renderer might otherwise treat as syntax. We over-quote a little
-// here (any label with a colon, pipe, or quote) because the cost is one
-// extra pair of quotes and the benefit is never having to track down a
-// "parse error" rendered by Mermaid live editor against output we
-// produced.
+// escapeLabel quotes a Mermaid node label when it contains anything that
+// could terminate the `[...]` shape early, be read as flowchart syntax,
+// or produce a parser error.
+//
+// The rule is an ALLOWLIST, not a denylist of the characters we happened
+// to think of. The previous denylist (`:|"()[]`) missed every character
+// that can inject structure — `-`, `>`, `<`, `{`, `}`, `#`, `;`, `&` —
+// and Stage.Capability, which goes straight into the label, is never
+// charset-validated: Validate only checks that it is non-empty. A
+// pipeline (these are model-generated) with `capability: "a-->b"`
+// therefore emitted an unquoted `id[a · a-->b]`, which Mermaid reads as
+// an extra edge in the diagram.
+//
+// Over-quoting is the deliberate trade: the cost is one pair of quotes,
+// the benefit is never chasing a Mermaid "parse error" against output we
+// produced. Labels almost always carry the " · " separator anyway, so in
+// practice nearly everything is quoted.
+//
+// Inside the quotes Mermaid does NOT understand backslash escapes — it
+// uses HTML entities. Emitting `\"` (which this did) produced exactly
+// the parse error the quoting exists to prevent. `#` is the entity
+// introducer, so it is escaped first or it would swallow what follows.
 func escapeLabel(s string) string {
-	if !strings.ContainsAny(s, ":|\"()[]") {
+	if !labelNeedsQuoting(s) {
 		return s
 	}
-	// Mermaid uses backslash to escape double quotes inside a quoted label.
-	return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+	esc := strings.ReplaceAll(s, "#", "#35;")
+	esc = strings.ReplaceAll(esc, `"`, "#quot;")
+	return `"` + esc + `"`
+}
+
+// labelNeedsQuoting reports whether s contains anything outside the set
+// that is unambiguously inert in an unquoted Mermaid label.
+func labelNeedsQuoting(s string) bool {
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '_' || r == ' ' || r == '.':
+		default:
+			return true
+		}
+	}
+	return false
 }

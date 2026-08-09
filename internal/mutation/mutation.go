@@ -1467,6 +1467,218 @@ var Registry = []Mutation{
 			"evidence (the same profile on the same box read 15.2 and 23.5 GiB free minutes apart). " +
 			"Same Find as the entry above, opposite direction: one guards the floor, one the ceiling.",
 	},
+
+	// ── vamp template helpers: the parsers that read model output ──────
+	{
+		Name:    "vamp/a-lesson-name-may-climb-out-of-the-lesson-root",
+		File:    "internal/vamp/exec.go",
+		Find:    "\tif err != nil || rel == \"..\" || strings.HasPrefix(rel, \"..\"+string(filepath.Separator)) {",
+		Replace: "\tif err != nil || rel == \"\" {",
+		Pkg:     "./internal/vamp/",
+		MustFail: []string{
+			"TestEnumerateImagePairs_RefusesLessonEscapingTheRoot",
+			"TestEnumerateUniqueImages_RefusesLessonEscapingTheRoot",
+			"TestImageDescriptionsFor_RefusesLessonEscapingTheRoot",
+			"TestLessonEscapeRefusalReachesTheTemplate",
+		},
+		Why: "the same threat ensureUnderRunDir names, one directory over. The lessons array these three " +
+			"helpers join against the lesson root is a PRIOR STAGE'S OUTPUT — the model's own text — and " +
+			"every image_path enumerateImagePairs emits is then read and attached to a vision prompt. " +
+			"filepath.Join does not refuse \"..\", it RESOLVES it, so a lesson entry of \"../../..\" turns " +
+			"the fan-out into an arbitrary-file read whose contents land in the next prompt. " +
+			"`rel == \"\"` rather than `false` because Rel never returns the empty string, and an unused " +
+			"variable does not compile.",
+	},
+	{
+		Name:     "vamp/a-searxng-body-with-no-results-field-reads-as-zero-hits",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\trawResults, hasKey := resp[\"results\"]\n\t\tif !hasKey {",
+		Replace:  "\t\trawResults, hasKey := resp[\"results\"]\n\t\tif !hasKey && false {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestParseSearXNGTemplate_MissingResultsKeyIsAnError"},
+		Why: "a search that found nothing carries a results key (empty or null) and is a real answer; a " +
+			"body with no results key is an error page, a proxy response or an LLM echo. Folded together, " +
+			"a research pipeline whose search backend is down completes GREEN with zero sources and " +
+			"writes the report anyway — the operator's only signal is a short document.",
+	},
+	{
+		Name:     "vamp/an-upstream-that-wrote-nothing-reads-as-an-empty-search",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tif responses == 0 {",
+		Replace:  "\tif responses < 0 {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestParseSearXNGTemplate_EmptyInputIsAnError"},
+		Why: "the inverse half of the same guard. json.Decoder over an empty string reaches EOF on the " +
+			"first read, so a webhook stage that produced no body at all parsed to {\"items\":[]} and no " +
+			"error. Zero responses is a broken fetch, not an empty result set.",
+	},
+	{
+		Name:     "vamp/a-mediawiki-error-body-reads-as-zero-search-hits",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\treturn \"\", fmt.Errorf(\"parseWikipediaSearch: response has no \\\"query\\\" object%s\", mediawikiErrorSuffix(resp))",
+		Replace:  "\t\treturn `{\"items\":[]}`, nil",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestParseWikipediaSearchTemplate_APIErrorIsNotZeroHits"},
+		Why: "MediaWiki's zero-hit shape always carries query.search, so an absent query object is a " +
+			"REFUSED request — invalidparammix, invalidtitle, a rate limit — or a body that is not a " +
+			"MediaWiki response at all. Returning empty items for it is how a research run reports " +
+			"success on a document with no sources in it, and it hides the API's own explanation.",
+	},
+	{
+		Name:     "vamp/a-mediawiki-error-body-reads-as-zero-extract-pages",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\treturn \"\", fmt.Errorf(\"parseWikipediaExtract: response has no \\\"query\\\" object%s\", mediawikiErrorSuffix(resp))",
+		Replace:  "\t\treturn `{\"items\":[]}`, nil",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestParseWikipediaExtractTemplate_APIErrorIsNotZeroPages"},
+		Why: "the sibling parser. A page that does not exist arrives as a query.pages entry with pageid " +
+			"-1 and is correctly skipped; a response with no query object is a fault. Guarding one of the " +
+			"two MediaWiki parsers is the one-of-N defect this package keeps producing.",
+	},
+	{
+		Name:     "vamp/empty-tts-text-fans-out-as-one-empty-segment",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tif text == \"\" {",
+		Replace:  "\tif text == \"\\x00\" {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestSplitSentences_EmptyInputIsEmptyArray"},
+		Why: "splitSentences returned [\"\"] for empty input — ONE chunk holding the empty string, which " +
+			"the TTS foreach downstream fans out into a synthesis call with nothing to say. A stage that " +
+			"produced nothing must read downstream as zero units of work, not one.",
+	},
+	{
+		Name:     "vamp/an-empty-chunk-list-marshals-as-json-null",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tout := []chunk{}",
+		Replace:  "\tvar out []chunk",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestChunkParagraphs_EmptyInputIsEmptyArrayNotNull"},
+		Why: "a nil slice marshals to `null`, and null is the one JSON value a foreach source cannot be: " +
+			"resolveForeachItems rejects it with \"must be a JSON array ... got <nil>\". The helper's own " +
+			"doc comment promised `[]`. The empty case therefore FAILED the next stage instead of running " +
+			"zero iterations, and the error named the consumer rather than the producer.",
+	},
+	{
+		Name:     "vamp/an-empty-image-fan-out-marshals-as-json-null",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tpairs := []pair{}",
+		Replace:  "\tvar pairs []pair",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestEnumerateImagePairs_NoImagesIsEmptyArrayNotNull"},
+		Why: "same shape, different helper: enumerateUniqueImages built through make and emitted `[]`, " +
+			"enumerateImagePairs used a nil slice and emitted `null`. A curriculum whose lessons carry no " +
+			"diagrams broke the vision fan-out rather than skipping it.",
+	},
+	{
+		Name:     "vamp/a-lesson-glob-matching-nothing-reads-as-no-lessons",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tif len(matches) == 0 {\n\t\treturn \"\", fmt.Errorf(\"enumerateLessons %s: no directories matched\", pattern)\n\t}",
+		Replace:  "\tif len(matches) < 0 {\n\t\treturn \"\", fmt.Errorf(\"enumerateLessons %s: no directories matched\", pattern)\n\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestEnumerateLessons_NoMatchesIsAnError"},
+		Why: "enumerateDirs returned JSON `null` and no error for a stale or typo'd lesson root, while " +
+			"BOTH its siblings (readFiles, readFileBatch) already errored on the same condition. The " +
+			"foreach it feeds then completed green having processed nothing. The test asserts the " +
+			"zero-match MESSAGE, not merely that some error occurred, because the all-filtered guard " +
+			"below would otherwise absorb this mutation.",
+	},
+	{
+		Name:     "vamp/lesson-dirs-that-all-fail-the-filter-read-as-no-lessons",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tif len(dirs) == 0 {",
+		Replace:  "\tif len(dirs) < 0 {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestEnumerateLessons_NoMatchesIsAnError"},
+		Why: "the other half: the glob matched, but nothing survived the is-a-directory / has-a-lesson.md " +
+			"/ under-1MB filter. Same silent-empty outcome, different remedy, so it is a separate rung " +
+			"with its own message — and without it the nil dirs slice marshals to `null` again.",
+	},
+
+	// ── vamp diff / viz ────────────────────────────────────────────────
+	{
+		Name:     "vamp/the-differ-reads-an-output-path-outside-the-run-dir-prior-state",
+		File:     "internal/vamp/diff.go",
+		Find:     "\t\tif err := ensureUnderRunDir(outPath); err != nil {\n\t\t\tout[st.ID] = &stageResult{}\n\t\t\tcontinue\n\t\t}",
+		Replace:  "\t\tif err := ensureUnderRunDir(outPath); err != nil && false {\n\t\t\tout[st.ID] = &stageResult{}\n\t\t\tcontinue\n\t\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestCompare_RefusesOutputPathEscapingTheRunDir"},
+		Why: "the differ was one of four consumers of a rendered `output:` template and the only pair " +
+			"that did not apply the containment rule. Executor.snapshot writes pipeline.yaml.snapshot " +
+			"VERBATIM before any stage runs, so a template the executor would refuse still reaches the " +
+			"differ — which reads the file and, if it looks textual, embeds it whole into the report " +
+			"the operator prints or pipes as JSON.",
+	},
+	{
+		Name:     "vamp/the-differ-stats-an-output-path-outside-the-run-dir",
+		File:     "internal/vamp/diff.go",
+		Find:     "\tif err := ensureUnderRunDir(outPath); err != nil {\n\t\treturn StageOutputSide{Missing: true}\n\t}",
+		Replace:  "\tif err := ensureUnderRunDir(outPath); err != nil && false {\n\t\treturn StageOutputSide{Missing: true}\n\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestCompare_RefusesOutputPathEscapingTheRunDir"},
+		Why: "the second of the two sites, and the one that feeds loadStageOutput — which sha256s the " +
+			"file and puts its bytes in StageOutputSide.Content. Guarding one of two is the defect " +
+			"class; both rungs are separate entries so removing either is caught.",
+	},
+	{
+		Name:     "vamp/a-sub-line-difference-is-reported-as-no-difference",
+		File:     "internal/vamp/diff.go",
+		Find:     "\tvar out strings.Builder\n\tif len(hunks) == 0 {",
+		Replace:  "\tvar out strings.Builder\n\tif len(hunks) == 0 {\n\t\treturn out.String()",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestUnifiedDiff_TrailingNewlineIsNotReportedAsIdentical", "TestCompare_TrailingNewlineChangeSurfacesInTheReport"},
+		Why: "splitLinesKeepEmpty strips exactly one trailing newline, so \"x\\n\" and \"x\" produce " +
+			"identical line slices and zero hunks. The empty string that came back is every caller's " +
+			"sentinel for NO CHANGE, and the human renderer prints `output: (identical)` for two " +
+			"outputs that differ. A missing final newline is one of the commonest real diffs there is.",
+	},
+	{
+		Name:     "vamp/a-stage-filter-matching-nothing-exits-zero",
+		File:     "internal/vamp/diff.go",
+		Find:     "\t\t\treturn DiffReport{}, fmt.Errorf(\"stage %q not found in either run (have: %s)\", opts.StageFilter, strings.Join(known, \", \"))",
+		Replace:  "\t\t\t_ = known",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestCompare_StageFilterNoMatchIsAnError"},
+		Why: "`vamp diff a b --stage scrpt` printed the headers, zero stage blocks and exited 0 — " +
+			"indistinguishable from \"the two runs agree about that stage\". The sibling command " +
+			"(RenderStageForPipeline) already refuses the same typo with the ids it does know.",
+	},
+	{
+		Name:     "vamp/a-mermaid-label-can-inject-flowchart-syntax",
+		File:     "internal/vamp/viz.go",
+		Find:     "\tif !labelNeedsQuoting(s) {",
+		Replace:  "\tif !strings.ContainsAny(s, \":|\\\"()[]\") {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestRenderMermaid_LabelCannotInjectFlowchartSyntax"},
+		Why: "restores the denylist the allowlist replaced. It held none of the characters that inject " +
+			"STRUCTURE (- > < { } # ; &), and Stage.Capability — which goes straight into the label — is " +
+			"never charset-validated: Validate only requires it to be non-empty. Pipeline yaml here is " +
+			"model-generated, so `capability: \"a-->b\"` emitted an unquoted node that Mermaid renders " +
+			"as an extra edge in the operator's diagram.",
+	},
+	{
+		Name:     "vamp/a-quoted-mermaid-label-escapes-with-backslashes",
+		File:     "internal/vamp/viz.go",
+		Find:     "\tesc = strings.ReplaceAll(esc, `\"`, \"#quot;\")",
+		Replace:  "\tesc = strings.ReplaceAll(esc, `\"`, `\\\"`)",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestRenderMermaid_QuotedLabelUsesMermaidEntitiesNotBackslashes"},
+		Why: "Mermaid has no backslash escape inside a quoted label — the entity is #quot;. Emitting " +
+			"\\\" produced exactly the parse error the over-quoting policy exists to prevent, so the " +
+			"one label Mermaid could not render was the one the guard had already decided was dangerous.",
+	},
+	{
+		Name:     "vamp/the-dry-run-elision-footer-counts-items-it-printed",
+		File:     "internal/vamp/dryrun.go",
+		Find:     "\tif elided := len(items) - printed; elided > 0 {",
+		Replace:  "\tif elided := len(items) - maxItemsToPrint; len(items) > maxItemsToPrint {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestDryRunForeachElisionCountMatchesWhatWasElided"},
+		Why: "restores the arithmetic the fix replaced. The print loop ALWAYS renders the last item, so " +
+			"len(items)-maxItemsToPrint over-counted by one on every foreach past the cap, and at " +
+			"exactly cap+1 items it announced an elision when nothing had been elided. The dry run's " +
+			"whole job is to tell the operator what the real run will do; a footer that disagrees with " +
+			"the list above it is the plan lying about its own contents.",
+	},
 }
 
 // ── tree copying and patching ────────────────────────────────────────
