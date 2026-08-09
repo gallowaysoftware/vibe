@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -41,7 +40,7 @@ type audioExecutor struct {
 	defaultBinary string
 	// httpClient is the injectable HTTP client used by the kokoro engine
 	// path. Tests swap this for a recorder; production callers leave it
-	// nil and we use http.DefaultClient.
+	// nil and we use a client bounded at 2 minutes (see Execute).
 	httpClient *http.Client
 }
 
@@ -331,13 +330,24 @@ func applyAudioEffect(ctx context.Context, wavPath, effect, binary string) error
 		return err
 	}
 	tmp := wavPath + ".fx.wav"
-	cmd := exec.CommandContext(ctx, binary, "-y", "-loglevel", "error",
+	cmd := command(ctx, binary, "-y", "-loglevel", "error",
 		"-i", wavPath, "-af", effect, tmp)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		os.Remove(tmp)
 		return fmt.Errorf("audio effect ffmpeg: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	// Same swallowed-filtergraph-error shape as the ffmpeg stages: a bad
+	// -af chain can exit 0 having written nothing. Renaming that over the
+	// real WAV would replace good audio with silence, and the resume
+	// layer would then treat the stage as never-run forever.
+	if info, err := os.Stat(tmp); err != nil || info.Size() == 0 {
+		os.Remove(tmp)
+		if err != nil {
+			return fmt.Errorf("audio effect ffmpeg: stat output: %w", err)
+		}
+		return fmt.Errorf("audio effect ffmpeg: produced 0-byte output for effect %q (source left intact)", effect)
 	}
 	return os.Rename(tmp, wavPath)
 }
@@ -405,7 +415,7 @@ func validateWAVResponse(wav []byte) error {
 type execCommandRunner struct{}
 
 func (execCommandRunner) Run(ctx context.Context, binary string, args []string, stdin string) error {
-	cmd := exec.CommandContext(ctx, binary, args...)
+	cmd := command(ctx, binary, args...)
 	cmd.Stdin = strings.NewReader(stdin)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

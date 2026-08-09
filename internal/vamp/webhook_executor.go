@@ -8,12 +8,67 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"text/template"
 	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetnotify"
 )
+
+// A webhook URL is a CREDENTIAL. A Slack incoming webhook
+// (`/services/T…/B…/…`), a Discord one (`/api/webhooks/<id>/<token>`)
+// and an ntfy topic all carry their bearer in the PATH: anyone holding
+// the string can post as the pipeline, forever, without any other
+// secret. So it must not reach either of the two places a run's strings
+// go.
+//
+//   - The run log. Under `--detach` that log is a FILE, opened 0o644,
+//     written on every run and kept.
+//   - A stage error. *url.Error embeds the full request URL in its
+//     Error() string, and a stage error becomes Executor.FailureSummary,
+//     which six executors hand to templates as {{ .failure_summary }} —
+//     so a `run_when: failure` webhook would post the leaked URL into a
+//     chat channel.
+//
+// internal/vibe/fleetnotify already closed exactly this trap for the
+// fleet notifier. Both redactions below call ITS code (Redact for the
+// loggable form, ScrubURL for arbitrary strings) rather than growing a
+// second implementation that can drift out of agreement with it.
+
+// scrubbedError carries a message with the webhook URL removed while
+// keeping the original error reachable through Unwrap.
+//
+// The chain matters as much as the message: the retry loop's
+// errors.Is(err, context.Canceled) early-out and isRetryable's
+// net.Error timeout check both walk it, so flattening the cause to a
+// string would silently turn a ctrl-C into another attempt and a
+// dial timeout into a permanent failure.
+type scrubbedError struct {
+	msg   string
+	cause error
+}
+
+func (e *scrubbedError) Error() string { return e.msg }
+func (e *scrubbedError) Unwrap() error { return e.cause }
+
+// scrubURLError renders err safe to print for a request to rawURL.
+//
+// *url.Error is unwrapped to its cause first — that is where the URL is
+// structurally embedded, and dropping the wrapper removes it without
+// relying on string replacement. What is left is scrubbed anyway:
+// a transport can quote the URL back inside its own message (proxy
+// errors, redirect chains), and defence in depth here costs one pass.
+func scrubURLError(rawURL string, err error) error {
+	msg := err.Error()
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Err != nil {
+		msg = ue.Err.Error()
+	}
+	return &scrubbedError{msg: fleetnotify.ScrubURL(rawURL, msg), cause: err}
+}
 
 // transientHTTPError is the typed error a webhook stage returns when it
 // classifies a response as retryable-by-status (HTTP 429 or 5xx). The retry
@@ -107,7 +162,7 @@ func parseRetryAfter(headerValue string, now time.Time) (time.Duration, bool) {
 // httptest.Server in the test file because it's still the clearest way to
 // assert on the resulting request shape).
 type webhookExecutor struct {
-	// doer is the injectable HTTP transport. nil means use http.DefaultClient.
+	// doer is the injectable HTTP transport. nil means defaultWebhookClient().
 	// Tests stub this to capture the rendered request without making a real
 	// network call.
 	doer httpDoer
@@ -215,7 +270,9 @@ func (w *webhookExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 	}
 	req, err := http.NewRequestWithContext(ctx, method, urlStr, reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("stage %s: build request: %w", st.ID, err)
+		// NewRequestWithContext returns a *url.Error carrying the whole
+		// URL on a parse failure — the same leak as the Do path below.
+		return nil, fmt.Errorf("stage %s: build request: %w", st.ID, scrubURLError(urlStr, err))
 	}
 	if len(bodyBytes) > 0 && method != http.MethodGet {
 		// Default Content-Type for the inline-body case is JSON. The
@@ -232,15 +289,19 @@ func (w *webhookExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 
 	doer := w.doer
 	if doer == nil {
-		doer = http.DefaultClient
+		doer = defaultWebhookClient()
 	}
 
 	if in.Log != nil {
-		fmt.Fprintf(in.Log, "webhook: %s %s\n", method, urlStr)
+		// Redact keeps what a human debugging a run actually needs —
+		// scheme, host:port, and a stable 8-hex id that distinguishes two
+		// endpoints from each other — and drops the path, query and
+		// userinfo, which is where every dialect keeps the bearer.
+		fmt.Fprintf(in.Log, "webhook: %s %s\n", method, fleetnotify.Redact(urlStr))
 	}
 	resp, err := doer.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("stage %s: request: %w", st.ID, err)
+		return nil, fmt.Errorf("stage %s: request: %w", st.ID, scrubURLError(urlStr, err))
 	}
 	defer resp.Body.Close()
 

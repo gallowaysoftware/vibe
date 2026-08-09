@@ -150,7 +150,35 @@ func (f *ffmpegExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 	if err := runner.Run(ctx, binary, args, in.Log); err != nil {
 		return nil, fmt.Errorf("stage %s: ffmpeg: %w", st.ID, err)
 	}
+	if err := requireNonEmptyOutput(st.ID, "ffmpeg", outAbs); err != nil {
+		return nil, err
+	}
 	return &StageOutput{Files: []string{outAbs}}, nil
+}
+
+// requireNonEmptyOutput fails a stage whose subprocess exited 0 without
+// writing anything.
+//
+// ffmpeg does this: a filtergraph that errors during setup can still
+// leave a 0-byte container behind and exit 0. Nothing downstream
+// notices — the file exists, the stage is green, and the run "succeeds"
+// with silence in it. Worse, that empty artefact is what the cache
+// stores, so the poisoned result replays on every subsequent run until
+// somebody clears the cache by hand.
+//
+// The cache's own admission rule (cache.Put) refuses a zero-length
+// binary artefact as a second line of defence, but the stage is where
+// the failure belongs: only here is there enough context to tell the
+// operator WHICH ffmpeg invocation produced nothing.
+func requireNonEmptyOutput(stageID, what, path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stage %s: %s: stat output: %w", stageID, what, err)
+	}
+	if info.Size() == 0 {
+		return fmt.Errorf("stage %s: %s produced 0-byte output at %s (likely an error swallowed by the exit code)", stageID, what, path)
+	}
+	return nil
 }
 
 // executeConcatWavs walks the run dir for all "*.wav" files, sorts them
@@ -268,6 +296,9 @@ func (f *ffmpegExecutor) executeConcatWavs(ctx context.Context, in StageInput, s
 	if err := runner.Run(ctx, binary, args, in.Log); err != nil {
 		return nil, fmt.Errorf("stage %s: ffmpeg concat: %w", st.ID, err)
 	}
+	if err := requireNonEmptyOutput(st.ID, "ffmpeg concat", outAbs); err != nil {
+		return nil, err
+	}
 	return &StageOutput{Files: []string{outAbs}}, nil
 }
 
@@ -298,7 +329,7 @@ type ffmpegCommandRunner struct{}
 const ffmpegStderrTailLines = 20
 
 func (ffmpegCommandRunner) Run(ctx context.Context, binary string, args []string, stderr io.Writer) error {
-	cmd := exec.CommandContext(ctx, binary, args...)
+	cmd := command(ctx, binary, args...)
 	// Tail buffer collects the last N stderr lines so non-zero exits surface
 	// a useful slice of ffmpeg's own error message. We also tee live to the
 	// caller-supplied writer when one is set; the two consumers are
@@ -534,6 +565,9 @@ func (f *ffmpegExecutor) executeConcatVideo(ctx context.Context, in StageInput, 
 	if err := runner.Run(ctx, binary, args, in.Log); err != nil {
 		return nil, fmt.Errorf("stage %s: ffmpeg concat_video: %w", st.ID, err)
 	}
+	if err := requireNonEmptyOutput(st.ID, "ffmpeg concat_video", outAbs); err != nil {
+		return nil, err
+	}
 	return &StageOutput{Files: []string{outAbs}}, nil
 }
 
@@ -731,6 +765,9 @@ func (f *ffmpegExecutor) executeM4B(ctx context.Context, in StageInput, st *Stag
 	if err := runner.Run(ctx, binary, args, in.Log); err != nil {
 		return nil, fmt.Errorf("stage %s: ffmpeg m4b: %w", st.ID, err)
 	}
+	if err := requireNonEmptyOutput(st.ID, "ffmpeg m4b", outAbs); err != nil {
+		return nil, err
+	}
 	return &StageOutput{Files: []string{outAbs}}, nil
 }
 
@@ -738,7 +775,7 @@ func (f *ffmpegExecutor) executeM4B(ctx context.Context, in StageInput, st *Stag
 // milliseconds. ffprobe's -show_entries form returns a float seconds
 // value; we round to ms to match the FFMETADATA TIMEBASE=1/1000.
 func probeDurationMs(ctx context.Context, path string) (int64, error) {
-	cmd := exec.CommandContext(ctx, "ffprobe",
+	cmd := command(ctx, "ffprobe",
 		"-v", "error",
 		"-show_entries", "format=duration",
 		"-of", "default=noprint_wrappers=1:nokey=1",

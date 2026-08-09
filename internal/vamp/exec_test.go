@@ -1800,20 +1800,27 @@ func TestExecutor_ForeachPerItemRetry(t *testing.T) {
 }
 
 // TestExecutor_ExponentialBackoffTiming verifies that the wait between
-// successive attempts grows by Multiplier and caps at MaxBackoff. The
-// stub records the wall-clock between attempts; we assert the second
-// gap is ~Multiplier * first, capped at MaxBackoff. Wide tolerances
-// keep CI green even on busy hosts.
+// successive attempts grows by Multiplier and caps at MaxBackoff.
+//
+// The numbers are chosen so the cap assertion can actually fail. The
+// previous version used initial=10ms, multiplier=2, cap=25ms and
+// asserted the third gap was under 50ms — but the UNCAPPED third gap
+// would have been 40ms, comfortably inside that bound, so deleting the
+// cap left the test green. With multiplier 4 the uncapped third gap is
+// 400ms against a capped 50ms: an order of magnitude of daylight
+// between "capped" and "not", which is what lets a wide CI tolerance
+// coexist with a real assertion.
 func TestExecutor_ExponentialBackoffTiming(t *testing.T) {
-	// Backoffs chosen so the geometric progression is visible:
-	//   attempt 1 -> attempt 2: ~10ms
-	//   attempt 2 -> attempt 3: ~20ms (10 * 2.0)
-	//   attempt 3 -> attempt 4: capped at 25ms (40 would exceed cap)
+	// Backoffs chosen so the geometric progression is visible AND the
+	// cap is discriminable:
+	//   attempt 1 -> attempt 2: ~25ms (initial)
+	//   attempt 2 -> attempt 3: capped at 50ms (100 uncapped)
+	//   attempt 3 -> attempt 4: capped at 50ms (400 uncapped)
 	policy := &RetryPolicy{
 		MaxAttempts:    4,
-		InitialBackoff: 10 * time.Millisecond,
-		MaxBackoff:     25 * time.Millisecond,
-		Multiplier:     2.0,
+		InitialBackoff: 25 * time.Millisecond,
+		MaxBackoff:     50 * time.Millisecond,
+		Multiplier:     4.0,
 		RetryOn:        []string{"transient"},
 	}
 	var (
@@ -1849,27 +1856,27 @@ func TestExecutor_ExponentialBackoffTiming(t *testing.T) {
 	gap := func(i int) time.Duration { return callTimes[i].Sub(callTimes[i-1]) }
 	g1, g2, g3 := gap(1), gap(2), gap(3)
 	t.Logf("gaps: %s, %s, %s", g1, g2, g3)
-	// First gap: ~10ms (the initial backoff). Allow some slack for
-	// goroutine scheduling.
-	if g1 < 8*time.Millisecond {
-		t.Errorf("gap1 = %s, expected >= 8ms (initial backoff 10ms)", g1)
+	// First gap: ~25ms (the initial backoff). Allow slack for goroutine
+	// scheduling; the lower bound is what proves the sleep happened at
+	// all.
+	if g1 < 20*time.Millisecond {
+		t.Errorf("gap1 = %s, expected >= 20ms (initial backoff 25ms)", g1)
 	}
-	if g1 > 50*time.Millisecond {
-		t.Errorf("gap1 = %s, expected <= 50ms (initial backoff 10ms, CI headroom)", g1)
+	// Second gap: 25 * 4 = 100 uncapped, so 50ms after the cap. The
+	// lower bound proves growth (it must exceed the initial backoff);
+	// the upper bound proves the cap, because 100ms would fail it.
+	if g2 <= g1 {
+		t.Errorf("gap2 (%s) should exceed gap1 (%s); backoff is not growing", g2, g1)
 	}
-	// Second gap: ~20ms (10 * 2.0). Must be strictly larger than the
-	// first gap minus a small jitter window — that's what proves
-	// "exponential", not just "constant".
-	if g2 < g1 {
-		t.Errorf("gap2 (%s) should be >= gap1 (%s); backoff is not growing", g2, g1)
+	if g2 > 90*time.Millisecond {
+		t.Errorf("gap2 = %s, expected <= 90ms (cap is 50ms; uncapped this gap is 100ms)", g2)
 	}
-	if g2 > 60*time.Millisecond {
-		t.Errorf("gap2 = %s, expected <= 60ms (target ~20ms + CI headroom)", g2)
-	}
-	// Third gap: capped at MaxBackoff = 25ms. Without the cap it would
-	// be ~40ms; assert it landed at or below the cap (with slack).
-	if g3 > 50*time.Millisecond {
-		t.Errorf("gap3 = %s, expected <= 50ms (cap is 25ms, would be 40ms uncapped)", g3)
+	// Third gap: capped at MaxBackoff = 50ms. UNCAPPED it would be 400ms
+	// — 8x the bound below, which is the whole point of picking
+	// multiplier 4: this assertion cannot pass with the cap removed, at
+	// any plausible amount of CI noise.
+	if g3 > 200*time.Millisecond {
+		t.Errorf("gap3 = %s, expected <= 200ms (cap is 50ms; uncapped this gap is 400ms)", g3)
 	}
 }
 
@@ -3237,5 +3244,204 @@ func TestStageCacheable_WebhookOptIn(t *testing.T) {
 				t.Errorf("stageCacheable(%+v) = %v, want %v", c.st, got, c.want)
 			}
 		})
+	}
+}
+
+// TestRenderOutputPathRejectsRunDirEscape covers the one guard standing
+// between a model's sampled string and the filesystem.
+//
+// The reachability is not theoretical: a foreach item map is parsed from
+// a PRIOR STAGE'S LLM OUTPUT, the stage's `output:` template interpolates
+// its fields, and the result reaches filepath.Join(e.RunDir, path) at
+// four call sites — two writes and two resume reads — with nothing
+// upstream cleaning or prefixing it. Deleting the guard used to leave the
+// entire suite green across 39 packages, which is why this test and the
+// internal/mutation entry that keeps it honest exist.
+func TestRenderOutputPathRejectsRunDirEscape(t *testing.T) {
+	e := &Executor{RunDir: t.TempDir()}
+	st := &Stage{ID: "s", Output: "{{.item}}"}
+	for _, bad := range []string{"../../etc/passwd", "/etc/passwd", "..", "../x.wav"} {
+		if got, err := e.renderOutputPath(st, map[string]any{"item": bad}); err == nil {
+			t.Errorf("renderOutputPath accepted %q -> %q; it escapes the run dir", bad, got)
+		}
+	}
+	if got, err := e.renderOutputPath(st, map[string]any{"item": "a/b.wav"}); err != nil || got != "a/b.wav" {
+		t.Errorf("renderOutputPath(%q) = %q, %v; want it accepted", "a/b.wav", got, err)
+	}
+}
+
+// TestDryRunRenderOutputPathRejectsRunDirEscape holds the dry run to the
+// same rule. A plan that prints an escaping output path as part of a
+// clean run has told the operator the opposite of what will happen.
+func TestDryRunRenderOutputPathRejectsRunDirEscape(t *testing.T) {
+	s := &dryRunState{executor: &Executor{RunDir: t.TempDir()}}
+	st := &Stage{ID: "s", Output: "{{.item}}"}
+	for _, bad := range []string{"../../etc/passwd", "/etc/passwd", "..", "../x.wav"} {
+		if got, err := s.renderOutputPath(st, nil, map[string]any{"item": bad}); err == nil {
+			t.Errorf("dry-run renderOutputPath accepted %q -> %q; it escapes the run dir", bad, got)
+		}
+	}
+	if got, err := s.renderOutputPath(st, nil, map[string]any{"item": "a/b.wav"}); err != nil || got != "a/b.wav" {
+		t.Errorf("dry-run renderOutputPath(%q) = %q, %v; want it accepted", "a/b.wav", got, err)
+	}
+}
+
+// TestTryResumeStage_SurfacesRunDirEscape pins the OTHER half of the
+// escape: the resume pre-pass joins the rendered path to RunDir and READS
+// it. Swallowing the error there (the pre-existing "can't decide
+// resumability" fallback) would let a rendered "/etc/passwd" be stat'd
+// and its contents loaded into a stage output — that is, into the next
+// prompt — with the run reported as merely not-resumable.
+func TestTryResumeStage_SurfacesRunDirEscape(t *testing.T) {
+	e := &Executor{
+		RunDir:       t.TempDir(),
+		stageOutputs: map[string]*stageResult{},
+	}
+	st := &Stage{ID: "s", Output: "../escaped.txt"}
+	ok, err := e.tryResumeStage(st)
+	if err == nil {
+		t.Fatalf("tryResumeStage(%q) = %v, nil; the escape must be an error, not a quiet 'run it again'", st.Output, ok)
+	}
+	if !errors.Is(err, errOutputPathEscape) {
+		t.Errorf("tryResumeStage error = %v; want it to wrap errOutputPathEscape", err)
+	}
+	if ok {
+		t.Error("tryResumeStage reported the stage as resumed despite the error")
+	}
+}
+
+// hangingExecutor blocks until its context ends — the shape of a model
+// server that accepted the connection and then said nothing, which is
+// the failure `timeout:` exists for.
+type hangingExecutor struct{ started chan struct{} }
+
+func (h *hangingExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput, error) {
+	select {
+	case h.started <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return nil, fmt.Errorf("hung stage: %w", ctx.Err())
+}
+
+// TestExecuteBounded_StageTimeoutEndsAHungStage is the whole point of
+// item 4: before this, `timeout:` was valid only on confirm stages, so a
+// pipeline author could bound the wait for a HUMAN and nothing else. A
+// stalled model server ran until somebody noticed.
+func TestExecuteBounded_StageTimeoutEndsAHungStage(t *testing.T) {
+	e := &Executor{}
+	st := &Stage{ID: "s", Type: StageTypeText, Timeout: 30 * time.Millisecond}
+	// The unbounded case does not return, so the test must not wait on it:
+	// run the call in a goroutine and fail on the clock. Waiting inline
+	// would turn "the bound is gone" into a suite-wide panic 10 minutes
+	// later instead of one named red test.
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.executeBounded(context.Background(), st, &hangingExecutor{}, StageInput{Stage: st})
+		done <- err
+	}()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a hung stage under a 30ms timeout never returned; the bound is not applied")
+	}
+	if err == nil {
+		t.Fatal("a hung stage under a 30ms timeout returned success")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error must wrap context.DeadlineExceeded so retry_on: [timeout] can classify it: %v", err)
+	}
+	if !strings.Contains(err.Error(), "timeout 30ms exceeded") {
+		t.Errorf("error should name the operator's own bound: %v", err)
+	}
+}
+
+// TestExecuteBounded_ZeroTimeoutIsUnbounded pins the default. Every
+// pipeline written before `timeout:` existed declares none, and a
+// stage-bounding change that silently imposed a number would fail long
+// audiobook renders in the field rather than in a test.
+func TestExecuteBounded_ZeroTimeoutIsUnbounded(t *testing.T) {
+	e := &Executor{}
+	st := &Stage{ID: "s", Type: StageTypeText}
+	var sawDeadline bool
+	probe := stageExecutorFunc(func(ctx context.Context, in StageInput) (*StageOutput, error) {
+		_, sawDeadline = ctx.Deadline()
+		return &StageOutput{Text: "ok"}, nil
+	})
+	if _, err := e.executeBounded(context.Background(), st, probe, StageInput{Stage: st}); err != nil {
+		t.Fatalf("executeBounded: %v", err)
+	}
+	if sawDeadline {
+		t.Error("a stage with no timeout: must see the caller's context untouched")
+	}
+}
+
+// TestExecuteBounded_ConfirmKeepsItsOwnTimeout: a confirm stage's
+// timeout means auto-REJECT, a recorded decision rather than an error,
+// and the confirm executor enforces it against its own marker-file
+// bookkeeping. Cancelling its context here would turn a deliberate
+// no-answer into an indistinguishable failure.
+func TestExecuteBounded_ConfirmKeepsItsOwnTimeout(t *testing.T) {
+	e := &Executor{}
+	st := &Stage{ID: "s", Type: StageTypeConfirm, Timeout: time.Millisecond}
+	var sawDeadline bool
+	probe := stageExecutorFunc(func(ctx context.Context, in StageInput) (*StageOutput, error) {
+		_, sawDeadline = ctx.Deadline()
+		return &StageOutput{Text: "accepted"}, nil
+	})
+	if _, err := e.executeBounded(context.Background(), st, probe, StageInput{Stage: st}); err != nil {
+		t.Fatalf("executeBounded: %v", err)
+	}
+	if sawDeadline {
+		t.Error("confirm stages must keep owning their timeout; the runner must not impose a deadline")
+	}
+}
+
+// stageExecutorFunc adapts a func to StageExecutor.
+type stageExecutorFunc func(ctx context.Context, in StageInput) (*StageOutput, error)
+
+func (f stageExecutorFunc) Execute(ctx context.Context, in StageInput) (*StageOutput, error) {
+	return f(ctx, in)
+}
+
+// TestRunStageCleanup_RefusesPatternsThatLeaveTheRunDir covers the
+// runtime half of the cleanup rule. LoadPipeline's validateCleanupPatterns
+// is tested, but it only runs for pipelines loaded from YAML — a
+// programmatically built Pipeline (mount.go's Go-DSL path) reaches
+// runStageCleanup with whatever the author wrote. `cleanup: ["."]`
+// resolves to the run dir itself.
+func TestRunStageCleanup_RefusesPatternsThatLeaveTheRunDir(t *testing.T) {
+	runDir := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "victim.txt")
+	if err := os.WriteFile(outside, []byte("keep me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keep := filepath.Join(runDir, "keep.txt")
+	if err := os.WriteFile(keep, []byte("keep me too"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var log strings.Builder
+	e := &Executor{RunDir: runDir, Log: &log}
+	e.runStageCleanup(&Stage{
+		ID: "s",
+		Cleanup: []string{
+			".",                                   // the run dir itself
+			"..",                                  // its parent
+			"../" + filepath.Base(runDir) + "/*",  // a laundered way back in
+			filepath.Dir(outside) + "/victim.txt", // absolute, outside
+		},
+	})
+	if _, err := os.Stat(runDir); err != nil {
+		t.Errorf("run dir was removed by cleanup: %v", err)
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Errorf("cleanup removed a file outside the run dir: %v", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf("cleanup removed a run-dir file via a parent-traversal pattern: %v", err)
+	}
+	if !strings.Contains(log.String(), "unsafe pattern") {
+		t.Errorf("cleanup should say why it skipped; log:\n%s", log.String())
 	}
 }

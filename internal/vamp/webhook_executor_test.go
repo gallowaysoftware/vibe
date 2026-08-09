@@ -3,10 +3,12 @@ package vamp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -844,5 +846,203 @@ stages:
 	}
 	if !strings.Contains(err.Error(), "not a valid HTTP status") {
 		t.Errorf("error: %v", err)
+	}
+}
+
+// secretWebhookPath is the shape every incoming-webhook dialect shares:
+// the credential is a PATH segment, so a message that keeps the path has
+// leaked the bearer whether or not it kept the host.
+const secretWebhookPath = "/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX"
+
+// TestWebhookExecutor_LogDoesNotCarryTheURL pins the run log. Under
+// --detach that log is a file on disk, so a URL printed here is a
+// credential persisted for the life of the run dir. The log must still
+// identify the endpoint well enough to debug with — host and a stable
+// id — which is why this asserts on what IS there as well as what is not.
+func TestWebhookExecutor_LogDoesNotCarryTheURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+	secretURL := srv.URL + secretWebhookPath
+
+	var log strings.Builder
+	exec := &webhookExecutor{}
+	_, err := exec.Execute(context.Background(), StageInput{
+		Stage: &Stage{
+			ID:     "notify",
+			Type:   StageTypeWebhook,
+			URL:    secretURL,
+			Body:   map[string]any{"text": "done"},
+			Output: "out.txt",
+		},
+		RunDir: t.TempDir(),
+		Log:    &log,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := log.String()
+	if strings.Contains(got, secretURL) {
+		t.Errorf("run log contains the full webhook URL:\n%s", got)
+	}
+	if strings.Contains(got, secretWebhookPath) {
+		t.Errorf("run log contains the webhook's secret path segment:\n%s", got)
+	}
+	// Still useful: the host survives, so an operator can tell which
+	// endpoint a stage talked to.
+	if !strings.Contains(got, "webhook: POST ") {
+		t.Errorf("run log lost the webhook line entirely:\n%s", got)
+	}
+	if !strings.Contains(got, "127.0.0.1") {
+		t.Errorf("run log should still name the host it called:\n%s", got)
+	}
+}
+
+// TestWebhookExecutor_TransportErrorDoesNotCarryTheURL pins the error
+// path, which is the worse of the two: a stage error becomes
+// Executor.FailureSummary, and {{ .failure_summary }} is what a
+// run_when: failure webhook posts into a chat channel. A leak here
+// republishes the credential to everyone in the room.
+func TestWebhookExecutor_TransportErrorDoesNotCarryTheURL(t *testing.T) {
+	// A server closed before the call: Do fails with a *url.Error, whose
+	// Error() embeds the full URL.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	base := srv.URL
+	srv.Close()
+	secretURL := base + secretWebhookPath
+
+	var log strings.Builder
+	exec := &webhookExecutor{}
+	_, err := exec.Execute(context.Background(), StageInput{
+		Stage: &Stage{
+			ID:     "notify",
+			Type:   StageTypeWebhook,
+			URL:    secretURL,
+			Body:   map[string]any{"text": "done"},
+			Output: "out.txt",
+		},
+		RunDir: t.TempDir(),
+		Log:    &log,
+	})
+	if err == nil {
+		t.Fatal("expected a transport error against a closed server")
+	}
+	if strings.Contains(err.Error(), secretURL) {
+		t.Errorf("stage error contains the full webhook URL: %v", err)
+	}
+	if strings.Contains(err.Error(), secretWebhookPath) {
+		t.Errorf("stage error contains the webhook's secret path segment: %v", err)
+	}
+	// The error must still say what happened, or scrubbing has traded a
+	// leak for an unusable failure.
+	if !strings.Contains(err.Error(), "stage notify: request:") {
+		t.Errorf("stage error lost its context: %v", err)
+	}
+	if strings.Contains(log.String(), secretWebhookPath) {
+		t.Errorf("run log contains the webhook's secret path segment:\n%s", log.String())
+	}
+}
+
+// errDoer is an httpDoer that fails the way net/http does: a *url.Error
+// wrapping the real cause, with the full request URL in the wrapper.
+type errDoer struct{ err error }
+
+func (d errDoer) Do(*http.Request) (*http.Response, error) { return nil, d.err }
+
+// TestWebhookExecutor_ErrorTextQuotingTheURLIsScrubbed pins the SECOND
+// of the two redactions on the error path, which the *url.Error test
+// cannot see: unwrapping the wrapper removes the URL only when the URL
+// is in the wrapper. A transport that quotes the destination inside its
+// own message — a proxy refusing CONNECT, a redirect chain, a custom
+// RoundTripper — leaks it past the unwrap. Neither half may be deleted
+// on the grounds that the other one covers it.
+func TestWebhookExecutor_ErrorTextQuotingTheURLIsScrubbed(t *testing.T) {
+	secretURL := "https://hooks.example.invalid" + secretWebhookPath
+	exec := &webhookExecutor{doer: errDoer{
+		err: fmt.Errorf("proxy refused CONNECT for %s", secretURL),
+	}}
+	_, err := exec.Execute(context.Background(), StageInput{
+		Stage: &Stage{
+			ID:     "notify",
+			Type:   StageTypeWebhook,
+			URL:    secretURL,
+			Body:   map[string]any{"text": "done"},
+			Output: "out.txt",
+		},
+		RunDir: t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("expected the transport error to fail the stage")
+	}
+	if strings.Contains(err.Error(), secretURL) {
+		t.Errorf("stage error contains the full webhook URL: %v", err)
+	}
+	if strings.Contains(err.Error(), secretWebhookPath) {
+		t.Errorf("stage error contains the webhook's secret path segment: %v", err)
+	}
+	if !strings.Contains(err.Error(), "proxy refused CONNECT") {
+		t.Errorf("scrubbing ate the diagnosis as well as the secret: %v", err)
+	}
+}
+
+// TestScrubURLError_DropsAURLTheScrubberCannotMatch pins the unwrap
+// half, which the string-scrub tests cannot reach because for a direct
+// transport failure both halves remove the same bytes.
+//
+// They come apart the moment the URL in the *url.Error is not the URL
+// the stage rendered. http.Client follows redirects and reports the hop
+// it actually failed on, so a webhook endpoint that 302s somewhere else
+// produces an error naming a URL no scrubber keyed on the stage's own
+// string can match. Unwrapping is what removes it — structurally,
+// without needing the two spellings to agree.
+func TestScrubURLError_DropsAURLTheScrubberCannotMatch(t *testing.T) {
+	stageURL := "https://hooks.example.invalid" + secretWebhookPath
+	redirected := "https://relay.internal.invalid/forward/9f3c0a1b-session-token"
+	err := scrubURLError(stageURL, &url.Error{
+		Op:  "Post",
+		URL: redirected,
+		Err: errors.New("dial tcp 10.0.0.9:443: i/o timeout"),
+	})
+	if strings.Contains(err.Error(), redirected) {
+		t.Errorf("error carries the redirect target the scrubber cannot know about: %v", err)
+	}
+	if !strings.Contains(err.Error(), "i/o timeout") {
+		t.Errorf("unwrapping lost the cause: %v", err)
+	}
+}
+
+// TestWebhookExecutor_ScrubbedErrorKeepsTheChain is the half a string
+// assertion cannot see. Redaction that flattened the cause to text would
+// break errors.Is on the wrapped error, and the retry loop depends on it
+// twice: a ctrl-C must never be retried (runWithRetryInner's
+// context.Canceled early-out) and a dial timeout must still classify as
+// one (isRetryable's net.Error check).
+func TestWebhookExecutor_ScrubbedErrorKeepsTheChain(t *testing.T) {
+	secretURL := "https://hooks.example.invalid" + secretWebhookPath
+	exec := &webhookExecutor{doer: errDoer{err: &url.Error{
+		Op:  "Post",
+		URL: secretURL,
+		Err: context.Canceled,
+	}}}
+	_, err := exec.Execute(context.Background(), StageInput{
+		Stage: &Stage{
+			ID:     "notify",
+			Type:   StageTypeWebhook,
+			URL:    secretURL,
+			Body:   map[string]any{"text": "done"},
+			Output: "out.txt",
+		},
+		RunDir: t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("expected the cancelled request to fail")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("errors.Is(err, context.Canceled) = false; the retry loop would retry a ctrl-C: %v", err)
+	}
+	if strings.Contains(err.Error(), secretURL) || strings.Contains(err.Error(), secretWebhookPath) {
+		t.Errorf("stage error still carries the webhook URL: %v", err)
 	}
 }

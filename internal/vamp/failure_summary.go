@@ -3,6 +3,8 @@ package vamp
 import (
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -53,6 +55,74 @@ func writeFailureSummary(w io.Writer, pipelineName string, runErr error, e *Exec
 			break
 		}
 	}
+	if cmd := resumeCommand(e); cmd != "" {
+		fmt.Fprintf(w, "  resume: %s\n", cmd)
+	}
+}
+
+// resumeCommand renders the exact command that continues this run.
+//
+// --resume is the best-built thing in the runner — per-item foreach
+// granularity, pipeline-drift detection against the snapshot, JSON
+// re-validation of resumed outputs — and until this line, NOTHING in
+// any user-facing output mentioned that it exists. A ten-stage
+// pipeline that died at stage nine printed a run dir and an error, and
+// the operator's obvious move was to run the whole thing again.
+//
+// The run dir is already on the line above; what was missing was the
+// sentence that turns it into an action. Printing the whole command
+// rather than naming the flag is deliberate: a path the operator has to
+// copy out of one line and paste into another is a path they get wrong
+// at 02:00.
+//
+// Returns "" when there is no run dir to resume from, or when this run
+// WAS a resume — in that case the same command is still correct, but
+// the operator has already found it.
+func resumeCommand(e *Executor) string {
+	if e == nil || e.RunDir == "" || e.ResumeDir != "" {
+		return ""
+	}
+	// argv[0] as invoked. A mounted pipeline is its own binary
+	// (`my-pipeline run --resume …`); the generic CLI takes the pipeline
+	// path as an argument (`vamp run pipeline.yaml --resume …`). Both
+	// spellings come out right because both are read off the process
+	// that is printing the message.
+	exe := "vamp"
+	if len(os.Args) > 0 && strings.TrimSpace(os.Args[0]) != "" {
+		exe = filepath.Base(os.Args[0])
+	}
+	args := []string{exe, "run"}
+	if p := pipelineArg(os.Args); p != "" {
+		args = append(args, p)
+	}
+	args = append(args, "--resume", e.RunDir)
+	return strings.Join(args, " ")
+}
+
+// pipelineArg recovers the pipeline-file argument from a `vamp run`
+// argv, or "" for a mounted pipeline binary (whose `run` takes no
+// positional).
+//
+// It looks for the .yaml/.yml rather than taking argv[2] positionally,
+// because `vamp run --input k=v pipeline.yaml` is a normal way to invoke
+// this and puts a flag there. Getting that case wrong prints a resume
+// command with no pipeline in it, which cobra rejects — and a line the
+// operator has to repair by hand at 02:00 is the failure this whole item
+// exists to avoid.
+func pipelineArg(argv []string) string {
+	if len(argv) < 3 || argv[1] != "run" {
+		return ""
+	}
+	for _, a := range argv[2:] {
+		if strings.HasPrefix(a, "-") {
+			continue
+		}
+		switch strings.ToLower(filepath.Ext(a)) {
+		case ".yaml", ".yml":
+			return a
+		}
+	}
+	return ""
 }
 
 // splitJoinedError unwraps an errors.Join chain into one string per

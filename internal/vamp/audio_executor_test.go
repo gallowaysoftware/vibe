@@ -687,8 +687,22 @@ func TestAudioExecutor_KokoroEngine_EmptyBodyTaggedForRetry(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on empty-body response")
 	}
-	if !strings.Contains(err.Error(), audioInvalidOutputTag) {
-		t.Errorf("error %q must contain audioInvalidOutputTag (%q) so retry classifier picks it up", err.Error(), audioInvalidOutputTag)
+	// Assert the BEHAVIOUR, not the spelling. Checking that the error
+	// contains audioInvalidOutputTag is a tautology: the executor formats
+	// the message with that same constant, so the assertion holds no
+	// matter what the retry classifier does — deleting the classifier's
+	// invalid_output arm outright left the whole suite green. What the
+	// test's name claims is that this failure is RETRIED, so ask the
+	// classifier.
+	policy := &RetryPolicy{MaxAttempts: 3, RetryOn: []string{retryOnInvalidOutput}}
+	if !isRetryable(err, policy) {
+		t.Errorf("isRetryable(%v, retry_on:[invalid_output]) = false; the kokoro warm-up empty-body race would fail the whole foreach", err)
+	}
+	// And that it is NOT retried by a policy that didn't ask for it: a
+	// classifier that returns true for everything would pass the check
+	// above while making retry_on meaningless.
+	if isRetryable(err, &RetryPolicy{MaxAttempts: 3, RetryOn: []string{retryOnTimeout}}) {
+		t.Errorf("isRetryable(%v, retry_on:[timeout]) = true; an empty WAV body is not a timeout", err)
 	}
 }
 

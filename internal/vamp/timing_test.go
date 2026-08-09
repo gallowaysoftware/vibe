@@ -277,3 +277,129 @@ func TestTracker_NilSafe(t *testing.T) {
 		t.Errorf("FormatTable on nil tracker: %v", err)
 	}
 }
+
+// TestFormatTable_RendersStageStatus is the assertion the timing table
+// went 27 review phases without: that it says whether the run worked.
+//
+// Before this, a run with two failed stages rendered EXACTLY like a
+// clean one — same rows, same durations, same closing "total:" line.
+// The status lived in pipeline_timing.json, which is not the thing a
+// human reads at the end of a run.
+func TestFormatTable_RendersStageStatus(t *testing.T) {
+	tr := NewTracker("p")
+	tr.StageStart("good", "text")
+	tr.StageEnd("good", "ok", nil)
+	tr.StageStart("bad", "ffmpeg")
+	tr.StageEnd("bad", "error", nil)
+	tr.StageStart("stopped", "audio")
+	tr.StageEnd("stopped", "cancelled", nil)
+	// A run_when-gated stage that did not run. NOT a failure: a
+	// `run_when: failure` notify stage is skipped on every successful
+	// pipeline, and a verdict line that cried wolf on those would stop
+	// being read.
+	tr.StageStart("notify", "webhook")
+	tr.StageEnd("notify", "skipped", nil)
+	tr.Finish()
+
+	var buf bytes.Buffer
+	if err := tr.FormatTable(&buf); err != nil {
+		t.Fatalf("FormatTable: %v", err)
+	}
+	got := buf.String()
+	if !strings.Contains(got, "status") {
+		t.Errorf("table has no status column:\n%s", got)
+	}
+	for _, want := range []string{"error", "cancelled"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("table never renders %q:\n%s", want, got)
+		}
+	}
+	if !strings.Contains(got, "skipped") {
+		t.Errorf("table never renders the skipped status:\n%s", got)
+	}
+	// The one-line verdict, so "did it work" survives a table that has
+	// scrolled off the top of the terminal.
+	if !strings.Contains(got, "FAILED: 2 of 4 stage(s) did not succeed") {
+		t.Errorf("table lacks the pass/fail summary line, or miscounts:\n%s", got)
+	}
+	if !strings.Contains(got, "bad (error)") || !strings.Contains(got, "stopped (cancelled)") {
+		t.Errorf("summary line must name every failed stage:\n%s", got)
+	}
+	if strings.Contains(got, "notify (skipped)") {
+		t.Errorf("a run_when-gated stage is not a failure:\n%s", got)
+	}
+}
+
+// TestFormatTable_SkippedStageIsNotAFailure is the false-alarm case on
+// its own: a pipeline whose only non-ok stage is a `run_when: failure`
+// notifier ran perfectly, and must not print a failure line.
+func TestFormatTable_SkippedStageIsNotAFailure(t *testing.T) {
+	tr := NewTracker("p")
+	tr.StageStart("work", "text")
+	tr.StageEnd("work", "ok", nil)
+	tr.StageStart("notify_on_failure", "webhook")
+	tr.StageEnd("notify_on_failure", "skipped", nil)
+	tr.Finish()
+	var buf bytes.Buffer
+	if err := tr.FormatTable(&buf); err != nil {
+		t.Fatalf("FormatTable: %v", err)
+	}
+	if strings.Contains(buf.String(), "FAILED") {
+		t.Errorf("a clean run with a skipped run_when stage must not print a failure line:\n%s", buf.String())
+	}
+}
+
+// TestFormatTable_CleanRunSaysNothingAboutFailure is the other half:
+// the verdict line must not appear when there is no verdict to give.
+func TestFormatTable_CleanRunSaysNothingAboutFailure(t *testing.T) {
+	tr := NewTracker("p")
+	tr.StageStart("a", "text")
+	tr.StageEnd("a", "ok", nil)
+	tr.Finish()
+	var buf bytes.Buffer
+	if err := tr.FormatTable(&buf); err != nil {
+		t.Fatalf("FormatTable: %v", err)
+	}
+	if strings.Contains(buf.String(), "FAILED") {
+		t.Errorf("a clean run must not print a failure line:\n%s", buf.String())
+	}
+}
+
+// TestFormatTable_UnmeasuredDurationIsNotZero: a stage that ended
+// without ever starting has no clock reading, and its DurationMS is
+// zero. Printing that as "0ms" claims the stage failed INSTANTLY, when
+// the truth is that it never ran — the opposite reading, and exactly
+// the sort of number an operator uses to decide where to look.
+func TestFormatTable_UnmeasuredDurationIsNotZero(t *testing.T) {
+	tr := NewTracker("p")
+	// StageEnd with no StageStart: the tracker synthesises the record.
+	tr.StageEnd("never-ran", "error", nil)
+	tr.Finish()
+
+	rep := tr.Report()
+	if len(rep.Stages) != 1 || !rep.Stages[0].DurationUnmeasured {
+		t.Fatalf("synthesised stage record should be marked unmeasured: %+v", rep.Stages)
+	}
+	var buf bytes.Buffer
+	if err := tr.FormatTable(&buf); err != nil {
+		t.Fatalf("FormatTable: %v", err)
+	}
+	// Assert on the stage's own row, not the whole table: the header and
+	// the "total:" footer legitimately say 0ms for a run this short.
+	var row string
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(line, "never-ran") && !strings.Contains(line, "FAILED") {
+			row = line
+			break
+		}
+	}
+	if row == "" {
+		t.Fatalf("no row for the stage:\n%s", buf.String())
+	}
+	if strings.Contains(row, "0ms") {
+		t.Errorf("an unmeasured duration must not render as an instant one: %q", row)
+	}
+	if !strings.Contains(row, "-") {
+		t.Errorf("an unmeasured duration should render as a dash: %q", row)
+	}
+}

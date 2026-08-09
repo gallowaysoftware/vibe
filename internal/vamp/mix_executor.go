@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -305,7 +304,7 @@ func (m *mixExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput,
 
 	args = append(args, outputPath)
 
-	cmd := exec.CommandContext(ctx, binary, args...)
+	cmd := command(ctx, binary, args...)
 	// Always retain a tail of stderr so a non-zero exit surfaces ffmpeg's own
 	// filtergraph diagnostic instead of a bare "exit status 1"; multi-stage
 	// capability groups pass a nil in.Log, which would otherwise drop stderr.

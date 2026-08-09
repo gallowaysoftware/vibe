@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -30,11 +31,68 @@ type ChatCompletion struct {
 // headers, leaving long streaming generations free to keep the body open for
 // minutes. The resulting timeout satisfies isRetryable so retry_on: timeout
 // fires.
-func defaultInferenceClient() *http.Client {
+var defaultInferenceClient = sync.OnceValue(func() *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.ResponseHeaderTimeout = 2 * time.Minute
 	return &http.Client{Transport: tr}
-}
+})
+
+// The rest of vamp's HTTP callers used http.DefaultClient, which has no
+// timeout at all — against this repo's own written rule, and with the
+// same consequence every time: a far side that accepts the connection
+// and then says nothing wedges the stage, and through it the run, with
+// no error to report and nothing to resume from. (connection-refused,
+// the failure these paths were actually tested against, returns in
+// microseconds and never reaches a timer.)
+//
+// The number is not one number. Which bound to use is a question about
+// what the call DOES, and defaultInferenceClient above already answers
+// it correctly for the hardest case: a streaming generation needs
+// ResponseHeaderTimeout, because a Client.Timeout large enough for a
+// long completion is not a bound and one small enough to be a bound
+// kills the completion. The three clients below each take the tightest
+// bound their job actually admits.
+
+// defaultWebhookClient bounds a webhook POST. A webhook is a
+// notification: the far side accepts a small JSON body and answers
+// immediately or is broken. Client.Timeout (whole call, headers AND
+// body) is right here precisely because there is no long body to wait
+// for — the response is a status line and a few hundred bytes.
+//
+// Thirty seconds rather than something tighter because the retry policy
+// on top of it is what handles a slow-but-alive endpoint, and a Slack
+// or ntfy instance behind a cold reverse proxy can genuinely take
+// seconds on the first call of the day.
+var defaultWebhookClient = sync.OnceValue(func() *http.Client {
+	return &http.Client{Timeout: 30 * time.Second}
+})
+
+// defaultYouTubeClient bounds the YouTube upload calls. Client.Timeout
+// would be wrong: the resumable-upload PUT streams a whole video, which
+// on a large render is minutes of legitimate body transfer, and a
+// whole-call deadline would kill exactly the uploads worth resuming.
+// Bound the wait for the server to START answering instead — the same
+// reasoning as the inference client, a different job.
+var defaultYouTubeClient = sync.OnceValue(func() *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ResponseHeaderTimeout = 2 * time.Minute
+	return &http.Client{Transport: tr}
+})
+
+// defaultComfyUIClient bounds the ComfyUI REST calls (submit, history
+// poll, /view download, free-memory). Each is a small local request
+// against a box on the LAN; none of them is the long wait, because the
+// long wait is the poll LOOP, which is bounded separately by
+// comfyuiWaitCeiling or by the stage's own timeout.
+//
+// The /view download is the one call that carries real bytes — a PNG or
+// a short video — so ResponseHeaderTimeout rather than Client.Timeout,
+// to bound the silence without capping the transfer.
+var defaultComfyUIClient = sync.OnceValue(func() *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ResponseHeaderTimeout = 60 * time.Second
+	return &http.Client{Transport: tr}
+})
 
 // StreamFunc receives incremental token deltas as they arrive from an SSE
 // chat-completion response. It is called once per non-empty content delta and

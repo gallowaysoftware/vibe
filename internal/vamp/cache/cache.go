@@ -284,6 +284,22 @@ func (s *Store) Put(in PutInput) error {
 	if len(in.Text) > 0 && len(in.Bytes) > 0 {
 		return errors.New("cache: Put: Text and Bytes are mutually exclusive")
 	}
+	// A binary artefact of zero length is never a result — it is the
+	// shape a subprocess leaves behind when it fails without saying so
+	// (ffmpeg exits 0 having written a 0-byte container). Admitting it
+	// is worse than a bad run: the entry is content-addressed, so every
+	// later run with the same inputs replays the empty file and the
+	// pipeline stays broken until someone clears the cache by hand.
+	//
+	// The check is on the MODE, not on emptiness in general: os.ReadFile
+	// of a 0-byte file returns an empty but non-nil slice, which is
+	// exactly what the `in.Bytes != nil` mode select below reads as
+	// "binary output". An empty TEXT output stays legal — a compact
+	// stage whose source had no content is a real, reproducible result
+	// (see TestStore_Put_EmptyTextRoundTrips).
+	if in.Bytes != nil && len(in.Bytes) == 0 {
+		return errors.New("cache: Put: refusing a zero-length binary artefact (an empty output is a failed stage, and caching it would replay the failure forever)")
+	}
 	dir := s.entryDir(in.Hash)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("cache: mkdir %s: %w", dir, err)

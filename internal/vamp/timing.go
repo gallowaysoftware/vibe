@@ -12,6 +12,36 @@ import (
 	"time"
 )
 
+// The status strings the runner records. Named constants because the
+// table's pass/fail line and the tracker's own defaults have to agree on
+// them, and because they appear in the JSON contract, so they must not
+// drift.
+const (
+	// stageStatusOK means the stage did its job.
+	stageStatusOK = "ok"
+	// stageStatusSkipped means the stage was NOT SUPPOSED to run: its
+	// run_when gate said no. A `run_when: failure` notify stage is
+	// skipped on every successful pipeline, so counting skipped as a
+	// failure would put a FAILED line on every clean run that declares
+	// one — the exact false alarm that teaches an operator to stop
+	// reading the line.
+	stageStatusSkipped = "skipped"
+)
+
+// stageFailed reports whether a status is one the operator needs to know
+// about at the end of a run. An empty status is not counted: it means the
+// runner never classified the stage, which the table already shows as "?"
+// in its own column, and inventing a failure from an absence would make
+// the verdict line less trustworthy rather than more.
+func stageFailed(status string) bool {
+	switch status {
+	case stageStatusOK, stageStatusSkipped, "":
+		return false
+	default:
+		return true
+	}
+}
+
 // Tracker records wall-clock timing for every stage (and per-item slice of
 // foreach stages) of a single pipeline run. It is safe for concurrent use:
 // the DAG runner may start multiple stages in parallel and a single foreach
@@ -49,6 +79,11 @@ type stageTiming struct {
 	items     []*itemTiming
 	// metrics is set via StageThroughput for LLM (text) stages; nil otherwise.
 	metrics *InferenceMetrics
+	// startSynthesized marks a record StageEnd had to invent because no
+	// StageStart preceded it. Its startedAt is end-time, so its duration
+	// is zero — which is not a measurement of anything and must not be
+	// printed as one. See StageReport.DurationUnmeasured.
+	startSynthesized bool
 }
 
 // itemTiming records one foreach item's slice of wall time. index is the
@@ -96,6 +131,13 @@ type StageReport struct {
 	Status     string         `json:"status"`
 	Notes      map[string]any `json:"notes,omitempty"`
 	Items      []ItemReport   `json:"items,omitempty"`
+	// DurationUnmeasured says DurationMS is not a measurement: the stage
+	// ended without ever having started, so there was no clock to read.
+	// The distinction matters because the value in that case is ZERO, and
+	// a failed stage printed as "0ms" reads as "failed instantly" — the
+	// opposite of the usual truth, which is that it never ran at all.
+	// omitempty keeps the JSON byte-identical for every stage that did.
+	DurationUnmeasured bool `json:"duration_unmeasured,omitempty"`
 	// Throughput carries inference tokens/sec + TTFT for LLM stages; nil for
 	// non-LLM stages (ffmpeg, comfyui, …). Surfaced as table columns + JSON.
 	Throughput *InferenceMetrics `json:"throughput,omitempty"`
@@ -148,7 +190,7 @@ func (t *Tracker) StageStart(id, stageType string) {
 		id:        id,
 		stageType: stageType,
 		startedAt: time.Now(),
-		status:    "ok",
+		status:    stageStatusOK,
 		notes:     map[string]any{},
 	}
 	t.order = append(t.order, id)
@@ -205,9 +247,10 @@ func (t *Tracker) StageEnd(id, status string, notes map[string]any) {
 		// Missing start — synthesize one at end-time so the report still
 		// contains the stage with zero duration rather than dropping it.
 		st = &stageTiming{
-			id:        id,
-			startedAt: time.Now(),
-			notes:     map[string]any{},
+			id:               id,
+			startedAt:        time.Now(),
+			notes:            map[string]any{},
+			startSynthesized: true,
 		}
 		t.stages[id] = st
 		t.order = append(t.order, id)
@@ -237,7 +280,7 @@ func (t *Tracker) ItemStart(stageID string, index int) {
 		st = &stageTiming{
 			id:        stageID,
 			startedAt: time.Now(),
-			status:    "ok",
+			status:    stageStatusOK,
 			notes:     map[string]any{},
 		}
 		t.stages[stageID] = st
@@ -246,7 +289,7 @@ func (t *Tracker) ItemStart(stageID string, index int) {
 	st.items = append(st.items, &itemTiming{
 		index:     index,
 		startedAt: time.Now(),
-		status:    "ok",
+		status:    stageStatusOK,
 		notes:     map[string]any{},
 	})
 }
@@ -336,6 +379,8 @@ func (t *Tracker) Report() Report {
 			Status:     st.status,
 			Throughput: st.metrics,
 			Notes:      copyNotes(st.notes),
+
+			DurationUnmeasured: st.startSynthesized,
 		}
 		if len(st.items) > 0 {
 			items := make([]ItemReport, len(st.items))
@@ -461,11 +506,17 @@ func (t *Tracker) WriteJSON(dir string) error {
 // matches the run-end summary documented in the timing-report spec:
 //
 //	pipeline "NAME" finished in <total>
-//	  stage          type     duration  notes
-//	  prompts        text       31.8s   <notes>
-//	  render         comfyui     8.9s   <notes>
+//	  stage          type     status  duration  notes
+//	  prompts        text     ok         31.8s  <notes>
+//	  render         comfyui  error          -  <notes>
 //	total: <sum-of-stages> (X% overhead)
+//	FAILED: 1 of 2 stage(s) did not succeed: render (error)
 //	outputs: <run-dir>     (caller appends; see runner)
+//
+// The status column is not decoration. Without it this table rendered a
+// run with two failed stages exactly like a clean one — same rows, same
+// numbers, same closing "total:" line — and the report a human actually
+// reads said nothing about whether the run worked.
 //
 // Overhead is the percentage of total wall time NOT inside any stage:
 // 1 - (sum of stage durations) / total. For sequential pipelines that's the
@@ -486,15 +537,16 @@ func (t *Tracker) FormatTable(w io.Writer) error {
 	// width so even an empty pipeline renders a usable header.
 	idW := len("stage")
 	typeW := len("type")
+	statusW := len("status")
 	durW := len("duration")
 	tpsW := len("tok/s")
 	tokW := len("tokens")
 	ttftW := len("ttft")
 	var stageMS int64
-	// row columns: id, type, duration, tok/s, tokens, ttft, notes.
-	rows := make([][7]string, 0, len(rep.Stages))
+	var failed []string
+	// row columns: id, type, status, duration, tok/s, tokens, ttft, notes.
+	rows := make([][8]string, 0, len(rep.Stages))
 	for _, s := range rep.Stages {
-		dur := time.Duration(s.DurationMS) * time.Millisecond
 		tps, tok, ttft := "", "", ""
 		if m := s.Throughput; m != nil {
 			if m.GenTPS > 0 {
@@ -507,8 +559,26 @@ func (t *Tracker) FormatTable(w io.Writer) error {
 				ttft = formatDuration(time.Duration(m.TTFTms) * time.Millisecond)
 			}
 		}
+		status := s.Status
+		if status == "" {
+			// A stage the runner never classified. "?" rather than blank:
+			// an empty cell reads as "nothing to report", and the whole
+			// point of this column is that an unreported status is not
+			// the same claim as a successful one.
+			status = "?"
+		}
+		if stageFailed(s.Status) {
+			failed = append(failed, fmt.Sprintf("%s (%s)", s.ID, s.Status))
+		}
+		// A duration of zero on a stage that never started is not a
+		// measurement of zero. Print a dash so nobody reads "failed
+		// instantly" off a stage that in fact never ran.
+		durCell := "-"
+		if !s.DurationUnmeasured {
+			durCell = formatDuration(time.Duration(s.DurationMS) * time.Millisecond)
+		}
 		notes := formatNotes(s)
-		row := [7]string{s.ID, s.Type, formatDuration(dur), tps, tok, ttft, notes}
+		row := [8]string{s.ID, s.Type, status, durCell, tps, tok, ttft, notes}
 		rows = append(rows, row)
 		if len(s.ID) > idW {
 			idW = len(s.ID)
@@ -516,8 +586,11 @@ func (t *Tracker) FormatTable(w io.Writer) error {
 		if len(s.Type) > typeW {
 			typeW = len(s.Type)
 		}
-		if len(row[2]) > durW {
-			durW = len(row[2])
+		if len(status) > statusW {
+			statusW = len(status)
+		}
+		if len(durCell) > durW {
+			durW = len(durCell)
 		}
 		if len(tps) > tpsW {
 			tpsW = len(tps)
@@ -532,13 +605,13 @@ func (t *Tracker) FormatTable(w io.Writer) error {
 	}
 	// Header. Numeric throughput columns are right-aligned like duration;
 	// they render blank for non-LLM stages.
-	fmt.Fprintf(w, "  %-*s  %-*s  %*s  %*s  %*s  %*s  notes\n",
-		idW, "stage", typeW, "type", durW, "duration", tpsW, "tok/s", tokW, "tokens", ttftW, "ttft")
+	fmt.Fprintf(w, "  %-*s  %-*s  %-*s  %*s  %*s  %*s  %*s  notes\n",
+		idW, "stage", typeW, "type", statusW, "status", durW, "duration", tpsW, "tok/s", tokW, "tokens", ttftW, "ttft")
 	for _, r := range rows {
-		line := fmt.Sprintf("  %-*s  %-*s  %*s  %*s  %*s  %*s",
-			idW, r[0], typeW, r[1], durW, r[2], tpsW, r[3], tokW, r[4], ttftW, r[5])
-		if r[6] != "" {
-			line += "  " + r[6]
+		line := fmt.Sprintf("  %-*s  %-*s  %-*s  %*s  %*s  %*s  %*s",
+			idW, r[0], typeW, r[1], statusW, r[2], durW, r[3], tpsW, r[4], tokW, r[5], ttftW, r[6])
+		if r[7] != "" {
+			line += "  " + r[7]
 		}
 		fmt.Fprintln(w, line)
 	}
@@ -549,6 +622,14 @@ func (t *Tracker) FormatTable(w io.Writer) error {
 		fmt.Fprintf(w, "total: %s (parallel; stages sum %s)\n", formatDuration(totalDur), formatDuration(stageDur))
 	} else {
 		fmt.Fprintf(w, "total: %s (%.1f%% overhead)\n", formatDuration(stageDur), overheadPct)
+	}
+	// One line that answers "did this work?" without reading the column.
+	// The failure summary below it explains the FIRST failure in detail;
+	// this names all of them, which is what a partially-failed foreach
+	// pipeline needs before deciding whether to resume.
+	if len(failed) > 0 {
+		fmt.Fprintf(w, "FAILED: %d of %d stage(s) did not succeed: %s\n",
+			len(failed), len(rep.Stages), strings.Join(failed, ", "))
 	}
 	return nil
 }

@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -252,10 +251,21 @@ func rasterizeSVG(ctx context.Context, svgPath string) (string, error) {
 	tmpPath := tmp.Name()
 	_ = tmp.Close()
 	dim := fmt.Sprintf("%d", svgRasterMaxDim)
-	cmd := exec.CommandContext(ctx, "rsvg-convert", "--width", dim, "--height", dim, "--keep-aspect-ratio", "-o", tmpPath, svgPath)
+	cmd := command(ctx, "rsvg-convert", "--width", dim, "--height", dim, "--keep-aspect-ratio", "-o", tmpPath, svgPath)
 	if out, runErr := cmd.CombinedOutput(); runErr != nil {
 		_ = os.Remove(tmpPath)
 		return "", fmt.Errorf("rsvg-convert: %w: %s", runErr, strings.TrimSpace(string(out)))
+	}
+	// A 0-byte raster must not be renamed into the content-addressed
+	// cache dir: the Stat above would then hit it on every later call
+	// for the same SVG, and the model would be handed an empty image
+	// for the life of the cache.
+	if info, statErr := os.Stat(tmpPath); statErr != nil || info.Size() == 0 {
+		_ = os.Remove(tmpPath)
+		if statErr != nil {
+			return "", fmt.Errorf("rsvg-convert: stat output: %w", statErr)
+		}
+		return "", fmt.Errorf("rsvg-convert: produced a 0-byte png for %s", svgPath)
 	}
 	if err := os.Rename(tmpPath, pngPath); err != nil {
 		_ = os.Remove(tmpPath)

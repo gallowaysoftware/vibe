@@ -431,6 +431,157 @@ var Registry = []Mutation{
 		Why: "an ntfy topic URL is bearer-equivalent. The sink unwraps *url.Error AND scrubs, and " +
 			"both guards are pinned individually — neither may be deleted because 'the other one covers it'.",
 	},
+	{
+		Name:     "vamp/a webhook stage stops scrubbing its own URL out of an error",
+		File:     "internal/vamp/webhook_executor.go",
+		Find:     "\treturn &scrubbedError{msg: fleetnotify.ScrubURL(rawURL, msg), cause: err}",
+		Replace:  "\treturn &scrubbedError{msg: msg, cause: err}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestWebhookExecutor_ErrorTextQuotingTheURLIsScrubbed"},
+		Why: "a Slack/Discord incoming-webhook URL carries its bearer in the PATH. A vamp stage error " +
+			"becomes Executor.FailureSummary, and six executors hand that to templates as " +
+			"{{ .failure_summary }} — so an unscrubbed transport error means the run's own " +
+			"run_when: failure webhook POSTS the credential into the chat channel. Pinned " +
+			"separately from the unwrap below: each covers a leak the other does not.",
+	},
+	{
+		Name:     "vamp/a webhook stage stops unwrapping *url.Error",
+		File:     "internal/vamp/webhook_executor.go",
+		Find:     "\tvar ue *url.Error\n\tif errors.As(err, &ue) && ue.Err != nil {\n\t\tmsg = ue.Err.Error()\n\t}",
+		Replace:  "\tvar ue *url.Error\n\t_ = ue",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestScrubURLError_DropsAURLTheScrubberCannotMatch"},
+		Why: "*url.Error embeds a URL STRUCTURALLY, and it is not always the one the stage rendered: " +
+			"http.Client follows redirects and names the hop it failed on. String scrubbing keyed on " +
+			"the stage's own URL cannot match that. Dropping the wrapper is the half that does not " +
+			"depend on the two spellings agreeing.",
+	},
+	{
+		Name:     "vamp/the run log prints the webhook URL",
+		File:     "internal/vamp/webhook_executor.go",
+		Find:     "\t\tfmt.Fprintf(in.Log, \"webhook: %s %s\\n\", method, fleetnotify.Redact(urlStr))",
+		Replace:  "\t\tfmt.Fprintf(in.Log, \"webhook: %s %s\\n\", method, urlStr)",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestWebhookExecutor_LogDoesNotCarryTheURL"},
+		Why: "under --detach the run log is a FILE in the run dir, written every run and kept. A URL " +
+			"printed there is the credential persisted at rest, which is how a leak survives the " +
+			"session that caused it.",
+	},
+
+	// ── a model's string reaching the filesystem (vamp) ───────────────
+	{
+		Name: "vamp/the run-dir containment rule stops containing",
+		File: "internal/vamp/exec.go",
+		// Keeps `cleaned` used so the mutation still compiles: a build
+		// failure proves nothing about the guard.
+		Find:     "\tcleaned := filepath.Clean(out)\n\tif filepath.IsAbs(cleaned) || cleaned == \"..\" || strings.HasPrefix(cleaned, \"..\"+string(filepath.Separator)) {",
+		Replace:  "\tcleaned := filepath.Clean(out)\n\tif false && (filepath.IsAbs(cleaned) || cleaned == \"..\" || strings.HasPrefix(cleaned, \"..\"+string(filepath.Separator))) {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestRenderOutputPathRejectsRunDirEscape", "TestDryRunRenderOutputPathRejectsRunDirEscape", "TestTryResumeStage_SurfacesRunDirEscape"},
+		Why: "a foreach item map is parsed from a PRIOR STAGE'S LLM OUTPUT and its fields are " +
+			"interpolated into the stage's output: template; the result reaches " +
+			"filepath.Join(RunDir, path) at four sites with nothing cleaning it. Two are writes " +
+			"(a sampled \"../../etc/cron.d/x\") and two are resume READS (a sampled \"/etc/passwd\" " +
+			"loaded into a stage output, i.e. into the next prompt). Deleting this guard used to " +
+			"leave all 39 packages green.",
+	},
+
+	// ── an empty artefact that outlives the run that made it (vamp) ───
+	{
+		Name:     "vamp/an ffmpeg stage stops checking that it produced anything",
+		File:     "internal/vamp/ffmpeg_executor.go",
+		Find:     "\tif info.Size() == 0 {\n\t\treturn fmt.Errorf(\"stage %s: %s produced 0-byte output at %s (likely an error swallowed by the exit code)\", stageID, what, path)\n\t}",
+		Replace:  "\tif false && info.Size() == 0 {\n\t\treturn fmt.Errorf(\"stage %s: %s produced 0-byte output at %s\", stageID, what, path)\n\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestFFmpegExecutor_ZeroByteOutputFailsTheStage", "TestRequireNonEmptyOutput"},
+		Why: "ffmpeg exits 0 having written a 0-byte container when a filtergraph error never reaches " +
+			"the exit status. The stage goes green, the run 'succeeds' with silence in it, and the " +
+			"empty file is what gets cached — so the failure replays on every later run with the " +
+			"same inputs until someone clears the cache by hand.",
+	},
+	{
+		Name:     "vamp/a stage's declared timeout stops being applied",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tif st.Timeout <= 0 || stageTypeOrDefault(st) == StageTypeConfirm {\n\t\treturn exec.Execute(ctx, in)\n\t}",
+		Replace:  "\tif true || st.Timeout <= 0 || stageTypeOrDefault(st) == StageTypeConfirm {\n\t\treturn exec.Execute(ctx, in)\n\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestExecuteBounded_StageTimeoutEndsAHungStage"},
+		Why: "the class the fleet plan calls 'a deadline that is present but never reached'. Every " +
+			"unreachable this package is normally tested against answers in microseconds " +
+			"(ECONNREFUSED, a missing binary); the failure the bound exists for is a model server " +
+			"that ACCEPTS the connection and says nothing, which without it hangs the stage, the " +
+			"run and the overnight pipeline behind it, with no error to report and nothing to resume.",
+	},
+	{
+		Name:     "vamp/the exponential backoff cap stops capping",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\tnext := time.Duration(float64(backoff) * policy.Multiplier)\n\t\tif next > policy.MaxBackoff || next <= 0 {\n\t\t\tnext = policy.MaxBackoff\n\t\t}",
+		Replace:  "\t\tnext := time.Duration(float64(backoff) * policy.Multiplier)\n\t\tif next <= 0 {\n\t\t\tnext = policy.MaxBackoff\n\t\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestExecutor_ExponentialBackoffTiming"},
+		Why: "max_backoff is the only thing between a four-attempt retry policy and a geometric " +
+			"series. The test that names the cap used to pick numbers whose UNCAPPED value still " +
+			"satisfied its own upper bound, so the cap could be deleted without any test noticing — " +
+			"the mutation-verified-once-then-drifted shape this registry exists to catch.",
+	},
+	{
+		Name:     "vamp/the timing table stops saying whether the run worked",
+		File:     "internal/vamp/timing.go",
+		Find:     "\t\tif stageFailed(s.Status) {\n\t\t\tfailed = append(failed, fmt.Sprintf(\"%s (%s)\", s.ID, s.Status))\n\t\t}",
+		Replace:  "\t\tif false && stageFailed(s.Status) {\n\t\t\tfailed = append(failed, fmt.Sprintf(\"%s (%s)\", s.ID, s.Status))\n\t\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestFormatTable_RendersStageStatus"},
+		Why: "the end-of-run table is what a human reads. Without the verdict a run with two failed " +
+			"stages rendered identically to a clean one — same rows, same numbers, same closing " +
+			"total: line — and the only place the truth existed was pipeline_timing.json.",
+	},
+	{
+		Name:     "vamp/a run_when-gated stage is reported as a failure",
+		File:     "internal/vamp/timing.go",
+		Find:     "\tcase stageStatusOK, stageStatusSkipped, \"\":\n\t\treturn false",
+		Replace:  "\tcase stageStatusOK, \"\":\n\t\treturn false",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestFormatTable_SkippedStageIsNotAFailure"},
+		Why: "a `run_when: failure` notify stage is SKIPPED on every successful run. Counting skipped " +
+			"as failed puts a FAILED line on every clean run of every pipeline that declares one, " +
+			"which is how an operator learns to stop reading the line that exists to be read.",
+	},
+	{
+		Name:     "vamp/the failure summary stops naming the way back",
+		File:     "internal/vamp/failure_summary.go",
+		Find:     "\tif cmd := resumeCommand(e); cmd != \"\" {",
+		Replace:  "\tif cmd := \"\"; cmd != \"\" {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestFailureSummary_PrintsTheResumeCommand"},
+		Why: "--resume is fully built (per-item foreach granularity, snapshot-drift detection, JSON " +
+			"revalidation) and for its whole life NO user-facing output mentioned it. A ten-stage " +
+			"pipeline dying at stage nine gets re-run from stage one by an operator who had no way " +
+			"to know there was another option.",
+	},
+	{
+		Name:     "vamp/the invalid_output classifier stops recognising a bad TTS body",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\tif strings.Contains(msg, audioInvalidOutputTag) {\n\t\t\treturn true\n\t\t}",
+		Replace:  "\t\tif false && strings.Contains(msg, audioInvalidOutputTag) {\n\t\t\treturn true\n\t\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestAudioExecutor_KokoroEngine_EmptyBodyTaggedForRetry"},
+		Why: "kokoro 200-OKs with an empty body during model warm-up — once in 1500+ chunks, and that " +
+			"one chunk fails the whole foreach. The test that covers this asserted the error CONTAINS " +
+			"the tag constant it was formatted with, which is a tautology: deleting this arm outright " +
+			"left the entire suite green.",
+	},
+	{
+		Name:     "vamp/the cache admits a zero-length artefact",
+		File:     "internal/vamp/cache/cache.go",
+		Find:     "\tif in.Bytes != nil && len(in.Bytes) == 0 {",
+		Replace:  "\tif false && in.Bytes != nil && len(in.Bytes) == 0 {",
+		Pkg:      "./internal/vamp/cache/",
+		MustFail: []string{"TestStore_Put_RefusesAZeroLengthBinaryArtefact"},
+		Why: "os.ReadFile of a 0-byte file returns an empty but NON-NIL slice, and Put's mode select " +
+			"reads non-nil Bytes as 'binary output'. This is the rung that decides whether a " +
+			"swallowed subprocess error is a bad run or a permanently poisoned content-addressed " +
+			"entry.",
+	},
 
 	// ── class 4: a deadline that is present but never reached ─────────
 	//
