@@ -56,19 +56,23 @@ jobs:
   #
   # Measured 2026-08-09, both machines:
   #   - ON THIS RUNNER: 5m38s / 5m52s / 6m3s across three observed runs.
-  #   - On a 32-core workstation: 245.7s for the package, reporting
-  #     "77/77 guards mutation-verified in 4m2s", of which 28.2s is the
-  #     baseline round that warms the cache — so the per-entry cost after
-  #     it is one package rebuild.
-  # Note what that pair says: the registry grew 67 -> 77 and the
-  # workstation time moved 243s -> 246s, because the entries run in
-  # parallel. Wall time here tracks WORKER COUNT far more than entry
+  #   - On a 32-core workstation: 245.7s at 77 entries, then 249.1s at 94
+  #     and 253.4s at 97 ("97/97 guards mutation-verified in 4m10s"), of
+  #     which ~30s is the baseline round that warms the cache — so the
+  #     per-entry cost after it is one package rebuild.
+  # Note what that series says: the registry grew 67 -> 77 -> 97 and the
+  # workstation time moved 243s -> 246s -> 253s, because the entries run
+  # in parallel. Wall time here tracks WORKER COUNT far more than entry
   # count, which is why the runner figure is 38% higher for the same
-  # work.
+  # work — and why 900s still has room at 97.
   #
   # (The previous figure here was "21s … (16 mutations)" — stale ~5x on
   # entries and ~16x on time, because the registry kept growing and the
-  # comment did not. If you add entries, re-measure this line.)
+  # comment did not. It then went stale again inside one day: the eight
+  # PRs merged 2026-08-09 took it 67 -> 94 while this block still said
+  # 77, because seven of the eight added entries and the one that wrote
+  # this block was measuring its own branch. Treat the number as decaying
+  # by default. If you add entries, re-measure this line.)
   #
   # NOTE the headroom, and note that the RUNNER is the number that
   # matters: `-timeout 900s` is about **2.5x** the slowest run observed

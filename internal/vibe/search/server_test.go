@@ -451,6 +451,14 @@ func TestCrossOriginBrowserRequestIsRefused(t *testing.T) {
 		if got := post(t, "/fetch", hostile, fetchBody); got != http.StatusForbidden {
 			t.Errorf("POST /fetch with Origin %q = %d, want 403", hostile, got)
 		}
+		// /search too. server.go's comment claims "an Origin check on
+		// every route" and the guard is mounted outside the mux, so the
+		// claim is true — but a test that checks three of the four routes
+		// is asserting less than the sentence it is defending, and
+		// /search is the one that spends the operator's paid quota.
+		if got := post(t, "/search", hostile, `{"query":"x"}`); got != http.StatusForbidden {
+			t.Errorf("POST /search with Origin %q = %d, want 403 — a rebound page can spend the search quota", hostile, got)
+		}
 	}
 
 	// No Origin at all is every non-browser client this service exists for:

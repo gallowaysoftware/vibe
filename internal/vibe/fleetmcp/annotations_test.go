@@ -88,9 +88,30 @@ func TestTools_AnnotationsAreDerivedFromTheDeclaredEffect(t *testing.T) {
 // tool CHANGES NOTHING" and `render_front` says "DRY-RUN ONLY"; either
 // sentence is a claim of read-only-ness, and a tool that makes it while
 // declaring an effect that mutates is a contradiction shipped to an
-// agent. The two destructive verbs are checked the other way: they must
-// keep warning in prose, because the flag is a hint and the sentence is
-// what an operator is told.
+// agent. The destructive verbs are checked the other way: they must keep
+// warning in prose, because the flag is a hint and the sentence is what
+// an operator is told.
+//
+// hazardSentence is a TABLE and every destructive tool must be a key,
+// so a new one cannot arrive without somebody deciding what its
+// description has to keep saying. The prose half used to be a single
+// `if d.Name == "drain_cell"`, under a comment claiming "the two
+// destructive verbs are checked the other way" — there are four, and one
+// was checked.
+var hazardSentence = map[string]string{
+	"drain_cell":   "CANCELS in-flight streams",
+	"suspend_cell": "check the cell HAS a wake path before suspending",
+	"probe_model":  "a probe spends real GPU time",
+	// unload_model carries no hazard sentence today: its description says
+	// what eviction does and how it is undone, and nothing about what
+	// happens to work in flight on the model being evicted. Recorded as
+	// empty rather than papered over with a phrase from the first
+	// sentence — an assertion that matches the tool's own summary proves
+	// only that the summary exists. Writing the sentence is a change to
+	// what agents are TOLD, which is a product decision, not a review one.
+	"unload_model": "",
+}
+
 func TestTools_ProseAndFlagAgree(t *testing.T) {
 	readOnlyClaims := []string{"CHANGES NOTHING", "DRY-RUN ONLY", "READ-ONLY audit", "RAW COUNTS ONLY"}
 	for _, d := range (&Server{}).toolDefs() {
@@ -102,16 +123,20 @@ func TestTools_ProseAndFlagAgree(t *testing.T) {
 					d.Name, claim, d.Effect)
 			}
 		}
-		if d.Effect == effectRead {
+		if d.Effect != effectDestructive {
 			continue
 		}
-		// The converse guard, stated positively for the two verbs whose
-		// truncation risk is the whole reason drain_cell's description
-		// exists.
-		if d.Name == "drain_cell" {
-			require.Contains(t, d.Description, "CANCELS in-flight streams",
-				"drain_cell stopped saying what its SIGTERM does to a generation in progress")
+		want, listed := hazardSentence[d.Name]
+		require.Truef(t, listed,
+			"tool %q is declared destructive but hazardSentence says nothing about it. Add it: an agent is "+
+				"told what a verb costs by the description, and a destructive verb that arrives without that "+
+				"decision being made is one nobody chose not to warn about", d.Name)
+		if want == "" {
+			continue
 		}
+		require.Containsf(t, d.Description, want,
+			"tool %q stopped saying %q — the sentence an operator is shown before a destructive verb runs",
+			d.Name, want)
 	}
 }
 
@@ -150,6 +175,26 @@ func dispatchedToolNames(t *testing.T) map[string]bool {
 	path := filepath.Join(".", "fleetmcp.go")
 	src, err := os.ReadFile(path)
 	require.NoError(t, err)
+	return dispatchedToolNamesIn(t, path, src)
+}
+
+// dispatchedToolNamesIn is the parse, split out so it can be driven
+// against a fixture — see TestDispatchedToolNamesIgnoresTheTimeoutSwitch.
+//
+// callTool contains TWO switches keyed on `name`: the deadline-sizing one
+// and the dispatch one. Only a case that RETURNS answers the call, so
+// only a returning case counts as an implementation.
+//
+// This used to fold both switches into one set, on the stated grounds
+// that "the timeout one is a subset of the dispatch one, so folding them
+// together cannot hide a missing case". That is false in the direction
+// that matters: the timeout switch names six tools, so deleting any of
+// those six from the DISPATCH switch left the name in the set anyway and
+// the parity check stayed green while the tool answered "unknown tool".
+// Measured on render_front — advertised, undispatched, all five
+// TestTools_* green.
+func dispatchedToolNamesIn(t *testing.T, path string, src []byte) map[string]bool {
+	t.Helper()
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, path, src, 0)
 	require.NoError(t, err)
@@ -165,16 +210,13 @@ func dispatchedToolNames(t *testing.T) map[string]bool {
 			if !ok {
 				return true
 			}
-			// Both switches in callTool key on `name`; the timeout one is a
-			// subset of the dispatch one, so folding them together cannot
-			// hide a missing case.
 			id, ok := sw.Tag.(*ast.Ident)
 			if !ok || id.Name != "name" {
 				return true
 			}
 			for _, stmt := range sw.Body.List {
 				cc, ok := stmt.(*ast.CaseClause)
-				if !ok {
+				if !ok || !caseAnswers(cc) {
 					continue
 				}
 				for _, expr := range cc.List {
@@ -192,6 +234,52 @@ func dispatchedToolNames(t *testing.T) map[string]bool {
 	}
 	require.NotEmpty(t, out, "callTool's dispatch switch was not found; this guard is measuring nothing")
 	return out
+}
+
+// caseAnswers reports whether a `case "tool":` arm returns — i.e. whether
+// it is the arm that ANSWERS the call rather than one that adjusts a
+// deadline and falls through to the dispatch below.
+func caseAnswers(cc *ast.CaseClause) bool {
+	answers := false
+	for _, stmt := range cc.Body {
+		ast.Inspect(stmt, func(n ast.Node) bool {
+			if _, ok := n.(*ast.ReturnStmt); ok {
+				answers = true
+			}
+			return !answers
+		})
+	}
+	return answers
+}
+
+// TestDispatchedToolNamesIgnoresTheTimeoutSwitch is the guard on the
+// guard. TestTools_AdvertisedAndDispatchedAgree is only worth its name if
+// the set it compares against is the set of tools that can actually be
+// CALLED, and the fixture below is the exact shape that defeated it: a
+// tool named in the deadline switch and absent from the dispatch one.
+func TestDispatchedToolNamesIgnoresTheTimeoutSwitch(t *testing.T) {
+	const fixture = `package fleetmcp
+
+func (s *Server) callTool(ctx context.Context, name string, rawArgs []byte) (string, error) {
+	timeout := toolTimeout
+	switch name {
+	case "slow_tool", "also_slow":
+		timeout = 90
+	}
+	_ = timeout
+	switch name {
+	case "also_slow":
+		return s.toolAlsoSlow(ctx)
+	default:
+		return "", errUnknown
+	}
+}
+`
+	got := dispatchedToolNamesIn(t, "fixture.go", []byte(fixture))
+	require.Truef(t, got["also_slow"], "a tool with a returning case was not counted as dispatched: %v", got)
+	require.Falsef(t, got["slow_tool"],
+		"slow_tool appears ONLY in the deadline switch and has no dispatch case — counting it as dispatched is "+
+			"what let an advertised tool answer \"unknown tool\" with every parity test green: %v", got)
 }
 
 // TestTools_DestructiveSetIsSmallAndNamed is the tripwire, not a

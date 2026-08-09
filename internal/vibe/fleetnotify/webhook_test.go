@@ -163,6 +163,90 @@ func TestWebhookSink_ErrorBodyIsScrubbedOfTheTopic(t *testing.T) {
 	assertNoSecret(t, "404 error string", err.Error())
 }
 
+// TestScrubURL_RemovesACredentialThatIsNotInThePath: the path is not the
+// only place a webhook keeps its bearer, and it is the only place ScrubURL
+// used to look past the whole-URL match.
+//
+// The two shapes below are real deployments, not constructions: a `?auth=`
+// query is how ntfy's own access-token-in-a-URL works and how several
+// self-hosted receivers authenticate, and userinfo is what a `https://
+// user:pass@host/hook` line in hosts.yaml produces. Both defeat the
+// whole-URL replacement the moment the far side quotes a FRAGMENT of the
+// request rather than the string vibe sent — `r.RequestURI` is path+query
+// with no scheme or host, which is what an echoing 404 body contains.
+//
+// This is not a hypothetical surface. (*WebhookSink).Scrub feeds
+// deliver.go's stats.LastError, which fleetapi publishes on
+// GET /api/fleet/state — an AccessGuest route — and in the fleet_status
+// MCP tool. A credential that survives this function is a credential on
+// the guest surface.
+func TestScrubURL_RemovesACredentialThatIsNotInThePath(t *testing.T) {
+	const querySecret = "QUERYBEARER-SECRET"
+	const userinfoSecret = "USERINFOPASS-SECRET"
+	for _, tc := range []struct {
+		name   string
+		raw    string
+		msg    string
+		secret string
+	}{
+		{
+			name:   "credential in the query, quoted as RequestURI",
+			raw:    "https://hook.example/notify?auth=" + querySecret,
+			msg:    "404 Not Found: no such webhook /notify?auth=" + querySecret,
+			secret: querySecret,
+		},
+		{
+			// Path is "/" so the len(u.Path) > 1 fallback does not fire at
+			// all: the whole-URL match is the ONLY thing standing here, and
+			// a quoted fragment walks straight past it.
+			name:   "credential in the query with a bare path",
+			raw:    "https://hook.example/?auth=" + querySecret,
+			msg:    "rejected request-uri /?auth=" + querySecret,
+			secret: querySecret,
+		},
+		{
+			name:   "credential in userinfo",
+			raw:    "https://bot:" + userinfoSecret + "@hook.example/notify",
+			msg:    `Post "https://bot:` + userinfoSecret + `@hook.example/notify": EOF`,
+			secret: userinfoSecret,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ScrubURL(tc.raw, tc.msg)
+			if strings.Contains(got, tc.secret) {
+				t.Errorf("ScrubURL left the credential in place: %q", got)
+			}
+			// And the sink's own wrapper, which is what deliver.go calls.
+			sink, err := NewWebhookSink(WebhookConfig{URL: tc.raw})
+			if err != nil {
+				t.Fatalf("NewWebhookSink: %v", err)
+			}
+			if s := sink.Scrub(tc.msg); strings.Contains(s, tc.secret) {
+				t.Errorf("(*WebhookSink).Scrub left the credential in place: %q", s)
+			}
+			// Redact is the other half of the same promise and must not
+			// have regressed while this one was being fixed.
+			if e := sink.Endpoint(); strings.Contains(e, tc.secret) {
+				t.Errorf("Endpoint() carries the credential: %q", e)
+			}
+		})
+	}
+}
+
+// TestScrubURL_DoesNotRedactTheWholeMessage is the over-correction guard.
+// A scrubber that replaced too little is the bug above; one that replaces
+// a one-character path or an empty query eats the operator's diagnosis and
+// is how a scrub gets deleted rather than fixed.
+func TestScrubURL_DoesNotRedactTheWholeMessage(t *testing.T) {
+	got := ScrubURL("https://hook.example/", "connect: connection refused after 3 attempts")
+	if got != "connect: connection refused after 3 attempts" {
+		t.Errorf("ScrubURL rewrote a message containing none of its URL: %q", got)
+	}
+	if got := ScrubURL("", "anything at all"); got != "anything at all" {
+		t.Errorf("an empty URL must be a no-op, got %q", got)
+	}
+}
+
 // TestWebhookSink_FourXXIsNotRetriedAndFiveXXIs: a 4xx is the far side
 // ANSWERING (C6's piggyback rule) — a bad topic is a permanent failure,
 // and reporting it four attempts late helps nobody.

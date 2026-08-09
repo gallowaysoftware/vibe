@@ -86,3 +86,89 @@ func TestPSJSONSaysWhenNobodyWasAsked(t *testing.T) {
 		t.Errorf("services = %v, want an empty array (a JSON consumer iterates it)", got.Services)
 	}
 }
+
+// TestPSRefusesToCallASlowDaemonAStoppedOne: a ping that ran out of time is
+// not evidence that nothing is running, and `--json` is where that matters —
+// the human reads a sentence and re-runs, a script reads `daemon_running`
+// and acts on it.
+//
+// The rig is the real thing end to end: a real ControlService on a real unix
+// socket in a scratch XDG_RUNTIME_DIR, holding a real active profile, whose
+// Status simply answers slower than psPingBudget. Before the fix this
+// printed {"daemon_running": false, "active": null, "services": []} and
+// exited 0 — a live daemon with a resident model, reported as a stopped one.
+//
+// Both surfaces are asserted because the claim was made on both, and the
+// refusal has to NAME the ambiguity rather than say "not running" more
+// quietly.
+func TestPSRefusesToCallASlowDaemonAStoppedOne(t *testing.T) {
+	fake := newControlFake()
+	fake.active = &vibev1.Status{Running: true, Ready: true, Profile: "pi"}
+	fake.statusDelay = psPingBudget * 2
+	serveControlOnUnix(t, fake)
+
+	for _, args := range [][]string{{"--json"}, nil} {
+		label := "table"
+		if len(args) > 0 {
+			label = args[0]
+		}
+		t.Run(label, func(t *testing.T) {
+			cmd := psCmd()
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			cmd.SetArgs(args)
+			err := cmd.ExecuteContext(t.Context())
+			if err == nil {
+				t.Fatalf("vibe ps %v exited 0 with %q — a ping timeout was reported as a fact about the fleet", args, out.String())
+			}
+			if !strings.Contains(err.Error(), "did not answer") {
+				t.Errorf("err = %v, want it to name the unanswered ping rather than assert a state", err)
+			}
+			// The specific lie, in the specific shape a consumer parses.
+			if strings.Contains(out.String(), `"daemon_running": false`) {
+				t.Errorf("output = %q, want no daemon_running claim at all", out.String())
+			}
+			if strings.Contains(out.String(), "daemon not running") {
+				t.Errorf("output = %q, want no 'daemon not running' claim", out.String())
+			}
+		})
+	}
+}
+
+// TestDaemonAbsentSeparatesNoDaemonFromNoAnswer pins the discrimination the
+// command above depends on, at the level of the error itself. Measured
+// shapes, not invented ones: an absent or refused socket arrives as
+// connect.CodeUnavailable, a spent budget as CodeDeadlineExceeded. The
+// stopped-daemon half is named too, because a guard that refused everything
+// would satisfy the test above and break the ordinary answer.
+func TestDaemonAbsentSeparatesNoDaemonFromNoAnswer(t *testing.T) {
+	t.Run("no socket is absence", func(t *testing.T) {
+		t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+		err := pingDaemon(psPingBudget)
+		if err == nil {
+			t.Fatal("ping succeeded with no daemon")
+		}
+		if !daemonAbsent(err) {
+			t.Errorf("daemonAbsent(%v) = false — `vibe ps` would refuse instead of answering "+
+				"the ordinary stopped-daemon question, which must stay exit 0", err)
+		}
+	})
+	t.Run("a spent budget is not absence", func(t *testing.T) {
+		fake := newControlFake()
+		fake.statusDelay = psPingBudget * 2
+		serveControlOnUnix(t, fake)
+		err := pingDaemon(psPingBudget)
+		if err == nil {
+			t.Fatal("ping succeeded inside the budget; the fake is not slow enough to prove anything")
+		}
+		if daemonAbsent(err) {
+			t.Errorf("daemonAbsent(%v) = true — a timeout counted as evidence that no daemon exists", err)
+		}
+	})
+	t.Run("nil is not absence", func(t *testing.T) {
+		if daemonAbsent(nil) {
+			t.Error("daemonAbsent(nil) = true — a successful ping read as a missing daemon")
+		}
+	})
+}

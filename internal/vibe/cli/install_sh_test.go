@@ -137,6 +137,23 @@ func TestInstallScriptVerifiesOnEveryPlatformAndRefusesWhatItCannotVerify(t *tes
 	if !strings.Contains(script, "VIBE_INSECURE_SKIP_CHECKSUM") {
 		t.Error("there is no named opt-out: refusing with no way through leaves an operator editing the installer")
 	}
+	// And unverified() is FATAL, which is the entire claim above. Routing
+	// the three call sites through a function proves nothing about what
+	// the function does: change its one condition — `= "1"` to `!= "9"` is
+	// enough — and every assertion here still passed while every
+	// unverifiable archive installed with a warning, which is the exact
+	// shape the block above says was removed. Measured: both install-script
+	// tests green under that edit.
+	body := shellFuncBody(t, script, "unverified")
+	if !strings.Contains(body, `"${VIBE_INSECURE_SKIP_CHECKSUM:-0}" = "1"`) {
+		t.Errorf("unverified() no longer gates its warn-and-continue path on the opt-out being exactly \"1\" "+
+			"(defaulting to 0). An opt-out that reads a stray or absent value as ON is an installer with no "+
+			"verification at all:\n%s", body)
+	}
+	if last := lastStatement(body); !strings.HasPrefix(last, "fatal ") {
+		t.Errorf("unverified() ends with %q, not a fatal. The DEFAULT — no opt-out set — must refuse the "+
+			"install; a warning on a `curl | sh` path is read by nobody:\n%s", last, body)
+	}
 	if !strings.Contains(script, `fatal "sha256 mismatch for`) {
 		t.Error("a MISMATCH must stay fatal with no opt-out — that is the one case where something is known to be wrong")
 	}
@@ -149,4 +166,44 @@ func TestInstallScriptVerifiesOnEveryPlatformAndRefusesWhatItCannotVerify(t *tes
 			t.Errorf("install.sh still says %q: an unverified install is refused, not announced", gone)
 		}
 	}
+}
+
+// shellFuncBody returns the lines between `name() {` and the closing brace
+// at column 0. Deliberately naive: install.sh is one file this repo owns
+// and every function in it is written that way, and a shell parser is a
+// dependency this module is not taking for one assertion. It fails the
+// test rather than returning "" if the shape it assumes is not there,
+// because an extractor that silently returns nothing turns every
+// assertion over its output into a vacuous pass.
+func shellFuncBody(t *testing.T, script, name string) string {
+	t.Helper()
+	open := name + "() {\n"
+	i := strings.Index(script, open)
+	if i < 0 {
+		t.Fatalf("install.sh has no %s() function; this guard is measuring nothing", name)
+	}
+	rest := script[i+len(open):]
+	j := strings.Index(rest, "\n}\n")
+	if j < 0 {
+		t.Fatalf("%s() has no closing brace at column 0; the extractor's assumption no longer holds", name)
+	}
+	body := rest[:j]
+	if strings.TrimSpace(body) == "" {
+		t.Fatalf("%s() extracted as empty", name)
+	}
+	return body
+}
+
+// lastStatement is the final non-blank, non-comment line of a shell body,
+// trimmed. It is what runs when every conditional above it declined.
+func lastStatement(body string) string {
+	lines := strings.Split(body, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		s := strings.TrimSpace(lines[i])
+		if s == "" || strings.HasPrefix(s, "#") {
+			continue
+		}
+		return s
+	}
+	return ""
 }

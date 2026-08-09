@@ -83,6 +83,62 @@ func countingServer(t *testing.T, body string) (*httptest.Server, *atomic.Int64)
 	return ts, &hits
 }
 
+// TestBlockedIPReasonSeesThroughIPv6TransitionAddresses: an IPv6 address
+// can CARRY an IPv4 one, and the predicate set only ever saw the one form
+// (`::ffff:a.b.c.d`) that net.IP.To4 normalizes for it.
+//
+// Measured before the fix, all reported as ordinary global unicast and
+// therefore dialable: `::127.0.0.1`, `64:ff9b::7f00:1`, `64:ff9b::c0a8:1`,
+// `2002:7f00:1::`. The URL reaching this guard comes from a model that has
+// just read somebody else's page, so `http://[64:ff9b::c0a8:1]/` in that
+// page is a request to 192.168.0.1 on any network with a NAT64 gateway.
+//
+// The allow half of the table is the point of the fix and not an
+// afterthought: on a NAT64 network the well-known prefix is how every
+// IPv4 host is reached, so blocking the prefix outright would take the
+// public internet away from the fetcher rather than take the LAN away
+// from an attacker.
+func TestBlockedIPReasonSeesThroughIPv6TransitionAddresses(t *testing.T) {
+	for _, tc := range []struct {
+		addr    string
+		blocked bool
+		why     string
+	}{
+		// The forms that walked past it.
+		{"::127.0.0.1", true, "IPv4-compatible (RFC 4291) wrapping loopback"},
+		{"0:0:0:0:0:0:7f00:1", true, "the same address, spelled out"},
+		{"64:ff9b::7f00:1", true, "NAT64 well-known prefix wrapping 127.0.0.1"},
+		{"64:ff9b::c0a8:1", true, "NAT64 wrapping 192.168.0.1"},
+		{"64:ff9b::a9fe:a9fe", true, "NAT64 wrapping link-local 169.254.169.254"},
+		{"64:ff9b::6440:1", true, "NAT64 wrapping CGNAT/tailscale 100.64.0.1"},
+		{"2002:7f00:1::", true, "6to4 wrapping 127.0.0.1"},
+		{"2002:c0a8:132::", true, "6to4 wrapping 192.168.1.50"},
+		// Already refused before the fix, and must stay refused.
+		{"::1", true, "v6 loopback"},
+		{"::ffff:127.0.0.1", true, "IPv4-mapped loopback"},
+		{"fd00::1", true, "unique-local"},
+		{"fe80::1", true, "link-local"},
+		// Must NOT be refused: a wrapped PUBLIC address is the ordinary
+		// way out of a v6-only network.
+		{"64:ff9b::101:101", false, "NAT64 wrapping public 1.1.1.1"},
+		{"2002:0808:0808::", false, "6to4 wrapping public 8.8.8.8"},
+		{"2606:4700:4700::1111", false, "an ordinary public v6 address"},
+		{"1.1.1.1", false, "an ordinary public v4 address"},
+	} {
+		t.Run(tc.addr, func(t *testing.T) {
+			ip := net.ParseIP(tc.addr)
+			if ip == nil {
+				t.Fatalf("unparseable fixture %q", tc.addr)
+			}
+			reason := blockedIPReason(ip)
+			if got := reason != ""; got != tc.blocked {
+				t.Fatalf("blockedIPReason(%s) blocked = %v, want %v (%s). reason = %q",
+					tc.addr, got, tc.blocked, tc.why, reason)
+			}
+		})
+	}
+}
+
 // The headline finding: a fetch aimed straight at a service on this host is
 // refused, and refused BEFORE a socket is opened.
 func TestDirectFetcherRefusesALoopbackTarget(t *testing.T) {

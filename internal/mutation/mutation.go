@@ -419,6 +419,25 @@ var Registry = []Mutation{
 			"could ever notice. canNet is the single gate every subtraction and every payback ratio " +
 			"in that file goes through.",
 	},
+	{
+		Name: "ps/an unanswered ping is reported as a stopped daemon",
+		File: "internal/vibe/cli/client.go",
+		// The pre-fix behaviour exactly: EVERY ping failure is absence.
+		// The blank assignments keep `errors` and `connect` used, because a
+		// mutation that does not compile proves nothing.
+		Find: "\tif errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {\n" +
+			"\t\treturn false\n\t}\n\treturn connect.CodeOf(err) == connect.CodeUnavailable",
+		Replace:  "\t_ = errors.Is\n\t_ = connect.CodeOf\n\treturn true",
+		Pkg:      "./internal/vibe/cli/",
+		MustFail: []string{"TestPSRefusesToCallASlowDaemonAStoppedOne", "TestDaemonAbsentSeparatesNoDaemonFromNoAnswer"},
+		Why: "`vibe ps --json` is a document a script acts on, and its daemon_running field is a " +
+			"CLAIM. Only a refused or absent socket supports it; a ping that spent its 500ms supports " +
+			"nothing. Without this discrimination a daemon that is up with a model resident and merely " +
+			"slow to answer renders as {\"daemon_running\": false, \"active\": null} at exit 0 — the " +
+			"absent-evidence-as-a-definite-value class, on the one surface that is machine-readable. " +
+			"The helper is pinned rather than the call site because `daemonAbsent` is the whole of the " +
+			"discrimination and 'why not just treat every error the same?' reads as a simplification.",
+	},
 
 	// ── the credential never leaks ────────────────────────────────────
 	{
@@ -430,6 +449,21 @@ var Registry = []Mutation{
 		MustFail: []string{"TestRedact_KeepsSchemeAndHostAndDropsTheTopicQueryAndUserinfo"},
 		Why: "an ntfy topic URL is bearer-equivalent. The sink unwraps *url.Error AND scrubs, and " +
 			"both guards are pinned individually — neither may be deleted because 'the other one covers it'.",
+	},
+	{
+		Name:     "c9/only the whole URL is scrubbed, not the parts that carry the bearer",
+		File:     "internal/vibe/fleetnotify/webhook.go",
+		Find:     "\tfor _, part := range scrubbableParts(u) {\n\t\tout = strings.ReplaceAll(out, part, redacted)\n\t}",
+		Replace:  "\t_ = scrubbableParts(u)",
+		Pkg:      "./internal/vibe/fleetnotify/",
+		MustFail: []string{"TestScrubURL_RemovesACredentialThatIsNotInThePath", "TestWebhookSink_ErrorBodyIsScrubbedOfTheTopic"},
+		Why: "the far side quotes a FRAGMENT of the request, never the string vibe sent — an echoed " +
+			"r.RequestURI is path+query with no scheme and no host, so the whole-URL match cannot see " +
+			"it. `?auth=<token>` is a real webhook shape and, when the path is a bare \"/\", the path " +
+			"fallback does not fire either: the whole-URL match was the only guard and a quoted " +
+			"fragment walked past it. Scrub feeds deliver.go's stats.LastError, which fleetapi " +
+			"publishes on GET /api/fleet/state — an AccessGuest route — and in the fleet_status MCP " +
+			"tool, so a credential that survives this loop is a credential on the guest surface.",
 	},
 	{
 		Name:     "vamp/a webhook stage stops scrubbing its own URL out of an error",
@@ -1329,6 +1363,23 @@ var Registry = []Mutation{
 			"and not on the URL. Under this mutation the 302 into 127.0.0.1 is followed and the " +
 			"internal page comes back as the fetch result, which no URL-level allowlist would have " +
 			"caught, because net/http follows the hop with no second URL for anything to inspect.",
+	},
+	{
+		Name:    "search/an IPv6 address that wraps a private IPv4 one is dialled",
+		File:    "internal/vibe/search/dialguard.go",
+		Find:    "\tif v4 := embeddedIPv4(ip); v4 != nil {",
+		Replace: "\tif v4 := embeddedIPv4(ip); false && v4 != nil {",
+		Pkg:     "./internal/vibe/search/",
+		MustFail: []string{
+			"TestBlockedIPReasonSeesThroughIPv6TransitionAddresses",
+		},
+		Why: "the predicate set only ever saw the one wrapped form net.IP.To4 normalizes for it " +
+			"(::ffff:a.b.c.d). Measured, `::127.0.0.1`, `64:ff9b::c0a8:1` and `2002:7f00:1::` all came " +
+			"back as ordinary global unicast and every other test in the package stayed green — the " +
+			"guard looks complete, is at the dialer, checks every resolved answer, and waves the " +
+			"textbook bypass through. The URL is supplied by a model that has just read somebody " +
+			"else's page, and on a v6-only fleet the NAT64 prefix IS how IPv4 is reached, so the " +
+			"unwrap must judge the wrapped address rather than refuse the prefix.",
 	},
 	{
 		Name:     "search/the validated address is handed back to the resolver",

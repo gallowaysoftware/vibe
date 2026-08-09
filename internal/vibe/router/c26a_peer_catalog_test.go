@@ -391,7 +391,12 @@ routing:
 		}
 	})
 
-	t.Run("extras: an empty model entry is refused, not panicked on", func(t *testing.T) {
+	// The name says what the assertions check. The first cut called this
+	// "an empty model entry is refused, not panicked on" while asserting
+	// err == nil and the entry surviving into the output — a reader
+	// scanning subtest names would have believed a refusal guard existed
+	// here, and there is none by design (see the body).
+	t.Run("extras: an empty model entry passes through instead of panicking", func(t *testing.T) {
 		// `models:\n  ghost:` decodes to a nil *swapModel. The check now
 		// reads user-authored bytes, so a hand-written extras file must
 		// not be able to crash the renderer — llama-swap gets to have the
