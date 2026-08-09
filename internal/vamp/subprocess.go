@@ -2,10 +2,7 @@ package vamp
 
 import (
 	"context"
-	"errors"
-	"os"
 	"os/exec"
-	"syscall"
 	"time"
 )
 
@@ -14,36 +11,48 @@ import (
 // vamp shells out eleven times — ffmpeg four ways, ffprobe, piper, an
 // audio-effect pass, rsvg-convert, pandoc (sometimes as `docker run`) —
 // and every one of them used a bare exec.CommandContext. That gets the
-// easy half right and the hard half wrong:
+// easy half right and the hard half wrong.
 //
-//   - exec.CommandContext DOES kill the process it started when ctx
-//     ends. Good news, verified: none of these sites uses `sh -c`, so
-//     the process it started is the work, and internal/vibe/shellcmd's
-//     forking-shell defect does not apply here.
-//   - Cmd.Wait, however, does not return until the STDOUT/STDERR PIPES
-//     close, and a WaitDelay of zero is documented as "wait
-//     indefinitely". ffmpeg's stderr is inherited by anything it
-//     spawned, and a killed process wedged in uninterruptible I/O never
-//     closes it. So a cancelled stage's Run can outlive the
-//     cancellation by an unbounded amount — the deadline fires exactly
-//     on time and the call still does not come back, which on the wire
-//     is indistinguishable from the bound not working.
+// The easy half: exec.CommandContext DOES kill the process it started
+// when ctx ends. Verified, and load-bearing here: none of these eleven
+// sites uses `sh -c`, so the process it started IS the work, and
+// internal/vibe/shellcmd's forking-shell defect — a dash that forks the
+// command and leaves the deadline killing an empty shell — does not
+// apply.
 //
-// So: same two mechanisms as shellcmd, for the same reasons, one of
-// them (the process group) demoted from load-bearing to defence in
-// depth because these are not shells.
+// The hard half: Cmd.Wait does not return until the stdout/stderr PIPES
+// close, and a WaitDelay of ZERO is documented to mean "wait
+// indefinitely". ffmpeg's stderr is inherited by anything it spawned,
+// and a killed process wedged in uninterruptible I/O never closes it. So
+// a cancelled stage's Run could outlive its cancellation without bound:
+// the deadline fires exactly on time and the call still does not come
+// back, which on the wire is indistinguishable from the bound not
+// working at all.
 //
-// Not shellcmd.New itself: that builds `sh -c <script>`, which is a
-// different and worse call shape for an argv this package already has
-// as a slice — going through a shell here would ADD the quoting hazard
-// and the forking-grandchild problem that shellcmd exists to survive.
-// The shape is reused; the shell is not.
+// # What this deliberately does NOT do
+//
+// shellcmd pairs its WaitDelay with Setpgid and a negative-pid kill, and
+// copying that here would be a regression rather than defence in depth.
+// Setpgid takes the child OUT of the terminal's foreground process
+// group, so an operator's ctrl-C during a forty-minute ffmpeg render
+// would no longer reach ffmpeg: vamp dies on the default SIGINT
+// disposition without running any deferred cancel, and the render keeps
+// burning a GPU with nothing left to stop it. shellcmd needs the group
+// because its child is a SHELL that forks the real work somewhere the
+// deadline cannot see; here the child is the work, and a group of its
+// own buys nothing to pay that with.
+//
+// (`docker run` is the one site where the work genuinely lives
+// elsewhere — in a container dockerd owns, which no process-group signal
+// could reach either way. Ending that properly needs a named container
+// and a `docker kill` from Cancel; it is called out in the PR rather
+// than half-done here.)
 
 // subprocessKillGrace bounds how long Wait may block on the pipes after
 // the process has been killed. Two seconds, matching
 // shellcmd.DefaultKillGrace: long enough to still capture a killed
-// ffmpeg's last stderr line for the error a human reads, short enough
-// to be noise next to any stage budget worth having.
+// ffmpeg's last stderr line for the error a human reads, short enough to
+// be noise next to any stage budget worth having.
 const subprocessKillGrace = 2 * time.Second
 
 // command builds an *exec.Cmd whose ctx cancellation actually ends the
@@ -51,32 +60,10 @@ const subprocessKillGrace = 2 * time.Second
 //
 // Every subprocess in this package goes through here so the bound is a
 // property of the package rather than of whoever wrote the newest
-// executor — the same "guard in one of N call paths" shape that left
-// two of four ffmpeg outputs unchecked.
+// executor — the same "guard in one of N call paths" shape that left two
+// of four ffmpeg output checks missing.
 func command(ctx context.Context, name string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, name, args...)
-	// Setpgid + a negative-pid kill reaches anything the child spawned.
-	// ffmpeg and piper do not fork today; pandoc's docker path is the
-	// one that might, and a helper that only works for the binaries we
-	// happen to run now is the kind that stops working silently.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return os.ErrProcessDone
-		}
-		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
-			if errors.Is(err, syscall.ESRCH) {
-				// The group is already gone: the command finished on the
-				// same tick the deadline fired. Saying so lets a command
-				// that beat the wire report its own result rather than
-				// the context's.
-				return os.ErrProcessDone
-			}
-			return err
-		}
-		return nil
-	}
-	// The bound that does not depend on the kill landing.
 	cmd.WaitDelay = subprocessKillGrace
 	return cmd
 }

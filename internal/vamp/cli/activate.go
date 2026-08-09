@@ -163,7 +163,9 @@ func vibeStartContext(ctx context.Context, w cobraOutputWriter, name string, act
 	// A zero WaitDelay is documented as "Wait blocks indefinitely on the
 	// pipes", which would put the unbounded wait straight back after the
 	// deadline had done its job. CombinedOutput holds both pipes, so this
-	// is exactly the path that needs it.
+	// is exactly the path that needs it. (Same rule as
+	// vamp.subprocessKillGrace; a different package, so a literal rather
+	// than a shared constant nothing else here would use.)
 	c.WaitDelay = 2 * time.Second
 	out, err := c.CombinedOutput()
 	body := strings.TrimSpace(string(out))

@@ -527,13 +527,24 @@ var Registry = []Mutation{
 	{
 		Name:     "vamp/the timing table stops saying whether the run worked",
 		File:     "internal/vamp/timing.go",
-		Find:     "\t\tif status != stageStatusOK {\n\t\t\tfailed = append(failed, fmt.Sprintf(\"%s (%s)\", s.ID, status))\n\t\t}",
-		Replace:  "\t\tif false && status != stageStatusOK {\n\t\t\tfailed = append(failed, fmt.Sprintf(\"%s (%s)\", s.ID, status))\n\t\t}",
+		Find:     "\t\tif stageFailed(s.Status) {\n\t\t\tfailed = append(failed, fmt.Sprintf(\"%s (%s)\", s.ID, s.Status))\n\t\t}",
+		Replace:  "\t\tif false && stageFailed(s.Status) {\n\t\t\tfailed = append(failed, fmt.Sprintf(\"%s (%s)\", s.ID, s.Status))\n\t\t}",
 		Pkg:      "./internal/vamp/",
 		MustFail: []string{"TestFormatTable_RendersStageStatus"},
 		Why: "the end-of-run table is what a human reads. Without the verdict a run with two failed " +
 			"stages rendered identically to a clean one — same rows, same numbers, same closing " +
 			"total: line — and the only place the truth existed was pipeline_timing.json.",
+	},
+	{
+		Name:     "vamp/a run_when-gated stage is reported as a failure",
+		File:     "internal/vamp/timing.go",
+		Find:     "\tcase stageStatusOK, stageStatusSkipped, \"\":\n\t\treturn false",
+		Replace:  "\tcase stageStatusOK, \"\":\n\t\treturn false",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestFormatTable_SkippedStageIsNotAFailure"},
+		Why: "a `run_when: failure` notify stage is SKIPPED on every successful run. Counting skipped " +
+			"as failed puts a FAILED line on every clean run of every pipeline that declares one, " +
+			"which is how an operator learns to stop reading the line that exists to be read.",
 	},
 	{
 		Name:     "vamp/the failure summary stops naming the way back",

@@ -293,6 +293,12 @@ func TestFormatTable_RendersStageStatus(t *testing.T) {
 	tr.StageEnd("bad", "error", nil)
 	tr.StageStart("stopped", "audio")
 	tr.StageEnd("stopped", "cancelled", nil)
+	// A run_when-gated stage that did not run. NOT a failure: a
+	// `run_when: failure` notify stage is skipped on every successful
+	// pipeline, and a verdict line that cried wolf on those would stop
+	// being read.
+	tr.StageStart("notify", "webhook")
+	tr.StageEnd("notify", "skipped", nil)
 	tr.Finish()
 
 	var buf bytes.Buffer
@@ -308,13 +314,38 @@ func TestFormatTable_RendersStageStatus(t *testing.T) {
 			t.Errorf("table never renders %q:\n%s", want, got)
 		}
 	}
+	if !strings.Contains(got, "skipped") {
+		t.Errorf("table never renders the skipped status:\n%s", got)
+	}
 	// The one-line verdict, so "did it work" survives a table that has
 	// scrolled off the top of the terminal.
-	if !strings.Contains(got, "FAILED: 2 of 3 stage(s) did not succeed") {
-		t.Errorf("table lacks the pass/fail summary line:\n%s", got)
+	if !strings.Contains(got, "FAILED: 2 of 4 stage(s) did not succeed") {
+		t.Errorf("table lacks the pass/fail summary line, or miscounts:\n%s", got)
 	}
 	if !strings.Contains(got, "bad (error)") || !strings.Contains(got, "stopped (cancelled)") {
 		t.Errorf("summary line must name every failed stage:\n%s", got)
+	}
+	if strings.Contains(got, "notify (skipped)") {
+		t.Errorf("a run_when-gated stage is not a failure:\n%s", got)
+	}
+}
+
+// TestFormatTable_SkippedStageIsNotAFailure is the false-alarm case on
+// its own: a pipeline whose only non-ok stage is a `run_when: failure`
+// notifier ran perfectly, and must not print a failure line.
+func TestFormatTable_SkippedStageIsNotAFailure(t *testing.T) {
+	tr := NewTracker("p")
+	tr.StageStart("work", "text")
+	tr.StageEnd("work", "ok", nil)
+	tr.StageStart("notify_on_failure", "webhook")
+	tr.StageEnd("notify_on_failure", "skipped", nil)
+	tr.Finish()
+	var buf bytes.Buffer
+	if err := tr.FormatTable(&buf); err != nil {
+		t.Fatalf("FormatTable: %v", err)
+	}
+	if strings.Contains(buf.String(), "FAILED") {
+		t.Errorf("a clean run with a skipped run_when stage must not print a failure line:\n%s", buf.String())
 	}
 }
 

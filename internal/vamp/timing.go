@@ -12,11 +12,35 @@ import (
 	"time"
 )
 
-// stageStatusOK is the one status that means the stage did its job. It
-// is a named constant because the table's pass/fail line and the
-// tracker's own defaults have to agree on it; the string appears in the
-// JSON contract, so it must not drift.
-const stageStatusOK = "ok"
+// The status strings the runner records. Named constants because the
+// table's pass/fail line and the tracker's own defaults have to agree on
+// them, and because they appear in the JSON contract, so they must not
+// drift.
+const (
+	// stageStatusOK means the stage did its job.
+	stageStatusOK = "ok"
+	// stageStatusSkipped means the stage was NOT SUPPOSED to run: its
+	// run_when gate said no. A `run_when: failure` notify stage is
+	// skipped on every successful pipeline, so counting skipped as a
+	// failure would put a FAILED line on every clean run that declares
+	// one — the exact false alarm that teaches an operator to stop
+	// reading the line.
+	stageStatusSkipped = "skipped"
+)
+
+// stageFailed reports whether a status is one the operator needs to know
+// about at the end of a run. An empty status is not counted: it means the
+// runner never classified the stage, which the table already shows as "?"
+// in its own column, and inventing a failure from an absence would make
+// the verdict line less trustworthy rather than more.
+func stageFailed(status string) bool {
+	switch status {
+	case stageStatusOK, stageStatusSkipped, "":
+		return false
+	default:
+		return true
+	}
+}
 
 // Tracker records wall-clock timing for every stage (and per-item slice of
 // foreach stages) of a single pipeline run. It is safe for concurrent use:
@@ -543,8 +567,8 @@ func (t *Tracker) FormatTable(w io.Writer) error {
 			// the same claim as a successful one.
 			status = "?"
 		}
-		if status != stageStatusOK {
-			failed = append(failed, fmt.Sprintf("%s (%s)", s.ID, status))
+		if stageFailed(s.Status) {
+			failed = append(failed, fmt.Sprintf("%s (%s)", s.ID, s.Status))
 		}
 		// A duration of zero on a stage that never started is not a
 		// measurement of zero. Print a dash so nobody reads "failed
