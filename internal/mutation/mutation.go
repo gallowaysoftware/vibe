@@ -502,6 +502,69 @@ var Registry = []Mutation{
 			"session that caused it.",
 	},
 	{
+		Name:     "vamp/a webhook stage stops scrubbing what the far side said",
+		File:     "internal/vamp/webhook_executor.go",
+		Find:     "\tdefer func() { retErr = scrubResponseError(retErr, urlStr, resp, renderedHeaders) }()",
+		Replace:  "\t_ = scrubResponseError",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestWebhookExecutor_ErrorBodyQuotingTheURLIsScrubbed", "TestWebhookExecutor_AssertStatusMismatchBodyIsScrubbed", "TestWebhookExecutor_TransientErrorBodyIsScrubbed", "TestWebhookExecutor_EchoedCredentialHeaderIsScrubbed", "TestWebhookExecutor_FailureSummaryDoesNotPostTheCredential"},
+		Why: "the two entries above scrub errors the TRANSPORT produced. This one scrubs the error " +
+			"the SERVER produced, which is the shorter path to a chat channel: for Slack, Discord " +
+			"and ntfy the URL PATH is the bearer, and a 404 page routinely quotes the request line " +
+			"back — so the credential arrives inside far-side prose, where there is no *url.Error " +
+			"to unwrap. It is a DEFERRED rewrite over the whole response phase rather than a scrub " +
+			"at each return because that is how this leak survived being closed twice: the fix " +
+			"reached the sites someone had in mind (the *url.Error paths) and not the non-2xx body " +
+			"preview, the assert.status_code mismatch preview or the assert failure list. Deleting " +
+			"the defer reopens every one of them at once, and the return added next year with it.",
+	},
+	{
+		Name:     "vamp/a webhook stage stops scrubbing its URL out of the far side's prose",
+		File:     "internal/vamp/webhook_executor.go",
+		Find:     "\tmsg := fleetnotify.ScrubURL(reqURL, err.Error())",
+		Replace:  "\tmsg := err.Error()",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestWebhookExecutor_BodyIsScrubbedWhenTheResponseCarriesNoRequest"},
+		Why: "pinned separately from the defer above because the defer only decides WHEN the scrub " +
+			"runs; this is the scrub. It has to be ScrubURL and not a whole-string match: what a " +
+			"server echoes is r.RequestURI — path+query, no scheme, no host — so the string vibe " +
+			"sent never appears in the body, and a `?auth=<token>` webhook with a bare \"/\" path " +
+			"has no path part to fall back on either. The named test is the ONE that separates this " +
+			"guard from the resp.Request guard below: for an *http.Client the two URLs are the same " +
+			"string and either scrub covers the other, so this entry first went in naming six tests " +
+			"and the harness correctly reported all six still green. httpDoer is an interface, a " +
+			"hand-built response has a nil Request, and there this is the only guard left.",
+	},
+	{
+		Name:     "vamp/a webhook stage stops scrubbing the URL it was redirected to",
+		File:     "internal/vamp/webhook_executor.go",
+		Find:     "\tif resp != nil && resp.Request != nil && resp.Request.URL != nil {\n\t\tmsg = fleetnotify.ScrubURL(resp.Request.URL.String(), msg)\n\t}",
+		Replace:  "\t_ = resp",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestWebhookExecutor_RedirectTargetQuotedInABodyIsScrubbed"},
+		Why: "http.Client follows redirects, so the body that comes back was written by a host the " +
+			"stage never addressed, about a URL the stage never rendered — and a scrub keyed on the " +
+			"stage's own string cannot match it. resp.Request is where the URL actually requested " +
+			"lives. Same class as youtube_executor.go's resumable session URI: a URL handed out by " +
+			"the far side that IS an authorisation, and it reaches the same place — " +
+			"{{ .failure_summary }} in a run_when: failure webhook that posts it into a room.",
+	},
+	{
+		Name:     "vamp/a webhook stage stops scrubbing the credential header the far side echoed",
+		File:     "internal/vamp/webhook_executor.go",
+		Find:     "\t\tif value := headers[name]; len(value) >= minScrubbableHeaderValue && credentialHeader(name) {\n\t\t\tmsg = fleetnotify.ScrubURL(value, msg)\n\t\t}",
+		Replace:  "\t\t_ = headers[name]",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestWebhookExecutor_EchoedCredentialHeaderIsScrubbed"},
+		Why: "the URL is not the only credential a webhook stage holds. The `env` template helper " +
+			"exists so a bearer travels in an Authorization / X-Api-Key header instead of the " +
+			"pipeline YAML, and gateways echo the header they rejected straight into their error " +
+			"body. The same test pins the DELIBERATE narrowness beside it — an ordinary header " +
+			"value must survive — because blanket-scrubbing everything we sent erases " +
+			"\"application/json\" from a preview that says the server rejected exactly that, and a " +
+			"preview of nothing but <redacted> is a leak traded for an unusable error.",
+	},
+	{
 		Name:     "vamp/a youtube upload stops scrubbing its session URI out of an error",
 		File:     "internal/vamp/youtube_executor.go",
 		Find:     "\t\treturn \"\", fmt.Errorf(\"upload PUT: %w\", scrubURLError(uploadURL, err))",
