@@ -1046,3 +1046,411 @@ func TestWebhookExecutor_ScrubbedErrorKeepsTheChain(t *testing.T) {
 		t.Errorf("stage error still carries the webhook URL: %v", err)
 	}
 }
+
+// ── the response body is a credential channel too ─────────────────────
+//
+// The two redactions above cover errors the TRANSPORT produced. They do
+// not cover the one the SERVER produced, and that is the leak with the
+// shortest path to a chat channel: for Slack, Discord and ntfy the URL
+// path IS the bearer, and a 404 body routinely quotes the request line
+// back. The secret then arrives inside far-side prose rather than inside
+// a *url.Error, so unwrapping finds nothing to unwrap.
+
+// secretWebhookQuery is the OTHER dialect: the bearer in the query
+// string rather than the path. Pinned separately because a scrubber that
+// only decomposes the path cannot reach it — exactly the gap a sibling
+// PR closed in fleetnotify.ScrubURL, and this asserts vamp's call sites
+// benefit from the fixed version.
+const secretWebhookQuery = "auth=tk_0000000000000000000000000000"
+
+// echoingServer is the far side that turns its own error page into a
+// credential channel: it quotes r.RequestURI (path+query, no scheme, no
+// host) back into the body, which is what nginx, Cloudflare and most
+// API gateways actually do on a 404.
+func echoingServer(t *testing.T, status int) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		fmt.Fprintf(w, "<html><title>error</title><body>no such webhook: %s</body></html>", r.RequestURI)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestWebhookExecutor_ErrorBodyQuotingTheURLIsScrubbed is the headline
+// reproduction. A non-2xx body preview goes into the stage error, the
+// stage error becomes Executor.FailureSummary, and six executors hand
+// that to templates as {{ .failure_summary }} — so a run_when: failure
+// webhook posts whatever is in here into the room.
+func TestWebhookExecutor_ErrorBodyQuotingTheURLIsScrubbed(t *testing.T) {
+	srv := echoingServer(t, http.StatusNotFound)
+	secretURL := srv.URL + secretWebhookPath
+
+	_, err := (&webhookExecutor{}).Execute(context.Background(), StageInput{
+		Stage: &Stage{
+			ID:     "notify",
+			Type:   StageTypeWebhook,
+			URL:    secretURL,
+			Body:   map[string]any{"text": "done"},
+			Output: "out.txt",
+		},
+		RunDir: t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("expected the 404 to fail the stage")
+	}
+	if strings.Contains(err.Error(), secretWebhookPath) {
+		t.Errorf("the response body carried the webhook's secret path into the stage error: %v", err)
+	}
+	if strings.Contains(err.Error(), secretURL) {
+		t.Errorf("stage error contains the full webhook URL: %v", err)
+	}
+	// Scrubbing that ate the diagnosis has traded one bug for another:
+	// the operator still has to be able to tell a 404 from a 500 and to
+	// see what the server said.
+	if !strings.Contains(err.Error(), "HTTP 404") {
+		t.Errorf("stage error lost the status: %v", err)
+	}
+	if !strings.Contains(err.Error(), "no such webhook") {
+		t.Errorf("stage error lost the server's own message: %v", err)
+	}
+}
+
+// TestWebhookExecutor_ErrorBodyQuotingTheQueryCredentialIsScrubbed pins
+// the `?auth=<token>` dialect. It is the case a path-only scrubber
+// cannot reach at all: with a bare "/" path there is no path part to
+// match, and an echoed RequestURI contains neither scheme nor host, so
+// the whole-URL match does not fire either.
+func TestWebhookExecutor_ErrorBodyQuotingTheQueryCredentialIsScrubbed(t *testing.T) {
+	srv := echoingServer(t, http.StatusForbidden)
+	secretURL := srv.URL + "/?" + secretWebhookQuery
+
+	_, err := (&webhookExecutor{}).Execute(context.Background(), StageInput{
+		Stage: &Stage{
+			ID:     "notify",
+			Type:   StageTypeWebhook,
+			URL:    secretURL,
+			Body:   map[string]any{"text": "done"},
+			Output: "out.txt",
+		},
+		RunDir: t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("expected the 403 to fail the stage")
+	}
+	if strings.Contains(err.Error(), secretWebhookQuery) {
+		t.Errorf("the response body carried the webhook's query credential into the stage error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "HTTP 403") {
+		t.Errorf("stage error lost the status: %v", err)
+	}
+}
+
+// TestWebhookExecutor_AssertStatusMismatchBodyIsScrubbed pins the
+// sibling site. assert.status_code takes a different branch to the
+// "2xx required" default and formats its own preview, so a fix applied
+// to one branch and not the other leaves the leak reachable by any
+// pipeline that declares an assert.
+func TestWebhookExecutor_AssertStatusMismatchBodyIsScrubbed(t *testing.T) {
+	srv := echoingServer(t, http.StatusUnauthorized)
+	secretURL := srv.URL + secretWebhookPath
+
+	_, err := (&webhookExecutor{}).Execute(context.Background(), StageInput{
+		Stage: &Stage{
+			ID:     "smoke",
+			Type:   StageTypeWebhook,
+			URL:    secretURL,
+			Body:   map[string]any{"text": "done"},
+			Assert: &AssertSpec{StatusCode: http.StatusOK},
+			Output: "out.txt",
+		},
+		RunDir: t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("expected the status mismatch to fail the stage")
+	}
+	if strings.Contains(err.Error(), secretWebhookPath) {
+		t.Errorf("the assert mismatch text carried the webhook's secret path: %v", err)
+	}
+	if !strings.Contains(err.Error(), "expected HTTP 200, got HTTP 401") {
+		t.Errorf("stage error lost the mismatch it exists to report: %v", err)
+	}
+}
+
+// TestWebhookExecutor_TransientErrorBodyIsScrubbed pins the typed-error
+// branch. A 5xx/429 does not return a plain error — it returns a
+// *transientHTTPError whose Underlying string is what the retry loop
+// LOGS on every attempt ("attempt %d failed; retrying in %s: %v"), and
+// under --detach that log is a file. The scrub must not cost the retry
+// machinery its classification or its Retry-After hint.
+func TestWebhookExecutor_TransientErrorBodyIsScrubbed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, "upstream unavailable for %s", r.RequestURI)
+	}))
+	defer srv.Close()
+	secretURL := srv.URL + secretWebhookPath
+
+	_, err := (&webhookExecutor{}).Execute(context.Background(), StageInput{
+		Stage: &Stage{
+			ID:     "notify",
+			Type:   StageTypeWebhook,
+			URL:    secretURL,
+			Body:   map[string]any{"text": "done"},
+			Output: "out.txt",
+		},
+		RunDir: t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("expected the 503 to fail the stage")
+	}
+	if strings.Contains(err.Error(), secretWebhookPath) {
+		t.Errorf("the 503 body carried the webhook's secret path into the stage error: %v", err)
+	}
+	th := asTransientHTTPError(err)
+	if th == nil {
+		t.Fatal("scrubbing broke the transient classification; a 503 would no longer retry")
+	}
+	if th.RetryAfter != 2*time.Second {
+		t.Errorf("RetryAfter = %v, want 2s; the server's own hint was lost", th.RetryAfter)
+	}
+	if !strings.Contains(err.Error(), "HTTP 503") {
+		t.Errorf("stage error lost the status the substring classifier also keys on: %v", err)
+	}
+}
+
+// nilRequestDoer answers with a hand-built response, the way anything
+// that is not an *http.Client does: http.Response.Request is documented
+// as "only populated for Client requests".
+type nilRequestDoer struct {
+	status int
+	body   string
+}
+
+func (d nilRequestDoer) Do(*http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: d.status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(d.body)),
+	}, nil
+}
+
+// TestWebhookExecutor_BodyIsScrubbedWhenTheResponseCarriesNoRequest is
+// the half the tests above cannot see. For an *http.Client the URL the
+// stage rendered and the URL on resp.Request are the same string, so
+// either scrub removes it and the two guards look interchangeable.
+//
+// They are not. httpDoer is an interface precisely so the transport can
+// be swapped, and a response built by hand has a nil Request — at which
+// point the scrub keyed on the stage's own URL is the only one left. A
+// redaction that works for one implementation of the transport is a
+// redaction with a hole in it.
+func TestWebhookExecutor_BodyIsScrubbedWhenTheResponseCarriesNoRequest(t *testing.T) {
+	secretURL := "https://hooks.example.invalid" + secretWebhookPath
+	exec := &webhookExecutor{doer: nilRequestDoer{
+		status: http.StatusNotFound,
+		body:   "no such webhook: " + secretWebhookPath,
+	}}
+	_, err := exec.Execute(context.Background(), StageInput{
+		Stage: &Stage{
+			ID:     "notify",
+			Type:   StageTypeWebhook,
+			URL:    secretURL,
+			Body:   map[string]any{"text": "done"},
+			Output: "out.txt",
+		},
+		RunDir: t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("expected the 404 to fail the stage")
+	}
+	if strings.Contains(err.Error(), secretWebhookPath) {
+		t.Errorf("the scrub depended on the transport populating resp.Request: %v", err)
+	}
+	if !strings.Contains(err.Error(), "HTTP 404") {
+		t.Errorf("stage error lost the status: %v", err)
+	}
+}
+
+// TestWebhookExecutor_RedirectTargetQuotedInABodyIsScrubbed covers the
+// URL the stage never rendered. http.Client follows redirects, so the
+// body that comes back is written by a host we did not address, about a
+// URL we did not build — and a scrubber keyed only on the stage's own
+// string cannot match it. The URL actually requested is on
+// resp.Request, which is where this has to read it from.
+func TestWebhookExecutor_RedirectTargetQuotedInABodyIsScrubbed(t *testing.T) {
+	const redirectedSecretPath = "/forwarded/9f3c0a1b-session-token-0000"
+	final := echoingServer(t, http.StatusNotFound)
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, final.URL+redirectedSecretPath, http.StatusTemporaryRedirect)
+	}))
+	defer front.Close()
+
+	_, err := (&webhookExecutor{}).Execute(context.Background(), StageInput{
+		Stage: &Stage{
+			ID:     "notify",
+			Type:   StageTypeWebhook,
+			URL:    front.URL + secretWebhookPath,
+			Body:   map[string]any{"text": "done"},
+			Output: "out.txt",
+		},
+		RunDir: t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("expected the redirected 404 to fail the stage")
+	}
+	if strings.Contains(err.Error(), redirectedSecretPath) {
+		t.Errorf("stage error carries the redirect target the stage never rendered: %v", err)
+	}
+	if !strings.Contains(err.Error(), "HTTP 404") {
+		t.Errorf("stage error lost the status: %v", err)
+	}
+}
+
+// TestWebhookExecutor_EchoedCredentialHeaderIsScrubbed covers the other
+// half of "we sent it, they said it back". The `env` template helper
+// exists precisely so a webhook's bearer travels in a header instead of
+// the YAML, and debug/gateway endpoints echo request headers into their
+// error bodies. The scrub is keyed on the header NAME, so this asserts
+// both halves: the credential-named value goes, an ordinary one stays.
+func TestWebhookExecutor_EchoedCredentialHeaderIsScrubbed(t *testing.T) {
+	const secretToken = "Bearer xoxb-0000-0000-fake-not-a-real-token"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprintf(w, "bad credentials; received Authorization=%q X-Vamp-Pipeline=%q",
+			r.Header.Get("Authorization"), r.Header.Get("X-Vamp-Pipeline"))
+	}))
+	defer srv.Close()
+
+	_, err := (&webhookExecutor{}).Execute(context.Background(), StageInput{
+		Stage: &Stage{
+			ID:   "notify",
+			Type: StageTypeWebhook,
+			URL:  srv.URL + "/hook",
+			Headers: map[string]string{
+				"Authorization":   secretToken,
+				"X-Vamp-Pipeline": "demo-pipeline",
+			},
+			Body:   map[string]any{"text": "done"},
+			Output: "out.txt",
+		},
+		RunDir: t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("expected the 401 to fail the stage")
+	}
+	if strings.Contains(err.Error(), secretToken) {
+		t.Errorf("the echoed Authorization header carried the bearer into the stage error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "bad credentials") {
+		t.Errorf("stage error lost the server's own message: %v", err)
+	}
+	// Targeted, not blanket: scrubbing every value we sent would erase
+	// the ordinary headers an operator debugs with.
+	if !strings.Contains(err.Error(), "demo-pipeline") {
+		t.Errorf("scrubbing took a non-credential header with it: %v", err)
+	}
+}
+
+// TestWebhookExecutor_AssertFailureTextIsScrubbed covers the last
+// string this executor can return. The body checks echo the user's own
+// literals, and a pipeline asserting that an endpoint echoes its URL
+// back puts the credential in one — a narrower leak than the body
+// preview, included because the rule that stops this class recurring is
+// "no string leaves this executor unscrubbed", not "no string we
+// currently believe carries a secret".
+func TestWebhookExecutor_AssertFailureTextIsScrubbed(t *testing.T) {
+	srv := newWebhookTestServer(t) // defaults: 200, body "ok"
+	secretURL := srv.URL() + secretWebhookPath
+
+	_, err := (&webhookExecutor{}).Execute(context.Background(), StageInput{
+		Stage: &Stage{
+			ID:     "smoke",
+			Type:   StageTypeWebhook,
+			URL:    secretURL,
+			Body:   map[string]any{"text": "done"},
+			Assert: &AssertSpec{BodyContains: []string{secretWebhookPath}},
+			Output: "out.txt",
+		},
+		RunDir: t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("expected the body_contains check to fail")
+	}
+	if strings.Contains(err.Error(), secretWebhookPath) {
+		t.Errorf("the assert failure text quoted the webhook's secret path: %v", err)
+	}
+	if !strings.Contains(err.Error(), "body_contains") {
+		t.Errorf("stage error lost the name of the check that failed: %v", err)
+	}
+}
+
+// TestWebhookExecutor_FailureSummaryDoesNotPostTheCredential is the
+// whole chain, driven through the real Executor rather than asserted on
+// an error string: a webhook stage fails against a server that quotes
+// the request line, and a second `run_when: failure` webhook stage
+// posts {{ .failure_summary }} — which is what a real pipeline does —
+// to a channel. The assertion is on the bytes that left the process.
+func TestWebhookExecutor_FailureSummaryDoesNotPostTheCredential(t *testing.T) {
+	upstream := echoingServer(t, http.StatusNotFound)
+	secretURL := upstream.URL + secretWebhookPath
+
+	alert := newWebhookTestServer(t)
+
+	var logMu sync.Mutex
+	log := &lockedBuffer{mu: &logMu}
+	exec := &Executor{
+		Pipeline: &Pipeline{
+			Name: "leak_chain",
+			Stages: []Stage{
+				{ID: "post", Type: StageTypeWebhook, URL: secretURL,
+					Body: map[string]any{"text": "done"}, Output: "post.txt"},
+				{ID: "alert", Type: StageTypeWebhook, URL: alert.URL(),
+					Body:   map[string]any{"text": "run failed: {{ .failure_summary }}"},
+					Inputs: []string{"post"}, RunWhen: "failure", Output: "alert.txt"},
+			},
+		},
+		RunDir: t.TempDir(),
+		Log:    log,
+	}
+	if err := exec.Run(context.Background()); err == nil {
+		t.Fatal("expected the pipeline to fail on the 404")
+	} else if strings.Contains(err.Error(), secretWebhookPath) {
+		t.Errorf("the aggregated run error carries the webhook's secret path: %v", err)
+	}
+
+	req, ok := alert.lastRequest()
+	if !ok {
+		t.Fatal("the run_when: failure stage never fired; this test proves nothing without it")
+	}
+	posted := string(req.Body)
+	if strings.Contains(posted, secretWebhookPath) {
+		t.Errorf("the credential was POSTed into the notification channel:\n%s", posted)
+	}
+	// Without this the test would pass on a failure_summary that had
+	// been emptied rather than scrubbed.
+	if !strings.Contains(posted, "HTTP 404") {
+		t.Errorf("the notification lost the failure it exists to report:\n%s", posted)
+	}
+	logMu.Lock()
+	logged := log.buf.String()
+	logMu.Unlock()
+	if strings.Contains(logged, secretWebhookPath) {
+		t.Errorf("the run log — a file on disk under --detach — carries the secret path:\n%s", logged)
+	}
+}
+
+// lockedBuffer is a mutex-guarded io.Writer for tests that hand
+// Executor.Log a buffer: the runner writes to it from stage goroutines
+// and the deferred summary, and -race objects to an unguarded one.
+type lockedBuffer struct {
+	mu  *sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"text/template"
@@ -34,9 +35,20 @@ import (
 //     chat channel.
 //
 // internal/vibe/fleetnotify already closed exactly this trap for the
-// fleet notifier. Both redactions below call ITS code (Redact for the
+// fleet notifier. Every redaction below calls ITS code (Redact for the
 // loggable form, ScrubURL for arbitrary strings) rather than growing a
 // second implementation that can drift out of agreement with it.
+//
+// The URL is not the only credential a stage holds, and *url.Error is
+// not the only way one gets out. The FAR SIDE quotes us: an nginx 404
+// page echoes the request line, an API gateway echoes back the
+// Authorization header it rejected, and a redirect means the body that
+// comes back describes a URL this stage never rendered. All of that
+// arrives as ordinary prose in a response body, where unwrapping finds
+// nothing to unwrap — so the response phase is scrubbed as a WHOLE (see
+// scrubResponseError) rather than at the return sites someone
+// remembered. Fixing the sites is how this leak survived being fixed
+// twice already.
 
 // scrubbedError carries a message with the webhook URL removed while
 // keeping the original error reachable through Unwrap.
@@ -73,6 +85,108 @@ func scrubURLError(rawURL string, err error) error {
 		msg = ue.Err.Error()
 	}
 	return &scrubbedError{msg: fleetnotify.ScrubURL(rawURL, msg), cause: err}
+}
+
+// minScrubbableHeaderValue is the shortest header value worth removing
+// from a message. ScrubURL is a substring replacement at heart, so
+// scrubbing a one- or two-character value would redact the message
+// rather than the credential — `X-Api-Key: 1` would turn every "1" in a
+// server's error into "<redacted>". Nothing this short is a bearer for
+// any dialect this repo speaks (Slack, Discord and ntfy tokens are all
+// past twenty characters), so the floor costs no real coverage.
+const minScrubbableHeaderValue = 8
+
+// credentialHeaderMarkers are the substrings that make a header NAME one
+// whose VALUE must not survive into an error.
+//
+// Name-based, not blanket. Every header this executor sets is either
+// ours (Content-Type) or the user's, and the `env` template helper
+// exists precisely so a bearer travels in a header instead of the YAML
+// — but scrubbing every value we sent would erase "application/json"
+// from a body preview that says the server rejected exactly that, and a
+// preview full of "<redacted>" is a leak traded for an unusable error.
+// So the values that go are the ones the user NAMED as secrets:
+// Authorization, Proxy-Authorization, Cookie, X-Api-Key, X-Auth-Token,
+// X-Hub-Signature and every spelling around them.
+var credentialHeaderMarkers = []string{
+	"auth", "token", "key", "secret", "password", "cookie", "credential", "signature",
+}
+
+// credentialHeader reports whether name is a header whose value is a
+// bearer. Case-insensitive substring matching rather than an exact set:
+// the header name is user-supplied and the dialects are endless
+// (`X-Api-Key`, `Api-Key`, `X-Auth-Token`, `Xi-Api-Key`), and the cost
+// of a false positive is one redacted diagnostic string while the cost
+// of a false negative is a token in a chat channel.
+func credentialHeader(name string) bool {
+	lower := strings.ToLower(name)
+	for _, marker := range credentialHeaderMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// scrubResponseError removes every credential THIS request carried from
+// an error describing what came back, and is installed as a deferred
+// rewrite over the whole response phase rather than called at each
+// return.
+//
+// That shape is the fix, not an implementation detail. This leak has
+// been closed twice at the sites someone had in mind — the *url.Error
+// paths — and reopened both times by a site that formats far-side text
+// somewhere else: the non-2xx body preview, the assert.status_code
+// mismatch preview, the assert failure list. A deferred rewrite covers
+// the return added next year too.
+//
+// Three credentials, because a stage holds three:
+//
+//   - the URL it rendered. ScrubURL takes its PARTS as well as the whole
+//     string, which is what an echoed r.RequestURI (path+query, no
+//     scheme, no host) needs and what a `?auth=<token>` webhook with a
+//     bare "/" path needs.
+//   - the URL actually requested, off resp.Request. http.Client follows
+//     redirects, so the body that came back may describe a hop this
+//     stage never rendered and no scrubber keyed on the stage's own
+//     string can match. Same class as youtube_executor.go's resumable
+//     session URI: a URL handed out by the far side that IS an
+//     authorisation.
+//   - the credential-named request headers, because the far side echoes
+//     what it rejected.
+//
+// The chain is preserved through scrubbedError.Unwrap: the retry loop
+// reads a *transientHTTPError out of this with errors.As for its
+// Retry-After hint, and isRetryable's context.Canceled / net.Error
+// checks walk it too. Flattening to a string would silently turn a
+// ctrl-C into another attempt.
+func scrubResponseError(err error, reqURL string, resp *http.Response, headers map[string]string) error {
+	if err == nil {
+		return nil
+	}
+	msg := fleetnotify.ScrubURL(reqURL, err.Error())
+	if resp != nil && resp.Request != nil && resp.Request.URL != nil {
+		msg = fleetnotify.ScrubURL(resp.Request.URL.String(), msg)
+	}
+	// Sorted so two credential headers whose values overlap produce the
+	// same message on every run; map order would make the error text
+	// depend on the hash seed.
+	names := make([]string, 0, len(headers))
+	for name := range headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		// ScrubURL rather than a second replacement helper: its first
+		// act is a whole-string replace, and its part decomposition of
+		// something that is not a URL either fails to parse or yields
+		// that same string back, so it degrades exactly to "remove this
+		// value" — with the one redaction marker the repo already has.
+		if value := headers[name]; len(value) >= minScrubbableHeaderValue && credentialHeader(name) {
+			msg = fleetnotify.ScrubURL(value, msg)
+		}
+	}
+	return &scrubbedError{msg: msg, cause: err}
 }
 
 // transientHTTPError is the typed error a webhook stage returns when it
@@ -199,7 +313,11 @@ const maxWebhookErrorBody = 1024
 // transient-mode classification — so this executor just has to produce an
 // error string the runner's isRetryable() heuristic recognises (the
 // literal "HTTP 5xx" status form matches the http5xxRE regex).
-func (w *webhookExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput, error) {
+//
+// The result is named for one reason: everything after the response
+// arrives is rewritten by scrubResponseError on the way out. See its
+// doc for why that is a deferred rewrite and not a call at each return.
+func (w *webhookExecutor) Execute(ctx context.Context, in StageInput) (_ *StageOutput, retErr error) {
 	st := in.Stage
 	if st == nil {
 		return nil, errors.New("webhook: missing stage")
@@ -309,6 +427,15 @@ func (w *webhookExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 		return nil, fmt.Errorf("stage %s: request: %w", st.ID, scrubURLError(urlStr, err))
 	}
 	defer resp.Body.Close()
+
+	// The request went out; from here every error this function can
+	// return describes what the far side SAID, and what the far side
+	// says quotes us. Registered here rather than at the top of the
+	// function so the two transport returns above keep their own,
+	// differently-shaped redaction (scrubURLError has to unwrap
+	// *url.Error, which is structural and not a string problem) and
+	// stay pinned independently of this one.
+	defer func() { retErr = scrubResponseError(retErr, urlStr, resp, renderedHeaders) }()
 
 	respBody, _ := io.ReadAll(resp.Body)
 
