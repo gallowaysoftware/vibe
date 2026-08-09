@@ -1057,6 +1057,85 @@ var Registry = []Mutation{
 			"went red once in CI for a reason of its own making (C26b), and a guard people have " +
 			"learned to re-run is worse than no guard.",
 	},
+
+	// ── class 6: the retrieval plane's egress and its front door ──────
+	//
+	// vibe-search was verified end to end as an unauthenticated SSRF
+	// proxy: POST /fetch and MCP fetch_url returned the body of an
+	// internal service to a caller with no credential, followed a 302
+	// into one without re-checking the target, and accepted any Origin.
+	// The five entries below are the five guards that replaced that.
+	{
+		Name:    "search/the fetch dialer stops refusing non-global addresses",
+		File:    "internal/vibe/search/dialguard.go",
+		Find:    "\t\t\tif reason := blockedIPReason(ip); reason != \"\" {",
+		Replace: "\t\t\tif reason := \"\"; reason != \"\" {",
+		Pkg:     "./internal/vibe/search/",
+		MustFail: []string{
+			"TestDirectFetcherRefusesALoopbackTarget",
+			"TestFetchIsRefusedAtTheRedirectHopIntoThePrivateNetwork",
+			"TestEveryResolvedAddressIsChecked",
+			"TestPostFetchOfALoopbackURLIsRefused",
+		},
+		Why: "the one line between an LLM-supplied URL and every HTTP service the search host can " +
+			"reach — NAS and router admin pages, the registry, the other cells. The REDIRECT test is " +
+			"named alongside the direct one on purpose: it is what proves the check is at the dialer " +
+			"and not on the URL. Under this mutation the 302 into 127.0.0.1 is followed and the " +
+			"internal page comes back as the fetch result, which no URL-level allowlist would have " +
+			"caught, because net/http follows the hop with no second URL for anything to inspect.",
+	},
+	{
+		Name:     "search/the validated address is handed back to the resolver",
+		File:     "internal/vibe/search/dialguard.go",
+		Find:     "conn, dialErr := g.dialAddr(ctx, network, net.JoinHostPort(ip.String(), port))",
+		Replace:  "conn, dialErr := g.dialAddr(ctx, network, net.JoinHostPort(host, port))",
+		Pkg:      "./internal/vibe/search/",
+		MustFail: []string{"TestTheDialGoesToTheAddressThatWasChecked"},
+		Why: "DNS rebinding, and the reason resolve-then-dial-the-NAME is not a fix. Every predicate " +
+			"above this line still runs and every other test in the package still passes — the guard " +
+			"looks present, judges a public address, and then lets the OS resolve the name a second " +
+			"time on the way to the socket. A resolver that answers differently on the second lookup " +
+			"walks straight into the fleet's LAN with the verdict already recorded as clean.",
+	},
+	{
+		Name:     "search/private targets are permitted unless the operator forbids them",
+		File:     "internal/vibe/search/dialguard.go",
+		Find:     "func AllowPrivateFetch() bool { return os.Getenv(AllowPrivateEnv) == \"1\" }",
+		Replace:  "func AllowPrivateFetch() bool { return os.Getenv(AllowPrivateEnv) != \"0\" }",
+		Pkg:      "./internal/vibe/search/",
+		MustFail: []string{"TestPrivateFetchIsOffUnlessTheEnvSaysExactlyOne"},
+		Why: "the escape hatch's DEFAULT, which is the whole of its security value. Inverted like " +
+			"this the guard is still fully implemented and every dial test still passes, because the " +
+			"tests construct the fetcher directly — but no deployment that did not explicitly set " +
+			"VIBE_SEARCH_ALLOW_PRIVATE=0 has a guard at all. An opt-out that reads a stray or absent " +
+			"value as ON is indistinguishable from having shipped no opt-out.",
+	},
+	{
+		Name:     "search/a token-less start is allowed to serve",
+		File:     "cmd/vibe-search/main.go",
+		Find:     "\tif !noAuth {\n",
+		Replace:  "\tif false {\n",
+		Pkg:      "./cmd/vibe-search/",
+		MustFail: []string{"TestStartupRefusesToServeWithoutATokenUnlessNoAuth"},
+		Why: "the pre-fix default, restored exactly: no VIBE_SEARCH_TOKEN warns and then serves every " +
+			"route to everyone. It fails OPEN on the service whose documented deployment is " +
+			"--bind 0.0.0.0 beside the router, so any host on the LAN gets fetch_url and the search " +
+			"quota. The warning it replaced scrolled past once at boot and the service worked " +
+			"perfectly afterwards, which is why nobody ever went back and read it.",
+	},
+	{
+		Name:     "search/the MCP and fetch surfaces stop checking Origin",
+		File:     "internal/vibe/search/server.go",
+		Find:     "if origin := r.Header.Get(\"Origin\"); origin != \"\" && !isLoopbackOrigin(origin) {",
+		Replace:  "if origin := r.Header.Get(\"Origin\"); false && origin != \"\" && !isLoopbackOrigin(origin) {",
+		Pkg:      "./internal/vibe/search/",
+		MustFail: []string{"TestCrossOriginBrowserRequestIsRefused"},
+		Why: "a JSON-RPC body posted as text/plain is a CORS simple request, so a page the operator " +
+			"is merely looking at can drive /mcp on 127.0.0.1 with no preflight — and after a DNS " +
+			"rebind the browser treats the reply as same-origin, so CORS stops withholding it. The " +
+			"Origin header is the one signal that survives the rebind, which is why MCP's own " +
+			"transport spec requires this check on every streamable-HTTP server.",
+	},
 }
 
 // ── tree copying and patching ────────────────────────────────────────

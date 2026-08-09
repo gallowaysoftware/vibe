@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -76,7 +78,59 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/fetch", s.handleFetch)
 	mux.HandleFunc("/mcp", s.handleMCP)
 	mux.HandleFunc("/healthz", s.handleHealth)
-	return s.withAuth(mux)
+	// Origin outside auth: a browser request from somewhere else is refused
+	// before the credential is even looked at, and /healthz — exempt from
+	// auth so a supervisor can probe it — is NOT exempt from this, because a
+	// readiness probe never carries an Origin and a rebound page does.
+	return s.withOriginGuard(s.withAuth(mux))
+}
+
+// withOriginGuard refuses any request carrying a browser Origin that is not
+// this machine.
+//
+// Does a JSON service on loopback have a browser threat model at all? Yes,
+// and it is the one MCP's own streamable-HTTP transport calls out. A page
+// the operator is merely LOOKING AT can POST a JSON-RPC body to
+// 127.0.0.1:14003 with no preflight — send it as text/plain and it is a CORS
+// "simple request", and nothing here inspects Content-Type. CORS then stops
+// the attacker READING the reply… until DNS rebinding, at which point the
+// browser believes the response is same-origin and CORS protects nothing.
+// That is the whole exfiltration path for `fetch_url`, and the reason this
+// is a real control rather than ceremony.
+//
+// The Origin header is what survives rebinding: it still names the page's
+// ORIGINAL origin, because the browser stamps it at request time from the
+// document, not from DNS. So the rule is: absent Origin is fine, present
+// Origin must be loopback. Non-browser clients — curl, an MCP harness, a
+// harness's native SearXNG path — send none and are unaffected, which is why
+// this needs no flag and no allowlist to configure.
+func (s *Server) withOriginGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if origin := r.Header.Get("Origin"); origin != "" && !isLoopbackOrigin(origin) {
+			s.logger().Warn("refused a cross-origin request",
+				"origin", origin, "path", r.URL.Path, "method", r.Method)
+			http.Error(w, "forbidden: cross-origin browser request", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isLoopbackOrigin reports whether an Origin header names a page served from
+// this machine. Anything unparseable is not loopback — `Origin: null`, which
+// a sandboxed iframe or a file:// document sends, has no host and must be
+// refused rather than treated as absent.
+func isLoopbackOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := u.Hostname()
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // withAuth enforces the bearer token when one is configured. /healthz stays

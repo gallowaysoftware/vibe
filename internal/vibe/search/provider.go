@@ -130,6 +130,12 @@ var ErrUnauthorized = errors.New("upstream rejected the credential")
 type Options struct {
 	APIKey      string
 	UpstreamURL string
+	// AllowPrivateFetch turns the direct fetcher's non-global address guard
+	// off. Ignored by every other provider — see dialguard.go for why the
+	// guard is scoped to the one fetcher whose target an attacker picks.
+	// The zero value is the safe one on purpose: a caller that forgets this
+	// field gets the guard.
+	AllowPrivateFetch bool
 }
 
 // NewProvider builds a search provider by id. The id set is closed rather
@@ -167,7 +173,7 @@ func NewFetcher(id string, o Options) (Fetcher, error) {
 		}
 		return newTavily(o.APIKey), nil
 	case "direct":
-		return newDirectFetcher(), nil
+		return newDirectFetcher(o.AllowPrivateFetch), nil
 	default:
 		return nil, fmt.Errorf("unknown fetcher %q (known: tavily, direct)", id)
 	}
