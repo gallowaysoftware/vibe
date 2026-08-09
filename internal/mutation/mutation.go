@@ -1042,6 +1042,91 @@ var Registry = []Mutation{
 			"went red once in CI for a reason of its own making (C26b), and a guard people have " +
 			"learned to re-run is worse than no guard.",
 	},
+
+	// ── class 8: a contract between two packages that only prose held ─
+	//
+	// The four entries below pin one chain end to end: the daemon emits a
+	// typed refusal, vibeclient classifies it, and vamp's candidate walk
+	// acts on it. It is registered because the chain has ALREADY broken
+	// once in exactly the way a registry catches and a review does not.
+	//
+	// vibeclient.IsVRAMRejection used to substring-match the daemon's
+	// human-facing pre-flight message for "free VRAM". 4a4c5ea rewrote
+	// that message AND deleted the condition that emitted it — short of
+	// free memory became a slog.Warn — so from that commit forward no
+	// code path in the tree produced a string the classifier could match.
+	// Every capability with N>1 candidates silently degraded to
+	// candidate-1-or-abort, and candidates 2..N of capabilities.yaml were
+	// dead config for as long as nobody read the daemon and the client in
+	// the same sitting.
+	//
+	// CI stayed green throughout, because each of the two covering tests
+	// CONSTRUCTED the daemon message it then asserted on. That is the
+	// whole lesson: a test that mints its own input proves the matcher
+	// matches itself. These entries assert the opposite property — break
+	// the sender, and the receiver's test goes red.
+	{
+		Name:    "vram/the start refusal loses its typed reason",
+		File:    "internal/vibe/daemon/rejection.go",
+		Find:    "\tce.AddDetail(d)\n\treturn ce",
+		Replace: "\t_ = d\n\treturn ce",
+		Pkg:     "./internal/vibe/daemon/",
+		MustFail: []string{
+			"TestDaemon_VRAMCheck_ExceedsCapacity",
+			"TestDaemon_VRAMCheck_StrictRefusesInsufficientFree",
+			"TestDaemon_VRAMCheck_ARefusalDoesNotBlockTheNextCandidate",
+		},
+		Why: "THE producer→classifier entry. Both named tests drive a real daemon over a real Connect " +
+			"socket and ask vibeclient to classify what came back, so a refusal that stops carrying " +
+			"its typed reason goes red at the receiver. Without this, the refusal degrades to prose " +
+			"only — which is precisely the state the tree was in from 4a4c5ea until this was fixed, " +
+			"and in that state vamp's candidate walk cannot tell 'try a smaller model' from 'your " +
+			"config is broken' and aborts the pipeline on both.",
+	},
+	{
+		Name:    "vram/the strict pre-flight stops refusing a short free read",
+		File:    "internal/vibe/daemon/daemon.go",
+		Find:    "\t\tcase res.Warn && req.Msg.StrictVram:",
+		Replace: "\t\tcase res.Warn && req.Msg.StrictVram && false:",
+		Pkg:     "./internal/vibe/daemon/",
+		MustFail: []string{
+			"TestDaemon_VRAMCheck_StrictRefusesInsufficientFree",
+			"TestDaemon_VRAMCheck_ARefusalDoesNotBlockTheNextCandidate",
+		},
+		Why: "this branch IS the rejection class. Delete it and insufficient free memory is a warning " +
+			"for everyone again — the 4a4c5ea state, in which the one case vamp's biggest-first walk " +
+			"exists for ('another model is resident') can never fire, so a capability's second " +
+			"candidate is unreachable no matter what the classifier does. Its twin " +
+			"TestDaemon_VRAMCheck_StrictIsOptInOnly stays GREEN under this mutation on purpose: the " +
+			"pair is what distinguishes an opt-in from a restored hard failure.",
+	},
+	{
+		Name:     "vram/the candidate walk stops asking for a strict pre-flight",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\topts := vibeclient.StartOptions{StrictVRAM: i < len(candidates)-1}",
+		Replace:  "\t\topts := vibeclient.StartOptions{StrictVRAM: i < 0}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestExecutor_VRAMFallbackPicksNextCandidate"},
+		Why: "the consumer's half. The daemon's default is warn-don't-block, so a walk that never asks " +
+			"to be refused gets a successful start from candidate 1 every time and never reaches the " +
+			"smaller model behind it — green, silent, and identical in behaviour to having no " +
+			"candidate list at all. `i < 0` rather than `false` because an unused range variable does " +
+			"not compile, and a mutation that does not build proves nothing.",
+	},
+	{
+		Name:     "vram/strictness is applied to the last candidate too",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\topts := vibeclient.StartOptions{StrictVRAM: i < len(candidates)-1}",
+		Replace:  "\t\topts := vibeclient.StartOptions{StrictVRAM: i >= 0}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestExecutor_SingleCandidateIsNotAskedForAStrictPreFlight"},
+		Why: "the over-correction, which is the likelier future edit — 'why not just always be strict?' " +
+			"reads as a simplification. Strictness is only ever paid for by having somewhere else to " +
+			"go; applied to the last candidate it converts every tight-but-workable pipeline start " +
+			"into a dead pipeline, which is the false-negative behaviour 4a4c5ea removed on measured " +
+			"evidence (the same profile on the same box read 15.2 and 23.5 GiB free minutes apart). " +
+			"Same Find as the entry above, opposite direction: one guards the floor, one the ceiling.",
+	},
 }
 
 // ── tree copying and patching ────────────────────────────────────────

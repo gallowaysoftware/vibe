@@ -1043,34 +1043,49 @@ func (e *Executor) runGroup(ctx context.Context, capability string, group []*Sta
 
 // activateCapability walks the capability's candidate list in declared order
 // (biggest first). It stops on the first candidate that activates; skips on
-// a VRAM rejection (the daemon's FailedPrecondition pre-flight error) so it
-// can fall back to a smaller profile; and aborts on any other error so
+// a memory rejection (the daemon's typed StartRejection pre-flight detail) so
+// it can fall back to a smaller profile; and aborts on any other error so
 // genuine failures aren't silently re-tried against a different profile.
 // Returns the winning activation's status plus the candidate name.
+//
+// Every candidate but the last is asked for a STRICT pre-flight. That is
+// what makes the walk mean anything: the daemon's default is
+// warn-don't-block on a short free read (4a4c5ea — free memory moves, and
+// refusing a human's `vibe start` on it produced false negatives), so
+// without asking, "another model is resident" never refuses and the walk
+// can only ever land on candidate 1. The LAST candidate is asked the
+// ordinary way on purpose — there is nothing behind it to fall back to, so
+// refusing it would convert a start that usually works into a dead
+// pipeline. Only a genuine exceeds-capacity verdict stops the last one.
 func (e *Executor) activateCapability(ctx context.Context, capability string) (*vibev1.Status, string, error) {
 	candidates, err := e.Capabilities.Profiles(capability)
 	if err != nil {
 		return nil, "", err
 	}
 	var lastErr error
-	for _, cand := range candidates {
+	for i, cand := range candidates {
 		if len(candidates) > 1 {
 			e.logf("  -> activating backend %q (candidate for %q)", cand, capability)
 		} else {
 			e.logf("  -> activating backend %q", cand)
 		}
+		opts := vibeclient.StartOptions{StrictVRAM: i < len(candidates)-1}
 		// Capability candidates name a BACKEND (backends/<name>.yaml), not a
 		// frontend-bearing profile — vamp depends on the model, not the UI.
-		st, actErr := e.Vibe.EnsureBackendActive(ctx, cand)
+		st, actErr := e.Vibe.EnsureBackendActiveWithOptions(ctx, cand, opts)
 		if actErr != nil && vibeclient.IsNotFound(actErr) {
 			// No backend by that name: fall back to treating the candidate as a
 			// profile name. Keeps pre-backend capabilities.yaml files working.
 			e.logf("  -> no backend %q; falling back to profile activation", cand)
-			st, actErr = e.Vibe.EnsureActive(ctx, cand)
+			st, actErr = e.Vibe.EnsureActiveWithOptions(ctx, cand, opts)
 		}
 		if actErr != nil {
-			if vibeclient.IsVRAMRejection(actErr) {
-				e.logf("  -> skipping %q: %s", cand, actErr.Error())
+			if rej, ok := vibeclient.VRAMRejection(actErr); ok {
+				// Name the typed reason, not just the daemon's prose: an
+				// operator reading the log after the fact needs to tell
+				// "too big for this box" from "busy right now", and those
+				// two want different fixes.
+				e.logf("  -> skipping %q [%s]: %s", cand, vramReasonLabel(rej), actErr.Error())
 				lastErr = fmt.Errorf("activate %q: %w", cand, actErr)
 				continue
 			}
@@ -1094,6 +1109,20 @@ func (e *Executor) activateCapability(ctx context.Context, capability string) (*
 	// still sees a useful "needs N GiB" message rather than a vague "no
 	// candidates fit".
 	return nil, "", lastErr
+}
+
+// vramReasonLabel renders the daemon's typed refusal reason for the run
+// log. Derived from the enum, so a reason this build does not know is
+// reported as unknown rather than guessed at.
+func vramReasonLabel(rej *vibev1.StartRejection) string {
+	switch rej.GetReason() {
+	case vibev1.StartRejection_REASON_VRAM_EXCEEDS_CAPACITY:
+		return "vram: exceeds this machine's capacity"
+	case vibev1.StartRejection_REASON_VRAM_INSUFFICIENT_FREE:
+		return "vram: insufficient free memory"
+	default:
+		return "vram: unspecified"
+	}
 }
 
 // freeProfileIfRequested stops the active vibe profile (unloading the LLM and

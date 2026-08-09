@@ -983,7 +983,40 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 				"estimated_gib", p.EstimatedVRAMGB,
 				"total_gib", res.TotalGiB,
 				"free_gib", res.FreeGiB)
-			return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New(msg))
+			total := res.TotalGiB
+			return nil, startRejection(msg, &vibev1.StartRejection{
+				Reason:       vibev1.StartRejection_REASON_VRAM_EXCEEDS_CAPACITY,
+				Profile:      p.Name,
+				EstimatedGib: p.EstimatedVRAMGB,
+				FreeGib:      res.FreeGiB,
+				TotalGib:     &total,
+			})
+		case res.Warn && req.Msg.StrictVram:
+			// The caller declared it has somewhere else to go (vamp's
+			// candidate walk, mid-list), so the short read becomes a
+			// refusal FOR THAT CALLER only — which is the whole point of
+			// the walk: another model being resident is exactly the case
+			// a smaller candidate is meant to absorb. The default caller
+			// still falls through to the warning below; 4a4c5ea's
+			// warn-don't-block verdict is about a human at `vibe start`,
+			// and it is untouched.
+			//
+			// Refusing is not evicting. The pre-flight OBSERVES free
+			// memory and reports; it never stops another tenant to make
+			// room. Residency stays llama-swap's.
+			msg := fmt.Sprintf(
+				"profile %q needs ~%.1f GiB but only %.1f GiB is free right now.\nRefused because the caller asked for a strict pre-flight; free memory or let it fall back to a smaller candidate.",
+				p.Name, p.EstimatedVRAMGB, res.FreeGiB)
+			slog.Warn("vram pre-flight refused (strict)",
+				"profile", p.Name,
+				"estimated_gib", p.EstimatedVRAMGB,
+				"free_gib", res.FreeGiB)
+			return nil, startRejection(msg, &vibev1.StartRejection{
+				Reason:       vibev1.StartRejection_REASON_VRAM_INSUFFICIENT_FREE,
+				Profile:      p.Name,
+				EstimatedGib: p.EstimatedVRAMGB,
+				FreeGib:      res.FreeGiB,
+			})
 		case res.Warn:
 			// Tight, not impossible: free memory moves (page cache, another
 			// tenant exiting), so this proceeds and says so rather than

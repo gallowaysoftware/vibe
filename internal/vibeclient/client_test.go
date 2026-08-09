@@ -303,13 +303,49 @@ func TestClient_NoTokenMeansNoHeader(t *testing.T) {
 	}
 }
 
-// TestIsVRAMRejection covers the heuristic vamp uses to tell a VRAM
-// pre-flight rejection apart from any other FailedPrecondition (e.g. "no
-// profile is active"). The dual check (code + message substring) is
-// deliberate: vamp will only fall back to a smaller candidate on a true
-// VRAM rejection, so this matcher decides whether a candidate gets
-// skipped or the whole pipeline aborts.
+// rejectionErr builds a Connect error carrying the typed StartRejection
+// detail, the way the daemon does. It exists to enumerate cases the
+// daemon does not currently produce (an unknown reason, a detail under a
+// different code) — the ones it DOES produce are asserted against the
+// real daemon in internal/vibe/daemon's TestDaemon_VRAMCheck_* tests,
+// which is where the producer→classifier contract actually lives. This
+// helper deliberately builds a typed message and never a prose string:
+// the previous version of this test minted the daemon's sentence and
+// then matched on it, which is why nobody noticed when 4a4c5ea changed
+// the sentence and deleted the condition that emitted it.
+func rejectionErr(t *testing.T, code connect.Code, msg string, detail *vibev1.StartRejection) error {
+	t.Helper()
+	ce := connect.NewError(code, errors.New(msg))
+	d, err := connect.NewErrorDetail(detail)
+	if err != nil {
+		t.Fatalf("build error detail: %v", err)
+	}
+	ce.AddDetail(d)
+	return ce
+}
+
+// TestIsVRAMRejection is the discrimination table: which errors vamp's
+// candidate walk may skip past, and which must abort the pipeline. It
+// asserts on the TYPED detail only — see rejectionErr.
+//
+// The two cases that matter most are the ones that would have caught the
+// original defect: a FailedPrecondition whose prose reads exactly like
+// the old pre-flight message but carries no detail is NOT a rejection,
+// and a rejection with no such prose IS one.
 func TestIsVRAMRejection(t *testing.T) {
+	insufficient := &vibev1.StartRejection{
+		Reason:       vibev1.StartRejection_REASON_VRAM_INSUFFICIENT_FREE,
+		Profile:      "code",
+		EstimatedGib: 24,
+		FreeGib:      8,
+	}
+	exceeds := &vibev1.StartRejection{
+		Reason:       vibev1.StartRejection_REASON_VRAM_EXCEEDS_CAPACITY,
+		Profile:      "code",
+		EstimatedGib: 128,
+		FreeGib:      1,
+	}
+
 	cases := []struct {
 		name string
 		err  error
@@ -321,15 +357,29 @@ func TestIsVRAMRejection(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "real VRAM rejection",
+			name: "insufficient free memory, strict caller",
+			err:  rejectionErr(t, connect.CodeFailedPrecondition, "needs more than is free right now", insufficient),
+			want: true,
+		},
+		{
+			name: "exceeds the machine's capacity",
+			err:  rejectionErr(t, connect.CodeFailedPrecondition, "will never fit on this box", exceeds),
+			want: true,
+		},
+		{
+			// The regression case. This is verbatim the message the
+			// classifier used to grep for, and it must no longer be
+			// enough on its own — a producer that stops attaching the
+			// detail has to go red somewhere.
+			name: "the old prose with no detail",
 			err: connect.NewError(
 				connect.CodeFailedPrecondition,
 				errors.New(`profile "code" needs ~24.0 GiB free VRAM but only 8.0 GiB is free.`),
 			),
-			want: true,
+			want: false,
 		},
 		{
-			name: "FailedPrecondition but unrelated message",
+			name: "FailedPrecondition with no detail",
 			err: connect.NewError(
 				connect.CodeFailedPrecondition,
 				errors.New("no profile is active"),
@@ -337,19 +387,29 @@ func TestIsVRAMRejection(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "right message wrong code",
-			err: connect.NewError(
-				connect.CodeInternal,
-				errors.New("free VRAM probe failed"),
-			),
+			// A reason this build does not recognise is not a memory
+			// rejection. Skipping a candidate on an unknown reason would
+			// mean guessing that a future SLOT_HELD or NOT_STAGED is
+			// safe to retry past, which is the caller's decision to make
+			// deliberately when it teaches itself the new value.
+			name: "unspecified reason",
+			err: rejectionErr(t, connect.CodeFailedPrecondition, "refused",
+				&vibev1.StartRejection{Profile: "code"}),
 			want: false,
 		},
 		{
+			// The detail is the contract, not the code. A rejection that
+			// arrives under a different code is still a rejection; the
+			// classifier deliberately does not require both, because two
+			// couplings rot independently and that is how we got here.
+			name: "detail under a different code",
+			err:  rejectionErr(t, connect.CodeResourceExhausted, "refused", insufficient),
+			want: true,
+		},
+		{
 			name: "wrapped connect error",
-			err: fmt.Errorf("activate: %w", connect.NewError(
-				connect.CodeFailedPrecondition,
-				errors.New(`needs 24.0 GiB free VRAM`),
-			)),
+			err: fmt.Errorf("activate %q: %w", "code",
+				rejectionErr(t, connect.CodeFailedPrecondition, "refused", insufficient)),
 			want: true,
 		},
 		{
@@ -365,6 +425,77 @@ func TestIsVRAMRejection(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestVRAMRejectionSurvivesTheWire proves the detail is readable by a
+// real client after a real Connect round trip, not merely by the process
+// that built it. A detail that marshalled but did not travel would leave
+// the classifier answering false in production while every in-process
+// test passed — the same shape of blind spot as the string match, one
+// layer down.
+//
+// The numbers are asserted too: a candidate walk that can classify the
+// refusal but cannot report what it cost is only half useful.
+func TestVRAMRejectionSurvivesTheWire(t *testing.T) {
+	want := &vibev1.StartRejection{
+		Reason:       vibev1.StartRejection_REASON_VRAM_INSUFFICIENT_FREE,
+		Profile:      "code",
+		EstimatedGib: 24,
+		FreeGib:      8.25,
+	}
+	mux := http.NewServeMux()
+	path, handler := vibev1connect.NewControlServiceHandler(&rejectingControl{rej: want})
+	mux.Handle(path, handler)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := NewWithHTTPClient(srv.URL, srv.Client(), "")
+	_, err := c.StartWithOptions(context.Background(), "code", StartOptions{StrictVRAM: true})
+	if err == nil {
+		t.Fatal("Start: expected the handler's refusal, got nil")
+	}
+	got, ok := VRAMRejection(err)
+	if !ok {
+		t.Fatalf("VRAMRejection lost the detail across the wire: %v", err)
+	}
+	if got.GetReason() != want.GetReason() {
+		t.Errorf("reason = %v, want %v", got.GetReason(), want.GetReason())
+	}
+	if got.GetProfile() != want.GetProfile() {
+		t.Errorf("profile = %q, want %q", got.GetProfile(), want.GetProfile())
+	}
+	if got.GetEstimatedGib() != want.GetEstimatedGib() {
+		t.Errorf("estimated_gib = %v, want %v", got.GetEstimatedGib(), want.GetEstimatedGib())
+	}
+	if got.GetFreeGib() != want.GetFreeGib() {
+		t.Errorf("free_gib = %v, want %v", got.GetFreeGib(), want.GetFreeGib())
+	}
+	if got.TotalGib != nil {
+		t.Errorf("total_gib = %v, want absent — an unset optional must not arrive as a zero", *got.TotalGib)
+	}
+}
+
+// rejectingControl answers Start with a typed rejection and everything
+// else with Unimplemented. It also records whether the caller asked for
+// a strict pre-flight, so the wire test proves the request flag travels
+// as well as the error detail.
+type rejectingControl struct {
+	vibev1connect.UnimplementedControlServiceHandler
+	rej *vibev1.StartRejection
+}
+
+func (s *rejectingControl) Start(_ context.Context, req *connect.Request[vibev1.StartRequest]) (*connect.Response[vibev1.StartResponse], error) {
+	if !req.Msg.GetStrictVram() {
+		return nil, connect.NewError(connect.CodeInvalidArgument,
+			errors.New("strict_vram did not reach the handler: the request half of the contract is broken"))
+	}
+	ce := connect.NewError(connect.CodeFailedPrecondition, errors.New("refused"))
+	d, err := connect.NewErrorDetail(s.rej)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	ce.AddDetail(d)
+	return nil, ce
 }
 
 // TestClient_TCPRejectsMissingTokenAgainstSecuredHandler proves a client

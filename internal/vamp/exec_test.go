@@ -2352,17 +2352,43 @@ func TestRunWhen_TemplateBadShape(t *testing.T) {
 	}
 }
 
+// startCall is one Start the executor made, and whether it asked for a
+// strict pre-flight. The flag is half the contract: without it the
+// daemon warns and proceeds on a short free read, so a walk that never
+// sets it can only ever land on candidate 1.
+type startCall struct {
+	name   string
+	strict bool
+}
+
 // vramFallbackControl is a ControlServiceHandler tuned for the candidate
-// fallback test. It rejects Start for any profile whose name appears in
-// rejectProfiles with the daemon's well-known VRAM precondition error;
-// other profiles succeed. Records every Start call so the test can verify
-// the executor walked the candidate list in order.
+// fallback tests. It reproduces the daemon's ACTUAL pre-flight verdicts
+// rather than a message shaped like one:
+//
+//   - a name in shortOfFree is short of currently-free memory. That is a
+//     refusal only when the caller asked for a strict pre-flight, and a
+//     warning-and-proceed otherwise — daemon.go's `case res.Warn &&
+//     req.Msg.StrictVram` and the `case res.Warn` below it.
+//   - a name in exceedsCapacity is bigger than the machine. That refuses
+//     every caller, strict or not.
+//
+// Both refusals carry the typed vibev1.StartRejection detail, because
+// that is what vibeclient.IsVRAMRejection reads. The previous version of
+// this stub returned a hand-written sentence containing "free VRAM" and
+// a comment explaining that the classifier grepped for that substring;
+// it kept passing for the four months in which no daemon anywhere
+// emitted the string, which is the defect this file now guards.
+//
+// Records every Start call so the tests can verify both the order of the
+// walk and what it asked for at each rung.
 type vramFallbackControl struct {
 	mu              sync.Mutex
 	profile         string
 	proxyURL        string
-	rejectProfiles  map[string]bool
+	shortOfFree     map[string]bool
+	exceedsCapacity map[string]bool
 	startedProfiles []string
+	startCalls      []startCall
 }
 
 func (s *vramFallbackControl) Status(_ context.Context, _ *connect.Request[vibev1.StatusRequest]) (*connect.Response[vibev1.StatusResponse], error) {
@@ -2374,29 +2400,60 @@ func (s *vramFallbackControl) Status(_ context.Context, _ *connect.Request[vibev
 }
 func (s *vramFallbackControl) Start(_ context.Context, req *connect.Request[vibev1.StartRequest]) (*connect.Response[vibev1.StartResponse], error) {
 	// Capability activation now names a backend; fall back to Profile for the
-	// interactive path. rejectProfiles is keyed on the candidate name.
+	// interactive path. The verdict maps are keyed on the candidate name.
 	name := req.Msg.Profile
 	if req.Msg.Backend != "" {
 		name = req.Msg.Backend
 	}
+	strict := req.Msg.GetStrictVram()
+
+	var detail *vibev1.StartRejection
+	switch {
+	case s.exceedsCapacity[name]:
+		total := 16.0
+		detail = &vibev1.StartRejection{
+			Reason:       vibev1.StartRejection_REASON_VRAM_EXCEEDS_CAPACITY,
+			Profile:      name,
+			EstimatedGib: 24,
+			FreeGib:      8,
+			TotalGib:     &total,
+		}
+	case s.shortOfFree[name] && strict:
+		detail = &vibev1.StartRejection{
+			Reason:       vibev1.StartRejection_REASON_VRAM_INSUFFICIENT_FREE,
+			Profile:      name,
+			EstimatedGib: 24,
+			FreeGib:      8,
+		}
+	}
+
 	s.mu.Lock()
 	s.startedProfiles = append(s.startedProfiles, name)
-	reject := s.rejectProfiles[name]
-	if !reject {
+	s.startCalls = append(s.startCalls, startCall{name: name, strict: strict})
+	if detail == nil {
 		s.profile = name
 	}
 	s.mu.Unlock()
-	if reject {
-		// Mirror the daemon's pre-flight VRAM rejection: same code
-		// (FailedPrecondition) and the "free VRAM" substring that
-		// vibeclient.IsVRAMRejection looks for.
-		return nil, connect.NewError(
-			connect.CodeFailedPrecondition,
-			fmt.Errorf(`profile %q needs ~24.0 GiB free VRAM but only 8.0 GiB is free`, name),
-		)
+
+	if detail != nil {
+		ce := connect.NewError(connect.CodeFailedPrecondition,
+			fmt.Errorf("profile %q needs ~24.0 GiB, refused by the pre-flight", name))
+		d, err := connect.NewErrorDetail(detail)
+		if err != nil {
+			return nil, connect.NewError(connect.CodeInternal, err)
+		}
+		ce.AddDetail(d)
+		return nil, ce
 	}
 	r, _ := s.Status(context.TODO(), nil)
 	return connect.NewResponse(&vibev1.StartResponse{Status: r.Msg.Status}), nil
+}
+
+// calls returns a copy of the recorded Start calls.
+func (s *vramFallbackControl) calls() []startCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]startCall(nil), s.startCalls...)
 }
 func (s *vramFallbackControl) Stop(_ context.Context, _ *connect.Request[vibev1.StopRequest]) (*connect.Response[vibev1.StopResponse], error) {
 	s.mu.Lock()
@@ -2427,15 +2484,23 @@ func (s *vramFallbackControl) Pull(_ context.Context, _ *connect.Request[vibev1.
 }
 
 // TestExecutor_VRAMFallbackPicksNextCandidate runs the executor against a
-// capability with two candidates [code, code_small]. The daemon rejects the
-// first with the well-known VRAM FailedPrecondition error; the second
-// succeeds. The executor must:
-//  1. attempt candidate 1, see the VRAM rejection,
-//  2. fall back to candidate 2 (the smaller fit) and activate it,
-//  3. write a "skipping <candidate>" line to the run log so the operator
-//     can tell from after-the-fact log inspection that fallback fired.
+// capability with two candidates [code, code_small]. Candidate 1 is short
+// of currently-free memory — the "something else is resident right now"
+// case the whole walk exists for. The executor must:
+//  1. attempt candidate 1 asking for a STRICT pre-flight (without which
+//     the daemon warns and proceeds, and the walk never moves),
+//  2. see the typed rejection and fall back to candidate 2, asking for it
+//     the ordinary way because there is nothing behind it,
+//  3. write a "skipping <candidate>" line naming the typed reason, so the
+//     operator can tell "busy right now" from "too big for this box"
+//     after the fact.
+//
+// Step 1 is the end-to-end proof that candidate 2 is reachable at all.
+// Between 4a4c5ea and this change it was not: insufficient free memory
+// had stopped being an error, so candidate 1 always won or the pipeline
+// died, and candidates 2..N of every capability were dead config.
 func TestExecutor_VRAMFallbackPicksNextCandidate(t *testing.T) {
-	stub := &vramFallbackControl{rejectProfiles: map[string]bool{"code": true}}
+	stub := &vramFallbackControl{shortOfFree: map[string]bool{"code": true}}
 	mux := http.NewServeMux()
 	path, handler := vibev1connect.NewControlServiceHandler(stub)
 	mux.Handle(path, handler)
@@ -2472,12 +2537,20 @@ func TestExecutor_VRAMFallbackPicksNextCandidate(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	// Both candidates should have been attempted, in order.
-	stub.mu.Lock()
-	started := append([]string(nil), stub.startedProfiles...)
-	stub.mu.Unlock()
-	if len(started) != 2 || started[0] != "code" || started[1] != "code_small" {
-		t.Errorf("startedProfiles = %v, want [code code_small]", started)
+	// Both candidates should have been attempted, in order — and each with
+	// the pre-flight strictness its position calls for. Candidate 1 is
+	// asked strictly BECAUSE a smaller one is behind it; the last is not,
+	// because refusing it would only turn a start that usually works into
+	// a dead pipeline.
+	calls := stub.calls()
+	want := []startCall{{name: "code", strict: true}, {name: "code_small", strict: false}}
+	if len(calls) != len(want) {
+		t.Fatalf("Start calls = %+v, want %+v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Errorf("Start call %d = %+v, want %+v", i, calls[i], want[i])
+		}
 	}
 
 	// And the log must record the fallback in human-readable form so
@@ -2486,8 +2559,11 @@ func TestExecutor_VRAMFallbackPicksNextCandidate(t *testing.T) {
 	if !strings.Contains(logTxt, `skipping "code"`) {
 		t.Errorf("log missing skip notice for 'code': %s", logTxt)
 	}
-	if !strings.Contains(logTxt, "free VRAM") {
-		t.Errorf("log missing VRAM reason from the daemon: %s", logTxt)
+	// The typed reason, rendered from the enum — not a substring of the
+	// daemon's sentence. "Insufficient free memory" and "exceeds this
+	// machine's capacity" want different fixes from the operator.
+	if !strings.Contains(logTxt, "vram: insufficient free memory") {
+		t.Errorf("log missing the typed rejection reason: %s", logTxt)
 	}
 	if !strings.Contains(logTxt, `activating backend "code_small"`) {
 		t.Errorf("log missing activation notice for 'code_small': %s", logTxt)
@@ -2509,8 +2585,13 @@ func TestExecutor_VRAMFallbackPicksNextCandidate(t *testing.T) {
 // candidate VRAM-rejects, the executor surfaces the last error (so the
 // operator sees a real "needs N GiB" message) rather than silently
 // proceeding with no active profile.
+//
+// Both candidates exceed the machine's capacity here, deliberately: that
+// is the verdict that refuses regardless of strictness, so it is the only
+// way EVERY rung of the walk can fail — the last candidate is asked
+// non-strictly and a merely-short-of-free reading would let it through.
 func TestExecutor_VRAMFallbackAllCandidatesFail(t *testing.T) {
-	stub := &vramFallbackControl{rejectProfiles: map[string]bool{"code": true, "code_small": true}}
+	stub := &vramFallbackControl{exceedsCapacity: map[string]bool{"code": true, "code_small": true}}
 	mux := http.NewServeMux()
 	path, handler := vibev1connect.NewControlServiceHandler(stub)
 	mux.Handle(path, handler)
@@ -2537,8 +2618,69 @@ func TestExecutor_VRAMFallbackAllCandidatesFail(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when all candidates VRAM-reject")
 	}
-	if !strings.Contains(err.Error(), "free VRAM") {
-		t.Errorf("err = %v, want a 'free VRAM' message from the daemon", err)
+	// The LAST candidate's refusal is what surfaces, and it must still be
+	// classifiable after the executor's wrapping — a caller upstack that
+	// re-inspects it has to reach the same verdict this walk did.
+	if !strings.Contains(err.Error(), "code_small") {
+		t.Errorf("err = %v, want the last candidate's refusal", err)
+	}
+	rej, ok := vibeclient.VRAMRejection(err)
+	if !ok {
+		t.Fatalf("err = %v, want a classifiable rejection to survive the executor's wrapping", err)
+	}
+	if rej.GetReason() != vibev1.StartRejection_REASON_VRAM_EXCEEDS_CAPACITY {
+		t.Errorf("reason = %v, want REASON_VRAM_EXCEEDS_CAPACITY", rej.GetReason())
+	}
+}
+
+// TestExecutor_SingleCandidateIsNotAskedForAStrictPreFlight: a capability
+// with ONE candidate must be started the ordinary way, and a candidate
+// that is merely short of free memory must therefore still run.
+//
+// This is the guard on 4a4c5ea's verdict from vamp's side. Strictness is
+// only ever justified by having somewhere else to go; asking for it with
+// no fallback would convert every tight-but-workable pipeline start into
+// a hard failure, which is the false-negative behaviour 4a4c5ea removed
+// on the evidence that the same profile on the same box read 15.2 and
+// 23.5 GiB free minutes apart.
+func TestExecutor_SingleCandidateIsNotAskedForAStrictPreFlight(t *testing.T) {
+	stub := &vramFallbackControl{shortOfFree: map[string]bool{"code": true}}
+	mux := http.NewServeMux()
+	path, handler := vibev1connect.NewControlServiceHandler(stub)
+	mux.Handle(path, handler)
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]string{{"id": "stub-model"}}})
+	})
+	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]string{"content": "ok"}}},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	stub.proxyURL = srv.URL
+
+	caps := &Capabilities{Mapping: map[string]CapabilityBinding{
+		"reasoning": {Candidates: []string{"code"}},
+	}}
+	pipeline := &Pipeline{
+		Name: "vram-single-candidate",
+		Stages: []Stage{
+			{ID: "plan", Capability: "reasoning", Prompt: "hi", Output: "plan.txt"},
+		},
+	}
+	exec := &Executor{
+		Pipeline:     pipeline,
+		Capabilities: caps,
+		Vibe:         vibeclient.NewWithHTTPClient(srv.URL, srv.Client(), ""),
+		RunDir:       t.TempDir(),
+	}
+	if err := exec.Run(context.Background()); err != nil {
+		t.Fatalf("Run: a lone candidate short of free memory must still start, got: %v", err)
+	}
+	calls := stub.calls()
+	if len(calls) != 1 || calls[0] != (startCall{name: "code", strict: false}) {
+		t.Errorf("Start calls = %+v, want exactly [{code false}]", calls)
 	}
 }
 
@@ -2550,7 +2692,7 @@ func TestExecutor_VRAMFallbackAllCandidatesFail(t *testing.T) {
 func TestExecutor_VRAMFallbackAbortsOnNonVRAMError(t *testing.T) {
 	// custom handler that returns a non-VRAM FailedPrecondition for the
 	// first candidate, so the executor must NOT fall back.
-	stub := &vramFallbackControl{rejectProfiles: map[string]bool{}}
+	stub := &vramFallbackControl{shortOfFree: map[string]bool{}}
 	mux := http.NewServeMux()
 	path, handler := vibev1connect.NewControlServiceHandler(&abortControl{inner: stub})
 	mux.Handle(path, handler)
