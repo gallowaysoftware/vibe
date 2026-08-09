@@ -467,6 +467,115 @@ var Registry = []Mutation{
 			"printed there is the credential persisted at rest, which is how a leak survives the " +
 			"session that caused it.",
 	},
+	{
+		Name:     "vamp/a youtube upload stops scrubbing its session URI out of an error",
+		File:     "internal/vamp/youtube_executor.go",
+		Find:     "\t\treturn \"\", fmt.Errorf(\"upload PUT: %w\", scrubURLError(uploadURL, err))",
+		Replace:  "\t\treturn \"\", fmt.Errorf(\"upload PUT: %w\", err)",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestYouTubeExecutor_TransportErrorDoesNotCarryTheSessionURI", "TestYouTubeExecutor_SessionURIQuotedInAMessageIsScrubbed", "TestYouTubeExecutor_RedirectedSessionURIIsDropped"},
+		Why: "a resumable-upload session URI is CREDENTIAL-EQUIVALENT: whoever holds it can append " +
+			"to, complete or abort that upload without the access token that created it. This is " +
+			"the same trap as the webhook URL two entries up, arriving by the same two routes — " +
+			"*url.Error embeds the URL structurally, and a transport can quote it in its own prose " +
+			"— and reaching the same place, {{ .failure_summary }} in a run_when: failure webhook " +
+			"that posts it into a chat channel.",
+	},
+	{
+		Name:     "vamp/the run log prints the youtube session URI",
+		File:     "internal/vamp/youtube_executor.go",
+		Find:     "\t\tfmt.Fprintf(in.Log, \"youtube: uploading video bytes to %s\\n\", fleetnotify.Redact(uploadURL))",
+		Replace:  "\t\tfmt.Fprintf(in.Log, \"youtube: uploading video bytes to %s\\n\", uploadURL)",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestYouTubeExecutor_LogRecordsARedactedSessionURI"},
+		Why: "same persistence argument as the webhook log line: under --detach this is a FILE " +
+			"kept after the run. Redact rather than silence, because a foreach publishing twelve " +
+			"episodes still has to tell its twelve sessions apart.",
+	},
+
+	{
+		Name:     "vamp/every vamp subprocess loses its kill grace",
+		File:     "internal/vamp/subprocess.go",
+		Find:     "\tcmd.WaitDelay = subprocessKillGrace",
+		Replace:  "\tcmd.WaitDelay = 0",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestPandocCommand_DoesNotPutTheChildInItsOwnProcessGroup"},
+		Why: "a WaitDelay of ZERO is documented to mean 'wait indefinitely'. Cmd.Wait does not return " +
+			"until the stdout/stderr PIPES close, and a killed ffmpeg's descendant wedged in " +
+			"uninterruptible I/O never closes them — so a cancelled stage's deadline fires exactly " +
+			"on time and the call still never comes back, which on the wire is indistinguishable " +
+			"from the bound not working at all. The same test pins the DELIBERATE absence of " +
+			"Setpgid beside it: that pairing was tried in vamp and rejected, because a process " +
+			"group of its own takes the child out of the terminal's foreground group and ctrl-C " +
+			"stops reaching a forty-minute render.",
+	},
+
+	// ── a container that outlives the run that started it (vamp) ──────
+	//
+	// `docker run` is the ONE subprocess in this package whose work does
+	// not live in the child. subprocess.go's WaitDelay ends the client and
+	// no process-group signal could ever reach the container, because
+	// dockerd owns it — so the name and the Cancel hook are the entire
+	// mechanism, and each half is pinned separately.
+	{
+		Name:     "vamp/a cancelled pandoc leaves its container running",
+		File:     "internal/vamp/pandoc_executor.go",
+		Find:     "\tcmd := command(ctx, binary, args...)\n\tif containerName == \"\" {\n\t\treturn cmd\n\t}",
+		Replace:  "\tcmd := command(ctx, binary, args...)\n\tif true || containerName == \"\" {\n\t\treturn cmd\n\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestNewPandocCommand_CancelKillsTheContainerNotJustTheClient"},
+		Why: "killing `docker run` kills a CLIENT. The container keeps converting, keeps its bind " +
+			"mount on the run dir, and with --rm nothing ever cleans up after it — so a cancelled " +
+			"overnight pipeline leaves a process the operator cannot see from `ps` still writing " +
+			"into a run they believe is over.",
+	},
+	{
+		Name:     "vamp/the pandoc container stops being named",
+		File:     "internal/vamp/pandoc_executor.go",
+		Find:     "\t\tif containerName != \"\" {\n\t\t\t// BEFORE the image name",
+		Replace:  "\t\tif false && containerName != \"\" {\n\t\t\t// BEFORE the image name",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestBuildPandocArgs_NamesTheContainerBeforeTheImage", "TestPandocExecutor_DockerFallbackIsNamed"},
+		Why: "the name is the only handle that crosses the daemon boundary, and it is the only one " +
+			"that survives THIS process: after a SIGKILL there is no Cancel hook and no defer, and " +
+			"`docker ps --filter name=vamp-pandoc-` is all a human has left. An unnamed container " +
+			"is an orphan nobody can find.",
+	},
+	{
+		Name:     "vamp/two pandoc stages can collide on one container name",
+		File:     "internal/vamp/pandoc_executor.go",
+		Find:     "\t\tfmt.Sprintf(\"%d-%s\", itemIdx, hex.EncodeToString(tail[:]))",
+		Replace:  "\t\tfmt.Sprintf(\"%d-%s\", itemIdx, hex.EncodeToString([]byte(\"fix\")))",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestPandocContainerName_IsUniquePerInvocationAndGreppable"},
+		Why: "`docker run --name` FAILS on a name already in use. A retry whose predecessor is " +
+			"still shutting down, or two foreach items landing in the same millisecond, would then " +
+			"die on a conflict that has nothing to do with the document being converted.",
+	},
+	{
+		Name:     "vamp/an already-exited container is reported as a failed reap",
+		File:     "internal/vamp/pandoc_executor.go",
+		Find:     "\tif err == nil || containerAlreadyGone(err) {\n\t\treturn nil\n\t}",
+		Replace:  "\tif err == nil {\n\t\treturn nil\n\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestReapDockerContainer_AlreadyExitedIsNotAFailure", "TestDockerCLIKiller_FoldsTheDaemonMessageIntoTheError"},
+		Why: "`docker kill` RACES the container's own exit, and winning that race is the ordinary " +
+			"shape of a cancelled stage. Reporting it puts an alarming line in the log of every " +
+			"correctly-cancelled run, which is how an operator learns to stop reading the lines " +
+			"that exist to be read.",
+	},
+	{
+		Name:     "vamp/the container reap can hang teardown",
+		File:     "internal/vamp/pandoc_executor.go",
+		Find:     "\tctx, cancel := context.WithTimeout(context.Background(), dockerKillTimeout)",
+		Replace:  "\tctx, cancel := context.WithCancel(context.Background())",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestReapDockerContainer_IsBounded"},
+		Why: "class 4 again — a deadline that is present but never reached. The reap runs while the " +
+			"caller is ALREADY tearing down, on a context deliberately detached from the cancelled " +
+			"stage's, so an unreachable dockerd with no bound of its own turns a stage that timed " +
+			"out exactly on schedule into a run that never returns.",
+	},
 
 	// ── a model's string reaching the filesystem (vamp) ───────────────
 	{
@@ -498,6 +607,57 @@ var Registry = []Mutation{
 			"the exit status. The stage goes green, the run 'succeeds' with silence in it, and the " +
 			"empty file is what gets cached — so the failure replays on every later run with the " +
 			"same inputs until someone clears the cache by hand.",
+	},
+	{
+		Name:     "vamp/a mix stage stops checking that it produced anything",
+		File:     "internal/vamp/mix_executor.go",
+		Find:     "\tif info.Size() == 0 {",
+		Replace:  "\tif false && info.Size() == 0 {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestMixExecutor_ZeroByteOutputFailsTheStage"},
+		Why: "the same swallowed-filtergraph failure as the ffmpeg entry above, at the executor that " +
+			"produces the FINISHED artefact — an m4b nobody plays until the episode ships. The " +
+			"guard was added without a test of its own, which is the shape this registry exists " +
+			"to make impossible.",
+	},
+	{
+		Name:    "vamp/a mix stage races on the log it streams to",
+		File:    "internal/vamp/mix_executor.go",
+		Find:    "\tvar sink io.Writer = tail\n\tif in.Log != nil {\n\t\tsink = io.MultiWriter(tail, in.Log)\n\t}\n\tcmd.Stdout = sink\n\tcmd.Stderr = sink",
+		Replace: "\tif in.Log != nil {\n\t\tcmd.Stdout = in.Log\n\t\tcmd.Stderr = io.MultiWriter(tail, in.Log)\n\t} else {\n\t\tcmd.Stderr = tail\n\t}",
+		Pkg:     "./internal/vamp/",
+		// The named test carries a chatty fake that talks on BOTH streams
+		// at volume, so the detector has something to catch.
+		MustFail: []string{"TestMixExecutor_NonZeroExitSurfacesFFmpegsOwnDiagnostic"},
+		Why: "os/exec gives Stdout and Stderr separate pipes AND separate copying goroutines unless " +
+			"the two fields compare equal. The sink vamp passes here is a per-item *bytes.Buffer " +
+			"that executeForeachStage hands out unguarded, so the divergent form raced on every " +
+			"foreach mix invocation with a live log — found by `go test -race`, and silent " +
+			"corruption of the operator's log in production.",
+	},
+	{
+		Name:     "vamp/a pandoc stage accepts an empty book",
+		File:     "internal/vamp/pandoc_executor.go",
+		Find:     "\tif err := requireNonEmptyOutput(st.ID, \"pandoc\", outAbs); err != nil {\n\t\treturn nil, err\n\t}",
+		Replace:  "\tif err := requireNonEmptyOutput(st.ID, \"pandoc\", outAbs); false && err != nil {\n\t\treturn nil, err\n\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestPandocExecutor_ZeroByteOutputFailsTheStage"},
+		Why: "pandoc opens its output before it knows the conversion will work, so a missing LaTeX " +
+			"engine or an undecodable cover leaves a 0-byte EPUB and exits 0 — and the docker " +
+			"fallback adds a second route, since `docker run` reports the CLIENT's status. This " +
+			"site checked existence only; the size half is what an empty book fails.",
+	},
+	{
+		Name:     "vamp/an empty raster is admitted to the SVG cache",
+		File:     "internal/vamp/vision_executor.go",
+		Find:     "\tif info, statErr := os.Stat(tmpPath); statErr != nil || info.Size() == 0 {",
+		Replace:  "\tif info, statErr := os.Stat(tmpPath); false && (statErr != nil || info.Size() == 0) {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestRasterizeSVG_ZeroBytePNGNeverEntersTheCache"},
+		Why: "this cache is CONTENT-ADDRESSED and permanent. A 0-byte render renamed into place is " +
+			"served by the Stat fast path to every later call for that SVG — every lesson reusing " +
+			"the boilerplate diagram, on every future run — handing the vision model an empty " +
+			"image with no error anywhere until somebody deletes the cache dir by hand.",
 	},
 	{
 		Name:     "vamp/a stage's declared timeout stops being applied",

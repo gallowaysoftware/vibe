@@ -308,13 +308,24 @@ func (m *mixExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput,
 	// Always retain a tail of stderr so a non-zero exit surfaces ffmpeg's own
 	// filtergraph diagnostic instead of a bare "exit status 1"; multi-stage
 	// capability groups pass a nil in.Log, which would otherwise drop stderr.
+	//
+	// ONE writer for both streams, and the same interface VALUE in both
+	// fields. That is not tidiness: os/exec gives Stdout and Stderr
+	// separate pipes and separate copying goroutines unless the two
+	// fields compare equal, in which case it wires them to a single
+	// descriptor. Two goroutines writing the same sink is a data race,
+	// and the sink vamp actually passes here is a per-item
+	// *bytes.Buffer (executeForeachStage hands every foreach item its
+	// own, unguarded) — so a foreach mix stage with a live log raced on
+	// every invocation, which `go test -race` reports and a production
+	// run silently corrupts.
 	tail := newLineRingBuffer(ffmpegStderrTailLines)
+	var sink io.Writer = tail
 	if in.Log != nil {
-		cmd.Stdout = in.Log
-		cmd.Stderr = io.MultiWriter(tail, in.Log)
-	} else {
-		cmd.Stderr = tail
+		sink = io.MultiWriter(tail, in.Log)
 	}
+	cmd.Stdout = sink
+	cmd.Stderr = sink
 	if err := cmd.Run(); err != nil {
 		if msg := strings.TrimSpace(tail.String()); msg != "" {
 			return nil, fmt.Errorf("ffmpeg mix: %w: %s", err, msg)

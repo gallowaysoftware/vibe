@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetnotify"
 )
 
 // youtubeExecutor implements StageExecutor for type: youtube stages. It uploads
@@ -192,7 +194,14 @@ func (y *youtubeExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 	}
 
 	if in.Log != nil {
-		fmt.Fprintf(in.Log, "youtube: uploading video bytes\n")
+		// Redact, never the URI itself. Under --detach this log is a FILE
+		// in the run dir, opened 0o644 and kept, so a raw session URI
+		// written here is the credential persisted at rest long after the
+		// upload it belonged to. Redact keeps what a human debugging
+		// actually needs — scheme, host, and a stable 8-hex id that tells
+		// two sessions apart — and drops the path and query, which is
+		// where the session's bearer half lives.
+		fmt.Fprintf(in.Log, "youtube: uploading video bytes to %s\n", fleetnotify.Redact(uploadURL))
 	}
 	videoID, err := uploadVideoBytes(ctx, doer, uploadURL, videoFile, videoSize)
 	if err != nil {
@@ -430,17 +439,41 @@ func initiateResumableUpload(ctx context.Context, doer httpDoer, accessToken str
 // assigned id. 308 Resume Incomplete is treated as a transient failure
 // surface — Phase 1 fails clearly rather than silently looping, so the user
 // sees the problem instead of an indefinite hang.
+//
+// # The upload URL is a CREDENTIAL
+//
+// A resumable-upload session URI carries its own authorisation: Google
+// documents it as a URL that must be kept secret, because whoever holds it
+// can append to, complete, or abort THAT upload without the access token
+// that created it. It is exactly the shape webhook_executor.go closed for
+// incoming-webhook URLs, and it reaches the same two places:
+//
+//   - a stage error becomes Executor.FailureSummary, and six executors hand
+//     that to templates as {{ .failure_summary }} — so a `run_when: failure`
+//     webhook posts it into a chat channel;
+//   - *url.Error embeds the request URL STRUCTURALLY, so every transport
+//     failure on this PUT produced it verbatim.
+//
+// Both halves of the webhook fix are needed here and neither subsumes the
+// other: scrubURLError unwraps *url.Error (which removes a URL no string
+// scrubber could match — http.Client names the redirect hop it failed on,
+// not the one we passed) and runs what is left through
+// fleetnotify.ScrubURL (which catches a transport that quotes the URL
+// inside its own prose). It keeps the cause wrapped, so errors.Is against
+// context.Canceled upstream still works.
 func uploadVideoBytes(ctx context.Context, doer httpDoer, uploadURL string, src io.Reader, size int64) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, src)
 	if err != nil {
-		return "", fmt.Errorf("build upload PUT: %w", err)
+		// NewRequestWithContext returns a *url.Error carrying the whole
+		// session URI on a parse failure — the same leak as the Do path.
+		return "", fmt.Errorf("build upload PUT: %w", scrubURLError(uploadURL, err))
 	}
 	req.Header.Set("Content-Type", "video/*")
 	req.ContentLength = size
 
 	resp, err := doer.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("upload PUT: %w", err)
+		return "", fmt.Errorf("upload PUT: %w", scrubURLError(uploadURL, err))
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -461,7 +494,11 @@ func uploadVideoBytes(ctx context.Context, doer httpDoer, uploadURL string, src 
 		// the partial state clearly so the user retries the whole stage.
 		return "", fmt.Errorf("upload incomplete (HTTP 308); resumable chunking is not implemented in Phase 1, retry the stage")
 	default:
-		return "", fmt.Errorf("upload PUT returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		// The BODY is scrubbed too. Google's own error documents echo the
+		// request back in some quota / redirect shapes, and this string is
+		// pasted straight into the stage error.
+		return "", errors.New(fleetnotify.ScrubURL(uploadURL,
+			fmt.Sprintf("upload PUT returned %s: %s", resp.Status, strings.TrimSpace(string(body)))))
 	}
 }
 
