@@ -983,7 +983,11 @@ func TestFleetPage_DeepLinkPicksTheViewBeforeTheFirstFetch(t *testing.T) {
 		body = body[:end]
 	}
 	showAt := strings.Index(body, "showView()")
-	awaitAt := strings.Index(body, "await refresh()")
+	// The awaited call is matched by the AWAIT, not by the callee's name.
+	// It was `await refresh()` and is now `await tick()` — refresh with
+	// the failure handled — and pinning the callee made this guard fail
+	// for a rename while the property it exists for was untouched.
+	awaitAt := strings.Index(body, "await ")
 	if showAt < 0 || awaitAt < 0 {
 		t.Fatalf("boot() no longer both awaits and picks a view: %q", body)
 	}
@@ -991,8 +995,13 @@ func TestFleetPage_DeepLinkPicksTheViewBeforeTheFirstFetch(t *testing.T) {
 		t.Error("boot() picks the view only after the first fetch; a failed fetch strands a #savings deep link on the fleet view")
 	}
 	// And a tab with no token still resolves its view (the gate then asks
-	// for the token).
-	if !strings.Contains(page, "showView();\nif (token) boot()") {
+	// for the token). Ordering, not adjacency: the bootstrap runs other
+	// statements between the two now.
+	bootAt := strings.Index(page, "if (token) boot()")
+	if bootAt < 0 {
+		t.Fatal("the page no longer defers boot() until a token exists")
+	}
+	if !strings.Contains(page[:bootAt], "\nshowView();") {
 		t.Error("a bare tab with no token does not resolve its view before the token gate")
 	}
 }

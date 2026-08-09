@@ -17,11 +17,14 @@ import (
 // implementation so the description and the behaviour are edited
 // together: the "this is not a pin" sentence is load-bearing, and an
 // agent that drops it will tell an operator their model is safe.
-func holdTools() []any {
-	return []any{
-		map[string]any{
-			"name": "hold_model",
-			"description": "Suspend fleetd's automatic warm policy on one cell until a deadline — the " +
+func holdTools() []toolDef {
+	return []toolDef{
+		{
+			// A declaration against the lease store. It PREVENTS fleetd from
+			// evicting; it evicts nothing itself, and it expires on its own.
+			Effect: effectMutate,
+			Name:   "hold_model",
+			Description: "Suspend fleetd's automatic warm policy on one cell until a deadline — the " +
 				"evaluation-afternoon verb. Without it, the cell's warm target correctly notices that " +
 				"the challenger model you were testing has been idle since you left for lunch and " +
 				"restores the default, evicting it. A hold also suppresses scheduled warms and " +
@@ -31,7 +34,7 @@ func holdTools() []any {
 				"that GPU. It expires on its own (default 4h, max 24h), so a forgotten hold cannot " +
 				"permanently disable the policy. Explicit verbs still work while held: warm_model, " +
 				"unload_model, drain_cell and resume_cell are unaffected.",
-			"inputSchema": map[string]any{
+			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"cell":  map[string]any{"type": "string", "description": "Cell name from hosts.yaml (not the front — it serves no models of its own)."},
@@ -42,12 +45,15 @@ func holdTools() []any {
 				"required": []string{"cell", "model"},
 			},
 		},
-		map[string]any{
-			"name": "release_hold",
-			"description": "End a hold_model early, letting the warm policy resume on that cell. " +
+		{
+			// Ends a declaration early. Nothing is lost that the hold's own
+			// expiry would not have released anyway.
+			Effect: effectMutate,
+			Name:   "release_hold",
+			Description: "End a hold_model early, letting the warm policy resume on that cell. " +
 				"Holds expire on their own, so this is only needed when the evaluation finished " +
 				"sooner than planned.",
-			"inputSchema": map[string]any{
+			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"cell":  map[string]any{"type": "string", "description": "Cell name from hosts.yaml."},

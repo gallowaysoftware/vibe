@@ -69,6 +69,15 @@ type SavingsReport struct {
 
 	Prices PriceTableInfo `json:"prices"`
 
+	// Currency is the unit of every money field below, and the reason the
+	// two halves of this screen can or cannot be netted against each
+	// other. It is a first-class part of the payload rather than a page
+	// affordance because the MCP tool serves this same document to
+	// agents, and "$12.40 net" quoted out of a report whose gross is USD
+	// and whose electricity is CAD is a wrong number no reader can
+	// detect.
+	Currency CurrencyInfo `json:"currency"`
+
 	// Empty is the fresh-install state: no ledger at all. The page shows
 	// the install panel, NOT a $0.00 hero — a zero hero is a claim about
 	// the fleet, and there is nothing to claim yet.
@@ -99,6 +108,71 @@ type PriceTableInfo struct {
 	Stale     bool            `json:"stale"`
 	Snapshots int             `json:"snapshots"`
 	Sources   []prices.Source `json:"sources,omitempty"`
+}
+
+// CurrencyInfo says what each half of the screen is denominated in.
+//
+// Two halves, two sources. TOKENS are priced out of the vendored table,
+// which is normalized to prices.Currency and is not the operator's
+// business. LOCAL — electricity and capital — is the operator's own
+// money, declared in `pricing.currency`. They are the same number's
+// worth of money only when the two codes agree.
+type CurrencyInfo struct {
+	// Tokens is the price table's currency: every gross, frontier and
+	// cloud figure in this report.
+	Tokens string `json:"tokens"`
+	// Local is the currency of every power and capital figure.
+	Local string `json:"local"`
+	// LocalDeclared is false when hosts.yaml said nothing and Local is
+	// therefore an ASSUMPTION this report is making out loud rather than
+	// a fact it was told. The page renders a chip for it, next to the
+	// EXAMPLE DATA one, for the same reason.
+	LocalDeclared bool `json:"local_declared"`
+	// Mixed is true when the two differ. Every subtraction and every
+	// ratio that would cross the two is then refused: this repo ships no
+	// exchange rate, a rate invented at render time is an unsourced
+	// number in a screen whose entire premise is that it does not invent
+	// numbers, and a rate is dated anyway (the ledger spans months).
+	Mixed bool `json:"mixed"`
+	// Note is the one-sentence explanation the page and the agents both
+	// render. Never empty when Mixed or when Local is undeclared.
+	Note string `json:"note,omitempty"`
+}
+
+// canNet reports whether a token-priced figure and a locally-priced one
+// may be combined into one number. It is the single gate every
+// subtraction and every payback ratio in this file goes through.
+func (c CurrencyInfo) canNet() bool { return !c.Mixed }
+
+// currencyOf resolves the two currencies from config. Undeclared local
+// is assumed to be the table's — that is what the arithmetic did before
+// this field existed, so it is the only choice that does not silently
+// change every existing fleet's numbers — but the assumption is
+// RECORDED, and the page and the agents both render it.
+func currencyOf(hosts *fleetcfg.File) CurrencyInfo {
+	info := CurrencyInfo{Tokens: prices.Currency, Local: prices.Currency}
+	var declared string
+	if hosts != nil {
+		declared = hosts.Pricing.CurrencyOrEmpty()
+	}
+	if declared == "" {
+		info.Note = "electricity and capital have no declared currency (pricing.currency), so they are assumed to be " +
+			prices.Currency + " like the price table; if your hydro bill and your hardware receipts are in another currency, " +
+			"the net and the payback bars below are wrong by the exchange rate"
+		return info
+	}
+	info.Local = declared
+	info.LocalDeclared = true
+	if declared == prices.Currency {
+		return info
+	}
+	info.Mixed = true
+	info.Note = "token savings are priced in " + prices.Currency + " (the vendored price table) and electricity and capital are declared in " +
+		declared + ". This report will not subtract one from the other or divide one by the other: no exchange rate ships with vibe, " +
+		"a rate invented here would be an unsourced number, and the ledger spans months over which any rate moved. " +
+		"Both figures are shown, each labelled with its own currency; declare pricing.currency: " + prices.Currency +
+		" (converting the values yourself) to get a net and a payback bar back"
+	return info
 }
 
 // SavingsTotals is the fleet line. Every money field is a pointer:
@@ -257,7 +331,10 @@ const savingsCaveat = "This is an estimate of money NOT SPENT, and it is an uppe
 	"get used casually precisely because the marginal token is free — which is why actual cloud spend sits beside it " +
 	"at the same size. Electricity is subtracted from declared wattage, not measured, and is good to roughly ±30%. " +
 	"Payback counts the capital number in hosts.yaml and nothing else — not the hours spent building and running the " +
-	"fleet, which very likely exceed everything shown here."
+	"fleet, which very likely exceed everything shown here. " +
+	"The token figures are priced in the vendored table's currency and the electricity and capital figures in the one " +
+	"declared in hosts.yaml; when those differ this report refuses to net them rather than subtracting across an " +
+	"exchange rate it does not have."
 
 // hostedTwinFootnote is the honest defence of comparing a Q5/Q6 local
 // build against a hosted twin, rather than pretending quantization does
@@ -379,6 +456,7 @@ func (s *Server) Savings(ctx context.Context, window string) (SavingsReport, err
 		Window:      window,
 		TZ:          loc.String(),
 		Caveat:      savingsCaveat,
+		Currency:    currencyOf(s.hosts),
 		Cells:       []CellSavings{},
 		Payback:     []Payback{},
 		Prices: PriceTableInfo{
@@ -657,9 +735,18 @@ func (s *Server) priceLedger(ctx context.Context, rep *SavingsReport, byDay map[
 			if agg != nil && agg.powerKnown {
 				row.Power = money(agg.power)
 				row.PowerDeclared = true
-				row.Net = money(-agg.power)
-				row.NetLabel = "net (nothing priced)"
 				row.Reason = "no measured requests in this window; electricity still counted"
+				// The net column is denominated in the TOKEN currency
+				// throughout. A bare negative electricity figure needs no
+				// conversion, but printing it in this column under a mixed
+				// pair would put one row's CAD beside another row's USD under
+				// one heading — which is the same defect one column over.
+				if rep.Currency.canNet() {
+					row.Net = money(-agg.power)
+					row.NetLabel = "net (nothing priced)"
+				} else {
+					row.NetLabel = netUnavailableLabel(rep.Currency)
+				}
 				addMoney(&totals.Power, agg.power)
 				powerCounted = true
 			}
@@ -685,14 +772,9 @@ func (s *Server) priceLedger(ctx context.Context, rep *SavingsReport, byDay map[
 		case !agg.anyPriced:
 			row.Reason = "nothing priced in this window (no twin declared, or no published rate)"
 			row.NetLabel = "net (nothing priced)"
-		case agg.powerKnown:
-			row.Gross, row.GrossLow, row.GrossHigh = money(agg.gross), money(agg.low), money(agg.high)
-			row.Net = money(agg.gross - agg.power)
-			row.NetLabel = "net"
 		default:
 			row.Gross, row.GrossLow, row.GrossHigh = money(agg.gross), money(agg.low), money(agg.high)
-			row.Net = money(agg.gross)
-			row.NetLabel = "net (power not counted)"
+			row.Net, row.NetLabel = netOf(agg.gross, agg.power, agg.powerKnown, rep.Currency)
 		}
 		row.TokensPricedPct = pct(agg.priced, agg.total)
 		row.Partial = partialNote(agg.req, agg.unmeasured, agg.errReq, agg.pokeReq, agg.lostRows)
@@ -726,16 +808,20 @@ func (s *Server) priceLedger(ctx context.Context, rep *SavingsReport, byDay map[
 		rep.Frontier = &FrontierLine{Model: fr.Model, Rationale: fr.Rationale, Unpriced: orDefault(frontierUnpriced, prices.ReasonNoHosts)}
 	}
 
-	totals.NetLabel = "net (power not counted)"
-	if powerCounted {
-		totals.NetLabel = "net"
-	}
 	if totals.Gross != nil {
-		net := *totals.Gross
+		power := 0.0
 		if totals.Power != nil {
-			net -= *totals.Power
+			power = *totals.Power
 		}
-		totals.Net = money(net)
+		totals.Net, totals.NetLabel = netOf(*totals.Gross, power, totals.Power != nil, rep.Currency)
+	} else {
+		totals.NetLabel = "net (power not counted)"
+		if powerCounted {
+			totals.NetLabel = "net"
+		}
+		if !rep.Currency.canNet() {
+			totals.NetLabel = netUnavailableLabel(rep.Currency)
+		}
 	}
 	var priced, total int64
 	for _, a := range windowCells {
@@ -766,12 +852,17 @@ func (s *Server) priceLedger(ctx context.Context, rep *SavingsReport, byDay map[
 	}
 	rep.Cloud = cloud
 
-	rep.Payback, rep.Notes = s.payback(lifetime, now, loc, rep.Notes)
+	rep.Payback, rep.Notes = s.payback(lifetime, now, loc, rep.Notes, rep.Currency)
 	// The inverted rule, on the page (C7b §4): energy lands around 11-16%
 	// of net savings against an honest twin-priced headline, so an
 	// electricity line that looks like a rounding error is evidence the
 	// COMPARABLE is wrong, not evidence that power is free.
-	if totals.Power != nil && totals.Gross != nil && *totals.Gross > 0 {
+	//
+	// The ratio is a division across the same seam netOf refuses, so it
+	// is gated identically: "electricity is 0.8% of the gross figure" is
+	// a claim about an exchange rate when the two are in different
+	// currencies.
+	if rep.Currency.canNet() && totals.Power != nil && totals.Gross != nil && *totals.Gross > 0 {
 		if share := *totals.Power / *totals.Gross * 100; share < 3 {
 			rep.Notes = append(rep.Notes, fmt.Sprintf(
 				"electricity is %.1f%% of the gross figure; against an honest same-model-rented comparable it lands around 11-16%%, so a power line this small usually means the comparable is too expensive",
@@ -872,9 +963,31 @@ func cellPowerCost(hosts *fleetcfg.File, cell string, cd *cellDay) (float64, boo
 
 // payback walks each cell's daily series into the lifetime scoreboard.
 // It returns the notes it was given plus any it had to add.
-func (s *Server) payback(lifetime map[string]map[string]*dayNet, now time.Time, loc *time.Location, notes []string) ([]Payback, []string) {
+func (s *Server) payback(lifetime map[string]map[string]*dayNet, now time.Time, loc *time.Location, notes []string, cur CurrencyInfo) ([]Payback, []string) {
 	out := []Payback{}
 	if s.hosts == nil {
+		return out, notes
+	}
+	// A payback bar is `recovered / capital_cost` — a token-priced
+	// numerator over a locally-declared denominator — and its daily
+	// series is `gross − power`. Both cross the currency seam, so a mixed
+	// pair gets no bar at all, on the same principle as a cell with no
+	// capital_cost: not 0%, not an invented denominator, and here not an
+	// invented exchange rate either. The reason is a note, because a
+	// screen that silently drops the payback strip is the confusing kind
+	// of honest.
+	if !cur.canNet() {
+		var declared []string
+		for _, name := range slices.Sorted(maps.Keys(s.hosts.Cells)) {
+			if s.hosts.Cells[name].CapitalCost > 0 {
+				declared = append(declared, name)
+			}
+		}
+		if len(declared) > 0 {
+			notes = append(notes, "no payback bars: "+strings.Join(declared, ", ")+" declare capital_cost in "+cur.Local+
+				" and the savings above are priced in "+cur.Tokens+
+				", so the percentage would be a claim about an exchange rate this repo does not ship")
+		}
 		return out, notes
 	}
 	for _, name := range slices.Sorted(maps.Keys(s.hosts.Cells)) {
@@ -1014,6 +1127,30 @@ func powerGapNote(hosts *fleetcfg.File, missing []string, anyCounted bool) strin
 	}
 	return "electricity is counted for only some cells — " + who +
 		" contributed none, so the fleet net is that much too generous"
+}
+
+// netOf combines a token-priced gross with a locally-priced electricity
+// term, and is the ONE place in this file where the two sides of the
+// screen meet. It refuses the subtraction when they are denominated
+// differently: `gross − power` across two currencies is not an
+// approximation, it is a different quantity, and it renders as a
+// perfectly plausible dollar figure with no visible symptom. An absent
+// net with a label that says why is this screen's existing answer for
+// every other thing it does not know.
+func netOf(gross, power float64, powerKnown bool, cur CurrencyInfo) (*float64, string) {
+	if !powerKnown {
+		return money(gross), "net (power not counted)"
+	}
+	if !cur.canNet() {
+		return nil, netUnavailableLabel(cur)
+	}
+	return money(gross - power), "net"
+}
+
+// netUnavailableLabel is the sentence that stands where a net would be.
+func netUnavailableLabel(cur CurrencyInfo) string {
+	return "net unavailable — savings are priced in " + cur.Tokens + " and electricity in " + cur.Local +
+		", and no exchange rate is declared"
 }
 
 // money boxes a float. Every money field on this report is a pointer so

@@ -57,6 +57,48 @@
   .warn-item code { color: var(--red); }
   #status-line { color: var(--dim); font-size: 12px; margin-top: 18px; }
   .pending { color: var(--amber); font-style: italic; }
+  /* ── liveness ──────────────────────────────────────────────────────
+     What this page looks like when fleetd stops answering. It used to
+     look like nothing: refresh() threw, every caller was
+     `.catch(() => {})`, render() ran only on success, and the table
+     froze with every SERVING badge still green — cued by a bare
+     toLocaleTimeString() in 12px dim grey. */
+  #liveness { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+              padding: 7px 12px; border: 1px solid var(--line); border-radius: 4px;
+              margin: 0 0 14px; font-size: 12px; color: var(--dim); }
+  #lv-head { font-weight: 700; letter-spacing: .06em; }
+  .lv-degraded { background: rgba(217,161,59,.08); border-color: var(--amber); color: var(--amber); }
+  .lv-stale { background: rgba(217,161,59,.18); border-color: var(--amber); color: var(--amber); }
+  .lv-offline { background: rgba(217,95,95,.18); border-color: var(--red); color: var(--red); }
+  /* Stale badges are NEUTRALISED rather than left green. That is a
+     decision, not a style: a badge's colour is a claim about a value
+     OBSERVED now, and once the observations stop arriving the colour is
+     asserting something nobody is measuring. Leaving it green is
+     "absent evidence read as a healthy value" — the defect class this
+     project has refused seven times elsewhere — on the one surface
+     somebody glances at from a hallway. The state WORD stays, because
+     it is the last thing anyone knew; the decoration that made it read
+     as live does not. */
+  body.notlive .badge { background: rgba(107,118,134,.15); color: var(--gray);
+                        border: 1px dashed var(--gray); }
+  body.notlive .m-ready, body.notlive .m-starting, body.notlive .m-degraded,
+  body.notlive .intent, body.notlive .leases, body.notlive .held { color: var(--dim); font-weight: 400; }
+  body.notlive #cells { opacity: .8; }
+  /* The tool result panel. It replaces a 60-character, hover-only
+     title= that the next render() destroyed 1.5s later. */
+  #toolresult { margin: 16px 0; border: 1px solid var(--line); border-left: 3px solid var(--blue);
+                border-radius: 4px; background: var(--panel); }
+  #toolresult.err { border-left-color: var(--red); }
+  .tr-head { display: flex; align-items: center; gap: 10px; padding: 6px 10px;
+             border-bottom: 1px solid var(--line); font-size: 12px; color: var(--dim); }
+  .tr-head b { color: var(--text); font-weight: 600; }
+  #tr-dismiss { margin-left: auto; }
+  #tr-body { margin: 0; padding: 10px; font: 12px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
+             white-space: pre-wrap; word-break: break-word; color: var(--text); }
+  #toolresult.err #tr-body { color: var(--red); }
+  #sleeprow { margin: 12px 0; font-size: 12px; }
+  .sleepline { color: var(--dim); }
+  #sv-currency { color: var(--amber); font-size: 12px; margin: 0 0 14px; max-width: 70em; }
   nav#views { display: flex; gap: 14px; }
   nav#views a { color: var(--dim); text-decoration: none; font-size: 13px; padding-bottom: 2px; border-bottom: 2px solid transparent; }
   nav#views a.on { color: var(--text); border-bottom-color: var(--blue); }
@@ -116,6 +158,14 @@
   </span>
 </header>
 <main>
+  <!-- Above BOTH views and outside them: "is any of this still true" is
+       not a per-view question, and the savings screen is priced from a
+       ledger the same daemon serves. -->
+  <div id="liveness" class="lv-offline" role="status" aria-live="polite">
+    <span id="lv-head">NO LIVE DATA</span>
+    <span id="lv-detail"></span>
+    <button id="lv-retry" onclick="reconnect()" hidden>retry now</button>
+  </div>
   <section id="view-fleet">
   <table>
     <thead><tr><th>cell</th><th>display</th><th>class</th><th>models</th><th>intent / last seen</th><th>actions</th></tr></thead>
@@ -130,7 +180,19 @@
        tools/call on the MCP facade — the page still adds no mutation
        route of its own. -->
   <div id="notifyrow"></div>
+  <!-- C14's declared nights. `wake_failed_since` is the one thing in
+       that phase that ALARMS and a doctor LevelFail, and it had no
+       page-side signal at all: notifyReport() returns nil on a fleet
+       with no webhook, so on the reference fleet a promised wake that
+       did not happen was visible nowhere a human looks. -->
+  <div id="sleeprow"></div>
   <div id="warnings"></div>
+  <!-- Tool results land here, in full, and stay until dismissed or
+       superseded — outside the tbody render() rebuilds. -->
+  <div id="toolresult" hidden>
+    <div class="tr-head"><b id="tr-title"></b><button id="tr-dismiss" onclick="dismissResult()">dismiss</button></div>
+    <pre id="tr-body"></pre>
+  </div>
   <div id="status-line"></div>
   </section>
   <!-- The savings view has NO action buttons. That is what keeps "the
@@ -151,6 +213,11 @@
       <summary>what this number is, and why it is an upper bound</summary>
       <p id="sv-caveat-text"></p>
     </details>
+    <!-- Which currency each half of this screen is in, and — when they
+         differ — why there is no net. Not a footnote: `net = gross −
+         power` across two currencies is a wrong number that looks
+         exactly like a right one. -->
+    <div id="sv-currency" hidden></div>
     <div id="sv-empty" hidden>
       <h2>nothing measured yet</h2>
       <p>No cell has announced any usage. The ledger fills in as cells announce
@@ -308,10 +375,146 @@ function modelSpan(m) {
   return out;
 }
 
+// ── liveness: what this page shows when fleetd stops answering ─────────
+//
+// It used to show nothing. refresh() threw, every caller was
+// `.catch(() => {})`, and render() ran only on success — so a dead
+// fleetd left the table frozen with every SERVING badge green, cued by a
+// bare toLocaleTimeString() in 12px dim grey. This is the phone-in-the-
+// hallway surface: a green badge on it is a claim that a cell was
+// OBSERVED serving, and an observation that stopped arriving is not one.
+//
+// Two signals, handled separately, because they fail separately and mean
+// different things. The SSE event stream dropping is immediate and costs
+// only the liveness of UPDATES — the poll still works, the data is still
+// fresh, and neutralising the table for it would be its own lie. The
+// state POLL failing means the page's data is now the last thing it
+// heard, and everything below it stops being a measurement.
+//
+// The ladder is a TABLE parsed from JSON, not a chain of ifs, because a
+// Go test drives these exact bytes over fixture ages and asserts what a
+// reader sees at 0s, 30s and five minutes after fleetd dies. A guard
+// that had to read the ifs would be reading prose.
+const LIVENESS = JSON.parse(`[
+  {"level":"never","never":true,"cls":"lv-offline","neutralise":true,"head":"NO LIVE DATA",
+   "detail":"this page has never received fleet state — nothing below it is a measurement"},
+  {"level":"offline","min_age_s":150,"cls":"lv-offline","neutralise":true,"head":"OFFLINE",
+   "detail":"fleetd is not answering; every row below is the LAST STATE RECEIVED, not the fleet now"},
+  {"level":"stale","failing":true,"cls":"lv-stale","neutralise":true,"head":"STALE",
+   "detail":"fleetd did not answer the last request; the rows below are the last state received, not the fleet now"},
+  {"level":"stale","min_age_s":45,"cls":"lv-stale","neutralise":true,"head":"STALE",
+   "detail":"no update has arrived within the poll interval; the rows below are the last state received"},
+  {"level":"degraded","stream_down":true,"cls":"lv-degraded","neutralise":false,"head":"POLLING ONLY",
+   "detail":"the live event stream is down; the table still refreshes on the 30s poll"},
+  {"level":"live","cls":"lv-live","neutralise":false,"head":"LIVE","detail":""}
+]`);
+// The FIRST row whose declared conditions all hold wins. An absent
+// condition is "don't care"; `never` is the only one also checked in the
+// negative, so a page with no data can never fall through to a row that
+// talks about how old that data is.
+function liveness(st) {
+  for (const r of LIVENESS) {
+    if (!!r.never !== !!st.never) continue;
+    if (r.min_age_s != null && st.age_s < r.min_age_s) continue;
+    if (r.failing && !st.failing) continue;
+    if (r.stream_down && !st.stream_down) continue;
+    return r;
+  }
+  return LIVENESS[LIVENESS.length - 1];
+}
+let lastOkAt = 0, lastGeneratedAt = 0, lastFetchError = "", streamUp = false, streamRetryAt = 0;
+// stateAgeS is how old the fleet state on screen is, in seconds, or null
+// when there has never been any. The OLDER of two clocks wins: the
+// browser's own receipt time and the server's generated_at. A fleetd
+// answering 200 with a document it has stopped regenerating is stale in
+// exactly the way this banner exists to show, and the receipt clock
+// alone would call it live. A generated_at in the FUTURE is clock skew,
+// not evidence, so it is ignored rather than believed.
+function stateAgeS() {
+  if (!lastOkAt) return null;
+  const now = Date.now();
+  let s = (now - lastOkAt) / 1000;
+  if (lastGeneratedAt) {
+    const g = (now - lastGeneratedAt) / 1000;
+    if (g > s) s = g;
+  }
+  return Math.max(0, Math.floor(s));
+}
+function relS(s) {
+  if (s < 60) return s + "s";
+  if (s < 3600) return (s / 60 | 0) + "m " + (s % 60) + "s";
+  if (s < 86400) return (s / 3600 | 0) + "h " + ((s % 3600) / 60 | 0) + "m";
+  return (s / 86400 | 0) + "d";
+}
+function renderLiveness() {
+  const age = stateAgeS();
+  const r = liveness({ never: age == null, age_s: age == null ? 0 : age,
+                       failing: !!lastFetchError, stream_down: !streamUp });
+  $("liveness").className = r.cls;
+  document.body.classList.toggle("notlive", !!r.neutralise);
+  $("lv-head").textContent = r.head;
+  $("lv-retry").hidden = r.level === "live";
+  const bits = [];
+  if (r.detail) bits.push(r.detail);
+  // Relative and RECOMPUTED every second: a "last updated" that only
+  // moves when an update arrives reads as fresh forever once they stop.
+  bits.push(age == null ? "no successful update yet" : "last updated " + relS(age) + " ago");
+  if (lastFetchError) bits.push("last error: " + lastFetchError);
+  if (!streamUp) {
+    bits.push(streamRetryAt > Date.now()
+      ? "event stream reconnecting in " + Math.max(0, Math.ceil((streamRetryAt - Date.now()) / 1000)) + "s"
+      : "event stream reconnecting");
+  }
+  $("lv-detail").textContent = bits.join("  ·  ");
+}
+
 async function refresh() {
   const r = await api("/api/fleet/state");
   const st = await r.json();
+  lastOkAt = Date.now();
+  lastGeneratedAt = Date.parse(st.generated_at) || 0;
+  lastFetchError = "";
+  stateRetryDelay = 0;
+  clearTimeout(stateRetryTimer);
+  stateRetryTimer = 0;
   render(st);
+  renderLiveness();
+}
+
+// tick is refresh WITH the failure handled, and it is what every caller
+// now uses. Discarding the rejection into an empty catch — which every
+// call site used to do — is how a dead fleetd became invisible: the
+// throw was swallowed, render() never ran, and the last good table
+// stayed on screen looking exactly like a live one.
+function tick() {
+  return refresh().catch((e) => {
+    lastFetchError = (e && e.message) ? String(e.message) : "unreachable";
+    renderLiveness();
+    // A 401 already popped the token gate and saveToken() re-boots;
+    // retrying it every few seconds would re-attack the endpoint with a
+    // dead token forever. The 30s poll is retry enough for that one.
+    if (lastFetchError !== "401") scheduleStateRetry();
+  });
+}
+// While the fleet is unreachable the page retries FASTER than its 30s
+// poll and backs off, so a fleetd that comes back is picked up in
+// seconds instead of on the next half-minute boundary.
+function scheduleStateRetry() {
+  if (stateRetryTimer) return;
+  stateRetryDelay = stateRetryDelay ? Math.min(stateRetryDelay * 2, 30000) : 3000;
+  stateRetryTimer = setTimeout(() => { stateRetryTimer = 0; tick(); }, stateRetryDelay);
+}
+// The manual reconnect path behind the banner's button: re-dial the
+// event stream and re-poll now, without waiting out the backoff.
+function reconnect() {
+  stateRetryDelay = 0;
+  clearTimeout(stateRetryTimer);
+  stateRetryTimer = 0;
+  if (streamAbort) streamAbort.abort();
+  streamAbort = new AbortController();
+  retryDelay = 0;
+  streamEvents(streamAbort.signal);
+  tick();
 }
 
 function render(st) {
@@ -349,11 +552,17 @@ function render(st) {
       b.onclick = () => runTool(b, tool, args);
       actions.appendChild(b);
     };
+    const mkFn = (label, fn) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.onclick = () => fn(b);
+      actions.appendChild(b);
+    };
     // Every action here is a tools/call on /mcp, which the guest bearer
     // does not reach. Rendering the buttons anyway would be a claim about
     // the reader's authority the server has already contradicted.
     if (!guest) {
-      mk("drain", "drain_cell", { cell: c.name });
+      mkFn("drain", (b) => drainCell(b, c.name));
       mk("resume", "resume_cell", { cell: c.name });
       if (c.presence || c.class) mk("wake", "wake_cell", { cell: c.name });
       for (const m of (c.models || []).filter(m => m.state && m.state !== "stopped")) {
@@ -394,6 +603,43 @@ function render(st) {
   }
   $("status-line").textContent = bits.join("  ·  ");
   renderNotify(st.notify);
+  renderSleep(st.sleep);
+}
+
+// C14's declared nights. The `sleep` block was rendered NOWHERE on this
+// page — the word did not appear in it once — and the field that matters
+// most is `wake_failed_since`: a wake this fleet PROMISED and did not
+// deliver, the one thing in that phase that alarms and a `LevelFail` in
+// the doctor. Its only other surface is a webhook, and notifyReport()
+// returns nil on a fleet that has none, so on the reference fleet the
+// failure had no signal a human would ever see. It renders as a warning
+// item, in the same place as a fingerprint mismatch, not as a word in a
+// status line.
+function renderSleep(sl) {
+  const row = $("sleeprow");
+  row.innerHTML = "";
+  if (!sl || !(sl.entries || []).length) return;
+  for (const e of sl.entries) {
+    if (!e.wake_failed_since) continue;
+    const w = document.createElement("div");
+    w.className = "warn-item";
+    w.textContent = "WAKE FAILED: " + e.cell + " — this fleet's schedule (" + e.wake_cron +
+      ") promised a wake and the cell did not come back. Since " +
+      new Date(e.wake_failed_since).toLocaleString() + " (" + ago(e.wake_failed_since) + ")." +
+      (e.detail ? " " + e.detail : "");
+    row.appendChild(w);
+  }
+  const line = document.createElement("div");
+  line.className = "sleepline";
+  line.textContent = "sleep: " + sl.entries.map(e => {
+    const b = [e.cell + " " + e.state];
+    if (e.next_suspend) b.push("suspend " + new Date(e.next_suspend).toLocaleString());
+    if (e.next_wake) b.push("wake " + new Date(e.next_wake).toLocaleString());
+    if (e.deferred_since) b.push("deferred " + ago(e.deferred_since));
+    if (e.last_skip) b.push("last skip: " + e.last_skip);
+    return b.join(" ");
+  }).join("  ·  ");
+  row.appendChild(line);
 }
 
 // The notify strip. A suppressed alarm is shown HERE, in the same place
@@ -436,16 +682,63 @@ async function runTool(btn, tool, args) {
   try {
     const r = await rpc(tool, args);
     const text = (((r.result || {}).content || [])[0] || {}).text || JSON.stringify(r);
-    const isErr = (r.result || {}).isError;
-    flash(btn, old, text.slice(0, 60), isErr);
+    const isErr = !!(r.result || {}).isError;
+    showResult(tool, args, text, isErr);
+    flash(btn, old, isErr);
   } catch (e) {
-    flash(btn, old, "failed", true);
+    showResult(tool, args, "the call failed before the tool ran: " + ((e && e.message) || e) +
+      "\n\nA 401 here is ambiguous — a working read-only guest token and an expired control-plane " +
+      "token look identical on /mcp — which is why this did not pop the token prompt.", true);
+    flash(btn, old, true);
   }
 }
-function flash(btn, old, msg, isErr) {
+// The tool result area. Every tools/call result used to go into
+// btn.title: hover-only, sliced to 60 characters, and destroyed by the
+// next render() 1.5 seconds later. drain_cell's "WARNING: the requested
+// wait was SKIPPED … cancelled any streams" and its lease list are two
+// hundred characters and arrive AFTER the drain has happened, so nobody
+// ever read them. warm_model was worse than truncated: its prefix alone
+// is 64 characters, so the ETA the warm row promises could not fit in
+// the field it was being written to at all.
+function showResult(tool, args, text, isErr) {
+  const box = $("toolresult");
+  box.hidden = false;
+  box.className = isErr ? "err" : "";
+  let who = tool;
+  if (args && args.cell) who += " · " + args.cell;
+  if (args && args.model) who += " · " + args.model;
+  $("tr-title").textContent = who + "  ·  " + new Date().toLocaleTimeString();
+  // textContent into a <pre>: the pre-drain report is a LIST, and
+  // flattening it is how the lease line stops being read.
+  $("tr-body").textContent = text;
+}
+function dismissResult() {
+  $("toolresult").hidden = true;
+  $("tr-body").textContent = "";
+}
+function flash(btn, old, isErr) {
   btn.textContent = isErr ? "✗" : "✓";
-  btn.title = msg;
-  setTimeout(() => { btn.textContent = old; btn.disabled = false; refresh().catch(() => {}); }, 1500);
+  // No title= any more: the result lives in #toolresult, which sits
+  // outside the tbody render() rebuilds and stays until it is dismissed
+  // or superseded by the next call.
+  setTimeout(() => { btn.textContent = old; btn.disabled = false; tick(); }, 1500);
+}
+// llama-swap's SIGTERM cancels in-flight streams immediately, so a
+// drain_cell with no wait_seconds truncates whatever is generating —
+// the tool's own description says never to tell an operator otherwise.
+// This button sent exactly that, on one click, with no confirmation and
+// no reason. It now waits by default, and it asks for the reason, which
+// is the difference between a DRAINED row (somebody chose this and said
+// why) and a DRAINED? one.
+const DRAIN_WAIT_SECONDS = 60;
+function drainCell(btn, cell) {
+  const reason = prompt(
+    "Drain " + cell + "?\n\n" +
+    "It waits up to " + DRAIN_WAIT_SECONDS + "s for in-flight requests to finish. " +
+    "Anything still generating when that runs out is CANCELLED.\n\n" +
+    "Reason (recorded as this cell's intent, and shown on every status surface):", "");
+  if (reason === null) return;
+  runTool(btn, "drain_cell", { cell: cell, reason: reason.trim(), wait_seconds: DRAIN_WAIT_SECONDS });
 }
 function warmModel() {
   const id = $("warm-model").value.trim();
@@ -459,15 +752,19 @@ let refreshTimer = 0;
 // gate → save → boot). Without these handles each rotation would leave
 // another live reader and another poller behind.
 let pollTimer = 0, streamAbort = null, retryDelay = 0, savingsTimer = 0;
+let livenessTimer = 0, stateRetryTimer = 0, stateRetryDelay = 0;
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(() => refresh().catch(() => {}), 300);
+  refreshTimer = setTimeout(tick, 300);
 }
 async function streamEvents(signal) {
   let gated = false;
   try {
     const r = await api("/api/fleet/events", { signal });
     retryDelay = 0;
+    streamUp = true;
+    streamRetryAt = 0;
+    renderLiveness();
     const reader = r.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
@@ -508,12 +805,21 @@ async function streamEvents(signal) {
     // every 3s forever.
     gated = String(e && e.message) === "401";
   }
-  if (gated || (signal && signal.aborted)) return;
+  // Reached on an error AND on a clean end-of-stream: either way this
+  // page no longer has a live channel, and the banner says so
+  // separately from anything about the poll.
+  streamUp = false;
+  if (gated || (signal && signal.aborted)) {
+    renderLiveness();
+    return;
+  }
   retryDelay = retryDelay ? Math.min(retryDelay * 2, 30000) : 3000;
+  streamRetryAt = Date.now() + retryDelay;
+  renderLiveness();
   setTimeout(() => streamEvents(signal), retryDelay);
 }
 
-document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh().catch(() => {}); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
 
 // ── savings view ───────────────────────────────────────────────────────────
 // A second VIEW at the same single route, selected by the URL fragment.
@@ -522,9 +828,23 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) refr
 // have to widen to a prefix — which C5 §7 forbids in as many words.
 let savingsAt = 0, savingsWindow = "30d", savingsBusy = false;
 
-function usd(v) { return v == null ? "—" : (v < 0 ? "-$" : "$") + Math.abs(v).toFixed(2); }
-// Capital numbers are whole-dollar and grouped: "$3,100", not "$3100.00".
-function usd0(v) { return v == null ? "—" : "$" + Math.round(Math.abs(v)).toLocaleString(); }
+// Money on this screen ALWAYS carries its currency code, because two
+// different currencies live here: token savings are priced out of the
+// vendored table (USD per MTok, its own unit), and electricity and
+// capital are the household's own money, declared in hosts.yaml. An
+// unlabelled "$" is how a USD figure and a CAD figure come to look like
+// the same kind of number — and `net = gross − power` across the two is
+// a wrong answer with no visible symptom. CUR is replaced from the
+// payload on every render; the default matches the price table so a
+// server that has not been upgraded yet still reads sensibly.
+let CUR = { tokens: "USD", local: "USD", local_declared: false, mixed: false };
+function amt(v, cur) { return v == null ? "—" : (v < 0 ? "-$" : "$") + Math.abs(v).toFixed(2) + " " + cur; }
+// tok() is the price table's currency, locAmt() the household's. Every
+// figure on this screen goes through exactly one of them.
+function tok(v) { return amt(v, CUR.tokens); }
+function locAmt(v) { return amt(v, CUR.local); }
+// Capital numbers are whole-dollar and grouped: "$3,100 CAD".
+function amt0(v, cur) { return v == null ? "—" : "$" + Math.round(Math.abs(v)).toLocaleString() + " " + cur; }
 function mtok(n) { return (Number(n || 0) / 1e6).toFixed(2) + "M"; }
 // A percentage that rounds to zero but is not zero reads "<1%": "0% of
 // $3,100" would look like a bug in a screen whose whole job is to be
@@ -574,6 +894,7 @@ function showSavingsDenied() {
 }
 
 function renderSavings(sv) {
+  CUR = sv.currency || CUR;
   const head = $("sv-head");
   head.innerHTML = "";
   const sel = document.createElement("select");
@@ -600,7 +921,24 @@ function renderSavings(sv) {
     c.textContent = "price table is stale";
     head.appendChild(c);
   }
+  // The currency chip sits beside EXAMPLE DATA and the staleness chip
+  // because it is the same class of fact: something about these numbers
+  // that a reader has to know before reading them.
+  if (CUR.mixed) {
+    const c = document.createElement("span");
+    c.className = "chip chip-bad";
+    c.textContent = "MIXED CURRENCY — " + CUR.tokens + " savings, " + CUR.local + " costs";
+    head.appendChild(c);
+  } else if (!CUR.local_declared) {
+    const c = document.createElement("span");
+    c.className = "chip chip-warn";
+    c.textContent = "currency assumed " + CUR.tokens;
+    head.appendChild(c);
+  }
   $("sv-caveat-text").textContent = sv.caveat || "";
+  const curNote = $("sv-currency");
+  curNote.textContent = (sv.currency && sv.currency.note) || "";
+  curNote.hidden = !curNote.textContent;
 
   const empty = !!sv.empty;
   $("sv-empty").hidden = !empty;
@@ -615,13 +953,21 @@ function renderSavings(sv) {
   const line = document.createElement("div");
   line.className = "hero";
   // Gross and net always render on the same line: never gross alone,
-  // never net alone.
-  line.appendChild(document.createTextNode(usd(t.gross) + " not spent"));
+  // never net alone. Under a mixed pair the net is an em dash and the
+  // label says why — the one thing the line must never do is print a
+  // minus sign between two different currencies.
+  line.appendChild(document.createTextNode(tok(t.gross) + " not spent"));
   const sep1 = document.createElement("span");
   sep1.className = "sep";
-  sep1.textContent = t.power == null ? " · power not counted · " : " − " + usd(t.power) + " power = ";
+  if (t.power == null) {
+    sep1.textContent = " · power not counted · ";
+  } else if (CUR.mixed) {
+    sep1.textContent = "  ·  electricity " + locAmt(t.power) + ", a different currency, NOT subtracted  ·  ";
+  } else {
+    sep1.textContent = " − " + locAmt(t.power) + " power = ";
+  }
   line.appendChild(sep1);
-  line.appendChild(document.createTextNode(usd(t.net) + " " + (t.net_label || "net")));
+  line.appendChild(document.createTextNode(tok(t.net) + " " + (t.net_label || "net")));
   hero.appendChild(line);
 
   const sub = document.createElement("div");
@@ -633,7 +979,7 @@ function renderSavings(sv) {
     // it is the induced-demand control, not a footnote.
     cloudBit.appendChild(document.createTextNode("actual cloud spend, same window: "));
     const amount = document.createElement("b");
-    amount.textContent = usd(cloud.cost);
+    amount.textContent = tok(cloud.cost);
     cloudBit.appendChild(amount);
   } else {
     cloudBit.textContent = "actual cloud spend: not measured (" + (cloud.reason || "no data") + ")";
@@ -652,7 +998,7 @@ function renderSavings(sv) {
     const f = document.createElement("div");
     f.className = "hero-sub";
     f.textContent = "if I'd used " + sv.frontier.model + " instead: " +
-      (sv.frontier.cost != null ? usd(sv.frontier.cost) : "unpriced — " + (sv.frontier.unpriced || "")) +
+      (sv.frontier.cost != null ? tok(sv.frontier.cost) : "unpriced — " + (sv.frontier.unpriced || "")) +
       " — " + sv.frontier.rationale;
     hero.appendChild(f);
   }
@@ -668,8 +1014,8 @@ function renderSavings(sv) {
       // spends it whether or not anyone asked it for a token.
       const td = cellText(tr, c.reason || "unmeasured", "dash");
       td.colSpan = 4;
-      cellText(tr, c.power == null ? "—" : (c.power_declared ? "~" : "") + usd(c.power), c.power == null ? "num dash" : "num");
-      cellText(tr, usd(c.net), c.net == null ? "num dash" : "num");
+      cellText(tr, c.power == null ? "—" : (c.power_declared ? "~" : "") + locAmt(c.power), c.power == null ? "num dash" : "num");
+      cellText(tr, tok(c.net), c.net == null ? "num dash" : "num");
       tb.appendChild(tr);
       continue;
     }
@@ -677,9 +1023,9 @@ function renderSavings(sv) {
     cellText(tr, priced.length ? priced[0] + (priced.length > 1 ? " +" + (priced.length - 1) : "") : "—", priced.length ? "" : "dash");
     cellText(tr, mtok(c.in_fresh) + " / " + mtok(c.in_cached), "num");
     cellText(tr, mtok(c.out), "num");
-    cellText(tr, usd(c.gross), "num");
-    cellText(tr, c.power == null ? "—" : (c.power_declared ? "~" : "") + usd(c.power), c.power == null ? "num dash" : "num");
-    cellText(tr, usd(c.net), "num");
+    cellText(tr, tok(c.gross), "num");
+    cellText(tr, c.power == null ? "—" : (c.power_declared ? "~" : "") + locAmt(c.power), c.power == null ? "num dash" : "num");
+    cellText(tr, tok(c.net), c.net == null ? "num dash" : "num");
     tb.appendChild(tr);
     for (const m of c.models || []) {
       const mrow = document.createElement("tr");
@@ -693,8 +1039,8 @@ function renderSavings(sv) {
       const note = document.createElement("span");
       if (m.priced) {
         let s = "  median of " + m.hosts + " host" + (m.hosts === 1 ? "" : "s") +
-          ", $" + Number(m.rate_low).toFixed(2) + "–$" + Number(m.rate_high).toFixed(2) + " /MTok in" +
-          "  ·  " + usd(m.cost_low) + "–" + usd(m.cost_high);
+          ", $" + Number(m.rate_low).toFixed(2) + "–$" + Number(m.rate_high).toFixed(2) + " " + CUR.tokens + " /MTok in" +
+          "  ·  " + tok(m.cost_low) + "–" + tok(m.cost_high);
         if (m.no_cache_discount) s += "  ·  no cache discount published for this host";
         if (m.multiplier != null && m.multiplier !== 1) s += "  ·  " + m.counterfactual + " ×" + m.multiplier;
         note.textContent = s;
@@ -727,9 +1073,9 @@ function renderSavings(sv) {
   cellText(tr, pct1(t.tokens_priced_pct) + " of tokens priced");
   cellText(tr, mtok(t.in_fresh) + " / " + mtok(t.in_cached), "num");
   cellText(tr, mtok(t.out), "num");
-  cellText(tr, usd(t.gross), "num");
-  cellText(tr, t.power == null ? "—" : usd(t.power), t.power == null ? "num dash" : "num");
-  cellText(tr, usd(t.net), "num");
+  cellText(tr, tok(t.gross), "num");
+  cellText(tr, t.power == null ? "—" : locAmt(t.power), t.power == null ? "num dash" : "num");
+  cellText(tr, tok(t.net), t.net == null ? "num dash" : "num");
   tf.appendChild(tr);
 
   const pb = $("sv-payback");
@@ -756,7 +1102,7 @@ function renderSavings(sv) {
       bar.appendChild(fill);
       row.appendChild(bar);
       const label = document.createElement("span");
-      label.textContent = pct1(p.recovered_pct) + " of " + usd0(p.capital_cost) + "   ·   " + p.projection;
+      label.textContent = pct1(p.recovered_pct) + " of " + amt0(p.capital_cost, CUR.local) + "   ·   " + p.projection;
       row.appendChild(label);
       const note = document.createElement("div");
       note.className = "pb-note";
@@ -802,6 +1148,10 @@ async function boot() {
   if (streamAbort) streamAbort.abort();
   clearInterval(pollTimer);
   clearInterval(savingsTimer);
+  clearInterval(livenessTimer);
+  clearTimeout(stateRetryTimer);
+  stateRetryTimer = 0;
+  stateRetryDelay = 0;
   streamAbort = new AbortController();
   retryDelay = 0;
   const signal = streamAbort.signal;
@@ -809,14 +1159,21 @@ async function boot() {
   // land on the savings view even when that first state fetch fails, or
   // one unreachable cell sends the reader to the wrong screen.
   showView();
-  pollTimer = setInterval(() => refresh().catch(() => {}), 30000);
+  pollTimer = setInterval(tick, 30000);
   savingsTimer = setInterval(() => { if (location.hash === "#savings") loadSavings(true); }, 60000);
-  await refresh();
+  // The age on screen has to keep COUNTING while nothing is arriving.
+  livenessTimer = setInterval(renderLiveness, 1000);
+  // tick(), not refresh(): boot's own first fetch failing is precisely
+  // the case where the banner has to appear, and it used to be the one
+  // that threw into a caller's empty catch.
+  await tick();
   streamEvents(signal);
 }
 // A bare tab with no token still lands on the right view; boot() (and
-// with it the data) waits for the token.
+// with it the data) waits for the token. The banner renders immediately
+// either way — a page with no data must not look like a page with data.
 showView();
+renderLiveness();
 if (token) boot().catch(() => {});
 </script>
 </body>

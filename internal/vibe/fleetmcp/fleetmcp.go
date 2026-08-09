@@ -237,11 +237,100 @@ func (s *Server) dispatchRPC(ctx context.Context, req jsonRPCRequest) (jsonRPCRe
 	}
 }
 
+// toolEffect is what a tool DOES to the fleet. It is declared BESIDE the
+// tool, in the same table as its name, description and schema, for the
+// reason fleetapi's route table declares Access beside the mount: two
+// lists that must agree are two lists that will not. The protocol's
+// `annotations` are derived from this one field — nothing anywhere
+// re-states which tools are read-only.
+//
+// There is deliberately no safe zero value, exactly as with
+// fleetapi.Access. A tool added without a decision is effectUndeclared,
+// and TestTools_EveryToolDeclaresAnEffect fails on it: "the next agent
+// forgot" must not be spelled the same way as "the next agent decided
+// this changes nothing".
+type toolEffect int
+
+const (
+	// effectUndeclared is the zero value and is never a valid declaration.
+	effectUndeclared toolEffect = iota
+	// effectRead changes nothing on any cell, in any store, or on disk.
+	// This is the claim fleet_doctor makes in prose ("This tool CHANGES
+	// NOTHING"); declaring it here is what makes it machine-readable.
+	effectRead
+	// effectMutate changes fleet state additively or reversibly: it
+	// records something, declares something, or asks for a model to be
+	// loaded. Re-running it cannot lose work that existed before it ran.
+	effectMutate
+	// effectDestructive can destroy something that re-running the tool
+	// cannot recreate: an in-flight generation, a box's availability, a
+	// stored measurement baseline.
+	effectDestructive
+)
+
+// annotations renders the tool-annotation object of MCP
+// mcpProtocolVersion. Only the two hints this facade can honestly derive
+// are emitted, plus openWorldHint, which is a property of the fleet
+// rather than of any one tool. idempotentHint is deliberately ABSENT:
+// nothing in this table records whether re-running a verb is a no-op,
+// and a hint guessed from the effect class would be exactly the
+// confident-answer-from-absent-evidence this plan keeps refusing.
+func (e toolEffect) annotations() map[string]any {
+	return map[string]any{
+		"readOnlyHint":    e == effectRead,
+		"destructiveHint": e == effectDestructive,
+		// The fleet is an open world by construction: cells come and go,
+		// llama-swap owns residency, and a human at the box outranks every
+		// verb here. No tool in this facade operates on a closed sandbox.
+		"openWorldHint": true,
+	}
+}
+
+// toolDef is one advertised tool. It is the single authority: tools/list
+// renders from it, the effect annotation derives from it, and
+// TestTools_AdvertisedAndDispatchedAgree checks callTool's switch against
+// it.
+type toolDef struct {
+	Name        string
+	Description string
+	InputSchema map[string]any
+	Effect      toolEffect
+}
+
+// wire renders one tool the way tools/list must return it.
+func (d toolDef) wire() any {
+	return map[string]any{
+		"name":        d.Name,
+		"description": d.Description,
+		"inputSchema": d.InputSchema,
+		"annotations": d.Effect.annotations(),
+	}
+}
+
+// toolDefs is every tool this facade advertises, from the three files
+// that own them.
+func (s *Server) toolDefs() []toolDef {
+	defs := s.coreTools()
+	defs = append(defs, holdTools()...)
+	defs = append(defs, sleepTools()...)
+	return defs
+}
+
 func (s *Server) mcpTools() []any {
-	return append([]any{
-		map[string]any{
-			"name": "fleet_status",
-			"description": "Fleet-wide state: one derived row per cell (SERVING / DRAINED / " +
+	defs := s.toolDefs()
+	out := make([]any, 0, len(defs))
+	for _, d := range defs {
+		out = append(out, d.wire())
+	}
+	return out
+}
+
+func (s *Server) coreTools() []toolDef {
+	return []toolDef{
+		{
+			Effect: effectRead,
+			Name:   "fleet_status",
+			Description: "Fleet-wide state: one derived row per cell (SERVING / DRAINED / " +
 				"STOPPED / DRAINED? / OFF / OFF/AWAY / OFF/AWAY? / INCONSISTENT) with resident " +
 				"models, declared intent (why a cell is drained), last-seen for absent cells, and " +
 				"per-model cold-start ETA history. DRAINED means somebody chose it and said why; " +
@@ -249,19 +338,22 @@ func (s *Server) mcpTools() []any {
 				"why (a clean stop and a crash look identical); DRAINED? means nothing is " +
 				"recorded at all. None of the three is a reason to act — they are for humans. " +
 				"Answer 'what is every cell doing, and why' with this.",
-			"inputSchema": map[string]any{
+			InputSchema: map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},
 			},
 		},
-		map[string]any{
-			"name": "warm_model",
-			"description": "Warm (JIT-load) a chat model by sending a 1-token request through " +
+		{
+			// Additive: it asks the front to JIT-load a model. Nothing that
+			// existed before the call is lost by it.
+			Effect: effectMutate,
+			Name:   "warm_model",
+			Description: "Warm (JIT-load) a chat model by sending a 1-token request through " +
 				"the fleet front — JIT IS the start verb. Returns immediately with the " +
 				"cold-start ETA from history; the model loads in the background. " +
 				"Embed/rerank-class models are rejected: warming those means their pinned " +
 				"cell is misconfigured.",
-			"inputSchema": map[string]any{
+			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"model": map[string]any{"type": "string", "description": "Model id as listed in the front catalog."},
@@ -269,12 +361,20 @@ func (s *Server) mcpTools() []any {
 				"required": []string{"model"},
 			},
 		},
-		map[string]any{
-			"name": "unload_model",
-			"description": "Evict a resident model from a cell (llama-swap unload API). The " +
+		{
+			// Destructive on purpose, and NOT because the model is hard to
+			// get back (the next request JIT-loads it). llama-swap's unload
+			// stops the upstream llama-server process: anything generating
+			// on that model when the call lands dies with it, exactly as
+			// drain_cell's SIGTERM does. The tool's own description says
+			// "without stopping anything", which is about the CELL, and an
+			// agent must not read it as a promise about a stream.
+			Effect: effectDestructive,
+			Name:   "unload_model",
+			Description: "Evict a resident model from a cell (llama-swap unload API). The " +
 				"next request for it JIT-loads again. Use to force a VRAM reshuffle without " +
 				"stopping anything.",
-			"inputSchema": map[string]any{
+			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"cell":  map[string]any{"type": "string", "description": "Cell name from hosts.yaml."},
@@ -283,9 +383,14 @@ func (s *Server) mcpTools() []any {
 				"required": []string{"cell", "model"},
 			},
 		},
-		map[string]any{
-			"name": "probe_model",
-			"description": "Measure one model's throughput on its cell and score it against that " +
+		{
+			// A measurement — but `rebaseline: true` DELETES that model's
+			// stored baseline, and no amount of re-running the tool brings
+			// the old one back. The annotation describes what the tool may
+			// do, not what the common call does.
+			Effect: effectDestructive,
+			Name:   "probe_model",
+			Description: "Measure one model's throughput on its cell and score it against that " +
 				"model's own rolling baseline — the answer to \"is this thing slow right now?\", " +
 				"which fleet_status cannot give you (llama-server degrades 10-100x while /health " +
 				"stays green). Probes ONLY a model the cell already holds resident: a probe never " +
@@ -295,7 +400,7 @@ func (s *Server) mcpTools() []any {
 				"later; read it back with fleet_status. A degraded verdict changes nothing on its " +
 				"own (the catalog, the render and the intent are untouched) — the remediation verb " +
 				"is unload_model, then probe again.",
-			"inputSchema": map[string]any{
+			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"cell":       map[string]any{"type": "string", "description": "Cell name from hosts.yaml."},
@@ -305,16 +410,19 @@ func (s *Server) mcpTools() []any {
 				"required": []string{"cell", "model"},
 			},
 		},
-		map[string]any{
-			"name": "drain_cell",
-			"description": "Reclaim a cell (stop its serving stack). llama-swap's SIGTERM " +
+		{
+			// The description already says it: llama-swap's SIGTERM cancels
+			// in-flight streams. This is that sentence, as a flag.
+			Effect: effectDestructive,
+			Name:   "drain_cell",
+			Description: "Reclaim a cell (stop its serving stack). llama-swap's SIGTERM " +
 				"CANCELS in-flight streams immediately — a drain without wait_seconds " +
 				"truncates whatever is generating, so never tell an operator their stream " +
 				"is safe. Returns the pre-drain report — resident models, in-flight count, " +
 				"active leases, and whether a requested wait actually happened — so you can " +
 				"relay \"heads up: X holds a lease\" before confirming. Records intent " +
 				"(reason/eta) at fleetd after the drain succeeds.",
-			"inputSchema": map[string]any{
+			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"cell":         map[string]any{"type": "string", "description": "Cell name from hosts.yaml."},
@@ -325,11 +433,12 @@ func (s *Server) mcpTools() []any {
 				"required": []string{"cell"},
 			},
 		},
-		map[string]any{
-			"name": "resume_cell",
-			"description": "Resume a drained cell. Models return by JIT on next request; " +
+		{
+			Effect: effectMutate,
+			Name:   "resume_cell",
+			Description: "Resume a drained cell. Models return by JIT on next request; " +
 				"clears the cell's recorded intent.",
-			"inputSchema": map[string]any{
+			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"cell": map[string]any{"type": "string", "description": "Cell name from hosts.yaml."},
@@ -337,11 +446,12 @@ func (s *Server) mcpTools() []any {
 				"required": []string{"cell"},
 			},
 		},
-		map[string]any{
-			"name": "wake_cell",
-			"description": "Send a Wake-on-LAN packet to a cell. Always explicit — never " +
+		{
+			Effect: effectMutate,
+			Name:   "wake_cell",
+			Description: "Send a Wake-on-LAN packet to a cell. Always explicit — never " +
 				"triggered by a request. Only works for cells with wake: config in hosts.yaml.",
-			"inputSchema": map[string]any{
+			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"cell": map[string]any{"type": "string", "description": "Cell name from hosts.yaml."},
@@ -349,41 +459,47 @@ func (s *Server) mcpTools() []any {
 				"required": []string{"cell"},
 			},
 		},
-		map[string]any{
-			"name": "fleet_usage",
-			"description": "Token usage per cell, per model, per day, from the fleet's own " +
+		{
+			Effect: effectRead,
+			Name:   "fleet_usage",
+			Description: "Token usage per cell, per model, per day, from the fleet's own " +
 				"llama-swap activity logs. RAW COUNTS ONLY — this tool knows no prices and " +
 				"returns no dollars. Prompt tokens are split into in_fresh (actually processed) " +
 				"and in_cached (served from KV cache) because they are not worth the same. " +
 				"Fleet self-traffic (warm pokes) is counted separately in poke_req and excluded " +
 				"from every token sum; 200s that reported no tokens are counted in " +
 				"unmeasured_req and are never summed as zero.",
-			"inputSchema": map[string]any{
+			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"days": map[string]any{"type": "integer", "description": "How many days back to include (default 30, 0 = everything)."},
 				},
 			},
 		},
-		map[string]any{
-			"name": "fleet_savings",
-			"description": "What the fleet did NOT spend, priced from the usage ledger: tokens per cell " +
+		{
+			Effect: effectRead,
+			Name:   "fleet_savings",
+			Description: "What the fleet did NOT spend, priced from the usage ledger: tokens per cell " +
 				"priced against the SAME open-weight model rented from a real host (median across hosts, " +
 				"rendered as a range), minus declared-wattage electricity, against each cell's declared " +
 				"capital cost. Includes actual cloud spend in the same window beside it. Every figure is " +
 				"an upper bound and the payload carries the caveat that says why — quote the caveat with " +
 				"the number, never the number alone. Unpriced models keep their tokens and leave the " +
 				"money column.",
-			"inputSchema": map[string]any{
+			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"window": map[string]any{"type": "string", "description": "Window: \"7d\", \"30d\" (default) or \"all\"."},
 				},
 			},
 		},
-		map[string]any{
-			"name": "fleet_doctor",
-			"description": "Is the fleet still put together correctly? A READ-ONLY audit that runs " +
+		{
+			// "This tool CHANGES NOTHING" is in the description below. This
+			// is the same claim in the field a client can act on without
+			// reading English.
+			Effect: effectRead,
+			Name:   "fleet_doctor",
+			Description: "Is the fleet still put together correctly? A READ-ONLY audit that runs " +
 				"every 'is it still wired up' check at once: both-direction token auth per cell, " +
 				"def-SHA parity, the llama-swap version matrix, TLS expiry, disk headroom, wake " +
 				"configuration, whether each roaming cell's announcer is actually running, plus " +
@@ -392,20 +508,24 @@ func (s *Server) mcpTools() []any {
 				"be evaluated — it never means fine. This tool CHANGES NOTHING: it drains, warms, " +
 				"unloads, probes and renders nothing, and is safe to call mid-incident. Fixes are " +
 				"the operator's, through the other tools.",
-			"inputSchema": map[string]any{
+			InputSchema: map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},
 			},
 		},
-		map[string]any{
-			"name": "fleet_notify_scope",
-			"description": "Declare whether fleet ALARM notifications should be delivered right " +
+		{
+			// It gates delivery and nothing else — it drains nothing and
+			// changes no cell's state — but it is a declaration this daemon
+			// persists, so it is not a read.
+			Effect: effectMutate,
+			Name:   "fleet_notify_scope",
+			Description: "Declare whether fleet ALARM notifications should be delivered right " +
 				"now: \"away\" (vacation — alarms still fire and stay visible in fleet_status, " +
 				"but delivery is withheld and coming home sends one digest naming what was " +
 				"missed) or \"home\". This gates notifications only: it drains nothing, changes " +
 				"no cell's state, and is never consulted for routing. Prefer setting `until` so " +
 				"the fleet un-mutes itself.",
-			"inputSchema": map[string]any{
+			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"scope":  map[string]any{"type": "string", "description": "\"away\" or \"home\"."},
@@ -415,35 +535,42 @@ func (s *Server) mcpTools() []any {
 				"required": []string{"scope"},
 			},
 		},
-		map[string]any{
-			"name": "fleet_notify_test",
-			"description": "Send a test notification through the configured webhook NOW. It is " +
+		{
+			// It sends a message to a human's pager. That is a side effect
+			// on the world, so it is not read-only however little it touches
+			// the fleet.
+			Effect: effectMutate,
+			Name:   "fleet_notify_test",
+			Description: "Send a test notification through the configured webhook NOW. It is " +
 				"not an alarm: it skips the dwell, the dedup and the away gate, so it is also " +
 				"how you check the pager still works while away. An alerting path nobody has " +
 				"ever sent a message through is not an alerting path.",
-			"inputSchema": map[string]any{
+			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"message": map[string]any{"type": "string", "description": "Optional message body."},
 				},
 			},
 		},
-		map[string]any{
-			"name": "render_front",
-			"description": "Dry-run the front config render (vibe router render --cell front): " +
+		{
+			// DRY-RUN ONLY, enforced in toolRenderFront: dry_run: false is
+			// refused rather than honoured. It writes nothing.
+			Effect: effectRead,
+			Name:   "render_front",
+			Description: "Dry-run the front config render (vibe router render --cell front): " +
 				"renders the peers-only config from backend defs + hosts.yaml and returns the " +
 				"unified diff against the live front config (or the full render when no live " +
 				"path is mounted). DRY-RUN ONLY — fleetd's presence-driven render loop owns the " +
 				"write path; a second writer to the same -watch-config file breaks its " +
 				"atomic-write contract.",
-			"inputSchema": map[string]any{
+			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"dry_run": map[string]any{"type": "boolean", "description": "Must be true (dry-run is the only mode)."},
 				},
 			},
 		},
-	}, append(holdTools(), sleepTools()...)...)
+	}
 }
 
 func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMessage) (string, error) {
