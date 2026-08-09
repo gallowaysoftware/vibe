@@ -422,23 +422,26 @@ function liveness(st) {
   }
   return LIVENESS[LIVENESS.length - 1];
 }
-let lastOkAt = 0, lastGeneratedAt = 0, lastFetchError = "", streamUp = false, streamRetryAt = 0;
+let lastOkAt = 0, lastFetchError = "", streamUp = false, streamRetryAt = 0;
+// serverLagS is the SERVER's own contribution to the age: how far behind
+// this browser's receipt clock the document's generated_at was, minus
+// the smallest such gap ever observed.
+//
+// Subtracting the minimum is the whole trick, and it is why the raw
+// stamp is not used. A constant offset between this browser's clock and
+// fleetd's — minutes, on a LAN with no NTP — would otherwise pin a
+// perfectly healthy fleet at OFFLINE forever, and a banner that is
+// always red is a banner nobody reads. A constant offset cancels; what
+// survives is the case this term exists for, a fleetd answering 200 with
+// a document it has STOPPED regenerating, whose lag grows above that
+// floor. A stamp ahead of the receipt clock just sets a negative floor
+// and is otherwise ignored.
+let serverLagS = 0, minServerLagS = null;
 // stateAgeS is how old the fleet state on screen is, in seconds, or null
-// when there has never been any. The OLDER of two clocks wins: the
-// browser's own receipt time and the server's generated_at. A fleetd
-// answering 200 with a document it has stopped regenerating is stale in
-// exactly the way this banner exists to show, and the receipt clock
-// alone would call it live. A generated_at in the FUTURE is clock skew,
-// not evidence, so it is ignored rather than believed.
+// when there has never been any.
 function stateAgeS() {
   if (!lastOkAt) return null;
-  const now = Date.now();
-  let s = (now - lastOkAt) / 1000;
-  if (lastGeneratedAt) {
-    const g = (now - lastGeneratedAt) / 1000;
-    if (g > s) s = g;
-  }
-  return Math.max(0, Math.floor(s));
+  return Math.max(0, Math.floor((Date.now() - lastOkAt) / 1000 + serverLagS));
 }
 function relS(s) {
   if (s < 60) return s + "s";
@@ -472,7 +475,13 @@ async function refresh() {
   const r = await api("/api/fleet/state");
   const st = await r.json();
   lastOkAt = Date.now();
-  lastGeneratedAt = Date.parse(st.generated_at) || 0;
+  const gen = Date.parse(st.generated_at);
+  serverLagS = 0;
+  if (gen) {
+    const lag = (lastOkAt - gen) / 1000;
+    if (minServerLagS == null || lag < minServerLagS) minServerLagS = lag;
+    serverLagS = Math.max(0, lag - minServerLagS);
+  }
   lastFetchError = "";
   stateRetryDelay = 0;
   clearTimeout(stateRetryTimer);

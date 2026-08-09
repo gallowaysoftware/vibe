@@ -153,6 +153,13 @@ func TestFleetPage_OfflineStateFromHandlerToDOM(t *testing.T) {
 	require.NoError(t, err, "generated_at is not a parseable instant, so the page's clock cannot read it")
 	require.Contains(t, page, "Date.parse(st.generated_at)",
 		"the page no longer clocks its age against the server's own stamp")
+	// …and it subtracts the smallest gap it has ever seen before believing
+	// that stamp. A constant offset between the browser's clock and
+	// fleetd's — minutes, on a LAN with no NTP — would otherwise hold a
+	// perfectly healthy fleet at OFFLINE forever, and a banner that is
+	// always red is a banner nobody reads.
+	require.Contains(t, page, "lag - minServerLagS",
+		"the server's stamp is trusted raw, so clock skew alone can pin a healthy fleet at OFFLINE")
 
 	// Healthy: the control. Without it the assertions below would pass on
 	// a page that neutralises everything all the time.
