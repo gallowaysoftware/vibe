@@ -81,13 +81,22 @@ assert_contains "$out" "https://github.com/gallowaysoftware/vibe/releases/downlo
 # Test 3: idempotency — when an existing vibe reports the target version,
 #         the script skips the download. We fake `vibe` with a tiny shell
 #         script that echoes the version.
+#
+#         The fake prints what a RELEASED binary prints: goreleaser injects
+#         `{{ .Version }}` (the tag with its `v` stripped) into
+#         internal/buildinfo, and buildinfo.String() appends " (commit, date)".
+#         install.sh takes the first field of the first line and compares it
+#         against VERSION_NUM. It used to compare against the tag, so this
+#         check never fired for any real install — see
+#         TestInstallScriptIdempotencyMatchesWhatAReleasedBinaryPrints, which
+#         pins the same claim against a genuinely goreleaser-built binary.
 # ---------------------------------------------------------------------------
 printf '\n[test] idempotency: existing matching install is skipped\n'
 mkdir -p "$TMPROOT/bin3"
 cat >"$TMPROOT/bin3/vibe" <<'EOF'
 #!/bin/sh
 case "$1" in
-	--version) printf 'v9.9.9\n' ;;
+	--version) printf '9.9.9 (abc1234, 2026-01-02)\n' ;;
 	doctor)    printf 'fake-doctor-ok\n' ;;
 	*)         exit 0 ;;
 esac

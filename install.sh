@@ -10,6 +10,10 @@
 #   VIBE_OS        Override detected OS (linux|darwin).
 #   VIBE_ARCH      Override detected arch (amd64|arm64).
 #   VIBE_REPO      Override the source repo (org/name). Default: gallowaysoftware/vibe.
+#   VIBE_INSECURE_SKIP_CHECKSUM=1
+#                  Install even when the archive's sha256 could not be checked.
+#                  An unverifiable archive is refused by default; a MISMATCH is
+#                  always fatal and this knob does not override it.
 #
 # Flags:
 #   --dry-run      Print the planned actions and exit; download nothing.
@@ -47,6 +51,10 @@ Environment knobs:
   VIBE_OS        Override detected OS (linux|darwin).
   VIBE_ARCH      Override detected arch (amd64|arm64).
   VIBE_REPO      Override the source repo (org/name). Default: gallowaysoftware/vibe.
+  VIBE_INSECURE_SKIP_CHECKSUM=1
+                 Install even when the archive's sha256 could not be checked.
+                 An unverifiable archive is refused by default; a MISMATCH is
+                 always fatal and this knob does not override it.
 
 Flags:
   --dry-run      Print the planned actions and exit; download nothing.
@@ -154,7 +162,15 @@ if [ "$FORCE" -eq 0 ] && [ -x "$INSTALL_DIR/vibe" ]; then
 	# `vibe --version` is set via cobra's built-in flag (see internal/buildinfo).
 	# Failures are tolerated — older binaries may not support --version.
 	existing=$("$INSTALL_DIR/vibe" --version 2>/dev/null | head -n 1 | awk '{print $1}' || true)
-	if [ -n "$existing" ] && [ "$existing" = "$VERSION" ]; then
+	# Compare against the BARE version, not the tag. goreleaser injects
+	# `{{ .Version }}` into internal/buildinfo (see .goreleaser.yaml), and that
+	# template strips the leading `v` — so a binary from tag v1.2.3 prints
+	# `1.2.3`. Comparing it against `$VERSION` could never match: the script
+	# re-downloaded on every run, and `--force`, whose whole job is to override
+	# this check, had nothing to override. A hand-built binary may carry either
+	# spelling, so the `v` is stripped from both sides rather than assumed off.
+	existing_num=$(printf '%s' "$existing" | sed 's/^v//')
+	if [ -n "$existing_num" ] && [ "$existing_num" = "$VERSION_NUM" ]; then
 		info "vibe $VERSION is already installed at $INSTALL_DIR/vibe — skipping download (use --force to override)."
 		[ "$DRY_RUN" -eq 1 ] && exit 0
 		# Still run doctor so the user gets the diagnostic.
@@ -165,6 +181,7 @@ fi
 if [ "$DRY_RUN" -eq 1 ]; then
 	info "dry-run: would download $URL"
 	info "dry-run: would download $CHECKSUM_URL"
+	info "dry-run: would verify the archive's sha256 (an archive that cannot be verified is refused)"
 	info "dry-run: would extract vibe and vamp into $INSTALL_DIR"
 	info "dry-run: would run $INSTALL_DIR/vibe doctor"
 	exit 0
@@ -175,7 +192,11 @@ mkdir -p "$INSTALL_DIR" || fatal "could not create $INSTALL_DIR"
 
 tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t vibe-install)
 [ -d "$tmpdir" ] || fatal "could not create temp directory"
-trap 'rm -rf "$tmpdir"' EXIT INT TERM
+# ${tmpdir:?}: `set -u` catches an UNSET variable and not an empty one, and an
+# empty expansion here would make the trap `rm -rf ""` — the current
+# directory. The guard above already aborts on a failed mktemp; this is what
+# stops a later edit from being one typo away from deleting the operator's cwd.
+trap 'rm -rf "${tmpdir:?}"' EXIT INT TERM
 
 archive_path="$tmpdir/$ARCHIVE"
 checksum_path="$tmpdir/checksums.txt"
@@ -183,24 +204,64 @@ checksum_path="$tmpdir/checksums.txt"
 info "downloading $ARCHIVE ..."
 http_download "$URL" "$archive_path" || fatal "failed to download $URL"
 
+# -- checksum verification -------------------------------------------------
+#
+# sha256sum is coreutils and is NOT on a stock macOS, which shipped every
+# darwin install unverified — the gate was `command -v sha256sum`, and there
+# was no fallback anywhere in the script. macOS has shasum (perl); openssl is
+# on nearly everything else.
+sha256_of() {
+	# stdout = the file's sha256, or nothing at all if this box has no hasher.
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$1" | awk '{print $1}'
+	elif command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 "$1" | awk '{print $1}'
+	elif command -v openssl >/dev/null 2>&1; then
+		openssl dgst -sha256 "$1" | awk '{print $NF}'
+	fi
+}
+
+# unverified decides what "we could not check this archive" costs.
+#
+# POLICY: it is fatal, and the operator opts out by name. This script is
+# documented to be piped into `sh`, where a warning scrolls past on its way to
+# a binary that is already on the PATH — so "verification did not happen" has
+# to be something the operator ACTS on rather than something they notice. The
+# skip paths are also not the ordinary case: a release always carries a
+# checksums.txt with a line per archive, so each of them means something is
+# wrong with either the release or the box.
+#
+# What a same-origin checksum does not defend against is a compromised GitHub
+# or a forged TLS chain: an attacker who can replace the archive can replace
+# the digest list beside it. It defends against the truncated download, the
+# poisoned cache and the half-replaced release — the failures that actually
+# happen — and that is worth refusing to install over.
+#
+# A MISMATCH is fatal with no opt-out: that is the one case where something is
+# known to be wrong rather than unknown.
+unverified() {
+	if [ "${VIBE_INSECURE_SKIP_CHECKSUM:-0}" = "1" ]; then
+		warn "$1 — installing anyway because VIBE_INSECURE_SKIP_CHECKSUM=1."
+		return 0
+	fi
+	fatal "$1. Refusing to install an unverified binary; re-run with VIBE_INSECURE_SKIP_CHECKSUM=1 if you accept that."
+}
+
 info "downloading checksums.txt ..."
 if http_download "$CHECKSUM_URL" "$checksum_path"; then
-	if command -v sha256sum >/dev/null 2>&1; then
-		expected=$(grep " $ARCHIVE\$" "$checksum_path" | awk '{print $1}' || true)
-		if [ -n "$expected" ]; then
-			actual=$(sha256sum "$archive_path" | awk '{print $1}')
-			if [ "$expected" != "$actual" ]; then
-				fatal "sha256 mismatch for $ARCHIVE (expected $expected, got $actual)"
-			fi
-			info "sha256 verified."
-		else
-			warn "no checksum line for $ARCHIVE in checksums.txt — skipping verification."
-		fi
+	expected=$(grep " $ARCHIVE\$" "$checksum_path" | awk '{print $1}' || true)
+	actual=$(sha256_of "$archive_path")
+	if [ -z "$expected" ]; then
+		unverified "checksums.txt carries no line for $ARCHIVE (goreleaser emits one per archive, so this is not the artifact set we published)"
+	elif [ -z "$actual" ]; then
+		unverified "no sha256 tool on this box (looked for sha256sum, shasum and openssl)"
+	elif [ "$expected" != "$actual" ]; then
+		fatal "sha256 mismatch for $ARCHIVE (expected $expected, got $actual)"
 	else
-		warn "sha256sum not available — skipping checksum verification."
+		info "sha256 verified."
 	fi
 else
-	warn "could not download checksums.txt — skipping checksum verification."
+	unverified "could not download checksums.txt, though $ARCHIVE downloaded from the same host over the same connection"
 fi
 
 info "extracting into $INSTALL_DIR ..."

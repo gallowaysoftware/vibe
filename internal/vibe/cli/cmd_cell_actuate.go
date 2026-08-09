@@ -74,7 +74,18 @@ func cellDrainCmd() *cobra.Command {
 			if untilExit {
 				return drainUntilExit(ctx, out, cell, reason, eta, yes, wait, command)
 			}
-			return drainCell(ctx, out, cell, reason, eta, yes, wait)
+			if err := drainCell(ctx, out, cell, reason, eta, yes, wait); err != nil {
+				// A plain `vibe cell drain` the operator answered "n" to did
+				// exactly what they asked. It already printed "aborted"; the
+				// sentinel exists for the --until-exit caller, which must NOT
+				// run its command, and turning it into a non-zero exit here
+				// would make every declined prompt look like a failed drain.
+				if errors.Is(err, errDrainAborted) {
+					return nil
+				}
+				return err
+			}
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&reason, "reason", "", "why the cell is being reclaimed (recorded as intent)")
@@ -202,6 +213,30 @@ func hostsPath() string {
 	return "~/.config/vibe/hosts.yaml"
 }
 
+// errDrainAborted is what an operator answering the lease prompt with
+// anything but "y" returns. It exists because "the drain did not happen"
+// has to be distinguishable from "the drain happened" by the CALLER:
+// drainUntilExit's whole contract is drain → run → resume, and a nil
+// return on the abort path ran the command against a cell that was still
+// serving and then issued a CellResume for a cell nothing had drained.
+// The plain verb maps it back to exit 0 — see cellDrainCmd.
+var errDrainAborted = errors.New("drain aborted")
+
+// The two seams the lease prompt needs to be testable. A `go test`
+// process has no controlling terminal, so without them the only prompt
+// path any test could reach was the off-TTY refusal — which is why an
+// aborted drain shipped running its command anyway.
+//
+// Only the terminal check and the input SOURCE are replaceable; the
+// decision (EOF and a non-"y" answer both abort, "y" proceeds) stays in
+// drainCell, so a test that fakes a terminal still exercises the real
+// branch. fmt.Scanln is by definition fmt.Fscanln(os.Stdin, …), so the
+// production default is the same call it always made.
+var (
+	stdinIsTerminal           = func() bool { return isatty.IsTerminal(os.Stdin.Fd()) }
+	promptInput     io.Reader = os.Stdin
+)
+
 // drainCell executes one drain: lease check + confirmation first, then
 // the RPC, then the report.
 func drainCell(ctx context.Context, out io.Writer, cell, reason, eta string, yes bool, wait time.Duration) error {
@@ -212,20 +247,20 @@ func drainCell(ctx context.Context, out io.Writer, cell, reason, eta string, yes
 	leases := fetchLeasesForCell(ctx, cell)
 	if len(leases) > 0 && !yes {
 		printLeasePrompt(out, displayCell(name), leases)
-		if !isatty.IsTerminal(os.Stdin.Fd()) {
+		if !stdinIsTerminal() {
 			return fmt.Errorf("leases are active and stdin is not a terminal — re-run with --yes to drain anyway")
 		}
 		fmt.Fprintf(out, "drain %s anyway? [y/N] ", displayCell(name))
 		var answer string
-		if _, err := fmt.Scanln(&answer); err != nil {
+		if _, err := fmt.Fscanln(promptInput, &answer); err != nil {
 			// EOF (piped stdin, closed terminal) reads as "no": aborting is
 			// the safe default when the operator can't actually be asked.
 			fmt.Fprintln(out, "aborted")
-			return nil
+			return errDrainAborted
 		}
 		if strings.ToLower(strings.TrimSpace(answer)) != "y" {
 			fmt.Fprintln(out, "aborted")
-			return nil
+			return errDrainAborted
 		}
 	}
 
@@ -344,6 +379,13 @@ func drainUntilExit(ctx context.Context, out io.Writer, cell, reason, eta string
 		return fmt.Errorf("--until-exit runs on the local box (resume-on-exit needs it); drain the remote cell separately")
 	}
 	if err := drainCell(ctx, out, "", reason, eta, yes, wait); err != nil {
+		// An abort is not a failure, but it is not a drain either: the cell
+		// is still serving, so the command must not run and there is
+		// nothing to resume. Named in the error because the operator is
+		// about to look for their game.
+		if errors.Is(err, errDrainAborted) {
+			return fmt.Errorf("%w — %s was not run and the cell is still serving", err, command[0])
+		}
 		return err
 	}
 	// Resume is guaranteed from here on. Deferred first so a panic or a

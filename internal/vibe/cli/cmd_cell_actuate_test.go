@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -95,6 +96,15 @@ func (f *cellVerbFake) Pull(context.Context, *connect.Request[vibev1.PullRequest
 // path inside a temp XDG_RUNTIME_DIR (the local-daemon drain path).
 func serveCellVerbsOnUnix(t *testing.T, f *cellVerbFake) {
 	t.Helper()
+	serveControlOnUnix(t, f)
+}
+
+// serveControlOnUnix is the same thing for any ControlService fake: the
+// `vibe run` and `vibe ps` paths need Status/Start/Stop/Pull rather than
+// the cell verbs, and both must reach the daemon over the SAME socket the
+// production client dials, or ensureDaemon spawns a real one.
+func serveControlOnUnix(t *testing.T, h vibev1connect.ControlServiceHandler) {
+	t.Helper()
 	runtime := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", runtime)
 	if err := os.MkdirAll(filepath.Join(runtime, "vibe"), 0o700); err != nil {
@@ -105,7 +115,7 @@ func serveCellVerbsOnUnix(t *testing.T, f *cellVerbFake) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	path, handler := vibev1connect.NewControlServiceHandler(f)
+	path, handler := vibev1connect.NewControlServiceHandler(h)
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, path) {
 			handler.ServeHTTP(w, r)
@@ -347,6 +357,143 @@ cells:
 	}
 	if fake.drains != 1 {
 		t.Error("--yes drain did not fire")
+	}
+}
+
+// fakePrompt points the lease prompt at a canned answer and tells
+// drainCell that stdin is a terminal. A `go test` process has neither, so
+// before the seams the ONLY prompt path any test could reach was the
+// off-TTY refusal — which is exactly why an aborted drain shipped running
+// its --until-exit command anyway.
+func fakePrompt(t *testing.T, answer string) {
+	t.Helper()
+	oldTTY, oldIn := stdinIsTerminal, promptInput
+	t.Cleanup(func() { stdinIsTerminal, promptInput = oldTTY, oldIn })
+	stdinIsTerminal = func() bool { return true }
+	promptInput = strings.NewReader(answer)
+}
+
+// leasedCell wires a fleetd serving one active lease on gpu-cell plus a
+// cell daemon, so the drain prompt actually fires.
+func leasedCell(t *testing.T, fake *cellVerbFake) {
+	t.Helper()
+	leaseFleetd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"leases":[{"cell":"gpu-cell","model":"qwen","holder":"batch","note":"mid-batch","expires_at":"2099-01-01T00:00:00Z"}]}`))
+	}))
+	t.Cleanup(leaseFleetd.Close)
+	ts := serveCellVerbsTCP(t, fake)
+	writeHosts(t, fmt.Sprintf(`
+fleetd_url: "%s"
+cells:
+  front:    { url: "http://127.0.0.1:1", class: always_on }
+  gpu-cell: { url: "http://127.0.0.1:1", class: opportunistic, daemon_url: "%s" }
+`, leaseFleetd.URL, ts.URL))
+}
+
+// TestCellDrainPromptAnswers covers all three answers a human can give
+// the lease prompt. The two ABORT branches shipped returning nil — the
+// same value a completed drain returns — so the only caller that reads
+// the error could not tell "the operator said no" from "the cell is
+// drained", and ran its command against a cell that was still serving.
+func TestCellDrainPromptAnswers(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		answer     string
+		wantAbort  bool
+		wantDrains int
+	}{
+		// EOF: piped stdin, a closed terminal, a hung-up ssh.
+		{name: "eof aborts", answer: "", wantAbort: true},
+		{name: "n aborts", answer: "n\n", wantAbort: true},
+		{name: "anything else aborts", answer: "later\n", wantAbort: true},
+		{name: "y proceeds", answer: "y\n", wantDrains: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &cellVerbFake{}
+			leasedCell(t, fake)
+			fakePrompt(t, tc.answer)
+
+			var out bytes.Buffer
+			err := drainCell(t.Context(), &out, "gpu-cell", "", "", false, 0)
+			switch {
+			case tc.wantAbort && !errors.Is(err, errDrainAborted):
+				t.Fatalf("err = %v, want errDrainAborted — a caller cannot tell an abort from a drain", err)
+			case !tc.wantAbort && err != nil:
+				t.Fatalf("err = %v, want the drain to proceed", err)
+			}
+			if fake.drains != tc.wantDrains {
+				t.Errorf("drains = %d, want %d", fake.drains, tc.wantDrains)
+			}
+			if tc.wantAbort && !strings.Contains(out.String(), "aborted") {
+				t.Errorf("out = %q, want the operator told it aborted", out.String())
+			}
+		})
+	}
+}
+
+// TestCellDrainAbortIsNotAFailureForThePlainVerb: the sentinel is for the
+// --until-exit caller. A human who typed `vibe cell drain` and answered
+// "n" got what they asked for, and a shell that reads $? must not see a
+// failed drain.
+func TestCellDrainAbortIsNotAFailureForThePlainVerb(t *testing.T) {
+	fake := &cellVerbFake{}
+	leasedCell(t, fake)
+	fakePrompt(t, "n\n")
+
+	cmd := cellDrainCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"gpu-cell"})
+	if err := cmd.ExecuteContext(t.Context()); err != nil {
+		t.Fatalf("`vibe cell drain` answered n = %v (exit %d), want a clean exit", err, ExitCode(err))
+	}
+	if fake.drains != 0 {
+		t.Errorf("drains = %d after an aborted prompt", fake.drains)
+	}
+}
+
+// TestDrainUntilExitAbortedDrainRunsNothing is the defect, driven end to
+// end: the wrapper's contract is drain → run → resume, and on the abort
+// path there is no drain — so the command must not run, and there must be
+// no CellResume for a cell nothing drained. Both happened, and the
+// wrapper still exited 0, so `vibe cell drain --until-exit -- game && x`
+// proceeded to x.
+func TestDrainUntilExitAbortedDrainRunsNothing(t *testing.T) {
+	fake := &cellVerbFake{}
+	// The local (unix-socket) daemon is what --until-exit drains; the
+	// lease list still comes from fleetd, and the local cell's name comes
+	// from the daemon config, so the prompt is driven through the named
+	// cell's fleetd entry the same way the local drain reads it.
+	serveCellVerbsOnUnix(t, fake)
+	leaseFleetd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"leases":[{"cell":"local","model":"qwen","holder":"batch","note":"mid-batch","expires_at":"2099-01-01T00:00:00Z"}]}`))
+	}))
+	t.Cleanup(leaseFleetd.Close)
+	writeHosts(t, fmt.Sprintf("fleetd_url: %q\n", leaseFleetd.URL))
+	// The local cell's name comes from the daemon config; without it the
+	// lease lookup returns nothing and the prompt never fires.
+	if err := os.WriteFile(filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "vibe", "config.yaml"),
+		[]byte("fleet:\n  cell: local\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakePrompt(t, "n\n")
+
+	marker := filepath.Join(t.TempDir(), "ran")
+	var out bytes.Buffer
+	err := drainUntilExit(t.Context(), &out, "", "gaming", "", false, 0,
+		[]string{"sh", "-c", "echo ran > " + marker})
+
+	if !errors.Is(err, errDrainAborted) {
+		t.Fatalf("err = %v, want the abort to reach the wrapper's caller", err)
+	}
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Error("the wrapped command RAN after an aborted drain: the cell was still serving")
+	}
+	if fake.drains != 0 || fake.resumes != 0 {
+		t.Errorf("drains=%d resumes=%d — an aborted drain must neither drain nor resume", fake.drains, fake.resumes)
 	}
 }
 

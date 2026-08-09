@@ -87,6 +87,81 @@ func TestCellStatusRendersDerivedTable(t *testing.T) {
 	}
 }
 
+// TestCellStatusJSON: the read commands' --json half. `vibe cell status`
+// already holds the decoded snapshot, and a script that wanted one field
+// of it had to parse a column-aligned table with a trailing deep-link
+// block. The document is fleetd's own, exactly as `vibe fleet doctor
+// --json` emits fleetd's report rather than a second spelling of it.
+func TestCellStatusJSON(t *testing.T) {
+	now := time.Now()
+	ts := cannedFleetd(t, func() fleetapi.StateSnapshot {
+		return statusState(fleetapi.CellSnapshot{
+			Name: "gpu-cell", URL: "http://gpu.lan:9000", Class: "opportunistic",
+			Reachable: false, Display: fleetapi.DisplayDrained,
+			Intent: &fleetapi.Intent{State: "drained", Reason: "gaming", ETA: "23:00", Since: now},
+			Models: []fleetapi.ModelState{{ID: "qwen", State: "ready"}},
+		})
+	})
+
+	cmd := cellStatusCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"--api", ts.URL, "--json"})
+	if err := cmd.ExecuteContext(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	var got fleetapi.StateSnapshot
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v\n%s", err, out.String())
+	}
+	if len(got.Cells) != 1 {
+		t.Fatalf("cells = %+v", got.Cells)
+	}
+	c := got.Cells[0]
+	if c.Name != "gpu-cell" || c.Display != fleetapi.DisplayDrained || c.Intent == nil || c.Intent.Reason != "gaming" {
+		t.Errorf("cell = %+v, intent = %+v", c, c.Intent)
+	}
+	if len(c.Models) != 1 || c.Models[0].ID != "qwen" {
+		t.Errorf("models = %+v", c.Models)
+	}
+	// The table is not printed alongside it — a JSON document with a
+	// column-aligned header stapled to the front is not a JSON document.
+	if strings.Contains(out.String(), "CELL ") {
+		t.Errorf("--json printed the human table too:\n%s", out.String())
+	}
+}
+
+// TestCellStatusJSONRefusesTheDegradedDocument: the degraded fallback is
+// assembled by probing cells from THIS box. It carries no intent, no
+// last-seen and no daemon block, so emitting it under --json would hand a
+// script something shaped like fleetd's answer that fleetd never gave.
+func TestCellStatusJSONRefusesTheDegradedDocument(t *testing.T) {
+	// Hermetic: if this ever DID fall through to the degraded path it must
+	// probe a temp dir's (absent) hosts.yaml, never the operator's own.
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	deadLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	deadURL := "http://" + deadLn.Addr().String()
+	deadLn.Close()
+
+	cmd := cellStatusCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"--api", deadURL, "--json"})
+	err := cmd.ExecuteContext(t.Context())
+	if err == nil {
+		t.Fatalf("an unreachable fleetd produced JSON: %s", out.String())
+	}
+	if !strings.Contains(err.Error(), "--json") {
+		t.Errorf("err = %v, want it to name the flag and the human path", err)
+	}
+	if strings.Contains(out.String(), "{") {
+		t.Errorf("a partial document was printed before the refusal:\n%s", out.String())
+	}
+}
+
 func TestCellStatusDegradedFallback(t *testing.T) {
 	// fleetd is dead; hosts.yaml has cells. One cell answers a direct
 	// /v1/models probe, the other doesn't.
