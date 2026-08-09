@@ -97,28 +97,29 @@ func newRewritingBackend(u *url.URL, rw *modelRewrite) *backend {
 
 // replacingReader substitutes fixed byte sequences in a stream without
 // buffering the whole body — required because completion responses stream
-// as SSE and must keep flowing token by token. It retains up to one
-// needle's length between reads so a match spanning a chunk boundary is
-// still found.
+// as SSE and must keep flowing token by token. Between reads it retains
+// only the tail that could still turn into a match once more bytes
+// arrive, so a needle spanning a chunk boundary is still found.
 type replacingReader struct {
-	src   io.ReadCloser
-	pairs [][2][]byte
-	buf   []byte
-	eof   bool
+	src    io.ReadCloser
+	pairs  [][2][]byte
+	buf    []byte
+	eof    bool
+	srcErr error // the non-EOF error that ended the source, if any
 }
 
 func (r *replacingReader) Read(p []byte) (int, error) {
 	for {
 		if len(r.buf) > 0 {
-			// Hold back a needle-length tail unless the source is done, so
-			// a match split across reads isn't missed.
+			// Hold back only what could still become a match, so a needle
+			// split across reads isn't missed. Holding back a needle-LENGTH
+			// tail would do that too, but it also delays bytes that can
+			// never be part of a match — and the needle is as long as the
+			// upstream's id, 60+ bytes for a real mlx snapshot path, so
+			// every SSE event would go out one event late.
 			emit := len(r.buf)
 			if !r.eof {
-				if keep := r.maxNeedle() - 1; emit > keep {
-					emit -= keep
-				} else {
-					emit = 0
-				}
+				emit -= r.partialTail()
 			}
 			if emit > 0 {
 				n := copy(p, r.buf[:emit])
@@ -127,6 +128,15 @@ func (r *replacingReader) Read(p []byte) (int, error) {
 			}
 		}
 		if r.eof {
+			// An upstream that died mid-stream is not a stream that ended.
+			// Returning io.EOF here hands the client a well-formed OpenAI
+			// stream that simply stops before [DONE], and costs
+			// ReverseProxy the copy error it logs — so a truncated
+			// completion is invisible on both sides at once. Carrying the
+			// source's error to here is what keeps those two signals.
+			if r.srcErr != nil {
+				return 0, r.srcErr
+			}
 			return 0, io.EOF
 		}
 		chunk := make([]byte, 32<<10)
@@ -140,6 +150,7 @@ func (r *replacingReader) Read(p []byte) (int, error) {
 		if err != nil {
 			r.eof = true
 			if err != io.EOF {
+				r.srcErr = err
 				// Emit whatever survived, then surface the error next call.
 				if len(r.buf) > 0 {
 					n := copy(p, r.buf)
@@ -150,6 +161,34 @@ func (r *replacingReader) Read(p []byte) (int, error) {
 			}
 		}
 	}
+}
+
+// partialTail is the length of the longest suffix of buf that is a proper
+// prefix of some needle: the only bytes whose meaning can still change
+// when the next chunk arrives. Everything ahead of it is settled and goes
+// out now. It is 0 for the common case — an SSE frame ends in "\n\n" and
+// no needle begins there — so whole frames are dispatched on arrival.
+//
+// Cost is at most maxNeedle prefix compares per pair, nearly all of which
+// fail on their first byte.
+func (r *replacingReader) partialTail() int {
+	k := r.maxNeedle() - 1
+	if k > len(r.buf) {
+		k = len(r.buf)
+	}
+	for ; k > 0; k-- {
+		tail := r.buf[len(r.buf)-k:]
+		for _, pr := range r.pairs {
+			// Proper prefixes only. A WHOLE needle in the buffer is not a
+			// partial match — ReplaceAll has already been over it — and
+			// holding one back would stall the stream on a substitution
+			// that is already done.
+			if k < len(pr[0]) && bytes.HasPrefix(pr[0], tail) {
+				return k
+			}
+		}
+	}
+	return 0
 }
 
 func (r *replacingReader) maxNeedle() int {

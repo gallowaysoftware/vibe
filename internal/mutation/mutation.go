@@ -1044,18 +1044,21 @@ var Registry = []Mutation{
 		Name: "c26b/the model-rewrite reader buffers the stream",
 		File: "internal/vibe/proxy/proxy.go",
 		Find: "\t\t\temit := len(r.buf)\n\t\t\tif !r.eof {\n" +
-			"\t\t\t\tif keep := r.maxNeedle() - 1; emit > keep {\n" +
-			"\t\t\t\t\temit -= keep\n\t\t\t\t} else {\n\t\t\t\t\temit = 0\n\t\t\t\t}\n\t\t\t}\n",
+			"\t\t\t\temit -= r.partialTail()\n\t\t\t}\n",
 		Replace:  "\t\t\temit := len(r.buf)\n\t\t\tif !r.eof {\n\t\t\t\temit = 0\n\t\t\t}\n",
 		Pkg:      "./internal/vibe/proxy/",
-		MustFail: []string{"TestProxy_StreamingCompletionIsUnbuffered"},
-		Why: "ground rule 1, mechanically. The rewrite reader holds back a needle-length tail so a " +
-			"match split across chunks is still found; holding back EVERYTHING until EOF is the same " +
-			"code one condition simpler and passes every correctness test in the package, because the " +
-			"bytes are still right — they just arrive at the end. Claude Code kills a stalled stream " +
-			"at ~5 min, so that turns a slow model into a broken one. Registered because the guard " +
-			"went red once in CI for a reason of its own making (C26b), and a guard people have " +
-			"learned to re-run is worse than no guard.",
+		MustFail: []string{"TestProxy_StreamingCompletionIsUnbuffered", "TestReplacingReader_HoldsBackOnlyAnAmbiguousTail"},
+		Why: "ground rule 1, mechanically. The rewrite reader holds back the tail that could still " +
+			"become a match, so a needle split across chunks is still found; holding back EVERYTHING " +
+			"until EOF is the same code one condition simpler and passes every correctness test in the " +
+			"package, because the bytes are still right — they just arrive at the end. Claude Code kills " +
+			"a stalled stream at ~5 min, so that turns a slow model into a broken one. Registered " +
+			"because the guard went red once in CI for a reason of its own making (C26b), and a guard " +
+			"people have learned to re-run is worse than no guard. Re-pointed when the hold-back stopped " +
+			"being a fixed needle LENGTH: at that size the guard's own upstream id (11 chars) was 27 " +
+			"short of the length that would have stalled it, so it could not tell a hold-back bounded by " +
+			"ambiguity from one bounded by the id — which is what the second named test, and the " +
+			"mlx-path case inside the first, now assert.",
 	},
 }
 
