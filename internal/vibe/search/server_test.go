@@ -382,7 +382,7 @@ func TestHTMLToTextStripsScriptsAndKeepsProse(t *testing.T) {
 func TestDirectFetcherRejectsNonHTTPSchemes(t *testing.T) {
 	// A URL reaches this service from an agent, so file:// would turn a page
 	// fetch into local disk access on the fleet host.
-	_, err := newDirectFetcher().Fetch(context.Background(), "file:///etc/passwd")
+	_, err := newDirectFetcher(false).Fetch(context.Background(), "file:///etc/passwd")
 	if err == nil {
 		t.Fatal("expected an error for a file:// URL")
 	}
@@ -391,6 +391,11 @@ func TestDirectFetcherRejectsNonHTTPSchemes(t *testing.T) {
 	}
 }
 
+// Extraction, proven against a real socket. It runs with the private-address
+// guard OFF because httptest listens on 127.0.0.1 and this test is about the
+// HTML reducer, not about where a fetch may go — that is
+// dialguard_test.go's subject, and conflating the two would let a broken
+// guard hide behind a passing extraction.
 func TestDirectFetcherExtractsRealPage(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
@@ -399,11 +404,86 @@ func TestDirectFetcherExtractsRealPage(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	doc, err := newDirectFetcher().Fetch(context.Background(), upstream.URL)
+	doc, err := newDirectFetcher(true).Fetch(context.Background(), upstream.URL)
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
 	if doc.Title != "Doc" || !strings.Contains(doc.Text, "Body text here.") {
 		t.Errorf("doc = %+v, want title Doc and body text", doc)
+	}
+}
+
+// The verifier sent `Origin: https://evil.example.com` and got a 200 back
+// from every route. A browser is the only thing that sets this header, and
+// after a rebind it is the only thing left that still names where the page
+// came from.
+func TestCrossOriginBrowserRequestIsRefused(t *testing.T) {
+	ts := newTestServer(t, &Server{
+		Provider: &stubProvider{resp: &Response{}},
+		Fetcher:  &stubFetcher{name: "direct", doc: &Document{Text: strings.Repeat("prose ", 200)}},
+	})
+
+	post := func(t *testing.T, path, origin, body string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, ts.URL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	const rpc = `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`
+	const fetchBody = `{"url":"https://example.com/a"}`
+
+	for _, hostile := range []string{"https://evil.example.com", "http://evil.example.com:8080", "null", "http://192.168.1.50"} {
+		if got := post(t, "/mcp", hostile, rpc); got != http.StatusForbidden {
+			t.Errorf("POST /mcp with Origin %q = %d, want 403 — a page the operator is merely looking at can drive this endpoint", hostile, got)
+		}
+		if got := post(t, "/fetch", hostile, fetchBody); got != http.StatusForbidden {
+			t.Errorf("POST /fetch with Origin %q = %d, want 403", hostile, got)
+		}
+	}
+
+	// No Origin at all is every non-browser client this service exists for:
+	// curl, an MCP harness, a harness's native SearXNG path. Refusing those
+	// would be ceremony that breaks the product.
+	if got := post(t, "/mcp", "", rpc); got != http.StatusOK {
+		t.Errorf("POST /mcp with no Origin = %d, want 200 — non-browser clients send none", got)
+	}
+	for _, ours := range []string{"http://localhost:3000", "http://127.0.0.1:14003", "http://[::1]:8080"} {
+		if got := post(t, "/mcp", ours, rpc); got != http.StatusOK {
+			t.Errorf("POST /mcp with Origin %q = %d, want 200 — a page served from this machine is not the threat", ours, got)
+		}
+	}
+
+	// A plain browser NAVIGATION sends no Origin, so the readiness URL an
+	// operator types into a tab keeps working.
+	health, err := http.Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	health.Body.Close()
+	if health.StatusCode != http.StatusOK {
+		t.Errorf("healthz = %s, want 200", health.Status)
+	}
+	// …but a cross-origin scripted read of it does not.
+	hreq, _ := http.NewRequest(http.MethodGet, ts.URL+"/healthz", nil)
+	hreq.Header.Set("Origin", "https://evil.example.com")
+	hresp, err := http.DefaultClient.Do(hreq)
+	if err != nil {
+		t.Fatalf("GET /healthz cross-origin: %v", err)
+	}
+	hresp.Body.Close()
+	if hresp.StatusCode != http.StatusForbidden {
+		t.Errorf("cross-origin /healthz = %s, want 403 — auth exempts the probe, the origin rule does not", hresp.Status)
 	}
 }

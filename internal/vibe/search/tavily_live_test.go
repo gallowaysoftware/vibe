@@ -102,7 +102,7 @@ func TestLiveTieredFetchEscalation(t *testing.T) {
 	}
 	srv := &Server{
 		Provider: &stubProvider{resp: &Response{}},
-		Fetcher:  newDirectFetcher(),
+		Fetcher:  newDirectFetcher(false),
 		Escalate: tv,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

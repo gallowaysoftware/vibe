@@ -31,6 +31,11 @@ type searxngUpstream struct {
 	hc   *http.Client
 }
 
+// newSearxngUpstream's client is deliberately unguarded. The base URL comes
+// from --search-upstream, an address the OPERATOR chose, and the documented
+// zero-cost deployment points it at a SearXNG container on a private
+// network. The dial guard exists for targets an attacker picks; applying it
+// here would break the shipped configuration and protect nothing.
 func newSearxngUpstream(base string) *searxngUpstream {
 	return &searxngUpstream{base: strings.TrimRight(base, "/"), hc: &http.Client{}}
 }
@@ -94,20 +99,52 @@ func (s *searxngUpstream) Search(ctx context.Context, q Query) (*Response, error
 // host that also serves the router.
 const maxFetchBytes = 4 << 20 // 4 MiB
 
-type directFetcher struct{ hc *http.Client }
+type directFetcher struct {
+	hc *http.Client
+	// guard is held so its two seams stay reachable from the package's own
+	// tests. Nothing outside this package touches it.
+	guard *dialGuard
+}
 
-func newDirectFetcher() *directFetcher {
-	return &directFetcher{hc: &http.Client{
-		// Bound redirect chains; the default is already 10 but making it
-		// explicit documents that a redirect loop is a fetch failure, not a
-		// hang the caller's context has to clean up.
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return fmt.Errorf("stopped after %d redirects", len(via))
-			}
-			return nil
+func newDirectFetcher(allowPrivate bool) *directFetcher {
+	guard := newDialGuard(allowPrivate)
+	return &directFetcher{
+		guard: guard,
+		hc: &http.Client{
+			Transport: &http.Transport{
+				// The whole point of this file's security posture, in one
+				// field: every socket this client opens — first request,
+				// each redirect hop, each address a name resolves to — goes
+				// through the guard. See dialguard.go for why the check
+				// cannot live on the parsed URL.
+				DialContext: guard.DialContext,
+				// An operator's egress proxy stays honoured, as it was when
+				// this client was http.DefaultTransport. Note the boundary:
+				// with a proxy configured the socket goes to the PROXY, so
+				// the proxy — not this guard — is what decides where the
+				// request ultimately lands.
+				Proxy:                 http.ProxyFromEnvironment,
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          100,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
+			// Bound redirect chains; the default is already 10 but making it
+			// explicit documents that a redirect loop is a fetch failure, not
+			// a hang the caller's context has to clean up.
+			//
+			// Deliberately NOT where the address check happens: a URL check
+			// here would see only the hops net/http chooses to report, and
+			// would still be resolving a name it does not then dial.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 10 {
+					return fmt.Errorf("stopped after %d redirects", len(via))
+				}
+				return nil
+			},
 		},
-	}}
+	}
 }
 
 func (d *directFetcher) Name() string { return "direct" }
@@ -120,6 +157,10 @@ func (d *directFetcher) Fetch(ctx context.Context, rawURL string) (*Document, er
 	// Reject non-HTTP schemes outright: this handler takes a URL from an
 	// agent, and file:// or similar would turn a page fetch into local disk
 	// access on the fleet host.
+	//
+	// This is the scheme check and ONLY the scheme check. Where the request
+	// is allowed to land is decided at dial time (see dialguard.go), because
+	// a check on this URL would miss every redirect hop and every rebind.
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("direct fetch: unsupported scheme %q (http and https only)", u.Scheme)
 	}
