@@ -44,9 +44,12 @@ import (
 //
 // (`docker run` is the one site where the work genuinely lives
 // elsewhere — in a container dockerd owns, which no process-group signal
-// could reach either way. Ending that properly needs a named container
-// and a `docker kill` from Cancel; it is called out in the PR rather
-// than half-done here.)
+// could reach either way. Ending that needs a named container and a
+// `docker kill` from Cancel, which is what pandoc_executor.go's
+// newPandocCommand does: the WaitDelay below still bounds the CLIENT,
+// and the name is the only handle that crosses the daemon boundary. Note
+// that it REPLACES Cancel rather than adding a process group — the
+// argument above is unchanged by it.)
 
 // subprocessKillGrace bounds how long Wait may block on the pipes after
 // the process has been killed. Two seconds, matching

@@ -706,3 +706,211 @@ func TestYouTubeExecutor_ReadCredentialsFromDisk(t *testing.T) {
 		t.Errorf("missing file err = %v, want os.ErrNotExist", err)
 	}
 }
+
+// ── the resumable-upload session URI is a credential ──────────────────
+
+// secretUploadID is the authorisation half of a resumable-upload session
+// URI. Google carries it in the QUERY and documents the URI itself as a
+// value that must be kept secret: whoever holds it can append to,
+// complete or abort THAT upload without the access token that created it.
+const secretUploadID = "AEnB2Uo-SECRET-SESSION-TOKEN-9f3c0a1b"
+
+// sessionURI is the full session URI the tests below must never see leak.
+const sessionURI = "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=" + secretUploadID
+
+// youtubeSessionDoer answers the token exchange and the resumable init
+// normally, then fails (or answers) the bytes PUT as instructed. That is
+// the shape of every failure on the upload: the session URI has already
+// been handed out, and the error is what carries it back.
+//
+// The "PUT " pattern is listed BEFORE the init POST because recordingDoer
+// matches on "<METHOD> <URL>" substrings, first match wins, and the two
+// share a URL.
+func youtubeSessionDoer(put doerResponse) *recordingDoer {
+	put.match = "PUT "
+	return &recordingDoer{
+		responses: []doerResponse{
+			{
+				match:  "POST https://oauth2.googleapis.com/token",
+				status: 200,
+				body:   []byte(`{"access_token":"AT-test","token_type":"Bearer","expires_in":3600}`),
+			},
+			put,
+			{
+				match:  "POST https://www.googleapis.com/upload/youtube/v3/videos",
+				status: 200,
+				header: http.Header{"Location": []string{sessionURI}},
+			},
+		},
+	}
+}
+
+// runYouTubeUpload drives one upload through doer and returns the stage
+// error plus whatever reached the run log.
+func runYouTubeUpload(t *testing.T, doer *recordingDoer) (string, error) {
+	t.Helper()
+	clearYouTubeEnv(t)
+	runDir := t.TempDir()
+	writeVideoFile(t, filepath.Join(runDir, "final.mp4"), "fake mp4 bytes")
+	var log bytes.Buffer
+	_, err := (&youtubeExecutor{doer: doer, credsLoader: stubCreds()}).Execute(
+		context.Background(),
+		StageInput{
+			Stage: &Stage{
+				ID:          "publish",
+				Type:        StageTypeYouTube,
+				Video:       "final.mp4",
+				Title:       "T",
+				Description: "D",
+				Output:      "url.txt",
+			},
+			RunDir: runDir,
+			Log:    &log,
+		})
+	return log.String(), err
+}
+
+// TestYouTubeExecutor_TransportErrorDoesNotCarryTheSessionURI is the leak
+// PR #71 left open after closing the identical one for webhook URLs.
+//
+// *url.Error embeds the request URL STRUCTURALLY, so every transport
+// failure on the bytes PUT produced the session URI verbatim — and a
+// stage error becomes Executor.FailureSummary, which six executors hand
+// to templates as {{ .failure_summary }}. A `run_when: failure` webhook
+// then POSTS the credential into a chat channel, which is the path that
+// made the webhook version serious.
+func TestYouTubeExecutor_TransportErrorDoesNotCarryTheSessionURI(t *testing.T) {
+	log, err := runYouTubeUpload(t, youtubeSessionDoer(doerResponse{err: &url.Error{
+		Op:  "Put",
+		URL: sessionURI,
+		Err: errors.New("read tcp 10.0.0.9:443: connection reset by peer"),
+	}}))
+	if err == nil {
+		t.Fatal("expected the upload to fail")
+	}
+	if strings.Contains(err.Error(), secretUploadID) {
+		t.Errorf("the stage error carries the session URI, and FailureSummary hands it to {{ .failure_summary }}: %v", err)
+	}
+	if strings.Contains(log, secretUploadID) {
+		t.Errorf("the run log carries the session URI; under --detach that log is a FILE kept after the run:\n%s", log)
+	}
+	// The diagnosis must survive the redaction, or the fix trades a leak
+	// for an unusable error.
+	if !strings.Contains(err.Error(), "connection reset by peer") {
+		t.Errorf("scrubbing removed the transport's own message: %v", err)
+	}
+}
+
+// TestYouTubeExecutor_SessionURIQuotedInAMessageIsScrubbed covers the
+// half unwrapping alone does not reach: a transport (a proxy, a
+// middlebox, an SDK) that quotes the URL inside its OWN prose rather than
+// in *url.Error's structural field. Unwrapping drops the wrapper and
+// leaves that text untouched; ScrubURL is what removes it.
+func TestYouTubeExecutor_SessionURIQuotedInAMessageIsScrubbed(t *testing.T) {
+	_, err := runYouTubeUpload(t, youtubeSessionDoer(doerResponse{
+		err: errors.New("proxy rejected CONNECT for " + sessionURI + ": policy denied"),
+	}))
+	if err == nil {
+		t.Fatal("expected the upload to fail")
+	}
+	if strings.Contains(err.Error(), secretUploadID) {
+		t.Errorf("a transport that quoted the URI in its own message leaked it: %v", err)
+	}
+	if !strings.Contains(err.Error(), "policy denied") {
+		t.Errorf("scrubbing removed the transport's own message: %v", err)
+	}
+}
+
+// TestYouTubeExecutor_RedirectedSessionURIIsDropped pins the UNWRAP half
+// specifically, which no string scrubber can do.
+//
+// The two halves are indistinguishable on a direct failure — both remove
+// the same bytes — and come apart the moment the URL inside the
+// *url.Error is not the one we passed. http.Client follows redirects and
+// names the hop it actually failed on, and Google's upload endpoints do
+// redirect to regional hosts. A scrub keyed on the session URI we hold
+// cannot match that string; dropping the wrapper removes it structurally.
+func TestYouTubeExecutor_RedirectedSessionURIIsDropped(t *testing.T) {
+	redirected := "https://upload-eu-west1.googleusercontent.invalid/resume/OTHER-SESSION-4d2f"
+	_, err := runYouTubeUpload(t, youtubeSessionDoer(doerResponse{err: &url.Error{
+		Op:  "Put",
+		URL: redirected,
+		Err: errors.New("dial tcp 10.0.0.9:443: i/o timeout"),
+	}}))
+	if err == nil {
+		t.Fatal("expected the upload to fail")
+	}
+	if strings.Contains(err.Error(), redirected) {
+		t.Errorf("the error carries a redirect target no scrubber could know about: %v", err)
+	}
+	if !strings.Contains(err.Error(), "i/o timeout") {
+		t.Errorf("unwrapping lost the cause: %v", err)
+	}
+}
+
+// TestYouTubeExecutor_ScrubbedUploadErrorKeepsTheChain is the half a
+// string assertion cannot see. Redaction that flattened the cause to text
+// would break errors.Is on the wrapped error, and the runner depends on
+// it twice: runWithRetryInner's context.Canceled early-out must never
+// retry a ctrl-C, and isRetryable's net.Error check must still classify a
+// dial timeout as transient.
+func TestYouTubeExecutor_ScrubbedUploadErrorKeepsTheChain(t *testing.T) {
+	_, err := runYouTubeUpload(t, youtubeSessionDoer(doerResponse{err: &url.Error{
+		Op:  "Put",
+		URL: sessionURI,
+		Err: context.Canceled,
+	}}))
+	if err == nil {
+		t.Fatal("expected the cancelled upload to fail")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("the cancellation stopped being reachable through the chain; a ctrl-C would be retried: %v", err)
+	}
+	if strings.Contains(err.Error(), secretUploadID) {
+		t.Errorf("keeping the chain reintroduced the leak: %v", err)
+	}
+}
+
+// TestYouTubeExecutor_ErrorBodyQuotingTheSessionURIIsScrubbed covers the
+// non-2xx path, where the leak arrives in the RESPONSE rather than in a
+// transport error. Google's quota and redirect responses echo the request
+// in some shapes, and that body is pasted straight into the stage error.
+func TestYouTubeExecutor_ErrorBodyQuotingTheSessionURIIsScrubbed(t *testing.T) {
+	_, err := runYouTubeUpload(t, youtubeSessionDoer(doerResponse{
+		status: 403,
+		body:   []byte(`{"error":{"message":"quota exceeded for ` + sessionURI + `"}}`),
+	}))
+	if err == nil {
+		t.Fatal("expected a 403 to fail the stage")
+	}
+	if strings.Contains(err.Error(), secretUploadID) {
+		t.Errorf("a response body quoting the session URI leaked it into the stage error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "quota exceeded") {
+		t.Errorf("scrubbing removed the server's own diagnosis: %v", err)
+	}
+}
+
+// TestYouTubeExecutor_LogRecordsARedactedSessionURI is the positive half
+// of the log rule. The run log still has to distinguish two uploads — a
+// foreach publishing twelve episodes — so the answer is not silence but
+// fleetnotify.Redact: scheme, host, and a stable 8-hex id, with the path
+// and query (where the session's bearer lives) dropped.
+func TestYouTubeExecutor_LogRecordsARedactedSessionURI(t *testing.T) {
+	log, err := runYouTubeUpload(t, youtubeSessionDoer(doerResponse{
+		status: 200,
+		body:   []byte(`{"id":"vid_xyz"}`),
+	}))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if strings.Contains(log, "upload_id=") || strings.Contains(log, secretUploadID) {
+		t.Errorf("the run log carries the session URI's query:\n%s", log)
+	}
+	if !strings.Contains(log, "www.googleapis.com") {
+		t.Errorf("redaction removed the host, leaving nothing to debug with:\n%s", log)
+	}
+	if !strings.Contains(log, "(id ") {
+		t.Errorf("redaction dropped the stable id that tells two sessions apart:\n%s", log)
+	}
+}

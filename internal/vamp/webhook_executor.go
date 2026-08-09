@@ -61,6 +61,11 @@ func (e *scrubbedError) Unwrap() error { return e.cause }
 // relying on string replacement. What is left is scrubbed anyway:
 // a transport can quote the URL back inside its own message (proxy
 // errors, redirect chains), and defence in depth here costs one pass.
+//
+// Not webhook-only, despite living here. youtube_executor.go's
+// resumable-upload session URI is the same kind of value — a URL that IS
+// the authorisation — and calls this rather than growing a second
+// implementation, for the same reason this one calls fleetnotify's.
 func scrubURLError(rawURL string, err error) error {
 	msg := err.Error()
 	var ue *url.Error
