@@ -426,6 +426,40 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		// The check above saw only the defs' half of the catalog, and
+		// extras land in the SAME models:/peers: maps. mergeExtras guards
+		// the map KEYS it merges and nothing inside them, so an extras
+		// alias, or a model id listed under an extras peer, could still
+		// name an id a def already advertises — two entries, one
+		// client-facing id, no error.
+		//
+		// The front is the host this matters on: it ALWAYS renders with
+		// extras (fleet.front_extras is where its apiKeys come from), so
+		// the one config the whole fleet dials was the one config the
+		// namespace invariant did not hold for.
+		//
+		// Re-checking the merged BYTES rather than a merged structure is
+		// the same choice checkCatalogIDsUnique already makes: the merge
+		// is textual, so the merged text is the artifact clients see, and
+		// building a second, typed merge to check instead would be a
+		// second convention that can disagree with the one that ships.
+		var mergedCfg swapConfig
+		if err := yaml.Unmarshal(merged, &mergedCfg); err != nil {
+			// Plain Unmarshal, deliberately NOT KnownFields(true): extras
+			// legitimately carry whole sections the renderer never emits
+			// (routing:, macros:) and llama-swap fields swapConfig does
+			// not model. Unknown keys are llama-swap's business, not this
+			// check's, and rejecting them here would break every valid
+			// extras file in the fleet.
+			return "", fmt.Errorf("reparse merged config for the catalog check: %w", err)
+		}
+		if err := checkCatalogIDsUnique(mergedCfg); err != nil {
+			// The pre-merge check passed, so the duplicate entered with
+			// the extras file. Say so: an operator sent to audit their
+			// backend defs by an unqualified message would find nothing
+			// wrong there, because there is nothing wrong there.
+			return "", fmt.Errorf("router extras %s: %w — the backend defs render cleanly on their own, so the duplicate id enters with this extras file (fleet.front_extras on a front render); fix it there, not in the defs", opts.ExtrasPath, err)
+		}
 		body = merged
 	}
 	return headerComment + string(body), nil
@@ -449,6 +483,13 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 // Sorted iteration: a map-order-dependent error message would name a
 // different pair on different runs, and an error a human cannot reproduce
 // is most of the way to no error at all.
+//
+// nil entries are skipped rather than dereferenced. Every cfg the
+// renderer builds has non-nil values, but this also runs over the config
+// reparsed AFTER the extras merge, and `models:\n  ghost:` in a
+// hand-written extras file decodes to a nil *swapModel. A panic in the
+// renderer is a worse answer to a malformed extras file than llama-swap's
+// own complaint about a model with no cmd.
 func checkCatalogIDsUnique(cfg swapConfig) error {
 	owner := map[string]string{}
 	claim := func(id, by string) error {
@@ -462,14 +503,22 @@ func checkCatalogIDsUnique(cfg swapConfig) error {
 		if err := claim(name, "models."+name); err != nil {
 			return err
 		}
-		for _, a := range cfg.Models[name].Aliases {
+		m := cfg.Models[name]
+		if m == nil {
+			continue
+		}
+		for _, a := range m.Aliases {
 			if err := claim(a, "alias of models."+name); err != nil {
 				return err
 			}
 		}
 	}
 	for _, name := range slices.Sorted(maps.Keys(cfg.Peers)) {
-		for _, id := range cfg.Peers[name].Models {
+		p := cfg.Peers[name]
+		if p == nil {
+			continue
+		}
+		for _, id := range p.Models {
 			if err := claim(id, "peers."+name); err != nil {
 				return err
 			}
