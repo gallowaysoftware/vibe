@@ -12,7 +12,27 @@ export XDG_CONFIG_HOME=$LAB/etc
 export XDG_STATE_HOME=$LAB/state/fleetd
 export XDG_RUNTIME_DIR=$LAB/run/rt-fleetd
 export VIBE_API=$FLEETD_URL
-export VIBE_TOKEN=$(cat "$LAB/state/fleetd/vibe/token" 2>/dev/null)
+
+# The token, and a refusal if it is not there.
+#
+# `export VIBE_TOKEN=$(cat … 2>/dev/null)` could not fail: `export` reports
+# its OWN status, the `2>/dev/null` swallowed the reason, and a missing file
+# left VIBE_TOKEN empty. Every rig then sent `Authorization: Bearer ` at a
+# live fleetd, got 401 on every call, and printed the empty/refused
+# responses as its evidence — a lab that is not there reading exactly like a
+# feature that did not fire. The likeliest cause is also the one this repo
+# has already been bitten by: the WRONG FLEETLAB_DIR, i.e. a rig pointed at
+# a lab that was never brought up (C17's blocker, from the other end).
+#
+# `exit` rather than `return`: gl.sh is sourced by rig scripts, most of
+# which have no `set -e`, so a non-zero return would be discarded and the
+# rig would carry on with an empty token — which is the defect, not the fix.
+VIBE_TOKEN=$(cat "$LAB/state/fleetd/vibe/token" 2>/dev/null || true)
+if [[ -z $VIBE_TOKEN ]]; then
+  echo "gl.sh: no fleetd token at $LAB/state/fleetd/vibe/token — REFUSING to run a gate against a lab that is not up (every assertion below would measure a 401). Check FLEETLAB_DIR (currently $LAB) and run ./lab.sh up." >&2
+  exit 1
+fi
+export VIBE_TOKEN
 
 # fleetd's OWN log. $LAB/logs/fleetd.log holds only what the process wrote
 # to stdout before it installed its handler, which is nothing: every slog

@@ -190,7 +190,12 @@ sweep() {
 # ---------------------------------------------------------------- configs
 
 write_configs() {
-  mkdir -p "$ETC/vibe/backends" "$LOGS" "$RUN" "$CELLS"
+  # Guarded because this is the step every `cat >` below depends on. Unchecked,
+  # a failure here (a full disk, a $LAB owned by someone else) let all fourteen
+  # heredocs fail one by one and the run die three steps later on "render
+  # failed" — the true cause named nowhere. There is no `set -e` in this file.
+  mkdir -p "$ETC/vibe/backends" "$LOGS" "$RUN" "$CELLS" ||
+    die "could not create the lab tree under $LAB — nothing below this writes anywhere"
 
   # --- backend defs. `cell:` is what places a def on a cell and turns it
   #     into a peers: stanza on the front render (C2 §6).
@@ -545,7 +550,15 @@ cmd_up() {
     mkdir -p "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
     start_bg cell-bravo "$BIN" daemon )
   for _ in $(seq 1 60); do [[ -s $STATE/bravo/vibe/token ]] && break; sleep 0.25; done
-  [[ -s $STATE/bravo/vibe/token ]] || warn "bravo cell daemon never minted a token — see $LOGS/cell-bravo.log"
+  # FATAL, like its three siblings — the fleetd token six lines below, and
+  # both /v1/models waits above. This was the one component `up` was allowed
+  # to lose and still print "up.": hosts.yaml names this file as bravo's
+  # token_file, so without it fleetd cannot reach bravo's daemon and every
+  # drain/resume/suspend/stop-record gate measures a cell that was never
+  # answering — then reports that silence as its finding. That is the
+  # restart_fleetd defect (#67) with a different subject.
+  [[ -s $STATE/bravo/vibe/token ]] ||
+    die "bravo cell daemon never minted a token within 15s — REFUSING to continue (hosts.yaml points fleetd at it, so every cell-verb gate would measure a daemon it cannot talk to); see $LOGS/cell-bravo.log"
 
   say "starting fleetd (vibe daemon, fleet_registry: true) on $LAB_FLEETD_PORT"
   ( vibe_env fleetd; start_bg fleetd "$BIN" daemon )
@@ -569,6 +582,14 @@ cmd_up() {
     [[ ${n:-0} -ge 3 ]] && break
     sleep 1
   done
+  # Falling out of this loop is a fleet that never announced, not a slow
+  # one, and the loop said so to nobody: it ended, `up` printed "up." and
+  # exited 0. Every presence, staleness, alarm and drift gate reads
+  # .presence, so each would have measured a registry no cell ever reached
+  # and reported the emptiness as its result. Three is the wave: alpha and
+  # charlie announce out of process, bravo from inside its own daemon.
+  [[ ${n:-0} -ge 3 ]] ||
+    die "only ${n:-0} of 3 cells are announcing after 60s — REFUSING to report this lab as up (every presence-based gate would measure a registry nothing reached); see $LOGS/announce-alpha.log, $LOGS/announce-charlie.log and $LOGS/cell-bravo.log"
   say "up. $(cmd_env | grep -c export) env lines available via: $0 env"
   cmd_status
 }
@@ -670,7 +691,17 @@ case "${1:-}" in
   down)   cmd_down ;;
   status) cmd_status ;;
   prove)  cmd_prove ;;
-  render) render_cells && say "rendered" ;;
+  # `render_cells || die` first, THEN the banner — the same shape as cmd_up's
+  # call site, and for the same reason. The old `render_cells && say
+  # "rendered"` did carry the failure out in the exit status (measured: 1),
+  # so the recorded "exits 0" was wrong; what it did not carry out was a
+  # REFUSAL. All a failed `./lab.sh render` printed was `[warn]`, this
+  # script's advisory prefix, on a step whose failure means the cells are
+  # now a mix of re-rendered and stale — and C17's rule is that "not
+  # attempted" and "did not make it" must never share a line, let alone a
+  # colour.
+  render) render_cells || die "render failed — the cell configs are now PART re-rendered; fix the cause and re-run before starting anything"
+          say "rendered" ;;
   env)    cmd_env ;;
   ports)  lab_ports_table ;;
   state)  state | jq . ;;

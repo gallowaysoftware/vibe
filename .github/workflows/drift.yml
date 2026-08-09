@@ -93,6 +93,13 @@ jobs:
         # nothing is selected, and `go test` exits 0 having run ZERO
         # subtests. A green alarm that rang for nothing is the one failure
         # mode this whole workflow exists to avoid, so assert both halves.
+        #
+        # Both halves were then run both ways on a workstation (2026-08-09).
+        # Env dropped: `TestSwapContract` PASSes in 0.00s with no subtest
+        # under it, `TestSwapBehaviour` SKIPs, `go test` exits 0, and BOTH
+        # greps exit 1 — the step goes red on the first one. Env present:
+        # `live/exec` and `B1_loading_state_keeps_a_cold_stream_alive` are
+        # both in the log, both greps exit 0, 37.6s.
         run: |
           set -euo pipefail
           go test -timeout 420s -v -run 'TestSwapContract/live|TestSwapBehaviour' ./internal/swaptest/ | tee /tmp/conformance.log

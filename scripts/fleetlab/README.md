@@ -45,6 +45,30 @@ FLEETLAB_DIR=/tmp/fleetlab ./lab.sh up      # build, render, start, wait healthy
                            ./lab.sh down    # idempotent, works after a crash
 ```
 
+## What refuses, and why
+
+`up` is all-or-nothing, and `render` with it. Both exit non-zero with a
+red `[fail]` — never a yellow `[warn]` — when the render fails, a cell
+does not answer `/v1/models`, fleetd or bravo's cell daemon never mints
+its token, or fewer than three cells are announcing 60 s after the
+announcers start.
+
+That is stricter than it was, on purpose. A lab that comes up *most of
+the way* does not produce a smaller set of gate results, it produces a
+**wrong** one: every presence, staleness, alarm and drift gate reads
+`.presence`, and every drain/resume/suspend/stop-record gate talks to
+bravo's daemon through the token file `hosts.yaml` names. A half-up lab
+answers all of them with silence, and silence is indistinguishable from
+the feature not firing. The same rule as C13's: a rig that can report a
+healthy-looking zero is worse than no rig.
+
+`gl.sh` refuses on the same grounds. Sourcing it with no fleetd token
+under `$FLEETLAB_DIR` stops the rig then and there instead of exporting
+an empty `VIBE_TOKEN`, which used to send `Authorization: Bearer ` at a
+live fleetd and print a column of 401s as the gate's evidence. The
+likeliest cause is the wrong `FLEETLAB_DIR` — a rig pointed at a lab that
+was never brought up.
+
 ## Two labs on one box
 
 `FLEETLAB_PORT_BASE` (default **9600**) is the base of this instance's

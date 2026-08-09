@@ -109,7 +109,12 @@ out=$(
 	VIBE_ARCH=amd64 \
 	INSTALL_DIR="$TMPROOT/bin3" \
 	"$INSTALL_SH" --dry-run 2>&1
-) || true # The script execs `vibe doctor` on the match path; that's fine.
+) || { fail "idempotency dry-run exit" "$out"; }
+# This used to be `|| true`, on the theory that the match path execs
+# `vibe doctor`. It does not under --dry-run: the script exits 0 one line
+# ABOVE the exec (install.sh's `[ "$DRY_RUN" -eq 1 ] && exit 0`). So the
+# `|| true` masked nothing today and would have masked any regression that
+# made this path exit non-zero tomorrow.
 
 assert_contains "$out" "already installed"                       "idempotency banner printed"
 assert_not_contains "$out" "would download"                      "idempotency suppresses download plan"
@@ -145,7 +150,13 @@ if out=$(
 	# check fires only on the uname path. Make sure the URL is constructed.
 	assert_contains "$out" "vibe_1.0.0_linux_riscv64.tar.gz"     "VIBE_ARCH override is honoured verbatim"
 else
-	pass "VIBE_ARCH override didn't reject"
+	# The else branch used to call pass("VIBE_ARCH override didn't reject"),
+	# which made this test unfailable: install.sh could honour the override,
+	# reject the override, or fall over, and all three were green. It is one
+	# assertion with two outcomes — detect_arch() returns $VIBE_ARCH verbatim
+	# before any supported-arch check, so a non-zero exit here means that
+	# stopped being true.
+	fail "VIBE_ARCH override is honoured verbatim" "the script exited non-zero instead of building a riscv64 URL: $out"
 fi
 
 # Real uname-driven rejection: clear the override so detection runs.

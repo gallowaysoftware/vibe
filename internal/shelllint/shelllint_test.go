@@ -60,12 +60,12 @@ func TestScriptsAreSafe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lint %s: %v", moduleRoot, err)
 	}
-	t.Logf("linted %d .sh files: %d cd, %d recursive rm, %d kill, %d git write", stats.Files, stats.Cd, stats.RmRecursive, stats.Kill, stats.GitWrite)
+	t.Logf("linted %d shell scripts: %d cd, %d recursive rm, %d kill, %d git write", stats.Files, stats.Cd, stats.RmRecursive, stats.Kill, stats.GitWrite)
 	for _, c := range []struct {
 		what       string
 		got, floor int
 	}{
-		{".sh files", stats.Files, floors.Files},
+		{"shell scripts", stats.Files, floors.Files},
 		{"cd commands", stats.Cd, floors.Cd},
 		{"recursive rm commands", stats.RmRecursive, floors.RmRecursive},
 		{"pkill/killall commands", stats.Kill, floors.Kill},
@@ -124,7 +124,7 @@ func TestLintReachesTheScriptsItClaimsTo(t *testing.T) {
 			}
 			return nil
 		}
-		if strings.HasSuffix(d.Name(), ".sh") {
+		if IsShellScript(path, d.Name()) {
 			rel, _ := filepath.Rel(moduleRoot, path)
 			seen[filepath.ToSlash(rel)] = true
 		}
@@ -140,6 +140,10 @@ func TestLintReachesTheScriptsItClaimsTo(t *testing.T) {
 		"scripts/fleetlab/gate-c13-parity.sh",
 		"scripts/smoke/llama-swap/run-smoke.sh",
 		"scripts/upgrade/ritual.sh",
+		// Named by git, not by us: a hook must be called `pre-push` or it
+		// does not run, so extension-keyed selection covered every rig here
+		// and missed the file that fires on every push.
+		"scripts/hooks/pre-push",
 	} {
 		if !seen[want] {
 			t.Errorf("%s is not reached by the lint: a whole subtree of shell is unguarded", want)
@@ -187,6 +191,72 @@ func TestLintStopsAtANestedCheckout(t *testing.T) {
 	}
 	if findings[0].File != "scripts/rig.sh" {
 		t.Fatalf("finding keyed %q, want a path relative to the module root", findings[0].File)
+	}
+}
+
+// TestSelectionReachesHooksAndNothingElse pins both halves of the file
+// selection. The first half is the gap: git will not run a hook unless it
+// is named for the hook, so `scripts/hooks/pre-push` cannot carry a `.sh`
+// and an extension-keyed lint left the one script that runs on every push
+// as the only unguarded shell in the tree.
+//
+// The second half is the cost of closing it. "Sniff every file" would drag
+// marionette.py — and every future Python or Perl helper — under rules
+// written about `cd`, `rm -rf` and `pkill` in a POSIX shell, so only
+// EXTENSIONLESS files are opened and only a shell interpreter counts.
+func TestSelectionReachesHooksAndNothingElse(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, body string) {
+		t.Helper()
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One hazard per file, so a file that is linted contributes exactly one
+	// finding and a file that is not contributes none.
+	const hazard = "rm -rf \"$LAB\"\n"
+	write("go.mod", "module example.com/m\n")
+	write("scripts/rig.sh", "set -uo pipefail\n"+hazard)
+	write("scripts/hooks/pre-push", "#!/usr/bin/env bash\nset -uo pipefail\n"+hazard)
+	write("scripts/hooks/pre-commit", "#!/bin/sh\n"+hazard)
+	write("scripts/hooks/commit-msg", "#!/usr/bin/env -S bash -e\n"+hazard)
+	// Not shell, and the reason each is excluded differs on purpose.
+	write("scripts/marionette.py", "#!/usr/bin/env python3\n# rm -rf \"$LAB\"\n") // an extension
+	write("scripts/drive", "#!/usr/bin/env python3\nprint('rm -rf')\n")           // a shebang, not a shell's
+	write("LICENSE", "Copyright\n")                                               // no shebang
+	write("Dockerfile", "FROM scratch\nRUN rm -rf $X\n")                          // no shebang
+	write("scripts/blob", "\x7fELF\x02\x01\x01\x00\x00\x00")                      // no newline, not text
+
+	findings, stats, err := Lint(root)
+	if err != nil {
+		t.Fatalf("lint: %v", err)
+	}
+	got := map[string]bool{}
+	for _, f := range findings {
+		got[f.File] = true
+	}
+	for _, want := range []string{
+		"scripts/rig.sh",
+		"scripts/hooks/pre-push",
+		"scripts/hooks/pre-commit",
+		"scripts/hooks/commit-msg",
+	} {
+		if !got[want] {
+			t.Errorf("%s was not linted: a shell script the rules are written for is unguarded", want)
+		}
+	}
+	for _, never := range []string{"scripts/marionette.py", "scripts/drive", "LICENSE", "Dockerfile", "scripts/blob"} {
+		if got[never] {
+			t.Errorf("%s was linted: shell rules are being applied to a file that is not a shell script", never)
+		}
+	}
+	if stats.Files != 4 {
+		t.Errorf("counted %d shell scripts, want 4 (the .sh plus three hooks): the denominator every floor "+
+			"rests on must count what was actually examined", stats.Files)
 	}
 }
 
