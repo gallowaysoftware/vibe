@@ -37,6 +37,15 @@
 // never been linted; internal/install_test.sh had never been linted
 // either. A linter whose root excludes the most-executed shell script in
 // the repository is not a coverage story, it is a coincidence.
+//
+// The walk was widened; the SELECTION was not. Files were picked by the
+// `.sh` extension, and git requires a hook to be named exactly `pre-push`
+// — so scripts/hooks/pre-push, the one script an author edits casually
+// because it is "just the hook", was the only shell script in the tree
+// with no rule over it at all. Selection is now extension OR shebang, and
+// the shebang half is deliberately narrow: only an EXTENSIONLESS file is
+// sniffed, and only a shell interpreter counts, so marionette.py and every
+// other named-by-extension file is decided without being opened.
 package shelllint
 
 import (
@@ -154,10 +163,10 @@ var gitWriteVerbs = map[string]bool{
 	"notes": true, "replace": true,
 }
 
-// Lint scans every .sh file under root, which is expected to be a module
-// root. Findings and exemption keys are keyed on the path RELATIVE to
-// root, so they read the way a reviewer types a path and do not embed the
-// name of whichever checkout directory the tests happen to run in.
+// Lint scans every shell script under root, which is expected to be a
+// module root. Findings and exemption keys are keyed on the path RELATIVE
+// to root, so they read the way a reviewer types a path and do not embed
+// the name of whichever checkout directory the tests happen to run in.
 func Lint(root string) ([]Finding, Stats, error) {
 	var out []Finding
 	var stats Stats
@@ -171,7 +180,7 @@ func Lint(root string) ([]Finding, Stats, error) {
 			}
 			return nil
 		}
-		if !strings.HasSuffix(d.Name(), ".sh") {
+		if !IsShellScript(path, d.Name()) {
 			return nil
 		}
 		rel, err := filepath.Rel(root, path)
@@ -205,6 +214,80 @@ func skipDir(root, path, name string) bool {
 		return true
 	}
 	return astscan.ForeignDir(root, path)
+}
+
+// shebangPeek bounds what an extensionless file costs to classify. A
+// shebang is the FIRST line by definition, so there is nothing to find
+// past it, and a fixed prefix means a stray binary in an untracked build
+// directory is two syscalls rather than a whole read.
+const shebangPeek = 256
+
+// shellInterpreters is the allow-list the shebang half is decided on. It is
+// an allow-list for the same reason gitWriteVerbs is: an unrecognised
+// interpreter must not be linted with rules about `cd`, `rm -rf` and
+// `pkill` that are written for a POSIX shell.
+var shellInterpreters = map[string]bool{
+	"sh": true, "bash": true, "dash": true, "ksh": true, "zsh": true, "ash": true,
+}
+
+// IsShellScript reports whether path is one of the scripts these rules are
+// about: named `.sh`, or extensionless with a shell shebang.
+//
+// The second half exists for exactly one shape, and it is the shape most
+// likely to be edited without thinking: git will only run a hook that is
+// named for the hook, so scripts/hooks/pre-push cannot be called
+// pre-push.sh, and an extension-keyed lint therefore covered every rig in
+// scripts/fleetlab and not the file that runs on every push.
+//
+// Extensionless is the narrowing that keeps this from becoming "sniff
+// everything". A file whose name carries an extension is classified by
+// that extension and never opened, so marionette.py, the .go sources and
+// the fixtures stay out on their names alone; only Dockerfile, LICENSE and
+// their kind are read, and neither has a shebang.
+func IsShellScript(path, name string) bool {
+	if strings.HasSuffix(name, ".sh") {
+		return true
+	}
+	if strings.Contains(name, ".") {
+		return false
+	}
+	return hasShellShebang(path)
+}
+
+// hasShellShebang reads the first line of path and reports whether it names
+// a shell. An unreadable file is not a shell script: the walk has already
+// decided this entry exists, so a failure here is a permissions or race
+// problem, and reporting it as "lint me" would fail the whole run on a
+// file the lint has no rules for anyway.
+func hasShellShebang(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, shebangPeek)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return false
+	}
+	line := string(buf[:n])
+	if i := strings.IndexAny(line, "\r\n"); i >= 0 {
+		line = line[:i]
+	}
+	if !strings.HasPrefix(line, "#!") {
+		return false
+	}
+	fields := strings.Fields(line[2:])
+	// `#!/usr/bin/env bash` and `#!/usr/bin/env -S bash -e` both name their
+	// interpreter one or more words along, which is how every script in this
+	// repo is written.
+	for len(fields) > 0 && (filepath.Base(fields[0]) == "env" || strings.HasPrefix(fields[0], "-")) {
+		fields = fields[1:]
+	}
+	if len(fields) == 0 {
+		return false
+	}
+	return shellInterpreters[filepath.Base(fields[0])]
 }
 
 // lintPath opens and lints one file. The open/close pair is a function

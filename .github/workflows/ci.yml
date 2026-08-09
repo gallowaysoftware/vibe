@@ -39,6 +39,30 @@ jobs:
         run: |
           go mod tidy
           git diff --exit-code go.mod go.sum
+      # install.sh's BEHAVIOUR, as opposed to its text.
+      #
+      # internal/vibe/cli/install_sh_test.go greps the script for the shapes
+      # that must be present (the version comparison, the three hashers, the
+      # unverified() routing). This runs it: six `--dry-run` invocations that
+      # assert the URL it builds, the idempotency skip and what --force does
+      # to it. The two halves catch different things — a grep cannot tell you
+      # the comparison compares the wrong two strings, which is exactly the
+      # bug U7 fixed and this test now pins.
+      #
+      # It had never been executed against the current script. U7 (#69)
+      # rewrote the comparison and updated this test's fake `vibe --version`
+      # to the shape a goreleaser binary really prints, but running it was
+      # forbidden while agents held the box, so the edit shipped unverified.
+      # A test nobody runs is what this repo spent a week eliminating, so it
+      # goes in the blocking job rather than into a habit.
+      #
+      # Safe on a runner, by construction rather than by luck: every one of
+      # the six invocations passes --dry-run (which exits before mkdir,
+      # download or install), pins VIBE_VERSION (so the GitHub API is never
+      # called), and sets INSTALL_DIR under its own `mktemp -d`. It touches
+      # neither ~/.local/bin nor the network. ~0.2s.
+      - name: install.sh behaviour (POSIX, dry-run only)
+        run: sh internal/install_test.sh
 
   # The mutation harness (fleet-control C20): internal/mutation's registry
   # of {production line, edit that breaks it, tests that must go red},
@@ -207,6 +231,15 @@ jobs:
         # above argues must be ASSERTED rather than assumed, and it was
         # left unasserted here. A rename, a typo, or a merge that drops
         # one line of `env:` is enough. So prove the live target ran.
+        #
+        # The assertion itself was then run BOTH ways on a workstation
+        # (2026-08-09), because an assertion that cannot fail is the defect
+        # it was added to prevent. With the three env vars dropped: `go
+        # test` exits 0 over 18 green fake-only results, /tmp/conformance.log
+        # carries no `live/exec` line, and the grep exits 1 — the step goes
+        # red. With them present: `TestSwapContract/live/exec` and its seven
+        # invariants run against a real llama-swap in 38.9s and the grep
+        # exits 0.
         run: |
           set -euo pipefail
           go test -timeout 420s -v -run 'TestSwapContract|TestSwapBehaviour' ./internal/swaptest/ | tee /tmp/conformance.log
