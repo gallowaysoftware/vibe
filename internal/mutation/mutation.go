@@ -406,6 +406,34 @@ var Registry = []Mutation{
 			"arriving, leaving it green is absent evidence read as a healthy value.",
 	},
 	{
+		Name: "page/a later rule repaints a neutralised badge green",
+		File: "internal/vibe/fleetapi/fleet.html",
+		Find: "  body.notlive #cells { opacity: .8; }",
+		// Later in the sheet and the same specificity, so it WINS —
+		// while `body.notlive .badge`, the rule every previous guard
+		// read, is left untouched and still says --gray.
+		Replace:  "  body.notlive #cells { opacity: .8; }\n  body.notlive .b-serving { color: var(--green); }",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestFleetPage_NeutralisedBadgesAreNotGreen"},
+		Why: "the ladder can be perfect and the page still lie, because what a reader SEES is the " +
+			"cascade's answer, not one rule's text. The guard this replaced grepped the neutralising " +
+			"rule for '--green' and would pass this mutation unchanged; the current one resolves the " +
+			"cascade and paints the badge, so the last-wins rule is what it reads.",
+	},
+	{
+		Name:     "page/the tool-result panel moves back inside the table render() rebuilds",
+		File:     "internal/vibe/fleetapi/fleet.html",
+		Find:     "  <div id=\"toolresult\" hidden>",
+		Replace:  "  <div id=\"cells\"><div id=\"toolresult\" hidden>",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestFleetPage_ToolResultsSurviveTheNextRender"},
+		Why: "drain_cell's reply — 'WARNING: the requested wait was SKIPPED … cancelled any streams' plus " +
+			"the lease list — arrives AFTER the drain has happened and is two hundred characters. " +
+			"flash() re-polls 1.5s later, so anything inside the element render() replaces is " +
+			"destroyed before it is read. The containment is now computed from the served markup's " +
+			"nesting rather than inferred from a word not appearing in a function body.",
+	},
+	{
 		Name:     "savings/a CAD electricity bill is subtracted from a USD gross",
 		File:     "internal/vibe/fleetapi/savings.go",
 		Find:     "func (c CurrencyInfo) canNet() bool { return !c.Mixed }",
@@ -743,6 +771,21 @@ var Registry = []Mutation{
 			"engine or an undecodable cover leaves a 0-byte EPUB and exits 0 — and the docker " +
 			"fallback adds a second route, since `docker run` reports the CLIENT's status. This " +
 			"site checked existence only; the size half is what an empty book fails.",
+	},
+	{
+		Name:     "vamp/a cacheable stage type loses its key composer",
+		File:     "internal/vamp/cache_key.go",
+		Find:     "\tcase StageTypePandoc:\n\t\t// pandoc was on stageCacheable's allow-list",
+		Replace:  "\tcase StageType(\"pandoc-disabled\"):\n\t\t// pandoc was on stageCacheable's allow-list",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestCacheableAndKeyableAgree", "TestPandocCacheKeyDiscriminates"},
+		Why: "stageCacheable is the ADVERTISEMENT and computeStageCacheKey is the PERFORMANCE, and " +
+			"they were switches over the same domain in different functions. `pandoc` sat on the " +
+			"first from the day the type landed and never appeared in the second, so every pandoc " +
+			"stage reported `cache: miss` forever and re-ran a whole EPUB conversion each time — " +
+			"while buildPandocArgs sorted its metadata keys 'so the cache key doesn't oscillate'. " +
+			"This mutation is that defect exactly, and the named test is what makes it " +
+			"unrepresentable rather than merely fixed.",
 	},
 	{
 		Name:     "vamp/an empty raster is admitted to the SVG cache",

@@ -54,8 +54,19 @@ gofmt -l .                               # must print nothing
 go mod tidy && git diff --exit-code go.mod go.sum
 ```
 
-Two of those are easy to get wrong by hand, which is why the script
-exists rather than a list you retype:
+The blocking job runs one further step the local gate does not:
+`sh internal/install_test.sh`, six `--dry-run` invocations of `install.sh`
+that assert the URL it builds, the idempotency skip and what `--force`
+does to it. It is in CI rather than in `check.sh` because it is a
+behavioural check on a POSIX script (~0.2s, no network, no writes outside
+its own `mktemp -d`) — and because a test nobody runs is what this repo
+spent a week eliminating. `internal/vibe/cli/install_sh_test.go` greps
+the same script for the shapes that must be present; the two halves catch
+different things, since a grep cannot tell you the comparison compares
+the wrong two strings.
+
+Two of the steps above are easy to get wrong by hand, which is why the
+script exists rather than a list you retype:
 
 - **`golangci-lint` is part of the gate**, not a nicety. It is its own
   step in `ci.yml` (`bodyclose`, `misspell`, `unconvert` on top of the

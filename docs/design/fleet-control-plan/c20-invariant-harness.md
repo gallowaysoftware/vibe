@@ -407,17 +407,31 @@ local git identity and committed the working tree as *"fleetlab defs"*.
 
 The rigs are not incidental. Every live gate in this plan runs through
 them, they run beside a production llama-swap on `:9000` and a production
-vibe daemon on `:9001`, and they are written fast. Three rules:
+vibe daemon on `:9001`, and they are written fast. Four rules (three as
+C20 shipped; `git-write-no-repo` was added in C21):
 
 | rule | what it catches |
 |---|---|
 | `unguarded-cd` | a `cd` whose failure nothing handles, in a script with no `set -e`. `cd … \|\| exit 1` and `( cd … && … )` both pass |
 | `rm-rf-bare-var` | `rm -rf "$VAR"` — `set -u` catches UNSET but not EMPTY, and an empty expansion deletes the current directory. `${VAR:?}` and `${VAR:-…}` pass |
 | `unscoped-kill` | a `pkill`/`killall` pattern with no variable in it, which cannot be scoped to this rig and is entitled to kill a sibling lab's processes (futures item 15, from the port side) |
+| `git-write-no-repo` | a git WRITE verb that does not name the repository it writes to. Rule 1 catches the bad `cd`; this is what makes a bad `cd` catastrophic rather than merely wrong, and it is the other half of the C17 blocker above |
+
+**What gets linted, as opposed to which rules run.** C21 widened the walk
+from `scripts/` to the whole module (`install.sh` is the script this
+project asks strangers to pipe into `sh`, and it had never been linted),
+and then widened the SELECTION, which the walk alone did not fix: files
+were picked by the `.sh` suffix, and git requires a hook to be named
+exactly `pre-push`, so `scripts/hooks/pre-push` was the only shell script
+in the tree with no rule over it. `IsShellScript(path, name)` is now the
+selector — `.sh`, OR a shell shebang on an EXTENSIONLESS file. The
+shebang half is deliberately narrow (extensionless only, an allow-list of
+interpreters) so nothing named by extension is ever opened to be
+classified, and `marionette.py` costs a suffix compare.
 
 Stdlib only: shellcheck is a binary this repo does not vendor and CI
-would have to install, and these three rules are the ones this project's
-own history produced.
+would have to install, and these rules are the ones this project's own
+history produced.
 
 **It found five live `rm -rf` hazards** on the first run —
 `gate-c13-parity.sh`, `gate-c15-warm-auth.sh`, `gate-c19-drill.sh` and
@@ -909,10 +923,13 @@ A new section, "The invariant harness (fleet-control C20)":
   class rule are the instances. `MinProducers` is not optional: a rule
   that matches nothing passes. An exemption is a function name mapped to
   a reason, and an unused exemption is an error.
-- **`internal/shelllint` covers `scripts/`**: unguarded `cd` under no
-  `set -e`, `rm -rf` on a bare `$VAR` (use `${VAR:?}` — `set -u` catches
-  unset, not empty), and `pkill` patterns with no variable in them. Two
-  exemptions, both in `gate-c15-warm-auth.sh`, both written down.
+- **`internal/shelllint` covers every shell script in the module**,
+  selected by `.sh` or by a shell shebang on an extensionless file: the
+  four rules of §4, with three exemptions (two in
+  `gate-c15-warm-auth.sh`, one in `internal/install_test.sh`), all
+  written down and all keyed `file:line:rule` so an exemption cannot
+  outlive the line it exempts. (As shipped in C20 this read "covers
+  `scripts/`", three rules, two exemptions; C21 widened all three.)
 - Under the drain notes: **`drain --wait` refuses to claim quiescence
   from the LOSS of the in-flight report, and refuses to ACT on it
   either.** An unreported count mid-wait never returns `waited`; a gap

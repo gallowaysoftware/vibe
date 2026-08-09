@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +30,50 @@ import (
 // OWN liveness ladder — the JSON bytes the browser parses at load — over
 // the ages that matter. The ladder is data on purpose: a guard that had
 // to read a chain of ifs would be reading prose.
+//
+// # What each test here can and cannot see
+//
+// An adversarial pass found six of the seven asserting that a STRING
+// appears in the page. Three of those could not see their own defect: a
+// reintroduced `refresh().catch(()=>{})` (no spaces) or a
+// `text.slice(0,60)` sails past a NotContains of the spaced spelling.
+// That is the weakest possible guard on the newest safety feature, so
+// the split is now explicit and each test says which side it is on.
+//
+// COMPUTED — these derive a value from the served bytes and assert on
+// the value, so a respelling cannot pass them:
+//
+//   - OfflineStateFromHandlerToDOM parses the LIVENESS table out of the
+//     served page and runs the page's own selection rule over it.
+//   - NeutralisedBadgesAreNotGreen RESOLVES THE CASCADE: it parses the
+//     shipped stylesheet, matches selectors against a real element
+//     context with specificity and source order, and asserts the colour
+//     a browser would paint. A later rule that re-asserted the serving
+//     green would pass every grep and fail this.
+//   - ToolResultsSurviveTheNextRender walks the served HTML's tag
+//     nesting and asserts #toolresult is not INSIDE the element render()
+//     rebuilds — the containment claim, computed, not quoted.
+//   - SleepBlockIsRendered traces every key the renderer reads against
+//     the keys the live handler actually emits, in both directions.
+//
+// STRUCTURAL — control flow in a language nothing here executes. Made
+// EXHAUSTIVE rather than literal: they enumerate every call site / every
+// timer and assert a property of all of them, so the class is closed
+// even though the mechanism is not run:
+//
+//   - NoCallerSwallowsAFailedRefresh — every `refresh()` call site.
+//   - TheAgeKeepsCounting — every setInterval and its teardown.
+//   - DrainWaitsAndAsks — the button's argument shape. Its other half,
+//     that those argument names are ones the receiving tool declares and
+//     honours, is a cross-package wire contract and lives in
+//     internal/vibe/fleetmcp (TestFleetPageToolCallsMatchTheToolSchemas):
+//     fleetmcp imports fleetapi, so the check can only run from there.
+//
+// Running the page's JS is the one thing that would collapse the second
+// group into the first, and it needs a JS engine. This repo takes no new
+// dependencies for a test, and a headless browser in the blocking job
+// would cost more than the class is worth. Saying so beats leaving a
+// grep dressed as a behavioural test.
 
 // livenessRow mirrors one row of the page's LIVENESS table.
 type livenessRow struct {
@@ -209,38 +254,260 @@ func TestFleetPage_OfflineStateFromHandlerToDOM(t *testing.T) {
 // TestFleetPage_NeutralisedBadgesAreNotGreen binds the ladder's
 // `neutralise` flag to a visual consequence. A flag that no stylesheet
 // honours is a flag that changes nothing.
+//
+// COMPUTED, not grepped. The previous version asserted that the text
+// `body.notlive .badge { … }` did not contain `--green`, which cannot
+// see the two ways this actually breaks: a LATER rule re-asserting the
+// serving colour (the cascade's whole point), and a --gray that someone
+// has redefined to a green. So this resolves the cascade — every rule
+// in the shipped stylesheet, matched against a real element context by
+// specificity and source order, with var() substitution — and asserts
+// the colour a browser would paint.
 func TestFleetPage_NeutralisedBadgesAreNotGreen(t *testing.T) {
 	page, _, _ := livePageServer(t)
 
 	// The wiring: the flag drives the body class, and the body class is
-	// what the stylesheet keys on.
+	// what the stylesheet keys on. This one IS a literal, and it is the
+	// hinge everything below hangs off, so it is asserted separately.
 	require.Contains(t, page, `document.body.classList.toggle("notlive", !!r.neutralise)`,
 		"the ladder's neutralise flag is not wired to anything")
 
-	rule := regexp.MustCompile(`body\.notlive \.badge \{[^}]*\}`).FindString(page)
-	require.NotEmpty(t, rule, "no stylesheet rule neutralises a badge while the page is not live")
-	// --green is what .b-serving paints with. A neutralising rule that
-	// still resolves to it would leave the exact appearance this exists
-	// to remove.
-	require.NotContains(t, rule, "--green")
-	require.NotContains(t, rule, "76,175,125", "the neutralised badge is still the serving green")
-	require.Contains(t, rule, "--gray")
+	sheet := parseStylesheet(t, page)
+	// The custom properties are read out of the sheet too: a --gray that
+	// had been edited to a green would satisfy every "contains --gray"
+	// assertion ever written and repaint the whole neutralised table.
+	require.NotEqual(t, sheet.vars["--green"], sheet.vars["--gray"],
+		"--gray and --green resolve to the same colour, so neutralising a badge repaints it as SERVING")
+	require.NotEmpty(t, sheet.vars["--green"], "the page defines no --green, so nothing below is comparing colours")
+
+	badge := []node{{tag: "body"}, {tag: "span", classes: []string{"badge", "b-serving"}}}
+	notlive := []node{{tag: "body", classes: []string{"notlive"}}, {tag: "span", classes: []string{"badge", "b-serving"}}}
+
+	live := sheet.computed(badge, "color")
+	require.Equal(t, sheet.vars["--green"], live,
+		"a SERVING badge on a live page does not paint green, so the neutralised comparison below proves nothing")
+
+	dead := sheet.computed(notlive, "color")
+	require.NotEqual(t, live, dead,
+		"a SERVING badge paints the SAME colour whether or not the page has gone dark — this is the whole defect: "+
+			"a green badge asserting an observation nobody is making")
+	require.Equal(t, sheet.vars["--gray"], dead, "the neutralised badge is not the muted grey the ladder promises")
+	// The tinted background carries the same claim as the text colour.
+	require.NotEqual(t, sheet.computed(badge, "background"), sheet.computed(notlive, "background"),
+		"the badge keeps its green tint while the page is not live")
 
 	// And the per-model colours, which carry the same claim one column
-	// over.
-	require.Regexp(t, regexp.MustCompile(`body\.notlive \.m-ready`), page,
-		"a stale model row still renders ready in green")
+	// over. m-ready is the green one; m-degraded is the red one, and a
+	// neutralised page must stop shouting that too.
+	for _, cls := range []string{"m-ready", "m-degraded"} {
+		liveEl := []node{{tag: "body"}, {tag: "span", classes: []string{cls}}}
+		deadEl := []node{{tag: "body", classes: []string{"notlive"}}, {tag: "span", classes: []string{cls}}}
+		require.NotEqualf(t, sheet.computed(liveEl, "color"), sheet.computed(deadEl, "color"),
+			"a .%s model still renders in its live colour on a page that has gone dark", cls)
+	}
+}
+
+// ── a stylesheet, resolved ────────────────────────────────────────────
+//
+// Enough CSS to answer "what colour would a browser paint this" for the
+// selector shapes this page uses: comma-separated lists of descendant
+// chains of compound selectors (`body.notlive .m-ready, …`). Specificity
+// and source order decide; var() is substituted from :root.
+//
+// Deliberately small. It is not a CSS engine and does not need to be —
+// it needs to be something a respelled rule cannot slip past, which a
+// substring search is not.
+
+type node struct {
+	tag     string
+	id      string
+	classes []string
+}
+
+type cssRule struct {
+	sel   string
+	decls map[string]string
+	order int
+}
+
+type stylesheet struct {
+	rules []cssRule
+	vars  map[string]string
+}
+
+var (
+	styleBlockRE = regexp.MustCompile(`(?s)<style>(.*?)</style>`)
+	cssCommentRE = regexp.MustCompile(`(?s)/\*.*?\*/`)
+	cssRuleRE    = regexp.MustCompile(`(?s)([^{}]+)\{([^{}]*)\}`)
+	cssVarRE     = regexp.MustCompile(`var\(\s*(--[a-zA-Z0-9_-]+)\s*\)`)
+)
+
+func parseStylesheet(t *testing.T, page string) *stylesheet {
+	t.Helper()
+	blocks := styleBlockRE.FindAllStringSubmatch(page, -1)
+	require.NotEmpty(t, blocks, "the served page carries no <style> block, so nothing below is resolving anything")
+	s := &stylesheet{vars: map[string]string{}}
+	for _, b := range blocks {
+		for _, m := range cssRuleRE.FindAllStringSubmatch(cssCommentRE.ReplaceAllString(b[1], ""), -1) {
+			decls := map[string]string{}
+			for _, d := range strings.Split(m[2], ";") {
+				prop, val, ok := strings.Cut(d, ":")
+				if !ok {
+					continue
+				}
+				decls[strings.TrimSpace(prop)] = strings.TrimSpace(val)
+			}
+			sel := strings.TrimSpace(m[1])
+			if sel == ":root" {
+				for k, v := range decls {
+					if strings.HasPrefix(k, "--") {
+						s.vars[k] = v
+					}
+				}
+			}
+			s.rules = append(s.rules, cssRule{sel: sel, decls: decls, order: len(s.rules)})
+		}
+	}
+	require.NotEmpty(t, s.rules, "no rules parsed out of the page's stylesheet")
+	return s
+}
+
+// computed returns prop's winning value for the element at the end of
+// chain (root-first), with var() resolved. "" when nothing declares it.
+func (s *stylesheet) computed(chain []node, prop string) string {
+	best, bestSpec, bestOrder := "", -1, -1
+	for _, r := range s.rules {
+		for _, sel := range strings.Split(r.sel, ",") {
+			sel = strings.TrimSpace(sel)
+			if sel == "" || !selectorMatches(sel, chain) {
+				continue
+			}
+			v, ok := r.decls[prop]
+			if !ok {
+				continue
+			}
+			if spec := specificity(sel); spec > bestSpec || (spec == bestSpec && r.order > bestOrder) {
+				best, bestSpec, bestOrder = v, spec, r.order
+			}
+		}
+	}
+	// Resolve one level of var(); the page's custom properties are all
+	// literal colours, so one level is all there is.
+	return cssVarRE.ReplaceAllStringFunc(best, func(m string) string {
+		return s.vars[cssVarRE.FindStringSubmatch(m)[1]]
+	})
+}
+
+// selectorMatches walks the compound parts right-to-left: the last must
+// match the element itself, and each earlier one must match some
+// ancestor, in order. Descendant combinators only — the page uses no
+// child/sibling combinators, and a selector carrying one would fail to
+// match here rather than match wrongly.
+func selectorMatches(sel string, chain []node) bool {
+	parts := strings.Fields(sel)
+	if len(parts) == 0 || len(chain) == 0 {
+		return false
+	}
+	if !compoundMatches(parts[len(parts)-1], chain[len(chain)-1]) {
+		return false
+	}
+	i := len(chain) - 2
+	for p := len(parts) - 2; p >= 0; p-- {
+		for {
+			if i < 0 {
+				return false
+			}
+			if compoundMatches(parts[p], chain[i]) {
+				i--
+				break
+			}
+			i--
+		}
+	}
+	return true
+}
+
+func compoundMatches(compound string, n node) bool {
+	tag, id, classes := splitCompound(compound)
+	if tag != "" && tag != "*" && tag != n.tag {
+		return false
+	}
+	if id != "" && id != n.id {
+		return false
+	}
+	for _, c := range classes {
+		if !slices.Contains(n.classes, c) {
+			return false
+		}
+	}
+	return true
+}
+
+func splitCompound(compound string) (tag, id string, classes []string) {
+	for i := 0; i < len(compound); {
+		j := strings.IndexAny(compound[i+1:], ".#")
+		end := len(compound)
+		if j >= 0 {
+			end = i + 1 + j
+		}
+		tok := compound[i:end]
+		switch {
+		case strings.HasPrefix(tok, "."):
+			classes = append(classes, tok[1:])
+		case strings.HasPrefix(tok, "#"):
+			id = tok[1:]
+		default:
+			tag = tok
+		}
+		i = end
+	}
+	return tag, id, classes
+}
+
+func specificity(sel string) int {
+	n := 0
+	for _, compound := range strings.Fields(sel) {
+		tag, id, classes := splitCompound(compound)
+		if id != "" {
+			n += 100
+		}
+		n += 10 * len(classes)
+		if tag != "" && tag != "*" {
+			n++
+		}
+	}
+	return n
 }
 
 // TestFleetPage_NoCallerSwallowsAFailedRefresh is the defect stated
 // exactly. `refresh().catch(() => {})` at every call site is what made a
 // dead fleetd invisible: the throw was discarded, render() never ran, and
 // the last good table stayed on screen looking live.
+//
+// STRUCTURAL, and now EXHAUSTIVE. The previous version was a NotContains
+// of one spelling — `refresh().catch(() => {})`, spaces and all — which
+// is a guard that cannot see its own defect: `refresh().catch(()=>{})`,
+// `.catch(function(){})` or `.catch(e => {})` reintroduce it verbatim and
+// pass. So instead: find EVERY call site of refresh() in the served page
+// and assert none of them attaches a rejection handler that does nothing,
+// whatever the handler is spelled like.
 func TestFleetPage_NoCallerSwallowsAFailedRefresh(t *testing.T) {
 	page, _, _ := livePageServer(t)
-	require.NotContains(t, page, "refresh().catch(() => {})",
-		"a refresh failure is being discarded again; the page then keeps rendering the last good state "+
-			"with every SERVING badge green and no indication that nothing is arriving")
+	js := pageScript(t, page)
+
+	// Every `refresh()` in the script, with what follows it. The one
+	// legitimate rejection handler in the codebase is tick()'s, whose body
+	// records the error and re-renders; an EMPTY body is the defect.
+	sites := regexp.MustCompile(`refresh\(\)((?s).{0,80})`).FindAllStringSubmatch(js, -1)
+	require.NotEmpty(t, sites, "no refresh() call sites found at all — this guard is measuring nothing")
+	empty := regexp.MustCompile(`^\s*\.catch\(\s*(\(\s*[a-zA-Z0-9_,\s]*\s*\)|[a-zA-Z0-9_]+)\s*=>\s*\{\s*\}|^\s*\.catch\(\s*function\s*\([^)]*\)\s*\{\s*\}`)
+	for _, s := range sites {
+		require.NotRegexpf(t, empty, s[1],
+			"a refresh() call site discards its rejection into an empty handler: %q. The page then keeps "+
+				"rendering the last good state with every SERVING badge green and no indication that "+
+				"nothing is arriving — which is the entire defect this file exists for.", strings.TrimSpace(s[0]))
+	}
+
 	// The single handler that replaced them records the failure and shows
 	// it, rather than dropping it.
 	require.Contains(t, page, "lastFetchError =",
@@ -251,17 +518,62 @@ func TestFleetPage_NoCallerSwallowsAFailedRefresh(t *testing.T) {
 		"there is no manual reconnect control on the banner")
 }
 
+// pageScript returns the page's inline <script> source, comments
+// stripped. Stripping matters: this page documents its own defects in
+// prose, and the literal `.catch(() => {})` appears in three comments
+// describing what used to be there. A guard that searched the whole page
+// would be reading those.
+func pageScript(t *testing.T, page string) string {
+	t.Helper()
+	blocks := regexp.MustCompile(`(?s)<script>(.*?)</script>`).FindAllStringSubmatch(page, -1)
+	require.NotEmpty(t, blocks, "the served page carries no <script> block")
+	var b strings.Builder
+	line := regexp.MustCompile(`(?m)^\s*//.*$`)
+	block := regexp.MustCompile(`(?s)/\*.*?\*/`)
+	for _, m := range blocks {
+		b.WriteString(line.ReplaceAllString(block.ReplaceAllString(m[1], ""), ""))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 // TestFleetPage_TheAgeKeepsCounting pins the second half of "last
 // updated N ago": a relative age that is only recomputed when an update
 // arrives freezes at the moment the updates stop, which is precisely
 // when a reader needs it to move.
+// STRUCTURAL, and now EXHAUSTIVE on the half that has a class: every
+// interval the page starts must be held in a variable boot() clears.
+// boot() runs again on a mid-session token rotation (401 → gate → save →
+// boot), so an unheld interval is not a tidiness point — it is a second
+// renderLiveness firing every second, forever, for the rest of the tab's
+// life.
 func TestFleetPage_TheAgeKeepsCounting(t *testing.T) {
 	page, _, _ := livePageServer(t)
-	require.Contains(t, page, "setInterval(renderLiveness, 1000)",
+	js := pageScript(t, page)
+
+	require.Contains(t, js, "setInterval(renderLiveness, 1000)",
 		"the liveness banner is not on its own timer, so the age stops counting exactly when fleetd stops answering")
-	require.Contains(t, page, `"last updated " + relS(age) + " ago"`,
+	require.Contains(t, js, `"last updated " + relS(age) + " ago"`,
 		"the banner does not render a relative age")
-	require.Contains(t, page, "clearInterval(livenessTimer)",
+
+	// Every setInterval in the script, and the variable it was assigned
+	// to. An assignment-less `setInterval(...)` has no handle at all.
+	starts := regexp.MustCompile(`(?m)^\s*(?:([A-Za-z0-9_]+)\s*=\s*)?setInterval\(`).FindAllStringSubmatch(js, -1)
+	require.NotEmpty(t, starts, "no setInterval call sites found at all — this guard is measuring nothing")
+	cleared := map[string]bool{}
+	for _, m := range regexp.MustCompile(`clearInterval\(\s*([A-Za-z0-9_]+)\s*\)`).FindAllStringSubmatch(js, -1) {
+		cleared[m[1]] = true
+	}
+	for _, m := range starts {
+		require.NotEmptyf(t, m[1],
+			"a setInterval is started without keeping its handle (%q), so nothing can ever stop it: a token "+
+				"rotation re-runs boot() and stacks another one on top", strings.TrimSpace(m[0]))
+		require.Truef(t, cleared[m[1]],
+			"the interval held in %s is never passed to clearInterval. boot() runs again on a mid-session "+
+				"token rotation, so every rotation leaves another live timer behind — including the one "+
+				"that keeps the liveness age counting.", m[1])
+	}
+	require.True(t, cleared["livenessTimer"],
 		"boot() does not clear the liveness timer; a token rotation would stack another one")
 }
 
@@ -330,6 +642,81 @@ func TestFleetPage_SleepBlockIsRendered(t *testing.T) {
 		"a promised wake that did not happen renders as ordinary status text, not as a warning")
 }
 
+// renderedContainerID is the id of the element render() replaces
+// wholesale, read out of render() itself rather than assumed. If render()
+// is ever pointed at a different container, the containment assertion
+// follows it instead of quietly checking the wrong element.
+func renderedContainerID(t *testing.T, js string) string {
+	t.Helper()
+	body := funcBody(t, js, "function render(st) {")
+	// `const tb = $("cells"); tb.innerHTML = "";`
+	handle := regexp.MustCompile(`(?m)^\s*(?:const|let|var)\s+([A-Za-z0-9_]+)\s*=\s*\$\("([a-zA-Z0-9_-]+)"\)`)
+	for _, m := range handle.FindAllStringSubmatch(body, -1) {
+		if regexp.MustCompile(regexp.QuoteMeta(m[1]) + `\.innerHTML\s*=`).MatchString(body) {
+			return m[2]
+		}
+	}
+	t.Fatal("render() no longer replaces any element's innerHTML: this guard cannot tell what it rebuilds, so " +
+		"it cannot tell whether the result panel would survive it")
+	return ""
+}
+
+var (
+	htmlCommentRE = regexp.MustCompile(`(?s)<!--.*?-->`)
+	htmlTagRE     = regexp.MustCompile(`</?([a-zA-Z][a-zA-Z0-9]*)((?:"[^"]*"|'[^']*'|[^>"'])*)>`)
+	htmlIDRE      = regexp.MustCompile(`\bid="([^"]*)"`)
+	// Elements with no closing tag; anything else is assumed to nest.
+	htmlVoid = map[string]bool{
+		"area": true, "base": true, "br": true, "col": true, "embed": true, "hr": true,
+		"img": true, "input": true, "link": true, "meta": true, "param": true,
+		"source": true, "track": true, "wbr": true,
+	}
+)
+
+// elementAncestors returns the ids of the elements enclosing the element
+// with the given id, in the served markup. The containment question is a
+// fact about the document, so it is answered from the document.
+//
+// A deliberately small scanner: this page is hand-written, well-formed,
+// and has no unclosed tags. `<script>` and `<style>` bodies are removed
+// first so a `<` inside JS cannot be read as a tag.
+func elementAncestors(t *testing.T, page, id string) []string {
+	t.Helper()
+	clean := htmlCommentRE.ReplaceAllString(page, "")
+	clean = regexp.MustCompile(`(?s)<script>.*?</script>`).ReplaceAllString(clean, "")
+	clean = regexp.MustCompile(`(?s)<style>.*?</style>`).ReplaceAllString(clean, "")
+
+	var stack []string // ids (possibly "") of the open elements
+	for _, m := range htmlTagRE.FindAllStringSubmatch(clean, -1) {
+		tag := strings.ToLower(m[1])
+		if strings.HasPrefix(m[0], "</") {
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+			continue
+		}
+		if htmlVoid[tag] || strings.HasSuffix(strings.TrimSpace(m[2]), "/") {
+			continue
+		}
+		self := ""
+		if a := htmlIDRE.FindStringSubmatch(m[2]); a != nil {
+			self = a[1]
+		}
+		if self == id {
+			out := make([]string, 0, len(stack))
+			for _, s := range stack {
+				if s != "" {
+					out = append(out, s)
+				}
+			}
+			return out
+		}
+		stack = append(stack, self)
+	}
+	t.Fatalf("no element with id=%q in the served markup, so nothing about where it sits can be checked", id)
+	return nil
+}
+
 // funcBody returns the source of the function starting at marker, up to
 // its closing brace at column zero.
 func funcBody(t *testing.T, page, marker string) string {
@@ -348,11 +735,31 @@ func funcBody(t *testing.T, page, marker string) string {
 // The tool's own description says never to tell an operator their stream
 // is safe; a button that truncates silently is that sentence broken by
 // omission.
+//
+// STRUCTURAL, and honestly so: what a prompt() returns and what the
+// operator then sees is browser behaviour nothing here runs. Two things
+// were done about that rather than leaving a grep looking behavioural.
+//
+// First, the negative assertion matches the SHAPE of a wait-less drain
+// (any drain_cell call whose argument object has no wait_seconds) rather
+// than the one literal line the defect happened to be written on.
+//
+// Second, the half that CAN be executed — that `wait_seconds` is a name
+// the receiving tool declares and does not silently drop — is a
+// cross-package wire contract and runs in
+// internal/vibe/fleetmcp/pagetools_test.go, which can see both the served
+// page and the tool schemas. A rename on either side fails there.
 func TestFleetPage_DrainWaitsAndAsks(t *testing.T) {
 	page, _, _ := livePageServer(t)
+	js := pageScript(t, page)
 
-	require.NotContains(t, page, `mk("drain", "drain_cell", { cell: c.name });`,
-		"the drain button still sends drain_cell with no wait_seconds")
+	sites := regexp.MustCompile(`"drain_cell"\s*,\s*\{([^}]*)\}`).FindAllStringSubmatch(js, -1)
+	require.NotEmpty(t, sites, "no drain_cell call site on the page: the loop below would pass over nothing")
+	for _, m := range sites {
+		require.Containsf(t, m[1], "wait_seconds",
+			"a drain_cell call site passes no wait_seconds (args: %s). llama-swap's SIGTERM cancels in-flight "+
+				"streams immediately, so that one click truncates whatever is generating.", strings.TrimSpace(m[1]))
+	}
 	body := funcBody(t, page, "function drainCell(")
 	require.Contains(t, body, "wait_seconds: DRAIN_WAIT_SECONDS",
 		"the drain button does not pass a wait, so llama-swap's SIGTERM truncates whatever is generating")
@@ -375,20 +782,36 @@ func TestFleetPage_DrainWaitsAndAsks(t *testing.T) {
 // cancelled any streams" and its lease list vanished unseen, and
 // warm_model's ETA could not fit at all: its prefix alone is 64
 // characters before the model id.
+// COMPUTED for the containment claim. "The panel lives outside the tbody
+// render() rebuilds" is a fact about the DOM, so it is derived from the
+// served markup's nesting rather than asserted by not finding a word
+// inside a function body. The truncation half stays structural, but
+// matches the SHAPE (`slice(0, 60)` at any spacing) rather than one
+// spelling — the old NotContains of `text.slice(0, 60)` could not see
+// `text.slice(0,60)`.
 func TestFleetPage_ToolResultsSurviveTheNextRender(t *testing.T) {
 	page, _, _ := livePageServer(t)
+	js := pageScript(t, page)
 
-	require.NotContains(t, page, "text.slice(0, 60)",
+	require.NotRegexp(t, regexp.MustCompile(`\.slice\(\s*0\s*,\s*60\s*\)`), js,
 		"tool results are still truncated to 60 characters")
-	require.NotContains(t, page, "btn.title = msg",
+	require.NotRegexp(t, regexp.MustCompile(`\.title\s*=`), js,
 		"tool results still go into a hover-only title the next render() destroys")
 	require.Contains(t, page, `$("tr-body").textContent = text;`,
 		"the full tool result is not rendered anywhere")
-	// The panel must live OUTSIDE the tbody render() rebuilds, or it is
-	// the same defect with more markup.
 	require.Contains(t, page, `<pre id="tr-body">`, "the result area does not preserve newlines")
-	require.NotContains(t, funcBody(t, page, "function render(st) {"), "toolresult",
-		"the result panel is rebuilt by render(), so it still cannot outlive a refresh")
+
+	// The containment claim, computed from the markup the server sent.
+	// render() rebuilds $("cells").innerHTML, so anything INSIDE #cells is
+	// destroyed 1.5s later by flash()'s tick() — which is the defect with
+	// more markup rather than a fix for it.
+	rebuilt := renderedContainerID(t, js)
+	ancestors := elementAncestors(t, page, "toolresult")
+	require.NotContains(t, ancestors, rebuilt,
+		"#toolresult sits INSIDE #"+rebuilt+", the element render() replaces wholesale: the next refresh "+
+			"destroys the result before anyone reads it, which is the defect this panel replaced")
+	require.Contains(t, elementAncestors(t, page, "tr-body"), "toolresult",
+		"#tr-body is not inside #toolresult, so dismissing the panel leaves its text on screen")
 	require.Contains(t, page, "function dismissResult(", "the result panel cannot be dismissed")
 
 	// The arithmetic that made the old field structurally unusable: the

@@ -63,6 +63,28 @@ const forkingVerb = "sleep 10 & echo $! > %s; wait"
 // a CI round to find.
 const escapedVerb = "setsid sleep 10 & echo $! > %s; wait"
 
+// clockSlack is how far BELOW budget+grace the escape test tolerates a
+// return before calling the wait unbounded.
+//
+// It exists because that assertion was written with no tolerance at all
+// and was observed in CI losing by under a millisecond, which is the
+// worst kind of red: a real invariant, failing for a reason that has
+// nothing to do with it, teaching everyone who sees it to press re-run.
+// run() below now starts its clock BEFORE the context, which removes the
+// systematic half of that gap (the deadline used to begin a `LookPath`
+// and an allocation earlier than the measurement did, so `elapsed` was
+// structurally short by exactly that much). This is the residual:
+// coarse monotonic clocks, and any future edit that moves the two lines
+// apart again.
+//
+// 25ms cannot mask the thing the floor is for. The failure it catches is
+// a wait that was never delayed — the first draft of this file attached
+// no pipes, so Wait returned AT the kill and `elapsed` came in a full
+// `grace` (700ms) under the floor. The tolerance is 3.6% of that margin,
+// so a wait shortened by even a twentieth of the grace it was given is
+// still red.
+const clockSlack = 25 * time.Millisecond
+
 // grandchildPID reads the pid the command recorded, polling because "the
 // first thing it does" still happens after a fork and an exec.
 func grandchildPID(t *testing.T, path string) int {
@@ -120,10 +142,19 @@ func pidGoneWithin(pid int, limit time.Duration) bool {
 func run(t *testing.T, tmpl string, killGrace time.Duration) (elapsed time.Duration, pidFile string) {
 	t.Helper()
 	pidFile = filepath.Join(t.TempDir(), "child.pid")
+	// The clock starts BEFORE the context, not between it and the call.
+	// The deadline begins ticking inside WithTimeout, so a `start` taken
+	// after it — after a fmt.Sprintf and an exec.CommandContext, which
+	// does a LookPath — measures a window that is structurally SHORTER
+	// than budget+grace by however long those took. That is a floor
+	// assertion guaranteed to lose sometimes, and it did: sub-millisecond,
+	// in CI. Measuring from before the deadline exists makes `elapsed` an
+	// over-estimate of the bounded window rather than an under-estimate,
+	// which is the direction a floor can survive.
+	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	c := New(ctx, fmt.Sprintf(tmpl, pidFile), killGrace)
-	start := time.Now()
 	_, err := c.CombinedOutput()
 	elapsed = time.Since(start)
 	if err == nil {
@@ -228,8 +259,8 @@ func TestNew_TheWaitIsBoundedEvenWhenTheKillCannotLand(t *testing.T) {
 		t.Fatalf("the background child (pid %d, pgid %d, err %v) did not survive in a group of its own, so this test exercised the group kill and NOT the wait delay: setsid did not detach the job here, and the escape needs a different spelling",
 			pid, pgid, gerr)
 	}
-	if floor := budget + grace; elapsed < floor {
-		t.Fatalf("the call returned in %v, sooner than the %v it must spend when a writer to its pipes outlives the kill — whatever ended it, it was not the wait delay",
-			elapsed.Round(time.Millisecond), floor)
+	if floor := budget + grace - clockSlack; elapsed < floor {
+		t.Fatalf("the call returned in %v, sooner than the %v it must spend when a writer to its pipes outlives the kill (%v less a %v clock slack) — whatever ended it, it was not the wait delay",
+			elapsed.Round(time.Millisecond), floor, budget+grace, clockSlack)
 	}
 }

@@ -102,6 +102,15 @@ is not worth whatever fidelity it buys. The llama-swap conformance work
 and the mutation harness live in SEPARATE CI jobs for exactly that
 reason.
 
+The blocking job runs one step `check.sh` does not: `sh
+internal/install_test.sh`, six `--dry-run` invocations of `install.sh`.
+It is safe on a runner by construction (every invocation is `--dry-run`,
+pins `VIBE_VERSION` so the GitHub API is never called, and installs into
+its own `mktemp -d`), it costs ~0.2s, and it is in CI rather than in the
+local gate because it had never been executed against the current script
+— U7 rewrote the version comparison and updated this test's fake `vibe
+--version` without ever running it.
+
 ## Test doubles and upstream contracts
 
 **`internal/swaptest` is the one llama-swap double.** Stdlib only, no new
@@ -1816,13 +1825,21 @@ stand-in.
     `Find` stops matching is STALE and must be re-pointed, never deleted;
     a mutation that does not compile proves nothing. The staleness audit
     runs in the blocking test job (milliseconds); the runner is its own
-    CI job behind `VIBE_MUTATION_TEST=1` (**5m38s-6m3s on a GitHub runner**, three observed runs;
-    `77/77 guards mutation-verified in 4m2s` on a 32-core workstation,
-    both measured 2026-08-09 — the "~21 s / 16 mutations" this line used
-    to quote was the C20 shipping figure and had gone stale ~5x on
-    entries). Entries run in parallel, so wall time tracks worker count
-    more than entry count: 67 → 77 entries moved the workstation figure
-    243 s → 246 s.
+    CI job behind `VIBE_MUTATION_TEST=1`.
+    **How long it takes is not written down anywhere, on purpose.** The
+    job reports its own sizing on its last line — `SIZING: <n> entries,
+    <w> workers, <t> wall, <p>% of the <T> -timeout` — and `reportBudget`
+    fails it once that share passes two thirds, reading the bound from
+    `t.Deadline()` so it tracks `ci.yml`'s `-timeout` rather than a copy
+    of it. Read the log. A figure lived in this line and in `ci.yml` and
+    went stale three times in two days ("21 s / 16 mutations", then "77
+    entries / 338-363 s", then "97" while the registry was at 123),
+    because every writer measured their own branch while the registry
+    grew underneath them, and a reader cannot tell a fresh number from a
+    rotten one. What IS durable: entries run in parallel, so wall time
+    tracks WORKER COUNT and the one-off baseline round far more than
+    entry count — measured across five registry sizes on one 32-core box,
+    59 extra entries cost 14 extra seconds.
     **When a review pass mutation-verifies a guard by hand, add the
     entry** — that is the whole point.
   - **`internal/astscan` is the reusable "every function that does X must
@@ -1833,11 +1850,24 @@ stand-in.
     an HTTP request builder to `fleetapi`/`fleetmcp`, or a warm producer,
     must RAISE the corresponding floor — lowering it to make a deletion
     quiet is the failure this exists to prevent.
-  - **`internal/shelllint` covers `scripts/`**: unguarded `cd` under no
-    `set -e`, `rm -rf` on a bare `$VAR` (use `${VAR:?}` — `set -u`
-    catches unset, not empty), and `pkill` patterns with no variable in
-    them. Two exemptions, both in `gate-c15-warm-auth.sh`, both written
-    down.
+  - **`internal/shelllint` covers every shell script in the module**, and
+    selects them by `.sh` OR by a shell shebang on an EXTENSIONLESS file.
+    The second half is not tidiness: git requires a hook to be named
+    exactly `pre-push`, so `scripts/hooks/pre-push` — the script the repo
+    asks you to install, and the one an author edits casually because it
+    is "just the hook" — was for a while the only shell script in the tree
+    with no rule over it. The sniff is deliberately narrow (extensionless
+    only, shell interpreters only) so nothing named by extension is ever
+    opened to be classified. Four rules: unguarded `cd` under no
+    `set -e`; `rm -rf` on a bare `$VAR` (use `${VAR:?}` — `set -u` catches
+    unset, not empty); `pkill`/`killall` patterns with no variable in
+    them; and a git WRITE verb that does not name the repository it writes
+    to — rule 1 catches the bad `cd`, rule 4 is what makes a bad `cd`
+    catastrophic. THREE exemptions (two in `gate-c15-warm-auth.sh`, one in
+    `internal/install_test.sh`), all with written reasons, all keyed
+    `file:line:rule` so an exemption cannot outlive the line it exempts —
+    a stale key is an error, which is how `install.sh`'s entry retired
+    itself when U7 fixed the hazard.
   - **`drain --wait` refuses to claim quiescence from the LOSS of the
     in-flight report, and refuses to ACT on it either.** An unreported
     count mid-wait never returns `waited`; a gap shorter than
@@ -2119,20 +2149,42 @@ stand-in.
 ## vamp stage rules
 
 - Adding a stage type? Touch all of: `Stage` struct in
-  `internal/vamp/pipeline.go`, the type switch in
-  `pipeline.go:Validate`, the executor in
-  `internal/vamp/<kind>_executor.go` implementing `StageExecutor`,
-  `stageCacheable` in `cache_key.go` if it should be cacheable, and
-  `schema.go`'s stage-properties block.
-- **Cache invariants.** `stageCacheable` (in
-  `internal/vamp/cache_key.go`) is the single source of truth for "can
-  this stage type be cached?". Today it returns true for `text`,
-  `comfyui`, `audio`, `ffmpeg`, `render`, `compact`, `pandoc`, `mix`,
-  `short` and false for everything else (`youtube`, `confirm`).
-  `webhook` is non-cacheable by default but opt-in cacheable via
-  `cache: true` (for idempotent reads). Side-
-  effect stages must not be cached — replaying a "success" would skip
-  the side effect that gave the pipeline its reason for existing.
+  `internal/vamp/pipeline.go`, `allStageTypes` and `newStageRegistry` in
+  `exec.go`, the type switch in `pipeline.go:Validate`, the executor in
+  `internal/vamp/<kind>_executor.go` implementing `StageExecutor`, and —
+  if it should be cacheable — **both** `stageCacheable` AND
+  `computeStageCacheKey` in `cache_key.go`. `schema.go`'s `type` enum
+  derives from `allStageTypes`, so that one is free.
+- **Cache invariants, and they are TWO functions, not one.**
+  `stageCacheable` is the ADVERTISEMENT: it decides whether the timing
+  report prints `cache: hit/miss` for the stage at all. `computeStageCacheKey`
+  is the PERFORMANCE: an empty key means the runner does no Get and no
+  Put. A type on the first with no branch in the second advertises a
+  saving it never makes — `pandoc` shipped exactly that way from the day
+  the type landed, reporting `cache: miss` forever while re-converting a
+  whole EPUB on every run, and a comment in `buildPandocArgs` sorted its
+  metadata keys "so the cache key doesn't oscillate". This file used to
+  call `stageCacheable` "the single source of truth", which is the belief
+  that let it happen. `TestCacheableAndKeyableAgree` now walks
+  `allStageTypes` and fails if either half knows a type the other does
+  not.
+  Cacheable today: `text`, `comfyui`, `audio`, `ffmpeg`, `render`,
+  `compact`, `pandoc`, `mix`, `short`. Not: `youtube`, `confirm`.
+  `webhook` is non-cacheable by default and opt-in via `cache: true` (for
+  idempotent reads). Side-effect stages must not be cached — replaying a
+  "success" would skip the side effect that gave the pipeline its reason
+  for existing.
+- **`--resume` is not "skip what exists".** An output counts as done only
+  if it exists, is NON-EMPTY, and — for `output_format: json` stages —
+  still parses; a run killed mid-write leaves a truncated body, and
+  handing that downstream is worse than redoing the stage. Granularity is
+  per foreach ITEM, not per stage. Drift against the run's
+  `pipeline.yaml.snapshot` aborts unless `--resume-force`. And
+  `producesFileOutput` (`exec.go`) is what the resume pre-pass uses to
+  decide whether to seed `stageOutputs` with a PATH or with the file's
+  BYTES — it must mirror the cache's `IsBinary` split, which is set from
+  `StageOutput.Files` vs `.Text` at Put time. Two enumerations of the same
+  fact; keep them together.
 - **`.stages.X.output` semantics depend on stage type.** For text /
   render / webhook stages (including their foreach variants — the
   per-item content is `\n\n`-joined) it renders the **content**
@@ -2183,7 +2235,11 @@ stand-in.
   (same but returns "" on no-match — for foreach prompts that may
   have empty per-item globs), `readLessons(path, batch, total)`
   (paginated lesson reading), `enumerateLessons(glob)` (JSON array of
-  lesson dirs, filters files >200KB), `enumerateImagePairs(root, lessonsJSON)`
+  lesson dirs, filters files >200KB — and ERRORS on a glob that matched
+  nothing, or whose every match was filtered out, rather than returning
+  `[]`: a typo'd or stale lesson root that renders an empty array is a
+  pipeline that quietly does nothing all night),
+  `enumerateImagePairs(root, lessonsJSON)`
   (flatten lesson list to per-image `{lesson, image, image_path}`
   entries), `enumerateUniqueImages(root, lessonsJSON)`
   (content-hash-deduped variant returning `{hash, path, ext}`),
@@ -2219,6 +2275,12 @@ stand-in.
   `ttsNormalize(text, rulesPath)` (apply pronunciation-normalization
   rules, defaults + optional rules file). The full registry with WHY
   docs is `exec.go:templateFuncMap`.
+  **The three lesson-image helpers enforce lesson-root containment.** A
+  lesson NAME reaches them out of a PRIOR STAGE'S MODEL OUTPUT, so
+  `lessonImageDir` refuses one that resolves outside the declared root
+  (`errLessonPathEscape`) instead of joining it and reading whatever is
+  there. Same rule, same reason, as the run-dir containment on `output:`
+  — a sampled string must not become a path.
 - **Concat WAVs.** `Stage.ConcatWavs` on an `ffmpeg` stage auto-globs
   all `*.wav` files, creates a concat list, and merges into the output
   MP3. Implemented in `ffmpeg_executor.go:executeConcatWavs`.

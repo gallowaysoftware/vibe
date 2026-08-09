@@ -31,9 +31,16 @@ func EnvCacheDisabled() bool {
 // content-addressed caching. Webhook and YouTube stages perform network side
 // effects with no idempotency guarantee from the receiver; replaying a
 // cached "success" would skip the side effect that gave the pipeline its
-// reason for existing. Future "confirm" stages (human-in-loop) would also
-// land here. The check is centralised so the cache write site and the
-// CLI/docs all agree on the same allow-list.
+// reason for existing. Confirm stages (human-in-loop) land there too: a
+// cached "accepted" is a decision nobody made this run.
+//
+// This is only the ADVERTISEMENT. It decides whether the timing report
+// prints `cache: hit/miss` for the stage at all; whether anything is
+// actually cached is computeStageCacheKey's business, and a type on this
+// list with no branch there advertises a saving it never makes. That is
+// not hypothetical — `pandoc` shipped exactly that way. The two are held
+// together by TestCacheableAndKeyableAgree, which walks allStageTypes and
+// fails if either half knows a type the other does not.
 func stageCacheable(st *Stage) bool {
 	switch stageTypeOrDefault(st) {
 	case StageTypeText, StageTypeComfyUI, StageTypeAudio, StageTypeFFmpeg, StageTypeRender, StageTypeCompact, StageTypePandoc, StageTypeMix, StageTypeShort:
@@ -256,15 +263,20 @@ func stageCacheKey(in keyInput) (string, error) {
 			string(argsJSON),
 			string(inputsJSON),
 		), nil
-	case StageTypeRender:
-		return cache.HashStrings("render", in.RenderedPrompt), nil
-	case StageTypeCompact:
-		return cache.HashStrings("compact", in.RenderedPrompt, in.ModelID), nil
 	default:
 		// Non-cacheable types should never reach here — stageCacheable
 		// gates that upstream. Return an empty key as a defensive no-op so
 		// a future caller that forgets the gate doesn't accidentally cache
 		// a webhook side effect.
+		//
+		// A type gets a branch HERE only if computeStageCacheKey routes it
+		// here; the rest compose their key in place, and a type must never
+		// be defined in both. This case list held `render` and `compact`
+		// entries that nothing reached, and compact's was already WRONG —
+		// prompt+model, where the live composer keys on
+		// capability+source+target_chars+chunk_chars+preserve+model. A
+		// second definition of a cache key that no caller can reach is not
+		// dead weight, it is a wrong answer waiting for its first caller.
 		return "", nil
 	}
 }
@@ -727,6 +739,75 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 			bodyJSON,
 			strings.Join(hdr, "\n"),
 			assertJSON,
+		), nil
+	case StageTypePandoc:
+		// pandoc was on stageCacheable's allow-list from the day the type
+		// landed and never had a branch here, so it fell through to the
+		// default's empty key: no Get, no Put, and `cache: miss` in the
+		// timing report on every run forever. The stage advertised a
+		// saving it never made — and a full EPUB build (docker pull on
+		// first use, then a whole-book conversion) is one of the most
+		// expensive things vamp does per byte of output.
+		//
+		// The conversion is a pure function of the source bytes and the
+		// argv, exactly like ffmpeg, so caching it is right on the merits
+		// rather than merely convenient. Everything buildPandocArgs reads
+		// goes in — that function's own comment already assumed as much
+		// ("deterministic metadata-key order so the cache key (rendered
+		// argv) doesn't oscillate"), which is how long this has been
+		// believed to work.
+		//
+		// Note what this makes load-bearing: pandoc's 0-byte guard
+		// (`requireNonEmptyOutput`) was previously belt-only, because a
+		// stage that never caches cannot cache an empty book. It now
+		// carries the braces too — the runner only Puts on a nil error, so
+		// the guard is the only thing standing between a swallowed pandoc
+		// failure and a permanent, content-addressed empty EPUB. It has a
+		// test and a mutation-registry entry; keep both.
+		srcRel, err := renderTemplate(st.ID+":source_file", st.SourceFile, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+		if err != nil {
+			return "", fmt.Errorf("cache key: render pandoc source_file: %w", err)
+		}
+		outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+		if err != nil {
+			return "", fmt.Errorf("cache key: render pandoc output: %w", err)
+		}
+		// Content, not paths: a regenerated markdown source at the same
+		// path must miss. hashMediaFiles folds an absent file in as a
+		// stable "missing:" marker, which is the right answer here too —
+		// the executor is about to fail on it, and if it later appears
+		// the key changes.
+		media := []string{srcRel}
+		coverRel := ""
+		if st.CoverImage != "" {
+			coverRel, err = renderTemplate(st.ID+":cover_image", st.CoverImage, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+			if err != nil {
+				return "", fmt.Errorf("cache key: render pandoc cover_image: %w", err)
+			}
+			media = append(media, coverRel)
+		}
+		metaKeys := make([]string, 0, len(st.PandocMetadata))
+		for k := range st.PandocMetadata {
+			metaKeys = append(metaKeys, k)
+		}
+		sort.Strings(metaKeys)
+		meta := make([]string, 0, len(metaKeys))
+		for _, k := range metaKeys {
+			meta = append(meta, k+"="+st.PandocMetadata[k])
+		}
+		argsJSON, err := cache.CanonicalJSON(stringSliceToAny(st.PandocArgs))
+		if err != nil {
+			return "", fmt.Errorf("cache key: marshal pandoc args: %w", err)
+		}
+		return cache.HashStrings("pandoc",
+			st.Binary,
+			st.PandocFrom,
+			st.PandocTo,
+			outRel,
+			coverRel,
+			strings.Join(e.hashMediaFiles(media), "\n"),
+			strings.Join(meta, "\n"),
+			string(argsJSON),
 		), nil
 	case StageTypeMix:
 		// (Bug fix) mix was cacheable but had no key branch, so it fell
