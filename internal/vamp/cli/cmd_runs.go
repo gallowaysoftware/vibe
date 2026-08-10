@@ -122,9 +122,13 @@ func runsShowCmd() *cobra.Command {
 			dumpFile(out, "pipeline.json", filepath.Join(r.Path, "pipeline.json"))
 
 			// Outputs index: every regular file under the run dir EXCEPT
-			// the three metadata files we already printed. We list paths
-			// relative to the run dir so the output is portable across
-			// runs / machines.
+			// the run's own metadata. We list paths relative to the run
+			// dir so the output is portable across runs / machines.
+			//
+			// vamp.IsRunMetadataFile is the same list runStageCleanup
+			// refuses to delete — one definition of "this file is the
+			// run's provenance, not a stage artefact", so the two
+			// cannot drift.
 			fmt.Fprintln(out, "--- outputs ---")
 			any := false
 			_ = filepath.Walk(r.Path, func(p string, info os.FileInfo, err error) error {
@@ -138,8 +142,7 @@ func runsShowCmd() *cobra.Command {
 				if rerr != nil {
 					return nil
 				}
-				switch rel {
-				case "pipeline.yaml.snapshot", "inputs.json", "pipeline.json", vamp.LogFileName, vamp.PidFileName, "pipeline_timing.json":
+				if vamp.IsRunMetadataFile(rel) {
 					return nil
 				}
 				fmt.Fprintf(out, "%s\t%s\n", vamp.FormatSize(info.Size()), rel)

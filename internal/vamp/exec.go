@@ -4094,12 +4094,16 @@ func enumerateImagePairsTemplate(lessonRoot, lessonsJSON string) (string, error)
 // skipped) so a malformed per-item output fails the render stage with a
 // pointer at the offending position rather than dropping content downstream.
 func mergeJSONTemplate(raw string) (string, error) {
-	// stripJSONFences matches the opening "```json" / "```" lines and
-	// closing "```" lines on a per-line basis so a fence that wraps one
-	// item doesn't accidentally consume the next. Inline-fence forms
-	// ("``` foo ```") aren't an LLM artifact we expect from JSON-output
-	// stages, so we don't try to handle them.
-	dec := json.NewDecoder(strings.NewReader(stripJSONFences(raw)))
+	// stripThinkBlocks first: a reasoning block is the one artefact that
+	// can carry its own brace-balanced JSON, so leaving it in makes the
+	// decoder either fail at offset 0 (a lost foreach run) or, worse,
+	// merge the model's discarded drafts in with its answers. Fences are
+	// stripped after, per-line: stripJSONFences matches the opening
+	// "```json" / "```" lines and closing "```" lines on a per-line basis
+	// so a fence that wraps one item doesn't accidentally consume the
+	// next. Inline-fence forms ("``` foo ```") aren't an LLM artifact we
+	// expect from JSON-output stages, so we don't try to handle them.
+	dec := json.NewDecoder(strings.NewReader(stripJSONFences(stripThinkBlocks(raw))))
 	var merged []any
 	for {
 		var v any
@@ -4122,75 +4126,168 @@ func mergeJSONTemplate(raw string) (string, error) {
 	return string(out), nil
 }
 
-// parseJSONTemplate decodes the given JSON string. Returns the natural
-// Go shape (map[string]any / []any / float64 / string / bool / nil).
+// recoverJSON is the package's ONE JSON-recovery path for model output: it
+// returns both the cleaned JSON text and its decoded value, so the two
+// entry points that need one or the other can no longer answer the same
+// question differently.
 //
-// Tolerates two common LLM-output messes:
+// They used to. parseJSON stripped fences only and never called
+// stripModelArtifacts, so on
 //
-//  1. Markdown code fences — ```json ... ``` or bare ``` — frequently
-//     wrap JSON even when the prompt asks for raw output. Stripped
-//     before parsing.
-//  2. Thinking-mode preamble — Qwen3.6 / GLM / similar models in
-//     verbose-CoT mode emit "Here's a thinking process:" followed by
-//     bullets before the actual JSON. Extracts the first {…} or […]
-//     block by brace/bracket matching and parses just that.
+//	<think>First draft: {"answer":"WRONG"}</think>{"answer":"RIGHT"}
 //
-// Fighting LLM output shape via prompt engineering alone has
-// historically lost; pragmatic extraction here is the cheaper fix.
-func parseJSONTemplate(s string) (any, error) {
-	raw := strings.TrimSpace(s)
-	if strings.HasPrefix(raw, "```") {
-		raw = strings.TrimPrefix(raw, "```json")
-		raw = strings.TrimPrefix(raw, "```JSON")
-		raw = strings.TrimPrefix(raw, "```")
-		raw = strings.TrimSuffix(strings.TrimSpace(raw), "```")
-		raw = strings.TrimSpace(raw)
+// it returned WRONG — the draft the model itself discarded — while
+// extractCleanJSON on the same bytes returned RIGHT. Both with a nil
+// error. Two functions doing one job, with nothing that would ever notice
+// them disagreeing; the fix is not to strip think blocks in both places,
+// it is to have one place.
+//
+// The order is chosen so recovery never damages a payload that needs none:
+//
+//  1. Parse the input verbatim. A document that is already valid JSON is
+//     returned untouched, so a payload whose DATA mentions <think> or
+//     ``` survives intact. This is what keeps artefact-stripping (which
+//     is necessarily a heuristic on prose) off the healthy path.
+//  2. Strip model artefacts — reasoning blocks and markdown fences — and
+//     parse that.
+//  3. Fall back to the first balanced, parseable {…} / […] block in what
+//     is left, for the "Here's my thinking process: …" prose preamble
+//     Qwen3.6 and friends emit even at low temperature.
+//
+// Fighting LLM output shape via prompt engineering alone has historically
+// lost; pragmatic extraction here is the cheaper fix.
+func recoverJSON(s string) (string, any, error) {
+	verbatim := strings.TrimSpace(s)
+	var asis any
+	if err := json.Unmarshal([]byte(verbatim), &asis); err == nil {
+		return verbatim, asis, nil
 	}
-	var v any
-	if err := json.Unmarshal([]byte(raw), &v); err == nil {
-		return v, nil
+	cleaned := stripModelArtifacts(s)
+	var stripped any
+	err := json.Unmarshal([]byte(cleaned), &stripped)
+	if err == nil {
+		return cleaned, stripped, nil
 	}
-	// Fallback: extract the first balanced { … } or [ … ] block. Handles
-	// the "Here's a thinking process: …\n\n{…}" shape Qwen3.6 emits in
-	// its default verbose mode.
-	if extracted, ok := extractFirstJSONBlock(raw); ok {
-		if err := json.Unmarshal([]byte(extracted), &v); err == nil {
-			return v, nil
+	if block, ok := extractFirstJSONBlock(cleaned); ok {
+		var extracted any
+		if berr := json.Unmarshal([]byte(block), &extracted); berr == nil {
+			return block, extracted, nil
 		}
 	}
-	// Best-effort error: report the original Unmarshal failure on the
-	// pre-extraction string so the user sees something close to what
-	// they tried to parse.
-	var verr any
-	if err := json.Unmarshal([]byte(raw), &verr); err != nil {
-		return nil, fmt.Errorf("parseJSON: %w", err)
-	}
-	return verr, nil
+	// Report the post-strip parse error: closest to what the model
+	// emitted that the user can still read.
+	return "", nil, err
 }
 
-// extractFirstJSONBlock walks `s` looking for the first '{' or '['
-// outside a string literal, then scans forward tracking nesting depth
-// and string state until the matching close. Returns the inner block
-// and ok=true on success.
+// parseJSONTemplate decodes the given JSON string. Returns the natural
+// Go shape (map[string]any / []any / float64 / string / bool / nil).
+// Tolerates the LLM-output messes recoverJSON documents (reasoning
+// blocks, markdown fences, prose preamble).
+func parseJSONTemplate(s string) (any, error) {
+	_, v, err := recoverJSON(s)
+	if err != nil {
+		return nil, fmt.Errorf("parseJSON: %w", err)
+	}
+	return v, nil
+}
+
+// extractFirstJSONBlock returns the first balanced {…} or […] span in `s`
+// that is itself valid JSON, and ok=true. Two properties, both of which
+// the previous version's doc comment claimed and only one of which it had:
 //
-// Doesn't validate JSON itself — leaves that to the caller's Unmarshal.
-// Tolerates escaped quotes inside strings. Does NOT handle unicode
-// escapes that produce { or [ — extraordinarily rare in practice.
+//   - The search for the OPENING delimiter skips string literals, so
+//     `The key is "{" ok. {"real":true}` yields the object and not a span
+//     starting inside the prose. The comment promised this; the opener
+//     loop tracked no string state at all, while the body scan did.
+//   - A balanced span that is not JSON does not shadow the payload behind
+//     it: `**[list](x)** now.\n\n[1,2,3]` yields [1,2,3] rather than
+//     handing `[list]` to the caller to fail on. Markdown link syntax in
+//     front of a JSON answer is an extremely ordinary model output shape,
+//     and this function is the layer that exists to salvage exactly that.
+//
+// "First" still means first — an example object in the preamble that
+// parses does win over the real answer behind it, which is the documented
+// semantics rather than an oversight.
+//
+// Quote-blind is the fallback, not the behaviour: prose with an odd number
+// of `"` in it (`Here's the JSON for "widgets:`) would otherwise lose a
+// payload the old scan found, so a second, string-blind pass runs when the
+// string-aware one comes up empty. Tolerates escaped quotes inside
+// strings. Does NOT handle unicode escapes that produce { or [ —
+// extraordinarily rare in practice.
 func extractFirstJSONBlock(s string) (string, bool) {
-	// Find first opener.
-	open := -1
-	var openCh byte
-	for i := 0; i < len(s); i++ {
+	if block, ok := scanJSONBlock(s, true); ok {
+		return block, true
+	}
+	return scanJSONBlock(s, false)
+}
+
+// scanJSONBlock walks candidate openers in order and returns the first one
+// whose balanced span parses. quoteAware selects whether the opener search
+// skips braces inside string literals.
+//
+// Linear, and deliberately so. Each rejected candidate advances the cursor
+// PAST the span it matched, and an opener that never closes ends the scan
+// rather than restarting at the next one — restarting is what would turn
+// 200k unmatched '{' into quadratic work, and it could not find anything
+// this pass has not already seen (the old single-candidate scan returned
+// ok=false on that input too).
+func scanJSONBlock(s string, quoteAware bool) (string, bool) {
+	for i := 0; i < len(s); {
+		open, openCh := nextJSONOpener(s, i, quoteAware)
+		if open < 0 {
+			return "", false
+		}
+		end := matchingJSONClose(s, open, openCh)
+		if end < 0 {
+			return "", false
+		}
+		if block := s[open : end+1]; json.Valid([]byte(block)) {
+			return block, true
+		}
+		i = end + 1
+	}
+	return "", false
+}
+
+// nextJSONOpener returns the index and byte of the next '{' or '[' at or
+// after `from`, or -1. When quoteAware, delimiters inside a "…" literal
+// are skipped.
+func nextJSONOpener(s string, from int, quoteAware bool) (int, byte) {
+	inStr := false
+	escaped := false
+	for i := from; i < len(s); i++ {
 		c := s[i]
-		if c == '{' || c == '[' {
-			open = i
-			openCh = c
-			break
+		if inStr {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = quoteAware
+		case '{', '[':
+			return i, c
 		}
 	}
-	if open < 0 {
-		return "", false
-	}
+	return -1, 0
+}
+
+// matchingJSONClose scans forward from an opener tracking nesting depth
+// and string state, returning the index of the delimiter that closes it,
+// or -1 if it never closes. String- and escape-aware, so a '}' inside a
+// JSON string value does not close the object early.
+//
+// One return value, not (index, ok): internal/vibe/observed's rule, and
+// the right one here — a droppable bool guarding an index whose zero is a
+// plausible answer is how a "no match" reads as "matched at byte 0".
+func matchingJSONClose(s string, open int, openCh byte) int {
 	closeCh := byte('}')
 	if openCh == '[' {
 		closeCh = ']'
@@ -4222,11 +4319,11 @@ func extractFirstJSONBlock(s string) (string, bool) {
 		case closeCh:
 			depth--
 			if depth == 0 {
-				return s[open : i+1], true
+				return i
 			}
 		}
 	}
-	return "", false
+	return -1
 }
 
 // toJSONTemplate marshals v to its JSON representation. Compact form
@@ -4274,12 +4371,24 @@ func slugify(v any) string {
 // temp file in the same dir is written, then renamed over the target. A kill
 // mid-write thus leaves either the old file or none — never a truncated file
 // that resume would mark complete on size-positive.
+//
+// The mode is 0644 AS FILTERED BY THE UMASK, which is what the plain
+// os.WriteFile(path, data, 0o644) this replaced produced. The atomic
+// rewrite reached the same bits a different way — os.CreateTemp (0600)
+// followed by os.Chmod — and os.Chmod is not umask-filtered, so under
+// `umask 077` it published 0644 where the code it replaced gave 0600.
+// That matters here specifically: writeFile is what persists StageOutput
+// text, and for a webhook stage that is the raw HTTP response body, which
+// #76 chose to write verbatim on the reasoning that the run dir is
+// private. A mode the operator's umask cannot narrow is what breaks that
+// reasoning — and it travels when a run dir is rsync'd, tarred or backed
+// up, while the enclosing directory's permissions do not.
 func writeFile(path, content string) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".vamp-write-*")
+	tmp, err := createTempMode(dir, 0o644)
 	if err != nil {
 		return err
 	}
@@ -4293,17 +4402,32 @@ func writeFile(path, content string) error {
 		os.Remove(tmpName)
 		return err
 	}
-	// CreateTemp makes the file 0600; match the prior WriteFile mode so
-	// output files keep their conventional permissions.
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
 	if err := os.Rename(tmpName, path); err != nil {
 		os.Remove(tmpName)
 		return err
 	}
 	return nil
+}
+
+// createTempMode is os.CreateTemp with a caller-chosen mode: O_EXCL means
+// the kernel applies the umask on creation, which is the whole point (see
+// writeFile). Uniqueness comes from pid + nanosecond clock + attempt, the
+// same shape pandocContainerName falls back to, and O_EXCL is what makes
+// the retry loop correct rather than merely unlikely to collide.
+func createTempMode(dir string, mode os.FileMode) (*os.File, error) {
+	var err error
+	for attempt := 0; attempt < 100; attempt++ {
+		name := filepath.Join(dir, fmt.Sprintf(".vamp-write-%d-%d-%d", os.Getpid(), time.Now().UnixNano(), attempt))
+		var f *os.File
+		f, err = os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+		if err == nil {
+			return f, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("create temp file in %s: %w", dir, err)
 }
 
 func (e *Executor) modelIDForCurrent(ctx context.Context, status *vibev1.Status) (string, error) {
@@ -4407,6 +4531,42 @@ func (e *Executor) logf(format string, args ...any) {
 	fmt.Fprintf(e.Log, time.Now().Format("15:04:05")+" "+format+"\n", args...)
 }
 
+// runMetadataFiles are the run dir's own provenance, keyed by their path
+// relative to the run root: what pipeline ran (pipeline.yaml.snapshot),
+// with what parameters (inputs.json), what it did (pipeline.json,
+// pipeline_timing.json, vamp.log) and whether it is still doing it
+// (vamp.pid). Everything else under the run dir is a stage artefact.
+//
+// WHY AN EXCLUSION LIST AND NOT A METADATA SUBDIRECTORY. A `.vamp/`
+// subdirectory is the structurally stronger answer — it takes the run's
+// provenance out of the glob space entirely, so no future pattern syntax
+// can reach it and no future metadata file has to be remembered here. It
+// is also an on-disk layout change to a format five packages read
+// (jobs.go's run classification, cmd_runs.go's dump, diff, resume, every
+// run dir already on the operator's disk), and it would need a
+// compatibility path for all of them. The exclusion list is the shape
+// this codebase already chose one package over, at cmd_runs.go's
+// outputs-index switch, and the only real cost of that choice — the two
+// lists drifting apart — is removed by making it one list that both call.
+// If the layout ever does move, this function is the single place the
+// question is asked.
+var runMetadataFiles = map[string]bool{
+	"pipeline.yaml.snapshot": true,
+	"inputs.json":            true,
+	"pipeline.json":          true,
+	"pipeline_timing.json":   true,
+	LogFileName:              true,
+	PidFileName:              true,
+}
+
+// IsRunMetadataFile reports whether rel — a path relative to the run dir
+// root, as filepath.Rel produces — names one of the run's own metadata
+// files. Only the run root counts: a stage that writes sub/inputs.json has
+// written an artefact, and cleanup may take it.
+func IsRunMetadataFile(rel string) bool {
+	return runMetadataFiles[rel]
+}
+
 // runStageCleanup is the best-effort post-success disk-scrubber for stages
 // that declare a cleanup: list. Patterns are evaluated as filepath.Glob
 // against the run dir and every match is os.Remove'd. Failures (glob
@@ -4423,7 +4583,9 @@ func (e *Executor) logf(format string, args ...any) {
 //
 // Safety: validateCleanupPatterns has already rejected absolute paths and
 // `..` traversal at load time, so by the time we get here every pattern
-// is guaranteed to be a relative path under runDir.
+// is guaranteed to be a relative path under runDir. The run's own
+// metadata (IsRunMetadataFile) is excluded on top of that — see there for
+// why an exclusion list rather than a metadata subdirectory.
 func (e *Executor) runStageCleanup(st *Stage) {
 	if len(st.Cleanup) == 0 {
 		return
@@ -4463,6 +4625,14 @@ func (e *Executor) runStageCleanup(st *Stage) {
 				e.logf("  -> stage %q: cleanup skipping %q (outside run dir)", st.ID, m)
 				continue
 			}
+			// The run's provenance is not a stage artefact, and a glob
+			// aimed at stage artefacts must not be able to take it. Say
+			// so in the log: a silent skip teaches the author nothing
+			// about why their pattern kept a file.
+			if IsRunMetadataFile(rel) {
+				e.logf("  -> stage %q: cleanup keeping run metadata %q", st.ID, rel)
+				continue
+			}
 			if err := os.Remove(m); err != nil {
 				// A non-existent file is fine (the user may have listed a
 				// pattern that didn't match anything this time); other
@@ -4486,67 +4656,114 @@ func validateJSON(s string) error {
 }
 
 // extractCleanJSON returns the JSON payload from an LLM-produced string,
-// peeling off the wrappers and prose preamble LLMs add. Returns the
-// cleaned JSON string + nil error when extraction + parse both succeed.
-// Used by both validateJSON (output_format: json gate) and
-// visionExecutor.Execute (so downstream stages see clean JSON, not the raw
-// verbose output).
+// peeling off the wrappers and prose preamble LLMs add: `<think>` blocks,
+// ```json fences, and "Here's my thinking process:" bullets in front of
+// the object. recoverJSON is the implementation and documents the order.
 //
-// Handles, in order:
-//
-//  1. `<think>...</think>` reasoning blocks — Qwen3 / DeepSeek family
-//     uses these as explicit CoT markers.
-//  2. Surrounding ```json / ``` markdown code fences — most common
-//     output shape when the model hasn't seen the user's request as
-//     strict JSON-mode.
-//  3. Prose preamble — Qwen3.6 EXL3 emits "Here's a thinking process:"
-//     followed by bullets and analysis *before* the JSON object, even
-//     at low temperature. The fallback walks the string for the first
-//     balanced { … } or [ … ] block.
+// Two live consumers, and the difference between them is worth knowing.
+// validateJSON is the output_format: json gate, where a wrong-but-valid
+// extraction makes the gate PASS — resume then accepts a file whose real
+// content is a draft. visionExecutor.Execute (vision_executor.go:119) is
+// worse: the returned string BECOMES the stage output that every
+// downstream stage consumes. Neither caller can second-guess this
+// function, so it is the one that has to be right.
 func extractCleanJSON(s string) (string, error) {
-	cleaned := stripModelArtifacts(s)
-	var v any
-	if err := json.Unmarshal([]byte(cleaned), &v); err == nil {
-		return cleaned, nil
-	}
-	// Fallback: pull the first balanced block out of whatever's left
-	// (after artifact-stripping) and try that. Caller decides whether
-	// to bubble the original error or the extraction failure.
-	if block, ok := extractFirstJSONBlock(cleaned); ok {
-		if err := json.Unmarshal([]byte(block), &v); err == nil {
-			return block, nil
-		}
-	}
-	// Report the post-strip parse error — closest to what the model
-	// emitted that the user can read.
-	var verr any
-	if err := json.Unmarshal([]byte(cleaned), &verr); err != nil {
+	cleaned, _, err := recoverJSON(s)
+	if err != nil {
 		return "", err
 	}
 	return cleaned, nil
 }
 
 // stripModelArtifacts removes LLM-side wrappers that aren't part of the
-// intended JSON payload before parsing: Qwen3-style `<think>...</think>`
-// reasoning preambles and surrounding ```json / ``` markdown code fences.
-// Designed to be conservative — only the documented artefact shapes are
-// recognised, so a literal `<think>` token inside the user's data isn't
-// inadvertently scrubbed.
+// intended payload: Qwen3-style `<think>...</think>` reasoning blocks and
+// surrounding ```json / ``` markdown code fences.
+//
+// Conservative in the way that matters: the JSON path (recoverJSON) parses
+// its input verbatim BEFORE calling this, so a well-formed document whose
+// data happens to contain `<think>` or backticks is never handed here at
+// all. What is handed here is text that already failed to parse, where
+// scrubbing an artefact is the only way forward.
+//
+// The prose callers (compact, ffmpeg's upstream-array decode, the cache
+// key) have no such pre-check and never did — for them this is
+// unconditional, which is what they want: a reasoning block is not part of
+// the text a compact stage is summarising either.
 func stripModelArtifacts(s string) string {
-	s = strings.TrimSpace(s)
-	if strings.HasPrefix(s, "<think>") {
-		if end := strings.Index(s, "</think>"); end >= 0 {
-			s = strings.TrimSpace(s[end+len("</think>"):])
+	s = stripThinkBlocks(s)
+	if strings.HasPrefix(s, "```") {
+		s = s[len("```"):]
+		// Drop a language tag on the opening fence line ("json", "JSON",
+		// "json5") along with its newline. Anything else on that line is
+		// content and stays — a bare "```\n{...}" keeps its object.
+		if nl := strings.IndexByte(s, '\n'); nl >= 0 && isFenceLanguage(s[:nl]) {
+			s = s[nl+1:]
 		}
 	}
-	if strings.HasPrefix(s, "```json") {
-		s = strings.TrimPrefix(s, "```json")
-		s = strings.TrimPrefix(s, "```")
-	} else if strings.HasPrefix(s, "```") {
-		s = strings.TrimPrefix(s, "```")
-	}
-	s = strings.TrimSuffix(s, "```")
+	s = strings.TrimSuffix(strings.TrimSpace(s), "```")
 	return strings.TrimSpace(s)
+}
+
+// stripThinkBlocks removes every `<think>…</think>` span from s, wherever
+// it occurs.
+//
+// The prefix-only version this replaces was defeated by a single
+// conversational token: "Sure, here goes.\n<think>{draft}</think>{answer}"
+// left the whole block in, and the JSON extractor behind it then reached
+// into the reasoning and returned the draft — as the vision executor's
+// stage output, and as a pass from the output_format: json resume gate.
+//
+// Two shapes the old code got silently wrong, both real:
+//
+//   - UNCLOSED. A generation that stopped inside the reasoning stream has
+//     no answer in it at all, so everything from the dangling `<think>` to
+//     the end is reasoning. Dropping it makes the caller fail — which is
+//     the correct direction: the gate re-runs the stage instead of
+//     accepting a draft as the answer.
+//   - ORPHAN CLOSER. Models whose chat template pre-fills the opening tag
+//     emit only `</think>`. Everything before the last one is reasoning.
+func stripThinkBlocks(s string) string {
+	const openTag, closeTag = "<think>", "</think>"
+	var b strings.Builder
+	for {
+		open := strings.Index(s, openTag)
+		if open < 0 {
+			break
+		}
+		b.WriteString(s[:open])
+		rest := s[open+len(openTag):]
+		end := strings.Index(rest, closeTag)
+		if end < 0 {
+			return strings.TrimSpace(b.String())
+		}
+		s = rest[end+len(closeTag):]
+	}
+	b.WriteString(s)
+	out := b.String()
+	// Any closer still standing here is orphaned: the loop above consumed
+	// every matched pair.
+	if i := strings.LastIndex(out, closeTag); i >= 0 {
+		out = out[i+len(closeTag):]
+	}
+	return strings.TrimSpace(out)
+}
+
+// isFenceLanguage reports whether tok is a markdown fence's language tag
+// ("json", "JSON", "js") rather than the start of the payload.
+func isFenceLanguage(tok string) bool {
+	tok = strings.TrimSpace(tok)
+	if tok == "" || len(tok) > 16 {
+		return false
+	}
+	for i := 0; i < len(tok); i++ {
+		c := tok[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '+', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // recordStageFinish writes one StageRecord to the per-run timing map.

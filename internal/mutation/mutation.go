@@ -1489,6 +1489,102 @@ var Registry = []Mutation{
 			"value, one more time.",
 	},
 	{
+		Name:     "vamp/parseJSON stops stripping the model's reasoning block",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tcleaned := stripModelArtifacts(s)",
+		Replace:  "\tcleaned := strings.TrimSpace(s)",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestJSONRecovery_ParseJSONAndExtractCleanJSONAgree"},
+		Why: "two functions answered the same question differently on the same bytes, both with a nil " +
+			"error: parseJSON stripped fences only, so `readFile … | parseJSON | toJSON` — the chain " +
+			"templateFuncs advertises for threading a stage result into a webhook body — returned the " +
+			"draft the model discarded inside <think>, while extractCleanJSON returned the answer. A " +
+			"wrong answer that parses is the one failure mode nothing downstream can detect.",
+	},
+	{
+		Name:     "vamp/the reasoning-block strip goes back to prefix-only",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\topen := strings.Index(s, openTag)",
+		Replace:  "\t\topen := -1\n\t\tif strings.HasPrefix(s, openTag) {\n\t\t\topen = 0\n\t\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestJSONRecovery_HostileShapes"},
+		Why: "one conversational token in front of the tag — \"Sure,\", \"Okay —\", a quoted line the " +
+			"model restated the task on — defeats a prefix test, and what gets through is the model's " +
+			"scratch work. It lands as the vision executor's stage output, which every downstream stage " +
+			"then consumes, and it passes the output_format: json resume gate, which reports the stage " +
+			"healthy about bytes that are not its answer. The test named here is deliberate: the " +
+			"orphan-`</think>` rule RESCUES the obvious cases from this mutation (everything before the " +
+			"last closer goes), so the agreement test stays green and only a reasoning block that " +
+			"follows the payload separates the two rules. Registered by the harness reporting this " +
+			"entry UNPROTECTED against the obvious test first.",
+	},
+	{
+		Name:     "vamp/an unclosed reasoning block reads as content",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\tif end < 0 {\n\t\t\treturn strings.TrimSpace(b.String())\n\t\t}",
+		Replace:  "\t\tif end < 0 {\n\t\t\ts = rest\n\t\t\tbreak\n\t\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestJSONRecovery_UnclosedThinkIsNotAnAnswer"},
+		Why: "a generation cut off inside the reasoning stream never reached an answer, so there is no " +
+			"answer in it to find. Read as content, the extractor hands back the first draft object in " +
+			"the scratch work and the run continues on it. Failing costs one re-run in GPU minutes, " +
+			"which is the cheaper of the two mistakes and the only one that is visible.",
+	},
+	{
+		Name:     "vamp/the JSON extractor's opener scan stops skipping quoted delimiters",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tif block, ok := scanJSONBlock(s, true); ok {",
+		Replace:  "\tif block, ok := scanJSONBlock(s, false); ok {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestExtractFirstJSONBlock_OpenerSkipsQuotedDelimiters"},
+		Why: "this is the layer that exists to salvage messy model output, and a `{` quoted in the " +
+			"preamble made it decline the payload sitting right behind it. The doc comment claimed the " +
+			"scan was string-aware while only the BODY half was — the defect a reader verifying the " +
+			"comment cannot see. On the resume gate it re-runs a stage that succeeded; on the live path " +
+			"it fails the stage with an error pointing at the prose instead of the JSON.",
+	},
+	{
+		Name:     "vamp/a non-JSON balanced span shadows the payload behind it",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\ti = end + 1",
+		Replace:  "\t\treturn \"\", false",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestExtractFirstJSONBlock_OpenerSkipsQuotedDelimiters"},
+		Why: "markdown link syntax in front of the answer (`a **[list](x)** now:` then the array) is an " +
+			"ordinary model output shape and `[list]` is balanced, so a single-candidate scan hands the " +
+			"caller a span that cannot parse and stops. The advance is also what keeps the scan linear: " +
+			"it moves PAST the span it just rejected rather than restarting at the next opener, so " +
+			"200k unmatched braces stay 200k steps instead of becoming quadratic.",
+	},
+	{
+		Name:     "vamp/writeFile publishes its outputs past the umask",
+		File:     "internal/vamp/exec.go",
+		Find:     "\ttmp, err := createTempMode(dir, 0o644)",
+		Replace:  "\ttmp, err := os.CreateTemp(dir, \".vamp-write-*\")\n\tif err == nil {\n\t\terr = os.Chmod(tmp.Name(), 0o644)\n\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestWriteFile_HonoursUmask"},
+		Why: "the exact pair the atomic-write refactor reached for, and the reason a run dir stopped " +
+			"being private: os.WriteFile is umask-filtered and os.Chmod is not, so `umask 077` got 0644 " +
+			"where the code this replaced gave 0600. writeFile persists StageOutput text, and for a " +
+			"webhook stage that is the raw HTTP response body #76 chose to write verbatim BECAUSE the " +
+			"run dir is private. The mode travels when a run dir is rsync'd, tarred or backed up; the " +
+			"enclosing directory's permissions do not.",
+	},
+	{
+		Name:     "vamp/a cleanup glob reaches the run's own provenance",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\t\tif IsRunMetadataFile(rel) {",
+		Replace:  "\t\t\tif false {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestRunStageCleanup_KeepsRunMetadata"},
+		Why: "`cleanup: [\"*.json\"]` is an ordinary thing to write for a pipeline whose intermediates " +
+			"are JSON, and it took inputs.json with them — written once, never rebuilt, the only " +
+			"on-disk record of what the run was given. `cleanup: [\"*\"]` also takes " +
+			"pipeline.yaml.snapshot (so --resume now demands --resume-force, the mode that skips drift " +
+			"detection entirely) and vamp.pid (so `vamp cancel` can no longer find the job). Both " +
+			"reported a successful cleanup.",
+	},
+	{
 		Name:     "c25/a partially refused harvest reports a short n and no reason",
 		File:     "internal/vibe/benchreplay/report.go",
 		Find:     "\tif r.Sample.Refused > 0 {",
