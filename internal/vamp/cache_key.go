@@ -556,6 +556,13 @@ func (e *Executor) computeStageCacheKey(st *Stage, item any, itemIdx int) (strin
 				if d.IsDir() {
 					return nil
 				}
+				// The key must hash the set the executor will actually
+				// concatenate; executeConcatWavs skips vamp's scratch, so
+				// this walk has to skip it too or a crashed run's leftovers
+				// would change the key without changing the output.
+				if isScratchName(d.Name()) {
+					return nil
+				}
 				if strings.EqualFold(filepath.Ext(d.Name()), ".wav") {
 					inputs = append(inputs, path)
 				}
@@ -1135,7 +1142,11 @@ func (e *Executor) materializeCacheHit(_ context.Context, st *Stage, in StageInp
 		extra[st.Foreach.Var] = in.Item
 		extra["i"] = in.ItemIdx
 	}
-	outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)
+	// Same resolution the live executors use: a cache hit writes to the
+	// stage's output path without any executor running, so it needs the
+	// containment rule as much as they do — more, since it is the one
+	// write path where no subprocess would have failed first.
+	outRel, err := stageOutputPath(st, in, extra)
 	if err != nil {
 		return nil, fmt.Errorf("render output path: %w", err)
 	}
@@ -1150,8 +1161,8 @@ func (e *Executor) materializeCacheHit(_ context.Context, st *Stage, in StageInp
 	if err := os.MkdirAll(filepath.Dir(outAbs), 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir cache materialize dir: %w", err)
 	}
-	if err := os.WriteFile(outAbs, hit.Output, 0o644); err != nil {
-		return nil, fmt.Errorf("write cached output to %s: %w", outAbs, err)
+	if err := writeOutputAtomically(st.ID, "cache materialize", outAbs, hit.Output); err != nil {
+		return nil, err
 	}
 	return &StageOutput{Files: []string{outAbs}}, nil
 }

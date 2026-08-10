@@ -48,7 +48,22 @@ func (r *recordingRunner) Run(ctx context.Context, binary string, args []string,
 			return err
 		}
 	}
-	return wantErr
+	if wantErr != nil {
+		return wantErr
+	}
+	// A zero exit means piper claims it wrote the WAV. Write one, so the
+	// double describes the real success path: the executor now publishes
+	// the file by renaming what the producer wrote, so a stub that exits 0
+	// having written nothing is a case the stage is required to reject,
+	// not the shape of a successful run. Mirrors
+	// recordingFFmpegRunner.writeFakeOutput.
+	if out, ok := argByFlag(call.Args, "--output-file"); ok {
+		if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(out, []byte("RIFF....WAVEfake-piper-bytes"), 0o644)
+	}
+	return nil
 }
 
 func (r *recordingRunner) callCount() int {
@@ -131,16 +146,24 @@ func TestAudioExecutor_RendersTextAndCallsPiper(t *testing.T) {
 	if !ok {
 		t.Fatalf("--output-file missing from args %v", call.Args)
 	}
-	wantOut := filepath.Join(runDir, "voiceover.wav")
-	if gotOut != wantOut {
+	// piper is pointed at the scratch file, not at the stage's output
+	// path: the WAV appears where downstream stages look for it only once
+	// piper has exited and produced something.
+	wantFile := filepath.Join(runDir, "voiceover.wav")
+	if wantOut := partialOutputPath(wantFile); gotOut != wantOut {
 		t.Errorf("--output-file = %q, want %q", gotOut, wantOut)
 	}
 	if call.Stdin != "Hello Kyle, welcome." {
 		t.Errorf("stdin = %q, want %q", call.Stdin, "Hello Kyle, welcome.")
 	}
-	wantFile := filepath.Join(runDir, "voiceover.wav")
 	if len(out.Files) != 1 || out.Files[0] != wantFile {
 		t.Errorf("out.Files = %v, want [%s]", out.Files, wantFile)
+	}
+	if _, err := os.Stat(wantFile); err != nil {
+		t.Errorf("the finished WAV must be published at the stage's output path: %v", err)
+	}
+	if _, err := os.Stat(partialOutputPath(wantFile)); err == nil {
+		t.Error("the scratch file outlived the stage")
 	}
 }
 
@@ -343,11 +366,10 @@ func TestAudioExecutor_TemplatedOutputPath(t *testing.T) {
 		t.Fatalf("Execute: %v", err)
 	}
 	gotOut, _ := argByFlag(runner.call(0).Args, "--output-file")
-	wantOut := filepath.Join(runDir, "audio", "clip_3.wav")
-	if gotOut != wantOut {
+	wantFile := filepath.Join(runDir, "audio", "clip_3.wav")
+	if wantOut := partialOutputPath(wantFile); gotOut != wantOut {
 		t.Errorf("--output-file = %q, want %q", gotOut, wantOut)
 	}
-	wantFile := filepath.Join(runDir, "audio", "clip_3.wav")
 	if len(out.Files) != 1 || out.Files[0] != wantFile {
 		t.Errorf("out.Files = %v, want [%s]", out.Files, wantFile)
 	}
@@ -440,11 +462,15 @@ func TestAudioExecutor_RunGroupSkipsProfile(t *testing.T) {
 	if runner.callCount() != 1 {
 		t.Fatalf("expected 1 piper call, got %d", runner.callCount())
 	}
-	// And the resulting output path is reported relative to RunDir.
+	// And the resulting output path is reported relative to RunDir (piper
+	// writes the scratch file beside it; the executor publishes it).
 	out := filepath.Join(runDir, "voice.wav")
 	gotOut, _ := argByFlag(runner.call(0).Args, "--output-file")
-	if gotOut != out {
-		t.Errorf("--output-file = %q, want %q", gotOut, out)
+	if want := partialOutputPath(out); gotOut != want {
+		t.Errorf("--output-file = %q, want %q", gotOut, want)
+	}
+	if _, err := os.Stat(out); err != nil {
+		t.Errorf("the finished WAV must be published at the stage's output path: %v", err)
 	}
 }
 

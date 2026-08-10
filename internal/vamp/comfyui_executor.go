@@ -74,10 +74,18 @@ func (e *comfyuiExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 	}
 
 	// Foreach binding goes into both parameter-template rendering and the
-	// output-path render below so users can template both per item.
+	// output-path resolution below so users can template both per item.
 	var extra map[string]any
 	if st.Foreach != nil {
 		extra = map[string]any{st.Foreach.Var: in.Item, "i": in.ItemIdx}
+	}
+
+	// Resolve where the render will land BEFORE queueing it: a path that
+	// leaves the run dir can never be written, and finding that out after
+	// the diffusion model has run costs a GPU minute per foreach item.
+	outRel, err := stageOutputPath(st, in, extra)
+	if err != nil {
+		return nil, fmt.Errorf("stage %s: render output path: %w", st.ID, err)
 	}
 
 	if err := applyParameters(workflow, st, in, extra); err != nil {
@@ -140,10 +148,6 @@ func (e *comfyuiExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 		return nil, fmt.Errorf("stage %s: workflow produced %d output files; vamp currently supports one output per stage (set batch_size: 1 in your workflow, or split into multiple stages)", st.ID, len(files))
 	}
 
-	outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
-	if err != nil {
-		return nil, fmt.Errorf("stage %s: render output path: %w", st.ID, err)
-	}
 	dest := filepath.Join(in.RunDir, outRel)
 	if _, err := client.SaveOutputToFile(ctx, files[0], dest); err != nil {
 		return nil, fmt.Errorf("stage %s: save output: %w", st.ID, err)

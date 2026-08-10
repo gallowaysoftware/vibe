@@ -101,8 +101,15 @@ func TestMixExecutor_HappyPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	argv := strings.Split(strings.TrimSpace(string(raw)), "\n")
-	if argv[len(argv)-1] != want {
+	// The encoder writes the scratch file beside the output; the executor
+	// renames it into place after the 0-byte check. The last argument is
+	// still the destination — the fakes rely on that — it is just not the
+	// path a half-finished encode would be findable at.
+	if argv[len(argv)-1] != partialOutputPath(want) {
 		t.Errorf("output path must be the last argument (the executor and the fakes both rely on it): %v", argv)
+	}
+	if _, err := os.Stat(want); err != nil {
+		t.Errorf("the finished m4b must be published at the stage's output path: %v", err)
 	}
 	joined := strings.Join(argv, " ")
 	if !strings.Contains(joined, "concat=n=2:v=0:a=1") {

@@ -102,14 +102,15 @@ func (m *mixExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput,
 		return nil, err
 	}
 
-	outputPath, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
+	outRel, err := stageOutputPath(st, in, extra)
 	if err != nil {
 		return nil, fmt.Errorf("render output: %w", err)
 	}
-	outputPath = resolveInRunDir(outputPath, in.RunDir)
+	outputPath := resolveInRunDir(outRel, in.RunDir)
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir output: %w", err)
 	}
+	tmpPath := beginPartialOutput(outputPath)
 
 	// Build the input file list. Intro first, then every voice
 	// segment in order, then outro. Paths are resolved against the
@@ -302,7 +303,7 @@ func (m *mixExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput,
 		}
 	}
 
-	args = append(args, outputPath)
+	args = append(args, tmpPath)
 
 	cmd := command(ctx, binary, args...)
 	// Always retain a tail of stderr so a non-zero exit surfaces ffmpeg's own
@@ -327,21 +328,21 @@ func (m *mixExecutor) Execute(ctx context.Context, in StageInput) (*StageOutput,
 	cmd.Stdout = sink
 	cmd.Stderr = sink
 	if err := cmd.Run(); err != nil {
+		discardPartialOutput(tmpPath)
 		if msg := strings.TrimSpace(tail.String()); msg != "" {
 			return nil, fmt.Errorf("ffmpeg mix: %w: %s", err, msg)
 		}
 		return nil, fmt.Errorf("ffmpeg mix: %w", err)
 	}
-	// Verify the m4b/mp3 actually has content. ffmpeg occasionally
-	// exits 0 with a 0-byte output (filtergraph errors that don't
-	// propagate to exit status); without this check vamp would cache
-	// the empty result and replay it forever.
-	info, err := os.Stat(outputPath)
-	if err != nil {
-		return nil, fmt.Errorf("mix: stat output: %w", err)
-	}
-	if info.Size() == 0 {
-		return nil, fmt.Errorf("mix: ffmpeg produced 0-byte output at %s (likely a filtergraph error swallowed by ffmpeg exit code)", outputPath)
+	// Verify the m4b/mp3 actually has content, then publish it. ffmpeg
+	// occasionally exits 0 with a 0-byte output (filtergraph errors that
+	// don't propagate to exit status); without this check vamp would cache
+	// the empty result and replay it forever. Shared with the other
+	// file-producing executors so the check and the publish cannot get out
+	// of order in one of them: the check reads the SCRATCH file and
+	// nothing reaches outputPath until it passes.
+	if err := finalizeOutput(st.ID, "ffmpeg mix", tmpPath, outputPath); err != nil {
+		return nil, err
 	}
 	return &StageOutput{Files: []string{outputPath}}, nil
 }

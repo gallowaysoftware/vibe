@@ -405,6 +405,158 @@ var Registry = []Mutation{
 			"badge's colour is a claim about a value OBSERVED now; once the observations stop " +
 			"arriving, leaving it green is absent evidence read as a healthy value.",
 	},
+	// ── one copy of the rule, at the sites that write (vamp) ──────────
+	//
+	// The rung above pins ensureUnderRunDir itself. These pin the thing
+	// that made it insufficient: ten executor-side renders that never
+	// asked it. Each is its own entry because "guarded at one of ten" is
+	// precisely the state this replaced, and a single entry would let the
+	// other nine drift back one refactor at a time.
+	{
+		Name:     "vamp/the shared output-path resolution stops applying the rule",
+		File:     "internal/vamp/output_path.go",
+		Find:     "\tif err := ensureUnderRunDir(outRel); err != nil {\n\t\treturn \"\", err\n\t}",
+		Replace:  "\tif err := ensureUnderRunDir(outRel); err != nil && false {\n\t\treturn \"\", err\n\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestBinaryExecutorsRefuseAnOutputPathOutsideTheRunDir", "TestMaterializeCacheHitRefusesAnOutputPathOutsideTheRunDir"},
+		Why: "this one call is the containment rule for every stage that writes a media file — the " +
+			"executors reach it through stageOutputPath and, for a foreach item, it is the ONLY " +
+			"check the path gets (the per-item binding does not exist until the fan-out is " +
+			"running). Removing it puts ffmpeg's argv target, piper's --output-file and pandoc's " +
+			"-o back under a template that interpolates a prior stage's raw model text.",
+	},
+	{
+		Name:     "vamp/the runner stops checking the output path before it dispatches",
+		File:     "internal/vamp/exec.go",
+		Find:     "\toutPath, err := e.renderOutputPath(st, map[string]any{",
+		Replace:  "\toutPath, err := renderTemplate(st.ID+\":output\", st.Output, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, map[string]any{",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestExecuteStageValidatesTheOutputPathBeforeTheExecutorRuns"},
+		Why: "executeStage returns at `len(out.Files) > 0` before the write-back path's render, so " +
+			"this pre-dispatch resolution is where a binary stage's path is checked — and where a " +
+			"stage type added tomorrow gets the rule for free instead of being expected to ask for " +
+			"it. The mutation renders the same template with the same binding and skips the check, " +
+			"which is exactly the shape every executor used to carry.",
+	},
+	{
+		Name:     "vamp/a stage's output becomes visible before it is finished",
+		File:     "internal/vamp/output_path.go",
+		Find:     "\tdir, base := filepath.Split(outAbs)\n\treturn filepath.Join(dir, scratchPrefix+base)",
+		Replace:  "\t_, _ = filepath.Split(outAbs)\n\treturn outAbs",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestACrashedProducerLeavesNothingAtTheOutputPath", "TestKokoroPublishesThroughTheScratchFile"},
+		Why: "point the producers back at the final path and a SIGKILL / OOM / power cut part-way " +
+			"through a three-hour m4b encode leaves a real file, at the real path, with a real " +
+			"non-zero size — which is the ENTIRE integrity check --resume performs for a binary " +
+			"stage (tryResumeStage stats it and hands the path on). The measured shape: a 21-byte " +
+			"file beginning \\x00\\x00\\x00\\x20ftypM4A resumed as a completed stage, and the next " +
+			"stage uploads it.",
+	},
+	{
+		Name:     "vamp/the non-empty check moves after the publish",
+		File:     "internal/vamp/output_path.go",
+		Find:     "\tif err := requireNonEmptyOutput(stageID, what, tmpAbs); err != nil {\n\t\tdiscardPartialOutput(tmpAbs)\n\t\treturn err\n\t}",
+		Replace:  "\tif err := requireNonEmptyOutput(stageID, what, tmpAbs); err != nil && false {\n\t\tdiscardPartialOutput(tmpAbs)\n\t\treturn err\n\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestFFmpegExecutor_ZeroByteOutputFailsTheStage", "TestPandocExecutor_ZeroByteOutputFailsTheStage"},
+		Why: "the ORDER is the guarantee. ffmpeg and pandoc both exit 0 having written a 0-byte " +
+			"container when the real error never reached the exit status; checking the scratch " +
+			"file first means that artefact is deleted rather than published, so \"a file exists " +
+			"at the stage's output path\" keeps meaning \"that stage completed\". Check it after " +
+			"the rename and the empty file is already what --resume and tryCachePut can see.",
+	},
+	{
+		Name:     "vamp/a half-written segment is glued into the audiobook",
+		File:     "internal/vamp/output_path.go",
+		Find:     "func isScratchName(name string) bool {\n\treturn strings.HasPrefix(name, \".\")",
+		Replace:  "func isScratchName(name string) bool {\n\treturn strings.HasPrefix(name, \"\\x00\")",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestConcatWavsIgnoresScratchFiles"},
+		Why: "a scratch WAV is still a .wav, and concat_wavs decides the audiobook's contents by " +
+			"walking the run dir for that extension. Without this, the walk picks up a file whose " +
+			"producer is STILL RUNNING — a sibling foreach item, no crash required — and the " +
+			"cache-key walk hashes a set the executor will not concatenate.",
+	},
+	{
+		Name:     "vamp/a comfyui stage renders its own output path again",
+		File:     "internal/vamp/comfyui_executor.go",
+		Find:     "\toutRel, err := stageOutputPath(st, in, extra)",
+		Replace:  "\toutRel, err := renderTemplate(st.ID+\":output\", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestBinaryExecutorsRefuseAnOutputPathOutsideTheRunDir"},
+		Why: "the executed escape: a comfyui stage wrote its PNG outside the run dir through a full " +
+			"Executor.Run. This is the exact line that used to be there, so the mutation is a " +
+			"revert rather than an invention — which is how it will come back if it does.",
+	},
+	{
+		Name: "vamp/an ffmpeg m4b renders its own output path again",
+		File: "internal/vamp/ffmpeg_executor.go",
+		// The comment is the disambiguator: four ffmpeg modes call
+		// stageOutputPath with identical text.
+		Find:     "\t// Output path first: ffprobing every chapter of a book that has\n\t// nowhere legal to be written is minutes of work for a stage that\n\t// cannot succeed.\n\toutRel, err := stageOutputPath(st, in, extra)",
+		Replace:  "\toutRel, err := renderTemplate(st.ID+\":output\", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestBinaryExecutorsRefuseAnOutputPathOutsideTheRunDir"},
+		Why: "the m4b rung of the same class, and the one with the worst downstream: the audiobook " +
+			"is what a youtube / publish stage consumes. The escape source is model-controlled in " +
+			"the ordinary case — `output: \"{{ .stages.pick.output }}.m4b\"` puts a prior stage's " +
+			"raw text in the path.",
+	},
+	{
+		Name:     "vamp/an audio stage renders its own output path again",
+		File:     "internal/vamp/audio_executor.go",
+		Find:     "\toutRel, err := stageOutputPath(st, in, extra)",
+		Replace:  "\toutRel, err := renderTemplate(st.ID+\":output\", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestBinaryExecutorsRefuseAnOutputPathOutsideTheRunDir"},
+		Why: "audio is the stage type most often driven by a foreach over parsed model JSON " +
+			"(`output: \"audio/{{ .segment.slug }}.wav\"`), so it is the likeliest place a sampled " +
+			"\"../..\" reaches a filename slot — and piper writes wherever --output-file points.",
+	},
+	{
+		Name:     "vamp/a pandoc stage renders its own output path again",
+		File:     "internal/vamp/pandoc_executor.go",
+		Find:     "\toutRel, err := stageOutputPath(st, in, extra)",
+		Replace:  "\toutRel, err := renderTemplate(st.ID+\":output\", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestBinaryExecutorsRefuseAnOutputPathOutsideTheRunDir"},
+		Why: "pandoc's docker path rebases the output under /data — a bind mount of the run dir — " +
+			"so an escaping path is also the one shape that writes outside the mount the container " +
+			"was given, on a host that has a docker daemon and the operator's uid.",
+	},
+	{
+		Name:     "vamp/a mix stage renders its own output path again",
+		File:     "internal/vamp/mix_executor.go",
+		Find:     "\toutRel, err := stageOutputPath(st, in, extra)",
+		Replace:  "\toutRel, err := renderTemplate(st.ID+\":output\", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestBinaryExecutorsRefuseAnOutputPathOutsideTheRunDir"},
+		Why: "mix and short resolve with resolveInRunDir, which returns an ABSOLUTE rendered path " +
+			"unchanged — so for these two an escape needs no \"..\" at all, just a leading slash. " +
+			"That is why they are separate rungs from the filepath.Join sites.",
+	},
+	{
+		Name:     "vamp/a short stage renders its own output path again",
+		File:     "internal/vamp/short_executor.go",
+		Find:     "\toutRel, err := stageOutputPath(st, in, extra)",
+		Replace:  "\toutRel, err := renderTemplate(st.ID+\":output\", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestBinaryExecutorsRefuseAnOutputPathOutsideTheRunDir"},
+		Why: "the other resolveInRunDir site, and the one whose artefact is uploaded: a short's MP4 " +
+			"is the thing a publish stage hands to a platform. Same absolute-path shape as mix.",
+	},
+	{
+		Name:     "vamp/a cache hit writes wherever the template says",
+		File:     "internal/vamp/cache_key.go",
+		Find:     "\toutRel, err := stageOutputPath(st, in, extra)",
+		Replace:  "\toutRel, err := renderTemplate(st.ID+\":output\", st.Output, st.Inputs, e.Inputs, e.snapshotPrior(st.Inputs), e.RunDir, extra)",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestMaterializeCacheHitRefusesAnOutputPathOutsideTheRunDir"},
+		Why: "the write with no executor in front of it. materializeCacheHit puts the cached bytes " +
+			"at the rendered path itself, so on a cache HIT nothing else can refuse the path first " +
+			"— and a hit is the common case for the reruns a poisoned template would be found in.",
+	},
+
 	{
 		Name: "page/a later rule repaints a neutralised badge green",
 		File: "internal/vibe/fleetapi/fleet.html",
@@ -749,11 +901,14 @@ var Registry = []Mutation{
 		Pkg:      "./internal/vamp/",
 		MustFail: []string{"TestRenderOutputPathRejectsRunDirEscape", "TestDryRunRenderOutputPathRejectsRunDirEscape", "TestTryResumeStage_SurfacesRunDirEscape"},
 		Why: "a foreach item map is parsed from a PRIOR STAGE'S LLM OUTPUT and its fields are " +
-			"interpolated into the stage's output: template; the result reaches " +
-			"filepath.Join(RunDir, path) at four sites with nothing cleaning it. Two are writes " +
-			"(a sampled \"../../etc/cron.d/x\") and two are resume READS (a sampled \"/etc/passwd\" " +
-			"loaded into a stage output, i.e. into the next prompt). Deleting this guard used to " +
-			"leave all 39 packages green.",
+			"interpolated into the stage's output: template. COUNTED, on this tree: a rendered " +
+			"`output:` is resolved against the run dir at EIGHTEEN sites — this guard covered six " +
+			"of them (two writes, four resume/diff reads) and the twelve it did not cover included " +
+			"ten that WRITE (comfyui, audio, pandoc, mix, short, ffmpeg's four modes, and the cache " +
+			"materializer). The earlier text here said \"four sites\", and that undercount is what " +
+			"let the executors keep their own unguarded copies of the render; they now share " +
+			"stageOutputPath, whose own rung is below. Deleting this guard used to leave all 39 " +
+			"packages green.",
 	},
 
 	// ── an empty artefact that outlives the run that made it (vamp) ───
@@ -770,10 +925,14 @@ var Registry = []Mutation{
 			"same inputs until someone clears the cache by hand.",
 	},
 	{
-		Name:     "vamp/a mix stage stops checking that it produced anything",
-		File:     "internal/vamp/mix_executor.go",
-		Find:     "\tif info.Size() == 0 {",
-		Replace:  "\tif false && info.Size() == 0 {",
+		Name: "vamp/a mix stage stops checking that it produced anything",
+		File: "internal/vamp/mix_executor.go",
+		// Re-pointed: mix's hand-rolled stat + size check became a
+		// finalizeOutput call (one check-then-publish for every
+		// file-producing executor). The mutation publishes without the
+		// check, which is the same defect at the current shape.
+		Find:     "\tif err := finalizeOutput(st.ID, \"ffmpeg mix\", tmpPath, outputPath); err != nil {",
+		Replace:  "\tif err := os.Rename(tmpPath, outputPath); err != nil {",
 		Pkg:      "./internal/vamp/",
 		MustFail: []string{"TestMixExecutor_ZeroByteOutputFailsTheStage"},
 		Why: "the same swallowed-filtergraph failure as the ffmpeg entry above, at the executor that " +
@@ -945,16 +1104,21 @@ var Registry = []Mutation{
 			"corruption of the operator's log in production.",
 	},
 	{
-		Name:     "vamp/a pandoc stage accepts an empty book",
-		File:     "internal/vamp/pandoc_executor.go",
-		Find:     "\tif err := requireNonEmptyOutput(st.ID, \"pandoc\", outAbs); err != nil {\n\t\treturn nil, err\n\t}",
-		Replace:  "\tif err := requireNonEmptyOutput(st.ID, \"pandoc\", outAbs); false && err != nil {\n\t\treturn nil, err\n\t}",
+		Name: "vamp/a pandoc stage accepts an empty book",
+		File: "internal/vamp/pandoc_executor.go",
+		// Re-pointed: the check now runs inside finalizeOutput, on the
+		// scratch file, BEFORE the rename that publishes it. The mutation
+		// keeps the publish and drops the check — the same defect, at the
+		// shape the code has today.
+		Find:     "\tif err := finalizeOutput(st.ID, \"pandoc\", tmpAbs, outAbs); err != nil {\n\t\treturn nil, err\n\t}",
+		Replace:  "\tif err := os.Rename(tmpAbs, outAbs); err != nil {\n\t\treturn nil, err\n\t}",
 		Pkg:      "./internal/vamp/",
 		MustFail: []string{"TestPandocExecutor_ZeroByteOutputFailsTheStage"},
 		Why: "pandoc opens its output before it knows the conversion will work, so a missing LaTeX " +
 			"engine or an undecodable cover leaves a 0-byte EPUB and exits 0 — and the docker " +
 			"fallback adds a second route, since `docker run` reports the CLIENT's status. This " +
-			"site checked existence only; the size half is what an empty book fails.",
+			"site checked existence only; the size half is what an empty book fails. Publishing " +
+			"without the check is now the way to get one there, which is what this mutation does.",
 	},
 	{
 		Name:     "vamp/a cacheable stage type loses its key composer",
@@ -2247,8 +2411,9 @@ var Registry = []Mutation{
 		Replace:  "\t\tif err := ensureUnderRunDir(outPath); err != nil && false {\n\t\t\tout[st.ID] = &stageResult{}\n\t\t\tcontinue\n\t\t}",
 		Pkg:      "./internal/vamp/",
 		MustFail: []string{"TestCompare_RefusesOutputPathEscapingTheRunDir"},
-		Why: "the differ was one of four consumers of a rendered `output:` template and the only pair " +
-			"that did not apply the containment rule. Executor.snapshot writes pipeline.yaml.snapshot " +
+		Why: "the differ is one of the eighteen places a rendered `output:` template is resolved " +
+			"against a run dir (counted on this tree), and was for a long time the only pair of them " +
+			"that read a file without applying the rule. Executor.snapshot writes pipeline.yaml.snapshot " +
 			"VERBATIM before any stage runs, so a template the executor would refuse still reaches the " +
 			"differ — which reads the file and, if it looks textual, embeds it whole into the report " +
 			"the operator prints or pipes as JSON.",
