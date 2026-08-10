@@ -12,8 +12,9 @@ func envCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "env",
 		Short: "Print export lines for the active profile's frontend env vars.",
-		Long:  "Suitable for `eval \"$(vibe env)\"` in your shell. Prints nothing if no profile is active or the profile defined no env vars.",
-		Args:  cobra.NoArgs,
+		Long: "Suitable for `eval \"$(vibe env)\"` in your shell. Prints nothing if no profile is active or the profile defined no env vars.\n" +
+			"Exits non-zero, printing nothing, if the daemon does not answer in time — that is not the same as no profile being active, and stdout stays empty because your shell executes it.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
