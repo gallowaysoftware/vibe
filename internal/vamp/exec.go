@@ -2659,7 +2659,7 @@ var templateFuncMap = template.FuncMap{
 	"lower":                      strings.ToLower,
 	"upper":                      strings.ToUpper,
 	"trim":                       strings.TrimSpace,
-	"joinPath":                   func(parts ...string) string { return filepath.Join(parts...) },
+	"joinPath":                   joinPathTemplate,
 	"readFile":                   readFileTemplate,
 	"stripToHeading":             stripToHeadingTemplate,
 	"readFiles":                  readFilesTemplate,
@@ -3886,11 +3886,87 @@ func stripToHeadingTemplate(text, prefix string) string {
 	return text
 }
 
+// errTemplatePathTraversal marks a template-supplied read path that
+// climbs out of the directory it was handed with a ".." segment.
+// Sentinel for the same reason errOutputPathEscape and
+// errLessonPathEscape are: it is the one failure a caller must never
+// fold into "that file simply wasn't there".
+var errTemplatePathTraversal = errors.New(`path climbs out of its own prefix with ".."`)
+
+// ensureNoTraversal refuses a ".." segment in a path or glob a template
+// handed to one of the filesystem-reading helpers.
+//
+// WHY THIS EXISTS, and — more importantly — WHAT IT DOES NOT CLAIM.
+//
+// The executor's WRITE path is confined: a stage's rendered `output:`
+// goes through ensureUnderRunDir, and a lesson name goes through
+// lessonImageDir. The READ helpers had no guard of any kind, on the
+// same executor, fed from the same untrusted place: `readFile`'s
+// documented job is to chain a prior stage's output into the next
+// prompt, and a prior stage's output is whatever the model wrote. A
+// rendered `{{ readFile (printf "%s/../sibling.txt" .runDir) }}` walked
+// straight out of the run dir and inlined the file into the prompt,
+// which is the same escape the same executor refuses one function over.
+// `joinPath` composes the same way — filepath.Join CLEANS, so it
+// RESOLVES ".." rather than rejecting it, exactly as lessonImageDir's
+// doc comment warns.
+//
+// This is TRAVERSAL containment, not confinement, and the difference is
+// the whole honest statement of the fix. These helpers cannot be
+// confined to a root: their documented purpose is reading a user's
+// on-disk corpus (`{{ readFiles "~/curriculum/*/lesson.md" }}`, an
+// absolute lesson_root supplied by --input), so an absolute path stays
+// legal and a model that emits one still reaches the file it names.
+// What is closed is the relative escape — the form that turns a path
+// the pipeline author DID intend (`{{ .runDir }}/...`) into one they
+// did not. The residual absolute-path sink is answered by the rule
+// examples/rag-eval-pipeline/README.md now states ("readFile takes a
+// PATH; a text stage's .output/.outputs are CONTENT — passing one to
+// readFile is always a bug") and by the example that no longer
+// demonstrates the anti-pattern, not by this function.
+//
+// Costless for legitimate pipelines by construction: every path a
+// pipeline wants to read is nameable without a ".." segment, and the
+// error says so. It is also the rule validateCleanupPatterns
+// (pipeline.go) already applies to `cleanup:` globs at load time, so a
+// reader who has verified one has verified both.
+func ensureNoTraversal(fn, path string) error {
+	// Check the RAW string, before any "~" expansion: expansion goes
+	// through filepath.Join, which would clean the ".." away and leave
+	// the guard inspecting a path that no longer contains the segment
+	// it is looking for.
+	for _, seg := range strings.Split(filepath.ToSlash(path), "/") {
+		if seg == ".." {
+			return fmt.Errorf("%s %s: %w (name the directory directly)", fn, path, errTemplatePathTraversal)
+		}
+	}
+	return nil
+}
+
+// joinPathTemplate is filepath.Join with the traversal refusal above.
+//
+// Registered as `joinPath`. It is the natural composer for the read
+// helpers — `{{ readFile (joinPath .runDir .item.name) }}` — so leaving
+// it unguarded would leave the guard on its consumers trivially
+// bypassable: Join resolves the ".." itself, and readFile would then
+// receive a perfectly clean path pointing outside the run dir.
+func joinPathTemplate(parts ...string) (string, error) {
+	for _, p := range parts {
+		if err := ensureNoTraversal("joinPath", p); err != nil {
+			return "", err
+		}
+	}
+	return filepath.Join(parts...), nil
+}
+
 // readFileTemplate reads the file at path and returns its contents as a
 // string. Expands a leading "~" to the user's home directory. Surfaces a
 // wrapped error on miss so the template engine reports the failing stage
-// clearly.
+// clearly. A ".." segment is refused — see ensureNoTraversal.
 func readFileTemplate(path string) (string, error) {
+	if err := ensureNoTraversal("readFile", path); err != nil {
+		return "", err
+	}
 	if strings.HasPrefix(path, "~/") {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -3908,7 +3984,11 @@ func readFileTemplate(path string) (string, error) {
 // readFilesTemplate reads all files matching a glob pattern and returns
 // them concatenated with "--- <path> ---" headers. Paths are sorted for
 // determinism. Expands a leading "~" to the user's home directory.
+// A ".." segment is refused — see ensureNoTraversal.
 func readFilesTemplate(pattern string) (string, error) {
+	if err := ensureNoTraversal("readFiles", pattern); err != nil {
+		return "", err
+	}
 	if strings.HasPrefix(pattern, "~/") {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -3963,6 +4043,9 @@ func readLessonsTemplate(args ...any) (string, error) {
 	}
 	if batch < 1 || batch > total || total < 1 {
 		return "", fmt.Errorf("readLessons: batch %d out of range [1, %d]", batch, total)
+	}
+	if err := ensureNoTraversal("readFileBatch", pattern); err != nil {
+		return "", err
 	}
 	if strings.HasPrefix(pattern, "~/") {
 		home, err := os.UserHomeDir()
@@ -4023,6 +4106,31 @@ func readFilesFromMatches(matches []string) (string, error) {
 	return b.String(), nil
 }
 
+// globLiteralPrefix returns the leading run of a glob pattern's path
+// segments that contain no glob metacharacter — i.e. the directory the
+// pattern is rooted at, which is what a match's name should be
+// expressed RELATIVE TO.
+//
+// "root/*/Lesson_*" -> "root"; "/a/b/Lesson_*" -> "/a/b"; a pattern with
+// no metacharacter at all falls back to its parent directory, so a
+// non-glob argument keeps naming its own last segment. A pattern whose
+// FIRST segment is magic ("*/x") has no literal prefix and yields "",
+// which filepath.Rel reads as the current directory.
+//
+// The metacharacter set mirrors path/filepath's own hasMeta: `*`, `?`,
+// `[` and (on non-Windows) `\`. Including `\` unconditionally is safe —
+// on Windows it is the separator, so it never appears WITHIN a segment.
+func globLiteralPrefix(pattern string) string {
+	sep := string(filepath.Separator)
+	segs := strings.Split(pattern, sep)
+	for i, s := range segs {
+		if strings.ContainsAny(s, `*?[\`) {
+			return strings.Join(segs[:i], sep)
+		}
+	}
+	return filepath.Dir(pattern)
+}
+
 // enumerateLessonsTemplate glob-matches lesson directories and returns them
 // as a JSON array of relative directory names. Used as the source for
 // foreach stages that process lessons individually:
@@ -4030,6 +4138,27 @@ func readFilesFromMatches(matches []string) (string, error) {
 //	{{ enumerateLessons "~/path/to/Module_1/Lesson_*" }}
 //
 // Filters out directories whose lesson.md exceeds 1 MB (textbooks).
+//
+// Each name is the match's path RELATIVE TO the pattern's literal
+// prefix — which is what "relative directory names" above has always
+// promised, and what the three consumers (enumerateImagePairs,
+// enumerateUniqueImages, imageDescriptionsFor) need in order to resolve
+// the name back under the lesson root.
+//
+// It used to be filepath.Base, which is not relative to anything — it
+// is the last segment. For a flat glob the two agree, which is why the
+// doc example above works and the bug shipped for so long. For a glob
+// with a wildcard ABOVE the last segment ("root/*/Lesson_*" — the shape
+// the "Module_1" in that example implies exists) Base drops the module
+// segment and duplicates the leaf: four real lessons across two modules
+// enumerated as ["Lesson_1","Lesson_2","Lesson_1","Lesson_2"]. Those
+// names resolve to nothing under the root, the image fan-out came back
+// `[]` with a nil error, executeForeachStage logged "foreach array
+// empty, no items to run", and the pipeline completed green having
+// described zero diagrams — the exact failure the zero-match error
+// below was written to eliminate, arriving through a different door.
+// lessonImageDir already accepts a nested name, so nothing downstream
+// had to change.
 //
 // A glob that matches nothing is an ERROR, not an empty array — the
 // same contract readFilesTemplate and readLessonsTemplate already
@@ -4039,6 +4168,9 @@ func readFilesFromMatches(matches []string) (string, error) {
 // no work. Likewise when every match is filtered out (not a directory,
 // no lesson.md, lesson.md over the size cap).
 func enumerateLessonsTemplate(pattern string) (string, error) {
+	if err := ensureNoTraversal("enumerateDirs", pattern); err != nil {
+		return "", err
+	}
 	if strings.HasPrefix(pattern, "~/") {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -4055,6 +4187,7 @@ func enumerateLessonsTemplate(pattern string) (string, error) {
 	}
 	sort.Strings(matches)
 	const maxLessonSize = 1024 * 1024
+	prefix := globLiteralPrefix(pattern)
 	var dirs []string
 	for _, m := range matches {
 		info, statErr := os.Stat(m)
@@ -4066,7 +4199,16 @@ func enumerateLessonsTemplate(pattern string) (string, error) {
 		if err != nil || fi.Size() > maxLessonSize {
 			continue
 		}
-		dirs = append(dirs, filepath.Base(m))
+		name, relErr := filepath.Rel(prefix, m)
+		if relErr != nil || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
+			// filepath.Glob only ever returns paths under the pattern's
+			// own literal prefix, so this is unreachable by construction.
+			// Falling back to the last segment rather than erroring keeps
+			// a hypothetical future Rel failure from taking the whole
+			// enumeration down.
+			name = filepath.Base(m)
+		}
+		dirs = append(dirs, name)
 	}
 	if len(dirs) == 0 {
 		return "", fmt.Errorf("enumerateLessons %s: %d matches but none is a directory holding a lesson.md under %d bytes", pattern, len(matches), maxLessonSize)
@@ -4114,6 +4256,22 @@ func extractSVGTextTemplate(path string) (string, error) {
 // label is trimmed and internal whitespace collapsed; the order of
 // the result matches the document order so spatial reasoning
 // downstream (e.g. "top-left → bottom-right" reading order) survives.
+//
+// A child-element boundary inside a <text> contributes a SPACE. Multi-
+// line SVG text is authored as sibling <tspan>s with dy offsets — the
+// standard Inkscape and matplotlib output for a wrapped label or a
+// stacked value — and concatenating them with nothing between produced
+// a value that appears nowhere in the diagram: <tspan>12</tspan>
+// <tspan>34</tspan> read as "1234", and Total/Revenue read as
+// "TotalRevenue". That is worse than omission here, because this
+// helper's entire stated job is to hand a vision model GROUND TRUTH
+// for numbers it might mis-read off the pixels; a fabricated number
+// delivered with authority is the one output it must not produce.
+//
+// The cost is the reverse case — a word deliberately split across
+// tspans for kerning comes back with a space in it. That is the right
+// trade: a reader (and a model) can rejoin "un breakable"; neither can
+// un-join "1234".
 func parseSVGTextLabels(data []byte) ([]string, error) {
 	dec := xml.NewDecoder(bytes.NewReader(data))
 	dec.Strict = false
@@ -4144,6 +4302,8 @@ func parseSVGTextLabels(data []byte) ([]string, error) {
 					cur.Reset()
 				}
 				inText++
+			} else if inText > 0 {
+				cur.WriteByte(' ')
 			}
 		case xml.EndElement:
 			if t.Name.Local == "text" && inText > 0 {
@@ -4151,6 +4311,8 @@ func parseSVGTextLabels(data []byte) ([]string, error) {
 				if inText == 0 {
 					flush()
 				}
+			} else if inText > 0 {
+				cur.WriteByte(' ')
 			}
 		case xml.CharData:
 			if inText > 0 {
@@ -4187,6 +4349,33 @@ func collapseWhitespace(s string) string {
 // never fold into "this lesson simply has no images".
 var errLessonPathEscape = errors.New("lesson path escapes the lesson root")
 
+// errLessonNotFound marks a lesson name that resolves to nothing under
+// the lesson root.
+//
+// This is the RECEIVING half of the rule enumerateDirs already enforces
+// on the sending side. enumerateDirs errors on a glob that matched
+// nothing, and states the argument at length: "a typo'd or stale lesson
+// root is indistinguishable from a curriculum with no lessons once the
+// result is [], and the foreach it feeds then completes green having
+// done no work." That argument applies verbatim to the three helpers
+// that CONSUME the array, and none of them made it — and the array need
+// not come from enumerateDirs at all: the documented binding is
+// `.stages.list_lessons.output`, i.e. a stage output, i.e. whatever the
+// model wrote. `["Lesson_9999","Lesson_8888"]` against a real root
+// returned a well-formed empty fan-out with a nil error.
+//
+// The distinction that matters, and the one the guard is built around:
+//
+//   - lesson directory EXISTS, has no images/ subdirectory — zero units
+//     of work, correctly expressed. Stays `[]`, stays a nil error.
+//     TestEnumerateImagePairs_NoImagesIsEmptyArrayNotNull pins exactly
+//     this and is RIGHT.
+//   - lesson directory DOES NOT EXIST — the producer named something
+//     that is not there. A fault, and the one this sentinel reports.
+//
+// Both used to read as "this curriculum has no diagrams".
+var errLessonNotFound = errors.New("lesson names nothing under the lesson root")
+
 // lessonImageDir joins lessonRoot/<lesson>/images and refuses a lesson
 // name that resolves outside lessonRoot.
 //
@@ -4207,11 +4396,26 @@ var errLessonPathEscape = errors.New("lesson path escapes the lesson root")
 // imageDescriptionsFor read the identical directory from the identical
 // untrusted array, and a guard on one of three is the defect class this
 // package keeps producing.
+//
+// The EXISTENCE half of the contract lives here too, for that same
+// "one shape for all three helpers" reason: the lesson must name a real
+// directory under the root. See errLessonNotFound for why an empty
+// images/ and an absent lesson are different answers.
 func lessonImageDir(lessonRoot, lesson string) (string, error) {
+	if strings.TrimSpace(lesson) == "" {
+		return "", fmt.Errorf("%w: %q (empty lesson name)", errLessonNotFound, lesson)
+	}
 	dir := filepath.Join(lessonRoot, lesson, "images")
 	rel, err := filepath.Rel(lessonRoot, dir)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("%w: %q", errLessonPathEscape, lesson)
+	}
+	// Checked AFTER the escape test on purpose: an escaping name whose
+	// target happens to exist must still report the escape, which is
+	// the more specific and more alarming of the two faults.
+	info, statErr := os.Stat(filepath.Join(lessonRoot, lesson))
+	if statErr != nil || !info.IsDir() {
+		return "", fmt.Errorf("%w: %q under %s", errLessonNotFound, lesson, lessonRoot)
 	}
 	return dir, nil
 }
@@ -4228,6 +4432,10 @@ func lessonImageDir(lessonRoot, lesson string) (string, error) {
 // "ext": ".svg"|...}, ordered by hash for determinism. The path is a
 // sample (the first lesson seen for that hash); identical SVGs across
 // lessons collapse to one entry.
+//
+// An empty lessons array, or a lesson naming no directory under the
+// root, is a fault and errors — see errLessonNotFound. A lesson that
+// exists and has no images/ contributes nothing, which is not.
 func enumerateUniqueImagesTemplate(lessonRoot, lessonsJSON string) (string, error) {
 	root := lessonRoot
 	if strings.HasPrefix(root, "~/") {
@@ -4240,6 +4448,9 @@ func enumerateUniqueImagesTemplate(lessonRoot, lessonsJSON string) (string, erro
 	var lessons []string
 	if err := json.Unmarshal([]byte(lessonsJSON), &lessons); err != nil {
 		return "", fmt.Errorf("enumerateUniqueImages: parse lessons array: %w", err)
+	}
+	if len(lessons) == 0 {
+		return "", fmt.Errorf("enumerateUniqueImages: the lessons array is empty; a producer that found no lessons is a fault, not a curriculum with no diagrams")
 	}
 	allowed := map[string]bool{
 		".png": true, ".jpg": true, ".jpeg": true, ".gif": true,
@@ -4311,6 +4522,11 @@ func enumerateUniqueImagesTemplate(lessonRoot, lessonsJSON string) (string, erro
 // have been written yet). Errors only on truly unreadable state —
 // missing description files are skipped silently so a partial
 // resume still composes a usable prompt.
+//
+// A lesson name that resolves to NO directory under the root is not
+// "this lesson has no images": it errors (errLessonNotFound), because
+// the name came from a prior stage's output and a hallucinated lesson
+// must not read as an empty one.
 func imageDescriptionsForLessonTemplate(runDir, lessonRoot, lesson string) (string, error) {
 	root := lessonRoot
 	if strings.HasPrefix(root, "~/") {
@@ -4371,6 +4587,13 @@ func imageDescriptionsForLessonTemplate(runDir, lessonRoot, lesson string) (stri
 // diagrams → no per-image description files for that lesson). All other
 // behavior (sort, 200 KB cap, "--- <path> ---" headers) mirrors readFiles.
 func readFilesOrEmptyTemplate(pattern string) (string, error) {
+	// A traversal is a FAULT, not a "no matches" — the permissive
+	// contract here is about a glob that legitimately matches nothing,
+	// and folding an escape into that silence is precisely the shape
+	// this helper must not have.
+	if err := ensureNoTraversal("readFilesOrEmpty", pattern); err != nil {
+		return "", err
+	}
 	if strings.HasPrefix(pattern, "~/") {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -4412,9 +4635,12 @@ func readFilesOrEmptyTemplate(pattern string) (string, error) {
 // Output: JSON array of {"lesson": "<dir>", "image": "<basename>",
 // "image_path": "<abs path>"}, ordered by (lesson, image) sort.
 //
-// Lessons without an images/ dir contribute nothing. Errors (unreadable
-// directory, etc.) surface as a render-stage failure so the pipeline
-// stops before any vision stage sees a bad fan-out.
+// Lessons without an images/ dir contribute nothing — that is zero
+// units of work, correctly expressed, and the result stays `[]`. An
+// EMPTY lessons array, or a lesson that names no directory under the
+// root, is a fault and errors (errLessonNotFound). Other errors
+// (unreadable directory, etc.) surface as a render-stage failure too,
+// so the pipeline stops before any vision stage sees a bad fan-out.
 func enumerateImagePairsTemplate(lessonRoot, lessonsJSON string) (string, error) {
 	root := lessonRoot
 	if strings.HasPrefix(root, "~/") {
@@ -4427,6 +4653,9 @@ func enumerateImagePairsTemplate(lessonRoot, lessonsJSON string) (string, error)
 	var lessons []string
 	if err := json.Unmarshal([]byte(lessonsJSON), &lessons); err != nil {
 		return "", fmt.Errorf("enumerateImagePairs: parse lessons array: %w", err)
+	}
+	if len(lessons) == 0 {
+		return "", fmt.Errorf("enumerateImagePairs: the lessons array is empty; a producer that found no lessons is a fault, not a curriculum with no diagrams")
 	}
 	allowed := map[string]bool{
 		".png": true, ".jpg": true, ".jpeg": true, ".gif": true,
