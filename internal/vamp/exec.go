@@ -2234,18 +2234,10 @@ func (e *Executor) tryResumeForeachStage(st *Stage) (*foreachResumeInfo, error) 
 			ResumedOutputs: map[int]string{},
 		}, nil
 	}
-	// YouTube records the watch URL as the file body; downstream stages see
-	// the URL string the same way they'd see a text-stage completion, so we
-	// treat youtube like text for resume purposes.
-	rt := stageTypeOrDefault(st)
-	isText := rt == StageTypeText || rt == StageTypeYouTube
-
 	outPaths := make([]string, len(items))
-	resumed := make(map[int]string, len(items))
-	var missing []int
+	seenPaths := make(map[string]int, len(items))
 	for i, item := range items {
-		extra := map[string]any{st.Foreach.Var: item, "i": i}
-		path, err := e.renderOutputPath(st, extra)
+		path, err := e.renderOutputPath(st, foreachTemplateExtra(st, item, i))
 		if err != nil {
 			if errors.Is(err, errOutputPathEscape) {
 				// An item whose rendered path leaves the run dir is a
@@ -2261,8 +2253,68 @@ func (e *Executor) tryResumeForeachStage(st *Stage) (*foreachResumeInfo, error) 
 			// surface it cleanly).
 			return nil, nil
 		}
+		if _, dup := seenPaths[path]; dup {
+			// executeForeachStage carries two RUNTIME refusals that
+			// Validate deliberately does not make (pipeline.go:1517-1534):
+			// two items whose rendered paths collide, and a multi-item
+			// foreach whose output path is not templated at all. Both are
+			// checks the stage performs on ITSELF — so resume marking the
+			// stage complete does not merely skip the work, it suppresses
+			// the error permanently for that run dir: every item "resumes"
+			// from the one file that exists, .outputs is N copies of one
+			// body, and the run reports success.
+			//
+			// One check covers both: a non-templated output renders to the
+			// same constant for every item, so it arrives here as a
+			// collision. (Mutation-verified — the separate non-templated
+			// branch this replaced could not be made to fail a test,
+			// because it was unreachable behind this one.)
+			//
+			// Declining rather than re-raising keeps ONE wording of each
+			// message: executeForeachStage runs and errors as it would on
+			// a fresh run.
+			return nil, nil
+		}
+		seenPaths[path] = i
 		outPaths[i] = path
-		full := filepath.Join(e.RunDir, path)
+	}
+
+	// Nothing on disk records WHICH item produced a given file: the only
+	// pairing key is the rendered path. That is content-addressed and
+	// safe when the path is item-derived (items/{{.title}}.txt) and
+	// purely POSITIONAL when it is index-derived (assets/img_{{.i}}.png,
+	// a pattern this package's own comment advertises).
+	//
+	// Positional pairing is still correct whenever the item list is the
+	// prior run's list, which it is whenever the upstream stage resumed
+	// from its own on-disk output — byte-identical output, byte-identical
+	// list. It stops being correct when the upstream could NOT resume and
+	// re-ran against a non-deterministic model: a prior run over
+	// [a b c d] leaves items/0.txt, the upstream now says [w x y z], and
+	// item w is handed the body generated for a. The run exits 0.
+	//
+	// So the refusal is compound, matching the actual precondition: only
+	// when the paths do not record the item AND the upstream re-ran this
+	// pass. Refusing every index-templated foreach instead would re-render
+	// all 50 images of a fan-out that crashed on image 47 — the work
+	// --resume exists to avoid.
+	if !e.foreachPathsRecordItems(st, items, outPaths) && !e.resumedFromPriorRun(st.Foreach.From) {
+		e.logf("  -> stage %q: foreach output paths are index-derived and upstream %q re-ran this pass; rerunning every item rather than pairing prior files by position", st.ID, st.Foreach.From)
+		return nil, nil
+	}
+
+	// Classify by output kind, not by an allowlist — the single-stage
+	// path above carries the full argument, and this call site is where
+	// the allowlist it was fixed to stop using survived: `render`,
+	// `compact`, `webhook` and `confirm` foreach items resumed with an
+	// absolute PATH where the next prompt expects the file's bytes (and
+	// with the host's directory layout in a model request).
+	binary := producesFileOutput(stageTypeOrDefault(st))
+
+	resumed := make(map[int]string, len(items))
+	var missing []int
+	for i := range items {
+		full := filepath.Join(e.RunDir, outPaths[i])
 		body, ok, err := readNonEmpty(full)
 		if err != nil {
 			return nil, err
@@ -2271,24 +2323,26 @@ func (e *Executor) tryResumeForeachStage(st *Stage) (*foreachResumeInfo, error) 
 			missing = append(missing, i)
 			continue
 		}
-		if isText {
-			// Apply the same output_format: json integrity check the
-			// single-stage resume path applies. A corrupted JSON body
-			// would otherwise satisfy readNonEmpty but poison downstream
-			// foreach consumers that parse it.
-			if st.OutputFormat == "json" {
-				if err := validateJSON(string(body)); err != nil {
-					missing = append(missing, i)
-					continue
-				}
-			}
-			resumed[i] = string(body)
-		} else {
-			// Binary foreach items (comfyui) expose an ABSOLUTE path so
-			// downstream {{ .stages.X.outputs[i] }} references work as
-			// subprocess argv strings (the daemon's CWD is not RunDir).
+		if binary {
+			// Binary foreach items (comfyui/audio/ffmpeg/pandoc/mix/short)
+			// expose an ABSOLUTE path so downstream
+			// {{ .stages.X.outputs[i] }} references work as subprocess
+			// argv strings (the daemon's CWD is not RunDir).
 			resumed[i] = full
+			continue
 		}
+		// Apply the same output_format: json integrity check the
+		// single-stage resume path applies, to EVERY content-bearing
+		// type. A corrupted JSON body would otherwise satisfy
+		// readNonEmpty but poison downstream foreach consumers that
+		// parse it.
+		if st.OutputFormat == "json" {
+			if err := validateJSON(string(body)); err != nil {
+				missing = append(missing, i)
+				continue
+			}
+		}
+		resumed[i] = string(body)
 	}
 
 	info := &foreachResumeInfo{
@@ -2310,6 +2364,60 @@ func (e *Executor) tryResumeForeachStage(st *Stage) (*foreachResumeInfo, error) 
 		e.mu.Unlock()
 	}
 	return info, nil
+}
+
+// foreachTemplateExtra builds the per-item template bindings a foreach
+// stage renders its prompt and output path against: the item under the
+// stage's declared Var name, plus `.i`, the iteration index.
+func foreachTemplateExtra(st *Stage, item any, i int) map[string]any {
+	return map[string]any{st.Foreach.Var: item, "i": i}
+}
+
+// foreachProbeItem is the stand-in value foreachPathsRecordItems renders
+// with when a stage has exactly one item and there is no sibling to swap
+// in. Any real item equal to it makes the probe answer "does not record",
+// which is the conservative direction.
+const foreachProbeItem = "__vamp_foreach_probe__"
+
+// foreachPathsRecordItems reports whether the rendered output paths
+// actually encode WHICH item produced each file — i.e. whether pairing an
+// on-disk file back to an item is content-addressed or merely positional.
+//
+// It answers by substitution rather than by inspecting the template text:
+// render each index again with a DIFFERENT item's value and see whether
+// the path moves. Reading the template instead would have to decide what
+// `{{.i}}` means next to `{{.item}}` (which contains ".i"), what
+// `{{ index .parts 0 }}` means, and what any sprig pipeline does to
+// either — a heuristic where this is a measurement.
+//
+// A render error on the probe answers "does not record": we could not
+// prove the path varies, and the caller's conservative branch is to rerun.
+func (e *Executor) foreachPathsRecordItems(st *Stage, items []any, outPaths []string) bool {
+	if len(items) != len(outPaths) {
+		return false
+	}
+	for i := range items {
+		var other any = foreachProbeItem
+		if len(items) > 1 {
+			other = items[(i+1)%len(items)]
+		}
+		probe, err := e.renderOutputPath(st, foreachTemplateExtra(st, other, i))
+		if err != nil || probe == outPaths[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// resumedFromPriorRun reports whether the named stage's output was loaded
+// from the prior run's run dir by the resume pre-pass, as opposed to
+// having been produced by an executor during THIS invocation. The
+// distinction matters to any resume decision that assumes a stage's
+// output is the same bytes the prior run wrote.
+func (e *Executor) resumedFromPriorRun(stageID string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.completedStages[stageID]
 }
 
 // readNonEmpty reads path and reports whether the file exists with non-zero
@@ -4352,7 +4460,21 @@ func (e *Executor) snapshot() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(e.RunDir, "inputs.json"), data, 0o644)
+	inputsPath := filepath.Join(e.RunDir, "inputs.json")
+	if e.ResumeDir != "" {
+		// Same carve-out as the pipeline snapshot above, for the same
+		// reason: inputs.json is the ORIGINAL run's record of what
+		// produced the outputs already on disk, and `runs ls` / `vamp
+		// diff` read it. checkResumeSnapshot refuses a resume whose
+		// inputs drifted, so the only way to get here with different
+		// values is --resume-force — where overwriting would delete the
+		// record of the half of the run that is already done. Write only
+		// when the prior run left none (run dirs predating this file).
+		if _, err := os.Stat(inputsPath); err == nil {
+			return nil
+		}
+	}
+	return os.WriteFile(inputsPath, data, 0o644)
 }
 
 // checkResumeSnapshot loads the prior run's pipeline.yaml.snapshot and
@@ -4390,7 +4512,71 @@ func (e *Executor) checkResumeSnapshot() error {
 	if want != got {
 		return fmt.Errorf("resume: pipeline file changed since this run started (snapshot %s != current %s); either pass the original pipeline file or start a fresh run (omit --resume), or use --resume-force to override", want[:12], got[:12])
 	}
+	return e.checkResumeInputs()
+}
+
+// checkResumeInputs is the --input half of the same drift rule. The
+// pipeline hash covers the YAML and nothing the YAML is parameterised by,
+// so `vamp run --input topic=cats` followed by `--resume --input
+// topic=dogs` was accepted: the cat-era stages resume as complete, the
+// remaining stages generate dogs, and one run dir describes both. Inputs
+// reach prompts through {{ .inputs.x }}, so a changed value is drift of
+// exactly the kind the pipeline hash refuses — err on "may have changed".
+//
+// A run dir with no inputs.json predates the record and stays resumable;
+// --resume-force is the documented override and never reaches here.
+func (e *Executor) checkResumeInputs() error {
+	path := filepath.Join(e.RunDir, "inputs.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("resume: read run inputs %s: %w", path, err)
+	}
+	var recorded map[string]string
+	if err := json.Unmarshal(data, &recorded); err != nil {
+		// An unparseable record cannot prove drift either way; the
+		// pipeline hash already matched, so don't block on it.
+		return nil
+	}
+	if diff := inputsDrift(recorded, e.Inputs); diff != "" {
+		return fmt.Errorf("resume: --input values changed since this run started (%s); the already-completed stages were generated from the original values — start a fresh run (omit --resume), or use --resume-force to override", diff)
+	}
 	return nil
+}
+
+// inputsDrift describes the first difference between the recorded and
+// current input sets in sorted key order, or "" when they agree. The
+// VALUES are named because the operator has to be able to tell which of
+// their two invocations was the one they meant; inputs are CLI arguments
+// the user typed, not secrets read from the environment (those arrive as
+// ${VAR} references resolved inside the pipeline).
+func inputsDrift(recorded, current map[string]string) string {
+	keys := make([]string, 0, len(recorded)+len(current))
+	seen := make(map[string]bool, len(recorded)+len(current))
+	for _, m := range []map[string]string{recorded, current} {
+		for k := range m {
+			if !seen[k] {
+				seen[k] = true
+				keys = append(keys, k)
+			}
+		}
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		was, hadWas := recorded[k]
+		now, hadNow := current[k]
+		switch {
+		case hadWas && !hadNow:
+			return fmt.Sprintf("%s=%q is no longer set", k, was)
+		case !hadWas && hadNow:
+			return fmt.Sprintf("%s=%q was not set on the original run", k, now)
+		case was != now:
+			return fmt.Sprintf("%s was %q, now %q", k, was, now)
+		}
+	}
+	return ""
 }
 
 func sha256Hex(b []byte) string {

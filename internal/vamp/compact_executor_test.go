@@ -359,3 +359,90 @@ func TestBuildCompactPrompt_PreserveIsNeverBlank(t *testing.T) {
 		t.Error("the chunk must be last so the instructions frame it")
 	}
 }
+
+// TestCompactExecutor_AnEmptyChunkReplyIsAnErrorNotADeletion is finding 6
+// of the resume review, and it is this stage's own sales pitch failing:
+// compact exists as the alternative to truncating, "which silently drops
+// content".
+//
+// stripModelArtifacts removes a leading <think>…</think> block, so a
+// reasoning model that emits only its reasoning and no answer — the
+// commonest empty-ish reply from a local Qwen/Gemma — reduces to "". That
+// was appended as a successful summary of the chunk: the chunk's content
+// vanished from the joined output, the stage returned nil, and the
+// downstream prompt was built from a summary with a hole in it. Invisible
+// in the output file (it reads like a normal summary) and invisible in
+// the log.
+//
+// Retry policy already wraps the stage, so an erroring chunk gets retried
+// rather than dropped.
+func TestCompactExecutor_AnEmptyChunkReplyIsAnErrorNotADeletion(t *testing.T) {
+	rec := &recordingCompactor{}
+	rec.reply = func(call int, _ string) (string, error) {
+		if call == 1 {
+			// A reply that is ENTIRELY a think block: err is nil, the
+			// content is nothing.
+			return "<think>hmm, this chunk is hard</think>", nil
+		}
+		return fmt.Sprintf("SUMMARY-%d", call+1), nil
+	}
+	out, err := (&compactExecutor{inference: rec.fn}).Execute(context.Background(), StageInput{
+		Stage: &Stage{
+			ID:          "squeeze",
+			Type:        StageTypeCompact,
+			Source:      strings.Repeat("a", 6000),
+			TargetChars: 100,
+			ChunkChars:  1000,
+		},
+		RunDir: t.TempDir(),
+	})
+	if err == nil {
+		t.Fatalf("an empty chunk reply DELETED that chunk and reported success; out = %q", out.Text)
+	}
+	for _, want := range []string{"squeeze", "iter 1", "chunk 2/", "no content"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should contain %q so the operator knows which chunk vanished: %v", want, err)
+		}
+	}
+}
+
+// TestCompactExecutor_ANonShrinkingPassKeepsTheSmallerText is finding 7.
+// The comment on the guard says "stop rather than spin"; the code stopped
+// AND adopted the larger result, so a pass that grew the text shipped the
+// grown text — strictly worse than returning what it already had.
+//
+// Measured before the fix: target_chars 500, a 20,000-char source, and a
+// model that echoes 5,000 chars per chunk produced 50,018 characters, nil
+// error, and a silent log.
+func TestCompactExecutor_ANonShrinkingPassKeepsTheSmallerText(t *testing.T) {
+	source := strings.Repeat("a", 20000)
+	rec := &recordingCompactor{reply: func(int, string) (string, error) {
+		// Every chunk comes back BIGGER than it went in.
+		return strings.Repeat("z", 5000), nil
+	}}
+	var log strings.Builder
+	out, err := (&compactExecutor{inference: rec.fn}).Execute(context.Background(), StageInput{
+		Stage: &Stage{
+			ID:          "squeeze",
+			Type:        StageTypeCompact,
+			Source:      source,
+			TargetChars: 500,
+			ChunkChars:  2000,
+		},
+		RunDir: t.TempDir(),
+		Log:    &log,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Text) > len(source) {
+		t.Errorf("compact returned %d chars for a %d-char source: a pass that GREW the text was adopted", len(out.Text), len(source))
+	}
+	// The overshoot itself is best-effort — a dense source that needs 8x
+	// and compresses 2x per pass lands here legitimately — but it must
+	// not be silent, because the next stage's context window is what
+	// finds out otherwise.
+	if !strings.Contains(log.String(), "target_chars") {
+		t.Errorf("compact overshot target_chars=500 with %d chars and logged nothing about it:\n%s", len(out.Text), log.String())
+	}
+}

@@ -95,14 +95,36 @@ func (c *compactExecutor) Execute(ctx context.Context, in StageInput) (*StageOut
 			return nil, err
 		}
 		// Defensive: if a pass didn't shrink anything (model refused to
-		// compress, or input is already minimal), stop rather than spin.
+		// compress, or input is already minimal), stop rather than spin —
+		// and KEEP what we already had. Adopting the larger result was
+		// strictly worse than not running the pass at all: measured
+		// 20,000 chars in, 50,018 out, nil error.
 		if len(next) >= len(current) {
-			current = next
+			c.logf(in, "compact %s: pass %d returned %d chars for %d in (no progress); keeping the shorter text\n", st.ID, iter+1, len(next), len(current))
 			break
 		}
 		current = next
 	}
+	if len(current) > st.TargetChars {
+		// Best-effort by design — a dense source that compresses 2x per
+		// pass and needs 8x lands here legitimately, and failing the
+		// stage would break working pipelines for a bound the stage
+		// never promised to hit. But it must not be SILENT: the one
+		// thing compact exists to prevent is the next stage overflowing
+		// its context window, and that is exactly what happens next.
+		c.logf(in, "compact %s: WARNING result is %d chars, over target_chars=%d after %d pass(es); the downstream prompt may still overflow\n", st.ID, len(current), st.TargetChars, compactMaxIters)
+	}
 	return &StageOutput{Text: current}, nil
+}
+
+// logf writes an operator-facing line to the run log. in.Log is the same
+// writer the per-chunk token stream goes to, which is where somebody
+// reading "why is this output still huge" is already looking.
+func (c *compactExecutor) logf(in StageInput, format string, args ...any) {
+	if in.Log == nil {
+		return
+	}
+	fmt.Fprintf(in.Log, format, args...)
 }
 
 // compactPass runs one round of chunk-and-summarize. The per-chunk
@@ -135,7 +157,18 @@ func (c *compactExecutor) compactPass(ctx context.Context, in StageInput, source
 		if in.Log != nil {
 			_, _ = in.Log.Write([]byte("\n"))
 		}
-		parts = append(parts, strings.TrimSpace(stripModelArtifacts(out)))
+		part := strings.TrimSpace(stripModelArtifacts(out))
+		if part == "" {
+			// err == nil with no content is not a summary of this chunk,
+			// it is the chunk's DELETION: the empty part joins between
+			// its neighbours and the compacted text has a hole in it that
+			// reads like ordinary prose. stripModelArtifacts removes a
+			// leading <think> block, so a reasoning model that emits only
+			// its reasoning arrives here. Retry policy wraps the stage, so
+			// an erroring chunk is retried rather than dropped.
+			return "", fmt.Errorf("stage %s: compact iter %d chunk %d/%d: model returned no content (an empty summary would delete this chunk from the output)", in.Stage.ID, iter, ci+1, len(chunks))
+		}
+		parts = append(parts, part)
 	}
 	return strings.Join(parts, "\n\n"), nil
 }
