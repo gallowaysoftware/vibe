@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 
@@ -31,6 +32,22 @@ import (
 
 // Status is a check result level. WARN is informational only; FAIL is fatal
 // for the doctor's exit code.
+//
+// UNKNOWN is the fourth, and it is not a severity: it says the check could
+// not be EVALUATED, never that it passed and never that it failed. `vibe
+// fleet doctor` has had it since C13 (with exit 3 meaning "the report is
+// incomplete") and this command did not, so the rows that could not find
+// out an answer picked one — a probe that spent its budget was rendered as
+// "in use by another process", which is a definite claim about a machine
+// nobody looked at. GR10: "not attempted" and "not possible" must never
+// share a heading with "attempted, and here is the answer".
+//
+// It is used sparingly and on purpose. A row whose heading ADVISES (WARN,
+// INFO) can carry "we could not tell" in its text and stay WARN; promoting
+// those would turn a laptop with a slow `docker info` into a non-zero exit
+// for no new information. UNKNOWN replaces a heading that ASSERTS A FAULT
+// — the three rows below where a FAIL or a definite "not running" would
+// otherwise be manufactured out of an unanswered probe.
 type checkStatus int
 
 const (
@@ -38,6 +55,7 @@ const (
 	statusWarn
 	statusFail
 	statusInfo
+	statusUnknown
 )
 
 func (s checkStatus) tag() string {
@@ -50,6 +68,8 @@ func (s checkStatus) tag() string {
 		return "[FAIL]"
 	case statusInfo:
 		return "[INFO]"
+	case statusUnknown:
+		return "[UNKN]"
 	default:
 		return "[????]"
 	}
@@ -97,11 +117,37 @@ func defaultDoctorEnv() *doctorEnv {
 	}
 }
 
+// doctorPingBudget is how long the control-plane row waits for whatever
+// holds :9001 to identify itself.
+//
+// It is ONE number. It was two: the caller opened a 1s context and
+// defaultDaemonStatus set a 500ms http.Client.Timeout, so the effective
+// budget was half what the code appeared to say and the smaller one was
+// the invisible one. A refusal cannot quote a budget it does not know, and
+// a reader tuning the visible number would have changed nothing.
+//
+// 1s — the number the code already claimed — rather than the CLI's 500ms
+// `pingBudget` (client.go), because this probe is not the same probe: it
+// crosses a TCP listener rather than the unix socket, and it runs inside a
+// command that already spends five seconds on `llama-server --version`
+// alone. Nor is it larger, now that a spent budget is reported as a spent
+// budget: an UNKNOWN row costs a re-run, whereas a longer wait costs every
+// operator running the command with a wedged port-holder on the box.
+const doctorPingBudget = 1 * time.Second
+
 // defaultDaemonStatus calls vibeclient.Status over a plain TCP connect. It
 // returns the active profile name (or "" if no profile is active) on success.
+//
+// The CONTEXT is the budget — there is no second one on the client. A
+// deadline is applied here only when the caller supplied none, so this can
+// never hang the report; the one production caller always sets one.
 func defaultDaemonStatus(ctx context.Context, addr string) (string, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, doctorPingBudget)
+		defer cancel()
+	}
 	hc := &http.Client{
-		Timeout: 500 * time.Millisecond,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				var d net.Dialer
@@ -136,8 +182,11 @@ func doctorCmd() *cobra.Command {
 		Use:   "doctor",
 		Short: "Verify this machine is ready to run vibe.",
 		Long: "Runs a series of diagnostic checks (binaries, directories, ports, " +
-			"profiles, daemon) and reports OK / WARN / FAIL for each. " +
-			"Exits non-zero if any check fails.\n\n" +
+			"profiles, daemon) and reports OK / WARN / FAIL / UNKN for each. " +
+			"UNKN means the check could not be evaluated — never that it passed, " +
+			"and never that the thing it probes is absent.\n\n" +
+			"Exit codes: 0 all clear, 1 a FAIL, 3 only UNKNs (the report is " +
+			"incomplete — re-run). WARN does not affect the exit status.\n\n" +
 			"With --install <name>, switches from diagnostic to install mode " +
 			"and runs the install procedure for that component (supported: " +
 			"`comfyui`, `llama-cpp`). Each step is idempotent and skips when " +
@@ -169,20 +218,15 @@ func doctorCmd() *cobra.Command {
 			}
 			env := defaultDoctorEnv()
 			results := runChecks(ctx, env)
-			anyFail := false
 			out := cmd.OutOrStdout()
 			for _, r := range results {
 				fmt.Fprintf(out, "%s %-28s %s\n", r.Status.tag(), r.Name, r.Message)
-				if r.Status == statusFail {
-					anyFail = true
-				}
 			}
-			if anyFail {
+			if err := doctorOutcome(results); err != nil {
 				// Suppress cobra's "Error: ..." wrap; the per-line output is
-				// already self-explanatory. Exit non-zero via SilenceErrors
-				// + a sentinel that produces no extra output.
+				// already self-explanatory.
 				cmd.SilenceErrors = true
-				return errDoctorFailed
+				return err
 			}
 			return nil
 		},
@@ -252,13 +296,45 @@ func runInstall(cmd *cobra.Command, name string, yes, cuda bool, method string, 
 
 var errDoctorFailed = errors.New("doctor: one or more checks failed")
 
+// doctorOutcome turns a finished report into the process's exit status.
+//
+// 1 for a FAIL and 3 for "the report is incomplete" — the same two facts
+// `vibe fleet doctor` has separated since C13, and the reason UNKNOWN is
+// worth a level rather than just a nicer sentence: a wrapper reading the
+// status can tell "this box is broken" from "I could not find out", which
+// is the whole distinction this command was collapsing.
+//
+// A FAIL outranks an UNKNOWN: a report with both has something definite in
+// it and that is what the operator should be sent to first.
+//
+// No run's exit status gets WORSE than it was. Every row that can now
+// report UNKNOWN previously reported FAIL from the same evidence, so what
+// used to exit 1 exits 3 and what exited 0 still exits 0. UNKNOWN is
+// deliberately not handed to the advisory rows for exactly that reason —
+// promoting a WARN would turn a green box red on no new information.
+func doctorOutcome(results []checkResult) error {
+	anyUnknown := false
+	for _, r := range results {
+		switch r.Status {
+		case statusFail:
+			return errDoctorFailed
+		case statusUnknown:
+			anyUnknown = true
+		}
+	}
+	if anyUnknown {
+		return errDoctorLevel{doctorExitUnknown}
+	}
+	return nil
+}
+
 // runChecks executes each check in order and returns the results.
 func runChecks(ctx context.Context, env *doctorEnv) []checkResult {
-	// State that flows between checks: daemon PID when port 9001 is held by
-	// us, and the daemon's reported active profile.
+	// State that flows between checks: what the :9001 probe established
+	// about the daemon, and the daemon's reported active profile.
 	type sharedState struct {
-		daemonOnControl bool
-		daemonProfile   string
+		daemon        daemonPresence
+		daemonProfile string
 	}
 	st := &sharedState{}
 
@@ -279,11 +355,11 @@ func runChecks(ctx context.Context, env *doctorEnv) []checkResult {
 	results = append(results, checkXDGDirs())
 
 	// Control-plane port 9001 first (so we know if a vibe daemon is up).
-	cp := checkControlPlanePort(ctx, env, &st.daemonOnControl, &st.daemonProfile)
+	cp := checkControlPlanePort(ctx, env, &st.daemon, &st.daemonProfile)
 	results = append(results, cp)
 
 	// Then the proxy port 9000 (also probed against the daemon).
-	results = append(results, checkProxyPort(st.daemonOnControl, proxyDisabledInConfig()))
+	results = append(results, checkProxyPort(st.daemon, proxyDisabledInConfig()))
 
 	results = append(results, checkProfiles())
 	if r, ok := checkBackends(paths.ProfilesDir()); ok {
@@ -299,15 +375,7 @@ func runChecks(ctx context.Context, env *doctorEnv) []checkResult {
 		results = append(results, r)
 	}
 
-	if st.daemonOnControl {
-		msg := "running, no active profile"
-		if st.daemonProfile != "" {
-			msg = "running, active profile: " + st.daemonProfile
-		}
-		results = append(results, checkResult{Name: "daemon", Status: statusOK, Message: msg})
-	} else {
-		results = append(results, checkResult{Name: "daemon", Status: statusInfo, Message: "not running"})
-	}
+	results = append(results, daemonRow(st.daemon, st.daemonProfile))
 
 	results = append(results, checkGPU(ctx, env))
 
@@ -315,6 +383,42 @@ func runChecks(ctx context.Context, env *doctorEnv) []checkResult {
 }
 
 // ─── individual checks ──────────────────────────────────────────────────────
+
+// budgets for the external commands the checks shell out to. Named
+// because the rows below quote them: a row that says "did not finish
+// within 5s" has to be reading the same number it waited.
+const (
+	llamaVersionBudget = 5 * time.Second
+	hfAuthBudget       = 10 * time.Second
+	dockerInfoBudget   = 3 * time.Second
+	nvidiaSMIBudget    = 3 * time.Second
+)
+
+// runTimedOut describes OUR budget ending a command, and returns "" when
+// the command failed on its own. It is the same discrimination
+// classifyControlProbe makes, for the four rows that shell out.
+//
+// The context has to be asked, not the error: exec.CommandContext kills
+// the child and reports `signal: killed`, and — measured on this box —
+// errors.Is(err, context.DeadlineExceeded) is FALSE for it. So every row
+// below rendered our own timeout as a claim about the tool. A wedged
+// nvidia-smi, which is the classic symptom of a GPU in a bad state and
+// hangs rather than exits, read as "nvidia-smi failed: signal: killed";
+// a docker daemon merely slow to answer read as "(daemon not running?)".
+//
+// These stay WARN either way. A row whose heading advises can carry the
+// distinction in its text; see the note on statusUnknown for why they are
+// not promoted.
+func runTimedOut(ctx context.Context, budget time.Duration) string {
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return "did not finish within " + budget.String()
+	case ctx.Err() != nil:
+		return "was cancelled before it finished"
+	default:
+		return ""
+	}
+}
 
 // checkLlamaBinary fails when llama-server is missing from $PATH AND
 // something on disk would spawn it from $PATH. The second half is the
@@ -419,24 +523,30 @@ func checkLlamaVersion(ctx context.Context, env *doctorEnv, users []string) (che
 			Message: "skipped (llama-server not on $PATH)",
 		}, true
 	}
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, llamaVersionBudget)
 	defer cancel()
 	out, err := env.run(cctx, "llama-server", "--version")
 	version := firstNonEmptyLine(out)
 	if err != nil {
 		// `llama-server --version` is known to write to stderr and may exit
 		// non-zero on some builds; report whatever we got but mark WARN.
+		// "exited non-zero" is a claim about the BINARY, so it is not made
+		// when what happened is that we stopped waiting for it.
+		why := "exited non-zero: " + err.Error()
+		if to := runTimedOut(cctx, llamaVersionBudget); to != "" {
+			why = to
+		}
 		if version == "" {
 			return checkResult{
 				Name:    "llama-server --version",
 				Status:  statusWarn,
-				Message: "exited non-zero: " + err.Error(),
+				Message: why,
 			}, true
 		}
 		return checkResult{
 			Name:    "llama-server --version",
 			Status:  statusWarn,
-			Message: version + " (non-zero exit)",
+			Message: version + " (" + why + ")",
 		}, true
 	}
 	if version == "" {
@@ -469,15 +579,36 @@ func checkHFAuth(ctx context.Context, env *doctorEnv) checkResult {
 			Message: "skipped (hf not on $PATH)",
 		}
 	}
-	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, hfAuthBudget)
 	defer cancel()
-	out, _ := env.run(cctx, "hf", "auth", "whoami")
+	out, err := env.run(cctx, "hf", "auth", "whoami")
 	text := string(out)
+	// First, because this is the one failure that is EXPECTED to exit
+	// non-zero: `hf auth whoami` says so and returns 1.
 	if strings.Contains(text, "Not logged in") {
 		return checkResult{
 			Name:    "hf auth",
 			Status:  statusWarn,
 			Message: "not logged in — gated repos require `hf auth login`",
+		}
+	}
+	// The error used to be discarded outright, and firstNonEmptyLine of a
+	// FAILED run went straight into "logged in as …". Measured: a command
+	// that prints a traceback and exits 1 rendered as
+	// `[ OK ] hf auth  logged in as Traceback (most recent call last):`.
+	// An OK is the strongest claim in this report and it was being made
+	// out of an error message.
+	if err != nil {
+		why := "failed: " + err.Error()
+		if to := runTimedOut(cctx, hfAuthBudget); to != "" {
+			why = to
+		} else if first := firstNonEmptyLine(out); first != "" {
+			why += " (" + first + ")"
+		}
+		return checkResult{
+			Name:    "hf auth",
+			Status:  statusWarn,
+			Message: "`hf auth whoami` " + why + " — cannot tell whether this box can reach gated repos",
 		}
 	}
 	user := firstNonEmptyLine(out)
@@ -550,33 +681,169 @@ func probeDirWritable(path string) error {
 	return nil
 }
 
-func checkControlPlanePort(ctx context.Context, env *doctorEnv, daemonOnControl *bool, daemonProfile *string) checkResult {
-	const name = "control-plane port :9001"
-	free, err := tryBind("127.0.0.1:9001")
+// daemonPresence is what the :9001 probe ESTABLISHED about the local
+// daemon, as opposed to what a bool let two later rows assume.
+//
+// The zero value is "not established", which is the entire reason this is
+// not a bool. The bool started false, stayed false down every path that
+// failed to FIND OUT — a spent budget, a holder that answered and refused
+// this box's credential — and two rows downstream read that false as the
+// definite fact "there is no vibe daemon". One unanswered probe therefore
+// produced three claims: a FAIL saying :9001 was held by another process,
+// `daemon — not running`, and a FAIL saying the healthy proxy port had
+// been stolen. That is daemonAbsent's class (client.go) one transport
+// over, and it lands on the one command an operator runs BECAUSE they
+// already suspect something is wrong.
+type daemonPresence int
+
+const (
+	// daemonPresenceUnknown is the zero value on purpose: a path that
+	// learns nothing must leave nothing behind.
+	daemonPresenceUnknown daemonPresence = iota
+	daemonPresenceRunning
+	daemonPresenceStopped
+)
+
+// controlProbe sorts a FAILED status probe into the three different things
+// it can mean once we already know the port is held.
+type controlProbe int
+
+const (
+	probeNoAnswer  controlProbe = iota // the budget was spent
+	probeRefusedUs                     // something answered, and refused our credential
+	probeNotVibe                       // something answered, and it does not speak vibe's control plane
+)
+
+// classifyControlProbe is this file's daemonAbsent — the same shape (ask
+// the error what it is instead of collapsing it), a different question,
+// and deliberately NOT a call to daemonAbsent itself:
+//
+//   - the question differs. daemonAbsent asks "is there NO daemon?", which
+//     on this path is already answered: the bind failed with
+//     address-in-use, so something holds :9001. What is unknown here is
+//     WHO, and daemonAbsent's answer collapses "did not answer" and
+//     "refused us" into one not-absent bucket.
+//   - reusing it would be actively wrong. Measured: a plain HTTP 503 from
+//     a non-vibe holder arrives as connect.CodeUnavailable, which is
+//     exactly what daemonAbsent reads as proof of absence — on the one
+//     path where absence has already been ruled out.
+//
+// Deadline first, and by errors.Is before the connect code, so a stubbed
+// statusFn or a future non-connect transport still lands on "we do not
+// know" rather than on a claim.
+func classifyControlProbe(err error) controlProbe {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return probeNoAnswer
+	case connect.CodeOf(err) == connect.CodeDeadlineExceeded:
+		return probeNoAnswer
+	case connect.CodeOf(err) == connect.CodeUnauthenticated:
+		return probeRefusedUs
+	default:
+		return probeNotVibe
+	}
+}
+
+func checkControlPlanePort(ctx context.Context, env *doctorEnv, presence *daemonPresence, daemonProfile *string) checkResult {
+	return checkControlPlanePortAt(ctx, env, "127.0.0.1:9001", presence, daemonProfile)
+}
+
+// checkControlPlanePortAt is the testable core, split out for the same
+// reason checkProxyPortAt was: the address was hardcoded, so the row that
+// makes the most consequential claim in the report was the one row no test
+// could drive end to end. The old test said so in a comment and asserted
+// the "composable inputs" instead.
+func checkControlPlanePortAt(ctx context.Context, env *doctorEnv, addr string, presence *daemonPresence, daemonProfile *string) checkResult {
+	name := "control-plane port " + strings.TrimPrefix(addr, "127.0.0.1")
+	free, err := tryBind(addr)
 	if free {
+		// The one branch that PROVES absence: we just held the port
+		// ourselves, so nothing was listening on it.
+		*presence = daemonPresenceStopped
 		return checkResult{Name: name, Status: statusOK, Message: "free"}
 	}
 	if !isAddrInUse(err) {
-		// Some other listen failure (permissions, bad iface). Report it.
+		// Some other listen failure (permissions, bad iface). Report it —
+		// and leave presence unknown: a bind we were not allowed to attempt
+		// is not evidence about who holds the port.
 		return checkResult{Name: name, Status: statusFail, Message: err.Error()}
 	}
 	// Port is bound; figure out whether the holder is a vibe daemon.
-	cctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, doctorPingBudget)
 	defer cancel()
 	profileName, sErr := env.statusFn(cctx, env.daemonAddr)
-	if sErr != nil {
+	if sErr == nil {
+		*presence = daemonPresenceRunning
+		*daemonProfile = profileName
+		return checkResult{
+			Name:    name,
+			Status:  statusOK,
+			Message: "vibe daemon already running",
+		}
+	}
+	switch classifyControlProbe(sErr) {
+	case probeNoAnswer:
+		// A daemon holding a model and serving the proxy can miss a
+		// one-second window with nothing whatever wrong. Saying "another
+		// process" here sends the operator hunting a port conflict that
+		// does not exist, on the command they opened because they already
+		// believed something was broken.
+		return checkResult{
+			Name:   name,
+			Status: statusUnknown,
+			Message: fmt.Sprintf("in use, holder unidentified: no answer within %s (%v). "+
+				"NOT evidence of a port conflict — a busy vibe daemon looks like this; re-run to retry", doctorPingBudget, sErr),
+		}
+	case probeRefusedUs:
+		// It answered. It is a control plane, and it refused US. The fix
+		// is a credential, not a port — the same distinction `vibe fleet
+		// doctor` draws for a cell that answers and rejects the key (C15),
+		// where reporting "no answer" sends the operator to the wrong box.
+		return checkResult{
+			Name:   name,
+			Status: statusUnknown,
+			Message: "in use, and the holder refused this box's credential — a vibe daemon started with a token " +
+				"this shell cannot resolve looks exactly like this. Check $VIBE_TOKEN or " + paths.TokenFile(),
+		}
+	default:
+		// Something is listening and it does not speak vibe's control
+		// plane. This is the definite claim and it keeps its FAIL — and,
+		// with it, the definite presence: the daemon binds :9001 at
+		// startup and cannot start when the port is taken, so a holder
+		// that is not a vibe control plane means no vibe daemon is
+		// serving on this box. Leaving presence unknown here would buy
+		// the fix's honesty by going vague about a real double conflict,
+		// which is the row's whole reason to exist.
+		*presence = daemonPresenceStopped
 		return checkResult{
 			Name:    name,
 			Status:  statusFail,
 			Message: "in use by another process (no vibe daemon answered: " + sErr.Error() + ")",
 		}
 	}
-	*daemonOnControl = true
-	*daemonProfile = profileName
-	return checkResult{
-		Name:    name,
-		Status:  statusOK,
-		Message: "vibe daemon already running",
+}
+
+// daemonRow renders the daemon's own line from what the control-plane
+// probe established. Split out from runChecks so the three-way outcome is
+// testable without a live :9001.
+func daemonRow(presence daemonPresence, profile string) checkResult {
+	const name = "daemon"
+	switch presence {
+	case daemonPresenceRunning:
+		msg := "running, no active profile"
+		if profile != "" {
+			msg = "running, active profile: " + profile
+		}
+		return checkResult{Name: name, Status: statusOK, Message: msg}
+	case daemonPresenceStopped:
+		return checkResult{Name: name, Status: statusInfo, Message: "not running"}
+	default:
+		return checkResult{
+			Name:   name,
+			Status: statusUnknown,
+			Message: "could not tell — the control-plane row above says why. " +
+				"`not running` is a claim, and nothing here supports it",
+		}
 	}
 }
 
@@ -589,11 +856,15 @@ func proxyDisabledInConfig() bool {
 	return err == nil && cfg.DisableProxy
 }
 
-func checkProxyPort(daemonOnControl, proxyDisabled bool) checkResult {
-	return checkProxyPortAt("127.0.0.1:9000", daemonOnControl, proxyDisabled)
+func checkProxyPort(presence daemonPresence, proxyDisabled bool) checkResult {
+	return checkProxyPortAt("127.0.0.1:9000", presence, proxyDisabled)
 }
 
-func checkProxyPortAt(addr string, daemonOnControl, proxyDisabled bool) checkResult {
+// checkProxyPortAt takes a daemonPresence rather than a bool so that a
+// caller cannot pass "we did not find out" as "there is no daemon" — which
+// is exactly what it received before, and why a healthy :9000 was reported
+// stolen whenever :9001 was merely slow.
+func checkProxyPortAt(addr string, presence daemonPresence, proxyDisabled bool) checkResult {
 	name := "proxy port " + strings.TrimPrefix(addr, "127.0.0.1")
 	free, err := tryBind(addr)
 	if !free && !isAddrInUse(err) {
@@ -620,17 +891,32 @@ func checkProxyPortAt(addr string, daemonOnControl, proxyDisabled bool) checkRes
 	if free {
 		return checkResult{Name: name, Status: statusOK, Message: "free"}
 	}
-	if daemonOnControl {
+	switch presence {
+	case daemonPresenceRunning:
 		return checkResult{
 			Name:    name,
 			Status:  statusOK,
 			Message: "already bound by vibe daemon",
 		}
-	}
-	return checkResult{
-		Name:    name,
-		Status:  statusFail,
-		Message: "in use by another process (no vibe daemon detected on :9001)",
+	case daemonPresenceStopped:
+		return checkResult{
+			Name:    name,
+			Status:  statusFail,
+			Message: "in use by another process (no vibe daemon detected on :9001)",
+		}
+	default:
+		// The port is held and we could not attribute it, because the
+		// thing that would have attributed it — :9001 — did not answer.
+		// The likeliest holder is the vibe daemon's own proxy, which is
+		// what makes the FAIL this used to print so expensive: it names a
+		// conflict, on the healthy port, in the report an operator opened
+		// to find one.
+		return checkResult{
+			Name:   name,
+			Status: statusUnknown,
+			Message: "in use, holder unattributed: :9001 did not identify itself (see the control-plane row), " +
+				"so this may well be vibe's own proxy",
+		}
 	}
 }
 
@@ -647,31 +933,59 @@ func checkProxyPortAt(addr string, daemonOnControl, proxyDisabled bool) checkRes
 // tail covers compose-managed ports that never appear in profile YAML
 // (Open WebUI's in-container default 8080).
 func checkCommonPorts() checkResult {
-	const name = "common ports"
 	ports := declaredPorts()
 	if _, ok := ports[8080]; !ok {
 		ports[8080] = []string{"Open WebUI (compose default)"}
 	}
+	return checkCommonPortsWith(ports, tryBind)
+}
+
+// checkCommonPortsWith is the testable core, taking the inventory and the
+// probe rather than reading the one from disk and the other from the host.
+//
+// The third bucket is the fix. `isAddrInUse` has three call sites and this
+// was the one that never asked it: `if ok, _ := tryBind(...); ok` discards
+// the error, so EVERY listen failure became "in use". Measured: a declared
+// loopback port under 1024 fails with `bind: permission denied` as an
+// ordinary user, and this row reported it as a port conflict — on the
+// check whose entire job is telling an operator which ports are taken.
+// Both siblings above already separate in-use from could-not-attempt.
+func checkCommonPortsWith(ports map[int][]string, probe func(string) (bool, error)) checkResult {
+	const name = "common ports"
 	nums := make([]int, 0, len(ports))
 	for port := range ports {
 		nums = append(nums, port)
 	}
 	sort.Ints(nums)
-	var bound, free []string
+	var bound, free, unprobed []string
 	for _, port := range nums {
-		if ok, _ := tryBind(fmt.Sprintf("127.0.0.1:%d", port)); ok {
+		label := fmt.Sprintf(":%d (%s)", port, strings.Join(ports[port], ", "))
+		switch ok, err := probe(fmt.Sprintf("127.0.0.1:%d", port)); {
+		case ok:
 			free = append(free, strconv.Itoa(port))
-			continue
+		case isAddrInUse(err):
+			bound = append(bound, label)
+		default:
+			unprobed = append(unprobed, fmt.Sprintf("%s: %v", label, err))
 		}
-		bound = append(bound, fmt.Sprintf(":%d (%s)", port, strings.Join(ports[port], ", ")))
 	}
-	if len(bound) == 0 {
+	if len(bound) == 0 && len(unprobed) == 0 {
 		return checkResult{Name: name, Status: statusOK, Message: strings.Join(free, "/") + " free"}
+	}
+	var parts []string
+	if len(bound) > 0 {
+		parts = append(parts, "in use: "+strings.Join(bound, ", "))
+	}
+	if len(unprobed) > 0 {
+		// Not folded into "in use": whether anything holds these is
+		// exactly what was not established. An OK would be as wrong.
+		parts = append(parts, "could not probe (bind refused, so nothing is known about the holder): "+
+			strings.Join(unprobed, ", "))
 	}
 	return checkResult{
 		Name:    name,
 		Status:  statusInfo,
-		Message: "in use: " + strings.Join(bound, ", "),
+		Message: strings.Join(parts, "; "),
 	}
 }
 
@@ -1020,9 +1334,20 @@ func checkDockerForProfiles(ctx context.Context, env *doctorEnv, profilesDir str
 			Message: "not on $PATH — " + needs,
 		}, true
 	}
-	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, dockerInfoBudget)
 	defer cancel()
 	if _, err := env.run(cctx, "docker", "info"); err != nil {
+		// "(daemon not running?)" is a guess at a cause, and a fair one
+		// when docker itself answered. It is not fair when we stopped
+		// waiting: `docker info` on a busy host routinely takes longer
+		// than this budget with the daemon perfectly healthy.
+		if to := runTimedOut(cctx, dockerInfoBudget); to != "" {
+			return checkResult{
+				Name:    name,
+				Status:  statusWarn,
+				Message: "`docker info` " + to + " — cannot tell whether the daemon is up; " + needs,
+			}, true
+		}
 		return checkResult{
 			Name:    name,
 			Status:  statusWarn,
@@ -1075,10 +1400,23 @@ func checkGPU(ctx context.Context, env *doctorEnv) checkResult {
 		}
 		return checkResult{Name: name, Status: statusInfo, Message: "nvidia-smi not found (CPU-only or non-Nvidia GPU; VRAM pre-flight skipped)"}
 	}
-	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, nvidiaSMIBudget)
 	defer cancel()
 	out, err := env.run(cctx, "nvidia-smi", "--query-gpu=name,memory.free", "--format=csv,noheader")
 	if err != nil {
+		// A driver in a bad state makes nvidia-smi HANG rather than exit,
+		// which is the single most recognisable GPU symptom there is —
+		// and it arrived here as "nvidia-smi failed: signal: killed",
+		// naming our own kill as the tool's failure and hiding the one
+		// detail that identifies the fault.
+		if to := runTimedOut(cctx, nvidiaSMIBudget); to != "" {
+			return checkResult{
+				Name:   name,
+				Status: statusWarn,
+				Message: "nvidia-smi " + to + " — that is what a wedged driver looks like; " +
+					"VRAM pre-flight is unavailable (not clear)",
+			}
+		}
 		return checkResult{Name: name, Status: statusWarn, Message: "nvidia-smi failed: " + err.Error()}
 	}
 	lines := nonEmptyLines(out)

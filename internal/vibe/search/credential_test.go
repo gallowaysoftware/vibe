@@ -263,3 +263,71 @@ func TestMCPFetchErrorWithholdsTheCallersCredential(t *testing.T) {
 		}
 	}
 }
+
+// ── the upstream the OPERATOR chose ──────────────────────────────────
+
+// TestSearxngSearchErrorDoesNotCarryTheOperatorsUpstream is the tenth
+// site, and the one whose URL is not the caller's.
+//
+// Every other URL in this package arrives from whoever is calling; this
+// one is --search-upstream, a line of the operator's config that the
+// shipped zero-cost deployment points at a SearXNG container on a private
+// network and that a basic-auth-fronted instance carries userinfo in.
+// `fmt.Errorf("searxng: %w", err)` published net/http's structural copy of
+// it — scheme, userinfo, internal host, port, path and the caller's query
+// — to three audiences at once: the operator's journal, the 502 body GET
+// /search hands anyone holding the bearer token, and the MCP tool result
+// that lands in a model's transcript.
+//
+// The rig is a closed loopback port, so the failure is a deterministic
+// connection refusal that never leaves the machine.
+//
+// The stated limit, so nobody reads this test as promising more than it
+// does: what is removed is the URL net/http embedded. Whatever the
+// TRANSPORT names in its own message can remain — a dial failure quotes
+// the resolved address, and a DNS failure quotes the name it could not
+// resolve. Withholding that too would mean discarding the transport error
+// entirely, which leaves "searxng: request failed" and nothing to act on.
+func TestSearxngSearchErrorDoesNotCarryTheOperatorsUpstream(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// The operator's upstream, with the credential shape a basic-auth
+	// SearXNG deployment actually uses.
+	up := newSearxngUpstream("http://svc:" + testPassword + "@" + addr + "/searxng-private")
+	_, err = up.Search(t.Context(), Query{Text: "quarterly-revenue-leak"})
+	if err == nil {
+		t.Fatal("search against a closed port succeeded; the rig proves nothing")
+	}
+	msg := err.Error()
+	for _, secret := range []string{
+		testPassword,
+		// The username is half a credential and an identifier the caller
+		// has no business learning.
+		"svc:",
+		// The operator's private path, which names their deployment.
+		"/searxng-private",
+		// And the caller is not the only caller: one client's query text
+		// must not ride out in another's error.
+		"quarterly-revenue-leak",
+	} {
+		if strings.Contains(msg, secret) {
+			t.Errorf("the searxng transport error carries %q — this string is the 502 body, the MCP "+
+				"tool result and the operator's journal line: %s", secret, msg)
+		}
+	}
+	// Withholding everything would be safe and useless: the operator has
+	// to be able to tell a refused upstream from a decode failure.
+	if !strings.Contains(msg, "searxng") {
+		t.Errorf("the error no longer says which provider failed: %s", msg)
+	}
+	if !strings.Contains(msg, "refused") {
+		t.Errorf("the error no longer says what the transport did: %s", msg)
+	}
+}

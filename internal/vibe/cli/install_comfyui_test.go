@@ -490,10 +490,13 @@ func TestDoctorCmd_NoInstallFlag_StillRunsChecks(t *testing.T) {
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)
 	err := cmd.Execute()
-	if err != nil && !errors.Is(err, errDoctorFailed) {
-		// A FAIL on a check would surface as errDoctorFailed; any other
-		// error means something is structurally wrong.
-		t.Fatalf("doctor without --install returned %v (want nil or errDoctorFailed)", err)
+	// A FAIL on a check surfaces as errDoctorFailed. An UNKNOWN — a check
+	// that could not be evaluated, which on a box where something already
+	// holds :9001 is the honest answer — surfaces as the exit-3 sentinel.
+	// Either is a diagnostic outcome; any OTHER error means the command
+	// took the install path or is structurally wrong.
+	if err != nil && !errors.Is(err, errDoctorFailed) && doctorExitCode(err) != doctorExitUnknown {
+		t.Fatalf("doctor without --install returned %v (want nil, errDoctorFailed or exit 3)", err)
 	}
 }
 
