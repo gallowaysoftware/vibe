@@ -9,6 +9,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net"
@@ -3081,6 +3082,15 @@ func jsonItems(raw string) ([]any, error) {
 // that wrote nothing) and is an error. Without the distinction a
 // research pipeline whose search backend was down completes green with
 // zero sources and writes the report anyway.
+//
+// The same distinction extends to results that are PRESENT but unreadable,
+// which is where the original guard stopped. `"results"` holding an object
+// or a scalar is not "SearXNG's spelling of empty" — only `null` is — and a
+// response that carried N results none of which had a string `url` (a
+// renamed field, a different engine behind the same URL, a proxy that
+// mangled the body) is schema drift, not a search that found nothing. Both
+// used to fold into `{"items":[]}` with the disconfirming evidence sitting
+// unread in the same map.
 func parseSearXNGTemplate(raw string) (string, error) {
 	dec := json.NewDecoder(strings.NewReader(stripJSONFences(raw)))
 	var out []map[string]any
@@ -3101,10 +3111,14 @@ func parseSearXNGTemplate(raw string) (string, error) {
 		}
 		results, ok := rawResults.([]any)
 		if !ok {
-			// Present but null (or a scalar): treat as an empty result
-			// set, which is what SearXNG means by it.
-			continue
+			if rawResults == nil {
+				// Explicit null: SearXNG's spelling of "this engine set
+				// returned nothing", and a real answer.
+				continue
+			}
+			return "", fmt.Errorf("parseSearXNG: response %d has a %T \"results\" field, not an array or null (not a SearXNG /search?format=json body)", responses, rawResults)
 		}
+		emitted := 0
 		for _, r := range results {
 			obj, ok := r.(map[string]any)
 			if !ok {
@@ -3123,6 +3137,14 @@ func parseSearXNGTemplate(raw string) (string, error) {
 				"url":         url,
 				"snippet":     obj["content"],
 			})
+			emitted++
+		}
+		// "N results arrived and none of them was readable" is never an
+		// empty search — the response is telling us it found things. Folding
+		// it into zero hits is the same silent-success this parser's
+		// results-key check exists to prevent, one drift away.
+		if len(results) > 0 && emitted == 0 {
+			return "", fmt.Errorf("parseSearXNG: response %d carried %d result(s) and none had a string \"url\" field (SearXNG schema drift, or a different engine behind the same URL)", responses, len(results))
 		}
 	}
 	if responses == 0 {
@@ -3147,9 +3169,11 @@ func parseSearXNGTemplate(raw string) (string, error) {
 // returns the best-matching N pages with their snippets.
 //
 // snippet is the search snippet HTML-stripped (Wikipedia wraps
-// matched terms in <span class="searchmatch">…</span>); url is
-// constructed from the title via the canonical
-// en.wikipedia.org/wiki/<Title> shape.
+// matched terms in <span class="searchmatch">…</span>) and then
+// entity-decoded, in that order: decoding first would turn a `&lt;` the
+// source wrote into a `<` the tag stripper then eats. url is constructed
+// from the title via the canonical en.wikipedia.org/wiki/<Title> shape,
+// path-escaped — see wikipediaArticleURL.
 //
 // A MediaWiki response that carries no `query` object is a FAULT, not
 // an empty result: the zero-hit shape is
@@ -3183,8 +3207,8 @@ func parseWikipediaSearchTemplate(raw string) (string, error) {
 			continue
 		}
 		snippet, _ := hit["snippet"].(string)
-		snippet = strings.TrimSpace(wikiSearchTagRE.ReplaceAllString(snippet, ""))
-		url := "https://en.wikipedia.org/wiki/" + strings.ReplaceAll(title, " ", "_")
+		snippet = html.UnescapeString(strings.TrimSpace(wikiSearchTagRE.ReplaceAllString(snippet, "")))
+		url := wikipediaArticleURL(title)
 		h := sha256.Sum256([]byte(url))
 		id := hex.EncodeToString(h[:6])
 		out = append(out, map[string]any{
@@ -3213,6 +3237,18 @@ func parseWikipediaSearchTemplate(raw string) (string, error) {
 // trimmed of newlines + repeated whitespace (arXiv likes to wrap),
 // url is the abs/ page URL, and id is sha256(arxiv-id) truncated to
 // 12 chars — stable across re-fetches.
+//
+// The same empty-vs-faulted distinction parseSearXNGTemplate and both
+// MediaWiki parsers draw, which this parser was missing. arXiv has no error
+// channel: a rejected request comes back as HTTP 200 carrying a valid Atom
+// feed with a single entry whose <id> is an `arxiv.org/api/errors#…` URL,
+// titled "Error", with the complaint as its <summary>. Parsed literally that
+// is a paper — so a mistyped id_list used to produce one source called
+// "Error" whose abstract is the API telling you the id was malformed, and
+// the research stage cited it. That prefix is stable and unambiguous, so the
+// feed is refused. A feed that carried <entry> elements and yielded no items
+// is refused for the same reason: an arXiv schema change must not read as
+// "this query matched no papers".
 func parseArxivTemplate(raw string) (string, error) {
 	type arxivAuthor struct {
 		Name string `xml:"name"`
@@ -3239,6 +3275,13 @@ func parseArxivTemplate(raw string) (string, error) {
 		}
 		title := strings.Join(strings.Fields(e.Title), " ")
 		summary := strings.Join(strings.Fields(e.Summary), " ")
+		if strings.Contains(strings.ToLower(url), arxivAPIErrorMarker) {
+			reason := summary
+			if reason == "" {
+				reason = title
+			}
+			return "", fmt.Errorf("parseArxiv: the arXiv API rejected the query (it reports errors as a 200 + a one-entry feed): %s", reason)
+		}
 		h := sha256.Sum256([]byte(url))
 		id := hex.EncodeToString(h[:6])
 		out = append(out, map[string]any{
@@ -3249,6 +3292,9 @@ func parseArxivTemplate(raw string) (string, error) {
 			"snippet":     summary,
 		})
 	}
+	if len(feed.Entries) > 0 && len(out) == 0 {
+		return "", fmt.Errorf("parseArxiv: feed carried %d <entry> element(s) and none had an <id> (arXiv schema drift?)", len(feed.Entries))
+	}
 	wrapped := map[string]any{"items": out}
 	res, err := json.Marshal(wrapped)
 	if err != nil {
@@ -3257,16 +3303,33 @@ func parseArxivTemplate(raw string) (string, error) {
 	return string(res), nil
 }
 
+// arxivAPIErrorMarker is the id-URL prefix arXiv puts on the single entry it
+// returns instead of an error status. Lowercased at the comparison site: the
+// scheme and host of an <id> are case-insensitive.
+const arxivAPIErrorMarker = "arxiv.org/api/errors#"
+
 // parseWikipediaExtractTemplate decodes a single MediaWiki API
-// query response (with prop=extracts|info, explaintext=true) into a
-// flat one-item `{"items":[{id, source_type:"wikipedia", title, url,
-// snippet}]}` array. snippet is the full plaintext extract (NOT
-// truncated; downstream stages handle context-window sizing).
+// query response into a flat `{"items":[{id, source_type:"wikipedia",
+// title, url, snippet}]}` array. snippet is the full plaintext extract
+// (NOT truncated; downstream stages handle context-window sizing).
 //
-// Single-page assumption: titles= queries always resolve to one
-// page (or one redirect target). Multi-page responses return only
-// the first page; if a pipeline needs multi-page fan-out it should
-// query each title separately.
+// Query it with prop=extracts|info, explaintext=true AND inprop=url.
+// `inprop=url` is not optional and this comment used to omit it: `fullurl`
+// is the only field the item's url and its sha256 id come from, so without
+// it every page in the response hashed the empty string and shared one id —
+// e3b0c44298fc — and the id's whole stated purpose is stable per-source
+// FILENAMES downstream. Three sources, one filename, last write wins, two
+// sources silently gone. A page with an extract and no `fullurl` is now a
+// loud error naming the missing parameter, because that is a property of the
+// query the pipeline author wrote and so it fires deterministically on the
+// first run rather than intermittently forever.
+//
+// Multi-page responses return EVERY page, ordered by the response's page
+// key. The old comment claimed only the first page came back, which was
+// never true; the order was whatever Go's randomised map iteration produced,
+// so one 5-page response rendered five different prompts over 200 runs and
+// nothing keyed on the rendered prompt could cache. readFilesTemplate sorts
+// for the same reason three hundred lines down.
 //
 // Same distinction parseWikipediaSearchTemplate draws: a page that
 // does not exist comes back as a `query.pages` entry with pageid -1
@@ -3286,9 +3349,16 @@ func parseWikipediaExtractTemplate(raw string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("parseWikipediaExtract: response has no \"query.pages\" object%s", mediawikiErrorSuffix(resp))
 	}
+	// Sorted, not map order: see the doc comment. The key is MediaWiki's
+	// pageid-as-string, which is stable for a given response.
+	pageKeys := make([]string, 0, len(pages))
+	for k := range pages {
+		pageKeys = append(pageKeys, k)
+	}
+	sort.Strings(pageKeys)
 	out := []map[string]any{}
-	for _, raw := range pages {
-		page, ok := raw.(map[string]any)
+	for _, key := range pageKeys {
+		page, ok := pages[key].(map[string]any)
 		if !ok {
 			continue
 		}
@@ -3297,10 +3367,16 @@ func parseWikipediaExtractTemplate(raw string) (string, error) {
 			continue
 		}
 		title, _ := page["title"].(string)
-		url, _ := page["fullurl"].(string)
 		extract, _ := page["extract"].(string)
 		if title == "" || extract == "" {
 			continue
+		}
+		// Checked AFTER the skips above so a missing page (no extract) still
+		// skips quietly; a page that HAS content but no url is the
+		// inprop=url mistake, and it must not become a duplicate id.
+		url, _ := page["fullurl"].(string)
+		if url == "" {
+			return "", fmt.Errorf("parseWikipediaExtract: page %q has no \"fullurl\" — add inprop=url to the query; without it every page hashes the empty string and all sources share one id", title)
 		}
 		h := sha256.Sum256([]byte(url))
 		id := hex.EncodeToString(h[:6])
@@ -3405,15 +3481,31 @@ func flattenItemsTemplate(raw string) (string, error) {
 //
 // Trims to a rune boundary so a 4-byte glyph at the boundary isn't sliced
 // in half, producing invalid UTF-8 in the prompt.
-func truncateTemplate(n int, s string) string {
-	if n <= 0 || len(s) <= n {
-		return s
+//
+// A non-positive n is an ERROR, not "no cap". `n <= 0` used to return the
+// input unchanged, which is a guard disarming itself: `truncate 0` — a typo,
+// or a remaining-token-budget expression that went non-positive — passed a
+// 100KB document through and reported success, and the only symptom was the
+// context-window overrun this helper exists to prevent. The failure
+// direction matters more than the convenience, and because n comes from the
+// pipeline's own text rather than from upstream data the error fires
+// deterministically on the first render.
+//
+// The output can exceed n by the length of the marker: the cap sizes the
+// CONTENT, and the marker is appended after the cut so the model can see
+// that something was elided.
+func truncateTemplate(n int, s string) (string, error) {
+	if n <= 0 {
+		return "", fmt.Errorf("truncate: limit must be positive, got %d (a non-positive limit would pass the whole %d-byte input through uncapped)", n, len(s))
+	}
+	if len(s) <= n {
+		return s, nil
 	}
 	cut := n
 	for cut > 0 && (s[cut]&0xC0) == 0x80 {
 		cut--
 	}
-	return s[:cut] + "\n\n... [content truncated to fit model context]"
+	return s[:cut] + "\n\n... [content truncated to fit model context]", nil
 }
 
 // stripDataURIsTemplate removes inline `data:` image references from a
@@ -3428,30 +3520,227 @@ func truncateTemplate(n int, s string) string {
 // resolve via image_dir multimodal attachment.
 //
 // Each `![alt](data:...)` is rewritten to `[alt]` so the description survives
-// for the LLM to read; the broken-once-stripped image link is dropped. We
-// match through to the next `)` only when no `)` can appear inside the data
-// URI body (URL-encoded form uses %29 for literal close-paren), which is the
-// common case.
+// for the LLM to read; the broken-once-stripped image link is dropped.
+//
+// Three shapes carry the same payload and all three are handled, because a
+// size guard that only covers one spelling does not bound the size. Measured
+// on the very document this comment describes — 30 references at ~10KB each:
+//
+//   - `DATA:` / `Data:`. URI schemes are case-insensitive (RFC 3986) and
+//     browsers accept them, and the old `data:`-only regex reduced that
+//     document by 0.0%.
+//   - A `)` inside an un-encoded body. `translate(…)`, `rgb(…)` and
+//     `matrix(…)` are what MathJax and pandoc's inline SVG emit. The old
+//     `[^)]*` stopped at the first one, giving a 0.6% reduction AND a
+//     corrupted document: `![alt](data:…rgb(1,2,3)…)` became
+//     `[alt]" d="M0 0"/></svg>)`, so the 10KB payload survived as raw prose
+//     while the helper looked like it had worked. That quiet half-strip is
+//     worse than no strip, so the destination is scanned with balanced
+//     parens, bounded by the end of the line — a markdown inline
+//     destination cannot span a newline, and an unbalanced one is left
+//     untouched rather than swallowing the rest of the document.
+//   - `<img src="data:…">` and reference definitions (`[fig1]: data:…`).
+//     Both are ordinary in exported markdown and both used to pass through
+//     whole.
+//
+// File-backed images (`![alt](images/foo.svg)`, `<img src="images/foo.svg">`)
+// are left alone in every form, since they resolve via image_dir multimodal
+// attachment.
 func stripDataURIsTemplate(s string) string {
-	return mdDataURIRE.ReplaceAllString(s, "[$1]")
+	s = stripMarkdownDataImages(s)
+	s = htmlDataImgRE.ReplaceAllStringFunc(s, replaceHTMLDataImg)
+	s = dataURIRefDefRE.ReplaceAllString(s, "$1: [data uri removed]")
+	return s
 }
 
-var mdDataURIRE = regexp.MustCompile(`!\[([^\]]*)\]\(data:[^)]*\)`)
+// stripMarkdownDataImages rewrites `![alt](data:…)` to `[alt]`, scanning the
+// destination rather than matching it with a regex so a `)` in the body
+// cannot end the match early. Anything that does not resolve to a balanced
+// destination on one line is copied through unchanged.
+func stripMarkdownDataImages(s string) string {
+	var b strings.Builder
+	i := 0
+	for i < len(s) {
+		open := strings.Index(s[i:], "![")
+		if open < 0 {
+			break
+		}
+		open += i
+		altEnd := strings.IndexByte(s[open+2:], ']')
+		if altEnd < 0 {
+			break
+		}
+		altEnd += open + 2
+		end := dataURIDestinationEnd(s, altEnd+1)
+		if end < 0 {
+			// Not a data: destination (a file-backed image, or a
+			// destination we cannot bound). Emit through the `]` and keep
+			// looking from there, so a later `![` on the same line is still
+			// considered.
+			b.WriteString(s[i : altEnd+1])
+			i = altEnd + 1
+			continue
+		}
+		b.WriteString(s[i:open])
+		b.WriteByte('[')
+		b.WriteString(s[open+2 : altEnd])
+		b.WriteByte(']')
+		i = end
+	}
+	b.WriteString(s[i:])
+	return b.String()
+}
 
-var wikiSearchTagRE = regexp.MustCompile(`<[^>]*>`)
+// dataURIDestinationEnd returns the index just past the `)` closing a
+// markdown link destination starting at p, when that destination is a data
+// URI, and -1 when it is not one or cannot be bounded.
+//
+// One int rather than (int, bool): a droppable ok next to an index whose
+// zero value is a plausible index is the pair internal/vibe/observed forbids,
+// and here the sentinel is unambiguous — a closing paren can never end at
+// offset 0, so no valid answer is negative.
+func dataURIDestinationEnd(s string, p int) int {
+	if p >= len(s) || s[p] != '(' {
+		return -1
+	}
+	q := p + 1
+	for q < len(s) && (s[q] == ' ' || s[q] == '\t') {
+		q++
+	}
+	if q < len(s) && s[q] == '<' {
+		q++
+	}
+	if !hasDataURIPrefix(s[q:]) {
+		return -1
+	}
+	depth := 1
+	for ; q < len(s); q++ {
+		switch s[q] {
+		case '\n':
+			// An inline destination cannot span a line. Refusing here is
+			// what stops an unclosed `(` from eating the rest of the file.
+			return -1
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return q + 1
+			}
+		}
+	}
+	return -1
+}
 
-// mediawikiErrorSuffix renders the `{"error":{"code":…,"info":…}}`
-// body MediaWiki returns on a rejected request as a trailing clause,
-// so the operator reading the failed stage sees WHY the API refused
-// rather than only that the shape was wrong. Empty when the response
-// carries no such object.
+// hasDataURIPrefix reports whether s begins with the `data:` scheme,
+// case-insensitively.
+func hasDataURIPrefix(s string) bool {
+	const scheme = "data:"
+	return len(s) >= len(scheme) && strings.EqualFold(s[:len(scheme)], scheme)
+}
+
+// replaceHTMLDataImg reduces one `<img …src="data:…">` tag to its alt text
+// in brackets, or to nothing when it has none.
+func replaceHTMLDataImg(tag string) string {
+	if m := htmlImgAltRE.FindStringSubmatch(tag); m != nil {
+		alt := m[1]
+		if alt == "" {
+			alt = m[2]
+		}
+		return "[" + alt + "]"
+	}
+	return ""
+}
+
+// htmlDataImgRE matches an <img> tag whose src is a data URI. The body
+// alternation steps over quoted attribute values so a `>` inside an
+// un-encoded SVG data URI does not terminate the tag early.
+var htmlDataImgRE = regexp.MustCompile(`(?is)<img\b(?:[^>"']|"[^"]*"|'[^']*')*?\bsrc\s*=\s*(?:"\s*data:[^"]*"|'\s*data:[^']*')(?:[^>"']|"[^"]*"|'[^']*')*>`)
+
+// htmlImgAltRE extracts the alt attribute from such a tag.
+var htmlImgAltRE = regexp.MustCompile(`(?is)\balt\s*=\s*(?:"([^"]*)"|'([^']*)')`)
+
+// dataURIRefDefRE matches a markdown reference definition whose destination
+// is a data URI (`[fig1]: data:image/png;base64,…`). The label is kept so
+// the `[fig1]` references in the prose still read as something.
+var dataURIRefDefRE = regexp.MustCompile(`(?im)^([ \t]*\[[^\]]*\])[ \t]*:[ \t]*data:.*$`)
+
+// wikiSearchTagRE matches an HTML tag in a MediaWiki search snippet.
+//
+// The opener is `</?[a-zA-Z]` rather than a bare `<` because the previous
+// `<[^>]*>` read the prose BETWEEN two comparison operators as a tag and
+// deleted it: `0 < n and n > 5` came back as `0  5`, so the snippet handed
+// to the model asserted something the source did not say. Inequalities,
+// generics and code fragments are ordinary content in a search snippet.
+var wikiSearchTagRE = regexp.MustCompile(`</?[a-zA-Z][^>]*>`)
+
+// wikipediaArticleURL builds the canonical /wiki/<Title> URL for a MediaWiki
+// article title.
+//
+// The title is upstream text landing in a URL PATH, so it is escaped rather
+// than concatenated. Concatenating "C# (programming language)" produces
+// `…/wiki/C#_(programming_language)`, whose `#` opens a fragment that is
+// never sent to the server — the citation resolves to the article "C", with
+// no error and a self-consistently wrong sha256 id computed over it.
+// url.URL.String() applies RFC 3986 path encoding: `#`, `?` and `%` are
+// escaped, while the `/` of a subpage title and the `:` of a namespace
+// prefix survive, which is what url.PathEscape would have destroyed.
+func wikipediaArticleURL(title string) string {
+	u := url.URL{Scheme: "https", Host: "en.wikipedia.org", Path: "/wiki/" + strings.ReplaceAll(title, " ", "_")}
+	return u.String()
+}
+
+// mediawikiErrorSuffix renders the error body MediaWiki returns on a
+// rejected request as a trailing clause, so the operator reading the failed
+// stage sees WHY the API refused rather than only that the shape was wrong.
+// Empty when the response carries no error at all.
+//
+// Three wire shapes, because knowing only one is how this helper returned ""
+// for a real refusal and left the operator with "response has no query
+// object" and no reason — the exact outcome it exists to prevent:
+//
+//   - `{"error":{"code":…,"info":…}}` — the legacy default.
+//   - `{"errors":[{"code":…,"text":…}]}` — what MediaWiki returns whenever
+//     the request carries errorformat= (plaintext/wikitext/html), i.e. the
+//     modern form.
+//   - `{"error":"…"}` — several MediaWiki-compatible mirrors.
 func mediawikiErrorSuffix(resp map[string]any) string {
-	apiErr, ok := resp["error"].(map[string]any)
-	if !ok {
+	switch e := resp["error"].(type) {
+	case map[string]any:
+		return mediawikiErrorClause(e, "info")
+	case string:
+		if s := strings.TrimSpace(e); s != "" {
+			return fmt.Sprintf(" (MediaWiki error: %s)", s)
+		}
+		return " (MediaWiki returned an error object)"
+	case nil:
+		// Fall through to the errors[] form below.
+	default:
+		return fmt.Sprintf(" (MediaWiki error: %v)", e)
+	}
+	list, ok := resp["errors"].([]any)
+	if !ok || len(list) == 0 {
 		return ""
 	}
-	code, _ := apiErr["code"].(string)
-	info, _ := apiErr["info"].(string)
+	first, ok := list[0].(map[string]any)
+	if !ok {
+		return fmt.Sprintf(" (MediaWiki error: %v)", list[0])
+	}
+	return mediawikiErrorClause(first, "text", "info", "*", "html")
+}
+
+// mediawikiErrorClause formats one error object. textKeys are the message
+// fields to try in order — the legacy shape calls it "info", errorformat=
+// calls it "text" (or "*" / "html", depending on the format asked for).
+func mediawikiErrorClause(obj map[string]any, textKeys ...string) string {
+	code, _ := obj["code"].(string)
+	var info string
+	for _, k := range textKeys {
+		if v, ok := obj[k].(string); ok && strings.TrimSpace(v) != "" {
+			info = strings.TrimSpace(v)
+			break
+		}
+	}
 	switch {
 	case code != "" && info != "":
 		return fmt.Sprintf(" (MediaWiki error %s: %s)", code, info)

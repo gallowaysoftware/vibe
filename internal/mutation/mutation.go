@@ -939,6 +939,247 @@ var Registry = []Mutation{
 			"field would turn a 10-minute cold-start allowance into an instant deadline-exceeded " +
 			"on every restore — and the piggyback queue would then carry the failure to the cell.",
 	},
+	// ── the external-input parsers, and the router classifier ─────────
+	//
+	// A review pass over internal/vamp/exec.go 3015–3495 and routererr.go
+	// deleted fifteen guards in this region and NINE of them left the
+	// package green. The four entries above (searxng/mediawiki) are the six
+	// that went red; every entry below is a guard that either had no test
+	// at all or, in one case, had a test that could not tell which of two
+	// rungs was doing the work. These parsers have no in-repo caller — they
+	// are reached only from templateFuncMap by user pipelines living outside
+	// the repo — so nothing in CI will ever catch a regression here by
+	// accident. The registry is the only thing standing under them.
+	{
+		Name:     "vamp/an-arxiv-api-error-feed-reads-as-a-source",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\tif strings.Contains(strings.ToLower(url), arxivAPIErrorMarker) {",
+		Replace:  "\t\tif false && strings.Contains(strings.ToLower(url), arxivAPIErrorMarker) {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestParseArxivTemplate_APIErrorFeedIsNotASource"},
+		Why: "arXiv has NO error channel: a rejected request comes back as HTTP 200 carrying a valid " +
+			"one-entry Atom feed whose id is an arxiv.org/api/errors# URL and whose title is \"Error\". " +
+			"Without this rung a mistyped id_list produces a paper called Error whose abstract is the " +
+			"API's own complaint, and the research stage cites it in the report. Both sibling parsers " +
+			"carried this distinction and argued it in their doc comments; this one did not mention it.",
+	},
+	{
+		Name:     "vamp/an-arxiv-feed-whose-entries-all-fail-to-parse-reads-as-zero-papers",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tif len(feed.Entries) > 0 && len(out) == 0 {",
+		Replace:  "\tif len(feed.Entries) < 0 && len(out) == 0 {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestParseArxivTemplate_UnreadableEntriesAreNotZeroPapers"},
+		Why: "the other half. Entries the parser cannot read were dropped one at a time, so an arXiv " +
+			"namespace or schema change turned N papers into zero sources on a GREEN run — the exact " +
+			"outcome parseSearXNG's nine-line comment exists to prevent, one function away.",
+	},
+	{
+		Name:     "vamp/a-wikipedia-page-with-no-url-shares-every-other-pages-id",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\turl, _ := page[\"fullurl\"].(string)\n\t\tif url == \"\" {",
+		Replace:  "\t\turl, _ := page[\"fullurl\"].(string)\n\t\tif url == \"\\x00\" {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestParseWikipediaExtractTemplate_MissingFullurlIsAnError"},
+		Why: "`fullurl` only exists when the query carries inprop=url, which this function's own doc " +
+			"comment omitted. Without it every page hashes the empty string and every source gets the " +
+			"id e3b0c44298fc — and the id's stated purpose is stable per-source FILENAMES, so three " +
+			"sources write to one file, last write wins, two sources vanish, and no error is raised " +
+			"anywhere. Both sibling parsers refuse the identical missing-url shape.",
+	},
+	{
+		Name:     "vamp/the-missing-page-skip-is-absorbed-by-the-empty-extract-skip",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\tif pid, ok := page[\"pageid\"].(float64); ok && pid < 0 {",
+		Replace:  "\t\tif pid, ok := page[\"pageid\"].(float64); ok && pid < -1000 {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestParseWikipediaExtractTemplate_NotFound"},
+		Why: "this rung was individually deletable with its own named test still green. MediaWiki's " +
+			"missing-page entry has no `extract`, so the pageid check and the empty-extract check both " +
+			"fire on the wire fixture and the test could not say which one was working. The fixture " +
+			"that discriminates is the same page WITH an extract. Relaxing `extract == \"\"` is a " +
+			"plausible future edit — exintro legitimately returns empty leads — and it must not " +
+			"promote a nonexistent page to a source titled \"DoesNotExist\".",
+	},
+	{
+		Name:     "vamp/multi-page-extract-output-goes-back-to-map-order",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tsort.Strings(pageKeys)",
+		Replace:  "\t_ = sort.Strings",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestParseWikipediaExtractTemplate_MultiPageOrderIsDeterministic"},
+		Why: "titles=A|B|C is a legal MediaWiki query (up to 50 titles) and Go randomises map " +
+			"iteration, so one 5-page response rendered five different prompts over 200 parses. " +
+			"Nothing is reproducible and nothing keyed on the rendered prompt can cache. readFiles " +
+			"sorts \"for determinism\" three hundred lines down; this is the same norm.",
+	},
+	{
+		Name:     "vamp/searxng-results-that-all-fail-to-parse-read-as-zero-hits",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\tif len(results) > 0 && emitted == 0 {",
+		Replace:  "\t\tif len(results) < 0 && emitted == 0 {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestParseSearXNGTemplate_UnreadableResultsAreNotZeroHits"},
+		Why: "the third rung on the existing searxng pair, and the sharpest: a body stating " +
+			"number_of_results 12 whose items carry a RENAMED url field read as a clean zero, with " +
+			"the disconfirming evidence sitting unused in the same map. The original guard was built " +
+			"for the missing KEY and never extended to a key that is present and unreadable.",
+	},
+	{
+		Name:     "vamp/a-non-array-searxng-results-field-reads-as-an-empty-search",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\t\tif rawResults == nil {",
+		Replace:  "\t\t\tif rawResults == nil || true {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestParseSearXNGTemplate_UnreadableResultsAreNotZeroHits"},
+		Why: "the tolerant branch's own comment said \"null (or a scalar)\" while the code accepted " +
+			"ANYTHING that was not an array — including an object holding twelve entries. Only null " +
+			"is SearXNG's spelling of an empty result set; an object or a scalar there means something " +
+			"other than SearXNG answered.",
+	},
+	{
+		Name:     "vamp/a-wikipedia-title-goes-into-a-url-path-unescaped",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tu := url.URL{Scheme: \"https\", Host: \"en.wikipedia.org\", Path: \"/wiki/\" + strings.ReplaceAll(title, \" \", \"_\")}\n\treturn u.String()",
+		Replace:  "\treturn \"https://en.wikipedia.org/wiki/\" + strings.ReplaceAll(title, \" \", \"_\")",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestParseWikipediaSearchTemplate_TitlesArePathEscaped", "TestParseWikipediaSearchTemplate"},
+		Why: "the title is upstream text landing in a URL PATH. Concatenated, \"C# (programming " +
+			"language)\" yields a URL whose # opens a fragment that is never sent to the server, so " +
+			"the citation in the report resolves to the article \"C\" — silently, with the sha256 id " +
+			"computed over the broken URL. url.URL is the right tool and url.PathEscape is not: a " +
+			"subpage \"/\" and a namespace \":\" have to survive.",
+	},
+	{
+		Name:     "vamp/the-search-snippet-tag-stripper-eats-prose-again",
+		File:     "internal/vamp/exec.go",
+		Find:     "var wikiSearchTagRE = regexp.MustCompile(`</?[a-zA-Z][^>]*>`)",
+		Replace:  "var wikiSearchTagRE = regexp.MustCompile(`<[^>]*>`)",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestParseWikipediaSearchTemplate_SnippetKeepsProseAndDecodesEntities"},
+		Why: "a bare `<` opener read the prose BETWEEN two comparison operators as a tag and deleted " +
+			"it: \"for all n where 0 < n and n > 5\" reached the model as \"0  5\". The snippet then " +
+			"asserts something the source did not say, and nothing anywhere reports a problem. " +
+			"Inequalities, generics and code fragments are ordinary content in a search snippet.",
+	},
+	{
+		Name:     "vamp/mediawiki-search-snippets-stop-being-entity-decoded",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\tsnippet = html.UnescapeString(strings.TrimSpace(wikiSearchTagRE.ReplaceAllString(snippet, \"\")))",
+		Replace:  "\t\tsnippet = html.UnescapeString(\"\") + strings.TrimSpace(wikiSearchTagRE.ReplaceAllString(snippet, \"\"))",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestParseWikipediaSearchTemplate_SnippetKeepsProseAndDecodesEntities"},
+		Why: "the other half of the same half-done sanitiser: tags out, entities in. The model read " +
+			"\"5 &deg;C\" and \"&amp;\" literally. The order is load-bearing and the mutation keeps " +
+			"the import alive so the entry cannot pass by failing to compile: decoding BEFORE " +
+			"stripping would turn a `&lt;b&gt;` the source wrote into a tag the stripper then eats.",
+	},
+	{
+		Name:     "vamp/a-non-positive-truncate-limit-means-no-cap-again",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tif n <= 0 {\n\t\treturn \"\", fmt.Errorf(\"truncate: limit must be positive, got %d (a non-positive limit would pass the whole %d-byte input through uncapped)\", n, len(s))\n\t}",
+		Replace:  "\tif n <= 0 {\n\t\treturn s, nil\n\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestTruncateTemplate_NonPositiveLimitIsAnError"},
+		Why: "truncate is the one guard between an oversized document and the context window, and " +
+			"`n <= 0` used to mean \"no cap\" — so a typo'd `truncate 0`, or a remaining-budget " +
+			"expression that went non-positive, passed a 100KB document straight through and reported " +
+			"success. A guard that disarms itself on a typo is the shape this package keeps paying " +
+			"for; splitSentences answers the same question with a default rather than a bypass.",
+	},
+	{
+		Name:     "vamp/stripDataURIs-becomes-a-no-op",
+		File:     "internal/vamp/exec.go",
+		Find:     "func stripDataURIsTemplate(s string) string {",
+		Replace:  "func stripDataURIsTemplate(s string) string {\n\tif true {\n\t\treturn s\n\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestStripDataURIsTemplate", "TestStripDataURIsTemplate_MeetsItsSizeGoal"},
+		Why: "deleting this helper's whole body left the package green — it had no test at all, while " +
+			"being the guard between a 30-reference lesson (10KB per reference) and a blown context " +
+			"window. Measured on that document before the fix: 0.0% reduction on an uppercase DATA: " +
+			"scheme, and 0.6% plus a CORRUPTED document when an un-encoded SVG body contained rgb(…), " +
+			"where the payload survived as prose and the helper looked like it had worked.",
+	},
+	{
+		Name:     "vamp/mediawiki-knows-one-of-its-three-error-shapes-again",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tlist, ok := resp[\"errors\"].([]any)",
+		Replace:  "\tlist, ok := resp[\"errors-that-are-never-there\"].([]any)",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestMediawikiErrorSuffix"},
+		Why: "{\"errors\":[{\"code\":…,\"text\":…}]} is what MediaWiki returns whenever the request " +
+			"carries errorformat= — the MODERN form. Knowing only the legacy {\"error\":{code,info}} " +
+			"shape meant a real refusal produced \"response has no query object\" and no reason at " +
+			"all, which is the exact outcome this helper exists to prevent. Cost is operator minutes, " +
+			"paid every time.",
+	},
+	{
+		Name:     "router/an-oom-substring-turns-a-name-error-into-a-retry-loop",
+		File:     "internal/vamp/routererr.go",
+		Find:     "\tcase containsAny(lower, capacityPhrases...) || containsToken(lower, \"oom\"):",
+		Replace:  "\tcase containsAny(lower, capacityPhrases...) || strings.Contains(lower, \"oom\"):",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestClassifyFailureMessage_OOMIsMatchedAsAWord", "TestClassifyHTTPFailure_NameErrorAndCapacityDoNotSwap"},
+		Why: "\"oom\" as a bare substring is inside bloom, bloomz, zoom, doom, room and bedroom — real " +
+			"GGUF families and ordinary path segments — and the OOM arm is tested BEFORE the NOT_FOUND " +
+			"arm, so it wins. A 404 saying `model not found: bloomz-7b1` classified as CAPACITY, which " +
+			"WaitForWarm retries: the operator who typo'd one catalog entry hammered a 404 every 3s " +
+			"for the full 10-minute warm budget and was then told the model did not fit in VRAM. The " +
+			"same 404 for qwen3-30b failed in milliseconds.",
+	},
+	{
+		Name:     "router/an-allocation-failure-outside-the-phrase-list-permanently-fails-a-capability",
+		File:     "internal/vamp/routererr.go",
+		Find:     "\t\"insufficient vram\", \"allocate\", \"allocation failed\",\n\t\"exit status 137\", \"signal: killed\",",
+		Replace:  "\t\"insufficient vram\", \"failed to allocate\",",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestClassifyFailureMessage_AllocationFailuresAreRetryable"},
+		Why: "the same three lines in the opposite direction, and the more expensive one. The list " +
+			"required the exact phrase \"failed to allocate\", so \"unable to allocate CUDA0 buffer\" " +
+			"and \"exit status 137\" (the Linux OOM-killer's signature) fell through to START_FAILED — " +
+			"which WaitForWarm treats as an AUTHORITATIVE verdict and does not retry. A transient VRAM " +
+			"squeeze, another cell's model still resident, is the normal state of a two-GPU fleet, and " +
+			"it permanently failed the capability instead of succeeding three seconds later.",
+	},
+	{
+		Name:     "router/an-empty-error-field-becomes-a-reasonless-non-retryable-failure",
+		File:     "internal/vamp/routererr.go",
+		Find:     "\t\tif strings.TrimSpace(s) == \"\" {\n\t\t\treturn \"\", false\n\t\t}",
+		Replace:  "\t\tif strings.TrimSpace(s) == \"\\x00\" {\n\t\t\treturn \"\", false\n\t\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestRouterFailureMessage_AnEmptyErrorFieldIsNotAMessage"},
+		Why: "routerFailureMessage has two callers and only classifyHTTPFailure checked msg != \"\". " +
+			"readWarmStream handed it straight through, so `{\"error\":\"\"}` mid-stream produced " +
+			"`router: START_FAILED: model \"qwen3\"` and nothing else — and START_FAILED is " +
+			"non-retryable, so the whole capability died with an error containing no reason to act on. " +
+			"One helper, guarded on one of its two call paths.",
+	},
+	{
+		Name:     "router/the-classifier-loses-its-own-bound-on-far-side-text",
+		File:     "internal/vamp/routererr.go",
+		Find:     "\tmsg = boundDetail(msg)",
+		Replace:  "\t_ = boundDetail",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestClassifyHTTPFailure_DetailIsBounded"},
+		Why: "the 8192-byte io.LimitReader was in WarmModel, the CALLER, so the classifier was a guard " +
+			"in one of N call paths with N=1. Whatever the far side says lands verbatim in an error " +
+			"warmCapability writes to the run log, and the moment a cloud_api backend joins the warm " +
+			"path — which the fleet design plans — a caller that forgets the LimitReader hands this an " +
+			"unbounded body. A 7KB HTML proxy page is not a diagnostic.",
+	},
+	{
+		Name:     "router/a-connection-level-errno-stops-answering-is-anything-listening",
+		File:     "internal/vamp/routererr.go",
+		Find:     "\t\terrors.Is(err, syscall.EPIPE) ||\n\t\terrors.Is(err, syscall.ECONNABORTED) ||\n\t\terrors.Is(err, syscall.ETIMEDOUT) {",
+		Replace:  "\t\tfalse {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestIsConnectFailure_ConnectionLevelErrnos"},
+		Why: "vamp/errors.go publishes errors.Is(err, ErrUpstreamDown) as THE documented way for an " +
+			"external caller to ask \"is anything listening on the router port\". A router killed " +
+			"mid-request answers with OpError{Op:\"write\", Err: EPIPE}, which the dial-only Op check " +
+			"never saw, so the published API returned the wrong answer to the one question it exists " +
+			"to answer.",
+	},
 	{
 		Name:     "u5/a zero suspendTimeout seam becomes an already-expired context",
 		File:     "internal/vibe/fleetapi/sleepsched.go",

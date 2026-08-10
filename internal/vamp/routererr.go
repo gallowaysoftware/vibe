@@ -83,7 +83,18 @@ func (e *RouterError) Is(target error) bool {
 // body. Two shapes exist in the wild: llama-swap's
 // {"error":"<string>","src":"llama-swap"} (also its final in-stream SSE data
 // line) and the OpenAI-style {"error":{"message":...}}. Returns ok=false when
-// the payload has no error field — e.g. an ordinary completion chunk.
+// the payload has no error field — e.g. an ordinary completion chunk — or
+// when the field carries no text.
+//
+// The empty-string case is ok=false rather than ("", true) because this
+// helper has two callers and only one of them guarded it.
+// classifyHTTPFailure checks `msg != ""` before building its detail;
+// readWarmStream hands the message straight to classifyFailureMessage, so
+// `{"error":""}` mid-stream produced `router: START_FAILED: model "qwen3"`
+// — and WaitForWarm treats START_FAILED as authoritative, so the whole
+// capability died with an error containing no reason at all. Reporting "no
+// message here" instead lets the HTTP path fall back to the raw body and the
+// stream path keep reading.
 func routerFailureMessage(raw []byte) (string, bool) {
 	var envelope struct {
 		Error json.RawMessage `json:"error"`
@@ -93,6 +104,9 @@ func routerFailureMessage(raw []byte) (string, bool) {
 	}
 	var s string
 	if err := json.Unmarshal(envelope.Error, &s); err == nil {
+		if strings.TrimSpace(s) == "" {
+			return "", false
+		}
 		return s, true
 	}
 	var obj struct {
@@ -108,26 +122,95 @@ func routerFailureMessage(raw []byte) (string, bool) {
 	return strings.TrimSpace(string(envelope.Error)), true
 }
 
+// capacityPhrases are the substrings that make a failure message an
+// allocation failure — the model or request does not fit RIGHT NOW, so
+// WaitForWarm should wait 3s and ask again.
+//
+// The list is a family rather than the six exact spellings it started as.
+// `"failed to allocate"` alone missed "unable to allocate CUDA0 buffer",
+// "cannot allocate memory" and every other verb, and the miss is expensive
+// in one direction only: an allocation failure that falls through to
+// START_FAILED is treated by WaitForWarm as an AUTHORITATIVE verdict and
+// permanently fails the capability, so a transient VRAM squeeze — another
+// cell's model still resident, the normal state of a two-GPU fleet — kills
+// a run that would have succeeded three seconds later.
+//
+// `exit status 137` and `signal: killed` are here for the same reason:
+// 128+SIGKILL is the Linux OOM-killer's signature, and it is not
+// engine-specific.
+var capacityPhrases = []string{
+	"out of memory", "outofmemory", "insufficient memory", "not enough memory",
+	"insufficient vram", "allocate", "allocation failed",
+	"exit status 137", "signal: killed",
+}
+
+// notFoundPhrases are the substrings that mean the model id is not in the
+// catalog. Asking again will not grow it, so WaitForWarm fails fast.
+var notFoundPhrases = []string{
+	"model not found", "unknown model", "no such model", "could not find model",
+	"model_not_found",
+}
+
 // classifyFailureMessage maps a router/engine failure message to a typed
 // error. Message-text matching is the only signal available for the two
 // cases HTTP status can't discriminate: an in-stream failure after a 200
 // (START_FAILED vs CAPACITY) and engines that report unknown models with a
 // 400 instead of a 404.
+//
+// The OOM arm is tested first, which is why its tokens must be exact. `"oom"`
+// used to be matched as a bare substring, and it is a substring of bloom,
+// bloomz, zoom, doom, room and bedroom — real GGUF model families and
+// ordinary path segments. A 404 saying `model not found: bloomz-7b1` was
+// therefore CAPACITY (retryable) while the same 404 for `qwen3-30b` was
+// NOT_FOUND (fail fast): the operator who typo'd a catalog entry hammered a
+// 404 every 3s for the full 10-minute warm budget and was then told the model
+// did not fit in VRAM. `oom` is now matched only as a whole token, so
+// "cuda oom" and "oom-kill" still hit and "bloomz-7b1" does not.
 func classifyFailureMessage(model, msg string) *RouterError {
 	lower := strings.ToLower(msg)
 	switch {
-	case containsAny(lower,
-		"out of memory", "oom", "insufficient memory", "not enough memory",
-		"insufficient vram", "failed to allocate"):
+	case containsAny(lower, capacityPhrases...) || containsToken(lower, "oom"):
 		return &RouterError{Code: RouterCapacity, Model: model, Detail: msg}
-	case containsAny(lower,
-		"model not found", "unknown model", "no such model", "could not find model",
-		"model_not_found"):
+	case containsAny(lower, notFoundPhrases...):
 		return &RouterError{Code: RouterNotFound, Model: model, Detail: msg}
 	default:
 		return &RouterError{Code: RouterStartFailed, Model: model, Detail: msg}
 	}
 }
+
+// containsToken reports whether tok appears in s bounded by non-alphanumeric
+// characters on both sides — the word-boundary test strings.Contains is not.
+// s and tok are both expected lowercase.
+func containsToken(s, tok string) bool {
+	for i := 0; i+len(tok) <= len(s); i++ {
+		if s[i:i+len(tok)] != tok {
+			continue
+		}
+		if i > 0 && isTokenByte(s[i-1]) {
+			continue
+		}
+		if j := i + len(tok); j < len(s) && isTokenByte(s[j]) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// isTokenByte reports whether c continues a word. Underscore counts: a model
+// id like "bloom_7b" is one token, not two.
+func isTokenByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
+}
+
+// maxRouterDetail bounds the far-side text this package will carry in an
+// error string. The 8192-byte io.LimitReader that used to be the only bound
+// lives in WarmModel — the CALLER — so the classifier was a guard in one of
+// N call paths with N=1, and any future caller that forgets the LimitReader
+// (a cloud_api backend on the warm path, which the fleet design plans) hands
+// this an unbounded body that goes verbatim into a run log. A 7KB HTML proxy
+// page is not a diagnostic; the first 512 bytes of it are.
+const maxRouterDetail = 512
 
 // classifyHTTPFailure maps a non-2xx router response to a typed error.
 func classifyHTTPFailure(model string, status int, body []byte) *RouterError {
@@ -135,6 +218,7 @@ func classifyHTTPFailure(model string, status int, body []byte) *RouterError {
 	if !ok {
 		msg = strings.TrimSpace(string(body))
 	}
+	msg = boundDetail(msg)
 	detail := fmt.Sprintf("status %d", status)
 	if msg != "" {
 		detail = fmt.Sprintf("status %d: %s", status, msg)
@@ -178,11 +262,34 @@ func classifyTransportError(model string, err error) error {
 	return err
 }
 
+// boundDetail clips far-side text to maxRouterDetail bytes on a rune
+// boundary, marking the cut so the reader knows there was more.
+func boundDetail(s string) string {
+	if len(s) <= maxRouterDetail {
+		return s
+	}
+	cut := maxRouterDetail
+	for cut > 0 && (s[cut]&0xC0) == 0x80 {
+		cut--
+	}
+	return s[:cut] + "… [truncated]"
+}
+
+// isConnectFailure reports whether err means nothing took the request at the
+// connection level. EPIPE, ECONNABORTED and ETIMEDOUT are here alongside the
+// dial-time errnos because vamp/errors.go publishes
+// errors.Is(err, ErrUpstreamDown) as the documented way for an external
+// caller to ask "is anything listening on the router port" — and a router
+// killed mid-request answers with OpError{Op:"write", Err: EPIPE}, which the
+// dial-only Op check never saw.
 func isConnectFailure(err error) bool {
 	if errors.Is(err, syscall.ECONNREFUSED) ||
 		errors.Is(err, syscall.ECONNRESET) ||
 		errors.Is(err, syscall.EHOSTUNREACH) ||
-		errors.Is(err, syscall.ENETUNREACH) {
+		errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.ETIMEDOUT) {
 		return true
 	}
 	var dnsErr *net.DNSError
