@@ -781,6 +781,154 @@ var Registry = []Mutation{
 			"guard was added without a test of its own, which is the shape this registry exists " +
 			"to make impossible.",
 	},
+	// ── a resumed stage that is not the stage that ran (vamp) ─────────
+	{
+		Name: "vamp/foreach resume classifies stage types by an allowlist again",
+		File: "internal/vamp/exec.go",
+		// The exact allowlist this line replaced: text and youtube of the
+		// six content-bearing types.
+		Find:     "\tbinary := producesFileOutput(stageTypeOrDefault(st))",
+		Replace:  "\trt := stageTypeOrDefault(st)\n\tbinary := rt != StageTypeText && rt != StageTypeYouTube",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestTryResumeForeach_ClassifiesByOutputKindNotAnAllowlist"},
+		Why: "the single-stage resume path was already fixed for this, with a comment ending " +
+			"\"Classify by output kind, not an allowlist that forgot compact\" — and the foreach " +
+			"path 60 lines later WAS that allowlist. A resumed foreach render/compact/webhook/" +
+			"confirm item handed the next stage an absolute path where the prompt expects the " +
+			"file's bytes: the model generates from memory, the run exits 0, and the host's " +
+			"directory layout is in a model request.",
+	},
+	{
+		Name:     "vamp/resume stops re-validating a foreach item's JSON",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\tif st.OutputFormat == \"json\" {\n\t\t\tif err := validateJSON(string(body)); err != nil {\n\t\t\t\tmissing = append(missing, i)\n\t\t\t\tcontinue\n\t\t\t}\n\t\t}",
+		Replace:  "\t\tif false && st.OutputFormat == \"json\" {\n\t\t\tif err := validateJSON(string(body)); err != nil {\n\t\t\t\tmissing = append(missing, i)\n\t\t\t\tcontinue\n\t\t\t}\n\t\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestTryResumeForeach_JSONRevalidationCoversEveryContentType"},
+		Why: "size > 0 is the whole integrity check resume performs, and a run killed mid-write " +
+			"leaves truncated JSON that passes it. The item then resumes as COMPLETE and every " +
+			"downstream stage that parses it inherits the corruption. Deleting this branch used " +
+			"to leave the package green.",
+	},
+	{
+		Name:     "vamp/resume stops re-validating a single stage's JSON",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tif st.OutputFormat == \"json\" {\n\t\tif err := validateJSON(string(body)); err != nil {",
+		Replace:  "\tif false && st.OutputFormat == \"json\" {\n\t\tif err := validateJSON(string(body)); err != nil {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestTryResumeStage_JSONRevalidation"},
+		Why: "the non-foreach half of the same guard, and the one that feeds foreach: a truncated " +
+			"titles.json resuming as complete is how a fan-out runs over half a list, or over " +
+			"nothing, and reports success.",
+	},
+	{
+		Name:     "vamp/an empty file resumes as a completed stage",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tif info.Size() == 0 {\n\t\treturn nil, false, nil\n\t}",
+		Replace:  "\tif false && info.Size() == 0 {\n\t\treturn nil, false, nil\n\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestReadNonEmpty_ZeroByteIsNotAResult"},
+		Why: "readNonEmpty exists to embody \"an empty file is not a result\" — it is NAMED for this " +
+			"branch — and the half that makes the name true could be deleted with the whole " +
+			"package staying green. A zero-byte output is the crashed-mid-write case --resume is " +
+			"for; without it that stage is skipped and the empty string is what the next prompt " +
+			"gets.",
+	},
+	{
+		Name: "vamp/a foreach item's escaping path stops being a refusal",
+		File: "internal/vamp/exec.go",
+		Find: "\t\t\tif errors.Is(err, errOutputPathEscape) {\n\t\t\t\t// An item whose rendered path leaves the run dir is a",
+		// Falls through to the "can't decide resumability" return, which
+		// is exactly the quiet treatment the comment argues against.
+		Replace:  "\t\t\tif false && errors.Is(err, errOutputPathEscape) {\n\t\t\t\t// An item whose rendered path leaves the run dir is a",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestTryResumeForeachStage_SurfacesRunDirEscape"},
+		Why: "the foreach half of the refusal whose non-foreach twin is already registered above. " +
+			"A foreach item is a field of a PRIOR STAGE'S LLM OUTPUT interpolated into the output " +
+			"template; the next line joins the result to RunDir and READS it, so a sampled " +
+			"\"/etc/passwd\" is loaded into a stage output — into the next prompt — while the run " +
+			"reports merely \"nothing to resume\". Added with a five-line comment and no test.",
+	},
+	{
+		Name:     "vamp/resume suppresses the foreach collision refusal",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\tif _, dup := seenPaths[path]; dup {",
+		Replace:  "\t\tif _, dup := seenPaths[path]; false && dup {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestResumeForeach_CollisionStaysRefused", "TestResumeForeach_NonTemplatedOutputStaysRefused"},
+		Why: "executeForeachStage refuses two items that render to the same output path, but resume " +
+			"marking the stage complete means the stage never runs and the error can never fire. " +
+			"Both items then \"resume\" from the one file that exists: .outputs is N copies of one " +
+			"body and the run reports success — a per-chapter TTS fan-out ships the same chapter " +
+			"N times. The guard is on the path resume prevents you from reaching. It covers the " +
+			"NON-TEMPLATED refusal too, which is why two tests are named: a static output path " +
+			"renders to the same constant for every item and arrives here as a collision.",
+	},
+	{
+		Name:     "vamp/foreach resume pairs prior files to items by position",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tif !e.foreachPathsRecordItems(st, items, outPaths) && !e.resumedFromPriorRun(st.Foreach.From) {",
+		Replace:  "\tif false && !e.foreachPathsRecordItems(st, items, outPaths) && !e.resumedFromPriorRun(st.Foreach.From) {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestResumeForeach_IndexPathDoesNotPairByPositionAcrossADifferentList"},
+		Why: "with an index-derived path (assets/img_{{.i}}.png) the only thing pairing an on-disk " +
+			"file to an item is its POSITION, and nothing records which item produced it. When the " +
+			"upstream could not resume it re-runs against a non-deterministic model and returns a " +
+			"different list: a prior run over [a b c d] hands item w the body generated for a, and " +
+			"the run exits 0 with two bodies labelled as items that were never generated.",
+	},
+	{
+		Name:     "vamp/compact drops a chunk whose reply came back empty",
+		File:     "internal/vamp/compact_executor.go",
+		Find:     "\t\tif part == \"\" {",
+		Replace:  "\t\tif false && part == \"\" {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestCompactExecutor_AnEmptyChunkReplyIsAnErrorNotADeletion"},
+		Why: "compact's doc comment sells it as the alternative to truncating, \"which silently drops " +
+			"content\". stripModelArtifacts removes a leading <think> block, so a reasoning model " +
+			"that emits only its reasoning reduces to \"\" — appended as that chunk's summary. The " +
+			"chunk is then ABSENT from the compacted text, with nil error and nothing in the log, " +
+			"and the study-guide prompt downstream is built from a summary with a hole in it.",
+	},
+	{
+		Name: "vamp/compact adopts a pass that made the text bigger",
+		File: "internal/vamp/compact_executor.go",
+		// Restores the exact line this replaced.
+		Find:     "\t\tif len(next) >= len(current) {\n\t\t\tc.logf(in, \"compact %s: pass %d returned %d chars for %d in (no progress); keeping the shorter text\\n\", st.ID, iter+1, len(next), len(current))\n\t\t\tbreak\n\t\t}",
+		Replace:  "\t\tif len(next) >= len(current) {\n\t\t\tcurrent = next\n\t\t\tbreak\n\t\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestCompactExecutor_ANonShrinkingPassKeepsTheSmallerText"},
+		Why: "one token with an invisible consequence: the comment says \"stop rather than spin\" and " +
+			"the code stopped AND kept the LARGER text. Measured 20,000 chars in, 50,018 out for " +
+			"target_chars: 500, nil error, silent log — strictly worse than not running the pass, " +
+			"and the next stage's context window is what finds out.",
+	},
+	{
+		Name:     "vamp/resume stops noticing that the inputs changed",
+		File:     "internal/vamp/exec.go",
+		Find:     "\treturn e.checkResumeInputs()",
+		Replace:  "\treturn nil",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestCheckResumeSnapshot_InputsAreDrift"},
+		Why: "the drift hash covered the pipeline YAML and nothing the YAML is parameterised BY, so " +
+			"`--input topic=cats` then `--resume --input topic=dogs` was accepted: the cat-era " +
+			"stages resume as complete, the rest generate dogs, and one run dir describes both. " +
+			"Inputs reach prompts through {{ .inputs.x }} — this is the same class the pipeline " +
+			"hash already refuses, one rung down.",
+	},
+	{
+		Name:     "vamp/a resumed run overwrites the record of what produced it",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\tif _, err := os.Stat(inputsPath); err == nil {\n\t\t\treturn nil\n\t\t}",
+		Replace:  "\t\tif _, err := os.Stat(inputsPath); false && err == nil {\n\t\t\treturn nil\n\t\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestSnapshot_ResumeKeepsThePriorRunsInputsRecord"},
+		Why: "inputs.json is the only on-disk record of what the already-completed stages were " +
+			"generated from, and `runs ls` and `vamp diff` both read it. Rewriting it on a forced " +
+			"resume replaces the first half of the run's parameters with the second half's — the " +
+			"pipeline snapshot beside it has carried exactly this carve-out for months.",
+	},
+
 	{
 		Name:    "vamp/a mix stage races on the log it streams to",
 		File:    "internal/vamp/mix_executor.go",
