@@ -62,12 +62,24 @@ func TestSplitSentences_GreedyPack(t *testing.T) {
 	}
 }
 
-func TestSplitSentences_SingleLongSentence(t *testing.T) {
-	// A single 80-char sentence over a 30-char limit stays as one chunk —
-	// splitting mid-clause is worse than one long call.
+// TestSplitSentences_SingleLongSentenceIsSubSplitToBudget records a
+// deliberate behaviour change. This test used to assert the opposite —
+// that a single 72-char sentence over a 30-char limit comes back as
+// ONE chunk, on the argument that splitting mid-clause reads worse
+// than one long TTS call. That argument holds for a sentence 10% over
+// and collapses at 9x, which is what the helper actually produced on
+// every input shape whose sentence boundaries the detector missed. A
+// budget that only binds when detection succeeds is not a budget, and
+// the caller discovered the overrun as a rejected request after the
+// pipeline had run.
+//
+// The break is at a word boundary, not mid-word: splitToBudget's
+// cascade prefers sentence, then clause, then word, and only cuts a
+// word when there is no whitespace in the budget at all.
+func TestSplitSentences_SingleLongSentenceIsSubSplitToBudget(t *testing.T) {
 	in := "The room is a cube with rounded corners and a magnetic seal on the door."
 	got := splitSentencesTemplate(in, 30)
-	want := `["The room is a cube with rounded corners and a magnetic seal on the door."]`
+	want := `["The room is a cube with","rounded corners and a","magnetic seal on the door."]`
 	if got != want {
 		t.Errorf("got %s\nwant %s", got, want)
 	}
