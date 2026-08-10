@@ -75,12 +75,23 @@ type ttsRulesFile struct {
 //go:embed default_tts_rules.yaml
 var defaultTTSRulesYAML []byte
 
-// rulesCache memoises parsed rule files by their absolute path +
-// modtime. ttsNormalize is template-hot — once per audio segment —
-// so re-parsing the YAML each invocation would dominate any TTS
-// latency on long modules.
+// rulesCache memoises parsed rule files by their path + modtime +
+// size. ttsNormalize is template-hot — once per audio segment — so
+// re-parsing the YAML each invocation would dominate any TTS latency
+// on long modules.
+//
+// size is part of the key because mtime alone is not a change
+// detector: an editor that writes within the same filesystem mtime
+// tick leaves the cached rules in place, and the operator sees their
+// edit silently not apply. Size closes the common case (a rules edit
+// almost always changes the byte count). It does not close ALL of it —
+// a same-tick, same-size edit still serves the stale entry — and that
+// residual hole is accepted rather than papered over: the fix would be
+// hashing the file on every segment, which is the cost this cache
+// exists to avoid.
 type rulesCacheEntry struct {
 	mtime time.Time
+	size  int64
 	rules []ttsRule
 }
 
@@ -105,7 +116,9 @@ func loadDefaults() {
 }
 
 // loadRulesFile reads the rules YAML at path, caching the result
-// keyed on (path, mtime). Returns empty (no error) when path is "".
+// keyed on (path, mtime, size). Returns empty (no error) when path is
+// "". A path that is set but unreadable, or a YAML that does not
+// parse, is an ERROR — see ttsNormalizeTemplate for why.
 func loadRulesFile(path string) ([]ttsRule, error) {
 	if path == "" {
 		return nil, nil
@@ -115,7 +128,7 @@ func loadRulesFile(path string) ([]ttsRule, error) {
 		return nil, fmt.Errorf("stat %s: %w", path, err)
 	}
 	rulesCacheMu.Lock()
-	if entry, ok := rulesCache[path]; ok && entry.mtime.Equal(info.ModTime()) {
+	if entry, ok := rulesCache[path]; ok && entry.mtime.Equal(info.ModTime()) && entry.size == info.Size() {
 		rulesCacheMu.Unlock()
 		return entry.rules, nil
 	}
@@ -131,7 +144,7 @@ func loadRulesFile(path string) ([]ttsRule, error) {
 	}
 	compileRules(f.Rules)
 	rulesCacheMu.Lock()
-	rulesCache[path] = rulesCacheEntry{mtime: info.ModTime(), rules: f.Rules}
+	rulesCache[path] = rulesCacheEntry{mtime: info.ModTime(), size: info.Size(), rules: f.Rules}
 	rulesCacheMu.Unlock()
 	return f.Rules, nil
 }
@@ -161,9 +174,21 @@ func applyTTSRules(text string, rules []ttsRule) string {
 //	{{ ttsNormalize .segment.text "" }}            # defaults only
 //	{{ ttsNormalize .segment.text "tts_rules.yaml" }}  # defaults + overrides
 //
-// Errors at the function level produce an empty string + log a
-// warning — the audio stage continues with the original text. This
-// keeps a bad rules-file from killing a run mid-flight.
+// A rulesPath that cannot be read or parsed is a hard ERROR: the
+// returned error aborts the stage's template render, and with it the
+// run.
+//
+// This comment used to promise the opposite — "errors produce an empty
+// string + log a warning; the audio stage continues with the original
+// text" — describing a guard the function has never had. There is no
+// logger in this file and no fallback. The code was picked over the
+// comment rather than the other way round, because the failure the
+// comment describes is worse than the one it claims to prevent: a
+// typo'd rules path would render an entire module of audio with every
+// domain term mispronounced, exit 0, and be discovered on listening.
+// A pipeline that names a rules file has declared it load-bearing.
+// (The defaults still apply with rulesPath == "" — opting out is
+// spelled by not naming a file, not by naming a broken one.)
 func ttsNormalizeTemplate(text, rulesPath string) (string, error) {
 	defaultOnce.Do(loadDefaults)
 	out := applyTTSRules(text, defaultRules)

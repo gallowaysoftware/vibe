@@ -1079,6 +1079,123 @@ var Registry = []Mutation{
 	// workstation where /bin/sh is bash) — which is the argument both for
 	// the builder being SHARED and for each site's membership being
 	// pinned separately from the builder's own correctness.
+	// ── vamp text budgets and record filters ─────────────────────────
+	//
+	// Review 03's headline: 20 of 32 guard deletions survived a green
+	// suite, in the code that decides how much text reaches a model and
+	// which records survive a filter. The seven below are the survivors
+	// that were load-bearing. Every one names a test that did not exist
+	// before the fix, which is the point — the functions were 0.0%,
+	// 44.4% and 64.0% covered, and line coverage was not the signal.
+	{
+		Name:     "vamp/the paragraph chunker stops seeing a blank line it did not spell itself",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\tif strings.TrimSpace(line) == \"\" {",
+		Replace:  "\t\tif line == \"\" {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestSplitParagraphs_BlankLineFormsAllSeparate"},
+		Why: "restores the literal-separator reading that made every documented text budget " +
+			"advisory. A blank line carrying a space, a tab, or a \\r — i.e. any CRLF document — " +
+			"stopped being a paragraph break, the splitter returned the WHOLE document as one " +
+			"paragraph, and the packer below it had nothing to pack. A correctly-paragraphed " +
+			"Windows source came back 3.2x over budget and an unparagraphed one 41.7x, reported as " +
+			"one healthy chunk. The RAG consumer discovers it as a rejected embedding request, " +
+			"after the fetch and extraction stages have already run. The MustFail test names the " +
+			"SPLITTER, not the chunker: routed through chunkParagraphs this mutant survives, " +
+			"because splitToBudget's post-condition re-cuts the merged blob at the same newlines. " +
+			"Two guards, one of which can mask the other, so each is pinned where it lives.",
+	},
+	{
+		Name:     "vamp/the sentence chunker stops agreeing with TrimSpace about what a space is",
+		File:     "internal/vamp/exec.go",
+		Find:     "func isSpaceRune(r rune) bool {\n\treturn unicode.IsSpace(r)\n}",
+		Replace:  "func isSpaceRune(r rune) bool {\n\treturn r == ' ' || r == '\\t' || r == '\\n' || r == '\\r'\n}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestIsSpaceRune_AgreesWithUnicodeIsSpace"},
+		Why: "restores the four-rune whitespace test that sat two lines below a strings.TrimSpace " +
+			"using unicode.IsSpace — the correct answer adjacent to the wrong one. NBSP, U+202F and " +
+			"U+3000 are what PDF extraction and LLM output emit between sentences; on that text the " +
+			"splitter found NO boundary and returned 1 chunk instead of 6, at 2x budget, while " +
+			"reporting success. " +
+			"MustFail names only the UNIT assertion, and that is a measured decision rather than a " +
+			"weak one: end to end, splitSentences survives this mutation, because bestBreak asks " +
+			"unicode.IsSpace directly and classifies a space after '.' as a sentence-quality break, " +
+			"so the post-condition independently recovers the same cut points. That is real " +
+			"defence in depth and it is also why the agreement has to be asserted where it lives — " +
+			"an end-to-end MustFail here would report a coverage claim the suite cannot actually " +
+			"make. TestSplitSentences_NonASCIISpaceIsASentenceBoundary stays in the suite as a " +
+			"regression test; it is not evidence about this line.",
+	},
+	{
+		Name:     "vamp/the text budget goes back to being advisory",
+		File:     "internal/vamp/exec.go",
+		Find:     "\tif maxChars <= 0 || len(s) <= maxChars {",
+		Replace:  "\tif maxChars <= 0 || len(s) <= maxChars || true {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestChunkParagraphs_BudgetIsAPostCondition", "TestSplitSentences_BudgetIsAPostCondition", "TestSplitToBudget_BreaksAtTheBestBoundaryAvailable"},
+		Why: "disarms the post-condition and leaves only the detection heuristics, which is the " +
+			"state both chunkers shipped in. Detection is a guess and will always have inputs it " +
+			"does not see; the budget is a fact about the context window at the other end of the " +
+			"request. Without this line a heuristic miss silently converts the budget back into a " +
+			"suggestion, and the caller learns the real number from a truncated or rejected " +
+			"request at 2am rather than from the helper that promised it.",
+	},
+	{
+		Name:     "vamp/an LLM's \"kept\": \"false\" is read as a keep",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\tcase \"\", \"false\", \"no\", \"0\", \"off\", \"null\", \"none\":",
+		Replace:  "\t\tcase \"\":",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestFilterByField_LLMFalseStringsAreRejections"},
+		Why: "restores text/template's {{if}} truthiness as filterByField's keep/reject rule, under " +
+			"which the string \"false\" is truthy because it is non-empty. The producer named in " +
+			"that helper's own doc is an LLM quality-check stage, and models under JSON-mode " +
+			"pressure emit \"kept\": \"false\" / \"no\" / \"0\" routinely. A full enumeration put " +
+			"four items in and four out, including all three the model had REJECTED, and the " +
+			"pipeline reported success — a filter that keeps what it was told to drop.",
+	},
+	{
+		Name:     "vamp/every record an LLM was unsure about dedupes to one",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\tif !hasKey || !identifies(val) {",
+		Replace:  "\t\tif !hasKey {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestUniqueByKey_NonIdentifyingKeysPassThrough"},
+		Why: "restores the presence check that guarded the wrong thing: it distinguished ABSENT " +
+			"from PRESENT when what matters is IDENTIFYING from NOT IDENTIFYING. A JSON null key " +
+			"is present, so 15 sub-units an LLM emitted `parent_unit_id: null` for collapsed to " +
+			"ONE and the mp3 stage downstream fanned out over a single parent. Note the MustFail " +
+			"fixture carries at least TWO records of each shape — the test this replaced used one " +
+			"item, and one item cannot demonstrate a passthrough, which is why the original " +
+			"missing-key mutant survived.",
+	},
+	{
+		Name:     "vamp/the voice filter keeps exactly the segments it should drop",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\tif fmt.Sprint(val) == want {",
+		Replace:  "\t\tif fmt.Sprint(val) != want {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestFilterByValueTemplate"},
+		Why: "the highest-signal survivor in review 03: filterByValue was at 0.0% coverage, so its " +
+			"core comparison — the one deciding which \"host\":\"aria\" segments reach which TTS " +
+			"voice — could be inverted outright with the whole suite green. An inverted filter is " +
+			"not a crash; it is a finished episode in the wrong voices.",
+	},
+	{
+		Name:     "vamp/the left outer join quietly becomes an inner join",
+		File:     "internal/vamp/exec.go",
+		Find:     "\t\tmerged := make(map[string]any, len(obj)+4)\n\t\tif match, found := index[fmt.Sprint(key)]; found {",
+		Replace:  "\t\tif _, ok := index[fmt.Sprint(key)]; !ok {\n\t\t\tcontinue\n\t\t}\n\t\tmerged := make(map[string]any, len(obj)+4)\n\t\tif match, found := index[fmt.Sprint(key)]; found {",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestJoinByFieldTemplate"},
+		Why: "joinByField was the other 0.0% helper: you could change its CARDINALITY — drop every " +
+			"left row that found no match, turning the documented outer join into an inner one — " +
+			"and nothing noticed. The documented use is rejoining a filter foreach's kept subset " +
+			"to the candidate payloads, so the rows this drops are the ones whose payload the " +
+			"render stage failed to emit: the pipeline silently produces fewer episodes than the " +
+			"filter approved and reports success.",
+	},
+
 	{
 		Name: "u3/the drain verb's budget stops reaching its command",
 		File: "internal/vibe/daemon/cell_drain.go",

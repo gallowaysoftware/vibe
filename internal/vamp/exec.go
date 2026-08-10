@@ -21,6 +21,8 @@ import (
 	"sync"
 	"text/template"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gallowaysoftware/vibe/internal/vamp/cache"
 	"github.com/gallowaysoftware/vibe/internal/vibeclient"
@@ -2601,12 +2603,24 @@ func addIntTemplate(a, b int) int {
 }
 
 // splitSentencesTemplate splits a string into chunks no larger than
-// maxChars, cutting only at sentence boundaries (period, question
-// mark, or exclamation followed by whitespace). Greedy: packs as many
-// whole sentences as fit, then starts a new chunk. A single sentence
-// longer than maxChars is emitted as its own chunk (no sub-sentence
-// splitting — splitting mid-clause produces worse TTS prosody than
-// one long sentence).
+// maxChars, cutting at sentence boundaries (period, question mark, or
+// exclamation followed by whitespace) wherever it can. Greedy: packs
+// as many whole sentences as fit, then starts a new chunk.
+//
+// maxChars is a HARD post-condition, not a hint: every chunk this
+// returns is at most maxChars BYTES long (see splitToBudget for the
+// one degenerate exception). It did not used to be. A "sentence"
+// longer than the budget was emitted whole on the argument that
+// splitting mid-clause reads worse than one long sentence — which is
+// true of a sentence 10% over and false of the 9x-over chunk this
+// produced on any text whose sentence boundaries the detector missed:
+// a markdown bullet list, CJK full-width stops, prose separated by
+// NBSP. Eight of nine realistic input shapes exceeded the budget, and
+// the caller learns about it as a rejected TTS/embedding request after
+// the pipeline has already run. splitToBudget cuts at the best
+// boundary available — sentence, then clause, then word — so the
+// prosody argument is preserved wherever there is anything to preserve
+// it with.
 //
 // Use case: TTS engines like Kokoro rush long multi-sentence
 // paragraphs, eliding interior comma pauses. Splitting at sentence
@@ -2658,8 +2672,10 @@ func splitSentencesTemplate(text string, maxChars int) string {
 		sentences = append(sentences, tail)
 	}
 	if len(sentences) == 0 {
-		b, _ := json.Marshal([]string{text})
-		return string(b)
+		// No boundary anywhere in the text. The budget still applies:
+		// this fallback used to hand back the whole document as one
+		// "chunk", which is the shape that made the budget advisory.
+		return boundedChunksJSON([]string{text}, maxChars)
 	}
 
 	// Greedy pack sentences into chunks.
@@ -2685,12 +2701,133 @@ func splitSentencesTemplate(text string, maxChars int) string {
 	if pack.Len() > 0 {
 		chunks = append(chunks, pack.String())
 	}
-	b, _ := json.Marshal(chunks)
+	return boundedChunksJSON(chunks, maxChars)
+}
+
+// isSpaceRune reports whether r is whitespace, by the SAME rule as the
+// strings.TrimSpace three lines above its only caller's loop:
+// unicode.IsSpace.
+//
+// It used to enumerate four runes — ' ', '\t', '\n', '\r'. Everything
+// else unicode.IsSpace accepts (U+000B, U+000C, NBSP U+00A0, U+2007,
+// U+202F, U+3000, U+2028) was not a sentence boundary as far as
+// splitSentences was concerned, so prose whose sentences are separated
+// by an NBSP — which is what PDF text extraction and a good deal of
+// LLM output emit — came back as ONE chunk instead of six. The correct
+// answer was already in the same function, two lines up; this is the
+// two agreeing.
+func isSpaceRune(r rune) bool {
+	return unicode.IsSpace(r)
+}
+
+// boundedChunksJSON is the post-condition both text chunkers apply to
+// their own output: whatever the detection heuristics upstream decided,
+// nothing leaves over budget. Empty pieces are dropped and the result
+// is always a JSON array (never `null` — a foreach source cannot be
+// null).
+func boundedChunksJSON(chunks []string, maxChars int) string {
+	out := []string{}
+	for _, c := range chunks {
+		for _, piece := range splitToBudget(c, maxChars) {
+			if piece = strings.TrimSpace(piece); piece != "" {
+				out = append(out, piece)
+			}
+		}
+	}
+	b, _ := json.Marshal(out)
 	return string(b)
 }
 
-func isSpaceRune(r rune) bool {
-	return r == ' ' || r == '\t' || r == '\n' || r == '\r'
+// splitToBudget cuts s into pieces of at most maxChars BYTES, breaking
+// at the best boundary available at or before the budget.
+//
+// This is the enforcement half of both chunkers' contract. Detection —
+// "where are the sentences", "where are the paragraphs" — is a
+// heuristic and will always have inputs it does not see; the budget is
+// a fact about the context window on the other end of the request, and
+// a heuristic that fails must not be able to turn it back into a
+// suggestion.
+//
+// Byte-exact guarantee: every returned piece satisfies
+// len(piece) <= maxChars, with one degenerate exception — when maxChars
+// is smaller than a single rune of s (i.e. maxChars < 4 for the widest
+// UTF-8 encodings) the first piece is one whole rune, because a split
+// rune is not text. Neither chunker's default budget (300 / 2400) can
+// reach that case.
+//
+// maxChars <= 0 disables the cut; both callers resolve their default
+// before reaching here, so that path is for direct callers only.
+func splitToBudget(s string, maxChars int) []string {
+	if maxChars <= 0 || len(s) <= maxChars {
+		return []string{s}
+	}
+	var out []string
+	for len(s) > maxChars {
+		cut := bestBreak(s, maxChars)
+		if piece := strings.TrimSpace(s[:cut]); piece != "" {
+			out = append(out, piece)
+		}
+		// cut is always >= 1, so s strictly shrinks and this
+		// terminates.
+		s = strings.TrimSpace(s[cut:])
+	}
+	if s != "" {
+		out = append(out, s)
+	}
+	return out
+}
+
+// bestBreak returns the byte offset splitToBudget should cut s at,
+// always in [1, maxChars] unless a single rune is wider than the whole
+// budget.
+//
+// The cascade, best first: a sentence end (. ! ?) before whitespace, a
+// clause end (, ; : em/en dash) or a line break, any whitespace at all,
+// and finally a rune boundary. Within a quality class the LAST
+// candidate wins — cut as late as the budget allows.
+//
+// A candidate is only preferred for its QUALITY if it uses at least
+// half the budget. Without that floor a stray "Dr. " at byte 4 would
+// beat a word boundary at byte 290 and the packer would emit
+// four-character chunks for the rest of the document.
+func bestBreak(s string, maxChars int) int {
+	var sentence, clause, word, fit int
+	var prev rune
+	for i, r := range s {
+		n := utf8.RuneLen(r)
+		if i+n > maxChars {
+			break
+		}
+		fit = i + n
+		if i > 0 && unicode.IsSpace(r) {
+			switch {
+			case prev == '.' || prev == '!' || prev == '?':
+				sentence = i
+			case r == '\n' || prev == ',' || prev == ';' || prev == ':' || prev == '—' || prev == '–':
+				clause = i
+			default:
+				word = i
+			}
+		}
+		prev = r
+	}
+	if fit == 0 {
+		// One rune wider than the entire budget. Emit it whole.
+		_, n := utf8.DecodeRuneInString(s)
+		return n
+	}
+	half := maxChars / 2
+	for _, c := range []int{sentence, clause, word} {
+		if c >= half {
+			return c
+		}
+	}
+	if best := max(sentence, clause, word); best > 0 {
+		return best
+	}
+	// No whitespace at all in the budget: a single word longer than
+	// the chunk. Cut on the last rune boundary that fits.
+	return fit
 }
 
 // wordCountTemplate returns the whitespace-delimited word count of the
@@ -2715,18 +2852,32 @@ func mulIntTemplate(n int, mult float64) int {
 }
 
 // chunkParagraphsTemplate splits text into JSON-encoded chunks
-// respecting paragraph boundaries (double-newline). Greedily packs
+// respecting paragraph boundaries (blank lines). Greedily packs
 // paragraphs into chunks of up to maxChars; emits a new chunk when
-// the next paragraph would overflow. A single paragraph longer than
-// maxChars is emitted as its own chunk (no sub-paragraph splitting).
+// the next paragraph would overflow.
+//
+// maxChars is a HARD post-condition: every chunk is at most maxChars
+// BYTES. A paragraph longer than the budget on its own is sub-split by
+// splitToBudget at the best boundary available — sentence first, then
+// clause, then word — rather than emitted whole. It used to be emitted
+// whole, which is what made "no sub-paragraph splitting (to avoid
+// breaking sentences across chunks)" a promise the helper could not
+// keep: an unparagraphed 100KB document came back as one 41x-over
+// chunk, and the sentences were not preserved either way. Breaking at
+// a sentence boundary honours that intent; emitting 100KB did not.
 //
 // Returns a JSON array of objects `[{"idx": N, "text": "..."}, ...]`
 // suitable for direct use as a foreach source after wrapping in an
-// `{"items": ...}` shell. Used by the textbook-to-audiobook RAG
-// chunker: lecture_content → ~600-token chunks → embed each chunk.
+// `{"items": ...}` shell. `idx` is dense and matches the output
+// position. Used by the textbook-to-audiobook RAG chunker:
+// lecture_content → ~600-token chunks → embed each chunk.
 //
 // Empty / whitespace-only input returns `[]`. Negative or zero
-// maxChars defaults to 2400 (≈ 600 tokens at 4 chars/token).
+// maxChars defaults to 2400.
+//
+// The budget is in BYTES, not characters — 2400 is ≈ 600 tokens of
+// English at 4 chars/token, but only ~800 CJK characters, which run
+// closer to one token each. Size CJK budgets accordingly.
 func chunkParagraphsTemplate(text string, maxChars int) (string, error) {
 	if maxChars <= 0 {
 		maxChars = 2400
@@ -2747,18 +2898,16 @@ func chunkParagraphsTemplate(text string, maxChars int) (string, error) {
 		if s == "" {
 			return
 		}
-		out = append(out, chunk{Idx: len(out), Text: s})
+		for _, piece := range splitToBudget(s, maxChars) {
+			if piece = strings.TrimSpace(piece); piece != "" {
+				out = append(out, chunk{Idx: len(out), Text: piece})
+			}
+		}
 		cur.Reset()
 	}
-	for _, para := range strings.Split(strings.TrimSpace(text), "\n\n") {
-		para = strings.TrimSpace(para)
-		if para == "" {
-			continue
-		}
+	for _, para := range splitParagraphs(text) {
 		// If adding this paragraph would push us over the budget AND
-		// the current chunk is non-empty, flush first. A single
-		// over-budget paragraph is emitted alone (we don't sub-split
-		// to avoid breaking sentences across chunks).
+		// the current chunk is non-empty, flush first.
 		if cur.Len() > 0 && cur.Len()+len(para)+2 > maxChars {
 			flush()
 		}
@@ -2775,6 +2924,44 @@ func chunkParagraphsTemplate(text string, maxChars int) (string, error) {
 	return string(b), nil
 }
 
+// splitParagraphs cuts text at blank lines, returning the non-empty
+// paragraphs in order with each one whitespace-trimmed.
+//
+// A line is BLANK when it is empty after unicode-whitespace trimming.
+// That is the whole finding: this replaced
+// strings.Split(text, "\n\n"), which recognised one literal separator
+// and therefore did not see a CRLF document (`\r\n\r\n`), a separating
+// line carrying a stray space or tab, or an NBSP. A correctly
+// paragraphed Windows-authored source came back as ONE paragraph —
+// 3.2x over a 2400-byte budget on a 7.6KB document — and the packer
+// above, having been handed a single paragraph, had nothing to pack.
+// Absent evidence (no separator matched) read as a healthy value
+// (nothing needed splitting).
+//
+// Line endings are normalised to \n first, so `\r\n` and a lone `\r`
+// both behave as newlines throughout, including inside a paragraph.
+func splitParagraphs(text string) []string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	var out []string
+	var cur []string
+	flush := func() {
+		if p := strings.TrimSpace(strings.Join(cur, "\n")); p != "" {
+			out = append(out, p)
+		}
+		cur = cur[:0]
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == "" {
+			flush()
+			continue
+		}
+		cur = append(cur, line)
+	}
+	flush()
+	return out
+}
+
 // uniqueByKeyTemplate dedupes a JSON array of objects by the named key,
 // keeping the first occurrence of each unique value and preserving input
 // order. Used to derive a `{"items":[...]}` set of distinct "parents"
@@ -2789,8 +2976,26 @@ func chunkParagraphsTemplate(text string, maxChars int) (string, error) {
 //     the above, with optional ```json fences (LLM artifact).
 //
 // Output is always `{"items":[<deduped>]}` so it can drive a foreach.
-// Items lacking the named key are passed through verbatim (treated as
-// non-mergeable singletons).
+//
+// Passthrough rules — an item that cannot be identified is never
+// deduped away:
+//   - a non-object item (scalar, array) passes through verbatim
+//   - an item LACKING the key passes through verbatim
+//   - an item whose key is JSON null, or a blank/empty string, passes
+//     through verbatim. This is the one that used to lose data: the
+//     presence check distinguished ABSENT from PRESENT when the thing
+//     that matters is IDENTIFYING from NOT IDENTIFYING, so 15 items an
+//     LLM emitted `"parent_unit_id": null` for collapsed to ONE and the
+//     foreach downstream fanned out over a single parent.
+//
+// Dedupe identity is the key's TYPE and value, not fmt.Sprint(value)
+// alone: `{"id":1}` and `{"id":"1"}` are distinct records, and so are
+// `{"id":null}` and `{"id":"<nil>"}`, which the bare-string key
+// collided.
+//
+// First occurrence wins, which is also joinByFieldTemplate's rule for
+// duplicate right-hand keys. The two are deliberately the same; see
+// that function's comment.
 func uniqueByKeyTemplate(key, raw string) (string, error) {
 	if key == "" {
 		return "", fmt.Errorf("uniqueByKey: key is required")
@@ -2808,11 +3013,11 @@ func uniqueByKeyTemplate(key, raw string) (string, error) {
 			continue
 		}
 		val, hasKey := obj[key]
-		if !hasKey {
+		if !hasKey || !identifies(val) {
 			out = append(out, obj)
 			continue
 		}
-		k := fmt.Sprint(val)
+		k := dedupeKey(val)
 		if seen[k] {
 			continue
 		}
@@ -2830,6 +3035,34 @@ func uniqueByKeyTemplate(key, raw string) (string, error) {
 	return string(res), nil
 }
 
+// identifies reports whether a JSON value can serve as a record's
+// identity for dedupe or join purposes.
+//
+// JSON null and a blank string are PRESENT but identify nothing. An
+// LLM emits them for exactly the items it was unsure about, and those
+// are the items a dedupe must not fold together — "I don't know" is not
+// a shared identity. Treating them as one key is data loss that reports
+// as success.
+func identifies(val any) bool {
+	switch t := val.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(t) != ""
+	default:
+		return true
+	}
+}
+
+// dedupeKey renders a JSON value as a map key that does not collide
+// across types. fmt.Sprint alone rendered float64(1) and string("1")
+// identically, so `[{"id":1},{"id":"1"}]` deduped to one record; nil
+// and the literal string "<nil>" collided the same way. The \x00
+// separator cannot appear in a %T.
+func dedupeKey(val any) string {
+	return fmt.Sprintf("%T\x00%v", val, val)
+}
+
 // filterByFieldTemplate keeps only the items whose named field is
 // truthy (bool true, non-zero number, non-empty string). Useful as a
 // generic filter step after a foreach quality-check stage emits a
@@ -2845,6 +3078,12 @@ func uniqueByKeyTemplate(key, raw string) (string, error) {
 // Items that don't carry the field at all are DROPPED — a missing
 // field is treated as "rejected", matching the "kept items advertise
 // themselves" mental model.
+//
+// The truthiness rule is isKeptField, NOT Go template's {{if}}: a
+// string field carrying a canonical false literal ("false", "no", "0",
+// "off", "null", "none", any case, trimmed) is a REJECTION, not a
+// non-empty string. See isKeptField for why the two contracts had to
+// be separated.
 func filterByFieldTemplate(field, raw string) (string, error) {
 	if field == "" {
 		return "", fmt.Errorf("filterByField: field is required")
@@ -2863,7 +3102,7 @@ func filterByFieldTemplate(field, raw string) (string, error) {
 		if !has {
 			continue
 		}
-		if isTruthy(val) {
+		if isKeptField(val) {
 			out = append(out, obj)
 		}
 	}
@@ -2875,9 +3114,45 @@ func filterByFieldTemplate(field, raw string) (string, error) {
 	return string(res), nil
 }
 
+// isKeptField is filterByField's predicate: does this field value say
+// the producing stage KEPT the item?
+//
+// It is deliberately not isTruthy. isTruthy's contract is "mirror
+// text/template's {{if}}", and by that standard the string "false" is
+// truthy — it is non-empty. filterByField's contract is different and
+// its doc always said so: the field means kept/rejected, and the
+// producer named in that doc is an LLM. Models under JSON-mode
+// pressure emit `"kept": "false"`, `"kept": "no"` and `"kept": "0"`
+// routinely, and every one of those was a KEEP: a full enumeration of
+// the JSON value space put four items in and four items out, including
+// all three the model had rejected. The pipeline reported success.
+//
+// So the two contracts get two functions instead of one function with
+// two meanings. Everything that is not a string defers to isTruthy,
+// which is correct for bool / number / null / [] / {} and matches
+// {{if}} exactly.
+//
+// The rejected literals are compared case-insensitively after trimming:
+// "" (already isTruthy-false), "false", "no", "0", "off", "null",
+// "none". Not "n" — a one-letter field value is as likely to be a
+// legitimate datum as a negation, and this predicate DROPS records.
+func isKeptField(v any) bool {
+	if s, ok := v.(string); ok {
+		switch strings.ToLower(strings.TrimSpace(s)) {
+		case "", "false", "no", "0", "off", "null", "none":
+			return false
+		}
+		return true
+	}
+	return isTruthy(v)
+}
+
 // isTruthy mirrors Go template's truthiness rules (text/template
 // {{if .X}}) for the kinds of JSON-decoded values we see: bool, all
 // numeric forms, string, slice, map.
+//
+// It is a faithful mirror, which is why filterByField does not call it
+// directly — see isKeptField.
 func isTruthy(v any) bool {
 	switch t := v.(type) {
 	case bool:
@@ -2906,9 +3181,12 @@ func isTruthy(v any) bool {
 // foreach over only one category at a time (because the audio
 // stage's Voice field is set per-stage, not per-iteration).
 //
-// Output shape: {"items":[<matching items>]}. Items lacking the
-// field are dropped. Numeric values are stringified before
-// comparison so the caller can use plain string literals.
+// Output shape: {"items":[<matching items>]}. Non-object items and
+// items lacking the field are dropped. Comparison is EXACT string
+// equality against fmt.Sprint of the value, so `want` is
+// case-sensitive and a JSON number 1 matches "1" (the caller can use
+// plain string literals) while 1.5 matches "1.5" and 1e3 matches
+// "1000".
 func filterByValueTemplate(field, want, raw string) (string, error) {
 	if field == "" {
 		return "", fmt.Errorf("filterByValue: field is required")
@@ -2941,8 +3219,7 @@ func filterByValueTemplate(field, want, raw string) (string, error) {
 
 // joinByFieldTemplate merges two parallel `{"items":[...]}` arrays
 // on a shared field, returning the LEFT side's items decorated with
-// the matched RIGHT-side fields. Items from left that lack a match
-// in right are passed through unchanged.
+// the matched RIGHT-side fields.
 //
 // Concrete use case: a filter foreach emits per-item
 // {"keep":bool,"id":"X"}; a separate render stage has the full
@@ -2952,8 +3229,34 @@ func filterByValueTemplate(field, want, raw string) (string, error) {
 // LLM to echo the snippet (which blew the JSON budget on long
 // snippets).
 //
-// Left wins on field-name collisions: a left item that already has
-// the joined field keeps its value.
+// Semantics, in full, because none of this is guessable from the name:
+//
+//   - It is a LEFT OUTER join. Every left item appears in the output
+//     exactly once, in input order. A left item with no match is passed
+//     through undecorated — and the caller cannot distinguish that from
+//     "matched, and the right row had no extra fields".
+//   - Right-only rows are DROPPED. Nothing reports how many.
+//   - Left wins on field-name collisions: a left item that already has
+//     the joined field keeps its value.
+//   - Duplicate keys on the RIGHT resolve FIRST-wins. This used to be
+//     last-wins, silently, and undocumented — the opposite of
+//     uniqueByKeyTemplate's rule 150 lines up in the same file. Two
+//     adjacent helpers disagreeing about which duplicate survives is
+//     not a thing a pipeline author can be expected to hold in their
+//     head, so they now agree: the first occurrence is canonical. The
+//     realistic producer of a duplicate right key is LLM repetition or
+//     a retry that appended, and in both of those the first payload is
+//     the one that was actually reviewed.
+//   - Non-object left items are DROPPED, where uniqueByKey passes them
+//     through. That difference IS deliberate: uniqueByKey returns its
+//     input, so a scalar can survive it; a join returns decorated
+//     OBJECTS, and a scalar has no field to join on and no shape to
+//     decorate.
+//   - A join key that identifies nothing — JSON null, a blank string —
+//     does not join. Right rows carrying one are not indexed, left rows
+//     carrying one pass through undecorated. Otherwise every left row
+//     an LLM was unsure about would join to whichever equally-unsure
+//     right row happened to index; see identifies.
 func joinByFieldTemplate(field, leftRaw, rightRaw string) (string, error) {
 	if field == "" {
 		return "", fmt.Errorf("joinByField: field is required")
@@ -2969,8 +3272,11 @@ func joinByFieldTemplate(field, leftRaw, rightRaw string) (string, error) {
 	index := make(map[string]map[string]any, len(right))
 	for _, item := range right {
 		if obj, ok := item.(map[string]any); ok {
-			if val, has := obj[field]; has {
-				index[fmt.Sprint(val)] = obj
+			if val, has := obj[field]; has && identifies(val) {
+				k := fmt.Sprint(val)
+				if _, dup := index[k]; !dup {
+					index[k] = obj // first wins; see the doc comment
+				}
 			}
 		}
 	}
@@ -2981,7 +3287,7 @@ func joinByFieldTemplate(field, leftRaw, rightRaw string) (string, error) {
 			continue
 		}
 		key, has := obj[field]
-		if !has {
+		if !has || !identifies(key) {
 			out = append(out, obj)
 			continue
 		}

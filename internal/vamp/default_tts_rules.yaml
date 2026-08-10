@@ -43,30 +43,77 @@ rules:
       differential / ratio notation common in chemistry + physics
       textbooks. Lowercase 'd' anchored.
 
-  - regex: '\b([0-9]+)/([0-9]+)\b'
-    replacement: '$1 over $2'
+  - regex: '(^|[^0-9/])([0-9]+)/([0-9]+)($|[^0-9/])'
+    replacement: '${1}${2} over ${3}${4}'
     note: |
-      "1/2", "3/4" -> "1 over 2", "3 over 4". Skips dates with
-      slashes (those have 3+ digit groups and are caught elsewhere
-      OR not worth fixing in v1).
+      "1/2", "3/4" -> "1 over 2", "3 over 4", and now actually skips
+      dates. The old form was '\b([0-9]+)/([0-9]+)\b', whose note
+      already claimed dates were "caught elsewhere" — they were not,
+      and nothing was elsewhere: 8/9/2026 came out "8 over 9/2026",
+      heard as "eight over nine slash two thousand twenty six". RE2
+      has no lookaround, so the guards are ordinary capture groups
+      that consume one character on each side and re-emit it. That is
+      also why this rule appears TWICE: consuming the right-hand
+      character means a second fraction separated by a SINGLE
+      character ("1/2 3/4") starts inside the first match's tail and
+      is missed. The second pass sees the rewritten text and catches
+      it. ${N} braces are required — $1grams would parse as a group
+      NAMED "1grams".
+
+  - regex: '(^|[^0-9/])([0-9]+)/([0-9]+)($|[^0-9/])'
+    replacement: '${1}${2} over ${3}${4}'
+    note: 'Second pass; see above.'
 
   # ---- Units / abbreviations the TTS doesn't speak naturally ----
+  #
+  # Every unit rule is a REGEX with a left boundary, not a literal
+  # `pattern:`. A literal is strings.ReplaceAll, which fires mid-token:
+  # `pattern: 'm/s'` turned "km/s" into "kmetres per second" and
+  # `pattern: 'g/L'` turned "µg/L" into "µgrams per litre" — worse
+  # than the untouched input, in a chemistry textbook, silently.
+  # `mg/L` escaped only because it happened to be ordered first.
+  #
+  # The left guard is `(^|[^A-Za-z])` re-emitted as ${1} rather than
+  # `\b`, because Go's `\b` is ASCII-only: there is no word boundary
+  # in front of `µ`, so `\bµg/L` could never match at all.
 
-  - pattern: 'mg/L'
-    replacement: 'milligrams per litre'
+  - regex: '(^|[^A-Za-z])km/s\b'
+    replacement: '${1}kilometres per second'
+
+  - regex: '(^|[^A-Za-z])cm/s\b'
+    replacement: '${1}centimetres per second'
+
+  - regex: '(^|[^A-Za-z])mm/s\b'
+    replacement: '${1}millimetres per second'
+
+  - regex: '(^|[^A-Za-z])m/s\b'
+    replacement: '${1}metres per second'
+
+  - regex: '(^|[^A-Za-zµμ])mg/L\b'
+    replacement: '${1}milligrams per litre'
     note: 'Concentration units.'
 
-  - pattern: 'L/kg'
-    replacement: 'litres per kilogram'
+  - regex: '(µ|μ)g/L\b'
+    replacement: 'micrograms per litre'
+    note: |
+      Both the MICRO SIGN (U+00B5) and GREEK SMALL LETTER MU (U+03BC)
+      — text extraction emits either. The prefix is consumed, not
+      re-emitted: it IS the "micro".
 
-  - pattern: 'kg/m³'
-    replacement: 'kilograms per cubic metre'
+  - regex: '(^|[^A-Za-z])ng/L\b'
+    replacement: '${1}nanograms per litre'
 
-  - pattern: 'g/L'
-    replacement: 'grams per litre'
+  - regex: '(^|[^A-Za-zµμ])g/L\b'
+    replacement: '${1}grams per litre'
 
-  - pattern: 'm/s'
-    replacement: 'metres per second'
+  - regex: '(^|[^A-Za-z])L/kg\b'
+    replacement: '${1}litres per kilogram'
+
+  - regex: '(^|[^A-Za-z])kg/m³'
+    replacement: '${1}kilograms per cubic metre'
+    note: |
+      No trailing \b: `³` is not an ASCII word character, so a word
+      boundary after it can never match.
 
   - regex: '\b([0-9.]+)°([CFK])\b'
     replacement: '$1 degrees $2'
@@ -82,7 +129,16 @@ rules:
       we accept the no-anchor form here.
 
   # ---- Acronyms Kokoro mangles ----
-
-
-
+  #
+  # Deliberately empty, and this comment is the reason it is not a
+  # bare header. A section with nothing under it reads as "somebody
+  # meant to fill this in", and the fraction rule above used to point
+  # at it — "caught elsewhere" — as if it had.
+  #
+  # There is no shared acronym list because there is no shared domain.
+  # LAA, ABV, PMID and the rest are per-pipeline, and a spell-out that
+  # is right for a distillery script is wrong for a chemistry one.
+  # Domain acronyms belong in the owning pipeline's tts_rules.yaml,
+  # which layers on top of this file; the test
+  # TestTTSNormalize_UnitsExpandedAcronymsUntouched pins that.
 
