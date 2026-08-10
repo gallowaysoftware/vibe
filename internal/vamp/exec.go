@@ -129,16 +129,33 @@ const (
 // the key composer had no branch for it, so every pandoc stage reported
 // "cache: miss" forever and re-converted a whole EPUB on every run.
 //
-// The three consumers:
+// The consumers, each with the test that walks this list for it:
 //
 //   - newStageRegistry (below) — TestEveryStageTypeHasAnExecutor asserts
 //     the key set is exactly this list, so a type with no executor cannot
 //     reach `executorFor`'s runtime error.
 //   - Schema()'s stage `type` enum (schema.go).
-//   - TestCacheableAndKeyableAgree (cache_contract_test.go) — walks the
-//     list and asserts stageCacheable and computeStageCacheKey answer the
-//     same question for every one of them. That is the guard that makes the
-//     defect above unrepresentable rather than merely fixed.
+//   - stageCacheable / computeStageCacheKey (cache_key.go) —
+//     TestCacheableAndKeyableAgree walks the list and asserts the two
+//     answer the same question for every one of them. That is the guard
+//     that makes the defect above unrepresentable rather than merely fixed.
+//   - dryrun.go's formatStageHeader and dryRunRenderPerType —
+//     TestEveryStageTypeIsPreviewedByDryRun runs a real DryRun over one
+//     stage of every type.
+//   - diff.go's renderStagePromptForDiff —
+//     TestEveryStageTypeIsComparedByDiff runs a real Compare over two runs
+//     whose yaml is byte-identical and whose inputs differ.
+//
+// This comment said "the three consumers" while there were five, and the
+// two it did not count were both wrong: `vamp run --dry-run` returned
+// `unknown stage type "pandoc"` and refused to plan any pipeline
+// containing compact/pandoc/mix/short, and `vamp diff` compared those
+// four (plus confirm) not at all and rendered the silence as agreement.
+// A list of consumers maintained by hand in a comment is the same defect
+// class as a per-type rule maintained by hand in N switches, so the list
+// above is now backed by TestStageTypeSwitchesAreExhaustive, which reads
+// THIS declaration out of the AST and requires every stage-type switch in
+// diff.go / dryrun.go to name every entry.
 //
 // The empty string is deliberately absent: it is a spelling of
 // StageTypeText (see stageTypeOrDefault), not a type of its own.

@@ -188,7 +188,11 @@ func RunPipeline(ctx context.Context, p *vamp.Pipeline, pipelineDir string, pipe
 		RunDir:         runDir,
 		Log:            logOut,
 	}
-	if !opts.NoCache && !vamp.EnvCacheDisabled() {
+	// Not on the dry-run path: cache.New MkdirAlls its root, and DryRun
+	// never consults exec.Cache — so the store was a pure side effect on
+	// the one flag whose help text promises that no files are written.
+	// TestRunPipeline_DryRunWritesNothing is what keeps that true.
+	if !opts.DryRun && !opts.NoCache && !vamp.EnvCacheDisabled() {
 		if store, err := cache.New(cache.DefaultRoot()); err == nil {
 			exec.Cache = store
 		} else {
