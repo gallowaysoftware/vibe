@@ -148,11 +148,11 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 		return nil, fmt.Errorf("stage %s: rendered voice is empty — st.Voice template produced no content", st.ID)
 	}
 
-	// Render the output path. Audio stages own their own output write so
-	// we render here and pass the absolute path to whichever engine writes
+	// Resolve the output path. Audio stages own their own output write so
+	// we resolve here and pass the absolute path to whichever engine writes
 	// the file (piper subprocess via --output-file, kokoro path via our
-	// own os.WriteFile after the HTTP response).
-	outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
+	// own write after the HTTP response).
+	outRel, err := stageOutputPath(st, in, extra)
 	if err != nil {
 		return nil, fmt.Errorf("stage %s: render output path: %w", st.ID, err)
 	}
@@ -203,7 +203,13 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 	if binary == "" {
 		binary = "piper"
 	}
-	args := []string{"--model", voicePath, "--output-file", outAbs}
+	// piper writes wherever --output-file points, so it points at the
+	// scratch file: a killed piper (or a killed effect pass below) must
+	// not leave a short WAV at the real path, where the concat walk would
+	// glue it into the audiobook and --resume would read it as a
+	// completed item.
+	tmpAbs := beginPartialOutput(outAbs)
+	args := []string{"--model", voicePath, "--output-file", tmpAbs}
 
 	runner := a.runner
 	if runner == nil {
@@ -215,10 +221,15 @@ func (a *audioExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 		fmt.Fprintf(in.Log, "piper: %s (voice=%s, %d chars)\n", outRel, voice, len(text))
 	}
 	if err := runner.Run(ctx, binary, args, text); err != nil {
+		discardPartialOutput(tmpAbs)
 		return nil, fmt.Errorf("stage %s: piper: %w", st.ID, err)
 	}
-	if err := applyAudioEffect(ctx, outAbs, st.Effect, "ffmpeg"); err != nil {
+	if err := applyAudioEffect(ctx, tmpAbs, st.Effect, "ffmpeg"); err != nil {
+		discardPartialOutput(tmpAbs)
 		return nil, fmt.Errorf("stage %s: %w", st.ID, err)
+	}
+	if err := finalizeOutput(st.ID, "piper", tmpAbs, outAbs); err != nil {
+		return nil, err
 	}
 	// Report ABSOLUTE path: downstream {{ .stages.X.output(s) }} references
 	// land on argv strings consumed by ffmpeg/etc. subprocesses running from
@@ -306,11 +317,21 @@ func (a *audioExecutor) executeKokoro(ctx context.Context, in StageInput, st *St
 	// painful. Patch the RIFF size in-place so the header agrees with
 	// reality before we land the bytes.
 	patchRIFFSize(wav)
-	if err := os.WriteFile(outAbs, wav, 0o644); err != nil {
+	// Scratch file then rename, same as the piper path: os.WriteFile
+	// truncates the destination before it writes, so the previous run's
+	// good segment is destroyed the instant this call starts and a kill
+	// part-way through leaves a short WAV at the real path.
+	tmpAbs := beginPartialOutput(outAbs)
+	if err := os.WriteFile(tmpAbs, wav, 0o644); err != nil {
+		discardPartialOutput(tmpAbs)
 		return nil, fmt.Errorf("stage %s: write %s: %w", st.ID, outAbs, err)
 	}
-	if err := applyAudioEffect(ctx, outAbs, st.Effect, "ffmpeg"); err != nil {
+	if err := applyAudioEffect(ctx, tmpAbs, st.Effect, "ffmpeg"); err != nil {
+		discardPartialOutput(tmpAbs)
 		return nil, fmt.Errorf("stage %s: %w", st.ID, err)
+	}
+	if err := finalizeOutput(st.ID, "kokoro", tmpAbs, outAbs); err != nil {
+		return nil, err
 	}
 	return &StageOutput{Files: []string{outAbs}}, nil
 }

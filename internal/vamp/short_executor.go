@@ -92,14 +92,15 @@ func (s *shortExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 		probe = probeDurationMs
 	}
 
-	outputPath, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
+	outRel, err := stageOutputPath(st, in, extra)
 	if err != nil {
 		return nil, fmt.Errorf("stage %s: render output: %w", st.ID, err)
 	}
-	outputPath = resolveInRunDir(outputPath, in.RunDir)
+	outputPath := resolveInRunDir(outRel, in.RunDir)
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
 		return nil, fmt.Errorf("stage %s: mkdir output: %w", st.ID, err)
 	}
+	tmpPath := beginPartialOutput(outputPath)
 
 	fontFile := captionFontFile()
 
@@ -245,20 +246,20 @@ func (s *shortExecutor) Execute(ctx context.Context, in StageInput) (*StageOutpu
 			args = append(args, "-metadata", fmt.Sprintf("%s=%s", k, rendered))
 		}
 	}
-	args = append(args, "-y", outputPath)
+	args = append(args, "-y", tmpPath)
 
 	if in.Log != nil {
 		fmt.Fprintf(in.Log, "short: %s (%d shot(s), %dx%d@%d)\n", filepath.Base(outputPath), n, w, h, fps)
 	}
 	if err := runner.Run(ctx, binary, args, in.Log); err != nil {
+		discardPartialOutput(tmpPath)
 		return nil, fmt.Errorf("stage %s: ffmpeg short: %w", st.ID, err)
 	}
-	info, err := os.Stat(outputPath)
-	if err != nil {
-		return nil, fmt.Errorf("stage %s: stat output: %w", st.ID, err)
-	}
-	if info.Size() == 0 {
-		return nil, fmt.Errorf("stage %s: ffmpeg produced 0-byte output at %s", st.ID, outputPath)
+	// Check the SCRATCH file, then publish it: the vertical video only
+	// appears at its real path once ffmpeg has finished and produced
+	// something. Same helper as every other file-producing executor.
+	if err := finalizeOutput(st.ID, "ffmpeg short", tmpPath, outputPath); err != nil {
+		return nil, err
 	}
 	return &StageOutput{Files: []string{outputPath}}, nil
 }

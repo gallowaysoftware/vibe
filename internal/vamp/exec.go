@@ -188,6 +188,15 @@ type StageInput struct {
 	Item         any                // foreach item bound here (nil when not in a foreach)
 	ItemIdx      int                // foreach index (0 when not in a foreach)
 
+	// OutPath is the stage's output path, relative to RunDir, ALREADY
+	// rendered and already checked to resolve inside the run dir.
+	// Executors read it through stageOutputPath rather than rendering
+	// st.Output themselves, so the path the runner validated is the path
+	// that reaches the filesystem. Empty for foreach items, whose per-item
+	// binding only exists inside the fan-out; stageOutputPath renders and
+	// checks those itself.
+	OutPath string
+
 	// BaseURL is the inference root for this invocation (e.g.
 	// http://127.0.0.1:9000); /v1 is NOT included. Populated by the
 	// scheduler from the currently-active vibe profile. Text stages talk
@@ -1242,6 +1251,32 @@ func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID
 
 	e.timing.StageStart(st.ID, stageType)
 	in := e.makeStageInput(st, baseURL, modelID, backendAddr, tokenSink, nil, 0)
+	// Render and CHECK the output path here, before dispatch, and hand the
+	// result to the executor on StageInput.
+	//
+	// This is the one place a non-foreach stage's output path can be
+	// checked, because the len(out.Files) short-circuit below returns
+	// before the write-back path's guarded renderOutputPath ever runs. The
+	// stage types that report out.Files are exactly the ones that write
+	// media — comfyui, ffmpeg, audio, pandoc, mix, short — so rendering it
+	// only on the text path left every binary stage joining its OWN
+	// rendered path to RunDir with nothing checking it, and an escaping
+	// path is then what `.stages.<id>.output` resolves to for every
+	// downstream stage's argv and prompt.
+	//
+	// The binding is the superset of what the executors render against
+	// (mix already exposes pipeline_status / failure_summary in its output
+	// template), so the value computed here is byte-identical to the one
+	// each executor used to compute for itself.
+	outPath, err := e.renderOutputPath(st, map[string]any{
+		"pipeline_status": in.PipelineStatus,
+		"failure_summary": in.FailureSummary,
+	})
+	if err != nil {
+		e.timing.StageEnd(st.ID, "error", e.stageNotes(st))
+		return fmt.Errorf("render output path: %w", err)
+	}
+	in.OutPath = outPath
 	// Carry an inference-metrics collector through ctx; text stages' LLM call
 	// fills it (other stage types leave it empty), and we attach it to the
 	// stage's timing record for the tok/s column. Threading via ctx keeps the
@@ -1254,11 +1289,11 @@ func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID
 	}
 	e.timing.StageThroughput(st.ID, metrics)
 
-	// ComfyUI stages own their own output-path rendering + writing because
-	// the executor copies a binary file (or files) to disk inside Execute and
-	// reports the result via out.Files. Treat out.Files (when set) as the
-	// canonical record and keep stageOutputs.Output as the joined paths so
-	// downstream `.stages.<id>.output` references still resolve.
+	// ComfyUI stages own their own output WRITE because the executor copies
+	// a binary file (or files) to disk inside Execute and reports the
+	// result via out.Files. Treat out.Files (when set) as the canonical
+	// record and keep stageOutputs.Output as the joined paths so downstream
+	// `.stages.<id>.output` references still resolve.
 	if len(out.Files) > 0 {
 		e.mu.Lock()
 		e.stageOutputs[st.ID] = &stageResult{Output: strings.Join(out.Files, "\n")}
@@ -1270,11 +1305,6 @@ func (e *Executor) executeStage(ctx context.Context, st *Stage, baseURL, modelID
 		return nil
 	}
 
-	outPath, err := e.renderOutputPath(st, nil)
-	if err != nil {
-		e.timing.StageEnd(st.ID, "error", e.stageNotes(st))
-		return fmt.Errorf("render output path: %w", err)
-	}
 	if err := writeFile(filepath.Join(e.RunDir, outPath), out.Text); err != nil {
 		e.timing.StageEnd(st.ID, "error", e.stageNotes(st))
 		return err

@@ -104,13 +104,13 @@ func (f *ffmpegExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 		args = append(args, rendered)
 	}
 
-	// Render the output path. ffmpeg stages own their own output write (the
-	// ffmpeg subprocess does it), so we render here and pass the absolute
+	// Resolve the output path. ffmpeg stages own their own output write (the
+	// ffmpeg subprocess does it), so we resolve here and pass the absolute
 	// path on the argv. We ALSO report the absolute form in StageOutput.Files
 	// so downstream `.stages.<id>.output` references resolve from the
 	// daemon's CWD (subprocesses like ffmpeg/Piper can't open RunDir-relative
 	// paths).
-	outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
+	outRel, err := stageOutputPath(st, in, extra)
 	if err != nil {
 		return nil, fmt.Errorf("stage %s: render output path: %w", st.ID, err)
 	}
@@ -118,13 +118,14 @@ func (f *ffmpegExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 	if err := os.MkdirAll(filepath.Dir(outAbs), 0o755); err != nil {
 		return nil, fmt.Errorf("stage %s: create output dir: %w", st.ID, err)
 	}
+	tmpAbs := beginPartialOutput(outAbs)
 
 	// `-y` forces overwrite so reruns into the same run dir don't hang on
 	// the interactive "y/n" prompt ffmpeg would otherwise emit on stderr.
-	// We append it (along with the output path) AFTER the user args so
-	// ffmpeg's positional argv parser treats the rendered path as the
-	// output file, not as an input or an option value.
-	args = append(args, "-y", outAbs)
+	// We append it (along with the scratch path) AFTER the user args so
+	// ffmpeg's positional argv parser treats it as the output file, not as
+	// an input or an option value.
+	args = append(args, "-y", tmpAbs)
 
 	binary := st.Binary
 	if binary == "" {
@@ -148,9 +149,10 @@ func (f *ffmpegExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 		fmt.Fprintf(in.Log, "ffmpeg: %s (%d arg(s))\n", outRel, len(st.FFmpegArgs))
 	}
 	if err := runner.Run(ctx, binary, args, in.Log); err != nil {
+		discardPartialOutput(tmpAbs)
 		return nil, fmt.Errorf("stage %s: ffmpeg: %w", st.ID, err)
 	}
-	if err := requireNonEmptyOutput(st.ID, "ffmpeg", outAbs); err != nil {
+	if err := finalizeOutput(st.ID, "ffmpeg", tmpAbs, outAbs); err != nil {
 		return nil, err
 	}
 	return &StageOutput{Files: []string{outAbs}}, nil
@@ -211,6 +213,13 @@ func (f *ffmpegExecutor) executeConcatWavs(ctx context.Context, in StageInput, s
 		if d.IsDir() {
 			return nil
 		}
+		// Skip vamp's own scratch. A half-written segment is still a
+		// .wav, and this walk is what decides the audiobook's contents —
+		// it must not glue in a file whose producer is still running (a
+		// sibling foreach item) or was killed (a crash's leftovers).
+		if isScratchName(d.Name()) {
+			return nil
+		}
 		if strings.EqualFold(filepath.Ext(d.Name()), ".wav") {
 			wavs = append(wavs, path)
 		}
@@ -236,8 +245,8 @@ func (f *ffmpegExecutor) executeConcatWavs(ctx context.Context, in StageInput, s
 		return wavs[i] < wavs[j]
 	})
 
-	// Render the output path.
-	outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
+	// Resolve the output path.
+	outRel, err := stageOutputPath(st, in, extra)
 	if err != nil {
 		return nil, fmt.Errorf("stage %s: render output path: %w", st.ID, err)
 	}
@@ -245,6 +254,7 @@ func (f *ffmpegExecutor) executeConcatWavs(ctx context.Context, in StageInput, s
 	if err := os.MkdirAll(filepath.Dir(outAbs), 0o755); err != nil {
 		return nil, fmt.Errorf("stage %s: create output dir: %w", st.ID, err)
 	}
+	tmpAbs := beginPartialOutput(outAbs)
 
 	// Create concat file list. Path is scoped by stage ID and item index
 	// so concurrent writers never share a list: parallel foreach
@@ -280,7 +290,7 @@ func (f *ffmpegExecutor) executeConcatWavs(ctx context.Context, in StageInput, s
 		"-i", listPath,
 		"-c:a", "libmp3lame",
 		"-b:a", "128k",
-		"-y", outAbs,
+		"-y", tmpAbs,
 	}
 
 	runner := f.runner
@@ -294,9 +304,10 @@ func (f *ffmpegExecutor) executeConcatWavs(ctx context.Context, in StageInput, s
 		fmt.Fprintf(in.Log, "ffmpeg concat: %s (%d wav(s))\n", outRel, len(wavs))
 	}
 	if err := runner.Run(ctx, binary, args, in.Log); err != nil {
+		discardPartialOutput(tmpAbs)
 		return nil, fmt.Errorf("stage %s: ffmpeg concat: %w", st.ID, err)
 	}
-	if err := requireNonEmptyOutput(st.ID, "ffmpeg concat", outAbs); err != nil {
+	if err := finalizeOutput(st.ID, "ffmpeg concat", tmpAbs, outAbs); err != nil {
 		return nil, err
 	}
 	return &StageOutput{Files: []string{outAbs}}, nil
@@ -514,6 +525,12 @@ func (f *ffmpegExecutor) executeConcatVideo(ctx context.Context, in StageInput, 
 	if variable == "" {
 		variable = DefaultForeachVar
 	}
+	// Output path first: a stage that cannot legally write anywhere should
+	// not first stat every clip it will never concatenate.
+	outRel, err := stageOutputPath(st, in, extra)
+	if err != nil {
+		return nil, fmt.Errorf("stage %s: render output path: %w", st.ID, err)
+	}
 	clips := make([]string, 0, len(items))
 	for i, raw := range items {
 		itemExtra := map[string]any{variable: raw, "i": i}
@@ -535,14 +552,11 @@ func (f *ffmpegExecutor) executeConcatVideo(ctx context.Context, in StageInput, 
 
 	w, h, fps := normalizeVideoDims(st.ConcatVideoWidth, st.ConcatVideoHeight, st.ConcatVideoFPS)
 
-	outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
-	if err != nil {
-		return nil, fmt.Errorf("stage %s: render output path: %w", st.ID, err)
-	}
 	outAbs := filepath.Join(in.RunDir, outRel)
 	if err := os.MkdirAll(filepath.Dir(outAbs), 0o755); err != nil {
 		return nil, fmt.Errorf("stage %s: create output dir: %w", st.ID, err)
 	}
+	tmpAbs := beginPartialOutput(outAbs)
 
 	binary := st.Binary
 	if binary == "" {
@@ -558,14 +572,15 @@ func (f *ffmpegExecutor) executeConcatVideo(ctx context.Context, in StageInput, 
 		}
 		runner = ffmpegCommandRunner{}
 	}
-	args := append(concatVideoArgs(clips, w, h, fps), "-y", outAbs)
+	args := append(concatVideoArgs(clips, w, h, fps), "-y", tmpAbs)
 	if in.Log != nil {
 		fmt.Fprintf(in.Log, "ffmpeg concat_video: %s (%d clip(s), %dx%d@%d)\n", outRel, len(clips), w, h, fps)
 	}
 	if err := runner.Run(ctx, binary, args, in.Log); err != nil {
+		discardPartialOutput(tmpAbs)
 		return nil, fmt.Errorf("stage %s: ffmpeg concat_video: %w", st.ID, err)
 	}
-	if err := requireNonEmptyOutput(st.ID, "ffmpeg concat_video", outAbs); err != nil {
+	if err := finalizeOutput(st.ID, "ffmpeg concat_video", tmpAbs, outAbs); err != nil {
 		return nil, err
 	}
 	return &StageOutput{Files: []string{outAbs}}, nil
@@ -632,6 +647,14 @@ func (f *ffmpegExecutor) executeM4B(ctx context.Context, in StageInput, st *Stag
 		return nil, fmt.Errorf("stage %s: m4b_from %q produced zero items", st.ID, st.M4BFrom)
 	}
 
+	// Output path first: ffprobing every chapter of a book that has
+	// nowhere legal to be written is minutes of work for a stage that
+	// cannot succeed.
+	outRel, err := stageOutputPath(st, in, extra)
+	if err != nil {
+		return nil, fmt.Errorf("stage %s: render output path: %w", st.ID, err)
+	}
+
 	type chapter struct {
 		File    string
 		Title   string
@@ -673,14 +696,11 @@ func (f *ffmpegExecutor) executeM4B(ctx context.Context, in StageInput, st *Stag
 		cumMs += dur
 	}
 
-	outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
-	if err != nil {
-		return nil, fmt.Errorf("stage %s: render output path: %w", st.ID, err)
-	}
 	outAbs := filepath.Join(in.RunDir, outRel)
 	if err := os.MkdirAll(filepath.Dir(outAbs), 0o755); err != nil {
 		return nil, fmt.Errorf("stage %s: create output dir: %w", st.ID, err)
 	}
+	tmpAbs := beginPartialOutput(outAbs)
 
 	listPath := filepath.Join(in.RunDir, fmt.Sprintf(".ffmpeg-m4b-concat.%s.txt", st.ID))
 	var listBuf strings.Builder
@@ -751,7 +771,7 @@ func (f *ffmpegExecutor) executeM4B(ctx context.Context, in StageInput, st *Stag
 			"-c:a", "aac", "-b:a", "96k",
 		)
 	}
-	args = append(args, "-movflags", "+faststart", "-y", outAbs)
+	args = append(args, "-movflags", "+faststart", "-y", tmpAbs)
 	runner := f.runner
 	if runner == nil {
 		if err := ensureFFmpegOnPath(st.ID, binary); err != nil {
@@ -763,9 +783,10 @@ func (f *ffmpegExecutor) executeM4B(ctx context.Context, in StageInput, st *Stag
 		fmt.Fprintf(in.Log, "ffmpeg m4b: %s (%d chapter(s), %s total)\n", outRel, len(chapters), formatM4BDuration(cumMs))
 	}
 	if err := runner.Run(ctx, binary, args, in.Log); err != nil {
+		discardPartialOutput(tmpAbs)
 		return nil, fmt.Errorf("stage %s: ffmpeg m4b: %w", st.ID, err)
 	}
-	if err := requireNonEmptyOutput(st.ID, "ffmpeg m4b", outAbs); err != nil {
+	if err := finalizeOutput(st.ID, "ffmpeg m4b", tmpAbs, outAbs); err != nil {
 		return nil, err
 	}
 	return &StageOutput{Files: []string{outAbs}}, nil

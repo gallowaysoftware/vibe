@@ -141,15 +141,17 @@ func TestFFmpegExecutor_RendersArgsAndCallsFFmpeg(t *testing.T) {
 	if call.Binary != "ffmpeg" {
 		t.Errorf("binary = %q, want %q", call.Binary, "ffmpeg")
 	}
-	// User args must come first, then -y, then the rendered absolute output
-	// path. Argument ordering matters to ffmpeg's positional parser.
+	// User args must come first, then -y, then the path ffmpeg writes to —
+	// the SCRATCH file beside the rendered output, which the executor
+	// renames into place once ffmpeg has exited and produced something.
+	// Argument ordering matters to ffmpeg's positional parser.
 	wantArgs := []string{
 		"-loop", "1",
 		"-i", "assets/img_0.png",
 		"-i", "voiceover.wav",
 		"-c:v", "libx264",
 		"-shortest",
-		"-y", filepath.Join(runDir, "final.mp4"),
+		"-y", partialOutputPath(filepath.Join(runDir, "final.mp4")),
 	}
 	if !equalStringSlices(call.Args, wantArgs) {
 		t.Errorf("args mismatch:\n got:  %v\n want: %v", call.Args, wantArgs)
@@ -257,7 +259,7 @@ func TestFFmpegExecutor_TemplateUsesPriorStageFiles(t *testing.T) {
 		"-i", "assets/img_0.png",
 		"-i", "assets/img_2.png",
 		"-filter_complex", "concat=n=2:v=1:a=0",
-		"-y", filepath.Join(runDir, "concat.mp4"),
+		"-y", partialOutputPath(filepath.Join(runDir, "concat.mp4")),
 	}
 	if !equalStringSlices(call.Args, wantArgs) {
 		t.Errorf("args mismatch:\n got:  %v\n want: %v", call.Args, wantArgs)
@@ -393,17 +395,23 @@ func TestFFmpegExecutor_OutputUnderRunDir(t *testing.T) {
 		t.Fatalf("Execute: %v", err)
 	}
 	call := runner.call(0)
-	// Verify -y + output is the LAST argv pair (after user args).
+	// Verify -y + output is the LAST argv pair (after user args). What
+	// ffmpeg writes is the scratch file beside the rendered path; what the
+	// stage reports — and what a resumed run looks for — is the published
+	// path.
 	if len(call.Args) < 2 {
 		t.Fatalf("argv too short: %v", call.Args)
 	}
-	wantOut := filepath.Join(runDir, "renders/2024/final.mp4")
+	wantFile := filepath.Join(runDir, "renders/2024/final.mp4")
+	wantOut := partialOutputPath(wantFile)
 	if call.Args[len(call.Args)-2] != "-y" || call.Args[len(call.Args)-1] != wantOut {
 		t.Errorf("trailing argv = %v %v, want -y %s", call.Args[len(call.Args)-2], call.Args[len(call.Args)-1], wantOut)
 	}
-	wantFile := filepath.Join(runDir, "renders/2024/final.mp4")
 	if len(out.Files) != 1 || out.Files[0] != wantFile {
 		t.Errorf("out.Files = %v, want [%s]", out.Files, wantFile)
+	}
+	if _, err := os.Stat(wantFile); err != nil {
+		t.Errorf("the finished container must be published at the stage's output path: %v", err)
 	}
 }
 

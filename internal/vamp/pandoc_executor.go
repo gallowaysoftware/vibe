@@ -259,7 +259,7 @@ func (p *pandocExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 		return nil, fmt.Errorf("stage %s: source_file %s: %w", st.ID, srcAbs, err)
 	}
 
-	outRel, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, in.Inputs, in.Prior, in.RunDir, extra)
+	outRel, err := stageOutputPath(st, in, extra)
 	if err != nil {
 		return nil, fmt.Errorf("stage %s: render output: %w", st.ID, err)
 	}
@@ -267,6 +267,11 @@ func (p *pandocExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 	if err := os.MkdirAll(filepath.Dir(outAbs), 0o755); err != nil {
 		return nil, fmt.Errorf("stage %s: create output dir: %w", st.ID, err)
 	}
+	// pandoc opens its -o target immediately and streams into it, so it
+	// gets the scratch path: a killed conversion (or a docker daemon that
+	// takes the container down mid-write) must not leave a partial EPUB
+	// where --resume reads it as a finished book.
+	tmpAbs := beginPartialOutput(outAbs)
 
 	var coverAbs string
 	if st.CoverImage != "" {
@@ -306,7 +311,7 @@ func (p *pandocExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 	if useDocker {
 		containerName = pandocContainerName(in.RunDir, st.ID, in.ItemIdx)
 	}
-	args := buildPandocArgs(st, srcAbs, outAbs, coverAbs, useDocker, in.RunDir, containerName)
+	args := buildPandocArgs(st, srcAbs, tmpAbs, coverAbs, useDocker, in.RunDir, containerName)
 	if in.Log != nil {
 		fmt.Fprintf(in.Log, "pandoc: %s -> %s (engine=%s)\n", filepath.Base(srcAbs), outRel, binary)
 		if containerName != "" {
@@ -320,6 +325,7 @@ func (p *pandocExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 	cmd.Stdout = in.Log
 	cmd.Stderr = in.Log
 	if err := cmd.Run(); err != nil {
+		discardPartialOutput(tmpAbs)
 		return nil, fmt.Errorf("stage %s: pandoc: %w", st.ID, err)
 	}
 	// Existence was never the whole check. pandoc opens its output file
@@ -327,9 +333,11 @@ func (p *pandocExecutor) Execute(ctx context.Context, in StageInput) (*StageOutp
 	// dies (a missing LaTeX engine for --to pdf, an --epub-cover-image
 	// pandoc cannot decode) can leave a 0-byte artefact behind — and the
 	// docker path adds a second way to get one, since `docker run`
-	// reports the CLIENT's exit status. Reuses the ffmpeg check so all
-	// four output-producing executors say the same thing.
-	if err := requireNonEmptyOutput(st.ID, "pandoc", outAbs); err != nil {
+	// reports the CLIENT's exit status. finalizeOutput runs that check on
+	// the scratch file and only then publishes it, so all the
+	// output-producing executors say the same thing and none of them can
+	// publish what they just rejected.
+	if err := finalizeOutput(st.ID, "pandoc", tmpAbs, outAbs); err != nil {
 		return nil, err
 	}
 	return &StageOutput{Files: []string{outAbs}}, nil

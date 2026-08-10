@@ -606,7 +606,7 @@ func TestPandocExecutor_DockerFallbackIsNamed(t *testing.T) {
 	writeFakeBinary(t, binDir, "docker", fmt.Sprintf(`
 for a in "$@"; do echo "$a" >> %q; done
 printf 'EPUB-ish bytes' > %q
-exit 0`, argvLog, filepath.Join(runDir, "book.epub")))
+exit 0`, argvLog, partialOutputPath(filepath.Join(runDir, "book.epub"))))
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	var log bytes.Buffer
