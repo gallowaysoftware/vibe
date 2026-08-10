@@ -2703,6 +2703,159 @@ var Registry = []Mutation{
 			"whole job is to tell the operator what the real run will do; a footer that disagrees with " +
 			"the list above it is the plan lying about its own contents.",
 	},
+
+	// ── the diagnostic command's own claims ───────────────────────────
+	//
+	// `vibe doctor` is the one command an operator runs BECAUSE they
+	// already believe something is wrong, so a false definite costs more
+	// here than anywhere else in the CLI. The first four entries pin one
+	// cascade: a single unanswered probe of :9001 used to produce three
+	// claims — a port conflict, a stopped daemon, and a stolen :9000 —
+	// none of which any evidence supported. They are separate rungs
+	// because they are separate CLAIMS, made in three different
+	// functions, and the pre-fix code made each one independently.
+	{
+		Name: "doctor/an unanswered control-plane probe is a port thief",
+		File: "internal/vibe/cli/cmd_doctor.go",
+		// The pre-fix behaviour exactly: every statusFn error is "in use
+		// by another process". errors and connect stay referenced,
+		// because a mutation that does not compile proves nothing.
+		Find: "\tcase errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):\n" +
+			"\t\treturn probeNoAnswer\n" +
+			"\tcase connect.CodeOf(err) == connect.CodeDeadlineExceeded:\n" +
+			"\t\treturn probeNoAnswer\n" +
+			"\tcase connect.CodeOf(err) == connect.CodeUnauthenticated:\n" +
+			"\t\treturn probeRefusedUs\n",
+		Replace: "\tcase errors.Is(err, context.DeadlineExceeded), connect.CodeOf(err) == connect.CodeUnknown:\n" +
+			"\t\treturn probeNotVibe\n",
+		Pkg: "./internal/vibe/cli/",
+		MustFail: []string{
+			"TestCheckControlPlanePort_SlowDaemonIsNotAPortThief",
+			"TestCheckControlPlanePort_ARefusedCredentialIsNotAPortConflict",
+			"TestDoctorCascade_OneSlowProbeDoesNotProduceThreeClaims",
+		},
+		Why: "the daemon this probe asks about is holding a model and serving the proxy, so it can " +
+			"miss a one-second window with nothing whatever wrong — and the row answered `FAIL: in " +
+			"use by another process`, on the command someone opened because they already suspected " +
+			"a problem. It sends them hunting a port conflict that does not exist. The second named " +
+			"test is the other half and it is NOT a duplicate: a 401 means the holder ANSWERED and " +
+			"refused this box's credential, which is `vibe fleet doctor`'s C15 case — the remedy is " +
+			"a token, and \"another process\" points at the wrong thing entirely.",
+	},
+	{
+		Name: "doctor/an unattributed :9000 holder is reported as a thief",
+		File: "internal/vibe/cli/cmd_doctor.go",
+		Find: "\t\treturn checkResult{\n\t\t\tName:   name,\n\t\t\tStatus: statusUnknown,\n" +
+			"\t\t\tMessage: \"in use, holder unattributed: :9001 did not identify itself (see the control-plane row), \" +\n" +
+			"\t\t\t\t\"so this may well be vibe's own proxy\",\n\t\t}",
+		Replace: "\t\treturn checkResult{\n\t\t\tName:    name,\n\t\t\tStatus:  statusFail,\n" +
+			"\t\t\tMessage: \"in use by another process (no vibe daemon detected on :9001)\",\n\t\t}",
+		Pkg:      "./internal/vibe/cli/",
+		MustFail: []string{"TestCheckProxyPortAt_AnUnattributedHolderIsNotAThief"},
+		Why: "the cascade's most expensive claim: :9000 is the port the model is SERVED on, so \"in " +
+			"use by another process\" reads as \"something has stolen your inference port\". It was " +
+			"printed from a bool that had merely never been set — and when :9001 does not identify " +
+			"itself, the likeliest holder of :9000 is vibe's own proxy. The genuine conflict (a " +
+			"control plane that answered and is not vibe's) still FAILs here, which is the half a " +
+			"vaguer fix would have thrown away.",
+	},
+	{
+		Name: "doctor/a daemon nobody could reach is reported as stopped",
+		File: "internal/vibe/cli/cmd_doctor.go",
+		// Only the two fields, so the `default:` case still ENDS in a
+		// return: a switch whose last case falls through the end is not a
+		// terminating statement, and `missing return` is a build failure,
+		// which proves nothing.
+		Find:     "\t\t\tStatus: statusUnknown,\n\t\t\tMessage: \"could not tell — the control-plane row above says why. \" +\n\t\t\t\t\"`not running` is a claim, and nothing here supports it\",\n",
+		Replace:  "\t\t\tStatus: statusInfo,\n\t\t\tMessage: \"not running\",\n",
+		Pkg:      "./internal/vibe/cli/",
+		MustFail: []string{"TestDaemonRow_AnUnansweredProbeIsNotAStoppedDaemon"},
+		Why: "`daemon — not running` is a definite statement about a process, and it was printed " +
+			"from the same never-set flag. An operator reading it stops looking for the daemon and " +
+			"starts looking for what killed it — while it is up with a model resident. This is " +
+			"daemonAbsent's class (client.go) one transport over, which is why the fix is a " +
+			"three-valued presence rather than a better sentence.",
+	},
+	{
+		Name:     "doctor/an incomplete report exits 0",
+		File:     "internal/vibe/cli/cmd_doctor.go",
+		Find:     "\tif anyUnknown {\n\t\treturn errDoctorLevel{doctorExitUnknown}\n\t}\n",
+		Replace:  "\t_ = anyUnknown\n",
+		Pkg:      "./internal/vibe/cli/",
+		MustFail: []string{"TestDoctorOutcome_AnIncompleteReportIsNotAPassAndNotAFailure"},
+		Why: "the exit status is what a wrapper reads, and \"this box is broken\" and \"I could not " +
+			"find out\" are different facts — the distinction `vibe fleet doctor` has encoded as " +
+			"exit 3 since C13 and this command was collapsing. Under the mutation a doctor that " +
+			"could not evaluate the daemon, the control-plane port and the proxy port exits 0, and " +
+			"`vibe doctor && vibe start` proceeds on a report that established nothing.",
+	},
+	{
+		Name:     "doctor/a port we were not allowed to bind is reported as in use",
+		File:     "internal/vibe/cli/cmd_doctor.go",
+		Find:     "\t\tcase isAddrInUse(err):\n\t\t\tbound = append(bound, label)\n",
+		Replace:  "\t\tcase err != nil:\n\t\t\tbound = append(bound, label)\n",
+		Pkg:      "./internal/vibe/cli/",
+		MustFail: []string{"TestCheckCommonPorts_APortWeCouldNotProbeIsNotReportedAsInUse"},
+		Why: "isAddrInUse has three call sites and this was the one that never asked it: `if ok, _ " +
+			":= tryBind(...); ok` discarded the error, so EVERY listen failure became \"in use\". " +
+			"Measured: a declared loopback port under 1024 fails with `bind: permission denied` as " +
+			"an ordinary user, and the row whose entire job is telling an operator which ports are " +
+			"taken reported it as taken. The guard-on-some-call-sites shape, in the same file as " +
+			"the cascade above.",
+	},
+	{
+		Name:    "doctor/a failed `hf auth whoami` is reported as a login",
+		File:    "internal/vibe/cli/cmd_doctor.go",
+		Find:    "\tif err != nil {\n\t\twhy := \"failed: \" + err.Error()\n",
+		Replace: "\tif err != nil && false {\n\t\twhy := \"failed: \" + err.Error()\n",
+		Pkg:     "./internal/vibe/cli/",
+		MustFail: []string{
+			"TestCheckHFAuth_AFailedWhoamiIsNotALogin",
+			"TestCheckHFAuth_OurTimeoutIsNotTheToolsFailure",
+		},
+		Why: "the run error was discarded outright (`out, _ :=`) and firstNonEmptyLine of a FAILED " +
+			"run went straight into \"logged in as …\". Measured: a command that prints a traceback " +
+			"and exits 1 rendered as `[ OK ] hf auth  logged in as Traceback (most recent call " +
+			"last):`. An OK is the strongest claim this report makes and it was being manufactured " +
+			"out of an error message — the box then fails on the first gated pull with nothing in " +
+			"the doctor output to have warned it.",
+	},
+	{
+		Name:    "doctor/our own deadline is reported as the tool's failure",
+		File:    "internal/vibe/cli/cmd_doctor.go",
+		Find:    "func runTimedOut(ctx context.Context, budget time.Duration) string {\n\tswitch {\n",
+		Replace: "func runTimedOut(ctx context.Context, budget time.Duration) string {\n\treturn \"\"\n\tswitch {\n",
+		Pkg:     "./internal/vibe/cli/",
+		MustFail: []string{
+			"TestCheckGPU_AHungNvidiaSmiIsNotAFailedOne",
+			"TestCheckDockerForProfiles_OurTimeoutDoesNotClaimTheDaemonIsDown",
+			"TestCheckLlamaVersion_OurTimeoutIsNotANonZeroExit",
+			"TestCheckHFAuth_OurTimeoutIsNotTheToolsFailure",
+		},
+		Why: "exec.CommandContext kills the child and reports `signal: killed`, and " +
+			"errors.Is(err, context.DeadlineExceeded) is FALSE for it — measured — so the error " +
+			"alone cannot tell these four rows apart and the CONTEXT has to be asked. Without it a " +
+			"wedged nvidia-smi, which is the single most recognisable symptom of a GPU in a bad " +
+			"state and HANGS rather than exits, reads as \"nvidia-smi failed: signal: killed\", and " +
+			"a docker daemon that is merely slow reads as \"(daemon not running?)\". Four tests " +
+			"because the helper is one line and the four call sites are where it is not asked.",
+	},
+	{
+		Name:     "search/the operator's upstream URL rides out in the error",
+		File:     "internal/vibe/search/free.go",
+		Find:     "\t\treturn nil, fmt.Errorf(\"searxng: %w\", causeWithoutURL(err))",
+		Replace:  "\t\treturn nil, fmt.Errorf(\"searxng: %w\", err)",
+		Pkg:      "./internal/vibe/search/",
+		MustFail: []string{"TestSearxngSearchErrorDoesNotCarryTheOperatorsUpstream"},
+		Why: "the tenth site, and the only URL in this package that is not the caller's: " +
+			"--search-upstream, which the shipped zero-cost deployment points at a SearXNG " +
+			"container on a private network and a basic-auth-fronted instance carries userinfo in. " +
+			"net/http embeds it structurally in *url.Error and stripPassword replaces the password " +
+			"and nothing else, so `%w` published the scheme, the internal host, the port, the " +
+			"username, the operator's path and the CALLER's query text to three audiences at once: " +
+			"the journal, the 502 body GET /search hands anyone holding the bearer token, and the " +
+			"MCP tool result that lands in a model's transcript.",
+	},
 }
 
 // ── tree copying and patching ────────────────────────────────────────

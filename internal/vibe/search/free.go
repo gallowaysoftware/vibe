@@ -68,7 +68,29 @@ func (s *searxngUpstream) Search(ctx context.Context, q Query) (*Response, error
 	req.Header.Set("Accept", "application/json")
 	resp, err := s.hc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("searxng: %w", err)
+		// The URL inside this error is the OPERATOR's, not the caller's:
+		// --search-upstream, which the shipped zero-cost deployment points
+		// at a SearXNG container on a private network and which a
+		// basic-auth-fronted instance carries userinfo in. net/http embeds
+		// it structurally in *url.Error and stripPassword replaces the
+		// password and nothing else, so `%w` on the raw error published
+		// the scheme, the internal host, the port, the username and the
+		// query to three audiences at once: the operator's journal, the
+		// 502 body that GET /search returns to anyone holding the bearer
+		// token, and the MCP tool result that lands in a model's
+		// transcript. The most restrictive audience is the one that has to
+		// set the rule.
+		//
+		// causeWithoutURL is the whole fix here, and redactURL is
+		// deliberately NOT used to print a tidied copy alongside it. That
+		// is the right trade one function down — a fetch URL varies per
+		// request and identifies WHICH page failed, so withholding it
+		// makes the log undiagnosable. This URL is a fixed line of the
+		// operator's own config, identical on every error this provider
+		// can raise, and the "searxng" prefix already names the provider.
+		// It buys the reader nothing and it is exactly the thing a caller
+		// must not learn. See redact.go.
+		return nil, fmt.Errorf("searxng: %w", causeWithoutURL(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
