@@ -152,7 +152,9 @@ func (d *directFetcher) Name() string { return "direct" }
 func (d *directFetcher) Fetch(ctx context.Context, rawURL string) (*Document, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("direct fetch: parse url: %w", err)
+		// url.Error again, and this one quotes the WHOLE string it failed
+		// to parse — including anything a caller put in the query.
+		return nil, fmt.Errorf("direct fetch: parse url: %w", causeWithoutURL(err))
 	}
 	// Reject non-HTTP schemes outright: this handler takes a URL from an
 	// agent, and file:// or similar would turn a page fetch into local disk
@@ -173,15 +175,18 @@ func (d *directFetcher) Fetch(ctx context.Context, rawURL string) (*Document, er
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5")
 	resp, err := d.hc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("direct fetch %s: %w", rawURL, err)
+		// Both halves, and neither covers the other: redactURL hides what
+		// we print, causeWithoutURL drops the second copy net/http embeds
+		// in *url.Error (which strips only the password). See redact.go.
+		return nil, fmt.Errorf("direct fetch %s: %w", redactURL(rawURL), causeWithoutURL(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("direct fetch %s: status %s", rawURL, resp.Status)
+		return nil, fmt.Errorf("direct fetch %s: status %s", redactURL(rawURL), resp.Status)
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxFetchBytes))
 	if err != nil {
-		return nil, fmt.Errorf("direct fetch %s: read body: %w", rawURL, err)
+		return nil, fmt.Errorf("direct fetch %s: read body: %w", redactURL(rawURL), causeWithoutURL(err))
 	}
 	html := string(raw)
 	return &Document{

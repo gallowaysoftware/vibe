@@ -466,6 +466,42 @@ var Registry = []Mutation{
 			"The helper is pinned rather than the call site because `daemonAbsent` is the whole of the " +
 			"discrimination and 'why not just treat every error the same?' reads as a simplification.",
 	},
+	// daemonAbsent has four callers and the entry above pins the helper.
+	// These two pin the CALL SITES, which is a different failure: the
+	// helper can be perfect and a command can still not ask it. It was
+	// exactly that for as long as the helper existed — `ps` consulted it,
+	// `env` and `shutdown` did not, and the sweep that added it to one
+	// surface is the sweep a future agent will repeat.
+	{
+		Name: "env/an unanswered ping exports nothing and says nothing",
+		File: "internal/vibe/cli/cmd_env.go",
+		// The pre-fix line, restored exactly: any ping failure is silence
+		// at exit 0.
+		Find:     "\t\t\t\tif !daemonAbsent(err) {",
+		Replace:  "\t\t\t\tif false {",
+		Pkg:      "./internal/vibe/cli/",
+		MustFail: []string{"TestEnvRefusesToCallASlowDaemonAnAbsentOne"},
+		Why: "`eval \"$(vibe env)\"` is how a frontend is pointed at the local front, and printing " +
+			"nothing is the CORRECT answer when no profile is active — which is why this failure is " +
+			"invisible. A daemon that is up with a model resident and merely slow to answer produces " +
+			"the identical empty stdout at exit 0, the frontend falls back to its built-in vendor " +
+			"endpoint, and the operator is billed for tokens the local front was ready to serve. No " +
+			"log line, no exit code, no symptom other than the invoice.",
+	},
+	{
+		Name:     "shutdown/a busy daemon is reported as an absent one",
+		File:     "internal/vibe/cli/cmd_shutdown.go",
+		Find:     "\t\t\t\tif !daemonAbsent(err) {",
+		Replace:  "\t\t\t\tif false {",
+		Pkg:      "./internal/vibe/cli/",
+		MustFail: []string{"TestShutdownRefusesToCallASlowDaemonAStoppedOne"},
+		Why: "the command whose entire job is to talk to a daemon that is BY CONSTRUCTION busy — it " +
+			"is holding a model and it is about to be asked to tear the stack down. Under this " +
+			"mutation `vibe shutdown && <next step>` prints \"daemon not running\", exits 0 and runs " +
+			"the next step against a live daemon with the GPU still occupied. Idempotence is the " +
+			"right goal and it is preserved for genuine absence; what this pins is that the goal is " +
+			"not allowed to invent the evidence.",
+	},
 
 	// ── the credential never leaks ────────────────────────────────────
 	{
@@ -1698,6 +1734,54 @@ var Registry = []Mutation{
 			"rebind the browser treats the reply as same-origin, so CORS stops withholding it. The " +
 			"Origin header is the one signal that survives the rebind, which is why MCP's own " +
 			"transport spec requires this check on every streamable-HTTP server.",
+	},
+	{
+		Name: "search/the bearer compare goes back to byte-wise ==",
+		File: "internal/vibe/search/server.go",
+		Find: "if got == \"\" || subtle.ConstantTimeCompare([]byte(got), []byte(s.Token)) != 1 {",
+		// The pre-fix line, with subtle kept referenced so the mutation
+		// COMPILES — a build failure proves nothing.
+		Replace:  "if _ = subtle.ConstantTimeCompare; got != s.Token {",
+		Pkg:      "./internal/vibe/search/",
+		MustFail: []string{"TestBearerCompareIsConstantTime"},
+		Why: "`==` on strings returns at the first differing byte, so this endpoint answers a " +
+			"near-miss measurably later than a miss and a 32-byte token falls to ~8k requests. What " +
+			"makes it worth a registry entry rather than a review note is that the mutation is " +
+			"BEHAVIOUR-PRESERVING: every other test in the package stays green, including the " +
+			"bearer/basic/healthz auth test, because the two spellings accept and refuse exactly the " +
+			"same inputs. Measured. Only a structural assertion can see it, and the credential it " +
+			"protects unlocks fetch_url — the SSRF surface dialguard.go exists for — on a service " +
+			"whose documented deployment is --bind 0.0.0.0.",
+	},
+	{
+		Name:     "search/a caller's URL goes into the log with its query intact",
+		File:     "internal/vibe/search/redact.go",
+		Find:     "\t\t\tparts[i] = k + \"=\" + redactedValue",
+		Replace:  "\t\t\tparts[i] = k + \"=\" + v",
+		Pkg:      "./internal/vibe/search/",
+		MustFail: []string{"TestRedactURLWithholdsUserinfoAndQueryValues", "TestFetchLogsWithholdTheCallersCredential"},
+		Why: "url.URL.Redacted() strips USERINFO and nothing else, and the credential shape that " +
+			"actually reaches this service rides in the QUERY: a presigned S3 link's " +
+			"X-Amz-Signature, a share link's ?token=. Those URLs are handed to a model and passed " +
+			"straight to fetch_url, and the log they land in is journald on a host whose logs get " +
+			"pasted into issues — a bearer credential in a file with a different lifetime from the " +
+			"thing it opens. The mutation leaves userinfo handling fully intact, which is the point: " +
+			"the half that looks like the whole fix is not.",
+	},
+	{
+		Name:     "search/the URL net/http embeds in *url.Error survives",
+		File:     "internal/vibe/search/redact.go",
+		Find:     "\tif errors.As(err, &ue) && ue.Err != nil {",
+		Replace:  "\tif errors.As(err, &ue) && false {",
+		Pkg:      "./internal/vibe/search/",
+		MustFail: []string{"TestDirectFetchErrorDoesNotCarryTheCallersCredential"},
+		Why: "the second copy, and redacting our own format argument does not touch it. net/http's " +
+			"stripPassword replaces the password in *url.Error and leaves the query alone, so " +
+			"`Get \"http://svc:***@h/p?X-Amz-Signature=…\": dial tcp …` carries the signature into " +
+			"every message that wraps the transport error with %w. Verified both ways on a " +
+			"workstation: with redactURL applied and this unwrap removed, the signature was still in " +
+			"the error text. Pinned separately from the entry above for the same reason " +
+			"fleetnotify's two halves are — neither covers the other's case.",
 	},
 
 	// ── class 8: a contract between two packages that only prose held ─

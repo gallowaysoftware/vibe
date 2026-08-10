@@ -55,10 +55,6 @@ func newPSEntry(s *vibev1.Status) psEntry {
 	return e
 }
 
-// psPingBudget is how long `ps` waits for the daemon to say it is there.
-// Named so the refusal below can quote the number it actually used.
-const psPingBudget = 500 * time.Millisecond
-
 func psCmd() *cobra.Command {
 	var asJSON bool
 	cmd := &cobra.Command{
@@ -83,10 +79,10 @@ func psCmd() *cobra.Command {
 			// script `{"daemon_running": false, "active": null}` about a
 			// daemon that is up with a model resident — the value it would
 			// act on, from a timeout. See daemonAbsent in client.go.
-			if err := pingDaemon(psPingBudget); err != nil {
+			if err := pingDaemon(pingBudget); err != nil {
 				if !daemonAbsent(err) {
 					return fmt.Errorf("cannot tell what is running: the daemon did not answer within %s (%w). "+
-						"It may be busy — this is not evidence that nothing is running; re-run to retry", psPingBudget, err)
+						"It may be busy — this is not evidence that nothing is running; re-run to retry", pingBudget, err)
 				}
 				if asJSON {
 					return writeJSON(cmd.OutOrStdout(), psReport{Services: []psEntry{}})

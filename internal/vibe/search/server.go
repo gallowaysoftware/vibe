@@ -2,6 +2,7 @@ package search
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -157,7 +158,28 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 				got = pass
 			}
 		}
-		if got != s.Token {
+		// Constant-time, because `!=` on strings returns on the first
+		// differing byte and this endpoint answers as fast as an attacker
+		// can ask. Walking a 32-byte token one byte at a time is 32*256
+		// requests against a service whose documented deployment is
+		// --bind 0.0.0.0, and whose credential unlocks fetch_url (the
+		// SSRF surface dialguard.go exists for) and the operator's paid
+		// search quota.
+		//
+		// What this does NOT hide is the LENGTH: ConstantTimeCompare
+		// returns 0 immediately for unequal lengths and is only
+		// constant-time between equal-length inputs. That is the standard,
+		// accepted limit of the primitive — a token's length is not the
+		// secret — and it is written down here so nobody reads this line
+		// as promising more than it does.
+		//
+		// The explicit empty check is not redundant with it. It is the one
+		// input a caller can produce while holding nothing at all: no
+		// Authorization header and no basic auth. s.Token == "" is already
+		// short-circuited above, so the compare would refuse it anyway —
+		// this makes "an absent credential is never a match" true by
+		// inspection instead of by following two branches.
+		if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(s.Token)) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -318,11 +340,17 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 
 	doc, meta, err := s.fetchTiered(ctx, req.URL)
 	if err != nil {
-		s.logger().Error("fetch failed", "url", req.URL, "err", err)
+		// The URL is the CALLER's, and a URL handed to an agent is
+		// routinely a credential (a presigned link's signature is a query
+		// parameter). It goes into the operator's journal either way, so
+		// it goes in redacted. See redact.go. The response body is the
+		// caller's own error, echoed to the caller who supplied the URL,
+		// and err is already redacted at the point it was built.
+		s.logger().Error("fetch failed", "url", redactURL(req.URL), "err", err)
 		http.Error(w, "fetch failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	s.logger().Info("fetch", "url", req.URL, "extractor", meta.Extractor,
+	s.logger().Info("fetch", "url", redactURL(req.URL), "extractor", meta.Extractor,
 		"escalated", meta.Escalated, "chars", len(doc.Text))
 	writeJSON(w, http.StatusOK, fetchResponse{
 		URL: doc.URL, Title: doc.Title, Text: doc.Text,
@@ -375,11 +403,11 @@ func (s *Server) fetchTiered(ctx context.Context, rawURL string) (*Document, fet
 	if err != nil {
 		why = err.Error()
 	}
-	s.logger().Info("escalating fetch", "url", rawURL,
+	s.logger().Info("escalating fetch", "url", redactURL(rawURL),
 		"from", s.Fetcher.Name(), "to", s.Escalate.Name(), "why", why)
 	esc, escErr := s.Escalate.Fetch(ctx, rawURL)
 	if escErr != nil {
-		s.logger().Warn("escalation failed", "url", rawURL,
+		s.logger().Warn("escalation failed", "url", redactURL(rawURL),
 			"escalator", s.Escalate.Name(), "err", escErr)
 		// Prefer the primary's output if it produced anything at all: a thin
 		// page beats an error when the escalation also failed. But say so —

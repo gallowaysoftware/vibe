@@ -14,6 +14,23 @@ import (
 // re-execs the current binary in "daemon" mode in a new session and waits for
 // the unix socket to come up.
 func ensureDaemon(ctx context.Context) error {
+	// The POSITIVE test — `err == nil` rather than `!daemonAbsent(err)` —
+	// is deliberate here, and it is the one place in the CLI where it is
+	// safe. This is NOT `ps`, `env` or `shutdown`: nothing is claimed from
+	// this ping. A timeout falls through to spawning, and a second daemon
+	// is harmless because daemon.Run takes an exclusive flock on
+	// $PIDFILE.lock BEFORE it touches the socket path (daemon.go, "An
+	// exclusive flock held for the daemon's lifetime is the single-instance
+	// gate"). The loser returns "vibe daemon already running" and exits
+	// without reaching the unconditional os.Remove(sockPath) below it, so
+	// it cannot unlink the winner's live socket — the exact race the flock
+	// replaced a PID file to close. The retry loop then succeeds against
+	// whichever daemon holds the lock.
+	//
+	// So the short 200ms budget is a cost of one wasted fork, not a wrong
+	// answer, which is why it stays short and does not use pingBudget. Do
+	// not "fix" this to match the three commands above: the guard there
+	// exists because they PRINT a claim, and this prints nothing.
 	if err := pingDaemon(200 * time.Millisecond); err == nil {
 		return nil
 	}
