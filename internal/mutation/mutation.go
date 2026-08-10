@@ -2142,6 +2142,174 @@ var Registry = []Mutation{
 			"guard removed from it is a guard removed from everything — and the AST scan is what " +
 			"notices, because a reviewer reading the endpoint LIST would see nothing wrong.",
 	},
+	// ── the two consumers of allStageTypes nobody counted ─────────────
+	//
+	// exec.go's list comment named "the three consumers" while there were
+	// five, and both uncounted ones were wrong in the same direction:
+	// `vamp run --dry-run` refused to plan any pipeline containing
+	// compact/pandoc/mix/short at all, and `vamp diff` compared those four
+	// (plus confirm) not at all and printed the silence as agreement. The
+	// entries below are the rungs under the two walk tests that now stand
+	// in for that comment.
+	{
+		Name:     "vamp/four-stage-types-cannot-be-dry-run",
+		File:     "internal/vamp/dryrun.go",
+		Find:     "\tcase StageTypeText, StageTypeComfyUI, StageTypeCompact:",
+		Replace:  "\tcase StageTypeText, StageTypeComfyUI:",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestEveryStageTypeIsPreviewedByDryRun", "TestStageTypeSwitchesAreExhaustive"},
+		Why: "drops one stage type back through formatStageHeader's `default:`, which returns " +
+			"`unknown stage type %q` — and that error aborts the WHOLE plan at that stage. Four of " +
+			"twelve types were there, and they are the four longest-running ones (EPUB conversion, " +
+			"m4b assembly, vertical-video assembly, context compaction): exactly what a dry run " +
+			"exists to protect. `vamp validate` accepts them, so the operator had a green validate " +
+			"and a red dry-run on the same file, phrased as their mistake.",
+	},
+	{
+		Name: "vamp/the-dry-run-plan-prints-a-webhook-url-verbatim",
+		File: "internal/vamp/dryrun.go",
+		Find: "\ts.executor.dryRunLogf(\"%s  %s %s\", indent, method, fleetnotify.Redact(url))",
+		// `_ =` keeps the fleetnotify import live: it is the file's ONLY
+		// use, and a mutation that fails to compile proves nothing.
+		Replace:  "\t_ = fleetnotify.Redact\n\ts.executor.dryRunLogf(\"%s  %s %s\", indent, method, url)",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestDryRunWebhookPreviewRedactsTheURL"},
+		Why: "a Slack/Discord/ntfy incoming-webhook URL carries its bearer in the PATH, and a " +
+			"dry-run plan is a thing operators read on a terminal and paste into bug reports. The " +
+			"executor's own log line already redacts; the preview that describes the same request " +
+			"had no preview at all until this fix, so the redaction went in with it.",
+	},
+	{
+		Name:     "vamp/the-dry-run-foreach-stub-goes-back-to-scalars",
+		File:     "internal/vamp/dryrun.go",
+		Find:     "\titems, fields := dryRunObjectifyItems(st, items)",
+		Replace:  "\t_, fields := dryRunObjectifyItems(st, items)",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestDryRunAcceptsForeachItemsThatAreObjects", "TestDryRunObjectStubsCoverEveryFieldTheStageReads"},
+		Why: "restores the string stubs, and with them a dry run that FAILS A CORRECT PIPELINE. " +
+			"`output: \"{{.item.slug}}.md\"` is the pattern ensureUnderRunDir's own comment gives as " +
+			"the motivating example; against a string item it is a TYPE error (`can't evaluate field " +
+			"slug in type interface {}`), not a missing key, so no missingkey setting could have " +
+			"rescued it — only an item that actually has the field.",
+	},
+	{
+		Name:    "vamp/the-dry-run-stops-at-the-first-broken-stage",
+		File:    "internal/vamp/dryrun.go",
+		Find:    "\t\t\t\tstate.errors++\n\t\t\t\tstate.failures = append(state.failures, err)\n\t\t\t\te.dryRunLogf(\"  error: %v\", err)",
+		Replace: "\t\t\t\treturn err",
+		Pkg:     "./internal/vamp/",
+		MustFail: []string{
+			"TestDryRunReportsEveryBrokenStageNotJustTheFirst",
+		},
+		Why: "restores abort-on-first-defect. A dry run exists to find everything wrong in ONE pass; " +
+			"aborting at stage 1 of N made the operator iterate one defect per invocation, and it is " +
+			"also what made the `errors` counter structurally dead — every increment was followed by " +
+			"a return that unwound past the summary line, so `dry-run: %d errors` could only ever " +
+			"print 0.",
+	},
+	{
+		Name:     "vamp/a-failed-dry-run-exits-zero",
+		File:     "internal/vamp/dryrun.go",
+		Find:     "\treturn errors.Join(state.failures...)",
+		Replace:  "\treturn nil",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestDryRunReportsEveryBrokenStageNotJustTheFirst", "TestExecutor_DryRunDetectsTemplateError", "TestExecutor_DryRunDetectsCapabilityMissing"},
+		Why: "the other half of collect-and-continue, and the dangerous half: a walk that keeps going " +
+			"has to still FAIL at the end. Exit status is how `--dry-run` says \"do not run this\", " +
+			"and a dry run that prints errors and exits 0 is worse than one that aborts.",
+	},
+	{
+		Name:     "vamp/a-stage-types-payload-stops-being-compared",
+		File:     "internal/vamp/diff.go",
+		Find:     "\tcase StageTypeMix, StageTypeShort:",
+		Replace:  "\tcase StageTypeMix:",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestEveryStageTypeIsComparedByDiff", "TestStageTypeSwitchesAreExhaustive"},
+		Why: "drops one stage type back through renderStagePromptForDiff's fallthrough `return \"\"`. " +
+			"Both sides then render the empty string, compareStages sees equality, and the stage " +
+			"block prints status, duration and `output: (identical)` — a comparison that never " +
+			"happened, rendered as agreement. The yaml section does not cover for it: the commonest " +
+			"reason to run `vamp diff` is a fixed pipeline with moved inputs.",
+	},
+	{
+		Name:     "vamp/foreach-outputs-stop-being-compared",
+		File:     "internal/vamp/diff.go",
+		Find:     "\tif st.Foreach != nil {\n\t\treturn foreachOutputSide(r, st, prior, withDigests)\n\t}",
+		Replace:  "\tif st.Foreach != nil && false {\n\t\treturn foreachOutputSide(r, st, prior, withDigests)\n\t}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestCompare_ForeachStageOutputsAreCompared"},
+		Why: "restores the state in which a fan-out stage's outputs were never compared at all: " +
+			"st.Output renders with no per-item binding, `{{.i}}` fails under missingkey=error, and " +
+			"the failure returned Missing:true. Foreach is where the CONTENT of a run lives " +
+			"(per-chapter prose, per-shot audio); `vamp diff` compared everything except that.",
+	},
+	{
+		Name:     "vamp/a-skipped-comparison-reports-as-nothing-to-compare",
+		File:     "internal/vamp/diff.go",
+		Find:     "\t\treturn StageOutputSide{NotCompared: fmt.Sprintf(\"foreach over %q: %v\", st.Foreach.From, err)}",
+		Replace:  "\t\treturn StageOutputSide{Missing: true}",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestCompare_ForeachWithUnresolvableItemsSaysSo"},
+		Why: "collapses \"I could not work out what the items are\" back into \"there is no output " +
+			"here\" — the two facts that sharing one value is what made writeOutputBlock print " +
+			"nothing and a reader conclude the two runs agreed. The distinct state is the cheap half " +
+			"of the fix and the half that must never regress: the report may skip a comparison, but " +
+			"it must say so.",
+	},
+	{
+		Name:     "vamp/the-diff-lcs-table-loses-its-bound",
+		File:     "internal/vamp/diff.go",
+		Find:     "const maxDiffCells = 4_000_000",
+		Replace:  "const maxDiffCells = 1 << 40",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestUnifiedDiff_BoundsTheLCSTable"},
+		Why: "raises the ceiling out of reach, which is how a future refactor would quietly remove " +
+			"it. lineHunks is O(n*m) in MEMORY and its own comment reasons about PROMPTS, but " +
+			"unifiedDiff is also handed stage OUTPUT content — LLM-generated documents with no size " +
+			"bound, classified as textual off an 8 KiB sample. Measured: 622 KB of text allocated " +
+			"3.3 GB, clean 4x per doubling; two 2 MB outputs project to ~34 GB on a box that also " +
+			"hosts live model servers.",
+	},
+	{
+		Name:     "vamp/an-absent-snapshot-reports-as-identical",
+		File:     "internal/vamp/diff.go",
+		Find:     "\tcase rerr != nil || len(data) == 0:\n\t\tr.side.SnapshotMissing = true",
+		Replace:  "\tcase rerr != nil && false:\n\t\tr.side.SnapshotMissing = true",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestCompare_MissingArtefactsAreNotReportedAsIdentical"},
+		Why: "Compare used to discard os.ReadFile's error, so two runs with no pipeline.yaml.snapshot " +
+			"compared empty-to-empty and the renderer printed `(identical)` — for a comparison that " +
+			"never ran, on a run whose EVERY per-stage prompt and output comparison had also silently " +
+			"degraded to nothing. exec.go writes an empty snapshot by design when PipelineSource is " +
+			"unpopulated, so the state is reachable.",
+	},
+	{
+		Name:     "vamp/the-diff-prints-a-webhook-credential-from-the-inputs",
+		File:     "internal/vamp/diff.go",
+		Find:     "\tsum := sha256.Sum256([]byte(v))\n\treturn \"(redacted, id \" + hex.EncodeToString(sum[:4]) + \")\"",
+		Replace:  "\treturn v",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestCompare_WebhookDestinationIsComparedAndRedacted"},
+		Why: "an input whose value reaches a webhook's url or one of its headers is bearer-equivalent " +
+			"by construction, and the inputs section printed it verbatim to stdout and into --json. " +
+			"vamp already wrote it to inputs.json at 0644, so the diff is not the ORIGIN of the " +
+			"secret — it is a new distribution channel, which is the same multiplier argument the " +
+			"run-log fix made.",
+	},
+	{
+		Name:     "vamp/the-diff-prints-the-webhook-destination-unredacted",
+		File:     "internal/vamp/diff.go",
+		Find:     "\t\tfmt.Fprintf(&b, \"url: %s\\n\", fleetnotify.Redact(renderWebhookForDiff(st, r, prior, \"url\", st.URL)))",
+		Replace:  "\t\tfmt.Fprintf(&b, \"url: %s\\n\", renderWebhookForDiff(st, r, prior, \"url\", st.URL))",
+		Pkg:      "./internal/vamp/",
+		MustFail: []string{"TestCompare_WebhookDestinationIsComparedAndRedacted"},
+		Why: "the url/method/headers were not compared at all before this fix — `vamp diff` could not " +
+			"answer \"did these two runs notify the same endpoint?\" and printed `output: (identical)` " +
+			"for two runs that hit different servers. Redact is what makes comparing them safe: " +
+			"scheme+host plus a stable 8-hex id, so two endpoints differ visibly without the " +
+			"credential ever being in the report.",
+	},
+
 	{
 		Name:     "c25/the replay sample is harvested after the apply",
 		File:     "internal/vibe/modeltry/modeltry.go",
