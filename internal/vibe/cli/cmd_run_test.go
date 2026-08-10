@@ -33,6 +33,11 @@ type controlFake struct {
 	frontend *vibev1.FrontendInfo
 	starts   int
 	stops    int
+	// shutdowns counts Shutdown RPCs. cellVerbFake answers that verb
+	// Unimplemented, which is right for the cell paths and wrong for
+	// `vibe shutdown`, whose whole assertion is whether the teardown it
+	// REPORTED was actually asked for.
+	shutdowns int
 	// statusDelay stalls Status before it answers, so a test can be a
 	// daemon that is UP and merely slow — the case a ping budget cannot
 	// tell from a daemon that is gone unless somebody looks at the error.
@@ -76,10 +81,23 @@ func (f *controlFake) Pull(context.Context, *connect.Request[vibev1.PullRequest]
 	return nil
 }
 
+func (f *controlFake) Shutdown(context.Context, *connect.Request[vibev1.ShutdownRequest]) (*connect.Response[vibev1.ShutdownResponse], error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.shutdowns++
+	return connect.NewResponse(&vibev1.ShutdownResponse{}), nil
+}
+
 func (f *controlFake) counts() (starts, stops int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.starts, f.stops
+}
+
+func (f *controlFake) shutdownCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.shutdowns
 }
 
 // runFixture writes a kind=managed profile whose frontend is a script

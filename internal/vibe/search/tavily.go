@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetnotify"
 )
 
 // tavilyBaseURL is Tavily's API origin. Overridable only for tests — the
@@ -128,9 +130,13 @@ func (t *tavily) Fetch(ctx context.Context, rawURL string) (*Document, error) {
 		// status, so an empty result set is the normal shape of "this page
 		// could not be read" and has to be surfaced as an error here.
 		if len(out.FailedResults) > 0 {
-			return nil, fmt.Errorf("tavily extract %s: %s", rawURL, out.FailedResults[0].Error)
+			// The far side's message can quote the URL back at us verbatim
+			// — it is the string we sent — so the echo is redacted too, not
+			// just our own copy of it. See redact.go.
+			return nil, fmt.Errorf("tavily extract %s: %s", redactURL(rawURL),
+				fleetnotify.ScrubURL(rawURL, out.FailedResults[0].Error))
 		}
-		return nil, fmt.Errorf("tavily extract %s: no content returned", rawURL)
+		return nil, fmt.Errorf("tavily extract %s: no content returned", redactURL(rawURL))
 	}
 	return &Document{URL: out.Results[0].URL, Text: out.Results[0].RawContent}, nil
 }

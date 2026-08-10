@@ -94,7 +94,7 @@ func TestPSJSONSaysWhenNobodyWasAsked(t *testing.T) {
 //
 // The rig is the real thing end to end: a real ControlService on a real unix
 // socket in a scratch XDG_RUNTIME_DIR, holding a real active profile, whose
-// Status simply answers slower than psPingBudget. Before the fix this
+// Status simply answers slower than pingBudget. Before the fix this
 // printed {"daemon_running": false, "active": null, "services": []} and
 // exited 0 — a live daemon with a resident model, reported as a stopped one.
 //
@@ -104,7 +104,7 @@ func TestPSJSONSaysWhenNobodyWasAsked(t *testing.T) {
 func TestPSRefusesToCallASlowDaemonAStoppedOne(t *testing.T) {
 	fake := newControlFake()
 	fake.active = &vibev1.Status{Running: true, Ready: true, Profile: "pi"}
-	fake.statusDelay = psPingBudget * 2
+	fake.statusDelay = pingBudget * 2
 	serveControlOnUnix(t, fake)
 
 	for _, args := range [][]string{{"--json"}, nil} {
@@ -145,7 +145,7 @@ func TestPSRefusesToCallASlowDaemonAStoppedOne(t *testing.T) {
 func TestDaemonAbsentSeparatesNoDaemonFromNoAnswer(t *testing.T) {
 	t.Run("no socket is absence", func(t *testing.T) {
 		t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
-		err := pingDaemon(psPingBudget)
+		err := pingDaemon(pingBudget)
 		if err == nil {
 			t.Fatal("ping succeeded with no daemon")
 		}
@@ -156,9 +156,9 @@ func TestDaemonAbsentSeparatesNoDaemonFromNoAnswer(t *testing.T) {
 	})
 	t.Run("a spent budget is not absence", func(t *testing.T) {
 		fake := newControlFake()
-		fake.statusDelay = psPingBudget * 2
+		fake.statusDelay = pingBudget * 2
 		serveControlOnUnix(t, fake)
-		err := pingDaemon(psPingBudget)
+		err := pingDaemon(pingBudget)
 		if err == nil {
 			t.Fatal("ping succeeded inside the budget; the fake is not slow enough to prove anything")
 		}

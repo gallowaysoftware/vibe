@@ -245,9 +245,13 @@ func (s *Server) callTool(ctx context.Context, name string, rawArgs json.RawMess
 		}
 		doc, meta, err := s.fetchTiered(ctx, args.URL)
 		if err != nil {
-			return "", fmt.Errorf("could not fetch %s: %v", args.URL, err)
+			// Redacted even though this text goes back to the model that
+			// supplied the URL: a tool result is not a private channel. It
+			// is written into a transcript, and harnesses log tool results
+			// where they log everything else. See redact.go.
+			return "", fmt.Errorf("could not fetch %s: %v", redactURL(args.URL), err)
 		}
-		s.logger().Info("mcp fetch_url", "url", args.URL, "extractor", meta.Extractor,
+		s.logger().Info("mcp fetch_url", "url", redactURL(args.URL), "extractor", meta.Extractor,
 			"escalated", meta.Escalated, "chars", len(doc.Text))
 		var b strings.Builder
 		if doc.Title != "" {

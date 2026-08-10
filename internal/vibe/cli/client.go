@@ -31,6 +31,23 @@ func newClient() *vibeclient.Client {
 	return vibeclient.NewWithHTTPClient("http://vibe.local", hc, "")
 }
 
+// pingBudget is how long a read-only command waits for the daemon to say
+// it is there. Named so a refusal can quote the number it actually used.
+//
+// One number for `ps`, `env` and `shutdown` because they ask the same
+// question of the same process and there is no reason for the answer to
+// depend on which one asked. 500ms, and the size is set by what the
+// daemon is doing rather than by a human's patience: it is holding a
+// model, it serves the proxy, and a Status handler behind a loaded box
+// can miss a 200ms window without anything being wrong. Every millisecond
+// under that number is a millisecond in which a LIVE daemon looks absent.
+//
+// spawn.go deliberately does NOT use this. Its 200ms is a "should I
+// spawn?" probe with a five-second retry loop behind it, so a short
+// budget there costs a retry rather than a wrong answer — see the comment
+// at ensureDaemon.
+const pingBudget = 500 * time.Millisecond
+
 // pingDaemon returns nil if the daemon answers Status within the given timeout.
 func pingDaemon(timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
