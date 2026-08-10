@@ -42,8 +42,37 @@ func RenderStagePrompt(st *Stage, pipelineDir string, cliInputs map[string]strin
 // output without invoking the runner itself — e.g. the `vamp render`
 // command resolving a dependency's prior output by reading the file at
 // the rendered path.
+//
+// The result is run-dir-confined, same rule and same shared helper as
+// Executor.renderOutputPath (exec.go), dryRunState.renderOutputPath
+// (dryrun.go) and stagePriorOutputs (diff.go). This was the one
+// output-path caller that skipped it, and the omission was reachable
+// from the shipped CLI: `vamp render --run-dir <dir> --input
+// name=../outside/secret.txt` on a pipeline whose dependency declares
+// `output: "{{ .inputs.name }}"` exited 0 and printed the out-of-tree
+// file's contents as though it were the dependency's output
+// (cmd_render.go joins this path onto the run dir, os.ReadFile's it,
+// and binds the bytes to .stages.<id>.output).
+//
+// Blast radius, stated honestly so the next reader does not
+// over-correct: the reachable inputs here are the pipeline YAML's
+// `output:` field and `--input KEY=VALUE`, NOT a sampled LLM string —
+// buildRenderPrior binds every dependency's own prior output to "" — so
+// this is not the executor-grade sink ensureUnderRunDir's own doc
+// describes, and it is a read rather than a write. It is fixed anyway
+// for the second, non-security reason: without the guard `vamp render`
+// resolves a dependency path that `vamp run` and `vamp dry-run` both
+// refuse, which is the "a plan that lies" failure dryrun.go argues
+// against, one command over.
 func RenderStageOutputPath(st *Stage, cliInputs map[string]string, prior map[string]*StageResult, runDir string) (string, error) {
-	return renderTemplate(st.ID+":output", st.Output, st.Inputs, cliInputs, publicToPrivatePrior(prior), runDir, nil)
+	out, err := renderTemplate(st.ID+":output", st.Output, st.Inputs, cliInputs, publicToPrivatePrior(prior), runDir, nil)
+	if err != nil {
+		return "", err
+	}
+	if err := ensureUnderRunDir(out); err != nil {
+		return "", err
+	}
+	return out, nil
 }
 
 // publicToPrivatePrior converts the public StageResult map into the

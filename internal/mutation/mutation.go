@@ -614,6 +614,144 @@ var Registry = []Mutation{
 			"{{ .failure_summary }} in a run_when: failure webhook that posts it into a room.",
 	},
 	{
+		Name:    "vamp/vamp render resolves a dependency output path outside the run dir",
+		File:    "internal/vamp/render.go",
+		Find:    "\tif err := ensureUnderRunDir(out); err != nil {\n\t\treturn \"\", err\n\t}\n\treturn out, nil",
+		Replace: "\treturn out, nil",
+		Pkg:     "./internal/vamp/",
+		MustFail: []string{
+			"TestRenderStageOutputPath_RefusesAnEscapeFromTheRunDir",
+		},
+		Why: "renderTemplate-for-output-paths has five callers and this was the fifth. The other " +
+			"four apply the run-dir rule — Executor.renderOutputPath, dryRunState.renderOutputPath " +
+			"and both diff.go sites, one of which carries a ten-line comment naming this exact " +
+			"threat — and cmd_render.go joins THIS result onto the run dir, os.ReadFile's it, and " +
+			"binds the bytes into the printed prompt, so `vamp render --run-dir … --input " +
+			"name=../outside/secret.txt` exited 0 and printed the file. The reachable inputs are " +
+			"the pipeline YAML and --input rather than a sampled LLM string, so this is not the " +
+			"executor-grade sink; it is pinned anyway because without it `render` resolves a path " +
+			"`run` and `dry-run` both refuse, which is the \"a plan that lies\" failure one command " +
+			"over. The function measured 100% line coverage while asserting nothing about what it " +
+			"should REFUSE — which is why the entry, not the coverage number, is the guard.",
+	},
+	{
+		Name:    "vamp/a template read helper climbs out of the directory it was handed",
+		File:    "internal/vamp/exec.go",
+		Find:    "\tfor _, seg := range strings.Split(filepath.ToSlash(path), \"/\") {\n\t\tif seg == \"..\" {\n\t\t\treturn fmt.Errorf(\"%s %s: %w (name the directory directly)\", fn, path, errTemplatePathTraversal)\n\t\t}\n\t}\n\treturn nil",
+		Replace: "\treturn nil",
+		Pkg:     "./internal/vamp/",
+		MustFail: []string{
+			"TestReadHelpers_RefuseATraversalOutOfTheDirectoryTheyWereGiven",
+		},
+		Why: "the executor's WRITE path is confined and its READ path was not, on the same " +
+			"executor and from the same untrusted source: readFile's documented job is to chain a " +
+			"prior stage's output into the next prompt, and a prior stage's output is whatever the " +
+			"model wrote. `{{ readFile (printf \"%s/../id_rsa\" .runDir) }}` returned a private key " +
+			"into the rendered prompt while the identical escape through `output:` was refused one " +
+			"function over. joinPath is in the same entry's blast radius because filepath.Join " +
+			"RESOLVES \"..\" rather than rejecting it, so an unguarded composer hands readFile a " +
+			"clean path pointing outside the run dir. Deliberately traversal-only: an ABSOLUTE " +
+			"path stays legal because reading a user's on-disk corpus is what these helpers are " +
+			"for, and a mutation that \"finishes the job\" into a run-dir confinement would break " +
+			"every lesson pipeline.",
+	},
+	{
+		Name:    "vamp/a nested lesson glob collapses to bare leaf names",
+		File:    "internal/vamp/exec.go",
+		Find:    "\t\tdirs = append(dirs, name)",
+		Replace: "\t\tdirs = append(dirs, filepath.Base(m))",
+		Pkg:     "./internal/vamp/",
+		MustFail: []string{
+			"TestEnumerateDirs_NestedGlobKeepsTheParentSegment",
+		},
+		Why: "filepath.Base is not relative to anything — it is the last segment — and " +
+			"enumerateDirs promises \"relative directory names\". Over a module-organised " +
+			"curriculum (root/*/Lesson_*) four real lessons came back as " +
+			"[\"Lesson_1\",\"Lesson_2\",\"Lesson_1\",\"Lesson_2\"]: parent lost, leaf duplicated, " +
+			"none of them resolving under the root. The image fan-out then returned [] with a nil " +
+			"error and the foreach logged \"no items to run\" — a green pipeline that described " +
+			"zero diagrams, which is the same failure the zero-match error in this function was " +
+			"written to eliminate, arriving through a different door. The mutation is the exact " +
+			"line the bug lived on, so a future \"simplify to Base\" edit is caught by the test " +
+			"rather than by the next multi-module curriculum.",
+	},
+	{
+		Name:    "vamp/a lesson name that resolves to nothing reads as a lesson with no diagrams",
+		File:    "internal/vamp/exec.go",
+		Find:    "\tinfo, statErr := os.Stat(filepath.Join(lessonRoot, lesson))\n\tif statErr != nil || !info.IsDir() {\n\t\treturn \"\", fmt.Errorf(\"%w: %q under %s\", errLessonNotFound, lesson, lessonRoot)\n\t}",
+		Replace: "\t_ = lessonRoot",
+		Pkg:     "./internal/vamp/",
+		MustFail: []string{
+			"TestLessonHelpers_RefuseALessonThatNamesNothing",
+		},
+		Why: "enumerateDirs argues at length that a glob matching nothing must be an error " +
+			"because a stale root is indistinguishable from a curriculum with no lessons once the " +
+			"result is []. The three helpers that CONSUME the array never made that argument, and " +
+			"the array need not come from enumerateDirs at all — the documented binding is " +
+			"`.stages.list_lessons.output`, i.e. a model's own JSON. [\"Lesson_9999\"] against a " +
+			"real root returned a well-formed empty fan-out with a nil error. The guard lives in " +
+			"lessonImageDir so all three helpers get it from one place, and it is deliberately the " +
+			"LESSON directory it stats, not images/: a real lesson with no images/ is zero units " +
+			"of work correctly expressed and must stay [] — " +
+			"TestEnumerateImagePairs_NoImagesIsEmptyArrayNotNull pins that and is right.",
+	},
+	{
+		Name:    "vamp/an empty lessons array reads as a curriculum with no diagrams",
+		File:    "internal/vamp/exec.go",
+		Find:    "\tif len(lessons) == 0 {\n\t\treturn \"\", fmt.Errorf(\"enumerateImagePairs: the lessons array is empty; a producer that found no lessons is a fault, not a curriculum with no diagrams\")\n\t}",
+		Replace: "\tif len(lessons) < 0 {\n\t\treturn \"\", fmt.Errorf(\"enumerateImagePairs: the lessons array is empty; a producer that found no lessons is a fault, not a curriculum with no diagrams\")\n\t}",
+		Pkg:     "./internal/vamp/",
+		MustFail: []string{
+			"TestLessonHelpers_RefuseALessonThatNamesNothing",
+		},
+		Why: "the sibling of the entry above, and a separate guard: a producer can fail by naming " +
+			"lessons that are not there OR by naming none at all, and a model under JSON-mode " +
+			"pressure emits `[]` readily. Both used to produce an empty fan-out with a nil error, " +
+			"after which executeForeachStage logs \"foreach array empty, no items to run\" and " +
+			"returns nil — the run is green and nothing happened. `< 0` rather than a deletion " +
+			"because it is the shape a careless \"loosen this\" edit actually takes, and it keeps " +
+			"the error string in the tree so the entry cannot pass by accident.",
+	},
+	{
+		Name:    "vamp/the svg ground-truth sidecar invents a value",
+		File:    "internal/vamp/exec.go",
+		Find:    "\t\tcase xml.StartElement:\n\t\t\tif t.Name.Local == \"text\" {\n\t\t\t\tif inText == 0 {\n\t\t\t\t\tcur.Reset()\n\t\t\t\t}\n\t\t\t\tinText++\n\t\t\t} else if inText > 0 {\n\t\t\t\tcur.WriteByte(' ')\n\t\t\t}\n\t\tcase xml.EndElement:\n\t\t\tif t.Name.Local == \"text\" && inText > 0 {\n\t\t\t\tinText--\n\t\t\t\tif inText == 0 {\n\t\t\t\t\tflush()\n\t\t\t\t}\n\t\t\t} else if inText > 0 {\n\t\t\t\tcur.WriteByte(' ')\n\t\t\t}",
+		Replace: "\t\tcase xml.StartElement:\n\t\t\tif t.Name.Local == \"text\" {\n\t\t\t\tif inText == 0 {\n\t\t\t\t\tcur.Reset()\n\t\t\t\t}\n\t\t\t\tinText++\n\t\t\t}\n\t\tcase xml.EndElement:\n\t\t\tif t.Name.Local == \"text\" && inText > 0 {\n\t\t\t\tinText--\n\t\t\t\tif inText == 0 {\n\t\t\t\t\tflush()\n\t\t\t\t}\n\t\t\t}",
+		Pkg:     "./internal/vamp/",
+		MustFail: []string{
+			"TestExtractSVGText_AdjacentTspansAreSeparated",
+		},
+		Why: "this helper's whole stated purpose is to hand a vision model GROUND TRUTH for the " +
+			"numbers it might mis-read off a 896x896 raster. Sibling <tspan>s — what Inkscape and " +
+			"matplotlib emit for any wrapped or stacked label — were concatenated with nothing " +
+			"between them, so 12 and 34 arrived as \"1234\" and Total/Revenue as \"TotalRevenue\": " +
+			"a confident value that appears nowhere in the diagram, which is strictly worse than " +
+			"omitting it, because the sidecar exists to CORRECT the model's reading. Both arms are " +
+			"in one mutation because deleting either alone still leaves a separator and the test " +
+			"would not move — the honest mutation is the \"simplify away the space writes\" edit a " +
+			"future reader would actually make. The function was at 0.0% coverage, so the entry " +
+			"lands with its first test.",
+	},
+	{
+		Name:    "vamp/an unresolvable home dir relocates the whole state tree",
+		File:    "internal/vamp/paths.go",
+		Find:    "\tif home != \"\" && err == nil {\n\t\treturn home\n\t}\n\treturn fallbackHome(err)",
+		Replace: "\t_ = err\n\treturn home",
+		Pkg:     "./internal/vamp/",
+		MustFail: []string{
+			"TestPaths_AreAbsoluteWithNoResolvableHome",
+		},
+		Why: "`home, _ := os.UserHomeDir()` left home == \"\" when $HOME is unset, and " +
+			"filepath.Join(\"\", \".config\", \"vamp\") is the RELATIVE path \".config/vamp\" — so " +
+			"ConfigHome, StateHome, PipelinesDir, CapabilitiesFile and RunsDir all silently " +
+			"re-rooted onto the process CWD with nothing logged and nothing erroring. The first " +
+			"symptom is a capability lookup that reads \"this capability is not configured\" " +
+			"rather than \"I cannot find my configuration\". A HOME-less unit is the fleet's " +
+			"normal remote-exec shape (SSH + systemd), not an exotic one. The assertion is IsAbs " +
+			"rather than an exact path, so the entry survives a future change of fallback " +
+			"directory but not a return to a relative one.",
+	},
+	{
 		Name:     "vamp/a webhook stage stops scrubbing the credential header the far side echoed",
 		File:     "internal/vamp/webhook_executor.go",
 		Find:     "\t\tif value := headers[name]; len(value) >= minScrubbableHeaderValue && credentialHeader(name) {\n\t\t\tmsg = fleetnotify.ScrubURL(value, msg)\n\t\t}",

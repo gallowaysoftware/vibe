@@ -4,9 +4,9 @@ query, retrieved_count, relevant_count, top_chunk_relevant,
 precision_at_5, comment.
 
 Raw judge records:
-{{ range .stages.judge.outputs -}}
---- {{.}} ---
-{{ readFile . }}
+{{ range $i, $record := .stages.judge.outputs -}}
+--- judge_{{$i}}.json ---
+{{ $record }}
 
 {{ end }}
 

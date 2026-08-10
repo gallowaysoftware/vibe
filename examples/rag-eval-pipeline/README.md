@@ -41,10 +41,21 @@ vamp run pipeline.yaml --input collection=<name>       # live run
 ```
 
 **Note**: `vamp run --dry-run` doesn't traverse this pipeline cleanly.
-The `judge` and `report` stages use `readFile` to consume upstream
-webhook responses, but dry-run doesn't actually execute the
-upstream stages so the response files don't exist. Use `validate`
-for static checks; the live `run` works as expected.
+The `judge` stage and the `retrieve` body template use `readFile` to
+consume upstream webhook responses, but dry-run doesn't actually
+execute the upstream stages so the response files don't exist. Use
+`validate` for static checks; the live `run` works as expected.
+
+**A rule this example exists to demonstrate**: `readFile` takes a
+PATH. For a **text** stage, `.stages.<id>.output` / `.outputs` hold the
+model's own TEXT, not a path — so `judge.tmpl` reads its upstream by
+constructing the path itself (`{{ readFile (printf "%s/retrieve_%d.json"
+.runDir .i) }}`, from a *webhook* stage that wrote a file), while
+`report.tmpl` ranges over `.stages.judge.outputs` and emits each record
+directly. Passing a text stage's output to `readFile` is always a bug:
+at best the render dies naming the JSON blob it tried to open, and at
+worst the model has just chosen which file gets inlined into the next
+prompt.
 
 Outputs land in `$XDG_STATE_HOME/vamp/runs/<timestamp>_rag-eval/`:
 
