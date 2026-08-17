@@ -119,8 +119,48 @@ type swapModel struct {
 	CheckEndpoint string `yaml:"checkEndpoint,omitempty"`
 	// TTL is always emitted (never omitted): 0 is llama-swap's "never
 	// unload", which must stay distinguishable from "field absent".
-	TTL      int  `yaml:"ttl"`
-	Unlisted bool `yaml:"unlisted,omitempty"`
+	TTL          int               `yaml:"ttl"`
+	Unlisted     bool              `yaml:"unlisted,omitempty"`
+	Capabilities *swapCapabilities `yaml:"capabilities,omitempty"`
+}
+
+// swapCapabilities mirrors llama-swap's ModelCapConfig. llama-swap turns it
+// into top-level /v1/models fields — `in` becomes
+// architecture.input_modalities (and capabilities.vision when it contains
+// "image"), `context` becomes context_length — which clients prefer over
+// guessing capabilities from the model id. Its tools/reranker fields are
+// deliberately not emitted: the backend schema has nothing to derive them
+// from, and a guess would be indistinguishable to a client from a fact.
+type swapCapabilities struct {
+	In      []string `yaml:"in,omitempty"`
+	Out     []string `yaml:"out,omitempty"`
+	Context int      `yaml:"context,omitempty"`
+}
+
+// modelCapabilities derives a capabilities block from what a def already
+// declares, or nil when nothing truthful can be said about the model.
+//
+// Embedding servers are excluded rather than described. Their context is
+// llama.cpp's TOTAL budget divided across --parallel slots, so advertising it
+// as a context window overstates the real per-request limit by the slot count
+// (8192 across 16 slots is 512 per sequence, the figure that actually bounds
+// a chunk), and they refuse /v1/chat/completions, so no output modality holds
+// either.
+func modelCapabilities(def *profile.BackendDef) *swapCapabilities {
+	ls := def.Backend.LlamaServer
+	if ls == nil {
+		return nil
+	}
+	if slices.Contains(ls.ExtraArgs, "--embeddings") {
+		return nil
+	}
+	caps := &swapCapabilities{In: []string{"text"}, Out: []string{"text"}, Context: ls.Context}
+	if ls.MMProj != "" {
+		// The projector is the entire difference between a vision-capable
+		// checkpoint and a served model that answers 500 to image input.
+		caps.In = append(caps.In, "image")
+	}
+	return caps
 }
 
 type swapPeer struct {
@@ -321,6 +361,14 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 		// The front owns no models: every assigned def becomes a models
 		// entry under its cell's peer stanza, keyed by cell name so
 		// fleetd and the render agree on the peer's identity.
+		//
+		// Capabilities do not survive this hop. llama-swap's peer stanza
+		// carries a bare list of model ids, and its /v1/models handler
+		// builds every peer record with an empty ModelCapConfig, so a
+		// front-addressed client sees no context_length or modalities no
+		// matter what the cell declares. Clients that reach models through
+		// the front still need their own per-id corrections until llama-swap
+		// propagates a peer's catalog.
 		for _, def := range modelDefs {
 			if cfg.Peers == nil {
 				cfg.Peers = map[string]*swapPeer{}
@@ -339,8 +387,9 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 				cfg.Models = map[string]*swapModel{}
 			}
 			m := &swapModel{
-				Aliases: aliases[def.Name],
-				TTL:     int(DefaultTTL / time.Second),
+				Aliases:      aliases[def.Name],
+				TTL:          int(DefaultTTL / time.Second),
+				Capabilities: modelCapabilities(def),
 			}
 			if c := def.Backend.ComfyUI; c != nil {
 				// ComfyUI as a swap tenant (design §16): fixed port from the def

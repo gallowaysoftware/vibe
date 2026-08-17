@@ -519,3 +519,43 @@ peers:
 		t.Errorf("top-level fields drifted from the hand-maintained config: got %+v want %+v", got, want)
 	}
 }
+
+// TestRenderCell_FrontCarriesNoCapabilities pins the reason the front render
+// stays capability-free. llama-swap's peer stanza is a bare list of model ids,
+// and its /v1/models builds every peer record with an empty capability config,
+// so a block emitted here would be silently dropped rather than reach a
+// front-addressed client. Clients that talk to the front need their own
+// per-id corrections until llama-swap propagates a peer's catalog.
+func TestRenderCell_FrontCarriesNoCapabilities(t *testing.T) {
+	a := llamaDef("qwen-a", "qwen")
+	a.Cell = "gpu1"
+	vision := llamaDef("gemma-mm", "gemma-it")
+	vision.Cell = "gpu2"
+	vision.Backend.LlamaServer.MMProj = "/models/mmproj.gguf"
+
+	out, err := Render([]*profile.BackendDef{a, vision}, Options{
+		LlamaServerBinary: testBinary,
+		Cell:              fleetcfg.FrontCell,
+		Hosts:             testHosts(t, cellTestHosts),
+	})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if strings.Contains(out, "capabilities:") {
+		t.Errorf("front render emitted capabilities, which peers cannot carry:\n%s", out)
+	}
+
+	// The same defs on their own cell must still declare them, so the
+	// exclusion is the front's shape and not a lost derivation.
+	out, err = Render([]*profile.BackendDef{vision}, Options{
+		LlamaServerBinary: testBinary,
+		Cell:              "gpu2",
+		Hosts:             testHosts(t, cellTestHosts),
+	})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if !strings.Contains(out, "capabilities:") || !strings.Contains(out, "image") {
+		t.Errorf("cell render dropped the vision capability:\n%s", out)
+	}
+}

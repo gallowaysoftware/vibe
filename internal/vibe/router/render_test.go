@@ -519,3 +519,73 @@ backend:
 		t.Errorf("random-port comfyui render = %v, want port error", err)
 	}
 }
+
+// TestRender_Capabilities covers the block llama-swap turns into
+// architecture.input_modalities and context_length on /v1/models. A client
+// that has to guess these instead gets them from the model id, which is the
+// real upstream model rather than the one this def serves — a vision-capable
+// checkpoint run without an mmproj then receives images and answers 500.
+func TestRender_Capabilities(t *testing.T) {
+	_, _, _ = renderTestdata(t)
+	defs, err := LoadDefs("testdata/backends")
+	if err != nil {
+		t.Fatalf("LoadDefs: %v", err)
+	}
+	out, err := Render(defs, Options{LlamaServerBinary: testBinary})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	var cfg struct {
+		Models map[string]*swapModel `yaml:"models"`
+	}
+	if err := yaml.Unmarshal([]byte(out), &cfg); err != nil {
+		t.Fatalf("rendered output is not YAML: %v", err)
+	}
+
+	for _, tc := range []struct {
+		model   string
+		wantIn  []string
+		wantCtx int
+	}{
+		{"gemma-4-31b-mm", []string{"text", "image"}, 57344},
+		{"qwen3.6-27b", []string{"text"}, 131072},
+	} {
+		m := cfg.Models[tc.model]
+		if m == nil {
+			t.Fatalf("%s: model entry missing", tc.model)
+		}
+		if m.Capabilities == nil {
+			t.Fatalf("%s: no capabilities block", tc.model)
+		}
+		if !equalSlices(m.Capabilities.In, tc.wantIn) {
+			t.Errorf("%s: in = %v, want %v", tc.model, m.Capabilities.In, tc.wantIn)
+		}
+		if !equalSlices(m.Capabilities.Out, []string{"text"}) {
+			t.Errorf("%s: out = %v, want [text]", tc.model, m.Capabilities.Out)
+		}
+		if m.Capabilities.Context != tc.wantCtx {
+			t.Errorf("%s: context = %d, want %d (the def's own ctx-size)", tc.model, m.Capabilities.Context, tc.wantCtx)
+		}
+	}
+
+	t.Run("embedding servers are excluded, not described", func(t *testing.T) {
+		embed := llamaDef("bge-embed", "bge-embed")
+		embed.Backend.LlamaServer.Parallel = 16
+		embed.Backend.LlamaServer.ExtraArgs = []string{"--embeddings", "--pooling", "mean"}
+		out, err := Render([]*profile.BackendDef{embed}, Options{LlamaServerBinary: testBinary})
+		if err != nil {
+			t.Fatalf("Render: %v", err)
+		}
+		var cfg struct {
+			Models map[string]*swapModel `yaml:"models"`
+		}
+		if err := yaml.Unmarshal([]byte(out), &cfg); err != nil {
+			t.Fatal(err)
+		}
+		// context is the total budget across --parallel slots, so publishing
+		// it as a context window overstates the per-request limit 16-fold.
+		if c := cfg.Models["bge-embed"].Capabilities; c != nil {
+			t.Errorf("capabilities = %+v, want none for an embedding server", c)
+		}
+	})
+}
