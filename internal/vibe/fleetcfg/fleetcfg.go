@@ -106,6 +106,28 @@ type Cell struct {
 	// the bar. A capital number with no stated basis is unarguable, and
 	// this screen's whole value is being arguable.
 	CapitalNote string `yaml:"capital_note,omitempty"`
+	// Timeouts, when set, is emitted verbatim as the front render's
+	// peer stanza `timeouts:` block for this cell (llama-swap's
+	// per-peer proxy timeouts, seconds; 0 disables a timeout). It
+	// exists because llama-swap's built-in peer default is
+	// responseHeader: 60 — right for a warm local model, fatal for a
+	// 1M-class engine whose prefill needs minutes before the first
+	// byte.
+	Timeouts *Timeouts `yaml:"timeouts,omitempty"`
+}
+
+// Timeouts mirrors llama-swap's per-peer TimeoutsConfig (internal/config
+// in llama-swap: connect, keepalive, responseHeader, tlsHandshake,
+// expectContinue, idleConn — all seconds). The front render emits it on
+// the cell's peer stanza; a cloud_peer def reuses the same block on its
+// own stanza.
+type Timeouts struct {
+	Connect        int `yaml:"connect,omitempty"`
+	KeepAlive      int `yaml:"keepalive,omitempty"`
+	ResponseHeader int `yaml:"responseHeader,omitempty"`
+	TLSHandshake   int `yaml:"tlsHandshake,omitempty"`
+	ExpectContinue int `yaml:"expectContinue,omitempty"`
+	IdleConn       int `yaml:"idleConn,omitempty"`
 }
 
 // Power is a cell's declared power draw. Declared is sufficient because
@@ -562,6 +584,23 @@ func (f *File) validate() error {
 			return fmt.Errorf("cells.%s: capital_cost requires capital_note (what the number covers — e.g. \"dual-use GPU, upgrade delta over a gaming-adequate card\"); it is rendered beside the payback bar", name)
 		case c.CapitalCost == 0 && strings.TrimSpace(c.CapitalNote) != "":
 			return fmt.Errorf("cells.%s: capital_note without capital_cost (no capital number means no payback bar at all)", name)
+		}
+		if c.Timeouts != nil {
+			for field, v := range map[string]int{
+				"connect":        c.Timeouts.Connect,
+				"keepalive":      c.Timeouts.KeepAlive,
+				"responseHeader": c.Timeouts.ResponseHeader,
+				"tlsHandshake":   c.Timeouts.TLSHandshake,
+				"expectContinue": c.Timeouts.ExpectContinue,
+				"idleConn":       c.Timeouts.IdleConn,
+			} {
+				// A negative seconds value renders as an
+				// already-expired duration in llama-swap: the peer
+				// would fail every request, invisibly.
+				if v < 0 {
+					return fmt.Errorf("cells.%s.timeouts.%s: must be >= 0 (0 disables that timeout)", name, field)
+				}
+			}
 		}
 	}
 	if err := f.validatePricing(); err != nil {

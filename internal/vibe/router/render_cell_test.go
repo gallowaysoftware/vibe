@@ -260,6 +260,66 @@ func TestRenderCell_FrontPeersOnly(t *testing.T) {
 	}
 }
 
+// A cell's hosts.yaml timeouts block rides onto the front peer stanza
+// verbatim (llama-swap's per-peer proxy timeouts); a cell without one
+// renders no timeouts: key at all (the peer then rides llama-swap's
+// built-in responseHeader: 60 default). A cloud_peer def's own timeouts
+// block rides onto its stanza the same way.
+func TestRenderCell_FrontPeerCarriesCellTimeouts(t *testing.T) {
+	hosts := testHosts(t, `
+cells:
+  front: {url: "http://front.lan:9000", class: always_on}
+  gpu1:
+    url: "http://gpu1.lan:9000"
+    class: always_on
+    timeouts:
+      responseHeader: 600
+  gpu2:  {url: "http://gpu2.lan:9000", class: opportunistic}
+`)
+	a := llamaDef("qwen-a", "")
+	a.Cell = "gpu1"
+	b := llamaDef("gemma-b", "")
+	b.Cell = "gpu2"
+	cloud := &profile.BackendDef{
+		Name: "anthropic",
+		Backend: profile.Backend{
+			External: true,
+			CloudPeer: &profile.CloudPeerBackend{
+				BaseURL:   "https://api.anthropic.com",
+				APIKeyEnv: "ANTHROPIC_API_KEY",
+				Models:    []string{"claude-sonnet-5"},
+				Timeouts:  &fleetcfg.Timeouts{ResponseHeader: 600},
+			},
+		},
+	}
+	var warns warnCapture
+	out, err := Render([]*profile.BackendDef{a, b, cloud}, Options{
+		LlamaServerBinary: testBinary,
+		Cell:              fleetcfg.FrontCell,
+		Hosts:             hosts,
+		Warnf:             warns.warnf,
+	})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	cfg := parseRendered(t, out)
+
+	g1 := cfg.Peers["gpu1"]
+	if g1.Timeouts == nil {
+		t.Fatalf("gpu1 peer must carry the cell's timeouts block, stanza = %+v", g1)
+	}
+	if g1.Timeouts.ResponseHeader != 600 || g1.Timeouts.Connect != 0 || g1.Timeouts.IdleConn != 0 {
+		t.Errorf("gpu1 timeouts = %+v, want only responseHeader: 600", g1.Timeouts)
+	}
+	if g2 := cfg.Peers["gpu2"]; g2.Timeouts != nil {
+		t.Errorf("gpu2 peer must render no timeouts: key without a cell declaration, got %+v", g2.Timeouts)
+	}
+	cp := cfg.Peers["anthropic"]
+	if cp.Timeouts == nil || cp.Timeouts.ResponseHeader != 600 {
+		t.Errorf("cloud_peer timeouts must ride onto its stanza, got %+v", cp.Timeouts)
+	}
+}
+
 // Cloud peers follow cell: placement: assigned-to-a-cell renders on that
 // cell's render only; the front carries just unassigned and
 // front-assigned cloud ids (the front owns the fleet's shared clouds).
