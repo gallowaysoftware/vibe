@@ -13,12 +13,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gallowaysoftware/vibe/internal/vibe/fleetcfg"
 	"gopkg.in/yaml.v3"
 )
 
 // Profile is the top-level YAML shape on disk.
-//
-// Backend is a discriminated union: exactly one of its typed sub-blocks
 // (LlamaServer, ComfyUI) must be set. The presence of the sub-block is the
 // discriminator — no separate `kind` field is needed.
 //
@@ -126,6 +125,48 @@ type Backend struct {
 	TabbyAPI    *TabbyAPIBackend    `yaml:"tabby_api,omitempty"`
 	CloudPeer   *CloudPeerBackend   `yaml:"cloud_peer,omitempty"`
 	MLXServer   *MLXServerBackend   `yaml:"mlx_server,omitempty"`
+	VLLM        *VLLMBackend        `yaml:"vllm,omitempty"`
+}
+
+// VLLMBackend declares a vLLM (or any OpenAI-compatible) engine whose
+// process lifecycle this box manages OUTSIDE vibe — the DGX Spark pair's
+// recipe launcher, a systemd unit, a docker run. vibe never launches,
+// supervises, or health-checks the engine: normalize forces backend.external,
+// and the def's entire job is honest declaration. `vibe router render` on
+// the engine's own cell emits a llama-swap peers: stanza proxying to URL
+// (a models: entry is impossible — llama-swap would JIT-start the engine,
+// and a TP=2 boot is minutes, not seconds), and the front render joins the
+// def into its cell's peer model list.
+//
+// There is deliberately no alias field: the upstream served-model name IS
+// the def name (SERVED_MODEL_NAME=<name>). vLLM validates the model field
+// and 404s a name it does not serve, so an alias would be a second name for
+// the same thing and the pair is exactly the lying-catalog shape
+// heavy-advertise.sh exists to prevent. A client-facing id is the def name,
+// full stop.
+type VLLMBackend struct {
+	// URL is the engine's OpenAI-compatible origin, e.g.
+	// http://127.0.0.1:8888 — rendered as the llama-swap peer `proxy` on
+	// the engine's own cell. On the front render it is irrelevant: the
+	// front peers to the CELL's llama-swap, which proxies here.
+	URL string `yaml:"url"`
+	// Context is the served context window, advertised to a frontend as
+	// ${MODEL_CONTEXT}. Metadata only — vLLM owns the real limit
+	// (max_model_len) and vibe has no way to ask it. Optional; when unset
+	// ${MODEL_CONTEXT} drops out of the expansion map rather than
+	// rendering 0.
+	Context int `yaml:"context,omitempty"`
+	// APIKeyEnv names the environment variable holding the engine's API
+	// key in the router's environment. Rendered as
+	// apiKey: ${env.<APIKeyEnv>} on the cell-side peer stanza. Empty (the
+	// common case on a trusted LAN) sends no key.
+	APIKeyEnv string `yaml:"api_key_env,omitempty"`
+	// Timeouts, when set, renders as the cell-side peer stanza's
+	// llama-swap `timeouts:` block. A large-context prefill takes minutes
+	// to reach the first byte and llama-swap's peer default is
+	// responseHeader: 60 — the same trap the front's hosts.yaml timeouts
+	// exist for, one hop downstream.
+	Timeouts *fleetcfg.Timeouts `yaml:"timeouts,omitempty"`
 }
 
 // CloudPeerBackend names a remote OpenAI/Anthropic-compatible API the router
@@ -155,6 +196,13 @@ type CloudPeerBackend struct {
 	// frontend; when unset ${MODEL_CONTEXT} is left unexpanded rather than
 	// rendering 0, which a harness would read as "no room" or ignore.
 	Context int `yaml:"context,omitempty"`
+	// Timeouts, when set, renders as the peer stanza's llama-swap
+	// `timeouts:` block (seconds; 0 = no timeout). A local engine behind a
+	// cloud_peer def (a 1M-class SGLang on a paired box) needs
+	// responseHeader raised: llama-swap's built-in peer default is 60s,
+	// and a 100K-token prefill takes longer than that to reach the first
+	// byte.
+	Timeouts *fleetcfg.Timeouts `yaml:"timeouts,omitempty"`
 }
 
 // LlamaServerBackend supervises a llama-server child process exposing an
@@ -1044,6 +1092,40 @@ func isQuantizedKV(t string) bool {
 // will substitute via ${env.VAR}.
 var envVarNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
+// validateVLLM checks the external-engine declaration. There are no path
+// fields to stat (the engine's weights are its own box's business) and no
+// process to configure — every rule here is about the URL the cell's
+// llama-swap will proxy to and the strings llama-swap will substitute.
+func validateVLLM(v *VLLMBackend) error {
+	if v.URL == "" {
+		return errors.New("backend.vllm.url is required (the OpenAI-compatible origin the cell's llama-swap proxies to)")
+	}
+	if !strings.HasPrefix(v.URL, "http://") && !strings.HasPrefix(v.URL, "https://") {
+		return fmt.Errorf("backend.vllm.url %q must be an http(s) URL", v.URL)
+	}
+	if v.Context < 0 {
+		return errors.New("backend.vllm.context must be > 0 when set")
+	}
+	if v.APIKeyEnv != "" && !envVarNameRE.MatchString(v.APIKeyEnv) {
+		return fmt.Errorf("backend.vllm.api_key_env %q is not a valid environment variable name", v.APIKeyEnv)
+	}
+	if v.Timeouts != nil {
+		for name, t := range map[string]int{
+			"connect":        v.Timeouts.Connect,
+			"keepalive":      v.Timeouts.KeepAlive,
+			"responseHeader": v.Timeouts.ResponseHeader,
+			"tlsHandshake":   v.Timeouts.TLSHandshake,
+			"expectContinue": v.Timeouts.ExpectContinue,
+			"idleConn":       v.Timeouts.IdleConn,
+		} {
+			if t < 0 {
+				return fmt.Errorf("backend.vllm.timeouts.%s must be >= 0 (0 disables that timeout)", name)
+			}
+		}
+	}
+	return nil
+}
+
 func validateCloudPeer(c *CloudPeerBackend) error {
 	if c.BaseURL == "" {
 		return errors.New("backend.cloud_peer.base_url is required")
@@ -1062,6 +1144,23 @@ func validateCloudPeer(c *CloudPeerBackend) error {
 	}
 	if c.Context < 0 {
 		return errors.New("backend.cloud_peer.context must be > 0 when set")
+	}
+	if c.Timeouts != nil {
+		for name, v := range map[string]int{
+			"connect":        c.Timeouts.Connect,
+			"keepalive":      c.Timeouts.KeepAlive,
+			"responseHeader": c.Timeouts.ResponseHeader,
+			"tlsHandshake":   c.Timeouts.TLSHandshake,
+			"expectContinue": c.Timeouts.ExpectContinue,
+			"idleConn":       c.Timeouts.IdleConn,
+		} {
+			if v < 0 {
+				// A negative seconds value is an already-expired
+				// duration in llama-swap: the peer would die on
+				// every request, invisibly.
+				return fmt.Errorf("backend.cloud_peer.timeouts.%s must be >= 0 (0 disables that timeout)", name)
+			}
+		}
 	}
 	for _, f := range c.Formats {
 		switch f {

@@ -319,10 +319,15 @@ func (c *Client) announceOnce(ctx context.Context) error {
 		Intent: c.intentEcho(),
 	}
 	models, err := c.gatherModels(ctx)
+	// models_known separates "catalog read, possibly empty" from "the
+	// catalog could not be read at all". Without it an announce from a cell
+	// whose llama-swap is down is byte-identical to one from a cell serving
+	// nothing — and the front render's announce-catalog gate would prune
+	// the cell's defs on the former reading. A failed read still announces
+	// (that is how "the unit is stopped" reads as an absent model list
+	// instead of an absent cell); it just refuses to claim the catalog.
+	req.ModelsKnown = err == nil
 	if err != nil {
-		// A llama-swap that's down answers nothing: the cell still
-		// announces (that's how "the unit is stopped" reads as an empty
-		// model list instead of an absent cell).
 		models = nil
 	}
 	req.Models = models

@@ -265,6 +265,7 @@ func (rl *renderLoop) renderPass() error {
 
 	defs = rl.applyClassPolicy(defs, pres)
 	defs = rl.applyFingerprints(defs, pres)
+	defs = rl.applyAnnouncedCatalog(defs, pres)
 
 	aliasWinners, err := router.ResolveAliases(declared)
 	if err != nil {
@@ -487,6 +488,57 @@ func (rl *renderLoop) applyFingerprints(defs []*profile.BackendDef, pres map[str
 			continue
 		}
 		kept = append(kept, d)
+	}
+	return kept
+}
+
+// applyAnnouncedCatalog drops cell-assigned defs the cell's own announce
+// no longer lists. The front peer list must be a function of what cells say
+// they serve: a def whose cell announces a catalog without it renders an id
+// that 404s at the cell on request — the lying-catalog shape the heavy
+// rotation shipped for weeks (three heavy defs advertised, one served; two
+// ids answered "model not found" to every client that picked them).
+//
+// The truth table is fail-toward-holding, exactly like C6's staleness rule
+// and the C5 unreported-in-flight rule: NO evidence of the catalog's
+// contents never reads as evidence of emptiness. Prune requires the cell
+// to be announcing AND to have claimed a READ catalog (models_known) that
+// lists other ids without this one. A cell whose llama-swap was down at
+// announce time, and a cell that has never announced (probe-era), keep
+// their defs.
+//
+// Runs after applyFingerprints and before ResolveAliases so
+// warnOrphanedAliases still names the aliases this exclusion removes (an
+// exclusion takes an alias OUT of the catalog; it never re-points it, C21).
+func (rl *renderLoop) applyAnnouncedCatalog(defs []*profile.BackendDef, pres map[string]Presence) []*profile.BackendDef {
+	announced := make(map[string]map[string]bool, len(pres))
+	for cell, p := range pres {
+		if !p.Announcing || !p.CatalogKnown {
+			continue
+		}
+		set := make(map[string]bool, len(p.Models))
+		for _, m := range p.Models {
+			set[m.ID] = true
+		}
+		announced[cell] = set
+	}
+	if len(announced) == 0 {
+		return defs
+	}
+	kept := make([]*profile.BackendDef, 0, len(defs))
+	for _, d := range defs {
+		if d.Cell == "" {
+			kept = append(kept, d)
+			continue
+		}
+		set, gated := announced[d.Cell]
+		if !gated || set[d.Name] {
+			kept = append(kept, d)
+			continue
+		}
+		slog.Warn("dropping def from front render: not in the cell's announced catalog",
+			"model", d.Name, "cell", d.Cell,
+			"note", "the cell's llama-swap catalog no longer lists this id (rotation or def drift); requests for it would 404 at the cell")
 	}
 	return kept
 }

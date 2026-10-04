@@ -167,6 +167,11 @@ type swapPeer struct {
 	Proxy  string   `yaml:"proxy"`
 	APIKey string   `yaml:"apiKey,omitempty"`
 	Models []string `yaml:"models"`
+	// Timeouts renders as the peer stanza's llama-swap `timeouts:`
+	// block (seconds; 0 = no timeout). Without it a peer rides
+	// llama-swap's built-in responseHeader: 60 default, which 502s a
+	// long-prefill engine (1M-class context) before its first byte.
+	Timeouts *fleetcfg.Timeouts `yaml:"timeouts,omitempty"`
 }
 
 type swapHooks struct {
@@ -258,7 +263,7 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 			continue
 		}
 		switch {
-		case def.Backend.LlamaServer != nil, def.Backend.ComfyUI != nil, def.Backend.MLXServer != nil:
+		case def.Backend.LlamaServer != nil, def.Backend.ComfyUI != nil, def.Backend.MLXServer != nil, def.Backend.VLLM != nil:
 			if def.Cell != "" && opts.Hosts.HasCells() {
 				if _, ok := opts.Hosts.Cells[def.Cell]; !ok {
 					return "", fmt.Errorf("backend %s: cell %q is not in hosts.yaml (fix the def or the fleet membership)", def.Name, def.Cell)
@@ -375,14 +380,44 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 			}
 			p := cfg.Peers[def.Cell]
 			if p == nil {
-				p = &swapPeer{Proxy: opts.Hosts.Cells[def.Cell].URL}
+				p = &swapPeer{
+					Proxy:    opts.Hosts.Cells[def.Cell].URL,
+					Timeouts: opts.Hosts.Cells[def.Cell].Timeouts,
+				}
 				cfg.Peers[def.Cell] = p
 			}
 			p.Models = append(p.Models, def.Name)
 			p.Models = append(p.Models, aliases[def.Name]...)
 		}
 	} else {
+		// vllm defs render as llama-swap PEER stanzas on their own cell, not
+		// models: entries. A models: entry needs a cmd, and there is none to
+		// build — the engine's process is the box's business, and a cmd llama-
+		// swap could JIT-start would turn a TP=2 boot (minutes) into a request
+		// timeout. The peer is static, exactly like the cell's own llama-swap
+		// has peered to the engine head all along. Keyed by def name, with the
+		// same collision guard the cloud_peer stanzas get below.
 		for _, def := range modelDefs {
+			v := def.Backend.VLLM
+			if v == nil {
+				continue
+			}
+			if cfg.Peers == nil {
+				cfg.Peers = map[string]*swapPeer{}
+			}
+			if _, clash := cfg.Peers[def.Name]; clash {
+				return "", fmt.Errorf("vllm backend %s collides with an existing peer stanza named %q; rename the def", def.Name, def.Name)
+			}
+			p := &swapPeer{Proxy: v.URL, Models: []string{def.Name}, Timeouts: v.Timeouts}
+			if v.APIKeyEnv != "" {
+				p.APIKey = "${env." + v.APIKeyEnv + "}"
+			}
+			cfg.Peers[def.Name] = p
+		}
+		for _, def := range modelDefs {
+			if def.Backend.VLLM != nil {
+				continue
+			}
 			if cfg.Models == nil {
 				cfg.Models = map[string]*swapModel{}
 			}
@@ -447,7 +482,7 @@ func Render(defs []*profile.BackendDef, opts Options) (string, error) {
 			return "", fmt.Errorf("cloud_peer backend %s collides with the peer stanza for fleet cell %q; rename the def", def.Name, def.Name)
 		}
 		cp := def.Backend.CloudPeer
-		p := &swapPeer{Proxy: cp.BaseURL, Models: slices.Clone(cp.Models)}
+		p := &swapPeer{Proxy: cp.BaseURL, Models: slices.Clone(cp.Models), Timeouts: cp.Timeouts}
 		if cp.APIKeyEnv != "" {
 			// ${env.VAR} keeps the key out of the rendered file; the value
 			// lives in the llama-swap unit's EnvironmentFile.
@@ -670,6 +705,15 @@ func aliasClaimants(defs []*profile.BackendDef) (claimants []*profile.BackendDef
 					peerIDs[id] = d.Name
 				}
 			}
+			continue
+		}
+		if d.Backend.VLLM != nil {
+			// A vllm def's id is served as a peer model (the engine's own
+			// cell stanza), so it is RESERVED the same way a cloud peer's
+			// ids are — the engine validates the model field, so an alias
+			// equal to the def name would advertise an id the upstream
+			// rejects. Canonical ids, not claims.
+			peerIDs[d.Name] = d.Name
 			continue
 		}
 		if d.Backend.LlamaServer != nil || d.Backend.ComfyUI != nil || d.Backend.MLXServer != nil {

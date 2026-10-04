@@ -197,7 +197,7 @@ func (d Duration) Seconds() int {
 // mutual-exclusion error instead of being silently discarded when the ref
 // resolves over it.
 func (b Backend) isEmpty() bool {
-	return !b.External && b.LlamaServer == nil && b.ComfyUI == nil && b.HTTPServer == nil && b.TabbyAPI == nil && b.CloudPeer == nil && b.MLXServer == nil
+	return !b.External && b.LlamaServer == nil && b.ComfyUI == nil && b.HTTPServer == nil && b.TabbyAPI == nil && b.CloudPeer == nil && b.MLXServer == nil && b.VLLM == nil
 }
 
 // normalize applies in-place defaults (llama_server.parallel) and tilde-expands
@@ -209,6 +209,11 @@ func (b *Backend) normalize() {
 	// "the peer's model ids appear in the router catalog". Forcing the flag
 	// here lets every downstream external check stay a single boolean.
 	if b.CloudPeer != nil {
+		b.External = true
+	}
+	// vllm implies external for the same reason: the engine's process is
+	// this box's business (recipe launcher, systemd, docker), never vibe's.
+	if b.VLLM != nil {
 		b.External = true
 	}
 	if b.LlamaServer != nil {
@@ -271,16 +276,16 @@ func (b *Backend) markCellScoped(scoped bool) {
 // and runs the per-backend validation.
 func (b Backend) validate() error {
 	set := 0
-	for _, on := range []bool{b.LlamaServer != nil, b.ComfyUI != nil, b.HTTPServer != nil, b.TabbyAPI != nil, b.CloudPeer != nil, b.MLXServer != nil} {
+	for _, on := range []bool{b.LlamaServer != nil, b.ComfyUI != nil, b.HTTPServer != nil, b.TabbyAPI != nil, b.CloudPeer != nil, b.MLXServer != nil, b.VLLM != nil} {
 		if on {
 			set++
 		}
 	}
 	switch {
 	case set == 0:
-		return errors.New("backend is required: set exactly one of backend.llama_server, backend.comfyui, backend.http_server, backend.tabby_api, backend.cloud_peer, or backend.mlx_server")
+		return errors.New("backend is required: set exactly one of backend.llama_server, backend.comfyui, backend.http_server, backend.tabby_api, backend.cloud_peer, backend.mlx_server, or backend.vllm")
 	case set > 1:
-		return errors.New("backend: only one of backend.llama_server, backend.comfyui, backend.http_server, backend.tabby_api, backend.cloud_peer, or backend.mlx_server may be set")
+		return errors.New("backend: only one of backend.llama_server, backend.comfyui, backend.http_server, backend.tabby_api, backend.cloud_peer, backend.mlx_server, or backend.vllm may be set")
 	}
 	// external makes sense where the router serves the backend: LLM kinds
 	// appear on /v1/models, and comfyui rides llama-swap's /upstream/<id>
@@ -291,6 +296,8 @@ func (b Backend) validate() error {
 	if b.External && b.HTTPServer != nil {
 		return errors.New("backend.external is not valid for http_server backends (they stay vibe-supervised); llama_server, tabby_api, cloud_peer, and comfyui may be external")
 	}
+	// (cloud_peer and vllm are external by definition; normalize forces the
+	// flag for both.)
 	switch {
 	case b.LlamaServer != nil:
 		return validateLlamaServer(b.LlamaServer, b.External)
@@ -302,6 +309,8 @@ func (b Backend) validate() error {
 		return validateCloudPeer(b.CloudPeer)
 	case b.MLXServer != nil:
 		return validateMLXServer(b.MLXServer)
+	case b.VLLM != nil:
+		return validateVLLM(b.VLLM)
 	default:
 		return validateTabbyAPI(b.TabbyAPI)
 	}
@@ -369,6 +378,25 @@ func LoadBackendFrom(dir, name string) (*BackendDef, error) {
 	}
 	if err := def.validateTrial(); err != nil {
 		return nil, fmt.Errorf("backend %s: %w", name, err)
+	}
+	// A vllm def declares an externally managed engine, so three def-level
+	// blocks would silently do nothing or lie if accepted: lifecycle (no
+	// process here to ttl/preload — llama-swap's peer stanza has no ttl),
+	// router (an alias would advertise a second id the engine 404s — the
+	// served-model name IS the def name), and fingerprint (a vllm announce
+	// never carries a flags hash, so the mode could never fire). Load-time
+	// rejection beats silent no-op: a def that believes something false is
+	// the failure class this loader exists to catch.
+	if def.Backend.VLLM != nil {
+		if def.Lifecycle != nil {
+			return nil, fmt.Errorf("backend %s: lifecycle does not apply to a vllm def (the engine's process is externally managed; nothing here unloads or preloads it)", name)
+		}
+		if def.Router != nil {
+			return nil, fmt.Errorf("backend %s: router does not apply to a vllm def (the served-model name is the def name; an alias would advertise an id the engine rejects)", name)
+		}
+		if def.Fingerprint != "" {
+			return nil, fmt.Errorf("backend %s: fingerprint does not apply to a vllm def (the announce never carries a flags hash for an externally managed engine)", name)
+		}
 	}
 	switch def.Fingerprint {
 	case "", "strict", "advisory":

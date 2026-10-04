@@ -323,9 +323,10 @@ stand-in.
 
 - Backend is a **discriminated union by sub-block presence** — exactly
   one of `backend.llama_server`, `backend.comfyui`,
-  `backend.http_server`, or `backend.tabby_api` must be set. We
+  `backend.http_server`, `backend.tabby_api`, `backend.cloud_peer`,
+  `backend.mlx_server`, or `backend.vllm` must be set. We
   deliberately do NOT use a `kind:` field; the sub-block IS the
-  discriminator. If you add a fifth backend, follow the same pattern.
+  discriminator. Add the next backend the same way.
 - **`http_server` backend.** Wraps any HTTP-serving inference engine
   (TTS daemons, embedding servers, third-party inference). Two
   modes, mutually exclusive: docker (`image:` + optional `volumes`,
@@ -577,6 +578,19 @@ stand-in.
     hold until full wave or ~50s. `front_renders` in fleet_status is
     the flap-storm counter. Strict fingerprint mismatches exclude +
     event; advisory events only.
+  - **The front peer list intersects with the announced catalog**
+    (`renderPass`'s `applyAnnouncedCatalog`): a cell-assigned def renders
+    into the front ONLY while the cell announces its id. A rotation on the
+    cell (def swap + announcer restart) retires the old id from the front
+    within one announce cycle — no fleetd-side def edit. The gate holds
+    when evidence is missing (never announced, or `models_known` false —
+    the cell could not READ its catalog), because absence of evidence is
+    not an empty catalog; it prunes only on a KNOWN catalog listing other
+    ids. The wire carries the split: `models: []` with `models_known:
+    true` is "read, empty"; `models_known` absent is "could not read".
+    This closes the receiving half of the announceOnce empty-list hazard —
+    without it the front renders ids the cell 404s (the heavy rotation
+    shipped exactly that: three heavy defs advertised, one served).
   - **fleet.front_config is the render mount contract** (daemon
     config): fleetd writes the front's watched config dir atomically;
     -watch-config applies. MCP drain/resume fall back to
@@ -2101,6 +2115,26 @@ stand-in.
   the daemon uses so the two can't drift. Unlike llama-server it honours
   `chat_template_args` (`{enable_thinking: false}`) — verified: without it
   Qwen3.6 spent 1200 tokens in `reasoning` and emitted no content.
+- **`vllm` backend (externally managed engines).** Declares a vLLM/SGLang/
+  MTPLX-class engine whose process the box runs OUTSIDE vibe (recipe
+  launcher, systemd, docker — the DGX Spark pair's TP=2 stack is the worked
+  example). normalize forces `backend.external` (like `cloud_peer`): vibe
+  never launches, supervises, or VRAM-checks it. Fields: `url` (required,
+  the engine's OpenAI origin the cell's llama-swap proxies to), `context`
+  (metadata, feeds `${MODEL_CONTEXT}`), `api_key_env`, `timeouts` (the
+  CELL-side peer hop has llama-swap's 60s responseHeader default — a large
+  prefill needs this raised, same trap the front's hosts.yaml timeouts
+  exist for). Render shape is a llama-swap PEER stanza on the engine's own
+  cell (a models: entry is impossible — llama-swap would JIT-start a
+  minutes-long TP=2 boot) and a peer model id on the front. **No alias
+  field, deliberately**: the served-model name IS the def name, because
+  the engine validates the model field — and an alias would be a second
+  name for the same thing, the lying-catalog shape heavy-advertise.sh
+  exists to prevent. `lifecycle:`, `router:` and `fingerprint:` on a vllm
+  def are load errors (nothing here unloads, aliases would 404 upstream,
+  and a vllm announce never carries a flags hash). Do not extend this kind
+  into `workers:`/`image:` launch fields — fleet.md §4.3's launch design
+  stays deliberately unbuilt (vibe is not the provisioner).
 - **Speculative draft models (Gemma 4 MTP).**
   `backend.llama_server.draft_model` points at a draft GGUF loaded via
   `--model-draft`; vibe also emits `--spec-type` (`spec_type`, default
