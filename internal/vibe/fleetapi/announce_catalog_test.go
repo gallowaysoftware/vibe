@@ -233,3 +233,25 @@ func TestRenderLoop_GateExclusionTakesTheAliasOutOfTheCatalog(t *testing.T) {
 		t.Errorf("REPOINT: the gate-dropped owner's alias landed on cell %q — an exclusion must remove an alias from the catalog, never move it:\n%s", ids["best-coder"], after)
 	}
 }
+
+// TestRenderLoop_NamespacedCatalogIdKeepsTheDef: a cell's llama-swap
+// namespaces its OWN peer ids as peerID/model (drift's MTPLX stack
+// announces "qwen38fn-mlx/qwen38fn-mlx"). The gate must match the base of
+// a namespaced id, or the cell's def is pruned from the front on its first
+// known catalog and a client-facing id the front advertised 404s with "no
+// router" — the live defect of 2026-10-04. Paired with the prune case
+// below: same shape, id genuinely gone.
+func TestRenderLoop_NamespacedCatalogIdKeepsTheDef(t *testing.T) {
+	s, w := catalogFleet(t, rotationDefs(), 30*time.Second)
+	catalogAnnounce(t, s, "front", 1, true)
+	catalogAnnounce(t, s, "gpu", 1, true, "gpu-coder")
+	catalogAnnounce(t, s, "heavy", 1, true, "heavy/glm53flash")
+
+	out := w.await(t, "keeps the def behind a namespaced catalog id", func(out string) bool {
+		models := c21Parse(t, out).Peers["heavy"].Models
+		return len(models) > 0 && models[0] == "glm53flash"
+	})
+	if models := c21Parse(t, out).Peers["heavy"].Models; len(models) != 1 {
+		t.Errorf("heavy peer models = %v, want [glm53flash] only:\n%s", models, out)
+	}
+}

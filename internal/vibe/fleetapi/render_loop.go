@@ -512,15 +512,30 @@ func (rl *renderLoop) applyFingerprints(defs []*profile.BackendDef, pres map[str
 // exclusion takes an alias OUT of the catalog; it never re-points it, C21).
 func (rl *renderLoop) applyAnnouncedCatalog(defs []*profile.BackendDef, pres map[string]Presence) []*profile.BackendDef {
 	announced := make(map[string]map[string]bool, len(pres))
+	bases := make(map[string]map[string]bool, len(pres))
 	for cell, p := range pres {
 		if !p.Announcing || !p.CatalogKnown {
 			continue
 		}
 		set := make(map[string]bool, len(p.Models))
+		base := make(map[string]bool, len(p.Models))
 		for _, m := range p.Models {
 			set[m.ID] = true
+			// A cell's llama-swap namespaces its OWN peer ids as
+			// peerID/model (drift's MTPLX stack announces
+			// "qwen38fn-mlx/qwen38fn-mlx"). The def name is the model
+			// part, so the gate also matches the base of a namespaced
+			// id — an exact-name-only match pruned the drift def from
+			// the front on its first known catalog (2026-10-04),
+			// stranding a client-facing id the front advertised.
+			// Matching the base cannot over-keep: the id is in the
+			// cell's catalog, so the cell routes it.
+			if i := strings.LastIndexByte(m.ID, '/'); i >= 0 {
+				base[m.ID[i+1:]] = true
+			}
 		}
 		announced[cell] = set
+		bases[cell] = base
 	}
 	if len(announced) == 0 {
 		return defs
@@ -532,7 +547,7 @@ func (rl *renderLoop) applyAnnouncedCatalog(defs []*profile.BackendDef, pres map
 			continue
 		}
 		set, gated := announced[d.Cell]
-		if !gated || set[d.Name] {
+		if !gated || set[d.Name] || bases[d.Cell][d.Name] {
 			kept = append(kept, d)
 			continue
 		}
