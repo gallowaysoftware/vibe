@@ -63,6 +63,9 @@ type PoolConfig struct {
 type MemberConfig struct {
 	Model string `yaml:"model"`
 	Slots int    `yaml:"slots"`
+	// Weight is the member's relative speed (default 1). Once every slot is
+	// owned, new conversations go where they would finish soonest.
+	Weight int `yaml:"weight"`
 }
 
 // LoadConfig reads and validates a config file, filling defaults.
@@ -108,8 +111,8 @@ func LoadConfig(path string) (Config, error) {
 			return Config{}, fmt.Errorf("%s: pool %q has no members", path, p.ID)
 		}
 		for _, m := range p.Members {
-			if m.Model == "" || m.Slots < 1 {
-				return Config{}, fmt.Errorf("%s: pool %q: member needs a model and slots >= 1", path, p.ID)
+			if m.Model == "" || m.Slots < 1 || m.Weight < 0 {
+				return Config{}, fmt.Errorf("%s: pool %q: member needs a model, slots >= 1 and weight >= 0", path, p.ID)
 			}
 		}
 	}

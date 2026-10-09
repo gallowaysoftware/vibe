@@ -102,7 +102,7 @@ const convA = `{"model":"agent-exec","messages":[{"role":"system","content":"s"}
 
 func TestServer_RewritesThePoolIdToTheChosenMember(t *testing.T) {
 	front := &fakeFront{}
-	r := newRig(t, front, "", MemberConfig{"localmodel/qwen3.8-27b-tools", 1})
+	r := newRig(t, front, "", MemberConfig{Model: "localmodel/qwen3.8-27b-tools", Slots: 1})
 	resp := r.post(t, convA)
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
@@ -121,7 +121,7 @@ func TestServer_StepsPastAMemberTheFrontCannotServe(t *testing.T) {
 	// The shared llama-swap double: a model it does not route gets the
 	// front's real "no router for requested model" 404.
 	cell := swaptest.NewCell(t, swaptest.WithModels(swaptest.Model{ID: "drift/qwen38fn-mlx", State: "ready"}))
-	r := newRig(t, nil, cell.URL(), MemberConfig{"localmodel/qwen3.8-27b-tools", 1}, MemberConfig{"drift/qwen38fn-mlx", 1})
+	r := newRig(t, nil, cell.URL(), MemberConfig{Model: "localmodel/qwen3.8-27b-tools", Slots: 1}, MemberConfig{Model: "drift/qwen38fn-mlx", Slots: 1})
 	resp := r.post(t, convA)
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
@@ -139,7 +139,7 @@ func TestServer_StepsPastAMemberTheFrontCannotServe(t *testing.T) {
 
 func TestServer_PathsOtherThanTheExactCompletionPathsNeverReachTheFront(t *testing.T) {
 	front := &fakeFront{}
-	r := newRig(t, front, "", MemberConfig{"a", 1})
+	r := newRig(t, front, "", MemberConfig{Model: "a", Slots: 1})
 	resp, err := r.client.Post(r.pool.URL+"/openai/v1/chat/completions", "application/json", strings.NewReader(convA))
 	if err != nil {
 		t.Fatal(err)
@@ -164,7 +164,7 @@ func TestServer_ForwardsPromptsWithoutHTMLEscaping(t *testing.T) {
 		mu.Unlock()
 		_, _ = io.WriteString(w, `{}`)
 	})
-	r := newRig(t, front, "", MemberConfig{"a", 1})
+	r := newRig(t, front, "", MemberConfig{Model: "a", Slots: 1})
 	resp := r.post(t, `{"model":"agent-exec","messages":[{"role":"user","content":"if a < b && c > d"}]}`)
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
@@ -184,7 +184,7 @@ func TestServer_DrainFailsQueuedRequestsAtOnce(t *testing.T) {
 		w.(http.Flusher).Flush()
 		<-release
 	})
-	r := newRig(t, front, "", MemberConfig{"a", 1})
+	r := newRig(t, front, "", MemberConfig{Model: "a", Slots: 1})
 	defer unpark()
 	first := r.post(t, convA) //nolint:bodyclose // closed below after the member is unparked
 	defer func() {
@@ -220,7 +220,7 @@ func TestServer_BadRequestFromTheMemberIsPassedThroughNotRetried(t *testing.T) {
 	front := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"context too long"}`, http.StatusBadRequest)
 	})
-	r := newRig(t, front, "", MemberConfig{"a", 1}, MemberConfig{"b", 1})
+	r := newRig(t, front, "", MemberConfig{Model: "a", Slots: 1}, MemberConfig{Model: "b", Slots: 1})
 	resp := r.post(t, convA)
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
@@ -233,7 +233,7 @@ func TestServer_BadRequestFromTheMemberIsPassedThroughNotRetried(t *testing.T) {
 }
 
 func TestServer_DeadFrontAnswers503WithRetryAfter(t *testing.T) {
-	r := newRig(t, nil, "http://127.0.0.1:1", MemberConfig{"a", 1}, MemberConfig{"b", 1})
+	r := newRig(t, nil, "http://127.0.0.1:1", MemberConfig{Model: "a", Slots: 1}, MemberConfig{Model: "b", Slots: 1})
 	resp := r.post(t, convA)
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
@@ -254,7 +254,7 @@ func TestServer_StreamsEachFrameBeforeTheMemberFinishes(t *testing.T) {
 		<-release
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	})
-	r := newRig(t, front, "", MemberConfig{"a", 1})
+	r := newRig(t, front, "", MemberConfig{Model: "a", Slots: 1})
 	defer unpark()
 	resp := r.post(t, strings.Replace(convA, `"model"`, `"stream":true,"model"`, 1)) //nolint:bodyclose // closed by the teardown below, which bodyclose cannot follow
 	got := make(chan string, 1)
@@ -291,7 +291,7 @@ func TestServer_SlotIsHeldUntilTheStreamEnds(t *testing.T) {
 		w.(http.Flusher).Flush()
 		<-release
 	})
-	r := newRig(t, front, "", MemberConfig{"a", 1})
+	r := newRig(t, front, "", MemberConfig{Model: "a", Slots: 1})
 	defer unpark()
 	resp := r.post(t, convA)
 	defer resp.Body.Close()
@@ -310,7 +310,7 @@ func TestServer_SlotIsHeldUntilTheStreamEnds(t *testing.T) {
 }
 
 func TestServer_UnknownModelIs404(t *testing.T) {
-	r := newRig(t, &fakeFront{}, "", MemberConfig{"a", 1})
+	r := newRig(t, &fakeFront{}, "", MemberConfig{Model: "a", Slots: 1})
 	resp := r.post(t, `{"model":"heavy/glm53flash","messages":[]}`)
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
@@ -320,7 +320,7 @@ func TestServer_UnknownModelIs404(t *testing.T) {
 }
 
 func TestServer_ModelsListsEachPoolWithItsContext(t *testing.T) {
-	r := newRig(t, &fakeFront{}, "", MemberConfig{"a", 1})
+	r := newRig(t, &fakeFront{}, "", MemberConfig{Model: "a", Slots: 1})
 	resp, err := r.client.Get(r.pool.URL + "/v1/models")
 	if err != nil {
 		t.Fatal(err)
@@ -387,6 +387,7 @@ func TestLoadConfig_FillsDefaultsAndRejectsBadPools(t *testing.T) {
 		"upstream: x\npools:\n  - id: p\n    members: []\n",
 		"upstream: x\nbogus: 1\npools:\n  - id: p\n    members: [{model: a, slots: 1}]\n",
 		"upstream: x\ndown_cooldown: -30s\npools:\n  - id: p\n    members: [{model: a, slots: 1}]\n",
+		"upstream: x\npools:\n  - id: p\n    members: [{model: a, slots: 1, weight: -1}]\n",
 	} {
 		if _, err := LoadConfig(write(bad)); err == nil {
 			t.Fatalf("accepted %q", bad)

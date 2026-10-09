@@ -14,7 +14,9 @@ pools:
   - id: agent-exec
     # The smallest member context: a conversation may land on any member.
     context: 131072
-    # Configured order is preference order for new conversations.
+    # Configured order is preference order while slots are free. Weight is
+    # relative speed (default 1): once every slot is owned, conversations
+    # split in proportion to it.
     members:
-      - {model: cell-a/executor-model, slots: 1}
-      - {model: cell-b/executor-model, slots: 1}
+      - {model: cell-a/executor-model, slots: 1, weight: 3}
+      - {model: cell-b/executor-model, slots: 1, weight: 1}

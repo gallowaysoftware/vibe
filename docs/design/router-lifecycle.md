@@ -689,8 +689,14 @@ own dispatches and never asks fleetd.
   conversation take the member in that gap and then trade turns with it while
   another member sat idle.
 - A new conversation takes the first member, in configured order, with
-  unowned capacity. When every slot is owned, it shares the least-loaded
-  member rather than waiting minutes for a conversation to go idle.
+  unowned capacity. When every slot is owned, it goes to the member furthest
+  below its share by speed: conversations per slot per unit of `weight`
+  (default 1), so a member with weight 3 ends up with three times the
+  conversations of one with weight 1. If that member is mid-request, the
+  conversation waits for it rather than starting on a slower free member,
+  unless a free member's share is just as low. Splitting by count alone left
+  a fast member idle while a slow one, holding as many conversations, still
+  had a queue.
 - Every later request in it goes to the same member. The key is a hash of the
   first system and first user message, which an agent never rewrites. One
   conversation never has two requests in flight, so a second request under

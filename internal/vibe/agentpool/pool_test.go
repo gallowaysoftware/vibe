@@ -65,7 +65,7 @@ func waitForWaiters(t *testing.T, p *Pool, n int) {
 }
 
 func TestPool_NewConversationsFillMembersInConfiguredOrder(t *testing.T) {
-	p, _ := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
+	p, _ := testPool(t, MemberSpec{Model: "fast", Slots: 1}, MemberSpec{Model: "slow", Slots: 1})
 	a := mustAcquire(t, p, "conv-a")
 	b := mustAcquire(t, p, "conv-b")
 	if a.Model() != "fast" || b.Model() != "slow" {
@@ -74,7 +74,7 @@ func TestPool_NewConversationsFillMembersInConfiguredOrder(t *testing.T) {
 }
 
 func TestPool_ConversationStaysOnItsMemberWhenAPreferredOneFrees(t *testing.T) {
-	p, _ := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
+	p, _ := testPool(t, MemberSpec{Model: "fast", Slots: 1}, MemberSpec{Model: "slow", Slots: 1})
 	hold := mustAcquire(t, p, "conv-a") // fast
 	b := mustAcquire(t, p, "conv-b")    // slow, the only free one
 	hold.Release()
@@ -85,7 +85,7 @@ func TestPool_ConversationStaysOnItsMemberWhenAPreferredOneFrees(t *testing.T) {
 }
 
 func TestPool_PinnedConversationWaitsForItsMemberRatherThanMoving(t *testing.T) {
-	p, _ := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
+	p, _ := testPool(t, MemberSpec{Model: "fast", Slots: 1}, MemberSpec{Model: "slow", Slots: 1})
 	mustAcquire(t, p, "conv-a").Release() // conv-a owns fast, between requests
 	mustAcquire(t, p, "conv-b").Release() // conv-b owns slow
 	c := mustAcquire(t, p, "conv-c")      // every slot owned: shares fast
@@ -111,7 +111,7 @@ func TestPool_PinnedConversationWaitsForItsMemberRatherThanMoving(t *testing.T) 
 }
 
 func TestPool_NewConversationQueuesUntilAnySlotFrees(t *testing.T) {
-	p, _ := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
+	p, _ := testPool(t, MemberSpec{Model: "fast", Slots: 1}, MemberSpec{Model: "slow", Slots: 1})
 	mustAcquire(t, p, "conv-a")
 	b := mustAcquire(t, p, "conv-b")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -130,7 +130,7 @@ func TestPool_NewConversationQueuesUntilAnySlotFrees(t *testing.T) {
 }
 
 func TestPool_QueuedRequestReturnsWhenItsContextEnds(t *testing.T) {
-	p, _ := testPool(t, MemberSpec{"only", 1})
+	p, _ := testPool(t, MemberSpec{Model: "only", Slots: 1})
 	mustAcquire(t, p, "conv-a")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
@@ -143,7 +143,7 @@ func TestPool_QueuedRequestReturnsWhenItsContextEnds(t *testing.T) {
 }
 
 func TestPool_DownMemberIsSkippedAndItsConversationsMove(t *testing.T) {
-	p, _ := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
+	p, _ := testPool(t, MemberSpec{Model: "fast", Slots: 1}, MemberSpec{Model: "slow", Slots: 1})
 	mustAcquire(t, p, "conv-a").ReleaseDown() // fast failed for conv-a
 	if s := p.Status(); !s.Members[0].Down {
 		t.Fatalf("fast not marked down: %+v", s.Members)
@@ -155,7 +155,7 @@ func TestPool_DownMemberIsSkippedAndItsConversationsMove(t *testing.T) {
 }
 
 func TestPool_EveryMemberDownFailsFastInsteadOfQueueing(t *testing.T) {
-	p, _ := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
+	p, _ := testPool(t, MemberSpec{Model: "fast", Slots: 1}, MemberSpec{Model: "slow", Slots: 1})
 	mustAcquire(t, p, "a").ReleaseDown()
 	mustAcquire(t, p, "b").ReleaseDown()
 	if _, err := p.Acquire(context.Background(), "c"); !errors.Is(err, ErrNoMembers) {
@@ -164,7 +164,7 @@ func TestPool_EveryMemberDownFailsFastInsteadOfQueueing(t *testing.T) {
 }
 
 func TestPool_DownMemberServesAgainAfterTheCooldown(t *testing.T) {
-	p, clk := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
+	p, clk := testPool(t, MemberSpec{Model: "fast", Slots: 1}, MemberSpec{Model: "slow", Slots: 1})
 	mustAcquire(t, p, "a").ReleaseDown()
 	clk.advance(31 * time.Second)
 	if l := mustAcquire(t, p, "b"); l.Model() != "fast" {
@@ -173,7 +173,7 @@ func TestPool_DownMemberServesAgainAfterTheCooldown(t *testing.T) {
 }
 
 func TestPool_WaiterWakesWhenACooldownEndsWithoutAnyRelease(t *testing.T) {
-	p := NewPool("agent-exec", 0, []MemberSpec{{"fast", 1}, {"slow", 1}}, Timing{TTL: time.Hour, Idle: time.Hour, Cooldown: 50 * time.Millisecond})
+	p := NewPool("agent-exec", 0, []MemberSpec{{Model: "fast", Slots: 1}, {Model: "slow", Slots: 1}}, Timing{TTL: time.Hour, Idle: time.Hour, Cooldown: 50 * time.Millisecond})
 	mustAcquire(t, p, "a").ReleaseDown() // fast down for 50ms
 	mustAcquire(t, p, "b")               // slow busy, never released
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -185,7 +185,7 @@ func TestPool_WaiterWakesWhenACooldownEndsWithoutAnyRelease(t *testing.T) {
 }
 
 func TestPool_IdleConversationLosesItsPinAfterTheTTL(t *testing.T) {
-	p, clk := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
+	p, clk := testPool(t, MemberSpec{Model: "fast", Slots: 1}, MemberSpec{Model: "slow", Slots: 1})
 	mustAcquire(t, p, "conv-a").Release()
 	clk.advance(2 * time.Hour)
 	mustAcquire(t, p, "conv-b").Release()
@@ -195,7 +195,7 @@ func TestPool_IdleConversationLosesItsPinAfterTheTTL(t *testing.T) {
 }
 
 func TestPool_NewConversationAvoidsAMemberWhoseConversationIsBetweenRequests(t *testing.T) {
-	p, _ := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
+	p, _ := testPool(t, MemberSpec{Model: "fast", Slots: 1}, MemberSpec{Model: "slow", Slots: 1})
 	mustAcquire(t, p, "conv-a").Release() // conv-a is running a tool on fast
 	if l := mustAcquire(t, p, "conv-b"); l.Model() != "slow" {
 		t.Fatalf("conv-b took %s while conv-a owns it between requests; want slow", l.Model())
@@ -203,7 +203,7 @@ func TestPool_NewConversationAvoidsAMemberWhoseConversationIsBetweenRequests(t *
 }
 
 func TestPool_ConversationIdlePastTheWindowFreesItsMember(t *testing.T) {
-	p, clk := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
+	p, clk := testPool(t, MemberSpec{Model: "fast", Slots: 1}, MemberSpec{Model: "slow", Slots: 1})
 	mustAcquire(t, p, "conv-a").Release()
 	clk.advance(3 * time.Minute)
 	if l := mustAcquire(t, p, "conv-b"); l.Model() != "fast" {
@@ -212,7 +212,7 @@ func TestPool_ConversationIdlePastTheWindowFreesItsMember(t *testing.T) {
 }
 
 func TestPool_WhenEveryMemberIsOwnedNewConversationsShareTheLeastLoaded(t *testing.T) {
-	p, _ := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
+	p, _ := testPool(t, MemberSpec{Model: "fast", Slots: 1}, MemberSpec{Model: "slow", Slots: 1})
 	mustAcquire(t, p, "a").Release() // fast
 	mustAcquire(t, p, "b").Release() // slow
 	c := mustAcquire(t, p, "c")      // tie: preference order, fast
@@ -224,7 +224,7 @@ func TestPool_WhenEveryMemberIsOwnedNewConversationsShareTheLeastLoaded(t *testi
 }
 
 func TestPool_StatusCountsConversationsOwningEachMember(t *testing.T) {
-	p, _ := testPool(t, MemberSpec{"fast", 2})
+	p, _ := testPool(t, MemberSpec{Model: "fast", Slots: 2})
 	mustAcquire(t, p, "a").Release()
 	mustAcquire(t, p, "b")
 	if s := p.Status().Members[0]; s.Owners != 2 || s.Busy != 1 {
@@ -233,7 +233,7 @@ func TestPool_StatusCountsConversationsOwningEachMember(t *testing.T) {
 }
 
 func TestPool_SecondRequestUnderAKeyThatIsMidRequestIsPlacedAsANewConversation(t *testing.T) {
-	p, _ := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
+	p, _ := testPool(t, MemberSpec{Model: "fast", Slots: 1}, MemberSpec{Model: "slow", Slots: 1})
 	first := mustAcquire(t, p, "fixed-preamble") // fast, in flight
 	second := mustAcquire(t, p, "fixed-preamble")
 	if second.Model() != "slow" {
@@ -246,8 +246,52 @@ func TestPool_SecondRequestUnderAKeyThatIsMidRequestIsPlacedAsANewConversation(t
 	}
 }
 
+func TestPool_OverflowConversationsSplitByMemberWeight(t *testing.T) {
+	p, _ := testPool(t, MemberSpec{Model: "fast", Slots: 1, Weight: 3}, MemberSpec{Model: "slow", Slots: 1, Weight: 1})
+	var got []string
+	for _, k := range []string{"a", "b", "c", "d", "e", "f", "g"} {
+		l := mustAcquire(t, p, k)
+		got = append(got, l.Model())
+		l.Release()
+	}
+	// a and b take the unowned slots; after that each new conversation goes
+	// to whichever member is furthest below its 3:1 share.
+	want := []string{"fast", "slow", "fast", "fast", "fast", "slow", "fast"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("placements %v, want %v", got, want)
+		}
+	}
+}
+
+func TestPool_OverflowWaitsForAFasterMemberRatherThanTakingAFreeSlowOne(t *testing.T) {
+	p, _ := testPool(t, MemberSpec{Model: "fast", Slots: 1, Weight: 3}, MemberSpec{Model: "slow", Slots: 1, Weight: 1})
+	mustAcquire(t, p, "a").Release() // fast
+	mustAcquire(t, p, "b").Release() // slow
+	c := mustAcquire(t, p, "c")      // fast, in flight
+	if c.Model() != "fast" {
+		t.Fatalf("c got %s, want fast", c.Model())
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	got := acquireAsync(p, ctx, "d")
+	waitForWaiters(t, p, 1)
+	if s := p.Status(); s.Members[1].Busy != 0 {
+		t.Fatalf("d took the free slow member while fast is far below its share: %+v", s.Members)
+	}
+	c.Release()
+	select {
+	case l := <-got:
+		if l == nil || l.Model() != "fast" {
+			t.Fatalf("d got %v, want fast", l)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("d never got the fast member")
+	}
+}
+
 func TestPool_EmptyKeyHasNoAffinity(t *testing.T) {
-	p, _ := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
+	p, _ := testPool(t, MemberSpec{Model: "fast", Slots: 1}, MemberSpec{Model: "slow", Slots: 1})
 	mustAcquire(t, p, "").Release()
 	if n := p.Status().Pinned; n != 0 {
 		t.Fatalf("pinned = %d for an empty key", n)
@@ -255,7 +299,7 @@ func TestPool_EmptyKeyHasNoAffinity(t *testing.T) {
 }
 
 func TestLease_ReleaseIsIdempotent(t *testing.T) {
-	p, _ := testPool(t, MemberSpec{"only", 2})
+	p, _ := testPool(t, MemberSpec{Model: "only", Slots: 2})
 	l := mustAcquire(t, p, "a")
 	l.Release()
 	l.Release()

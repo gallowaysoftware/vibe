@@ -24,6 +24,7 @@ var ErrNoMembers = errors.New("agentpool: every member is down")
 type member struct {
 	model     string
 	slots     int
+	weight    int // relative speed; only shapes placement once every slot is owned
 	busy      int // requests in flight
 	downUntil time.Time
 }
@@ -63,6 +64,9 @@ type Pool struct {
 type MemberSpec struct {
 	Model string
 	Slots int
+	// Weight is the member's speed relative to the others (default 1). It
+	// decides where conversations go once every slot is owned.
+	Weight int
 }
 
 // Timing holds a pool's durations.
@@ -90,7 +94,11 @@ func NewPool(id string, context int, members []MemberSpec, t Timing) *Pool {
 		now:      time.Now,
 	}
 	for _, s := range members {
-		p.members = append(p.members, &member{model: s.Model, slots: s.Slots})
+		w := s.Weight
+		if w < 1 {
+			w = 1
+		}
+		p.members = append(p.members, &member{model: s.Model, slots: s.Slots, weight: w})
 	}
 	return p
 }
@@ -239,19 +247,29 @@ func (p *Pool) chooseLocked(key string, now time.Time) (*member, error) {
 			return m, nil
 		}
 	}
-	// Every slot is owned. Share the least-loaded member rather than wait for
-	// a conversation to go idle, which can take minutes; a member that is
-	// mid-request still bounds what runs at once.
-	var best *member
+	// Every slot is owned, and a conversation stays where it lands, so place
+	// it on the member furthest below its share of the work by speed
+	// (conversations per slot per unit of weight). Counting conversations
+	// alone split them evenly between a fast and a slow member, leaving the
+	// fast one idle while the slow one still had a queue. If that member is
+	// mid-request, wait for it rather than settling for a slower one that
+	// happens to be free; a free member with an equal share is taken instead.
+	better := func(a, b *member) bool {
+		return owners[a]*b.slots*b.weight < owners[b]*a.slots*a.weight
+	}
+	var best, bestFree *member
 	for _, m := range up {
-		if m.busy >= m.slots {
-			continue
-		}
-		if best == nil || owners[m]*best.slots < owners[best]*m.slots {
+		if best == nil || better(m, best) {
 			best = m
 		}
+		if m.busy < m.slots && (bestFree == nil || better(m, bestFree)) {
+			bestFree = m
+		}
 	}
-	return best, nil
+	if bestFree != nil && !better(best, bestFree) {
+		return bestFree, nil
+	}
+	return nil, nil
 }
 
 // ownersLocked counts the active conversations on each member, other than
