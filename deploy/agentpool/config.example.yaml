@@ -5,6 +5,9 @@ listen: ":9010"
 # the front still picks the cell.
 upstream: http://front.example:9000
 affinity_ttl: 2h
+# A conversation owns its member this long after its last request, so a new
+# one does not take the member while an agent is running a tool.
+conversation_idle: 2m
 down_cooldown: 30s
 queue_timeout: 15m
 pools:

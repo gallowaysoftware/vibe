@@ -23,7 +23,7 @@ func (c *fakeClock) advance(d time.Duration) {
 func testPool(t *testing.T, members ...MemberSpec) (*Pool, *fakeClock) {
 	t.Helper()
 	clk := &fakeClock{t: time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)}
-	p := NewPool("agent-exec", 131072, members, time.Hour, 30*time.Second)
+	p := NewPool("agent-exec", 131072, members, Timing{TTL: time.Hour, Idle: 2 * time.Minute, Cooldown: 30 * time.Second})
 	p.now = clk.now
 	return p, clk
 }
@@ -168,7 +168,7 @@ func TestPool_DownMemberServesAgainAfterTheCooldown(t *testing.T) {
 }
 
 func TestPool_WaiterWakesWhenACooldownEndsWithoutAnyRelease(t *testing.T) {
-	p := NewPool("agent-exec", 0, []MemberSpec{{"fast", 1}, {"slow", 1}}, time.Hour, 50*time.Millisecond)
+	p := NewPool("agent-exec", 0, []MemberSpec{{"fast", 1}, {"slow", 1}}, Timing{TTL: time.Hour, Idle: time.Hour, Cooldown: 50 * time.Millisecond})
 	mustAcquire(t, p, "a").ReleaseDown() // fast down for 50ms
 	mustAcquire(t, p, "b")               // slow busy, never released
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -181,12 +181,49 @@ func TestPool_WaiterWakesWhenACooldownEndsWithoutAnyRelease(t *testing.T) {
 
 func TestPool_IdleConversationLosesItsPinAfterTheTTL(t *testing.T) {
 	p, clk := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
-	mustAcquire(t, p, "conv-a").Release() // pinned to fast
-	hold := mustAcquire(t, p, "conv-b")   // pinned to fast too, holding it
-	_ = hold
+	mustAcquire(t, p, "conv-a").Release()
 	clk.advance(2 * time.Hour)
-	if l := mustAcquire(t, p, "conv-a"); l.Model() != "slow" {
-		t.Fatalf("conv-a got %s; an expired pin should place it afresh", l.Model())
+	mustAcquire(t, p, "conv-b").Release()
+	if n := p.Status().Pinned; n != 1 {
+		t.Fatalf("pinned = %d; conv-a's expired pin should be gone, leaving conv-b's", n)
+	}
+}
+
+func TestPool_NewConversationAvoidsAMemberWhoseConversationIsBetweenRequests(t *testing.T) {
+	p, _ := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
+	mustAcquire(t, p, "conv-a").Release() // conv-a is running a tool on fast
+	if l := mustAcquire(t, p, "conv-b"); l.Model() != "slow" {
+		t.Fatalf("conv-b took %s while conv-a owns it between requests; want slow", l.Model())
+	}
+}
+
+func TestPool_ConversationIdlePastTheWindowFreesItsMember(t *testing.T) {
+	p, clk := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
+	mustAcquire(t, p, "conv-a").Release()
+	clk.advance(3 * time.Minute)
+	if l := mustAcquire(t, p, "conv-b"); l.Model() != "fast" {
+		t.Fatalf("conv-b got %s; conv-a went idle, so fast is free again", l.Model())
+	}
+}
+
+func TestPool_WhenEveryMemberIsOwnedNewConversationsShareTheLeastLoaded(t *testing.T) {
+	p, _ := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
+	mustAcquire(t, p, "a").Release() // fast
+	mustAcquire(t, p, "b").Release() // slow
+	c := mustAcquire(t, p, "c")      // tie: preference order, fast
+	c.Release()
+	d := mustAcquire(t, p, "d") // fast now has two, slow one
+	if c.Model() != "fast" || d.Model() != "slow" {
+		t.Fatalf("c=%s d=%s; want fast then slow", c.Model(), d.Model())
+	}
+}
+
+func TestPool_StatusCountsConversationsOwningEachMember(t *testing.T) {
+	p, _ := testPool(t, MemberSpec{"fast", 2})
+	mustAcquire(t, p, "a").Release()
+	mustAcquire(t, p, "b")
+	if s := p.Status().Members[0]; s.Owners != 2 || s.Busy != 1 {
+		t.Fatalf("status %+v; want 2 active conversations, 1 busy", s)
 	}
 }
 

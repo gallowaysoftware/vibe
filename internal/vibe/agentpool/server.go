@@ -34,8 +34,14 @@ type Config struct {
 	// "http://172.16.3.211:9000". The pool picks the model id; the front
 	// still decides which cell serves it.
 	Upstream string `yaml:"upstream"`
-	// AffinityTTL is how long an idle conversation keeps its member.
+	// AffinityTTL is how long an idle conversation keeps its member for its
+	// own next request.
 	AffinityTTL Duration `yaml:"affinity_ttl"`
+	// ConversationIdle is how long after its last request a conversation
+	// stops owning its member's slot against new conversations. An agent is
+	// between requests whenever a tool runs, so this should outlast a typical
+	// test run.
+	ConversationIdle Duration `yaml:"conversation_idle"`
 	// DownCooldown is how long a member is skipped after a failed dispatch.
 	DownCooldown Duration `yaml:"down_cooldown"`
 	// QueueTimeout bounds how long a request waits for a slot.
@@ -89,6 +95,9 @@ func LoadConfig(path string) (Config, error) {
 	if c.AffinityTTL == 0 {
 		c.AffinityTTL = Duration(2 * time.Hour)
 	}
+	if c.ConversationIdle == 0 {
+		c.ConversationIdle = Duration(2 * time.Minute)
+	}
 	if c.DownCooldown == 0 {
 		c.DownCooldown = Duration(30 * time.Second)
 	}
@@ -137,6 +146,9 @@ func NewServer(c Config, transport http.RoundTripper, log *slog.Logger) *Server 
 			DialContext:         (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 			MaxIdleConnsPerHost: 16,
 			IdleConnTimeout:     90 * time.Second,
+			// Transparent gzip would put a decompressor between the member's
+			// SSE frames and the client; pass the bytes as the front sends them.
+			DisableCompression: true,
 		}
 	}
 	if log == nil {
@@ -156,7 +168,11 @@ func NewServer(c Config, transport http.RoundTripper, log *slog.Logger) *Server 
 		for _, m := range pc.Members {
 			specs = append(specs, MemberSpec(m))
 		}
-		p := NewPool(pc.ID, pc.Context, specs, time.Duration(c.AffinityTTL), time.Duration(c.DownCooldown))
+		p := NewPool(pc.ID, pc.Context, specs, Timing{
+			TTL:      time.Duration(c.AffinityTTL),
+			Idle:     time.Duration(c.ConversationIdle),
+			Cooldown: time.Duration(c.DownCooldown),
+		})
 		s.pools[pc.ID] = p
 		s.order = append(s.order, p)
 	}

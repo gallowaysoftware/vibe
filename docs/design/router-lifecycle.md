@@ -682,7 +682,15 @@ read-and-request-only (invariant 4): the pool judges member health from its
 own dispatches and never asks fleetd.
 
 **Scheduling.**
-- A new conversation takes the first member, in configured order, with a free slot.
+- A slot both bounds requests in flight and is **owned** by a conversation
+  while it is active: a request in flight, or one that ended within
+  `conversation_idle` (default 2m). An agent spends much of a task between
+  requests running tools. Counting in-flight requests alone let a new
+  conversation take the member in that gap and then trade turns with it while
+  another member sat idle.
+- A new conversation takes the first member, in configured order, with
+  unowned capacity. When every slot is owned, it shares the least-loaded
+  member rather than waiting minutes for a conversation to go idle.
 - Every later request in it goes to the same member. The key is a hash of the
   first system and first user message, which an agent never rewrites.
 - A pinned conversation waits for its member rather than moving. A move

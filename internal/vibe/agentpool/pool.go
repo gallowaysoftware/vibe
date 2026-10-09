@@ -1,7 +1,7 @@
 // Package agentpool serves virtual model ids backed by a pool of member
 // models, each with a fixed number of slots. It exists for coding-agent
 // subagents: a harness asks for "any free executor" by one id, and the pool
-// hands each conversation to whichever member has a free slot.
+// hands each conversation to whichever member has room.
 //
 // It is the deliberate front shim AGENTS.md reserves for router gaps, not a
 // daemon feature: it runs as its own process, only requests that name a pool
@@ -24,18 +24,26 @@ var ErrNoMembers = errors.New("agentpool: every member is down")
 type member struct {
 	model     string
 	slots     int
-	busy      int
+	busy      int // requests in flight
 	downUntil time.Time
 }
 
+// pin binds a conversation to a member. last is the end of its most recent
+// request, or its start while one is in flight.
 type pin struct {
-	m    *member
-	last time.Time
+	m        *member
+	last     time.Time
+	inflight int
 }
 
-// Pool schedules conversations onto members. Members are tried in
-// configuration order, so the first listed is preferred when several are
-// free.
+// Pool schedules conversations onto members.
+//
+// A slot means two things. It bounds requests in flight, which is what the
+// member's server can actually run at once. And it is owned by a
+// conversation for as long as that conversation is active: an agent spends
+// much of a task between requests, running the tool its last reply asked
+// for, and a new conversation must not take the member during that gap and
+// then trade turns with it while another member sits idle.
 type Pool struct {
 	ID      string
 	Context int
@@ -46,6 +54,7 @@ type Pool struct {
 	wake     chan struct{}
 	waiting  int
 	ttl      time.Duration
+	idle     time.Duration
 	cooldown time.Duration
 	now      func() time.Time
 }
@@ -56,16 +65,28 @@ type MemberSpec struct {
 	Slots int
 }
 
-// NewPool builds a pool. ttl bounds how long an idle conversation keeps its
-// member; cooldown is how long a member stays down after a failed dispatch.
-func NewPool(id string, context int, members []MemberSpec, ttl, cooldown time.Duration) *Pool {
+// Timing holds a pool's durations.
+type Timing struct {
+	// TTL bounds how long an idle conversation keeps its member for its own
+	// next request.
+	TTL time.Duration
+	// Idle is how long after its last request a conversation stops owning a
+	// slot that new conversations would otherwise take.
+	Idle time.Duration
+	// Cooldown is how long a member stays down after a failed dispatch.
+	Cooldown time.Duration
+}
+
+// NewPool builds a pool. Members are listed in preference order.
+func NewPool(id string, context int, members []MemberSpec, t Timing) *Pool {
 	p := &Pool{
 		ID:       id,
 		Context:  context,
 		pins:     map[string]*pin{},
 		wake:     make(chan struct{}),
-		ttl:      ttl,
-		cooldown: cooldown,
+		ttl:      t.TTL,
+		idle:     t.Idle,
+		cooldown: t.Cooldown,
 		now:      time.Now,
 	}
 	for _, s := range members {
@@ -74,11 +95,12 @@ func NewPool(id string, context int, members []MemberSpec, ttl, cooldown time.Du
 	return p
 }
 
-// Lease is one granted slot. Exactly one of Release or ReleaseDown must be
-// called.
+// Lease is one granted request slot. Exactly one of Release or ReleaseDown
+// must be called; later calls are no-ops.
 type Lease struct {
 	p    *Pool
 	m    *member
+	pin  *pin
 	key  string
 	once sync.Once
 }
@@ -86,11 +108,15 @@ type Lease struct {
 // Model is the member model id the request must be rewritten to.
 func (l *Lease) Model() string { return l.m.model }
 
-// Release returns the slot.
+// Release returns the slot when the request has finished.
 func (l *Lease) Release() {
 	l.once.Do(func() {
 		l.p.mu.Lock()
 		l.m.busy--
+		if l.pin != nil {
+			l.pin.inflight--
+			l.pin.last = l.p.now()
+		}
 		l.p.broadcastLocked()
 		l.p.mu.Unlock()
 	})
@@ -103,16 +129,20 @@ func (l *Lease) ReleaseDown() {
 		l.p.mu.Lock()
 		l.m.busy--
 		l.m.downUntil = l.p.now().Add(l.p.cooldown)
-		if pn, ok := l.p.pins[l.key]; ok && pn.m == l.m {
-			delete(l.p.pins, l.key)
+		if l.pin != nil {
+			l.pin.inflight--
+			if l.p.pins[l.key] == l.pin {
+				delete(l.p.pins, l.key)
+			}
 		}
 		l.p.broadcastLocked()
 		l.p.mu.Unlock()
 	})
 }
 
-// Acquire blocks until a slot is granted for the conversation identified by
-// key, ctx ends, or every member is down. An empty key has no affinity.
+// Acquire blocks until a request slot is granted for the conversation
+// identified by key, ctx ends, or every member is down. An empty key has no
+// affinity and owns nothing.
 //
 // A pinned conversation waits for its own member rather than moving to a
 // free one: switching members mid-task changes the model under the agent and
@@ -130,14 +160,22 @@ func (p *Pool) Acquire(ctx context.Context, key string) (*Lease, error) {
 		}
 		if m != nil {
 			m.busy++
+			l := &Lease{p: p, m: m, key: key}
 			if key != "" {
-				p.pins[key] = &pin{m: m, last: now}
+				pn := p.pins[key]
+				if pn == nil || pn.m != m {
+					pn = &pin{m: m}
+					p.pins[key] = pn
+				}
+				pn.inflight++
+				pn.last = now
+				l.pin = pn
 			}
 			p.mu.Unlock()
-			return &Lease{p: p, m: m, key: key}, nil
+			return l, nil
 		}
 		wake := p.wake
-		retry := p.nextUpLocked(now)
+		retry := p.nextChangeLocked(now)
 		p.waiting++
 		p.mu.Unlock()
 
@@ -176,30 +214,69 @@ func (p *Pool) chooseLocked(key string, now time.Time) (*member, error) {
 			return nil, nil
 		}
 	}
-	up := 0
+	owners := p.ownersLocked(now, key)
+	var up []*member
 	for _, m := range p.members {
-		if now.Before(m.downUntil) {
-			continue
+		if !now.Before(m.downUntil) {
+			up = append(up, m)
 		}
-		up++
-		if m.busy < m.slots {
+	}
+	if len(up) == 0 {
+		return nil, ErrNoMembers
+	}
+	// First choice: a member with unowned capacity, in preference order.
+	for _, m := range up {
+		if owners[m] < m.slots && m.busy < m.slots {
 			return m, nil
 		}
 	}
-	if up == 0 {
-		return nil, ErrNoMembers
+	// Every slot is owned. Share the least-loaded member rather than wait for
+	// a conversation to go idle, which can take minutes; a member that is
+	// mid-request still bounds what runs at once.
+	var best *member
+	for _, m := range up {
+		if m.busy >= m.slots {
+			continue
+		}
+		if best == nil || owners[m]*best.slots < owners[best]*m.slots {
+			best = m
+		}
 	}
-	return nil, nil
+	return best, nil
 }
 
-// nextUpLocked is when the earliest down member comes back, or zero. A
-// waiter must wake then even if no slot is released, or a pool whose only
-// free capacity is behind a cooldown would sleep through it.
-func (p *Pool) nextUpLocked(now time.Time) time.Time {
+// ownersLocked counts the active conversations on each member, other than
+// the one asking.
+func (p *Pool) ownersLocked(now time.Time, except string) map[*member]int {
+	owners := map[*member]int{}
+	for k, pn := range p.pins {
+		if k == except {
+			continue
+		}
+		if pn.inflight > 0 || now.Sub(pn.last) < p.idle {
+			owners[pn.m]++
+		}
+	}
+	return owners
+}
+
+// nextChangeLocked is the earliest moment a waiter's answer can change
+// without any slot being released: a down member coming back, or an owned
+// slot going idle. A waiter must wake then, or a pool whose only capacity is
+// behind a cooldown or an idle conversation would sleep through it.
+func (p *Pool) nextChangeLocked(now time.Time) time.Time {
 	var next time.Time
+	consider := func(t time.Time) {
+		if t.After(now) && (next.IsZero() || t.Before(next)) {
+			next = t
+		}
+	}
 	for _, m := range p.members {
-		if now.Before(m.downUntil) && (next.IsZero() || m.downUntil.Before(next)) {
-			next = m.downUntil
+		consider(m.downUntil)
+	}
+	for _, pn := range p.pins {
+		if pn.inflight == 0 {
+			consider(pn.last.Add(p.idle))
 		}
 	}
 	return next
@@ -207,7 +284,7 @@ func (p *Pool) nextUpLocked(now time.Time) time.Time {
 
 func (p *Pool) evictLocked(now time.Time) {
 	for k, pn := range p.pins {
-		if now.Sub(pn.last) > p.ttl {
+		if pn.inflight == 0 && now.Sub(pn.last) > p.ttl {
 			delete(p.pins, k)
 		}
 	}
@@ -220,10 +297,11 @@ func (p *Pool) broadcastLocked() {
 
 // MemberStatus is one member's state for /status.
 type MemberStatus struct {
-	Model string `json:"model"`
-	Slots int    `json:"slots"`
-	Busy  int    `json:"busy"`
-	Down  bool   `json:"down"`
+	Model  string `json:"model"`
+	Slots  int    `json:"slots"`
+	Busy   int    `json:"busy"`
+	Owners int    `json:"active_conversations"`
+	Down   bool   `json:"down"`
 }
 
 // Status is a pool's state for /status.
@@ -239,9 +317,12 @@ func (p *Pool) Status() Status {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := p.now()
+	owners := p.ownersLocked(now, "")
 	s := Status{ID: p.ID, Pinned: len(p.pins), Waiting: p.waiting}
 	for _, m := range p.members {
-		s.Members = append(s.Members, MemberStatus{Model: m.model, Slots: m.slots, Busy: m.busy, Down: now.Before(m.downUntil)})
+		s.Members = append(s.Members, MemberStatus{
+			Model: m.model, Slots: m.slots, Busy: m.busy, Owners: owners[m], Down: now.Before(m.downUntil),
+		})
 	}
 	return s
 }
