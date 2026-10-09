@@ -1,0 +1,17 @@
+# vibe agentpool: pooled executor ids (docs/design/router-lifecycle.md §18).
+# House values (addresses, member ids) belong in the private fleet repo.
+listen: ":9010"
+# The front every member is reached through; the pool picks the model id,
+# the front still picks the cell.
+upstream: http://front.example:9000
+affinity_ttl: 2h
+down_cooldown: 30s
+queue_timeout: 15m
+pools:
+  - id: agent-exec
+    # The smallest member context: a conversation may land on any member.
+    context: 131072
+    # Configured order is preference order for new conversations.
+    members:
+      - {model: localmodel/qwen3.8-27b-tools, slots: 1}
+      - {model: drift/qwen38fn-mlx, slots: 1}

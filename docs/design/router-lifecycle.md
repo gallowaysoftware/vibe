@@ -664,3 +664,47 @@ real A5/A6 (Sparks: single-node cell, dual-node pair scripts, NCCL
 workarounds, deep-health watchdog), A8b (delete proxy.go + LLM respawn
 paths once nothing daemon-supervised serves LLMs — bge-embed service is
 the last holdout on localmodel, destined for llamaloft).
+
+## 18. Agent pools (2026-10-09)
+
+`vibe agentpool` is the first deliberate front shim. A coding harness that
+fans work out to subagents needs "whichever executor is free", which neither
+llama-swap nor a failover chain expresses: llama-swap maps one id to one
+model, and a harness's own fallback list only checks that an id exists, never
+that its machine is up or idle.
+
+**Shape.** A separate process (its own container on hum), not the daemon. It
+serves virtual ids (`agent-exec`) whose members are front model ids with a
+slot count, and forwards to the front, which still decides the cell. Only
+requests that name a pool id take the extra hop; every other client keeps
+talking to the front directly, so invariant 1 holds for them and fleetd stays
+read-and-request-only (invariant 4): the pool judges member health from its
+own dispatches and never asks fleetd.
+
+**Scheduling.**
+- A new conversation takes the first member, in configured order, with a free slot.
+- Every later request in it goes to the same member. The key is a hash of the
+  first system and first user message, which an agent never rewrites.
+- A pinned conversation waits for its member rather than moving. A move
+  changes the model mid-task and throws away that member's prompt cache. It
+  only moves when its member is marked down.
+- Requests queue when every slot is busy (`queue_timeout`, default 15m). This
+  is the one place a request blocks. It blocks before dispatch, never
+  mid-stream. Once dispatched, bytes are copied and flushed per read, and
+  response headers are flushed at once, because a member prefilling a long
+  prompt can be silent for a minute.
+- A front 404/502/503 or a dial error marks the member down for
+  `down_cooldown` and retries the request on another member. Any other status
+  (a 400 for an over-long prompt, a 500) passes straight through. With every
+  member down, the pool answers 503 with `Retry-After` at once instead of
+  queueing.
+
+**Not silent rerouting (invariant 3).** The client asked for "any member";
+`X-Agent-Pool-Member` names the one that served, and `/status` shows slots,
+pins and waiters. A pool should list members of comparable capability, since
+a conversation may land on any of them; its advertised context is the
+smallest member's.
+
+**Known limit.** The pool only counts its own requests. Traffic that reaches a
+member's model id directly shares that member's slots without the pool
+knowing, so a member that serves both pays in queueing on the member side.

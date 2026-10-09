@@ -1,0 +1,18 @@
+# vibe agentpool: the same vibe binary and image as fleetd (deploy/fleetd
+# builds it), run as its own process so a pool restart never touches the
+# control plane and fleetd never sits in a request's path.
+services:
+  agentpool:
+    image: vibe-fleetd:latest
+    container_name: agentpool
+    restart: unless-stopped
+    command: ["agentpool", "--config", "/config/agentpool.yaml"]
+    volumes:
+      - ./agentpool.yaml:/config/agentpool.yaml:ro
+    ports:
+      - "9010:9010"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

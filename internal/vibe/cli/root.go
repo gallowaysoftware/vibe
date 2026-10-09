@@ -62,6 +62,7 @@ func rootCmd() *cobra.Command {
 		listCmd(),
 		logsCmd(),
 		daemonCmd(),
+		agentpoolCmd(),
 		shutdownCmd(),
 		envCmd(),
 		pullCmd(),

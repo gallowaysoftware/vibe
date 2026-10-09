@@ -2561,7 +2561,9 @@ planned. The short version an agent needs:
   in-flight work and may TTL-reap ComfyUI mid-pipeline.
 - Don't re-introduce model-serving/proxy logic into the vibe daemon; the
   design's pre-agreed fallback for router gaps is a thin front shim, decided
-  deliberately — not ad-hoc daemon features.
+  deliberately — not ad-hoc daemon features. `vibe agentpool` is that shim
+  for pooled executor ids (router-lifecycle.md §18): its own process, only
+  pool ids pass through it, and it never consults fleetd.
 
 ## Fleet control (node state / intent / presence, 2026-08-02+)
 
