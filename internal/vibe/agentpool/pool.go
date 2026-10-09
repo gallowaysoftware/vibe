@@ -57,6 +57,7 @@ type Pool struct {
 	ttl      time.Duration
 	idle     time.Duration
 	cooldown time.Duration
+	patience time.Duration
 	now      func() time.Time
 }
 
@@ -64,7 +65,7 @@ type Pool struct {
 type MemberSpec struct {
 	Model string
 	Slots int
-	// Weight is the member's speed relative to the others (default 1). It
+	// Weight is the member's speed relative to the others; zero means 1. It
 	// decides where conversations go once every slot is owned.
 	Weight int
 }
@@ -79,6 +80,9 @@ type Timing struct {
 	Idle time.Duration
 	// Cooldown is how long a member stays down after a failed dispatch.
 	Cooldown time.Duration
+	// Patience bounds how long a new conversation waits for a faster busy
+	// member before taking a free slower one.
+	Patience time.Duration
 }
 
 // NewPool builds a pool. Members are listed in preference order.
@@ -91,6 +95,7 @@ func NewPool(id string, context int, members []MemberSpec, t Timing) *Pool {
 		ttl:      t.TTL,
 		idle:     t.Idle,
 		cooldown: t.Cooldown,
+		patience: t.Patience,
 		now:      time.Now,
 	}
 	for _, s := range members {
@@ -167,10 +172,11 @@ func (p *Pool) Acquire(ctx context.Context, key string) (*Lease, error) {
 	if pn, ok := p.pins[key]; ok && pn.inflight > 0 {
 		key = ""
 	}
+	patientUntil := p.now().Add(p.patience)
 	for {
 		now := p.now()
 		p.evictLocked(now)
-		m, err := p.chooseLocked(key, now)
+		m, err := p.chooseLocked(key, now, now.Before(patientUntil))
 		if err != nil {
 			p.mu.Unlock()
 			return nil, err
@@ -193,6 +199,9 @@ func (p *Pool) Acquire(ctx context.Context, key string) (*Lease, error) {
 		}
 		wake := p.wake
 		retry := p.nextChangeLocked(now)
+		if patientUntil.After(now) && (retry.IsZero() || patientUntil.Before(retry)) {
+			retry = patientUntil
+		}
 		p.waiting++
 		p.mu.Unlock()
 
@@ -220,7 +229,8 @@ func (p *Pool) Acquire(ctx context.Context, key string) (*Lease, error) {
 }
 
 // chooseLocked returns the member to grant, nil to wait, or ErrNoMembers.
-func (p *Pool) chooseLocked(key string, now time.Time) (*member, error) {
+// patient allows a new conversation to wait for a faster busy member.
+func (p *Pool) chooseLocked(key string, now time.Time, patient bool) (*member, error) {
 	if pn, ok := p.pins[key]; ok && key != "" {
 		if now.Before(pn.m.downUntil) {
 			delete(p.pins, key)
@@ -248,12 +258,11 @@ func (p *Pool) chooseLocked(key string, now time.Time) (*member, error) {
 		}
 	}
 	// Every slot is owned, and a conversation stays where it lands, so place
-	// it on the member furthest below its share of the work by speed
-	// (conversations per slot per unit of weight). Counting conversations
-	// alone split them evenly between a fast and a slow member, leaving the
-	// fast one idle while the slow one still had a queue. If that member is
-	// mid-request, wait for it rather than settling for a slower one that
-	// happens to be free; a free member with an equal share is taken instead.
+	// it on the member furthest below its share: conversations per slot per
+	// unit of weight. A conversation that will be pinned waits, for up to
+	// the patience bound, when that member is mid-request and strictly faster
+	// than the best free one. Unpinned requests never wait: they add no
+	// owner, so every one of them would choose, and queue on, the same member.
 	better := func(a, b *member) bool {
 		return owners[a]*b.slots*b.weight < owners[b]*a.slots*a.weight
 	}
@@ -266,10 +275,14 @@ func (p *Pool) chooseLocked(key string, now time.Time) (*member, error) {
 			bestFree = m
 		}
 	}
-	if bestFree != nil && !better(best, bestFree) {
-		return bestFree, nil
+	if best.busy < best.slots {
+		return best, nil
 	}
-	return nil, nil
+	faster := bestFree == nil || best.weight*bestFree.slots > bestFree.weight*best.slots
+	if key != "" && patient && faster && (bestFree == nil || better(best, bestFree)) {
+		return nil, nil
+	}
+	return bestFree, nil
 }
 
 // ownersLocked counts the active conversations on each member, other than
@@ -326,6 +339,7 @@ func (p *Pool) broadcastLocked() {
 type MemberStatus struct {
 	Model  string `json:"model"`
 	Slots  int    `json:"slots"`
+	Weight int    `json:"weight"`
 	Busy   int    `json:"busy"`
 	Owners int    `json:"active_conversations"`
 	Down   bool   `json:"down"`
@@ -348,7 +362,7 @@ func (p *Pool) Status() Status {
 	s := Status{ID: p.ID, Pinned: len(p.pins), Waiting: p.waiting}
 	for _, m := range p.members {
 		s.Members = append(s.Members, MemberStatus{
-			Model: m.model, Slots: m.slots, Busy: m.busy, Owners: owners[m], Down: now.Before(m.downUntil),
+			Model: m.model, Slots: m.slots, Weight: m.weight, Busy: m.busy, Owners: owners[m], Down: now.Before(m.downUntil),
 		})
 	}
 	return s

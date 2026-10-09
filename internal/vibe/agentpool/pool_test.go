@@ -23,7 +23,7 @@ func (c *fakeClock) advance(d time.Duration) {
 func testPool(t *testing.T, members ...MemberSpec) (*Pool, *fakeClock) {
 	t.Helper()
 	clk := &fakeClock{t: time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)}
-	p := NewPool("agent-exec", 131072, members, Timing{TTL: time.Hour, Idle: 2 * time.Minute, Cooldown: 30 * time.Second})
+	p := NewPool("agent-exec", 131072, members, Timing{TTL: time.Hour, Idle: 2 * time.Minute, Cooldown: 30 * time.Second, Patience: time.Hour})
 	p.now = clk.now
 	return p, clk
 }
@@ -287,6 +287,47 @@ func TestPool_OverflowWaitsForAFasterMemberRatherThanTakingAFreeSlowOne(t *testi
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("d never got the fast member")
+	}
+}
+
+func TestPool_UnpinnedRequestNeverWaitsForAFasterMember(t *testing.T) {
+	p, _ := testPool(t, MemberSpec{Model: "fast", Slots: 1, Weight: 3}, MemberSpec{Model: "slow", Slots: 1, Weight: 1})
+	mustAcquire(t, p, "a").Release()
+	mustAcquire(t, p, "b").Release()
+	mustAcquire(t, p, "c") // fast, in flight
+	if l := mustAcquire(t, p, ""); l.Model() != "slow" {
+		t.Fatalf("unpinned request got %s; it adds no owner, so waiting would queue every one on fast", l.Model())
+	}
+}
+
+func TestPool_EqualWeightsTakeAFreeMemberInsteadOfWaiting(t *testing.T) {
+	p, _ := testPool(t, MemberSpec{Model: "a", Slots: 1}, MemberSpec{Model: "b", Slots: 1})
+	mustAcquire(t, p, "x").Release() // a
+	held := mustAcquire(t, p, "y")   // b, in flight
+	if held.Model() != "b" {
+		t.Fatalf("y got %s, want b", held.Model())
+	}
+	mustAcquire(t, p, "z").Release() // a: tie on owners, b busy
+	// Now b is busy with one owner and a is free with two. b has the lower
+	// share, but neither member is faster, so there is nothing to wait for.
+	if l := mustAcquire(t, p, "v"); l.Model() != "a" {
+		t.Fatalf("v got %s; with equal weights it should take free a", l.Model())
+	}
+}
+
+func TestPool_NewConversationStopsWaitingForTheFasterMemberAfterPatience(t *testing.T) {
+	p := NewPool("agent-exec", 0, []MemberSpec{{Model: "fast", Slots: 1, Weight: 3}, {Model: "slow", Slots: 1, Weight: 1}},
+		Timing{TTL: time.Hour, Idle: time.Hour, Cooldown: time.Minute, Patience: 50 * time.Millisecond})
+	mustAcquire(t, p, "a").Release()
+	mustAcquire(t, p, "b").Release()
+	mustAcquire(t, p, "c") // fast, held for the whole test
+	start := time.Now()
+	l := mustAcquire(t, p, "d")
+	if l.Model() != "slow" {
+		t.Fatalf("d got %s, want slow once patience ran out", l.Model())
+	}
+	if waited := time.Since(start); waited < 40*time.Millisecond {
+		t.Fatalf("d took slow after %s; it should first wait for fast", waited)
 	}
 }
 

@@ -27,6 +27,10 @@ import (
 // the 131K-token contexts the members serve.
 const maxBody = 32 << 20
 
+// maxWeight bounds slots and weight so owners*slots*weight comparisons stay
+// far from overflow; real members differ in speed by single-digit ratios.
+const maxWeight = 1000
+
 // Config is the agentpool configuration file.
 type Config struct {
 	// Listen is the address to serve on, e.g. ":9010".
@@ -45,6 +49,9 @@ type Config struct {
 	ConversationIdle profile.Duration `yaml:"conversation_idle"`
 	// DownCooldown is how long a member is skipped after a failed dispatch.
 	DownCooldown profile.Duration `yaml:"down_cooldown"`
+	// OverflowPatience bounds how long a new conversation waits for a faster
+	// busy member before taking a free slower one.
+	OverflowPatience profile.Duration `yaml:"overflow_patience"`
 	// QueueTimeout bounds how long a request waits for a slot.
 	QueueTimeout profile.Duration `yaml:"queue_timeout"`
 	Pools        []PoolConfig     `yaml:"pools"`
@@ -63,8 +70,8 @@ type PoolConfig struct {
 type MemberConfig struct {
 	Model string `yaml:"model"`
 	Slots int    `yaml:"slots"`
-	// Weight is the member's relative speed (default 1). Once every slot is
-	// owned, new conversations go where they would finish soonest.
+	// Weight is the member's relative speed, 1 to maxWeight; unset means 1.
+	// Once every slot is owned, conversations split in proportion to it.
 	Weight int `yaml:"weight"`
 }
 
@@ -89,6 +96,9 @@ func LoadConfig(path string) (Config, error) {
 	if c.ConversationIdle == 0 {
 		c.ConversationIdle = profile.Duration(2 * time.Minute)
 	}
+	if c.OverflowPatience == 0 {
+		c.OverflowPatience = profile.Duration(30 * time.Second)
+	}
 	if c.DownCooldown == 0 {
 		c.DownCooldown = profile.Duration(30 * time.Second)
 	}
@@ -102,7 +112,8 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, fmt.Errorf("%s: no pools", path)
 	}
 	seen := map[string]bool{}
-	for _, p := range c.Pools {
+	for pi := range c.Pools {
+		p := &c.Pools[pi]
 		if p.ID == "" || seen[p.ID] {
 			return Config{}, fmt.Errorf("%s: pool id %q is empty or repeated", path, p.ID)
 		}
@@ -110,9 +121,13 @@ func LoadConfig(path string) (Config, error) {
 		if len(p.Members) == 0 {
 			return Config{}, fmt.Errorf("%s: pool %q has no members", path, p.ID)
 		}
-		for _, m := range p.Members {
-			if m.Model == "" || m.Slots < 1 || m.Weight < 0 {
-				return Config{}, fmt.Errorf("%s: pool %q: member needs a model, slots >= 1 and weight >= 0", path, p.ID)
+		for mi := range p.Members {
+			m := &p.Members[mi]
+			if m.Weight == 0 {
+				m.Weight = 1
+			}
+			if m.Model == "" || m.Slots < 1 || m.Slots > maxWeight || m.Weight < 1 || m.Weight > maxWeight {
+				return Config{}, fmt.Errorf("%s: pool %q: member needs a model, and slots and weight in 1..%d", path, p.ID, maxWeight)
 			}
 		}
 	}
@@ -168,6 +183,7 @@ func NewServer(c Config, transport http.RoundTripper, log *slog.Logger) *Server 
 			TTL:      time.Duration(c.AffinityTTL),
 			Idle:     time.Duration(c.ConversationIdle),
 			Cooldown: time.Duration(c.DownCooldown),
+			Patience: time.Duration(c.OverflowPatience),
 		})
 		s.pools[pc.ID] = p
 		s.order = append(s.order, p)

@@ -378,7 +378,8 @@ func TestLoadConfig_FillsDefaultsAndRejectsBadPools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Listen != ":9010" || time.Duration(c.DownCooldown) != 30*time.Second || time.Duration(c.QueueTimeout) != 15*time.Minute {
+	if c.Listen != ":9010" || time.Duration(c.DownCooldown) != 30*time.Second || time.Duration(c.QueueTimeout) != 15*time.Minute ||
+		time.Duration(c.OverflowPatience) != 30*time.Second || c.Pools[0].Members[0].Weight != 1 {
 		t.Fatalf("defaults not filled: %+v", c)
 	}
 	for _, bad := range []string{
@@ -388,6 +389,7 @@ func TestLoadConfig_FillsDefaultsAndRejectsBadPools(t *testing.T) {
 		"upstream: x\nbogus: 1\npools:\n  - id: p\n    members: [{model: a, slots: 1}]\n",
 		"upstream: x\ndown_cooldown: -30s\npools:\n  - id: p\n    members: [{model: a, slots: 1}]\n",
 		"upstream: x\npools:\n  - id: p\n    members: [{model: a, slots: 1, weight: -1}]\n",
+		"upstream: x\npools:\n  - id: p\n    members: [{model: a, slots: 1, weight: 1001}]\n",
 	} {
 		if _, err := LoadConfig(write(bad)); err == nil {
 			t.Fatalf("accepted %q", bad)
