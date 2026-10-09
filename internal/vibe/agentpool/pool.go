@@ -150,6 +150,15 @@ func (l *Lease) ReleaseDown() {
 // moves when its member is down.
 func (p *Pool) Acquire(ctx context.Context, key string) (*Lease, error) {
 	p.mu.Lock()
+	// One agent conversation never has two requests in flight: it waits for
+	// each reply before sending the next. A second one under a key that is
+	// mid-request is a different conversation whose opening happens to match
+	// (a harness that sends a fixed preamble as the first user message), and
+	// pinning it would serialise exactly the fan-out the pool exists to
+	// spread. It is placed with no affinity instead.
+	if pn, ok := p.pins[key]; ok && pn.inflight > 0 {
+		key = ""
+	}
 	for {
 		now := p.now()
 		p.evictLocked(now)

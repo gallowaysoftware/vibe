@@ -26,9 +26,10 @@ func agentpoolCmd() *cobra.Command {
 				return err
 			}
 			log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+			pool := agentpool.NewServer(cfg, nil, log)
 			srv := &http.Server{
 				Addr:              cfg.Listen,
-				Handler:           agentpool.NewServer(cfg, nil, log),
+				Handler:           pool,
 				ReadHeaderTimeout: 10 * time.Second,
 			}
 			ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -42,11 +43,15 @@ func agentpoolCmd() *cobra.Command {
 			case <-ctx.Done():
 			}
 			// In-flight completions are agent turns; give them time to finish
-			// rather than cutting a stream mid-edit on a redeploy.
+			// rather than cutting a stream mid-edit on a redeploy. Queued
+			// requests are failed at once so they cannot hold the drain open.
+			pool.Drain()
 			shutdownCtx, stop := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer stop()
 			if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				return err
+				// A stream still running at the deadline is cut; that is the
+				// bound working, not a failed stop.
+				log.Warn("agentpool: drain deadline reached, closing remaining streams", "err", err)
 			}
 			return nil
 		},

@@ -692,7 +692,11 @@ own dispatches and never asks fleetd.
   unowned capacity. When every slot is owned, it shares the least-loaded
   member rather than waiting minutes for a conversation to go idle.
 - Every later request in it goes to the same member. The key is a hash of the
-  first system and first user message, which an agent never rewrites.
+  first system and first user message, which an agent never rewrites. One
+  conversation never has two requests in flight, so a second request under
+  a key that is mid-request is a different conversation whose opening
+  happens to match (a harness that sends a fixed preamble first). It is
+  placed with no affinity rather than queued behind the first.
 - A pinned conversation waits for its member rather than moving. A move
   changes the model mid-task and throws away that member's prompt cache. It
   only moves when its member is marked down.
@@ -707,11 +711,25 @@ own dispatches and never asks fleetd.
   member down, the pool answers 503 with `Retry-After` at once instead of
   queueing.
 
-**Not silent rerouting (invariant 3).** The client asked for "any member";
-`X-Agent-Pool-Member` names the one that served, and `/status` shows slots,
-pins and waiters. A pool should list members of comparable capability, since
-a conversation may land on any of them; its advertised context is the
-smallest member's.
+**An exception to invariant 3, made deliberately.** Retrying a down member's
+request on another member, and moving a pinned conversation when its member
+goes down, is the rerouting invariant 3 forbids for the front. It is accepted
+here because the client asked for "any member" by naming the pool, and the
+alternative is failing an agent mid-task while another executor is free. It
+is not silent: every move logs a warning, `X-Agent-Pool-Member` names the
+member that served, and `/status` shows slots, owners, pins and waiters.
+Requests that name a real model id never pass through the pool and keep the
+invariant. A pool should list members of comparable capability, since a
+conversation may land on any of them; its advertised context is the smallest
+member's.
+
+**Edges.** Only the exact `/v1/chat/completions` and `/v1/completions` paths
+are served. The path is forwarded verbatim, and a front 404 for a wrong path
+would otherwise read as every member being down. On shutdown, queued requests
+fail at once with 503 and in-flight streams get two minutes to finish (the
+compose `stop_grace_period` covers it). Every release wakes every waiter;
+with a handful of members and waiters that costs nothing, and a pool large
+enough to notice should move to per-member signalling.
 
 **Known limit.** The pool only counts its own requests. Traffic that reaches a
 member's model id directly shares that member's slots without the pool

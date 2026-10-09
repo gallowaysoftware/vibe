@@ -1,18 +1,40 @@
-# vibe agentpool: the same vibe binary and image as fleetd (deploy/fleetd
-# builds it), run as its own process so a pool restart never touches the
-# control plane and fleetd never sits in a request's path.
+# vibe agentpool: pooled executor ids (docs/design/router-lifecycle.md §18).
+#
+# REFERENCE STACK. Same conventions as deploy/fleetd: macvlan networking,
+# .env holds the values, no real addresses in the repo. Macvlan is not a
+# preference here: the pool forwards to the front, which is a macvlan child
+# of the same host, and a host cannot reach its own macvlan children from a
+# bridge network. A published port on the default bridge dials nothing.
+#
+# The image is the vibe binary in deploy/fleetd's Dockerfile, tagged as its
+# own image. Rebuilding fleetd's image for a pool change would silently change
+# fleetd on its next recreate; a separate tag keeps the two releases apart,
+# and a separate process keeps fleetd out of every request's path.
+
 services:
+
   agentpool:
-    image: vibe-fleetd:latest
-    container_name: agentpool
+    image: ${AGENTPOOL_IMAGE:-vibe-agentpool:latest}
+    container_name: ${AGENTPOOL_NAME:-agentpool}
     restart: unless-stopped
     command: ["agentpool", "--config", "/config/agentpool.yaml"]
+    # Matches the server's 2m drain, so a redeploy lets in-flight agent
+    # turns finish instead of SIGKILLing them after Docker's default 10s.
+    stop_grace_period: 2m30s
     volumes:
-      - ./agentpool.yaml:/config/agentpool.yaml:ro
-    ports:
-      - "9010:9010"
+      - ${AGENTPOOL_CONFIG_DIR:?set AGENTPOOL_CONFIG_DIR to the directory holding agentpool.yaml}:/config:ro
+    networks:
+      macvlan:
+        ipv4_address: ${AGENTPOOL_IPV4:?set AGENTPOOL_IPV4 to the pool's LAN address}
+    labels:
+      net.unraid.docker.webui: "http://${AGENTPOOL_IPV4}:9010/status"
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+networks:
+  macvlan:
+    external: true
+    name: ${MACVLAN_NETWORK:-br0}

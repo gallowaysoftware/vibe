@@ -16,5 +16,5 @@ pools:
     context: 131072
     # Configured order is preference order for new conversations.
     members:
-      - {model: localmodel/qwen3.8-27b-tools, slots: 1}
-      - {model: drift/qwen38fn-mlx, slots: 1}
+      - {model: cell-a/executor-model, slots: 1}
+      - {model: cell-b/executor-model, slots: 1}

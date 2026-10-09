@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 	"gopkg.in/yaml.v3"
 )
 
@@ -31,22 +32,22 @@ type Config struct {
 	// Listen is the address to serve on, e.g. ":9010".
 	Listen string `yaml:"listen"`
 	// Upstream is the front every member is reached through, e.g.
-	// "http://172.16.3.211:9000". The pool picks the model id; the front
+	// "http://front.example:9000". The pool picks the model id; the front
 	// still decides which cell serves it.
 	Upstream string `yaml:"upstream"`
 	// AffinityTTL is how long an idle conversation keeps its member for its
 	// own next request.
-	AffinityTTL Duration `yaml:"affinity_ttl"`
+	AffinityTTL profile.Duration `yaml:"affinity_ttl"`
 	// ConversationIdle is how long after its last request a conversation
 	// stops owning its member's slot against new conversations. An agent is
 	// between requests whenever a tool runs, so this should outlast a typical
 	// test run.
-	ConversationIdle Duration `yaml:"conversation_idle"`
+	ConversationIdle profile.Duration `yaml:"conversation_idle"`
 	// DownCooldown is how long a member is skipped after a failed dispatch.
-	DownCooldown Duration `yaml:"down_cooldown"`
+	DownCooldown profile.Duration `yaml:"down_cooldown"`
 	// QueueTimeout bounds how long a request waits for a slot.
-	QueueTimeout Duration     `yaml:"queue_timeout"`
-	Pools        []PoolConfig `yaml:"pools"`
+	QueueTimeout profile.Duration `yaml:"queue_timeout"`
+	Pools        []PoolConfig     `yaml:"pools"`
 }
 
 // PoolConfig is one virtual model id.
@@ -62,19 +63,6 @@ type PoolConfig struct {
 type MemberConfig struct {
 	Model string `yaml:"model"`
 	Slots int    `yaml:"slots"`
-}
-
-// Duration is a time.Duration that unmarshals from "30s"-style strings.
-type Duration time.Duration
-
-// UnmarshalYAML parses a Go duration string.
-func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
-	v, err := time.ParseDuration(n.Value)
-	if err != nil {
-		return fmt.Errorf("duration %q: %w", n.Value, err)
-	}
-	*d = Duration(v)
-	return nil
 }
 
 // LoadConfig reads and validates a config file, filling defaults.
@@ -93,16 +81,16 @@ func LoadConfig(path string) (Config, error) {
 		c.Listen = ":9010"
 	}
 	if c.AffinityTTL == 0 {
-		c.AffinityTTL = Duration(2 * time.Hour)
+		c.AffinityTTL = profile.Duration(2 * time.Hour)
 	}
 	if c.ConversationIdle == 0 {
-		c.ConversationIdle = Duration(2 * time.Minute)
+		c.ConversationIdle = profile.Duration(2 * time.Minute)
 	}
 	if c.DownCooldown == 0 {
-		c.DownCooldown = Duration(30 * time.Second)
+		c.DownCooldown = profile.Duration(30 * time.Second)
 	}
 	if c.QueueTimeout == 0 {
-		c.QueueTimeout = Duration(15 * time.Minute)
+		c.QueueTimeout = profile.Duration(15 * time.Minute)
 	}
 	if c.Upstream == "" {
 		return Config{}, fmt.Errorf("%s: upstream is required", path)
@@ -130,6 +118,8 @@ func LoadConfig(path string) (Config, error) {
 
 // Server is the HTTP face of a set of pools.
 type Server struct {
+	draining     context.Context
+	drain        context.CancelFunc
 	upstream     string
 	pools        map[string]*Pool
 	order        []*Pool
@@ -154,7 +144,10 @@ func NewServer(c Config, transport http.RoundTripper, log *slog.Logger) *Server 
 	if log == nil {
 		log = slog.Default()
 	}
+	draining, drain := context.WithCancel(context.Background())
 	s := &Server{
+		draining:     draining,
+		drain:        drain,
 		upstream:     strings.TrimRight(c.Upstream, "/"),
 		pools:        map[string]*Pool{},
 		queueTimeout: time.Duration(c.QueueTimeout),
@@ -179,16 +172,23 @@ func NewServer(c Config, transport http.RoundTripper, log *slog.Logger) *Server 
 	return s
 }
 
+// Drain fails every queued request so a shutdown can finish. Requests
+// already dispatched keep streaming.
+func (s *Server) Drain() { s.drain() }
+
 // ServeHTTP routes completions to pools and answers discovery locally.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
-	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/v1/models"):
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
 		s.serveModels(w)
 	case r.Method == http.MethodGet && r.URL.Path == "/status":
 		s.serveStatus(w)
 	case r.Method == http.MethodGet && r.URL.Path == "/healthz":
 		w.WriteHeader(http.StatusOK)
-	case r.Method == http.MethodPost && (strings.HasSuffix(r.URL.Path, "/v1/chat/completions") || strings.HasSuffix(r.URL.Path, "/v1/completions")):
+	// Exact paths only: the request path is forwarded verbatim, and a front
+	// 404 for a path it does not serve would otherwise read as a member
+	// being down and take the whole pool out for a cooldown.
+	case r.Method == http.MethodPost && (r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/completions"):
 		s.serveCompletion(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "agentpool serves only pool completions, /v1/models, /status and /healthz")
@@ -198,6 +198,27 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type completionPeek struct {
 	Model    string            `json:"model"`
 	Messages []json.RawMessage `json:"messages"`
+}
+
+// requestBody is a completion parsed once: its top-level fields as raw bytes,
+// so each dispatch attempt only swaps the model value.
+type requestBody map[string]json.RawMessage
+
+// withModel encodes the body with the member's model id. HTML escaping is
+// off so prompts full of code are not rewritten to \u003c and friends.
+func (b requestBody) withModel(model string) ([]byte, error) {
+	m, err := json.Marshal(model)
+	if err != nil {
+		return nil, err
+	}
+	b["model"] = m
+	var out bytes.Buffer
+	enc := json.NewEncoder(&out)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(map[string]json.RawMessage(b)); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(out.Bytes(), "\n"), nil
 }
 
 func (s *Server) serveCompletion(w http.ResponseWriter, r *http.Request) {
@@ -211,8 +232,13 @@ func (s *Server) serveCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var peek completionPeek
+	var fields requestBody
 	if err := json.Unmarshal(body, &peek); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "body is not JSON: "+err.Error())
+		return
+	}
+	if err := json.Unmarshal(body, &fields); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "body is not a JSON object: "+err.Error())
 		return
 	}
 	pool, ok := s.pools[peek.Model]
@@ -224,6 +250,11 @@ func (s *Server) serveCompletion(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.queueTimeout)
 	defer cancel()
+	// A shutdown fails queued requests at once: http.Server.Shutdown does not
+	// cancel request contexts, so a waiter would hold the drain open until
+	// its queue timeout. Requests already streaming are left to finish.
+	stop := context.AfterFunc(s.draining, cancel)
+	defer stop()
 	// Each member gets at most one attempt per request; a retry exists to
 	// step past a member that went away, not to hammer one that is failing.
 	for attempt := 0; attempt < len(pool.members); attempt++ {
@@ -232,7 +263,7 @@ func (s *Server) serveCompletion(w http.ResponseWriter, r *http.Request) {
 			s.writeAcquireError(w, r, pool, err)
 			return
 		}
-		out, err := rewriteModel(body, lease.Model())
+		out, err := fields.withModel(lease.Model())
 		if err != nil {
 			lease.Release()
 			writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
@@ -319,6 +350,9 @@ func (s *Server) writeAcquireError(w http.ResponseWriter, r *http.Request, pool 
 		writeError(w, http.StatusServiceUnavailable, "pool_unavailable", fmt.Sprintf("pool %q: every member is down", pool.ID))
 	case r.Context().Err() != nil:
 		// The client went away while queued; nobody is left to answer.
+	case s.draining.Err() != nil:
+		w.Header().Set("Retry-After", "5")
+		writeError(w, http.StatusServiceUnavailable, "pool_draining", "agentpool is shutting down")
 	default:
 		w.Header().Set("Retry-After", "30")
 		writeError(w, http.StatusServiceUnavailable, "pool_busy", fmt.Sprintf("pool %q: no slot freed within %s", pool.ID, s.queueTimeout))
@@ -370,19 +404,6 @@ func affinityKey(msgs []json.RawMessage) string {
 		h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil))
-}
-
-// rewriteModel swaps the request's model id for the member's. Every other
-// value passes through as raw bytes; only top-level key order changes, which
-// no server's prompt rendering depends on.
-func rewriteModel(body []byte, model string) ([]byte, error) {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(body, &fields); err != nil {
-		return nil, fmt.Errorf("body is not a JSON object: %w", err)
-	}
-	m, _ := json.Marshal(model)
-	fields["model"] = m
-	return json.Marshal(fields)
 }
 
 func (s *Server) serveModels(w http.ResponseWriter) {

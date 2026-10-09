@@ -13,6 +13,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gallowaysoftware/vibe/internal/swaptest"
+	"github.com/gallowaysoftware/vibe/internal/vibe/profile"
 )
 
 // Every socket here belongs to the test that opened it, per AGENTS.md's
@@ -67,9 +70,9 @@ func newRig(t *testing.T, front http.Handler, upstream string, members ...Member
 	}
 	cfg := Config{
 		Upstream:     upstream,
-		AffinityTTL:  Duration(time.Hour),
-		DownCooldown: Duration(time.Minute),
-		QueueTimeout: Duration(2 * time.Second),
+		AffinityTTL:  profile.Duration(time.Hour),
+		DownCooldown: profile.Duration(time.Minute),
+		QueueTimeout: profile.Duration(2 * time.Second),
 		Pools:        []PoolConfig{{ID: "agent-exec", Context: 131072, Members: members}},
 	}
 	r.server = NewServer(cfg, r.frontTr, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -115,20 +118,101 @@ func TestServer_RewritesThePoolIdToTheChosenMember(t *testing.T) {
 }
 
 func TestServer_StepsPastAMemberTheFrontCannotServe(t *testing.T) {
-	front := &fakeFront{down: map[string]bool{"localmodel/qwen3.8-27b-tools": true}}
-	r := newRig(t, front, "", MemberConfig{"localmodel/qwen3.8-27b-tools", 1}, MemberConfig{"drift/qwen38fn-mlx", 1})
+	// The shared llama-swap double: a model it does not route gets the
+	// front's real "no router for requested model" 404.
+	cell := swaptest.NewCell(t, swaptest.WithModels(swaptest.Model{ID: "drift/qwen38fn-mlx", State: "ready"}))
+	r := newRig(t, nil, cell.URL(), MemberConfig{"localmodel/qwen3.8-27b-tools", 1}, MemberConfig{"drift/qwen38fn-mlx", 1})
 	resp := r.post(t, convA)
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
-	if got := front.seen(); len(got) != 2 || got[1] != "drift/qwen38fn-mlx" {
-		t.Fatalf("front saw %v; want the 5090 tried, then drift", got)
+	if m := resp.Header.Get("X-Agent-Pool-Member"); m != "drift/qwen38fn-mlx" {
+		t.Fatalf("served by %q; want drift after the 5090 was unroutable", m)
 	}
 	st := r.server.pools["agent-exec"].Status()
 	if !st.Members[0].Down || st.Members[0].Busy != 0 || st.Members[1].Busy != 0 {
 		t.Fatalf("status after fallback: %+v", st.Members)
+	}
+}
+
+func TestServer_PathsOtherThanTheExactCompletionPathsNeverReachTheFront(t *testing.T) {
+	front := &fakeFront{}
+	r := newRig(t, front, "", MemberConfig{"a", 1})
+	resp, err := r.client.Post(r.pool.URL+"/openai/v1/chat/completions", "application/json", strings.NewReader(convA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusNotFound || len(front.seen()) != 0 {
+		t.Fatalf("status %d, front saw %v", resp.StatusCode, front.seen())
+	}
+	if r.server.pools["agent-exec"].Status().Members[0].Down {
+		t.Fatal("a misrouted path marked the member down")
+	}
+}
+
+func TestServer_ForwardsPromptsWithoutHTMLEscaping(t *testing.T) {
+	var got []byte
+	var mu sync.Mutex
+	front := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		got = b
+		mu.Unlock()
+		_, _ = io.WriteString(w, `{}`)
+	})
+	r := newRig(t, front, "", MemberConfig{"a", 1})
+	resp := r.post(t, `{"model":"agent-exec","messages":[{"role":"user","content":"if a < b && c > d"}]}`)
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(string(got), `if a < b && c > d`) || !strings.Contains(string(got), `"model":"a"`) {
+		t.Fatalf("front received %s", got)
+	}
+}
+
+func TestServer_DrainFailsQueuedRequestsAtOnce(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	unpark := func() { once.Do(func() { close(release) }) }
+	front := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-release
+	})
+	r := newRig(t, front, "", MemberConfig{"a", 1})
+	defer unpark()
+	first := r.post(t, convA) //nolint:bodyclose // closed below after the member is unparked
+	defer func() {
+		unpark()
+		_, _ = io.Copy(io.Discard, first.Body)
+		first.Body.Close()
+	}()
+	queued := make(chan int, 1)
+	go func() {
+		resp, err := r.client.Post(r.pool.URL+"/v1/chat/completions", "application/json",
+			strings.NewReader(`{"model":"agent-exec","messages":[{"role":"user","content":"task B"}]}`))
+		if err != nil {
+			queued <- -1
+			return
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		queued <- resp.StatusCode
+	}()
+	waitForWaiters(t, r.server.pools["agent-exec"], 1)
+	r.server.Drain()
+	select {
+	case code := <-queued:
+		if code != http.StatusServiceUnavailable {
+			t.Fatalf("queued request got %d, want 503", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain left the queued request waiting")
 	}
 }
 
@@ -302,6 +386,7 @@ func TestLoadConfig_FillsDefaultsAndRejectsBadPools(t *testing.T) {
 		"upstream: x\npools:\n  - id: p\n    members: [{model: a, slots: 0}]\n",
 		"upstream: x\npools:\n  - id: p\n    members: []\n",
 		"upstream: x\nbogus: 1\npools:\n  - id: p\n    members: [{model: a, slots: 1}]\n",
+		"upstream: x\ndown_cooldown: -30s\npools:\n  - id: p\n    members: [{model: a, slots: 1}]\n",
 	} {
 		if _, err := LoadConfig(write(bad)); err == nil {
 			t.Fatalf("accepted %q", bad)

@@ -86,22 +86,27 @@ func TestPool_ConversationStaysOnItsMemberWhenAPreferredOneFrees(t *testing.T) {
 
 func TestPool_PinnedConversationWaitsForItsMemberRatherThanMoving(t *testing.T) {
 	p, _ := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
-	first := mustAcquire(t, p, "conv-a") // pins conv-a to fast
+	mustAcquire(t, p, "conv-a").Release() // conv-a owns fast, between requests
+	mustAcquire(t, p, "conv-b").Release() // conv-b owns slow
+	c := mustAcquire(t, p, "conv-c")      // every slot owned: shares fast
+	if c.Model() != "fast" {
+		t.Fatalf("conv-c got %s, want fast", c.Model())
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	got := acquireAsync(p, ctx, "conv-a")
 	waitForWaiters(t, p, 1)
 	if s := p.Status(); s.Members[1].Busy != 0 {
-		t.Fatalf("pinned request took the free slow member: %+v", s.Members)
+		t.Fatalf("conv-a moved to the free slow member: %+v", s.Members)
 	}
-	first.Release()
+	c.Release()
 	select {
 	case l := <-got:
 		if l == nil || l.Model() != "fast" {
-			t.Fatalf("pinned conversation got %v, want fast", l)
+			t.Fatalf("conv-a got %v, want fast", l)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("pinned conversation never got its member back")
+		t.Fatal("conv-a never got its member back")
 	}
 }
 
@@ -224,6 +229,20 @@ func TestPool_StatusCountsConversationsOwningEachMember(t *testing.T) {
 	mustAcquire(t, p, "b")
 	if s := p.Status().Members[0]; s.Owners != 2 || s.Busy != 1 {
 		t.Fatalf("status %+v; want 2 active conversations, 1 busy", s)
+	}
+}
+
+func TestPool_SecondRequestUnderAKeyThatIsMidRequestIsPlacedAsANewConversation(t *testing.T) {
+	p, _ := testPool(t, MemberSpec{"fast", 1}, MemberSpec{"slow", 1})
+	first := mustAcquire(t, p, "fixed-preamble") // fast, in flight
+	second := mustAcquire(t, p, "fixed-preamble")
+	if second.Model() != "slow" {
+		t.Fatalf("second conversation sharing an opening got %s; it must not queue behind the first", second.Model())
+	}
+	first.Release()
+	second.Release()
+	if l := mustAcquire(t, p, "fixed-preamble"); l.Model() != "fast" {
+		t.Fatalf("the key's own pin moved to %s", l.Model())
 	}
 }
 
