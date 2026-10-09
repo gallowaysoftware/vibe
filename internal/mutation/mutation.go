@@ -3306,6 +3306,22 @@ var Registry = []Mutation{
 			"the journal, the 502 body GET /search hands anyone holding the bearer token, and the " +
 			"MCP tool result that lands in a model's transcript.",
 	},
+	{
+		Name:     "render-loop/an unread catalog is treated as a read one",
+		File:     "internal/vibe/fleetapi/render_loop.go",
+		Find:     "\t\tif !p.Announcing || !p.CatalogKnown {\n\t\t\tcontinue\n\t\t}",
+		Replace:  "\t\tif !p.Announcing {\n\t\t\tcontinue\n\t\t}\n\t\t_ = p.CatalogKnown",
+		Pkg:      "./internal/vibe/fleetapi/",
+		MustFail: []string{"TestRenderLoop_UnreadCatalogHoldsTheDefs"},
+		Why: "the announce-catalog gate's hold-on-unknown rung is the whole " +
+			"difference between a cell whose llama-swap did not answer its " +
+			"announcer and a cell that serves nothing. Dropping the bit prunes " +
+			"a cell's defs on the FIRST announce after any llama-swap blip — a " +
+			"flap storm against the front catalog, and the receiving half of " +
+			"the announceOnce empty-list hazard the C15 cell-side note already " +
+			"names. Same fail-toward-no-evidence direction as C6's staleness " +
+			"rule and the C5 unreported-in-flight rule.",
+	},
 }
 
 // ── tree copying and patching ────────────────────────────────────────

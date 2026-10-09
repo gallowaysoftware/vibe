@@ -328,6 +328,17 @@ var evidencePairScan = scan{
 		// Re-read at C21: every read of agg.power (the row's Power, the row's
 		// Net, both totals) sits under an `agg.powerKnown` guard.
 		"internal/vibe/fleetapi/savings.go:power": "same pair, the unexported window aggregate; every read of this one IS gated on powerKnown",
+		// The announce wire's catalog split (post-C27): ModelsKnown says the
+		// cell's llama-swap catalog was READ, not that Models is believed —
+		// an announce from a down llama-swap carries Models nil AND
+		// ModelsKnown false, and absent models_known means an OLD announcer,
+		// which is a THIRD state (unknown, gate holds). observed.Value cannot
+		// spell the wire: the JSON split (models absent vs empty vs
+		// models_known) is the announce contract, and both fields are set at
+		// ONE ingest site (recordAnnounce, adjacent assignments) and read at
+		// ONE gate (applyAnnouncedCatalog). Re-examine if a second writer or
+		// a second reader of either field appears.
+		"internal/vibe/fleetapi/announce.go:Models": "wire-shape split (read/empty vs could-not-read vs old-announcer-unknown), one writer one reader; observed.Value cannot express the announce JSON contract",
 	},
 	Floor: 400,
 	Unit:  "struct types",

@@ -1132,7 +1132,7 @@ func (d *Daemon) Start(_ context.Context, req *connect.Request[vibev1.StartReque
 	// cloud_peer included: the peer has no local process, but the rendered
 	// config is the entire deliverable there, and omitting it left a start
 	// reporting "ready" with nothing written.
-	if p.Backend.LlamaServer != nil || p.Backend.TabbyAPI != nil || p.Backend.MLXServer != nil || p.Backend.CloudPeer != nil {
+	if p.Backend.LlamaServer != nil || p.Backend.TabbyAPI != nil || p.Backend.MLXServer != nil || p.Backend.CloudPeer != nil || p.Backend.VLLM != nil {
 		if p.Frontend.Kind != "" {
 			// Pre-create the per-profile frontend state dir so docker-compose
 			// bind mounts (and any other path the profile points inside it)
@@ -1479,6 +1479,16 @@ func (d *Daemon) Pull(ctx context.Context, req *connect.Request[vibev1.PullReque
 		return stream.Send(&vibev1.PullProgress{
 			Phase:   vibev1.PullProgress_PHASE_DONE,
 			Message: "no model file to pull (cloud_peer models live at the provider)",
+		})
+	}
+	// A vllm def declares an engine whose weights live on the engine's own
+	// box, staged by whatever launcher manages the process (a DSpark recipe,
+	// systemd, docker). There is nothing here to pull and nothing here that
+	// would know where to put it.
+	if p.Backend.VLLM != nil {
+		return stream.Send(&vibev1.PullProgress{
+			Phase:   vibev1.PullProgress_PHASE_DONE,
+			Message: "no model file to pull (vllm weights live on the engine's box, staged by its launcher)",
 		})
 	}
 	// http_server backends bring their own model artefacts (baked into the
@@ -1968,6 +1978,12 @@ func frontendModelVars(p *profile.Profile, external bool) (alias string, ctxLen 
 			alias = c.Models[0]
 		}
 		return alias, p.Backend.CloudPeer.Context
+	case p.Backend.VLLM != nil:
+		// The engine validates the model field and answers only to its
+		// SERVED_MODEL_NAME, which is the def name — so ${MODEL_ALIAS}
+		// resolves through the canonicalRouterModelID branch below, exactly
+		// like an external llama_server def. Only the context is local.
+		ctxLen = p.Backend.VLLM.Context
 	}
 	// comfyui and http_server fall through with both unset: neither renders a
 	// frontend config (validateFrontend rejects a frontend block on both), so

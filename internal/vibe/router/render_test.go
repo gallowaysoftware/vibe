@@ -28,9 +28,17 @@ type parsedConfig struct {
 		Unlisted bool     `yaml:"unlisted"`
 	} `yaml:"models"`
 	Peers map[string]struct {
-		Proxy  string   `yaml:"proxy"`
-		APIKey string   `yaml:"apiKey"`
-		Models []string `yaml:"models"`
+		Proxy    string   `yaml:"proxy"`
+		APIKey   string   `yaml:"apiKey"`
+		Models   []string `yaml:"models"`
+		Timeouts *struct {
+			Connect        int `yaml:"connect"`
+			KeepAlive      int `yaml:"keepalive"`
+			ResponseHeader int `yaml:"responseHeader"`
+			TLSHandshake   int `yaml:"tlsHandshake"`
+			ExpectContinue int `yaml:"expectContinue"`
+			IdleConn       int `yaml:"idleConn"`
+		} `yaml:"timeouts"`
 	} `yaml:"peers"`
 	Hooks struct {
 		OnStartup struct {

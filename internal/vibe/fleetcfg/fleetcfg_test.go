@@ -96,6 +96,14 @@ cells:
 cells:
   front: { url: "http://front.lan:9000", class: always_on, wake: {mac: "aa:bb:cc:dd:ee:ff:00:11"} }
 `,
+		"negative timeout": `
+cells:
+  front: { url: "http://front.lan:9000", class: always_on, timeouts: {responseHeader: -1} }
+`,
+		"negative idle conn": `
+cells:
+  front: { url: "http://front.lan:9000", class: always_on, timeouts: {idleConn: -5} }
+`,
 	}
 	for name, doc := range cases {
 		if _, err := LoadFrom(writeHosts(t, doc)); err == nil {

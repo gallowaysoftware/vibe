@@ -181,13 +181,19 @@ type AnnounceUsageModel struct {
 
 // AnnounceRequest is the cell→fleetd heartbeat.
 type AnnounceRequest struct {
-	V        int               `json:"v"`
-	Cell     string            `json:"cell"`
-	Seq      uint64            `json:"seq"`
-	Intent   *AnnounceIntent   `json:"intent,omitempty"`
-	Models   []AnnounceModel   `json:"models,omitempty"`
-	Capacity *AnnounceCapacity `json:"capacity,omitempty"`
-	Versions *AnnounceVersions `json:"versions,omitempty"`
+	V      int             `json:"v"`
+	Cell   string          `json:"cell"`
+	Seq    uint64          `json:"seq"`
+	Intent *AnnounceIntent `json:"intent,omitempty"`
+	Models []AnnounceModel `json:"models,omitempty"`
+	// ModelsKnown separates "the catalog was read (and may be empty)"
+	// from "the catalog could not be read". Absent = unknown: the render
+	// gate must treat the cell's model list as NO EVIDENCE, never as an
+	// empty one — the same fail-toward-no-evidence direction as C6's
+	// staleness rule and the C5 unreported-in-flight rule.
+	ModelsKnown bool              `json:"models_known,omitempty"`
+	Capacity    *AnnounceCapacity `json:"capacity,omitempty"`
+	Versions    *AnnounceVersions `json:"versions,omitempty"`
 	// Usage is the C7a token ledger feed. Additive: old fleetd ignores
 	// it (unknown fields are tolerated by the C3 schema rule) and old
 	// cells omit it, rendering as unmeasured rather than as zero.
@@ -221,13 +227,18 @@ type AnnounceResponse struct {
 
 // Presence is one cell's announce-derived state in the table.
 type Presence struct {
-	Cell          string            `json:"cell"`
-	Seq           uint64            `json:"seq"`
-	Announcing    bool              `json:"announcing"` // at least one announce ever
-	Stale         bool              `json:"stale"`      // past stale_after
-	Withdrawn     bool              `json:"withdrawn"`  // clean withdraw (intent.state == withdrawing)
-	IntentEcho    *AnnounceIntent   `json:"intent_echo,omitempty"`
-	Models        []AnnounceModel   `json:"models,omitempty"`
+	Cell       string          `json:"cell"`
+	Seq        uint64          `json:"seq"`
+	Announcing bool            `json:"announcing"` // at least one announce ever
+	Stale      bool            `json:"stale"`      // past stale_after
+	Withdrawn  bool            `json:"withdrawn"`  // clean withdraw (intent.state == withdrawing)
+	IntentEcho *AnnounceIntent `json:"intent_echo,omitempty"`
+	Models     []AnnounceModel `json:"models,omitempty"`
+	// CatalogKnown mirrors the announce's models_known: this cell's model
+	// list is a READ of its llama-swap catalog, not a failure standing in
+	// for one. The render loop's announce-catalog gate prunes only on a
+	// known catalog.
+	CatalogKnown  bool              `json:"catalog_known,omitempty"`
 	Capacity      *AnnounceCapacity `json:"capacity,omitempty"`
 	Versions      *AnnounceVersions `json:"versions,omitempty"`
 	ReceivedAt    time.Time         `json:"received_at"`
@@ -584,6 +595,7 @@ func (s *Server) recordAnnounce(req *AnnounceRequest) *AnnounceResponse {
 	}
 	prevModels := p.Models
 	p.Models = req.Models
+	p.CatalogKnown = req.ModelsKnown
 	p.Capacity = req.Capacity
 	p.Versions = req.Versions
 

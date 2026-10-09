@@ -372,6 +372,7 @@ backend:
     api_key_env: ANTHROPIC_API_KEY
     models: [claude-opus-4-8, claude-sonnet-5]
     formats: [anthropic, openai]
+    timeouts: {responseHeader: 600}
 `)
 	def, err := LoadBackend("anthropic")
 	if err != nil {
@@ -386,6 +387,9 @@ backend:
 	}
 	if len(cp.Models) != 2 {
 		t.Errorf("models = %v", cp.Models)
+	}
+	if cp.Timeouts == nil || cp.Timeouts.ResponseHeader != 600 {
+		t.Errorf("timeouts = %+v, want responseHeader 600", cp.Timeouts)
 	}
 }
 
@@ -416,6 +420,11 @@ name: p
 backend:
   cloud_peer: {base_url: https://x.example, models: [m], formats: [grpc]}
 `, "formats"},
+		"negative timeout": {`
+name: p
+backend:
+  cloud_peer: {base_url: https://x.example, models: [m], timeouts: {responseHeader: -1}}
+`, "responseHeader"},
 		// cloud_peer implies external; a service sidecar contradiction must
 		// trip the same guard as an explicit external: true.
 		"service mode": {`

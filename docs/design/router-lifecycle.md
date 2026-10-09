@@ -664,3 +664,81 @@ real A5/A6 (Sparks: single-node cell, dual-node pair scripts, NCCL
 workarounds, deep-health watchdog), A8b (delete proxy.go + LLM respawn
 paths once nothing daemon-supervised serves LLMs — bge-embed service is
 the last holdout on localmodel, destined for llamaloft).
+
+## 18. Agent pools (2026-10-09)
+
+`vibe agentpool` is the first deliberate front shim. A coding harness that
+fans work out to subagents needs "whichever executor is free", which neither
+llama-swap nor a failover chain expresses: llama-swap maps one id to one
+model, and a harness's own fallback list only checks that an id exists, never
+that its machine is up or idle.
+
+**Shape.** A separate process (its own container on hum), not the daemon. It
+serves virtual ids (`agent-exec`) whose members are front model ids with a
+slot count, and forwards to the front, which still decides the cell. Only
+requests that name a pool id take the extra hop; every other client keeps
+talking to the front directly, so invariant 1 holds for them and fleetd stays
+read-and-request-only (invariant 4): the pool judges member health from its
+own dispatches and never asks fleetd.
+
+**Scheduling.**
+- A slot both bounds requests in flight and is **owned** by a conversation
+  while it is active: a request in flight, or one that ended within
+  `conversation_idle` (default 2m). An agent spends much of a task between
+  requests running tools. Counting in-flight requests alone let a new
+  conversation take the member in that gap and then trade turns with it while
+  another member sat idle.
+- A new conversation takes the first member, in configured order, with
+  unowned capacity. When every slot is owned, it goes to the member furthest
+  below its share by speed: conversations per slot per unit of `weight`
+  (default 1), so a member with weight 3 ends up with three times the
+  conversations of one with weight 1. If that member is mid-request and
+  strictly faster than the best free one, a conversation that will be pinned
+  waits for it, for at most `overflow_patience` (default 30s), then takes the
+  free member. Unpinned requests never wait: they add no owner, so every one
+  would pick, and queue on, the same member. Splitting by count alone left a
+  fast member idle while a slow one, holding as many conversations, still had
+  a queue.
+- Every later request in it goes to the same member. The key is a hash of the
+  first system and first user message, which an agent never rewrites. One
+  conversation never has two requests in flight, so a second request under
+  a key that is mid-request is a different conversation whose opening
+  happens to match (a harness that sends a fixed preamble first). It is
+  placed with no affinity rather than queued behind the first.
+- A pinned conversation waits for its member rather than moving. A move
+  changes the model mid-task and throws away that member's prompt cache. It
+  only moves when its member is marked down.
+- Requests queue when every slot is busy (`queue_timeout`, default 15m). This
+  is the one place a request blocks. It blocks before dispatch, never
+  mid-stream. Once dispatched, bytes are copied and flushed per read, and
+  response headers are flushed at once, because a member prefilling a long
+  prompt can be silent for a minute.
+- A front 404/502/503 or a dial error marks the member down for
+  `down_cooldown` and retries the request on another member. Any other status
+  (a 400 for an over-long prompt, a 500) passes straight through. With every
+  member down, the pool answers 503 with `Retry-After` at once instead of
+  queueing.
+
+**An exception to invariant 3, made deliberately.** Retrying a down member's
+request on another member, and moving a pinned conversation when its member
+goes down, is the rerouting invariant 3 forbids for the front. It is accepted
+here because the client asked for "any member" by naming the pool, and the
+alternative is failing an agent mid-task while another executor is free. It
+is not silent: every move logs a warning, `X-Agent-Pool-Member` names the
+member that served, and `/status` shows slots, owners, pins and waiters.
+Requests that name a real model id never pass through the pool and keep the
+invariant. A pool should list members of comparable capability, since a
+conversation may land on any of them; its advertised context is the smallest
+member's.
+
+**Edges.** Only the exact `/v1/chat/completions` and `/v1/completions` paths
+are served. The path is forwarded verbatim, and a front 404 for a wrong path
+would otherwise read as every member being down. On shutdown, queued requests
+fail at once with 503 and in-flight streams get two minutes to finish (the
+compose `stop_grace_period` covers it). Every release wakes every waiter;
+with a handful of members and waiters that costs nothing, and a pool large
+enough to notice should move to per-member signalling.
+
+**Known limit.** The pool only counts its own requests. Traffic that reaches a
+member's model id directly shares that member's slots without the pool
+knowing, so a member that serves both pays in queueing on the member side.

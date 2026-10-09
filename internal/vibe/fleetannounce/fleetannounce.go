@@ -18,12 +18,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -319,10 +321,15 @@ func (c *Client) announceOnce(ctx context.Context) error {
 		Intent: c.intentEcho(),
 	}
 	models, err := c.gatherModels(ctx)
+	// models_known separates "catalog read, possibly empty" from "the
+	// catalog could not be read at all". Without it an announce from a cell
+	// whose llama-swap is down is byte-identical to one from a cell serving
+	// nothing — and the front render's announce-catalog gate would prune
+	// the cell's defs on the former reading. A failed read still announces
+	// (that is how "the unit is stopped" reads as an absent model list
+	// instead of an absent cell); it just refuses to claim the catalog.
+	req.ModelsKnown = err == nil
 	if err != nil {
-		// A llama-swap that's down answers nothing: the cell still
-		// announces (that's how "the unit is stopped" reads as an empty
-		// model list instead of an absent cell).
 		models = nil
 	}
 	req.Models = models
@@ -586,19 +593,43 @@ func (c *Client) gatherModels(ctx context.Context) ([]fleetapi.AnnounceModel, er
 	}
 	var out []fleetapi.AnnounceModel
 	covered := map[string]bool{}
+	// A cell's llama-swap namespaces its OWN peer ids as peerID/model, so
+	// the catalog id a def serves may be "qwen38fn-mlx/qwen38fn-mlx"
+	// rather than the bare def name. Match the def against the base of a
+	// namespaced id and announce the CATALOG id — without the base match
+	// the def fell into the defless bucket below (a misleading "no
+	// backend def" warning for a def that is present), and without
+	// announcing the catalog id the announced model would not be the
+	// routable one. Deterministic pick when two peers expose the same
+	// base: sorted ids, first wins.
+	catBase := map[string]string{}
+	for _, id := range slices.Sorted(maps.Keys(catalog)) {
+		if i := strings.LastIndexByte(id, '/'); i >= 0 {
+			if _, taken := catBase[id[i+1:]]; !taken {
+				catBase[id[i+1:]] = id
+			}
+		}
+	}
 	for _, def := range c.cfg.Defs {
 		if !def.Backend.External || def.Backend.CloudPeer != nil {
 			continue
 		}
-		if !catalog[def.Name] {
+		if !catalog[def.Name] && catBase[def.Name] == "" {
 			continue
 		}
-		covered[def.Name] = true
-		state := states[def.Name]
+		catalogID := def.Name
+		if !catalog[def.Name] {
+			catalogID = catBase[def.Name]
+		}
+		covered[catalogID] = true
+		state := states[catalogID]
+		if state == "" {
+			state = states[def.Name]
+		}
 		if state == "" {
 			state = "stopped"
 		}
-		m := fleetapi.AnnounceModel{ID: def.Name, State: state}
+		m := fleetapi.AnnounceModel{ID: catalogID, State: state}
 		// Fingerprints only cover spec-rendered kinds (llama_server,
 		// mlx_server): ModelCmd's llama path has no comfyui/http_server
 		// branch — the router's own render has the same split.
@@ -613,7 +644,10 @@ func (c *Client) gatherModels(ctx context.Context) ([]fleetapi.AnnounceModel, er
 		if def.Fingerprint != "" {
 			m.Fingerprint = def.Fingerprint
 		}
-		m.Probe = probes[def.Name]
+		m.Probe = probes[catalogID]
+		if m.Probe == nil {
+			m.Probe = probes[def.Name]
+		}
 		out = append(out, m)
 	}
 	// A cloud peer's catalog ids are its cloud_peer.models entries, never its

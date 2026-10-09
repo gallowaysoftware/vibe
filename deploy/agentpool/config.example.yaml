@@ -1,0 +1,25 @@
+# vibe agentpool: pooled executor ids (docs/design/router-lifecycle.md §18).
+# House values (addresses, member ids) belong in the private fleet repo.
+listen: ":9010"
+# The front every member is reached through; the pool picks the model id,
+# the front still picks the cell.
+upstream: http://front.example:9000
+affinity_ttl: 2h
+# A conversation owns its member this long after its last request, so a new
+# one does not take the member while an agent is running a tool.
+conversation_idle: 2m
+down_cooldown: 30s
+# Longest a new conversation waits for a faster busy member before taking a
+# free slower one.
+overflow_patience: 30s
+queue_timeout: 15m
+pools:
+  - id: agent-exec
+    # The smallest member context: a conversation may land on any member.
+    context: 131072
+    # Configured order is preference order while slots are free. Weight is
+    # relative speed (default 1): once every slot is owned, conversations
+    # split in proportion to it.
+    members:
+      - {model: cell-a/executor-model, slots: 1, weight: 3}
+      - {model: cell-b/executor-model, slots: 1, weight: 1}

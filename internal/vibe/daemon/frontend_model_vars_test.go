@@ -88,6 +88,27 @@ func TestFrontendModelVars(t *testing.T) {
 		wantAlias: "kimi-k3",
 		wantCtx:   0,
 	}, {
+		// The engine validates the model field and answers only to its
+		// SERVED_MODEL_NAME — the def name. So ${MODEL_ALIAS} rides the
+		// external def-name branch, exactly like an external llama_server.
+		name:      "vllm uses the def name via the external branch",
+		backend:   profile.Backend{External: true, VLLM: &profile.VLLMBackend{URL: "http://127.0.0.1:8888", Context: 850000}},
+		profName:  "heavy",
+		ref:       "glm53flash",
+		external:  true,
+		wantAlias: "glm53flash",
+		wantCtx:   850000,
+	}, {
+		// context: is optional on a vllm def. 0 must stay 0 so it drops out
+		// of the expansion map instead of rendering a zero-size window.
+		name:      "vllm without context leaves the window unset",
+		backend:   profile.Backend{External: true, VLLM: &profile.VLLMBackend{URL: "http://127.0.0.1:8888"}},
+		profName:  "heavy",
+		ref:       "dsv4flash",
+		external:  true,
+		wantAlias: "dsv4flash",
+		wantCtx:   0,
+	}, {
 		// comfyui and http_server never render a frontend config
 		// (validateFrontend rejects a frontend block on both), so there is
 		// no template to expand a model id into. Both must stay unset rather
@@ -123,6 +144,7 @@ func TestFrontendModelVarsCoversEveryBackendKind(t *testing.T) {
 	covered := map[string]bool{
 		"LlamaServer": true, "TabbyAPI": true, "MLXServer": true,
 		"CloudPeer": true, "ComfyUI": true, "HTTPServer": true,
+		"VLLM": true,
 	}
 	bt := reflect.TypeOf(profile.Backend{})
 	var missing []string
